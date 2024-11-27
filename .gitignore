@@ -1,0 +1,42 @@
+*.sc
+*.class
+*.log
+#t
+t2
+t3
+t4
+
+.bsp/
+
+*.png
+*.DS_store
+
+local/
+
+# Intellij
+.idea/
+
+# Scalatest
+.cache-tests
+
+# sbt
+.cache
+.history
+.lib/
+lib/
+dist/*
+target/
+lib_managed/
+src_managed/
+project/boot/
+project/project/
+project/plugins/project/
+
+# Scala-IDE
+.scala_dependencies
+.worksheet
+/bin/
+.cache-main
+.classpath
+.project
+.settings/

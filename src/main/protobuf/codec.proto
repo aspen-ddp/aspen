@@ -1,0 +1,538 @@
+syntax = "proto3";
+
+package org.aspen_ddp.aspen.codec;
+
+option java_multiple_files = true;
+
+//---------------------------------------------------------------------------
+//- Object
+//---------------------------------------------------------------------------
+message UUID {
+  uint64 most_sig_bits = 1;
+  uint64 least_sig_bits = 2;
+}
+
+enum KeyComparison {
+  KEY_COMPARISON_BYTE_ARRAY = 0;
+  KEY_COMPARISON_INTEGER = 1;
+  KEY_COMPARISON_LEXICAL = 2;
+}
+
+message Replication {
+  uint32 width = 1;
+  uint32 write_threshold = 2;
+}
+
+message ReedSolomon {
+  uint32 width = 1;
+  uint32 restore_threshold = 2;
+  uint32 write_threshold = 3;
+}
+
+message IDA {
+  oneof ida {
+    Replication replication = 1;
+    ReedSolomon reed_solomon = 2;
+  }
+}
+
+message ObjectRevision {
+  UUID uuid = 1;
+}
+
+message ObjectRefcount {
+  uint64 update_serial = 1;
+  uint32 refcount = 2;
+}
+
+message StorePointer {
+  uint32 store_index = 1;
+  bytes data = 2;
+}
+
+enum ObjectType {
+  OBJECT_TYPE_DATA = 0;
+  OBJECT_TYPE_KEYVALUE = 1;
+}
+
+message ObjectPointer {
+  UUID uuid = 1;
+  UUID pool_uuid = 2;
+  uint32 size = 3;
+  repeated StorePointer store_pointers = 4;
+  IDA ida = 5;
+  ObjectType object_type = 6;
+}
+
+//---------------------------------------------------------------------------
+//- Transaction Description
+//---------------------------------------------------------------------------
+enum TransactionStatus {
+  TRANSACTION_STATUS_UNRESOLVED = 0;
+  TRANSACTION_STATUS_COMMITTED = 1;
+  TRANSACTION_STATUS_ABORT = 2;
+}
+
+enum TransactionDisposition {
+  TRANSACTION_DISPOSITION_UNDETERMINED = 0;
+  TRANSACTION_DISPOSITION_VOTE_COMMIT = 1;
+  TRANSACTION_DISPOSITION_VOTE_ABORT = 2;
+}
+
+enum DataUpdateOperation {
+  DATA_UPDATE_OPERATION_APPEND = 0;
+  DATA_UPDATE_OPERATION_OVERWRITE = 1;
+}
+
+enum KeyRequirement {
+  KEY_REQUIREMENT_KEY_REVISION = 0;
+  KEY_REQUIREMENT_KEY_OBJECT_REVISION = 1;
+  KEY_REQUIREMENT_WITHIN_RANGE = 2;
+  KEY_REQUIREMENT_EXISTS = 3;
+  KEY_REQUIREMENT_MAY_EXIST = 4;
+  KEY_REQUIREMENT_DOES_NOT_EXIST = 5;
+  KEY_REQUIREMENT_TIMESTAMP_EQUALS = 6;
+  KEY_REQUIREMENT_TIMESTAMP_LESS_THAN = 7;
+  KEY_REQUIREMENT_TIMESTAMP_GREATER_THAN = 8;
+}
+
+message DataUpdate {
+  ObjectPointer object_pointer = 1;
+  ObjectRevision required_revision = 2;
+  DataUpdateOperation operation = 3;
+}
+
+message RefcountUpdate {
+  ObjectPointer object_pointer = 1;
+  ObjectRefcount required_refcount = 2;
+  ObjectRefcount new_refcount = 3;
+}
+
+message VersionBump {
+  ObjectPointer object_pointer = 1;
+  ObjectRevision required_revision = 2;
+}
+
+message RevisionLock {
+  ObjectPointer object_pointer = 1;
+  ObjectRevision required_revision = 2;
+}
+
+message KVReq {
+  KeyRequirement requirement = 1;
+  uint64 timestamp = 2;
+  ObjectRevision revision = 3;
+  KeyComparison comparison = 4;
+  bytes key = 5;
+}
+
+message KeyRevision {
+  bytes key = 1;
+  ObjectRevision revision = 2;
+}
+
+message KeyValueUpdate {
+  ObjectPointer object_pointer = 1;
+  ObjectRevision required_revision = 2;
+  repeated KeyRevision content_lock = 3;
+  repeated KVReq requirements = 4;
+}
+
+enum LocalTimeRequirementEnum {
+  LOCAL_TIME_REQUIREMENT_ENUM_LESS_THAN = 0;
+  LOCAL_TIME_REQUIREMENT_ENUM_GREATER_THAN = 1;
+  LOCAL_TIME_REQUIREMENT_ENUM_EQUALS = 2;
+}
+
+message LocalTimeRequirement {
+  uint64 timestamp = 1;
+  LocalTimeRequirementEnum requirement = 2;
+}
+
+message TransactionRequirement {
+  DataUpdate data_update = 1;
+  RefcountUpdate refcount_update = 2;
+  VersionBump version_bump = 3;
+  RevisionLock revision_lock = 4;
+  KeyValueUpdate kv_update = 5;
+  LocalTimeRequirement localtime = 6;
+}
+
+message SerializedFinalizationAction {
+  UUID type_uuid = 1;
+  bytes data = 2;
+}
+
+message TransactionDescription {
+  UUID transaction_uuid = 1;
+  uint64 start_timestamp = 2;
+  ObjectPointer primary_object = 3;
+  uint32 designated_leader_uid = 4;
+  repeated TransactionRequirement requirements = 5;
+  repeated SerializedFinalizationAction finalization_actions = 6;
+  UUID originating_client = 7;
+  repeated StoreId notify_on_resolution = 8;
+  repeated string notes = 9;
+}
+
+//---------------------------------------------------------------------------
+//- Transaction Messages
+//---------------------------------------------------------------------------
+message ProposalId {
+  uint32 number = 1;
+  uint32 uid = 2;
+}
+
+message StoreId {
+  UUID storage_pool_uuid = 1;
+  uint32 storage_pool_index = 2;
+}
+
+enum TxPrepareResponseType {
+  TX_PREPARE_RESPONSE_TYPE_PROMISE = 0;
+  TX_PREPARE_RESPONSE_TYPE_NACK = 1;
+}
+
+message TxPrepare {
+  StoreId to = 1;
+  StoreId from = 2;
+  TransactionDescription txd = 3;
+  ProposalId proposal_id = 4;
+}
+
+message TxPrepareResponse {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  TxPrepareResponseType response_type = 4;
+  ProposalId proposal_id = 5;
+  ProposalId promised_id = 6;      // Valid for Nack responses
+  ProposalId last_accepted_id = 7; // Valid for Promise responses
+  bool last_accepted_value = 8;    // Valid for Promise responses
+  TransactionDisposition disposition = 9;
+  bytes transaction_collisions = 10; // sequence of 16-byte transaction UUIDs
+}
+
+message TxAccept {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  ProposalId proposal_id = 4;
+  bool value = 5;
+}
+
+message TxAcceptResponse {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  ProposalId proposal_id = 4;
+  bool is_nack = 5;
+  ProposalId promised_id = 6;      // Valid for Nack responses
+  bool value = 7;                  // Valid for Accepted responses
+}
+
+message TxResolved {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  bool committed = 4;
+}
+
+message TxCommitted {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  bytes object_commit_errors = 4; // sequence of 16-byte UUIDs
+}
+
+message TxFinalized {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  bool committed = 4;
+}
+
+message TxHeartbeat {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+}
+
+message TxStatusRequest {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  UUID request_uuid = 4;
+}
+
+message TxStatusResponse {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+  UUID request_uuid = 4;
+  TransactionStatus status = 5;
+  bool have_status = 6;
+  bool is_finalized = 7;
+}
+
+//---------------------------------------------------------------------------
+//- Read Messages
+//---------------------------------------------------------------------------
+enum ObjectReadError {
+  OBJECT_READ_ERROR_OBJECT_MISMATCH = 0;
+  OBJECT_READ_ERROR_OBJECT_NOT_FOUND = 1;
+  OBJECT_READ_ERROR_STORE_NOT_FOUND = 2;
+  OBJECT_READ_ERROR_CORRUPTED_OBJECT = 3;
+}
+
+enum ReadType {
+  READ_TYPE_METADATA_ONLY = 0;
+  READ_TYPE_FULL_OBJECT = 1;
+  READ_TYPE_BYTE_RANGE = 2;
+  READ_TYPE_SINGLE_KEY = 3;
+  READ_TYPE_LARGEST_KEY_LESS_THAN = 4;
+  READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO = 5;
+  READ_TYPE_KEY_RANGE = 6;
+}
+
+message Read {
+  StoreId to_store = 1;
+  UUID from_client = 2;
+  UUID read_uuid = 3;
+  ObjectPointer object_pointer = 4;
+  ReadType read_type = 5;
+  bytes key = 6;
+  bytes min = 7;
+  bytes max = 8;
+  KeyComparison comparison = 9;
+  uint32 offset = 10;
+  uint32 length = 11;
+}
+
+message ReadResponse {
+  StoreId from_store = 1;
+  UUID to_client = 2;
+  UUID read_uuid = 3;
+  ObjectRevision revision = 4;
+  ObjectRefcount refcount = 5;
+  uint64 timestamp = 6;
+  uint64 read_time = 7;
+  uint32 size_on_store = 8;
+  bool have_data = 9;
+  bytes object_data = 10;
+  bytes locked_write_transactions = 11; // Sequence of UUIDs
+  ObjectReadError readError = 12;
+}
+
+message OpportunisticRebuild {
+  StoreId to_store = 1;
+  UUID from_client = 2;
+  ObjectPointer pointer = 3;
+  ObjectRevision revision = 4;
+  ObjectRefcount refcount = 5;
+  uint64 timestamp = 6;
+  bytes data = 7;
+}
+
+message TransactionCompletionQuery {
+  StoreId to_store = 1;
+  UUID from_client = 2;
+  UUID query_uuid = 3;
+  UUID transaction_uuid = 4;
+}
+
+message TransactionCompletionResponse {
+  StoreId from_store = 1;
+  UUID to_client = 2;
+  UUID query_uuid = 3;
+  bool is_complete = 4;
+}
+
+message TransactionResolved {
+  StoreId from_store = 1;
+  UUID to_client = 2;
+  UUID transaction_uuid = 3;
+  bool committed = 4;
+}
+
+message TransactionFinalized {
+  StoreId from_store = 1;
+  UUID to_client = 2;
+  UUID transaction_uuid = 3;
+  bool committed = 4;
+}
+
+//---------------------------------------------------------------------------
+//- Allocation Messages
+//---------------------------------------------------------------------------
+
+message Allocate {
+  StoreId to_store = 1;
+  UUID from_client = 2;
+  UUID new_object_uuid = 3;
+  ObjectType object_type = 4;
+  uint32 object_size = 5;
+  ObjectRefcount initial_refcount = 6;
+  bytes object_data = 7;
+  uint64 timestamp = 8;
+  UUID allocation_transaction_uuid = 9;
+  ObjectPointer allocating_object = 10;
+  ObjectRevision allocating_object_revision = 11;
+  KVReq allocating_object_key_requirement = 12;
+}
+
+enum AllocationError {
+  ALLOCATION_ERROR_INSUFFICIENT_SPACE = 0;
+}
+
+message AllocateResponse {
+  UUID to_client = 1;
+  StoreId from_store = 2;
+  UUID allocation_transaction_uuid = 3;
+  UUID new_object_uuid = 4;
+  StorePointer allocate_store_pointer = 5;
+  AllocationError result_error = 6;
+}
+
+
+//---------------------------------------------------------------------------
+//- Node Support Message
+//---------------------------------------------------------------------------
+
+message NodeHeartbeat {
+  string from = 1;
+}
+
+
+//---------------------------------------------------------------------------
+//- Root Message
+//---------------------------------------------------------------------------
+message Message {
+  oneof msg {
+    TxPrepare prepare = 1;
+    TxPrepareResponse prepare_response = 2;
+    TxAccept accept = 3;
+    TxAcceptResponse accept_response = 4;
+    TxResolved resolved = 5;
+    TxCommitted committed = 6;
+    TxFinalized finalized = 7;
+    TxHeartbeat heartbeat = 8;
+    Allocate allocate = 9;
+    AllocateResponse allocate_response = 10;
+    Read read = 11;
+    ReadResponse read_response = 12;
+    OpportunisticRebuild opportunistic_rebuild = 13;
+    TransactionCompletionQuery transaction_completion_query = 14;
+    TransactionCompletionResponse transaction_completion_response = 15;
+    TransactionResolved tx_resolved = 16;
+    TransactionFinalized tx_finalized = 17;
+    NodeHeartbeat node_heartbeat = 18;
+    TxStatusRequest status_request = 19;
+    TxStatusResponse status_response = 20;
+  }
+}
+
+//---------------------------------------------------------------------------
+//- CRL State Messages
+//---------------------------------------------------------------------------
+message ObjectUpdate {
+  UUID object_id = 1;
+  bytes data = 2;
+}
+
+message PersistentState {
+  ProposalId promised = 1;             // Option[ProposalId],
+  ProposalId accepted_proposal_id = 2; // Option[(ProposalId, Boolean)]
+  bool accepted_value = 3;
+}
+
+message TransactionRecoveryState {
+  StoreId store_id = 1;
+  bytes serialized_txd = 2;
+  repeated ObjectUpdate object_updates = 3;
+  TransactionDisposition disposition = 4;
+  TransactionStatus status = 5;
+  PersistentState paxos_acceptor_state = 6;
+}
+
+message AllocationRecoveryState {
+  StoreId store_id = 1;
+  StorePointer store_pointer = 2;
+  UUID new_object_id = 3;
+  ObjectType object_type = 4;
+  uint32 object_size = 5;
+  bytes object_data = 6;
+  ObjectRefcount initial_refcount = 7;
+  uint64 timestamp = 8;
+  UUID transaction_uuid = 9;
+  bytes serialized_revision_guard = 10;
+}
+
+message StoreCRLEntry {
+  oneof msg {
+    TransactionRecoveryState trs = 1;
+    AllocationRecoveryState ars = 2;
+  }
+}
+
+message PoolConfig {
+  UUID poolId = 1;
+  string name = 2;
+  uint32 numberOfStores = 3;
+  IDA defaultIDA = 4;
+  uint32 maxObjectSize = 5;
+  repeated UUID storeHosts = 6;
+}
+
+message Host {
+  UUID hostId = 1;
+  string name = 2;
+  string address = 3;
+  uint32 dataPort = 4;
+  uint32 cncPort = 5;
+  uint32 storeTransferPort = 6;
+}
+
+//---------------------------------------------------------------------------
+//- CnC Messages
+//---------------------------------------------------------------------------
+
+enum BackendType {
+  BACKEND_TYPE_ROCKS_DB = 0;
+}
+
+message NewStore {
+  StoreId storeId = 1;
+  BackendType backendType = 2;
+}
+
+message ShutdownStore {
+  StoreId storeId = 1;
+}
+
+message TransferStore {
+  StoreId storeId = 1;
+  UUID toHost = 2;
+}
+
+
+message CnCRequest {
+  oneof msg {
+    NewStore new_store = 1;
+    ShutdownStore shutdown_store = 2;
+    TransferStore transfer_store = 3;
+  }
+}
+
+message CnCOk {
+}
+
+message CnCError {
+  string message = 1;
+}
+
+message CnCReply {
+  oneof msg {
+    CnCOk ok = 1;
+  }
+}

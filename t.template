@@ -7,7 +7,7 @@ export CLASSPATH=""
 
 
 # Replace this with your preferred JDK installation
-Export JAVA_HOME="/opt/homebrew/Cellar/openjdk/22.0.2/libexec/openjdk.jdk/Contents/Home"
+export JAVA_HOME="/opt/homebrew/Cellar/openjdk/22.0.2/libexec/openjdk.jdk/Contents/Home"
 
 #------------------
 

@@ -1,0 +1,13 @@
+
+name: node_c
+uuid: 00000000-0000-0000-0000-000000000002
+root-dir: demo/node_c
+endpoint:
+  host: 127.0.0.1
+  data-port: 5020
+  cnc-port: 5021
+  store-transfer-port: 5022
+log4j-config: demo/log4j-conf.xml
+crl:
+  storage-engine: simple-crl
+

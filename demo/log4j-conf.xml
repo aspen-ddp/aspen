@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration>
+    <Appenders>
+        <Console name="Console">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
+        </Console>
+    </Appenders>
+    <appender name="stdout" class="org.apache.log4j.ConsoleAppender">
+        <layout class="org.apache.log4j.PatternLayout">
+            <param name="ConversionPattern" value="%d{yyyy-MM-dd HH:mm:ss} %p %m%n"/>
+        </layout>
+    </appender>
+    <Loggers>
+        <Root level="trace">
+            <AppenderRef ref="Console"/>
+        </Root>
+        <logger name="org.dcache.oncrpc4j.rpc.OncRpcSvc" level="TRACE">
+            <AppenderRef ref="Console"/>
+        </logger>
+    </Loggers>
+</Configuration>

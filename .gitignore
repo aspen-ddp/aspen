@@ -40,3 +40,11 @@ project/plugins/project/
 .classpath
 .project
 .settings/
+
+# Demo generated files
+t
+demo/bootstrap
+demo/node_a
+demo/node_b
+demo/node_c
+

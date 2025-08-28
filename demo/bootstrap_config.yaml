@@ -1,0 +1,23 @@
+bootstrap-ida:
+  type: replication
+  width: 3
+  write-threshold: 2
+
+bootstrap-storage-nodes:
+  - name: node_a
+    host: 127.0.0.1
+    data-port: 5000
+    cnc-port: 5001
+    store-transfer-port: 5002
+
+  - name: node_b
+    host: 127.0.0.1
+    data-port: 5010
+    cnc-port: 5011
+    store-transfer-port: 5012
+
+  - name: node_c
+    host: 127.0.0.1
+    data-port: 5020
+    cnc-port: 5021
+    store-transfer-port: 5022

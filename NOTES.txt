@@ -12,23 +12,23 @@ sbt 'testOnly *KeyValueObjectReaderSuite -- -z min/max'
 
 # Testing commands
 
-./t bootstrap local/cfg.yaml
+./t bootstrap demo/bootstrap_config.yaml
 
-./t node local/bootstrap_config.yaml local/node_a.yaml
-./t node local/bootstrap_config.yaml local/node_b.yaml
-./t node local/bootstrap_config.yaml local/node_c.yaml
+./t node demo/bootstrap_config.yaml demo/node_a.yaml
+./t node demo/bootstrap_config.yaml demo/node_b.yaml
+./t node demo/bootstrap_config.yaml demo/node_c.yaml
 
 sudo launchctl start com.apple.rpcbind
-./t nfs local/cfg.yaml local/log4j-conf.xml
+./t nfs demo/cfg.yaml demo/log4j-conf.xml
 
 On Client:
     ssh rakis@192.168.64.2
     sudo
     umount -f /mnt; mount -v -t nfs4 -o "vers=4.1" 192.168.56.1:/ /mnt
 
-./t new-pool local/log4j-conf.xml local/bootstrap_config.yaml new_pool_name replication 3 2 2 node_a,node_b,node_c
+./t new-pool demo/log4j-conf.xml demo/bootstrap_config.yaml new_pool_name replication 3 2 2 node_a,node_b,node_c
 
-./t transfer-store local/log4j-conf.xml local/bootstrap_config.yaml 3f1ca5f7-74be-405d-aa48-739fc23651a4:2 node_a
+./t transfer-store demo/log4j-conf.xml demo/bootstrap_config.yaml 3f1ca5f7-74be-405d-aa48-739fc23651a4:2 node_a
 
 
 -------------------------------------------------------------------------------
@@ -39,18 +39,18 @@ On Client:
 # run "sbt pack"
 # then invoke ./target/pack/bin/demo
 
-sbt compile && rm -r local/node_* && ./t bootstrap local/cfg.yaml
+sbt compile && rm -r demo/node_* && ./t bootstrap demo/cfg.yaml
 
 Bootstrap Procedure:
     sbt pack
     rm -r ~/temp/aspen/*
-    rm -r local/*log
-    ./target/pack/bin/demo bootstrap local/t.yaml
-    emacs local/cfg.yaml
-    ./target/pack/bin/demo amoeba local/cfg.yaml local/amoeba-log4j.yaml
+    rm -r demo/*log
+    ./target/pack/bin/demo bootstrap demo/t.yaml
+    emacs demo/cfg.yaml
+    ./target/pack/bin/demo amoeba demo/cfg.yaml demo/amoeba-log4j.yaml
 
   For each node:
-    ./target/pack/bin/demo node local/cfg.yaml node_a
+    ./target/pack/bin/demo node demo/cfg.yaml node_a
 
   On client:
     ssh rakis@192.168.64.2

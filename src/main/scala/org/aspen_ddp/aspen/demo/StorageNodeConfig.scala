@@ -11,13 +11,13 @@ import java.nio.file.Path
 /*
 name: node_a
 uuid: 00000000-0000-0000-0000-000000000000
-root-dir: local/node_a
+root-dir: demo/node_a
 endpoint:
   host: 127.0.0.1
   data-port: 5000
   cnc-port: 5001
   store-transfer-port: 5002
-log4j-config: local/log4j-conf.xml
+log4j-config: demo/log4j-conf.xml
 crl:
   storage-engine: simple-crl
 */

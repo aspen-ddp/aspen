@@ -7,7 +7,7 @@ export CLASSPATH=""
 
 
 # Replace this with your preferred JDK installation
-export JAVA_HOME="/opt/homebrew/Cellar/openjdk/22.0.2/libexec/openjdk.jdk/Contents/Home"
+export JAVA_HOME="/opt/homebrew/Cellar/openjdk/23.0.2/libexec/openjdk.jdk/Contents/Home"
 
 #------------------
 
@@ -15,9 +15,9 @@ if [[ $1 == "bootstrap" ]]
 then
   sbt compile
 
-  rm -r demo/node_a
-  rm -r demo/node_b
-  rm -r demo/node_c
+  rm -rf demo/node_a
+  rm -rf demo/node_b
+  rm -rf demo/node_c
 fi
 
 $JAVA_HOME/bin/java -cp $CLASSPATH org.aspen_ddp.aspen.demo.Main "$@"

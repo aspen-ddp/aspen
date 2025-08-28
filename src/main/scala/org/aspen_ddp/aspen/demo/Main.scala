@@ -280,7 +280,7 @@ object Main {
           println(s"Successful config: $cfg")
           //println(s"Config file: $config")
           cfg.mode match {
-            case "bootstrap" => bootstrap(bootstrapConfig, Paths.get("local/bootstrap"))
+            case "bootstrap" => bootstrap(bootstrapConfig, Paths.get("demo/bootstrap"))
             case "node" => node(bootstrapConfig, StorageNodeConfig.loadStorageNode(cfg.nodeConfigFile))
             case "amoeba" => amoeba_server(cfg.log4jConfigFile, bootstrapConfig)
             case "debug" => run_debug_code(cfg.log4jConfigFile, bootstrapConfig)
@@ -782,7 +782,7 @@ object Main {
     var storeId: StoreId = StoreId(poolId, 0.toByte)
 
     cfg.nodes.zipWithIndex.foreach: (node, index) =>
-      Path.of(s"local/${node.name}/stores").toFile.listFiles.toList.foreach: storeFn =>
+      Path.of(s"demo/${node.name}/stores").toFile.listFiles.toList.foreach: storeFn =>
         val cfg = StoreConfig.loadStore(storeFn.toPath.resolve("store_config.yaml").toFile)
         if poolUuid == cfg.poolUuid && storeIndex == cfg.index then
           poolId = PoolId(cfg.poolUuid)

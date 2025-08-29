@@ -22,7 +22,7 @@ This approach involves a little more overhead in the data lookup process but all
 much more flexible data configuration and placement options when designing applications. 
 It also enables a great degree of freedom at run-time to move data stores between hosts
 and backing storage media to balance a number of operational factors such as availability, 
-reliability, latency, and cost to name a few.
+reliability, latency, and cost, to name a few.
 
 At it's core, Aspen is an object store. At least insofar as all data managed by the system
 is stored as discreet "objects" which are relatively small, typically on the order of
@@ -35,8 +35,8 @@ system designs.
 typically 50 - 100 bytes in size and may be stored in other objects to form distributed
 data structures like linked-lists, B-trees, graphs, etc.
 - **The choice between replication or erasure coding and their factor is made at the
-time of allocation** - This allows applications to mix-and-match replication and erasure
-coding to best suit their needs.
+time of allocation** - This allows applications to mix-and-match various replication and
+erasure coding schemes to best suit their needs.
 - **All object updates are made via transactions** - Transactions may simultaneously
 update single or multiple objects with Atomic, Consistent, and Durable guarantees.
 - **Transactions are 1RTT in the contention and error free case**
@@ -55,18 +55,20 @@ and backing media on-the-fly** - Data stores are logical entities that may be fr
 about to satisfy changing needs of the operational environment.
 
 Aspen isn't designed to be a "better" anything or to replace any existing systems. It's 
-intent is to compliment existing systems by providing application designers with a unique set 
-of tradeoffs that will allow them to explore new directions in distributed system design. 
+intent is to compliment existing systems by providing application designers with a unique
+and very different set of tradeoffs that will allow them to explore new directions in 
+distributed system design. 
 
-A full description of how Aspen works may be found in the Architecture section of the
-[Project Homepage](https://aspen-ddp.org)
+A full description of how Aspen works and its design tradeoffs may be found in the 
+Architecture section of the [Project Homepage](https://aspen-ddp.org)
 
 # AmoebaFS
 AmoebaFS is included with Aspen as a proof-of-concept application that demonstrates most
 of Aspen's unique features. It leverage's dcache's Java NFS server library to export a
 file system built on top of Aspen and currently supports most of the basic file system
 operations. It's very much alpha quality at the moment but it does a decent job of
-showcasing what Aspen is capable of and could eventually morph into something useful.
+showcasing what Aspen is capable of and could eventually morph into something useful,
+should others find it interesting enough to chip in on it's development.
 
 ## How to run the AmoebaFS NFS server demo
 

@@ -5,7 +5,10 @@
 Aspen is a general-purpose distributed data platform for building higher-level distributed
 applications like object stores, distributed file systems, distributed indices, databases,
 and other types of systems, particularly those that are not well suited to current 
-distributed system architectures.
+distributed system architectures. It is not designed to be a "better" anything or to replace
+any existing systems. Rather, the intent is to compliment existing systems by providing 
+application designers with a unique and very different set of tradeoffs that will allow 
+them to explore new directions in distributed system design.
 
 ## Why Aspen?
 Aspen takes a different approach to the distributed data management problem and emphasizes
@@ -20,7 +23,7 @@ it eschews the traditional consistent hashing and sharding models for achieving 
 and instead uses a model based on explicit object pointers for locating data in the system.
 This approach involves a little more overhead in the data lookup process but allows for
 much more flexible data configuration and placement options when designing applications. 
-It also enables a great degree of freedom at run-time to move data stores between hosts
+It also enables a great degree of freedom at run time to move data stores between hosts
 and backing storage media to balance a number of operational factors such as availability, 
 reliability, latency, and cost, to name a few.
 
@@ -53,11 +56,6 @@ by spinning disks to store bulk data.
 - **Data stores and, consequently, their stored objects may be freely migrated between hosts
 and backing media on-the-fly** - Data stores are logical entities that may be freely moved
 about to satisfy changing needs of the operational environment.
-
-Aspen isn't designed to be a "better" anything or to replace any existing systems. It's 
-intent is to compliment existing systems by providing application designers with a unique
-and very different set of tradeoffs that will allow them to explore new directions in 
-distributed system design. 
 
 A full description of how Aspen works and its design tradeoffs may be found in the 
 Architecture section of the [Project Homepage](https://aspen-ddp.org)

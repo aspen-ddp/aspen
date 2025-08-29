@@ -21,14 +21,14 @@ This approach involves a little more overhead in the data lookup process but all
 much more flexible data configuration and placement options when designing applications. 
 It also enables a great degree of freedom at run-time to move data stores between hosts
 and backing storage media to balance a number of operational factors such as availability, 
-reliability, latency, cost, etc.
+reliability, latency, and cost to name a few.
 
 At it's core, Aspen is an object store. At least insofar as all data managed by the system
 is stored as discreet "objects" which are relatively small, typically on the order of
 kilobytes to tens of megabytes. The following list outlines some of the characteristics of
 the system. While most of these aspects are not unique to Aspen, the combination of them
-results in an architecture significantly different from mainstream distributed system 
-designs.
+results in an architecture significantly different from current mainstream distributed 
+system designs.
 
 - **Object allocation results in an Object Pointer** - These are relatively small,
 typically 50 - 100 bytes in size and may be stored in other objects to form distributed
@@ -52,6 +52,10 @@ by spinning disks to store bulk data.
 - **Data stores and, consequently, their stored objects may be freely migrated between hosts
 and backing media on-the-fly** - Data stores are logical entities that may be freely moved
 about to satisfy changing needs of the operational environment.
+
+Aspen isn't designed to be a "better" anything or to replace any existing systems. It's 
+intent is to compliment existing systems by providing application designers with a unique set 
+of tradeoffs that will allow them to explore new directions in distributed system design. 
 
 A full description of how Aspen works may be found in the Architecture section of the
 [Project Homepage](https://aspen-ddp.org)

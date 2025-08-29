@@ -44,7 +44,7 @@ erasure coding schemes to best suit their needs.
 update single or multiple objects with Atomic, Consistent, and Durable guarantees.
 - **Transactions require only one round trip in the contention and error free case**
 - **Transactions may specify required post-commit actions** - These idempotent actions
-are guaranteed to be completed after a transaction successfully commits. These are useful
+are guaranteed to be completed after a transaction successfully commits and are useful
 for short-duration cleanup and maintenance activities.
 - **Provides a tasking model for durable, long-running operations** - Tasks leverage Aspen
 objects to store task state and multi-object transactions to ensure the successful

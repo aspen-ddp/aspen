@@ -42,10 +42,11 @@ time of allocation** - This allows applications to mix-and-match various replica
 erasure coding schemes to best suit their needs.
 - **All object updates are made via transactions** - Transactions may simultaneously
 update single or multiple objects with Atomic, Consistent, and Durable guarantees.
-- **Transactions are 1RTT in the contention and error free case**
+- **Transactions require only one round trip in the contention and error free case**
 - **Transactions may specify required post-commit actions** - These idempotent actions
-are guaranteed to be completed after a transaction successfully commits.
-- **Provides a tasking model for durable, long-running actions** - Tasks leverage Aspen
+are guaranteed to be completed after a transaction successfully commits. These are useful
+for short-duration cleanup and maintenance activities.
+- **Provides a tasking model for durable, long-running operations** - Tasks leverage Aspen
 objects to store task state and multi-object transactions to ensure the successful
 completion of multi-phase, long-running tasks in the presence of node failure and system 
 crashes, e.g, deleting a tree structure comprised of millions of individual objects.

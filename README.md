@@ -2,30 +2,36 @@
 [Project Homepage](https://aspen-ddp.org)
 
 ## What it is
-Aspen is a general-purpose distributed data platform for building higher-level distributed
-applications like object stores, distributed file systems, distributed indices, databases,
-and other types of systems, particularly those that are not well suited to current 
-distributed system architectures. It is not designed to "do the same thing only 
-better" or to replace any existing systems. Rather, the intent is to take a completely
-different approach to the distributed data management problem and provide developers
-with a new set of tools for approaching distributed system design.
+For the last few decades there have been two general solutions for managing distributed
+data at scale, consistent hashing and sharding. Aspen offers a third approach which is
+based on explicit data pointers. It requires a little more overhead in the data lookup
+process but offers an order of magnitude more flexibility for both distributed application
+design and run time operation.
+
+The goal of the Aspen project is to create a general-purpose platform for
+building higher-level distributed applications like object stores, distributed file 
+systems, distributed indices, databases, and other solutions, particularly those that are
+not well suited to current distributed system architectures. It is not designed to "do the
+same thing only better" or to replace any existing systems. Rather, the intent is to take a
+completely different approach to the distributed data management problem and provide
+developers with a new set of tools for approaching distributed system design.
 
 ## Why Aspen?
-Aspen handles distributed data management in a completely different manner and one that
-emphasizes flexibility for both application design and run time operation. It's also 
-intended to be a component shared across a wide variety of applications to both spread out
-the maintenance burden and allow enhancements made in support of one application to benefit
-a community of others.
+Aspen emphasizes flexibility for both application design and run time operation. It provides
+distributed system designers with a completely different set of capabilities that used to 
+build solutions that simply aren't possible with the consistent hashing or 
+sharding models. It's also designed to be a common component shared across a wide variety of 
+applications. This is to spread out the maintenance burden and allow enhancements made in 
+support of one application to benefit a community of others.
 
 ## How is it different?
-The key difference in Aspen. as compared to other distributed data architectures, is that
-it eschews the traditional consistent hashing and sharding models for achieving scalability
-and instead uses a model based on explicit object pointers for locating data in the system.
-This approach involves a little more overhead in the data lookup process but allows for
-much more flexible data configuration and placement options when designing applications. 
-It also enables a great degree of freedom at run time to move data stores between hosts
-and backing storage media to balance a number of operational factors such as availability, 
-reliability, latency, and cost, to name a few.
+As mentioned before, the key difference in Aspen, as compared to other distributed data 
+architectures, is that it uses a model based on explicit object pointers for locating data
+in the system rather than the conventional consistent hashing or sharding approaches. The
+cost is a little more overhead in the data lookup process and bookkeeping but the benefit
+is unparalleled flexibility in data configuration and placement options that may be
+leveraged during application design and run time benefits for on-the-fly tuning of 
+operational factors such as availability, reliability, latency, and cost, to name a few.
 
 At it's core, Aspen is an object store. At least insofar as all data managed by the system
 is stored as discreet "objects" which are relatively small, typically on the order of

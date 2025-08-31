@@ -5,10 +5,9 @@
 Aspen is a general-purpose distributed data platform for building higher-level distributed
 applications like object stores, distributed file systems, distributed indices, databases,
 and other types of systems, particularly those that are not well suited to current 
-distributed system architectures. It is not designed to be a "better" anything or to replace
-any existing systems. Rather, the intent is to compliment existing systems by providing 
-application designers with a unique and very different set of tradeoffs that will allow 
-them to explore new directions in distributed system design.
+distributed system architectures. It is not designed to "do the same thing only 
+better" or to replace any existing systems. Rather, the intent is to provide developers
+with a new and completely different toolset for approaching distributed system design.
 
 ## Why Aspen?
 Aspen takes a different approach to the distributed data management problem and emphasizes

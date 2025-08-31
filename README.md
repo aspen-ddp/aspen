@@ -18,11 +18,11 @@ developers with a new set of tools for approaching distributed system design.
 
 ## Why Aspen?
 Aspen emphasizes flexibility for both application design and run time operation. It provides
-distributed system designers with a completely different set of capabilities that used to 
-build solutions that simply aren't possible with the consistent hashing or 
-sharding models. It's also designed to be a common component shared across a wide variety of 
-applications. This is to spread out the maintenance burden and allow enhancements made in 
-support of one application to benefit a community of others.
+distributed system designers with a completely different set of capabilities for building
+solutions that simply aren't possible with the consistent hashing or sharding models. It's 
+also designed to be a common component shared across a wide variety of applications. This 
+is to spread out the maintenance burden and allow enhancements made in support of one 
+application to benefit a community of others.
 
 ## How is it different?
 As mentioned before, the key difference in Aspen, as compared to other distributed data 

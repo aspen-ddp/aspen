@@ -3,7 +3,7 @@
 
 ## What it is
 For the last few decades there have been two general solutions for managing distributed
-data at scale, consistent hashing and sharding. Aspen breaks this stagnant status quo by
+data at scale, consistent hashing and sharding. Aspen breaks the status quo by
 offering a third approach which is based on explicit data pointers. It requires a little 
 more overhead in the data lookup process but offers an order of magnitude more flexibility
 for both distributed application design and run time operation.

@@ -15,7 +15,7 @@ not well suited to current distributed system architectures. It is not designed 
 same thing only better" or to replace any existing systems. Rather, the intent is to take a
 completely different approach to the distributed data management problem and provide
 developers with a new set of tools for taking distributed system design in directions that
-were not previously feasible.
+were not previously possible.
 
 ## Why Aspen?
 Aspen emphasizes flexibility for both application design and run time operation. It provides

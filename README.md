@@ -34,7 +34,7 @@ leveraged during application design. It also provides run time benefits for on-t
 tuning of operational factors such as availability, reliability, latency, and cost, to 
 name a few.
 
-At it's core, Aspen is an object store. At least insofar as all data managed by the system
+At its core, Aspen is an object store. At least insofar as all data managed by the system
 is stored as discreet "objects" which are relatively small, typically on the order of
 kilobytes to tens of megabytes. The following list outlines some of the characteristics of
 the system. While most of these aspects are not unique to Aspen, the combination of them

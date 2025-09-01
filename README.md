@@ -30,7 +30,7 @@ architectures, is that it uses a model based on explicit object pointers for loc
 in the system rather than the conventional consistent hashing or sharding approaches. The
 cost is a little more overhead in the data lookup process and bookkeeping but the benefit
 is unparalleled flexibility in data configuration and placement options that may be
-leveraged during application design. It also provides, run time benefits for on-the-fly 
+leveraged during application design. It also provides run time benefits for on-the-fly 
 tuning of operational factors such as availability, reliability, latency, and cost, to 
 name a few.
 

@@ -75,7 +75,10 @@ of Aspen's unique features. It leverage's dcache's Java NFS server library to ex
 file system built on top of Aspen and currently supports most of the basic file system
 operations. It's very much alpha quality at the moment but it does a decent job of
 showcasing what Aspen is capable of and could eventually morph into something useful,
-should others find it interesting enough to chip in on it's development.
+should others find it interesting enough to chip in on its development.
+
+More information about the potential design and use cases for AmoebaFS may be found in
+its section of the [Project Homepage](https://aspen-ddp.org)
 
 ## How to run the AmoebaFS NFS server demo
 

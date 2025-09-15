@@ -11,7 +11,7 @@ class TempDirManager {
   tdir.mkdir()
 
 
-  def delete(): Unit = {
+  def delete(): Unit =
 
     def cleanup(f:File): Unit =
       if f.isFile then
@@ -21,5 +21,4 @@ class TempDirManager {
         f.delete()
 
     cleanup(tdir)
-  }
 }

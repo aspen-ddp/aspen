@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import scala.language.implicitConversions
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.amoebafs.{File, FileHandle}
 import org.apache.logging.log4j.scala.Logging

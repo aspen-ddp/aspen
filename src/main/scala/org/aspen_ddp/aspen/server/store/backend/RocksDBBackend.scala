@@ -10,6 +10,7 @@ import org.aspen_ddp.aspen.server.store.Locater
 import java.nio.file.Path
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
+import scala.language.implicitConversions
 
 object RocksDBBackend {
   val NullArray: Array[Byte] = new Array[Byte](0)

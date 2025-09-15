@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import scala.language.implicitConversions
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 

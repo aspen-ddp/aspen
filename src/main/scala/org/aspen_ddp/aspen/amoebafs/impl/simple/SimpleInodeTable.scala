@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.client.tkvl.{RootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, DataObjectPointer, Key, Value}

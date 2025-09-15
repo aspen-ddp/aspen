@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs
 
+import scala.language.implicitConversions
 import java.nio.{ByteBuffer, ByteOrder}
 import java.nio.charset.StandardCharsets
 

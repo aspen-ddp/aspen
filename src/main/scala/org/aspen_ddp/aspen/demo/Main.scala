@@ -109,23 +109,19 @@ object Main {
     var oclient: Option[AspenClient] = None
     var onode: Option[StoreManager] = None
 
-    def onClientResponseReceived(msg: ClientResponse): Unit ={
+    def onClientResponseReceived(msg: ClientResponse): Unit =
       //logger.trace(s"**** Recieved ClientResponse: $msg. $oclient")
       oclient.foreach(_.receiveClientResponse(msg))
-    }
-    def onClientRequestReceived(msg: ClientRequest): Unit = {
+    def onClientRequestReceived(msg: ClientRequest): Unit =
       onode.foreach(_.receiveClientRequest(msg))
-    }
-    def onTransactionMessageReceived(msg: TxMessage): Unit = {
+    def onTransactionMessageReceived(msg: TxMessage): Unit =
       onode.foreach(_.receiveTransactionMessage(msg))
-    }
   }
 
-  def setLog4jConfigFile(f: File): Unit = {
+  def setLog4jConfigFile(f: File): Unit =
     // Set all loggers to Asynchronous Logging
     System.setProperty("log4j2.contextSelector", "org.apache.logging.log4j.core.async.AsyncLoggerContextSelector")
     System.setProperty("log4j2.configurationFile", s"file:${f.getAbsolutePath}")
-  }
 
   def main(args: Array[String]): Unit = {
     val parser = new scopt.OptionParser[Args]("demo") {
@@ -272,15 +268,15 @@ object Main {
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
 
-    parser.parse(args, Args()) match {
+    parser.parse(args, Args()) match
       case Some(cfg) =>
         //
-        try {
+        try
           println(s"Loading BootstrapConfig ${cfg.bootstrapConfigFile}")
           val bootstrapConfig = BootstrapConfig.loadBootstrapConfig(cfg.bootstrapConfigFile)
           println(s"Successful config: $cfg")
           //println(s"Config file: $config")
-          cfg.mode match {
+          cfg.mode match
             case "bootstrap" => bootstrap(bootstrapConfig, Paths.get("demo/bootstrap"))
             case "node" => node(bootstrapConfig, StorageNodeConfig.loadStorageNode(cfg.nodeConfigFile))
             case "amoeba" => amoeba_server(cfg.log4jConfigFile, bootstrapConfig)
@@ -288,13 +284,10 @@ object Main {
             case "rebuild" => rebuild(cfg.log4jConfigFile, cfg.storeName, bootstrapConfig)
             case "new-pool" => new_pool(cfg.log4jConfigFile, bootstrapConfig, cfg.newPoolName, cfg.idaType, cfg.width, cfg.readThreshold, cfg.writeThreshold, cfg.hosts)
             case "transfer-store" => transfer_store(cfg.log4jConfigFile, bootstrapConfig, cfg.storeName, cfg.host)
-          }
-        } catch {
+        catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")
-        }
       case None =>
-    }
   }
 
   def createNetwork(cfg:BootstrapConfig.Config,

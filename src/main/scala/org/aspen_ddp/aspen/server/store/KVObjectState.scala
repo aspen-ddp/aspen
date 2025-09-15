@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.Varint
+import scala.language.implicitConversions
 
 class KVObjectState(
   var min: Option[Key] = None,

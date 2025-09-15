@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import scala.language.implicitConversions
 
 object RequirementsApplyer {
 

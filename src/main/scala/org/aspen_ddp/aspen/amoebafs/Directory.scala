@@ -17,15 +17,13 @@ trait Directory extends BaseFile with Logging {
 
   //def inode: DirectoryInode
 
-  def getInode(): Future[(DirectoryInode, ObjectRevision)] = {
+  def getInode(): Future[(DirectoryInode, ObjectRevision)] =
     fs.readInode(pointer).map(t => (t._1.asInstanceOf[DirectoryInode], t._3))
-  }
 
-  def lookup(name: String): Future[Option[InodePointer]] = name match {
+  def lookup(name: String): Future[Option[InodePointer]] = name match
     case "." => Future.successful(Some(pointer))
     case ".." => getInode().map( _._1.oparent )
     case _ => getEntry(name)
-  }
 
   def isEmpty(): Future[Boolean]
 
@@ -47,9 +45,9 @@ trait Directory extends BaseFile with Logging {
 
   private def retryUntilSuccessfulOr[T](prepare: Transaction => Future[T])
                                        (checkForErrors: => Future[Unit]): Future[T] = {
-    def onFail(err: Throwable): Future[Unit] = {
+    def onFail(err: Throwable): Future[Unit] =
 
-      err match {
+      err match
         case e: InvalidInode => throw StopRetrying(e)
         case e: FatalReadError => throw StopRetrying(e)
         case e: DirectoryNotEmpty => throw StopRetrying(e)
@@ -59,8 +57,6 @@ trait Directory extends BaseFile with Logging {
             case e: InvalidInode => throw StopRetrying(e)
             case other => throw other
           }.flatMap(_ => checkForErrors)
-      }
-    }
     fs.client.transactUntilSuccessfulWithRecovery(onFail) { tx =>
       prepare(tx)
     }

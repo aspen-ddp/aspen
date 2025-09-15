@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.common.ida
 import java.nio.ByteBuffer
 
 import org.aspen_ddp.aspen.common.DataBuffer
+import scala.language.implicitConversions
 
 object IDA {
   val ReplicationCode: Byte = 0

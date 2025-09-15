@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs.nfs
 
+import scala.language.implicitConversions
 import java.io.IOException
 import java.nio.ByteBuffer
 import com.github.blemale.scaffeine.{LoadingCache, Scaffeine}

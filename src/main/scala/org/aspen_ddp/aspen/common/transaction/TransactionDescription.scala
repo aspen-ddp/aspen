@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.common.network.{ClientId, Codec}
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.Locater
+import scala.language.implicitConversions
 
 object TransactionDescription {
   def deserialize(db: DataBuffer): TransactionDescription = {

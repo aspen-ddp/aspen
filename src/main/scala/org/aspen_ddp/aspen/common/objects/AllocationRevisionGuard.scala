@@ -5,6 +5,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.transaction.TransactionId
+import scala.language.implicitConversions
 
 object AllocationRevisionGuard {
   def deserialize(db: DataBuffer): AllocationRevisionGuard = {

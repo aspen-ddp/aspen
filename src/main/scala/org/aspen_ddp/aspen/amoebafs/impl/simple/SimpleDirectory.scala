@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.{StopRetrying, Transaction}
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList

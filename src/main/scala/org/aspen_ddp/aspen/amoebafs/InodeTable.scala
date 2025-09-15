@@ -24,7 +24,7 @@ trait InodeTable {
   def lookup(inodeNumber: Long): Future[Option[InodePointer]]
 
   def lookupRoot(): Future[DirectoryPointer] = {
-    implicit val ec: ExecutionContext = fs.executionContext
+    given ExecutionContext = fs.executionContext
 
     lookup(InodeTable.RootInode).map(_.get.asInstanceOf[DirectoryPointer])
   }

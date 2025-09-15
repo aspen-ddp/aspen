@@ -15,7 +15,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 
 class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory) extends Logging {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   private[this] var outstandingReads = Map[UUID, ReadDriver]()
   private[this] var completionTimes = Map[UUID, (Long, ReadDriver)]()

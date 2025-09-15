@@ -7,8 +7,16 @@ import scala.concurrent.{ExecutionContext, Future}
 
 package object util {
   import scala.language.implicitConversions
+  import scala.Conversion
 
-  implicit def uuid2byte(uuid: UUID): Array[Byte] = {
+  given Conversion[UUID, Array[Byte]] = uuid => {
+    val bb = ByteBuffer.allocate(16)
+    bb.putLong(0, uuid.getMostSignificantBits)
+    bb.putLong(8, uuid.getLeastSignificantBits)
+    bb.array()
+  }
+
+  def uuid2byte(uuid: UUID): Array[Byte] = {
     val bb = ByteBuffer.allocate(16)
     bb.putLong(0, uuid.getMostSignificantBits)
     bb.putLong(8, uuid.getLeastSignificantBits)
@@ -57,7 +65,7 @@ package object util {
     directoryToBeDeleted.delete
   }
   
-  def someOrThrow[U, T <: Throwable](o: Future[Option[U]], exceptionToThrow: => T)(implicit ec: ExecutionContext): Future[U] = o.map:
+  def someOrThrow[U, T <: Throwable](o: Future[Option[U]], exceptionToThrow: => T)(using ec: ExecutionContext): Future[U] = o.map:
     case None => throw exceptionToThrow
     case Some(u) => u
 }

@@ -15,7 +15,7 @@ class SimpleInodeTable(
                       val root: RootManager
                       ) extends InodeTable {
 
-  implicit val ec: ExecutionContext = fs.executionContext
+  given ExecutionContext = fs.executionContext
 
   protected val rnd = new java.util.Random
 

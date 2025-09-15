@@ -79,7 +79,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
       dir = new SimpleDirectory(rootPointer.asInstanceOf[DirectoryPointer],
         rootRevision, rootInode.asInstanceOf[DirectoryInode], fs)
       tx = client.newTransaction()
-      f <- CreateFileTask.prepareTask(fs, dir.pointer, "foo", initInode)(tx)
+      f <- CreateFileTask.prepareTask(fs, dir.pointer, "foo", initInode)(using tx)
       _ <- tx.commit()
       _ <- f
       ofile <- dir.getEntry("foo")
@@ -99,7 +99,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
         rootRevision, rootInode.asInstanceOf[DirectoryInode], fs)
 
       tx = client.newTransaction()
-      f <- CreateFileTask.prepareTask(fs, dir.pointer, "foo", initInode)(tx)
+      f <- CreateFileTask.prepareTask(fs, dir.pointer, "foo", initInode)(using tx)
       _ <- tx.commit()
       _ <- f
 

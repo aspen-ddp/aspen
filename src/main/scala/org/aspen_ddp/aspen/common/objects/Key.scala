@@ -4,6 +4,8 @@ import java.math.BigInteger
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
+import scala.language.implicitConversions
+import scala.Conversion
 
 final case class Key(bytes: Array[Byte]) {
 
@@ -36,11 +38,11 @@ final case class Key(bytes: Array[Byte]) {
 object Key {
   val AbsoluteMinimum = Key(new Array[Byte](0))
 
-  import scala.language.implicitConversions
-
-  implicit def apply(str: String): Key = Key(str.getBytes(StandardCharsets.UTF_8))
-
-  implicit def apply(uuid: UUID): Key = {
+  def apply(number: Long): Key = Key(BigInteger.valueOf(number).toByteArray)
+  
+  def apply(str: String): Key = Key(str.getBytes(StandardCharsets.UTF_8))
+  
+  def apply(uuid: UUID): Key = {
     val arr = new Array[Byte](16)
     val bb = ByteBuffer.wrap(arr)
     bb.putLong(uuid.getMostSignificantBits)
@@ -48,5 +50,15 @@ object Key {
     Key(arr)
   }
 
-  implicit def apply(number: Long): Key = Key(BigInteger.valueOf(number).toByteArray())
+  given Conversion[String, Key] = str => Key(str.getBytes(StandardCharsets.UTF_8))
+
+  given Conversion[UUID, Key] = uuid => {
+    val arr = new Array[Byte](16)
+    val bb = ByteBuffer.wrap(arr)
+    bb.putLong(uuid.getMostSignificantBits)
+    bb.putLong(uuid.getLeastSignificantBits)
+    Key(arr)
+  }
+
+  given Conversion[Long, Key] = number => Key(BigInteger.valueOf(number).toByteArray())
 }

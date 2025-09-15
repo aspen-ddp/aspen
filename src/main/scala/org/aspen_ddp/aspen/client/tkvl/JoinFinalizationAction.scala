@@ -15,7 +15,7 @@ class JoinFinalizationAction(val client: AspenClient,
                              val deleteMinimum: Key,
                              val deleteNode: KeyValueObjectPointer) extends FinalizationAction {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   private val completionPromise: Promise[Unit] = Promise()
 

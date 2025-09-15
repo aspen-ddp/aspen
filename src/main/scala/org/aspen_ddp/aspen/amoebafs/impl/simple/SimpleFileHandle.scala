@@ -35,7 +35,7 @@ class SimpleFileHandle(
 
   import SimpleFileHandle._
 
-  implicit val ec: ExecutionContext = file.fs.executionContext
+  given ExecutionContext = file.fs.executionContext
 
   private[this] var writeQueue: Queue[PendingWrite] = Queue()
   private[this] var ocurrentWrite: Option[PendingWrite] = None

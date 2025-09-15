@@ -29,7 +29,7 @@ class SimpleClientTransactionDriver(
                                      updateData: Map[StoreId, TransactionData])
     extends ClientTransactionDriver(client, txd, updateData) with Logging {
 
-  implicit private val ec: ExecutionContext = client.clientContext
+  private given ExecutionContext = client.clientContext
 
   private var retries = 0
   private var complete = false

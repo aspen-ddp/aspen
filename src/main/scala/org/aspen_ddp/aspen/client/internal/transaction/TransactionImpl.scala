@@ -128,7 +128,7 @@ class TransactionImpl(val client: AspenClient,
     */
   def commit(): Future[HLCTimestamp] = synchronized {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     if (!promise.isCompleted) {
 

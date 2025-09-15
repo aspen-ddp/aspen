@@ -19,7 +19,7 @@ object SimpleTaskExecutor {
             taskStateAllocator: ObjectAllocator,
             executorObject: KeyValueObjectPointer): Future[SimpleTaskExecutor] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     client.read(executorObject).map( kvos => new SimpleTaskExecutor(client, registeredTasks, taskStateAllocator, kvos))
   }
@@ -31,7 +31,7 @@ object SimpleTaskExecutor {
                         revisionGuard: AllocationRevisionGuard)
                        (implicit t: Transaction): Future[(KeyValueObjectPointer, SimpleTaskExecutor)] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     for {
       executor <- executorAllocator.allocateKeyValueObject(revisionGuard, Map())
@@ -49,7 +49,7 @@ class SimpleTaskExecutor(val client: AspenClient,
 
   import SimpleTaskExecutor._
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   private val executorObject: KeyValueObjectPointer = kvos.pointer
   private var executorRevision: ObjectRevision = kvos.revision

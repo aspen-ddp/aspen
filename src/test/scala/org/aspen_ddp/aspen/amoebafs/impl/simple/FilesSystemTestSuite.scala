@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
 
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.*
+import scala.language.implicitConversions
 
 class FilesSystemTestSuite  extends IntegrationTestSuite {
   var fs: FileSystem = _

@@ -2,13 +2,14 @@ package org.aspen_ddp.aspen.amoebafs.nfs
 
 import java.io.IOException
 import java.nio.ByteBuffer
-
 import com.github.blemale.scaffeine.{LoadingCache, Scaffeine}
 import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, InvalidInode}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, BlockDevice, CharacterDevice, Directory, DirectoryInode, File, FileHandle, FileMode, FileSystem, FileType, InodePointer, Symlink, Timespec}
+
 import javax.security.auth.Subject
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS.given_Conversion_Long_Inode
 import org.dcache.nfs.util.UnixSubjects
 import org.dcache.nfs.status.{ExistException, InvalException, NoEntException, NotDirException, NotSuppException, ServerFaultException}
 import org.dcache.nfs.v4.{NfsIdMapping, SimpleIdMap}
@@ -18,18 +19,23 @@ import org.dcache.nfs.vfs.{AclCheckable, DirectoryEntry, DirectoryStream, FsStat
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 
+
 // mount -v -t nfs4 -o "vers=4.1" 192.168.56.1:/ /mnt
 
 object AmoebaNFS {
   import scala.language.implicitConversions
+  import scala.Conversion
 
-  implicit def inode2long(inode: Inode): Long = ByteBuffer.wrap(inode.getFileId).getLong
-
-  implicit def long2inode(fd: Long): Inode = {
+  def inode2long(inode: Inode): Long = ByteBuffer.wrap(inode.getFileId).getLong
+  
+  def long2inode(fd: Long): Inode = {
     val arr = new Array[Byte](8)
     ByteBuffer.wrap(arr).putLong(fd)
     Inode.forFile(arr)
   }
+
+  given Conversion[Inode, Long] = inode => inode2long(inode)
+  given Conversion[Long, Inode] = fd => long2inode(fd)
 
   def nfsFileType(pointer: InodePointer): Int = FileType.toMode(pointer.ftype)
 
@@ -61,7 +67,7 @@ object AmoebaNFS {
     stats
   }
 
-  def blockingCall[T](fn: => Future[T])(implicit ec: ExecutionContext): T = try {
+  def blockingCall[T](fn: => Future[T])(using ExecutionContext): T = try {
     Await.result(fn, Duration.Inf)
   } catch {
     case e: DirectoryEntryExists => throw new ExistException(e.toString)
@@ -74,12 +80,15 @@ object AmoebaNFS {
 }
 
 class AmoebaNFS(val fs: FileSystem,
-                implicit val ec: ExecutionContext,
+                ec: ExecutionContext,
                 inodeCacheMax: Int = 1000,
                 fileHandleCacheMax: Int = 250,
                 writeBufferSize: Int = 4*1024*1024) extends VirtualFileSystem with Logging {
 
   import AmoebaNFS._
+  import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS.given_Conversion_Inode_Long
+
+  given ExecutionContext = ec
 
   private val NoAcl = new Array[nfsace4](0)
   private val IdMapper = new SimpleIdMap

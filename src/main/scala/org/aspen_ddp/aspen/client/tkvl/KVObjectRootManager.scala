@@ -16,7 +16,7 @@ class KVObjectRootManager(val client: AspenClient,
 
   import KVObjectRootManager._
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   def typeId: RootManagerTypeId = RootManagerTypeId(typeUUID)
 
@@ -149,7 +149,7 @@ object KVObjectRootManager extends RegisteredTypeFactory with RootManagerFactory
                     nodeAllocator: NodeAllocator,
                     initialContent: Map[Key,Value])(implicit tx: Transaction): Future[Future[KVObjectRootManager]] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     val kreqs = KeyValueUpdate.DoesNotExist(key) :: Nil
 

@@ -14,7 +14,7 @@ trait ObjectAllocator {
 
   def allocateDataObject(revisionGuard: AllocationRevisionGuard,
                          initialContent: DataBuffer,
-                         initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(implicit t: Transaction): Future[DataObjectPointer]
+                         initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[DataObjectPointer]
 
   def allocateKeyValueObject(revisionGuard: AllocationRevisionGuard,
                              initialContent: Map[Key,Value],
@@ -22,6 +22,6 @@ trait ObjectAllocator {
                              maximum: Option[Key] = None,
                              left: Option[Value] = None,
                              right: Option[Value] = None,
-                             initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(implicit t: Transaction): Future[KeyValueObjectPointer]
+                             initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[KeyValueObjectPointer]
 
 }

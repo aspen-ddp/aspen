@@ -17,14 +17,14 @@ trait FileSystem extends Logging {
   private[this] var openFiles: Map[Long, File] = Map()
 
   def readInode(inodeNumber: Long): Future[(Inode, InodePointer, ObjectRevision)] = {
-    implicit val ec: ExecutionContext = executionContext
+    given ExecutionContext = executionContext
     inodeTable.lookup(inodeNumber).flatMap {
       case None => Future.failed(InvalidInode(inodeNumber))
       case Some(iptr) => readInode(iptr)
     }
   }
   def readInode(iptr: InodePointer): Future[(Inode, InodePointer, ObjectRevision)] = {
-    implicit val ec: ExecutionContext = executionContext
+    given ExecutionContext = executionContext
     //client.read(iptr.pointer).map { dos =>
     //  (Inode(client, dos.data), dos.revision)
     //}
@@ -57,7 +57,7 @@ trait FileSystem extends Logging {
   }
 
   def lookup(inodeNumber: Long): Future[Option[BaseFile]] = {
-    implicit val ec: ExecutionContext = executionContext
+    given ExecutionContext = executionContext
     val p = Promise[Option[BaseFile]]()
     inodeTable.lookup(inodeNumber) onComplete {
       case Success(oiptr) =>

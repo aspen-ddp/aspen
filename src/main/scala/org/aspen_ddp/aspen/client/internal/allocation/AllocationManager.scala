@@ -14,7 +14,7 @@ import scala.concurrent.{ExecutionContext, Future}
 class AllocationManager(val client: AspenClient,
                         val driverFactory: AllocationDriver.Factory) {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   // Maps newObjectUUID -> driver
   private[this] var outstandingAllocations = Map[ObjectId, AllocationDriver]()

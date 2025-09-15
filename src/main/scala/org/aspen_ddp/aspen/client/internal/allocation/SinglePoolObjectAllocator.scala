@@ -15,7 +15,7 @@ class SinglePoolObjectAllocator(val client: AspenClient,
 
   override def allocateDataObject(revisionGuard: AllocationRevisionGuard,
                                   initialContent: DataBuffer,
-                                  initialRefcount: ObjectRefcount)(implicit t: Transaction): Future[DataObjectPointer] = {
+                                  initialRefcount: ObjectRefcount)(using t: Transaction): Future[DataObjectPointer] = {
     client.allocationManager.allocateDataObject(client, t, pool, maxObjectSize, objectIDA, initialRefcount,
       revisionGuard, initialContent)
   }
@@ -26,7 +26,7 @@ class SinglePoolObjectAllocator(val client: AspenClient,
                                       maximum: Option[Key],
                                       left: Option[Value],
                                       right: Option[Value],
-                                      initialRefcount: ObjectRefcount)(implicit t: Transaction): Future[KeyValueObjectPointer] = {
+                                      initialRefcount: ObjectRefcount)(using t: Transaction): Future[KeyValueObjectPointer] = {
     client.allocationManager.allocateKeyValueObject(client, t, pool, maxObjectSize, objectIDA, initialRefcount,
       revisionGuard, initialContent, minimum, maximum, left, right)
   }

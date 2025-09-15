@@ -11,7 +11,7 @@ import scala.concurrent.{ExecutionContext, Future}
 class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
                              private val node: KeyValueListNode) {
 
-  implicit val ec: ExecutionContext = tkvl.client.clientContext
+  given ExecutionContext = tkvl.client.clientContext
 
   def nodeUUID: UUID = node.pointer.id.uuid
 

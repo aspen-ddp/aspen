@@ -56,7 +56,7 @@ object BootstrapPoolNodeAllocator extends NodeAllocator {
 
 class SinglePoolNodeAllocator(val client:AspenClient, val poolId: PoolId) extends NodeAllocator {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   private var allocator: Option[SinglePoolObjectAllocator] = None
 

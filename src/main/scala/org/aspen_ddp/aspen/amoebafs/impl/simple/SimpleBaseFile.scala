@@ -107,7 +107,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
 
   import SimpleBaseFile._
 
-  implicit val ec: ExecutionContext = fs.executionContext
+  given ExecutionContext = fs.executionContext
 
   private[this] val pendingOps = new java.util.concurrent.ConcurrentLinkedQueue[FileOperation]()
   private[this] var activeOp: Option[FileOperation] = None

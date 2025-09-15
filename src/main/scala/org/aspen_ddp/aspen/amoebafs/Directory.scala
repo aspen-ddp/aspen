@@ -13,7 +13,7 @@ trait Directory extends BaseFile with Logging {
   val pointer: DirectoryPointer
   val fs: FileSystem
 
-  private implicit val ec: ExecutionContext = fs.executionContext
+  private given ExecutionContext = fs.executionContext
 
   //def inode: DirectoryInode
 
@@ -33,17 +33,17 @@ trait Directory extends BaseFile with Logging {
 
   def getEntry(name: String): Future[Option[InodePointer]]
 
-  def prepareInsert(name: String, pointer: InodePointer, incref: Boolean=true)(implicit tx: Transaction): Future[Unit]
+  def prepareInsert(name: String, pointer: InodePointer, incref: Boolean=true)(using tx: Transaction): Future[Unit]
 
-  def prepareDelete(name: String, decref: Boolean=true)(implicit tx: Transaction): Future[Unit]
+  def prepareDelete(name: String, decref: Boolean=true)(using tx: Transaction): Future[Unit]
 
-  def prepareRename(oldName: String, newName: String)(implicit tx: Transaction): Future[Unit]
+  def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit]
 
-  def prepareHardLink(name: String, file: BaseFile)(implicit tx: Transaction): Future[Unit]
+  def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit]
 
   /** Ensures the directory is empty and that all resources are cleaned up if the transaction successfully commits
     */
-  def prepareForDirectoryDeletion()(implicit tx: Transaction): Future[Unit]
+  def prepareForDirectoryDeletion()(using tx: Transaction): Future[Unit]
 
   private def retryUntilSuccessfulOr[T](prepare: Transaction => Future[T])
                                        (checkForErrors: => Future[Unit]): Future[T] = {
@@ -96,7 +96,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def insert(name: String, fpointer: InodePointer, incref: Boolean=true): Future[Unit] = {
-    retryUntilSuccessfulOr { implicit tx =>
+    retryUntilSuccessfulOr { tx =>
+      given Transaction = tx
       prepareInsert(name, fpointer, incref)
     }{
       getEntry(name).map {
@@ -108,7 +109,8 @@ trait Directory extends BaseFile with Logging {
 
 
   def delete(name: String, decref: Boolean=true): Future[Unit] = {
-    retryUntilSuccessfulOr { implicit tx =>
+    retryUntilSuccessfulOr { tx =>
+      given Transaction = tx
       prepareDelete(name, decref)
     }{
       getEntry(name).map {
@@ -119,7 +121,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def rename(oldName: String, newName: String): Future[Unit] = {
-    retryUntilSuccessfulOr { implicit tx =>
+    retryUntilSuccessfulOr { tx =>
+      given Transaction = tx
       prepareRename(oldName, newName)
     }{
       Future.sequence(getEntry(oldName) :: getEntry(newName) :: Nil).map { lst =>
@@ -133,7 +136,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def hardLink(name: String, f: BaseFile): Future[Unit] = {
-    retryUntilSuccessfulOr { implicit tx =>
+    retryUntilSuccessfulOr { tx =>
+      given Transaction = tx
       prepareHardLink(name, f)
     }{
       getEntry(name).map {
@@ -144,7 +148,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def createDirectory(name: String, mode: Int, uid: Int, gid: Int): Future[DirectoryPointer] = {
-    retryCreationOr { implicit tx =>
+    retryCreationOr { tx =>
+      given Transaction = tx
       prepareCreateDirectory(name, mode, uid, gid)
     }{
       getEntry(name).map {
@@ -155,7 +160,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def createFile(name: String, mode: Int, uid: Int, gid: Int): Future[FilePointer] = {
-    retryCreationOr { implicit tx =>
+    retryCreationOr { tx =>
+      given Transaction = tx
       prepareCreateFile(name, mode, uid, gid)
     }{
       getEntry(name).map {
@@ -166,7 +172,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def createSymlink(name: String, mode: Int, uid: Int, gid: Int, link: String): Future[SymlinkPointer] = {
-    retryCreationOr { implicit tx =>
+    retryCreationOr { tx =>
+      given Transaction = tx
       prepareCreateSymlink(name, mode, uid, gid, link)
     }{
       getEntry(name).map {
@@ -177,7 +184,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def createUnixSocket(name: String, mode: Int, uid: Int, gid: Int): Future[UnixSocketPointer] = {
-    retryCreationOr { implicit tx =>
+    retryCreationOr { tx =>
+      given Transaction = tx
       prepareCreateUnixSocket(name, mode, uid, gid)
     }{
       getEntry(name).map {
@@ -188,7 +196,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def createFIFO(name: String, mode: Int, uid: Int, gid: Int): Future[FIFOPointer] = {
-    retryCreationOr { implicit tx =>
+    retryCreationOr { tx =>
+      given Transaction = tx
       prepareCreateFIFO(name, mode, uid, gid)
     }{
       getEntry(name).map {
@@ -199,7 +208,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def createCharacterDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int): Future[CharacterDevicePointer] = {
-    retryCreationOr { implicit tx =>
+    retryCreationOr { tx =>
+      given Transaction = tx
       prepareCreateCharacterDevice(name, mode, uid, gid, rdev)
     }{
       getEntry(name).map {
@@ -210,7 +220,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def createBlockDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int): Future[BlockDevicePointer] = {
-    retryCreationOr { implicit tx =>
+    retryCreationOr { tx =>
+      given Transaction = tx
       prepareCreateBlockDevice(name, mode, uid, gid, rdev)
     }{
       getEntry(name).map {
@@ -220,7 +231,7 @@ trait Directory extends BaseFile with Logging {
     }
   }
 
-  def prepareSetParentDirectory(parent: Directory)(implicit tx: Transaction, ec: ExecutionContext): Unit = {
+  def prepareSetParentDirectory(parent: Directory)(using tx: Transaction, ec: ExecutionContext): Unit = {
     val updatedInode = inode.asInstanceOf[DirectoryInode].setParentDirectory(Some(parent.pointer))
 
     tx.overwrite(pointer.pointer, revision, updatedInode.toDataBuffer)
@@ -230,7 +241,7 @@ trait Directory extends BaseFile with Logging {
     }
   }
 
-  def prepareCreateDirectory(name: String, mode: Int, uid: Int, gid: Int)(implicit tx: Transaction): Future[Future[DirectoryPointer]] = {
+  def prepareCreateDirectory(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[DirectoryPointer]] = {
     val root = Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, pointer.pointer.poolId))
     val newInode = DirectoryInode.init(mode, uid, gid, Some(pointer), None, root)
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
@@ -244,7 +255,7 @@ trait Directory extends BaseFile with Logging {
     raw.map(_ => fdp)
   }
 
-  def prepareCreateFile(name: String, mode: Int, uid: Int, gid: Int)(implicit tx: Transaction): Future[Future[FilePointer]] = {
+  def prepareCreateFile(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[FilePointer]] = {
     val newInode = FileInode.init(mode, uid, gid)
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
@@ -257,7 +268,7 @@ trait Directory extends BaseFile with Logging {
     raw.map(_ => fdp)
   }
 
-  def prepareCreateSymlink(name: String, mode: Int, uid: Int, gid: Int, link: String)(implicit tx: Transaction): Future[Future[SymlinkPointer]] = {
+  def prepareCreateSymlink(name: String, mode: Int, uid: Int, gid: Int, link: String)(using tx: Transaction): Future[Future[SymlinkPointer]] = {
     val newInode = SymlinkInode.init(mode, uid, gid, link)
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
@@ -271,7 +282,7 @@ trait Directory extends BaseFile with Logging {
     raw.map(_ => fdp)
   }
 
-  def prepareCreateUnixSocket(name: String, mode: Int, uid: Int, gid: Int)(implicit tx: Transaction): Future[Future[UnixSocketPointer]] = {
+  def prepareCreateUnixSocket(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[UnixSocketPointer]] = {
     val newInode = UnixSocketInode.init(mode, uid, gid)
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
@@ -285,7 +296,7 @@ trait Directory extends BaseFile with Logging {
     raw.map(_ => fdp)
   }
 
-  def prepareCreateFIFO(name: String, mode: Int, uid: Int, gid: Int)(implicit tx: Transaction): Future[Future[FIFOPointer]] = {
+  def prepareCreateFIFO(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[FIFOPointer]] = {
     val newInode = FIFOInode.init(mode, uid, gid)
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
@@ -299,7 +310,7 @@ trait Directory extends BaseFile with Logging {
     raw.map(_ => fdp)
   }
 
-  def prepareCreateCharacterDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int)(implicit tx: Transaction): Future[Future[CharacterDevicePointer]] = {
+  def prepareCreateCharacterDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int)(using tx: Transaction): Future[Future[CharacterDevicePointer]] = {
     val newInode = CharacterDeviceInode.init(mode, uid, gid, rdev)
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
@@ -313,7 +324,7 @@ trait Directory extends BaseFile with Logging {
     raw.map(_ => fdp)
   }
 
-  def prepareCreateBlockDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int)(implicit tx: Transaction): Future[Future[BlockDevicePointer]] = {
+  def prepareCreateBlockDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int)(using tx: Transaction): Future[Future[BlockDevicePointer]] = {
     val newInode = BlockDeviceInode.init(mode, uid, gid, rdev)
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}

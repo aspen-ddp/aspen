@@ -12,7 +12,7 @@ class DeletionFinalizationAction(val client: AspenClient,
                                  val txd: TransactionDescription,
                                  val deletedObject: ObjectPointer) extends FinalizationAction {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   private val completionPromise: Promise[Unit] = Promise()
   

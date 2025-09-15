@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.amoebafs.FileInode
 
 import scala.concurrent.Future
+import scala.language.implicitConversions
 
 class IndexedFileContentSuite extends FilesSystemTestSuite {
   def boot(osegmentSize: Option[Int]=None, otierNodeSize: Option[Int]=None): Future[SimpleFile] = for {
@@ -13,7 +14,7 @@ class IndexedFileContentSuite extends FilesSystemTestSuite {
 
     tx = fs.client.newTransaction()
 
-    fdir <- rootDir.prepareCreateFile("foo", mode=0, uid=1, gid=2)(tx)
+    fdir <- rootDir.prepareCreateFile("foo", mode=0, uid=1, gid=2)(using tx)
 
     _ <- tx.commit()
 

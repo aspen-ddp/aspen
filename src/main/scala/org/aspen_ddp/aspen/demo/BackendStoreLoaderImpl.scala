@@ -12,7 +12,7 @@ import scala.concurrent.ExecutionContext
 
 class BackendStoreLoaderImpl extends BackendStoreLoader with Logging:
 
-  override def loadStoreFromPath(storePath: Path)(implicit ec: ExecutionContext): Option[Backend] =
+  override def loadStoreFromPath(storePath: Path)(using ec: ExecutionContext): Option[Backend] =
 
     val cfgFile = storePath.resolve("store_config.yaml")
 

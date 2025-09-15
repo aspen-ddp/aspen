@@ -12,7 +12,7 @@ import scala.util.{Failure, Success}
 class TieredKeyValueList(val client: AspenClient,
                          val rootManager: RootManager) extends Logging {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   import TieredKeyValueList._
 
@@ -214,7 +214,7 @@ object TieredKeyValueList {
                                         currentNode: KeyValueListNode,
                                         initialBlacklist: Set[ObjectId]): Future[Either[Set[ObjectId], KeyValueListNode]] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     if (currentTier == targetTier) {
       // Once we're on the right tier, we can rely on consistent right pointers to scan to the
@@ -261,7 +261,7 @@ object TieredKeyValueList {
                         pointer: KeyValueObjectPointer,
                         blacklist: Set[ObjectId]): Future[Either[Set[ObjectId], KeyValueListNode]] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     if (blacklist.contains(pointer.id)) {
       Future.successful(Left(blacklist))

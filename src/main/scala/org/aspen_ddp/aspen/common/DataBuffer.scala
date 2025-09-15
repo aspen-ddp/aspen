@@ -5,6 +5,7 @@ import java.nio.ByteBuffer
 import java.util.zip.CRC32
 
 import scala.language.implicitConversions
+import scala.Conversion
 
 /** This class serves as a Read-Only, compile-time wrapper around ByteBuffer.
   *
@@ -80,11 +81,14 @@ final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal {
 object DataBuffer {
   val Empty = DataBuffer(new Array[Byte](0))
 
-  implicit def apply(buf: ByteBuffer): DataBuffer = new DataBuffer(buf.asReadOnlyBuffer())
-  implicit def apply(arr: Array[Byte]): DataBuffer = new DataBuffer(ByteBuffer.wrap(arr))
-  implicit def db2bb(db: DataBuffer): ByteBuffer = db.asReadOnlyBuffer()
+  given Conversion[ByteBuffer, DataBuffer] = buf => new DataBuffer(buf.asReadOnlyBuffer())
+  given Conversion[Array[Byte], DataBuffer] = arr => new DataBuffer(ByteBuffer.wrap(arr))
+  given Conversion[DataBuffer, ByteBuffer] = db => db.asReadOnlyBuffer()
 
   def apply(): DataBuffer = Empty
+  def apply(bb: ByteBuffer): DataBuffer = new DataBuffer(bb.asReadOnlyBuffer())
+  def apply(arr: Array[Byte]): DataBuffer = DataBuffer(ByteBuffer.wrap(arr))
+  
 
   def zeroed(nbytes: Int): DataBuffer = if (nbytes == 0) Empty else DataBuffer(ByteBuffer.allocate(nbytes))
 

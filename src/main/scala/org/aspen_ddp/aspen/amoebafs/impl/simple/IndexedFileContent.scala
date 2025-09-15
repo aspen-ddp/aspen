@@ -14,6 +14,7 @@ import org.apache.logging.log4j.scala.{Logger, Logging}
 
 import scala.annotation.tailrec
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.language.implicitConversions
 
 class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otierNodeSize: Option[Int]=None) extends Logging {
   import IndexedFileContent._
@@ -678,7 +679,7 @@ object IndexedFileContent {
 
     import DeleteIndexTask._
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     private val promise = Promise[Option[AnyRef]]()
 

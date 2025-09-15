@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.amoebafs.{FileSystem, Inode, InodePointer}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
+import scala.language.implicitConversions
 
 object UnlinkFileTask extends DurableTaskType {
   val typeUUID: UUID = UUID.fromString("B02539DC-3AE1-4E50-B52B-A5EFA6B5B330")
@@ -46,7 +47,7 @@ class UnlinkFileTask(val taskPointer: DurableTaskPointer,
 
   import UnlinkFileTask._
 
-  implicit val ec: ExecutionContext = fs.executionContext
+  given ExecutionContext = fs.executionContext
 
   private val promise = Promise[Option[AnyRef]]()
 

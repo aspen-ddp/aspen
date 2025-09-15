@@ -14,7 +14,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 class MissedUpdateFinalizationAction(val client: AspenClient,
                                      val txd: TransactionDescription) extends FinalizationAction {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   private var commitErrors: Map[StoreId, List[ObjectId]] = Map()
 

@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.amoebafs.{DirectoryInode, DirectoryPointer, File, FileFactory, FileHandle, FileMode, FileSystem}
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.language.implicitConversions
 
 object SimpleFileSystem {
 
@@ -26,7 +27,7 @@ object SimpleFileSystem {
                 hostingObject: KeyValueObjectPointer,
                 amoebafsKey: Key): Future[FileSystem] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
     implicit val tx: Transaction = client.newTransaction()
 
     val fileSystemUUID: UUID = UUID.randomUUID()
@@ -61,7 +62,7 @@ object SimpleFileSystem {
   def load(client: AspenClient,
            fsRoot: KeyValueObjectPointer,
            numContextThreads: Int): Future[SimpleFileSystem] = {
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     for {
       kvos <- client.read(fsRoot)

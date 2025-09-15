@@ -54,12 +54,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(tx)
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
 
       lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(tx)
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
 
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -98,13 +98,13 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(tx)
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
 
       lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
 
-      _ <- lst.insert(key, value, 100, alloc)(tx)
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
 
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -143,12 +143,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(tx)
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
 
       lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(tx)
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
 
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -190,12 +190,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(tx)
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
 
       lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(tx)
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
 
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -245,12 +245,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(tx)
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
 
       lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(tx)
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
@@ -317,12 +317,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(tx)
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
 
       lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(tx)
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()

@@ -45,7 +45,7 @@ trait AspenClient extends ObjectReader {
                      ida: IDA,
                      backendType: BackendType): Future[StoragePool] =
 
-    implicit val ec: ExecutionContext = this.clientContext
+    given ExecutionContext = this.clientContext
 
     val newPoolId = PoolId(UUID.randomUUID())
 
@@ -66,7 +66,7 @@ trait AspenClient extends ObjectReader {
 
   def getHost(hostName: String): Future[Option[Host]]
 
-  def transact[T](prepare: Transaction => Future[T])(implicit ec: ExecutionContext): Future[T] = {
+  def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] = {
     val tx = newTransaction()
 
     val fprep = try { prepare(tx) } catch {
@@ -83,12 +83,12 @@ trait AspenClient extends ObjectReader {
     fresult
   }
 
-  def transactUntilSuccessful[T](prepare: Transaction => Future[T])(implicit ec: ExecutionContext): Future[T] = {
+  def transactUntilSuccessful[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] = {
     retryStrategy.retryUntilSuccessful {
       transact(prepare)
     }
   }
-  def transactUntilSuccessfulWithRecovery[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T])(implicit ec: ExecutionContext): Future[T] = {
+  def transactUntilSuccessfulWithRecovery[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] = {
     retryStrategy.retryUntilSuccessful(onCommitFailure) {
       transact(prepare)
     }

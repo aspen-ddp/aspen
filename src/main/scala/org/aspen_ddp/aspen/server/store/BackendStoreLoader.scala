@@ -6,4 +6,4 @@ import java.nio.file.Path
 import scala.concurrent.ExecutionContext
 
 trait BackendStoreLoader:
-  def loadStoreFromPath(storePath: Path)(implicit ec: ExecutionContext): Option[Backend]
+  def loadStoreFromPath(storePath: Path)(using ExecutionContext): Option[Backend]

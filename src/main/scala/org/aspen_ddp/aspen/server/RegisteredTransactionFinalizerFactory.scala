@@ -12,7 +12,7 @@ import scala.concurrent.{ExecutionContext, Future}
 
 object RegisteredTransactionFinalizerFactory {
   class Finalizer(val client: AspenClient, val actions: List[FinalizationAction]) extends TransactionFinalizer {
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     actions.foreach(_.execute())
 

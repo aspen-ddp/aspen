@@ -2,7 +2,6 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import java.nio.charset.StandardCharsets
 import java.util.UUID
-
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyRevisionGuard, ObjectRevision, Value}
@@ -13,6 +12,7 @@ import org.aspen_ddp.aspen.amoebafs.{DirectoryPointer, FileSystem, Inode, InodeP
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
+import scala.language.implicitConversions
 
 object CreateFileTask extends DurableTaskType {
   val typeUUID: UUID = UUID.fromString("48A4F255-7B78-4D7F-B8AB-D9301B8CDA40")
@@ -41,7 +41,7 @@ object CreateFileTask extends DurableTaskType {
   def prepareTask(fileSystem: FileSystem,
                   directoryPointer: DirectoryPointer,
                   fileName: String,
-                  inode: Inode)(implicit tx: Transaction): Future[Future[Option[AnyRef]]] = {
+                  inode: Inode)(using tx: Transaction): Future[Future[Option[AnyRef]]] = {
     val istate = List(
       StepKey -> Array[Byte](0),
       FileSystemUUIDKey -> uuid2byte(fileSystem.uuid),
@@ -60,7 +60,7 @@ class CreateFileTask(val taskPointer: DurableTaskPointer,
 
   import CreateFileTask._
 
-  implicit val ec: ExecutionContext = fs.executionContext
+  given ExecutionContext = fs.executionContext
 
   private val promise = Promise[Option[AnyRef]]()
 

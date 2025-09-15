@@ -44,6 +44,7 @@ import java.util.UUID
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.language.implicitConversions
 
 /*
 place this file in the head of the CLASSPATH
@@ -351,7 +352,7 @@ object Main {
                        numIndexNodeSegments: Int = 100,
                        fileSegmentSize:Int=1024*1024): Future[FileSystem] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     def loadFileSystem(kvos: KeyValueObjectState): Future[FileSystem] = kvos.contents.get(AmoebafsKey) match {
       case Some(arr) =>
@@ -383,7 +384,7 @@ object Main {
     }
     networkThread.start()
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     println("------------ Reading Radicle ---------------")
     for
@@ -436,7 +437,7 @@ object Main {
     }
     networkThread.start()
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     def randomContent: Array[Byte] =
       val arr = new Array[Byte](16)
@@ -459,7 +460,7 @@ object Main {
         val key = Key(100)
         for
           ptr <- alloc.allocateDataObject(ObjectRevisionGuard(kvos.pointer, kvos.revision),
-            randomContent)(tx)
+            randomContent)(using tx)
           _ = tx.update(kvos.pointer, None, None, DoesNotExist(key) :: Nil, Insert(key, ptr.toArray) :: Nil)
           _ <- tx.commit()
         yield
@@ -626,7 +627,8 @@ object Main {
            nodeCfg: StorageNodeConfig.StorageNode): Unit = {
 
     val sched = Executors.newScheduledThreadPool(3)
-    implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(sched)
+    val ec = ExecutionContext.fromExecutorService(sched)
+    given ExecutionContext = ec
 
     setLog4jConfigFile(nodeCfg.log4jConfigFile)
 
@@ -711,7 +713,8 @@ object Main {
   def bootstrap(cfg: BootstrapConfig.Config, storesDir: Path): Unit = {
 
     val sched = Executors.newScheduledThreadPool(1)
-    implicit val ec: ExecutionContext = ExecutionContext.fromExecutorService(sched)
+    val ec = ExecutionContext.fromExecutorService(sched)
+    given ExecutionContext = ec
 
     val bootstrapStores = cfg.nodes.zipWithIndex.map: (node, poolIndex) =>
 
@@ -770,8 +773,8 @@ object Main {
       }
     }
     networkThread.start()
-
-    implicit val ec: ExecutionContext = client.clientContext
+    
+    given ExecutionContext = client.clientContext
 
     val arr = storeName.split(":")
     val poolUuid = UUID.fromString(arr(0))
@@ -790,7 +793,7 @@ object Main {
           cfg.backend match {
             case b: StoreConfig.RocksDB =>
               println(s"Rebuilding data store $poolUuid:$storeIndex. Path $storeFn")
-              store = new RocksDBBackend(storeFn.toPath, storeId, ec)
+              store = new RocksDBBackend(storeFn.toPath, storeId, client.clientContext)
           }
 
     assert(store != null)
@@ -859,7 +862,7 @@ object Main {
     }
     networkThread.start()
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     val ida: IDA = idaType match
       case "replication" => Replication(width, writeThreshold)
@@ -897,7 +900,7 @@ object Main {
     }
     networkThread.start()
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     val storeId = StoreId(storeName)
 

@@ -15,7 +15,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
   def retryUntilSuccessful[T](attempt: => Future[T]): Future[T] = {
     val p = Promise[T]()
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     def scheduleNextAttempt(retryCount: Int): Unit = {
       var countdown = retryCount
@@ -69,7 +69,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
   def retryUntilSuccessful[T](onAttemptFailure: Throwable => Future[Unit])(attempt: => Future[T]): Future[T] = {
     val p = Promise[T]()
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     def scheduleNextAttempt(retryCount: Int): Unit = {
       var countdown = retryCount

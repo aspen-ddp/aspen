@@ -5,6 +5,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision}
 
 import scala.concurrent.Future
+import scala.language.implicitConversions
 
 object DurableTask {
   val TaskTypeKey = Key(0xFF) // Corresponds to TaskType UUID

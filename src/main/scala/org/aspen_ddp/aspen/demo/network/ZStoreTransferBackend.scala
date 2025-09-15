@@ -62,7 +62,7 @@ class ZStoreTransferBackend(val transferPort: Int,
           storeManager.loadStoreById(storeId)
           logger.info(s"Completed transfer of store ${storeId.directoryName}")
 
-          implicit val ec: ExecutionContext = client.clientContext
+          given ExecutionContext = client.clientContext
 
           client.updateStorageHost(storeId, hostId).foreach: _ =>
             logger.info(s"Successfully updated Storage Pool configuration for store: ${storeId.directoryName}")

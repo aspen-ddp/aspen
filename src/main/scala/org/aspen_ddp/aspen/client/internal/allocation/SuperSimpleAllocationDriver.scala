@@ -49,7 +49,7 @@ class SuperSimpleAllocationDriver(retransmitDelay: Duration,
   newObjectId, objectSize, objectIDA, objectData, objectType, timestamp, initialRefcount, allocationTransactionId,
   revisionGuard) with Logging {
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   private var retries = 0
   private val retryTask = client.backgroundTasks.schedulePeriodic(period=retransmitDelay) {

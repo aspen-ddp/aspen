@@ -16,7 +16,7 @@ class SimpleDirectoryRootManager(client: AspenClient,
 
   import SimpleDirectoryRootManager._
 
-  implicit val ec: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   override def typeId: RootManagerTypeId = RootManagerTypeId(typeUUID)
 

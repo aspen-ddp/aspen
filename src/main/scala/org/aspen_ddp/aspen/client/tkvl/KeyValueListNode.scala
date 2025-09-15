@@ -21,7 +21,7 @@ class KeyValueListNode(val reader: ObjectReader,
                        val contents: Map[Key, ValueState],
                        val tail: Option[KeyValueListPointer]) extends Logging {
 
-  implicit val ec: ExecutionContext = reader.client.clientContext
+  given ExecutionContext = reader.client.clientContext
 
   def maximum: Option[Key] = tail.map(rp => rp.minimum)
 

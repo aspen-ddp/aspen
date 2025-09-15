@@ -43,7 +43,7 @@ object Root {
              nodeAllocator: NodeAllocator,
              initialContent: Map[Key, Value] = Map())(implicit t: Transaction): Future[Root] = {
 
-    implicit val ec: ExecutionContext = client.clientContext
+    given ExecutionContext = client.clientContext
 
     if (initialContent.isEmpty) {
       Future.successful(new Root(0, ordering, None, nodeAllocator))

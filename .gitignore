@@ -1,17 +1,8 @@
-*.sc
-*.class
-*.log
-#t
 t2
 t3
 t4
 
 .bsp/
-
-*.png
-*.DS_store
-
-local/
 
 # Intellij
 .idea/

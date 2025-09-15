@@ -98,7 +98,7 @@ class CreateFileTask(val taskPointer: DurableTaskPointer,
 
   def allocateInode(stepRevision: ObjectRevision): Future[Unit] = {
 
-    implicit val tx: Transaction = fs.client.newTransaction()
+    given tx: Transaction = fs.client.newTransaction()
 
     val guard = KeyRevisionGuard(taskPointer.kvPointer, StepKey, stepRevision)
 
@@ -118,7 +118,7 @@ class CreateFileTask(val taskPointer: DurableTaskPointer,
   }
 
   def addToDirectory(stepRevision: ObjectRevision, newFile: InodePointer): Future[Unit] = {
-    implicit val tx: Transaction = fs.client.newTransaction()
+    given tx: Transaction = fs.client.newTransaction()
 
     val nextStep = Insert(StepKey, Array[Byte](2)) :: Nil
 

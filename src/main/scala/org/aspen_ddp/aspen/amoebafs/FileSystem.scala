@@ -52,7 +52,7 @@ trait FileSystem extends Logging {
     pload.future
   }
 
-  def loadRoot()(implicit ec: ExecutionContext): Future[Directory] = {
+  def loadRoot()(using ec: ExecutionContext): Future[Directory] = {
     inodeTable.lookupRoot() flatMap { pointer => loadDirectory(pointer) }
   }
 
@@ -74,7 +74,7 @@ trait FileSystem extends Logging {
     p.future
   }
 
-  def lookup(iptr: InodePointer)(implicit ec: ExecutionContext): Future[BaseFile] =  {
+  def lookup(iptr: InodePointer)(using ec: ExecutionContext): Future[BaseFile] =  {
     getCachedFile(iptr.number) match {
       case Some(f) => Future.successful(f)
       case None =>
@@ -98,7 +98,7 @@ trait FileSystem extends Logging {
     PointerType <: InodePointer,
     InodeType <: Inode,
     FileType <: BaseFile](pointer: PointerType,
-                          createFn: (FileSystem, PointerType, InodeType, ObjectRevision) => Future[FileType])(implicit ec: ExecutionContext): Future[FileType] = {
+                          createFn: (FileSystem, PointerType, InodeType, ObjectRevision) => Future[FileType])(using ec: ExecutionContext): Future[FileType] = {
     getCachedFile(pointer.number) match {
       case Some(f) => Future.successful(f.asInstanceOf[FileType])
       case None => synchronized {
@@ -121,31 +121,31 @@ trait FileSystem extends Logging {
     }
   }
 
-  def loadDirectory(pointer: DirectoryPointer)(implicit ec: ExecutionContext): Future[Directory] = {
+  def loadDirectory(pointer: DirectoryPointer)(using ec: ExecutionContext): Future[Directory] = {
     doLoad[DirectoryPointer, DirectoryInode, Directory](pointer, fileFactory.createDirectory)
   }
 
-  def loadFile(pointer: FilePointer)(implicit ec: ExecutionContext): Future[File] = {
+  def loadFile(pointer: FilePointer)(using ec: ExecutionContext): Future[File] = {
     doLoad[FilePointer, FileInode, File](pointer, fileFactory.createFile)
   }
 
-  def loadSymlink(pointer: SymlinkPointer)(implicit ec: ExecutionContext): Future[Symlink] = {
+  def loadSymlink(pointer: SymlinkPointer)(using ec: ExecutionContext): Future[Symlink] = {
     doLoad[SymlinkPointer, SymlinkInode, Symlink](pointer, fileFactory.createSymlink)
   }
 
-  def loadUnixSocket(pointer: UnixSocketPointer)(implicit ec: ExecutionContext): Future[UnixSocket] = {
+  def loadUnixSocket(pointer: UnixSocketPointer)(using ec: ExecutionContext): Future[UnixSocket] = {
     doLoad[UnixSocketPointer, UnixSocketInode, UnixSocket](pointer, fileFactory.createUnixSocket)
   }
 
-  def loadFIFO(pointer: FIFOPointer)(implicit ec: ExecutionContext): Future[FIFO] = {
+  def loadFIFO(pointer: FIFOPointer)(using ec: ExecutionContext): Future[FIFO] = {
     doLoad[FIFOPointer, FIFOInode, FIFO](pointer, fileFactory.createFIFO)
   }
 
-  def loadCharacterDevice(pointer: CharacterDevicePointer)(implicit ec: ExecutionContext): Future[CharacterDevice] = {
+  def loadCharacterDevice(pointer: CharacterDevicePointer)(using ec: ExecutionContext): Future[CharacterDevice] = {
     doLoad[CharacterDevicePointer, CharacterDeviceInode, CharacterDevice](pointer, fileFactory.createCharacterDevice)
   }
 
-  def loadBlockDevice(pointer: BlockDevicePointer)(implicit ec: ExecutionContext): Future[BlockDevice] = {
+  def loadBlockDevice(pointer: BlockDevicePointer)(using ec: ExecutionContext): Future[BlockDevice] = {
     doLoad[BlockDevicePointer, BlockDeviceInode, BlockDevice](pointer, fileFactory.createBlockDevice)
   }
 

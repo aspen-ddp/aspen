@@ -78,7 +78,7 @@ object SimpleFile {
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(implicit tx: Transaction, ec: ExecutionContext): Future[Inode] = synchronized {
+                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = synchronized {
       file.content.truncate(offset).map { t =>
         val (ws, fdeleteComplete) = t
 
@@ -97,7 +97,7 @@ object SimpleFile {
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(implicit tx: Transaction, ec: ExecutionContext): Future[Inode] = synchronized {
+                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = synchronized {
 
       val finode = inode.asInstanceOf[FileInode]
 

@@ -16,10 +16,10 @@ trait InodeTable {
 
   /** Future completes when the transaction is ready for commit */
   def prepareInodeAllocation(inode: Inode,
-                             guard: AllocationRevisionGuard)(implicit tx: Transaction): Future[InodePointer]
+                             guard: AllocationRevisionGuard)(using tx: Transaction): Future[InodePointer]
 
   /** Removes the Inode from the table. This method does NOT decrement the reference count on the Inode object. */
-  def delete(pointer: InodePointer)(implicit tx: Transaction): Future[Unit]
+  def delete(pointer: InodePointer)(using tx: Transaction): Future[Unit]
 
   def lookup(inodeNumber: Long): Future[Option[InodePointer]]
 

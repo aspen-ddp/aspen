@@ -23,9 +23,9 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
 
   private val fs = file.fs
 
-  def refresh()(implicit ec: ExecutionContext): Future[Unit] = refreshRoot().map(_=>())
+  def refresh()(using ec: ExecutionContext): Future[Unit] = refreshRoot().map(_=>())
 
-  private def refreshRoot()(implicit ec: ExecutionContext): Future[IndexNode] = {
+  private def refreshRoot()(using ec: ExecutionContext): Future[IndexNode] = {
 
     dropCache()
 
@@ -38,7 +38,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
     }
   }
 
-  private def getOrAllocateRoot()(implicit tx: Transaction, ec: ExecutionContext): Future[IndexNode] = {
+  private def getOrAllocateRoot()(using tx: Transaction, ec: ExecutionContext): Future[IndexNode] = {
     val (inode, revision) = file.inodeState
 
     inode.ocontents match {
@@ -74,12 +74,12 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
     cache.invalidateAll()
   }
 
-  private def updateCachedNodes(updatedNodes: List[IndexNode])(implicit tx: Transaction): Unit = {
+  private def updateCachedNodes(updatedNodes: List[IndexNode])(using tx: Transaction): Unit = {
     logger.trace(s"Tx ${tx.id} Updating IndexNodes ${updatedNodes.map(n => (n.id, n.revision))}")
     updatedNodes.foreach(n => cache.put(n.id, n))
   }
 
-  private def load(nodePointer: DataObjectPointer)(implicit ec: ExecutionContext): Future[IndexNode] = {
+  private def load(nodePointer: DataObjectPointer)(using ec: ExecutionContext): Future[IndexNode] = {
     cache.getIfPresent(nodePointer.id) match {
       case Some(n) =>
         logger.trace(s"Loading cached IndexNode ${nodePointer.id} revision ${n.revision}")
@@ -97,7 +97,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
                                  allocObj: ObjectPointer,
                                  allocRev: ObjectRevision,
                                  tier: Int,
-                                 content: DataBuffer)(implicit tx: Transaction, ec: ExecutionContext): Future[DataObjectPointer] = {
+                                 content: DataBuffer)(using tx: Transaction, ec: ExecutionContext): Future[DataObjectPointer] = {
     logger.trace("Allocating new index node")
 
     fs.defaultIndexNodeAllocator(tier).flatMap { allocater =>
@@ -112,7 +112,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
                                    allocObj: ObjectPointer,
                                    allocRev: ObjectRevision,
                                    offset: Long,
-                                   content: DataBuffer)(implicit tx: Transaction, ec: ExecutionContext): Future[DataObjectPointer] = {
+                                   content: DataBuffer)(using tx: Transaction, ec: ExecutionContext): Future[DataObjectPointer] = {
     logger.trace("Allocating new data segment")
 
     fs.defaultSegmentAllocator().flatMap { allocater =>
@@ -123,7 +123,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
     }
   }
 
-  def read(offset: Long, nbytes: Int)(implicit ec: ExecutionContext): Future[Option[DataBuffer]] = {
+  def read(offset: Long, nbytes: Int)(using ec: ExecutionContext): Future[Option[DataBuffer]] = {
     file.inode.ocontents match {
       case None => Future.successful(None)
       case Some(dp) =>
@@ -178,7 +178,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
     }
   }
 
-  def debugReadFully()(implicit ec: ExecutionContext): Future[Array[Byte]] = read(0, file.inode.size.toInt).map {
+  def debugReadFully()(using ec: ExecutionContext): Future[Array[Byte]] = read(0, file.inode.size.toInt).map {
     case None => new Array[Byte](0)
     case Some(db) => db.getByteArray
   }
@@ -190,7 +190,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
   @tailrec private def recursiveAlloc(
                               offset: Long,
                               remaining: List[DataBuffer],
-                              allocated: List[Future[(DownPointer, DataBuffer)]]=Nil)(implicit tx: Transaction, ec: ExecutionContext): List[Future[(DownPointer, DataBuffer)]] = {
+                              allocated: List[Future[(DownPointer, DataBuffer)]]=Nil)(using tx: Transaction, ec: ExecutionContext): List[Future[(DownPointer, DataBuffer)]] = {
 
     if (remaining.isEmpty)
       allocated.reverse
@@ -220,7 +220,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
 
   /** Returns updated segment content, remaining buffers, and the offset at which they begin */
   private def updateSegment(segmentOffset: Long, pointer: DataObjectPointer, revision: ObjectRevision, data: DataBuffer,
-                            offset: Long, buffers: List[DataBuffer])(implicit tx: Transaction, ec: ExecutionContext): (DataBuffer, List[DataBuffer], Long) = {
+                            offset: Long, buffers: List[DataBuffer])(using tx: Transaction, ec: ExecutionContext): (DataBuffer, List[DataBuffer], Long) = {
 
     if (offset < segmentOffset)
       logger.error(s"OFFSET IS LESS THAN SEGMENT OFFSET offset=$offset segmentOffset=$segmentOffset")
@@ -283,7 +283,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
     * The WriteStatus.writeComplete references the Inode being successfully updated. The future returned in the
     * tuple completes when the background index deletion task is fininshed deleting all of the file content.
     */
-  def truncate(endOffset: Long)(implicit tx: Transaction, ec: ExecutionContext): Future[(WriteStatus, Future[Unit])] = {
+  def truncate(endOffset: Long)(using tx: Transaction, ec: ExecutionContext): Future[(WriteStatus, Future[Unit])] = {
     val inode = file.inode
 
     tx.note(s"IndexedFileContent - preparing file truncation task")
@@ -312,7 +312,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
     }
   }
 
-  private def getTail()(implicit tx: Transaction, ec: ExecutionContext): Future[(Option[Tail], List[IndexNode])] = synchronized {
+  private def getTail()(using tx: Transaction, ec: ExecutionContext): Future[(Option[Tail], List[IndexNode])] = synchronized {
 
     val validCachedTail = otail.flatMap { tail =>
       val tailPath = tail.path.map { dp =>
@@ -365,7 +365,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
 
   private def writeTail(inode: FileInode,
                         beginOffset: Long,
-                        beginBuffers: List[DataBuffer])(implicit tx: Transaction, ec: ExecutionContext): Future[WriteStatus] = {
+                        beginBuffers: List[DataBuffer])(using tx: Transaction, ec: ExecutionContext): Future[WriteStatus] = {
     val nbytes = beginBuffers.foldLeft(0)((sz, db) => sz + db.size)
 
     tx.note(s"IndexedFileContent - writeTail(offset=$beginOffset, nbytes=$nbytes)")
@@ -432,7 +432,7 @@ class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otier
     *
     */
   def write(offset: Long,
-            buffers: List[DataBuffer])(implicit tx: Transaction, ec: ExecutionContext): Future[WriteStatus] = {
+            buffers: List[DataBuffer])(using tx: Transaction, ec: ExecutionContext): Future[WriteStatus] = {
 
     val inode = file.inode
 
@@ -662,7 +662,7 @@ object IndexedFileContent {
     */
   private def prepareIndexDeletionTask(
                                         fs: FileSystem,
-                                        root: DataObjectPointer)(implicit tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] = {
+                                        root: DataObjectPointer)(using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] = {
 
     fs.taskExecutor.prepareTask(DeleteIndexTask.TaskType, List((DeleteIndexTask.RootPointerKey, root.toArray))).map { fcomplete => fcomplete.map(_ => ()) }
 
@@ -706,7 +706,7 @@ object IndexedFileContent {
               else {
                 client.retryStrategy.retryUntilSuccessful {
                   client.read(remaining.head.pointer).flatMap { sdos =>
-                    implicit val tx: Transaction = client.newTransaction()
+                    given tx: Transaction = client.newTransaction()
                     tx.note(s"IndexedFileContent - deleteIndexTask decrementing refcount of ${sdos.pointer.id} to ${sdos.refcount.decrement()}")
                     tx.setRefcount(sdos.pointer, sdos.refcount, sdos.refcount.decrement())
                     tx.commit().map(_ => ())
@@ -726,7 +726,7 @@ object IndexedFileContent {
           destroyEntry(entries.sortBy(e => e.offset).reverse).flatMap { _ =>
             client.retryStrategy.retryUntilSuccessful {
               client.read(nodePointer).flatMap { sdos =>
-                implicit val tx: Transaction = client.newTransaction()
+                given tx: Transaction = client.newTransaction()
                 tx.note(s"IndexedFileContent - deleteIndexTask decrementing self refcount of ${sdos.pointer.id} to ${sdos.refcount.decrement()}")
                 tx.setRefcount(sdos.pointer, sdos.refcount, sdos.refcount.decrement())
                 tx.commit().map(_=>())
@@ -797,7 +797,7 @@ object IndexedFileContent {
 
     def prepareTruncation(
                            endOffset: Long,
-                           path: List[IndexNode])(implicit tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] = {
+                           path: List[IndexNode])(using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] = {
 
       val ftruncateData = path.head.getEntryForOffset(endOffset) match {
         case Some(d) =>
@@ -856,7 +856,7 @@ object IndexedFileContent {
                  path: List[IndexNode],
                  last: IndexNode,
                  updatedNodes: List[IndexNode] = Nil,
-                 rupdatedPath: List[IndexNode] = Nil)(implicit tx: Transaction, ec: ExecutionContext): Future[(IndexNode, List[IndexNode], List[IndexNode])] = {
+                 rupdatedPath: List[IndexNode] = Nil)(using tx: Transaction, ec: ExecutionContext): Future[(IndexNode, List[IndexNode], List[IndexNode])] = {
       if (adds.isEmpty) {
 
         if (path.isEmpty)
@@ -1024,7 +1024,7 @@ object IndexedFileContent {
 
     /** Seeks to the tier0 node owning the specified offset. ALL seeks must start from the root node.
       */
-    def seek(targetOffset: Long, path: List[IndexNode]=Nil)(implicit ec: ExecutionContext): Future[List[IndexNode]] = {
+    def seek(targetOffset: Long, path: List[IndexNode]=Nil)(using ec: ExecutionContext): Future[List[IndexNode]] = {
       // If this node doesn't contain the target offset, we've hit an inconsistency during navigation
       // re-start from a refreshed root node
       if (targetOffset < startOffset || endOffset.exists(targetOffset > _))
@@ -1044,7 +1044,7 @@ object IndexedFileContent {
     /** Returns future to reversed path to tail index node. The first element of the list is the tier-0 index
       * node and the last element is the root index node.
       */
-    def getTail(path: List[IndexNode]=Nil)(implicit ec: ExecutionContext): Future[List[IndexNode]] = {
+    def getTail(path: List[IndexNode]=Nil)(using ec: ExecutionContext): Future[List[IndexNode]] = {
       // If this node doesn't contain the target offset, we've hit an inconsistency during navigation
       // re-start from a refreshed root node
       if (!isTailNode)
@@ -1064,7 +1064,7 @@ object IndexedFileContent {
     /** Returns the path to the head IndexNode for the range and a list of the entries within the range along with which index node they
       *  are present within (range queries can potentially span multiple index nodes)
       */
-    def getIndexEntriesForRange(offset: Long, nbytes: Int)(implicit ec: ExecutionContext): Future[(List[IndexNode], List[(DownPointer, IndexNode)])] = {
+    def getIndexEntriesForRange(offset: Long, nbytes: Int)(using ec: ExecutionContext): Future[(List[IndexNode], List[(DownPointer, IndexNode)])] = {
       val seekOffset = offset - offset % index.segmentSize
 
       val endOffset = offset + nbytes
@@ -1095,17 +1095,17 @@ object IndexedFileContent {
     }
 
     /** MUST be called only from the root node */
-    def insert(logger: Logger, newEntry: DownPointer)(implicit tx: Transaction, ec: ExecutionContext): Future[(IndexNode, List[IndexNode])] = {
+    def insert(logger: Logger, newEntry: DownPointer)(using tx: Transaction, ec: ExecutionContext): Future[(IndexNode, List[IndexNode])] = {
       seek(newEntry.offset).flatMap(path => rupdate(logger, List(newEntry), path, path.head, Nil).map(t => t._1 -> t._2))
     }
 
     /** MUST be called only from the root node */
-    def insert(logger: Logger, newEntries: List[DownPointer])(implicit tx: Transaction, ec: ExecutionContext): Future[(IndexNode, List[IndexNode])] = {
+    def insert(logger: Logger, newEntries: List[DownPointer])(using tx: Transaction, ec: ExecutionContext): Future[(IndexNode, List[IndexNode])] = {
       seek(newEntries.head.offset).flatMap(path => rupdate(logger, newEntries, path, path.head, Nil).map(t => t._1 -> t._2))
     }
 
     /** MUST be called only from the root node */
-    def truncate(endOffset: Long)(implicit tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] = {
+    def truncate(endOffset: Long)(using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] = {
       seek(endOffset).flatMap(path => prepareTruncation(endOffset, path))
     }
 

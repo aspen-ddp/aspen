@@ -34,7 +34,7 @@ object UnlinkFileTask extends DurableTaskType {
   }
 
   def prepareTask(fileSystem: FileSystem,
-                  inodePointer: InodePointer)(implicit tx: Transaction): Future[Future[Option[AnyRef]]] = {
+                  inodePointer: InodePointer)(using tx: Transaction): Future[Future[Option[AnyRef]]] = {
     val istate = List((FileSystemUUIDKey -> uuid2byte(fileSystem.uuid)),
       (InodePointerKey -> inodePointer.toArray))
     fileSystem.taskExecutor.prepareTask(this, istate)
@@ -97,7 +97,7 @@ class UnlinkFileTask(val taskPointer: DurableTaskPointer,
                        inode: Inode,
                        revision: ObjectRevision): Future[Unit] = {
     val nextStep = Insert(StepKey, Array[Byte](2)) :: Nil
-    implicit val tx: Transaction = fs.client.newTransaction()
+    given tx: Transaction = fs.client.newTransaction()
 
     tx.update(taskPointer.kvPointer, None, None, KeyRevision(StepKey, stepRevision) :: Nil, nextStep)
 

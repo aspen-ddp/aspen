@@ -28,7 +28,7 @@ object SimpleFileSystem {
                 amoebafsKey: Key): Future[FileSystem] = {
 
     given ExecutionContext = client.clientContext
-    implicit val tx: Transaction = client.newTransaction()
+    given tx: Transaction = client.newTransaction()
 
     val fileSystemUUID: UUID = UUID.randomUUID()
 

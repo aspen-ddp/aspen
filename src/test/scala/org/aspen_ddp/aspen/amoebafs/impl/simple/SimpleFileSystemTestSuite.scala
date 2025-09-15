@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
+import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.common.objects.ObjectRevisionGuard
 import org.aspen_ddp.aspen.amoebafs.impl.simple.CreateFileTask
@@ -60,7 +61,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
         rootRevision, rootInode.asInstanceOf[DirectoryInode], fs)
       nlinks1 = dir.links
       tx = client.newTransaction()
-      _ = dir.prepareHardLink()(tx)
+      _ = dir.prepareHardLink()(using tx)
       _ <- tx.commit()
       _ <- async_sleep(1) // Cached Inode is updated via a .foreach on the commit future so we need to wait a bit
       nlinks2 = dir.links
@@ -104,7 +105,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
       _ <- f
 
       tx = client.newTransaction()
-      _ <- dir.prepareRename("foo", "bar")(tx)
+      _ <- dir.prepareRename("foo", "bar")(using tx)
       _ <- tx.commit()
 
       ofile1 <- dir.getEntry("foo")

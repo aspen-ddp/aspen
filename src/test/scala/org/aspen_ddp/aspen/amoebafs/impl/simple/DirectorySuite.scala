@@ -11,7 +11,7 @@ import scala.concurrent.Future
 
 class DirectorySuite extends FilesSystemTestSuite:
   def cdir(dir: Directory, name: String, mode: Int, uid: Int, gid: Int): Future[DirectoryPointer] =
-    implicit val tx: Transaction = dir.fs.client.newTransaction()
+    given tx: Transaction = dir.fs.client.newTransaction()
     val fprep = dir.prepareCreateDirectory(name, mode, uid, gid)
     fprep.foreach(_ => tx.commit())
     fprep.flatMap(fresult => fresult)
@@ -57,7 +57,7 @@ class DirectorySuite extends FilesSystemTestSuite:
 
   test("Change Directory UID with recovery from revision mismatch"):
     def vbump(ptr: ObjectPointer, revision: ObjectRevision): Future[Unit] =
-      implicit val tx: Transaction = client.newTransaction()
+      given tx: Transaction = client.newTransaction()
       tx.bumpVersion(ptr, revision)
       tx.commit().map(_=>())
 
@@ -220,7 +220,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       rootDir <- fs.loadRoot()
       _ <- rootDir.getContents()
       sptr <-
-        implicit val tx: Transaction = rootDir.fs.client.newTransaction()
+        given tx: Transaction = rootDir.fs.client.newTransaction()
         val fprep = rootDir.prepareCreateSymlink("foo", mode=0, uid=1, gid=2, link="bar")
         fprep.foreach(_ => tx.commit())
         fprep.flatMap(fresult => fresult)
@@ -243,7 +243,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       rootDir <- fs.loadRoot()
       _ <- rootDir.getContents()
       sptr <-
-        implicit val tx: Transaction = rootDir.fs.client.newTransaction()
+        given tx: Transaction = rootDir.fs.client.newTransaction()
         val fprep = rootDir.prepareCreateUnixSocket("foo", mode=0, uid=1, gid=2)
         fprep.foreach(_ => tx.commit())
         fprep.flatMap(fresult => fresult)
@@ -257,7 +257,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       rootDir <- fs.loadRoot()
       _ <- rootDir.getContents()
       sptr <-
-        implicit val tx: Transaction = rootDir.fs.client.newTransaction()
+        given tx: Transaction = rootDir.fs.client.newTransaction()
         val fprep = rootDir.prepareCreateFIFO("foo", mode=0, uid=1, gid=2)
         fprep.foreach(_ => tx.commit())
         fprep.flatMap(fresult => fresult)
@@ -271,7 +271,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       rootDir <- fs.loadRoot()
       _ <- rootDir.getContents()
       sptr <-
-        implicit val tx: Transaction = rootDir.fs.client.newTransaction()
+        given tx: Transaction = rootDir.fs.client.newTransaction()
         val fprep = rootDir.prepareCreateCharacterDevice("foo", mode=0, uid=1, gid=2, rdev=10)
         fprep.foreach(_ => tx.commit())
         fprep.flatMap(fresult => fresult)
@@ -286,7 +286,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       rootDir <- fs.loadRoot()
       _ <- rootDir.getContents()
       sptr <-
-        implicit val tx: Transaction = rootDir.fs.client.newTransaction()
+        given tx: Transaction = rootDir.fs.client.newTransaction()
         val fprep = rootDir.prepareCreateBlockDevice("foo", mode=0, uid=1, gid=2, rdev=10)
         fprep.foreach(_ => tx.commit())
         fprep.flatMap(fresult => fresult)
@@ -301,7 +301,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       rootDir <- fs.loadRoot()
       _ <- rootDir.getContents()
       sptr <-
-        implicit val tx: Transaction = rootDir.fs.client.newTransaction()
+        given tx: Transaction = rootDir.fs.client.newTransaction()
         val fprep = rootDir.prepareCreateBlockDevice("foo", mode=0, uid=1, gid=2, rdev=10)
         fprep.foreach(_ => tx.commit())
         fprep.flatMap(fresult => fresult)

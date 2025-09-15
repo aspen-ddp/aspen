@@ -39,7 +39,7 @@ class SimpleInodeTable(
 
   /** Future completes when the transaction is ready for commit */
   override def prepareInodeAllocation(inode: Inode,
-                                      guard: AllocationRevisionGuard)(implicit tx: Transaction): Future[InodePointer] = {
+                                      guard: AllocationRevisionGuard)(using tx: Transaction): Future[InodePointer] = {
 
     // Jump to new location if the transaction fails for any reason
     tx.result.failed.foreach( _ => selectNewInodeAllocationPosition() )
@@ -58,7 +58,7 @@ class SimpleInodeTable(
   }
 
   /** Removes the Inode from the table. This method does NOT decrement the reference count on the Inode object. */
-  override def delete(pointer: InodePointer)(implicit tx: Transaction): Future[Unit] = {
+  override def delete(pointer: InodePointer)(using tx: Transaction): Future[Unit] = {
     table.delete(Key(pointer.number))
   }
 

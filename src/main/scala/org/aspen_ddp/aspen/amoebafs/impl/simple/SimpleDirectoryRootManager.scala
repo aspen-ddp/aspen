@@ -84,7 +84,7 @@ class SimpleDirectoryRootManager(client: AspenClient,
   }
 
   override def prepareRootUpdate(newTier: Int,
-                                 newRoot: KeyValueObjectPointer)(implicit tx: Transaction): Future[Unit] = {
+                                 newRoot: KeyValueObjectPointer)(using tx: Transaction): Future[Unit] = {
     val p = Promise[Unit]()
 
     client.read(inodePointer).onComplete {
@@ -104,7 +104,7 @@ class SimpleDirectoryRootManager(client: AspenClient,
     p.future
   }
 
-  override def createInitialNode(contents: Map[Key,Value])(implicit tx: Transaction): Future[AllocationRevisionGuard] = {
+  override def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[AllocationRevisionGuard] = {
     for {
       RData(root, _, _) <- getRoot()
       alloc <- root.nodeAllocator.getAllocatorForTier(0)

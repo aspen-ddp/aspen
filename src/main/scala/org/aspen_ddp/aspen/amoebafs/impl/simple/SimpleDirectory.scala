@@ -46,7 +46,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
 
   override def prepareInsert(name: String,
                              pointer: InodePointer,
-                             incref: Boolean)(implicit tx: Transaction): Future[Unit] = {
+                             incref: Boolean)(using tx: Transaction): Future[Unit] = {
     val fcheck = tree.getContainingNode(name).map { onode =>
       onode.map { node =>
         if (node.contains(name))
@@ -71,7 +71,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     } yield ()
   }
 
-  override def prepareDelete(name: String, decref: Boolean)(implicit tx: Transaction): Future[Unit] = {
+  override def prepareDelete(name: String, decref: Boolean)(using tx: Transaction): Future[Unit] = {
     val key = Key(name)
 
     def onptr(ovs: Option[ValueState]): Future[Unit] = ovs match {
@@ -115,7 +115,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     } yield ()
   }
 
-  override def prepareRename(oldName: String, newName: String)(implicit tx: Transaction): Future[Unit] = {
+  override def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit] = {
     val oldKey = Key(oldName)
     val newKey = Key(newName)
     val tr = tree
@@ -142,13 +142,13 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     }
   }
 
-  override def prepareHardLink(name: String, file: BaseFile)(implicit tx: Transaction): Future[Unit] = {
+  override def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit] = {
     prepareInsert(name, file.pointer)
   }
 
   /** Ensures the directory is empty and that all resources are cleaned up if the transaction successfully commits
     */
-  override def prepareForDirectoryDeletion()(implicit tx: Transaction): Future[Unit] = {
+  override def prepareForDirectoryDeletion()(using tx: Transaction): Future[Unit] = {
     // TODO: protect against race conditions during directory deletion
     getContents().map { contents =>
       if (contents.nonEmpty)

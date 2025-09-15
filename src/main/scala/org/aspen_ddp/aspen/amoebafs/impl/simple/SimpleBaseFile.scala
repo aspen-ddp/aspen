@@ -20,13 +20,13 @@ object SimpleBaseFile {
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(implicit tx: Transaction, ec: ExecutionContext): Future[Inode]
+                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode]
   }
 
   case class Flush() extends FileOperation {
     override def prepareTransaction(pointer: DataObjectPointer,
                                     revision: ObjectRevision,
-                                    inode: Inode)(implicit tx: Transaction, ec: ExecutionContext): Future[Inode] = {
+                                    inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = {
       // Nothing to do. Due to serial nature of execution, by the time this method is called, all previous operations
       // have successfully committed
       Future.successful(inode)
@@ -39,7 +39,7 @@ object SimpleBaseFile {
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(implicit tx: Transaction, ec: ExecutionContext): Future[Inode] = {
+                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = {
 
       val updatedInode = update(inode)
 
@@ -144,7 +144,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
 
   def flush(): Future[Unit] = enqueueOp(Flush())
 
-  def prepareHardLink()(implicit tx: Transaction): Unit = synchronized {
+  def prepareHardLink()(using tx: Transaction): Unit = synchronized {
     val updatedInode = cachedInode.update(links=Some(cachedInode.links+1))
     tx.overwrite(pointer.pointer, cachedInodeRevision, updatedInode.toDataBuffer)
     tx.result.foreach { _ =>
@@ -153,7 +153,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
     }
   }
 
-  def prepareUnlink()(implicit tx: Transaction): Future[Future[Unit]] = synchronized {
+  def prepareUnlink()(using tx: Transaction): Future[Future[Unit]] = synchronized {
     val updatedInode = inode.update(links=Some(inode.links-1))
 
     tx.overwrite(pointer.pointer, cachedInodeRevision, updatedInode.toDataBuffer)
@@ -207,7 +207,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
     }
 
     def attempt(): Future[(ObjectRevision, Inode)] = {
-      implicit val tx: Transaction = fs.client.newTransaction()
+      given tx: Transaction = fs.client.newTransaction()
 
       tx.note(s"FileOperation: ${op.getClass.getSimpleName}: ${op.toString}")
 

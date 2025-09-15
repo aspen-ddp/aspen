@@ -40,9 +40,9 @@ trait BaseFile {
 
   def flush(): Future[Unit]
 
-  def prepareHardLink()(implicit tx: Transaction): Unit
+  def prepareHardLink()(using tx: Transaction): Unit
 
-  def prepareUnlink()(implicit tx: Transaction): Future[Future[Unit]]
+  def prepareUnlink()(using tx: Transaction): Future[Future[Unit]]
 
   def setattr(
                newUID: Int,

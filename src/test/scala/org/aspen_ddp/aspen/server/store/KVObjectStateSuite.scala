@@ -8,6 +8,8 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import scala.language.implicitConversions
+
 class KVObjectStateSuite extends AnyFunSuite with Matchers {
   test("Empty Object") {
     val kv = new KVObjectState(None, None, None, None, Map(), Map())

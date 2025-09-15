@@ -13,15 +13,12 @@ class TempDirManager {
 
   def delete(): Unit = {
 
-    def cleanup(f:File): Unit = {
-      if (f.isFile) {
+    def cleanup(f:File): Unit =
+      if f.isFile then
         f.delete()
-      }
-      else {
+      else
         f.listFiles().foreach( cleanup )
         f.delete()
-      }
-    }
 
     cleanup(tdir)
   }

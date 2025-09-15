@@ -14,8 +14,8 @@ class FilesSystemTestSuite  extends IntegrationTestSuite {
   var fs: FileSystem = _
 
   //override def subFixtureSetup(): Unit = {
-  def bootstrap(): Future[FileSystem] = {
-    for {
+  def bootstrap(): Future[FileSystem] =
+    for
       kvos <- client.read(radicle)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
       allocator = new SinglePoolObjectAllocator(client, rootPool.get, radicle.ida, None )
@@ -24,10 +24,8 @@ class FilesSystemTestSuite  extends IntegrationTestSuite {
         allocator,
         kvos.pointer,
         Key(100))
-    } yield {
+    yield
       fs
-    }
-  }
 
   override def subFixtureTeardown(): Unit = {
     if (fs != null)

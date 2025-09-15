@@ -34,7 +34,7 @@ object SimpleFileSystem {
 
     val rootDirMode = FileMode.S_IFDIR | FileMode.S_IRWXU
 
-    for {
+    for
       taskRoot <- allocator.allocateKeyValueObject(guard, Map())
       rootRoot = new Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(client, taskRoot.poolId))
       rootDirInode = DirectoryInode.init(rootDirMode, 0, 0, None, Some(1), rootRoot)
@@ -54,9 +54,8 @@ object SimpleFileSystem {
         List(Insert(amoebafsKey, fsRootPointer.toArray)))
       _ <- tx.commit()
       fs <- load(client, fsRootPointer, numContextThreads = 4)
-    } yield {
+    yield
       fs
-    }
   }
 
   def load(client: AspenClient,
@@ -64,15 +63,14 @@ object SimpleFileSystem {
            numContextThreads: Int): Future[SimpleFileSystem] = {
     given ExecutionContext = client.clientContext
 
-    for {
+    for
       kvos <- client.read(fsRoot)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
       defaultAllocator = new SinglePoolObjectAllocator(client, rootPool.get, fsRoot.ida, None)
       executorRoot = KeyValueObjectPointer(kvos.contents(TaskExecutorRootKey).value.bytes)
       executor <- SimpleTaskExecutor(client, StaticTaskTypeRegistry.registeredTasks, defaultAllocator, executorRoot)
-    } yield {
+    yield
       new SimpleFileSystem(client, kvos, defaultAllocator, executor, numContextThreads)
-    }
 
   }
 }

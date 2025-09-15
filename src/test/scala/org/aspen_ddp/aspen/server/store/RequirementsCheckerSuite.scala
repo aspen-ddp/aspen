@@ -13,6 +13,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import scala.collection.immutable.HashMap
+import scala.language.implicitConversions
 
 object RequirementsCheckerSuite {
   val oid1 = ObjectId(new UUID(0,1))

@@ -246,12 +246,11 @@ trait Directory extends BaseFile with Logging {
     val newInode = DirectoryInode.init(mode, uid, gid, Some(pointer), None, root)
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
-    val fdp = for {
+    val fdp = for
       fof <-  raw
       of <- fof
-    } yield {
+    yield
       of.get.asInstanceOf[DirectoryPointer]
-    }
     raw.map(_ => fdp)
   }
 
@@ -259,12 +258,11 @@ trait Directory extends BaseFile with Logging {
     val newInode = FileInode.init(mode, uid, gid)
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
-    val fdp = for {
+    val fdp = for
       fof <- raw
       of <- fof
-    } yield {
+    yield
       of.get.asInstanceOf[FilePointer]
-    }
     raw.map(_ => fdp)
   }
 
@@ -273,12 +271,11 @@ trait Directory extends BaseFile with Logging {
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
-    val fdp = for {
+    val fdp = for
       fof <- raw
       of <- fof
-    } yield {
+    yield
       of.get.asInstanceOf[SymlinkPointer]
-    }
     raw.map(_ => fdp)
   }
 
@@ -287,12 +284,11 @@ trait Directory extends BaseFile with Logging {
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
-    val fdp = for {
+    val fdp = for
       fof <- raw
       of <- fof
-    } yield {
+    yield
       of.get.asInstanceOf[UnixSocketPointer]
-    }
     raw.map(_ => fdp)
   }
 
@@ -301,12 +297,11 @@ trait Directory extends BaseFile with Logging {
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
-    val fdp = for {
+    val fdp = for
       fof <- raw
       of <- fof
-    } yield {
+    yield
       of.get.asInstanceOf[FIFOPointer]
-    }
     raw.map(_ => fdp)
   }
 
@@ -315,12 +310,11 @@ trait Directory extends BaseFile with Logging {
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
-    val fdp = for {
+    val fdp = for
       fof <- raw
       of <- fof
-    } yield {
+    yield
       of.get.asInstanceOf[CharacterDevicePointer]
-    }
     raw.map(_ => fdp)
   }
 
@@ -329,12 +323,11 @@ trait Directory extends BaseFile with Logging {
 
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
-    val fdp = for {
+    val fdp = for
       fof <- raw
       of <- fof
-    } yield {
+    yield
       of.get.asInstanceOf[BlockDevicePointer]
-    }
     raw.map(_ => fdp)
   }
 }

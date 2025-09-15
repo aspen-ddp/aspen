@@ -18,6 +18,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import scala.concurrent.Future
+import scala.language.implicitConversions
 
 object FrontendSuite {
 

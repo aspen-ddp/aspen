@@ -6,6 +6,8 @@ import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRevisionGuard, Value}
 
+import scala.language.implicitConversions
+
 class TKVLSuite extends IntegrationTestSuite {
   test("Create new tree") {
     val treeKey = Key(Array[Byte](1))

@@ -17,6 +17,8 @@ import org.scalatest.Assertion
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import scala.language.implicitConversions
+
 object KeyValueObjectReaderSuite {
   val pool = PoolId(new UUID(0,1))
   val readUUID = new UUID(1,2)

@@ -10,6 +10,8 @@ import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import scala.language.implicitConversions
+
 object SimpleLRUObjectCacheSuite {
 
   def mkobjs(): (ObjectState, ObjectState, ObjectState, ObjectState) = {

@@ -21,6 +21,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.*
+import scala.language.implicitConversions
 
 object BaseReadDriverSuite {
   val awaitDuration = Duration(100, MILLISECONDS)

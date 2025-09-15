@@ -17,6 +17,7 @@ import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import scala.concurrent.Await
 import scala.concurrent.duration.*
+import scala.language.implicitConversions
 
 object SimpleCRLSuite:
   val transactionId = TransactionId(new UUID(0, 1))

@@ -31,6 +31,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import java.nio.file.Path
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.language.implicitConversions
 
 
 object TestNetwork {

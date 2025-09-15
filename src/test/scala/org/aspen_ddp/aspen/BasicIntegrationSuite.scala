@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, ObjectRe
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.Future
+import scala.language.implicitConversions
 
 class BasicIntegrationSuite extends IntegrationTestSuite {
 

@@ -87,9 +87,8 @@ object BootstrapConfig {
     def create(o: Object): Config = Config( bootstrapIDA.get(o), nodes.get(o) )
 
 
-  def loadBootstrapConfig(file: File): Config = {
+  def loadBootstrapConfig(file: File): Config =
     val yaml = new Yaml(new SafeConstructor)
     val y = yaml.load[java.util.AbstractMap[Object,Object]](new FileInputStream(file))
     Config.create(y)
-  }
 }

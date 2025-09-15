@@ -4,9 +4,9 @@ import org.scalatest._
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-class LearnerSuite extends AnyFunSuite with Matchers {
+class LearnerSuite extends AnyFunSuite with Matchers:
 
-  test("Basic Resolution") {
+  test("Basic Resolution"):
 
     val l = new Learner(3, 2)
 
@@ -18,9 +18,8 @@ class LearnerSuite extends AnyFunSuite with Matchers {
     b.get(0) should be(true)
     b.get(1) should be(true)
     b.get(2) should be(false)
-  }
 
-  test("Ignore duplicates") {
+  test("Ignore duplicates"):
 
     val l = new Learner(3, 2)
 
@@ -34,9 +33,8 @@ class LearnerSuite extends AnyFunSuite with Matchers {
     b.get(0) should be(true)
     b.get(1) should be(true)
     b.get(2) should be(false)
-  }
 
-  test("Add peer bits after resolution") {
+  test("Add peer bits after resolution"):
 
     val l = new Learner(3, 2)
 
@@ -56,9 +54,8 @@ class LearnerSuite extends AnyFunSuite with Matchers {
     b.get(0) should be(true)
     b.get(1) should be(true)
     b.get(2) should be(true)
-  }
 
-  test("Watch only highest round") {
+  test("Watch only highest round"):
 
     val l = new Learner(3, 2)
 
@@ -72,9 +69,8 @@ class LearnerSuite extends AnyFunSuite with Matchers {
     b.get(0) should be(true)
     b.get(1) should be(false)
     b.get(2) should be(true)
-  }
 
-  test("Clear lower round state on higher round seen") {
+  test("Clear lower round state on higher round seen"):
 
     val l = new Learner(3, 2)
 
@@ -101,5 +97,3 @@ class LearnerSuite extends AnyFunSuite with Matchers {
     b.get(0) should be(false)
     b.get(1) should be(true)
     b.get(2) should be(true)
-  }
-}

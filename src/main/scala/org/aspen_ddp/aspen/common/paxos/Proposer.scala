@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.common.paxos
 class Proposer(
                 val peerId: Byte,
                 val numPeers: Int,
-                val quorumSize: Int) {
+                val quorumSize: Int):
 
   require(quorumSize >= numPeers/2 + 1)
 
@@ -24,37 +24,32 @@ class Proposer(
 
   def maySendAccept: Boolean = prepareQuorumReached && (highestAccepted.isDefined || localProposal.isDefined)
 
-  def proposalValue: Option[Boolean] = {
-    if (prepareQuorumReached) {
-      highestAccepted match {
+  def proposalValue: Option[Boolean] =
+    if prepareQuorumReached then
+      highestAccepted match
         case Some(t) => Some(t._2)
-        case None => localProposal match {
+        case None => localProposal match
           case Some(v) => Some(v)
           case None => None
-        }
-      }
-    }
     else
       None
-  }
 
   /** Sets the proposal value for this node. Once set, it cannot be unset. Subsequent calls are ignored.*/
-  def setLocalProposal(value:Boolean): Unit = if (localProposal.isEmpty) localProposal = Some(value)
+  def setLocalProposal(value:Boolean): Unit = if localProposal.isEmpty then localProposal = Some(value)
 
   /** Used to reduce the chance of receiving Nacks to our Prepare messages */
-  def updateHighestProposalId(pid: ProposalId): Unit = if (pid > highestProposalId) highestProposalId = pid
+  def updateHighestProposalId(pid: ProposalId): Unit = if pid > highestProposalId then highestProposalId = pid
 
   /** Abandons the current Paxos round and prepares for the next.
     *
     * After calling this method the current Prepare message will contain a ProposalID higher than any previously
     * seen and all internal state tracking will be reset to represent the new round.
     */
-  def nextRound(): Unit = {
+  def nextRound(): Unit =
     proposalId = ProposalId(highestProposalId.number+1, peerId)
     highestProposalId = proposalId
     promisesReceived.clear()
     nacksReceived.clear()
-  }
 
   def currentProposalId: ProposalId = proposalId
 
@@ -70,28 +65,21 @@ class Proposer(
   /** Returns true if this Nack eliminates the possibility of success for the
     * current proposal id. Returns false if success is still possible.
     */
-  def receiveNack(nack: Nack) : Boolean = {
+  def receiveNack(nack: Nack) : Boolean =
     updateHighestProposalId(nack.promisedProposalId)
 
-    if (nack.proposalId == proposalId)
+    if nack.proposalId == proposalId then
       nacksReceived.set(nack.fromPeer)
 
     nacksReceived.cardinality() > numPeers - quorumSize
-  }
 
-  def receivePromise(promise: Promise): Unit = {
+  def receivePromise(promise: Promise): Unit =
     updateHighestProposalId(promise.proposalId)
 
-    if (promise.proposalId == proposalId) {
+    if promise.proposalId == proposalId then
       promisesReceived.set(promise.fromPeer)
 
-      promise.lastAccepted.foreach(t => {
-        highestAccepted match {
-          case Some(highest) => if (t._1 > highest._1) highestAccepted = Some(t)
+      promise.lastAccepted.foreach: t =>
+        highestAccepted match
+          case Some(highest) => if t._1 > highest._1 then highestAccepted = Some(t)
           case None => highestAccepted = Some(t)
-        }
-      })
-    }
-  }
-
-}

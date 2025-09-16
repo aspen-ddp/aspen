@@ -1,19 +1,4 @@
 
-/* SETUP
- * 
- * This project depends on Flatbuffers which, unfortunately, must be manually installed.
- * To do so, download the flatbuffers source code, run "cmake ." from within the root
- * directory of the project, and then "make install" and "mvn install". This will
- * install the flatc utility as /usr/local/bin/flatc and create the flatbuffers jar file
- * in <flatbuffer_root>/target. Copy the jar file to the 'lib' folder of this project and
- * you should be good to go.
- *
- * Scala IDE project files can be generated with 'sbt eclipse'
- * 
- */
-
-import scala.sys.process._
-
 lazy val root = (project in file(".")).
   settings(
 

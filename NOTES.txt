@@ -1,7 +1,4 @@
 TODO:
-    * Re-evaluate TKVL tiering implemntation. Currently we're hard-coding
-      1 as the tier for all insertions when nodes are split. This is probably
-      incorrect.
 
 # Setting up intellij to use a JDK installed by homebrew:
 # homebrew install openjdk

@@ -112,6 +112,15 @@ class KeyValueListNode(val reader: ObjectReader,
     KeyValueListNode.delete(node, key, requiredRevision, requirements, reader, prepareForJoin)
   }
 
+  def splitAt(ordering: KeyOrdering,
+              splitAtKey: Key,
+              optionalDownPointer: Option[KeyValueObjectPointer],
+              maxNodeSize: Int,
+              allocator: ObjectAllocator,
+             )(using tx: Transaction): Future[KeyValueListPointer] = {
+    KeyValueListNode.splitAt(node, ordering, optionalDownPointer, maxNodeSize, allocator)
+  }
+
   def foldLeft[B](initialZ: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] = {
     val p = Promise[B]()
 
@@ -530,7 +539,7 @@ object KeyValueListNode {
     // slow deletion so it should be a non-issue.
     
     val (leftContents, rightContents) = node.contents.partition((k,v) => ordering.compare(k, splitAtKey) < 0)
-
+    
     val newLeftContent = optionalDownPointer match
       case None => Map()
       case Some(dptr) => Map(Key.AbsoluteMinimum -> Value(dptr.toArray))
@@ -540,7 +549,7 @@ object KeyValueListNode {
       Some(node.revision),
       Some(node.fullContentLock),
       Nil,
-      SetMax(splitAtKey) :: DeleteRight() :: rightContent.map((k,v) => Delete(k)))
+      SetMax(splitAtKey) :: DeleteRight() :: rightContents.map((k,v) => Delete(k)).toList)
     
     for 
       newRightPtr <- allocator.allocateKeyValueObject(
@@ -557,7 +566,7 @@ object KeyValueListNode {
         None,
         Some(splitAtKey),
         None,
-        Some(Value(newRightPtr.toArray)))
+        Some(Value(KeyValueListPointer(splitAtKey,newRightPtr).toArray)))
     yield
       KeyValueListPointer(Key.AbsoluteMinimum, newLeftPtr)
   

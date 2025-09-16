@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRefcount, ObjectRevisionGuard, Value}
 
+import scala.concurrent.Future
 import scala.language.implicitConversions
 
 class KeyValueListSuite extends IntegrationTestSuite {

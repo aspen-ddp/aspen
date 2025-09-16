@@ -56,7 +56,7 @@ class RocksDBBackend(dbPath:Path,
 
   import RocksDBBackend._
   
-  given ecGiven: ExecutionContext = executionContext
+  given ExecutionContext = executionContext
 
   private var chandler: Option[CompletionHandler] = None
 

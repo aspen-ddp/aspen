@@ -90,7 +90,7 @@ class SimpleTaskExecutor(val client: AspenClient,
       }
     }
     client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail) { tx =>
-      given tx2: Transaction = tx
+      given Transaction = tx
       synchronized {
         val guard = ObjectRevisionGuard(executorObject, executorRevision)
         val taskKey = Key(UUID.randomUUID())
@@ -107,7 +107,7 @@ class SimpleTaskExecutor(val client: AspenClient,
 
   private def deallocateTask(task: DurableTaskPointer): Unit = {
     client.transactUntilSuccessful[Unit] { tx =>
-      given tx2: Transaction = tx
+      given Transaction = tx
       
       client.read(task.kvPointer).map { kvos =>
         val deletes = kvos.contents.keys.map(k => Delete(k)).toList

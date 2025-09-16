@@ -56,7 +56,7 @@ class StoreManager(val rootDir: Path,
                    val heartbeatPeriod: Duration) extends Logging {
   import StoreManager._
   
-  given ecGiven: ExecutionContext = ec
+  given ExecutionContext = ec
 
   private val events = new LinkedBlockingQueue[Event]()
 

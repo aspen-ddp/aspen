@@ -66,33 +66,29 @@ trait AspenClient extends ObjectReader {
 
   def getHost(hostName: String): Future[Option[Host]]
 
-  def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] = {
+  def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
 
-    val fprep = try { prepare(tx) } catch {
+    val fprep = try prepare(tx) catch
       case err: Throwable => Future.failed(err)
-    }
 
-    val fresult = for {
+    val fresult = for
       prepResult <- fprep
       _ <- tx.commit()
-    } yield prepResult
+    yield prepResult
 
     fresult.failed.foreach(err => tx.invalidateTransaction(err))
 
     fresult
-  }
 
-  def transactUntilSuccessful[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] = {
+  def transactUntilSuccessful[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     retryStrategy.retryUntilSuccessful {
       transact(prepare)
     }
-  }
-  def transactUntilSuccessfulWithRecovery[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] = {
+  def transactUntilSuccessfulWithRecovery[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     retryStrategy.retryUntilSuccessful(onCommitFailure) {
       transact(prepare)
     }
-  }
 
   def retryStrategy: RetryStrategy
 

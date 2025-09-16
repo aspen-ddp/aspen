@@ -12,21 +12,20 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
 
   def shutdown(): Unit = synchronized { exit = true }
 
-  def retryUntilSuccessful[T](attempt: => Future[T]): Future[T] = {
+  def retryUntilSuccessful[T](attempt: => Future[T]): Future[T] =
     val p = Promise[T]()
 
     given ExecutionContext = client.clientContext
 
-    def scheduleNextAttempt(retryCount: Int): Unit = {
+    def scheduleNextAttempt(retryCount: Int): Unit =
       var countdown = retryCount
       var window = 2
 
-      while (countdown > 0 && countdown < backoffLimit) {
+      while countdown > 0 && countdown < backoffLimit do
         window = window * 2
         countdown -= 1
-      }
 
-      if (countdown > backoffLimit)
+      if countdown > backoffLimit then
         window = backoffLimit
 
       val rand = new java.util.Random
@@ -35,52 +34,45 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
       client.backgroundTasks.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)
       }
-    }
 
-    def retry(retryCount: Int): Unit = {
+    def retry(retryCount: Int): Unit =
       val shouldExit = synchronized { exit }
 
-      if (shouldExit)
+      if shouldExit then
         return
 
-      def onFail(cause: Throwable): Unit = {
-        cause match {
+      def onFail(cause: Throwable): Unit =
+        cause match
           case StopRetrying(reason) => p.failure(reason)
           case _ => scheduleNextAttempt(retryCount)
-        }
-      }
 
-      try {
+      try
         attempt onComplete {
           case Success(result) => p.success(result)
 
           case Failure(cause) => onFail(cause)
         }
-      } catch {
+      catch
         case cause: Throwable => onFail(cause)
-      }
-    }
 
     retry(1)
 
     p.future
-  }
 
-  def retryUntilSuccessful[T](onAttemptFailure: Throwable => Future[Unit])(attempt: => Future[T]): Future[T] = {
+  def retryUntilSuccessful[T](onAttemptFailure: Throwable => Future[Unit])(attempt: => Future[T]): Future[T] =
     val p = Promise[T]()
 
     given ExecutionContext = client.clientContext
 
-    def scheduleNextAttempt(retryCount: Int): Unit = {
+    def scheduleNextAttempt(retryCount: Int): Unit =
       var countdown = retryCount
       var window = 2
 
-      while (countdown > 0 && countdown < backoffLimit) {
+      while countdown > 0 && countdown < backoffLimit do
         window = window * 2
         countdown -= 1
-      }
 
-      if (countdown > backoffLimit)
+      if countdown > backoffLimit then
         window = backoffLimit
 
       val rand = new java.util.Random
@@ -89,44 +81,37 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
       client.backgroundTasks.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)
       }
-    }
 
-    def retry(retryCount: Int): Unit = {
+    def retry(retryCount: Int): Unit =
       val shouldExit = synchronized { exit }
 
-      if (shouldExit)
+      if shouldExit then
         return
 
-      def onFail(cause: Throwable): Unit = {
-        cause match {
+      def onFail(cause: Throwable): Unit =
+        cause match
           case StopRetrying(reason) => p.failure(reason)
           case _ =>
-            try {
+            try
               onAttemptFailure(cause) onComplete {
                 case Success(_) => scheduleNextAttempt(retryCount)
                 case Failure(StopRetrying(reason)) => p.failure(reason)
                 case Failure(_) => scheduleNextAttempt(retryCount)
               }
-            } catch {
+            catch
               case StopRetrying(reason) => p.failure(reason)
               case cause: Throwable => scheduleNextAttempt(retryCount)
-            }
-        }
-      }
 
-      try {
+      try
         attempt onComplete {
           case Success(result) => p.success(result)
 
           case Failure(cause) => onFail(cause)
         }
-      } catch {
+      catch
         case cause: Throwable => onFail(cause)
-      }
-    }
 
     retry(1)
 
     p.future
-  }
 }

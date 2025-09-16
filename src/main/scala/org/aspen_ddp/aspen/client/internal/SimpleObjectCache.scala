@@ -13,13 +13,11 @@ class SimpleObjectCache extends ObjectCache {
     .maximumSize(50)
     .build[ObjectId, ObjectState]()
 
-  def get(pointer: DataObjectPointer): Option[DataObjectState] = {
+  def get(pointer: DataObjectPointer): Option[DataObjectState] =
     cache.getIfPresent(pointer.id).map(_.asInstanceOf[DataObjectState])
-  }
 
-  def get(pointer: KeyValueObjectPointer): Option[KeyValueObjectState] = {
+  def get(pointer: KeyValueObjectPointer): Option[KeyValueObjectState] =
     cache.getIfPresent(pointer.id).map(_.asInstanceOf[KeyValueObjectState])
-  }
 
   /** To be called ONLY by read drivers */
   private[client] def put(pointer: ObjectPointer, dos: ObjectState): Unit = cache.put(pointer.id, dos)

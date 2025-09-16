@@ -25,7 +25,7 @@ class AllocationFinalizationAction(val client: AspenClient,
     for {
       pool <- someOrThrow(client.getStoragePool(newObject.poolId), StopRetrying(new Exception("Storage Pool Does Not Exist")))
       tx = client.newTransaction()
-      _ <- pool.allocationTree.set(Key(newObject.id.toBytes), Value(newObject.toArray))(tx)
+      _ <- pool.allocationTree.set(Key(newObject.id.toBytes), Value(newObject.toArray))(using tx)
       _ <- tx.commit()
     } yield {
       logger.debug(s"AllocationFA Completed Successfully for Tx ${txd.transactionId}, Object ${newObject.id}")

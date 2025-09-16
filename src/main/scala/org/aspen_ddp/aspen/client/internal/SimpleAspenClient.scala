@@ -21,7 +21,7 @@ import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
 
 class SimpleAspenClient(val msngr: ClientMessenger,
                         override val clientId: ClientId,
-                        implicit val executionContext: ExecutionContext,
+                        val executionContext: ExecutionContext,
                         val radicle: KeyValueObjectPointer,
                         txStatusCacheDuration: FiniteDuration,
                         initialReadDelay: Duration,
@@ -29,6 +29,8 @@ class SimpleAspenClient(val msngr: ClientMessenger,
                         txRetransmitDelay: Duration,
                         allocationRetransmitDelay: Duration,
                         bootstrapHosts: Map[HostId, Host]) extends AspenClient {
+  
+  given ec: ExecutionContext = executionContext
 
   var attributes: Map[String, String] = Map()
 
@@ -77,7 +79,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
     val tkvl = new TieredKeyValueList(this, root)
 
-    implicit val tx: Transaction = newTransaction()
+    given tx: Transaction = newTransaction()
     
     def updateConfig(config: StoragePool.Config): Unit =
       config.storeHosts(storeId.poolIndex) = newHostId
@@ -107,7 +109,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     val nameRoot = new KVObjectRootManager(this, Radicle.PoolNameTreeKey, radicle)
     val nameTkvl = new TieredKeyValueList(this, nameRoot)
 
-    implicit val tx: Transaction = newTransaction()
+    given tx: Transaction = newTransaction()
 
     def createPoolObj(alloc: ObjectAllocator): Future[KeyValueObjectPointer] =
       for

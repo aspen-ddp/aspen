@@ -72,7 +72,7 @@ class TKVLSuite extends IntegrationTestSuite {
       tree <- root.getTree()
 
       tx = client.newTransaction()
-      _ <- tree.set(key2, value2)(tx)
+      _ <- tree.set(key2, value2)(using tx)
       r <- tx.commit()
       _ <- waitForTransactionsToComplete()
 
@@ -116,11 +116,11 @@ class TKVLSuite extends IntegrationTestSuite {
       tree <- root.getTree()
 
       tx = client.newTransaction()
-      _ <- tree.set(key2, value2)(tx)
+      _ <- tree.set(key2, value2)(using tx)
       r <- tx.commit()
 
       tx = client.newTransaction()
-      _ <- tree.set(key3, value3)(tx)
+      _ <- tree.set(key3, value3)(using tx)
       r <- tx.commit()
 
       // Wait for background transactions complete since the tree is updated
@@ -170,27 +170,27 @@ class TKVLSuite extends IntegrationTestSuite {
       tree <- root.getTree()
 
       tx = client.newTransaction()
-      _ <- tree.set(key2, value2)(tx)
+      _ <- tree.set(key2, value2)(using tx)
       r <- tx.commit()
       _ <- waitForTransactionsToComplete()
 
       _ <- waitForTransactionsToComplete()
 
       tx = client.newTransaction()
-      _ <- tree.set(key3, value3)(tx)
+      _ <- tree.set(key3, value3)(using tx)
       r <- tx.commit()
 
       _ <- waitForTransactionsToComplete()
 
       tx = client.newTransaction()
-      _ <- tree.delete(key2)(tx)
+      _ <- tree.delete(key2)(using tx)
 
       r <- tx.commit()
 
       _ <- waitForTransactionsToComplete()
 
       tx = client.newTransaction()
-      _ <- tree.delete(key)(tx)
+      _ <- tree.delete(key)(using tx)
       _ <- tx.commit()
 
       _ <- waitForTransactionsToComplete()

@@ -26,7 +26,7 @@ class JoinFinalizationAction(val client: AspenClient,
     val fcomplete = client.retryStrategy.retryUntilSuccessful {
 
       def setNewRoot(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
-        implicit val tx: Transaction = client.newTransaction()
+        given tx: Transaction = client.newTransaction()
 
         // Root node always has a pointer to the AbsoluteMinimum node
         val newRoot = KeyValueObjectPointer(rootNode.contents(Key.AbsoluteMinimum).value.bytes)
@@ -51,7 +51,7 @@ class JoinFinalizationAction(val client: AspenClient,
               if (!node.contents.contains(deleteMinimum))
                 Future.successful(())
               else {
-                implicit val tx: Transaction = client.newTransaction()
+                given tx: Transaction = client.newTransaction()
 
                 def onJoin(min: Key, ptr: KeyValueObjectPointer): Future[Unit] = {
                   JoinFinalizationAction.addToTransaction(rootManager, tier + 1, min, ptr, tx)

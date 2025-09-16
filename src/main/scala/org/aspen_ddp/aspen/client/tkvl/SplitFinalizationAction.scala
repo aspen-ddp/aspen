@@ -29,7 +29,7 @@ class SplitFinalizationAction(val client: AspenClient,
 
       def createNewRoot(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
 
-        implicit val tx: Transaction = client.newTransaction()
+        given tx: Transaction = client.newTransaction()
 
         val rootContent = Map(
           rootNode.minimum -> Value(rootNode.pointer.toArray),
@@ -47,7 +47,7 @@ class SplitFinalizationAction(val client: AspenClient,
 
       def insertIntoExistingTier(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
 
-        implicit val tx: Transaction = client.newTransaction()
+        given tx: Transaction = client.newTransaction()
 
         val fe = TieredKeyValueList.fetchContainingNode(client, rootTier, tier, ordering, newMinimum, rootNode, Set())
         val fnodeSize = rootManager.getMaxNodeSize(tier)

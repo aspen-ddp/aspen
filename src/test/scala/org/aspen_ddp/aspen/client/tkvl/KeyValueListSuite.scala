@@ -69,7 +69,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 100, alloc)(tx2)
+      _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -114,7 +114,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 40, alloc)(tx2)
+      _ <- lst.insert(key2, value2, 40, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -158,7 +158,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 40, alloc)(tx2)
+      _ <- lst.insert(key2, value2, 40, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -205,7 +205,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 100, alloc)(tx2)
+      _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -213,7 +213,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx3 = client.newTransaction()
-      _ <- lst.insert(key3, value3, 60, alloc)(tx3)
+      _ <- lst.insert(key3, value3, 60, alloc)(using tx3)
 
       _ <- tx3.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -258,13 +258,13 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 40, alloc)(tx2)
+      _ <- lst.insert(key2, value2, 40, alloc)(using tx2)
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
 
       tx3 = client.newTransaction()
-      _ <- lst.insert(key3, value3, 200, alloc)(tx3)
+      _ <- lst.insert(key3, value3, 200, alloc)(using tx3)
       _ <- tx3.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
@@ -272,7 +272,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       preNuc <- client.read(lptr)
 
       tx4 = client.newTransaction()
-      _ <- lst.delete(key)(tx4)
+      _ <- lst.delete(key)(using tx4)
       _ <- tx4.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
@@ -330,13 +330,13 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 100, alloc)(tx2)
+      _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
 
       tx3 = client.newTransaction()
-      _ <- lst.delete(key)(tx3)
+      _ <- lst.delete(key)(using tx3)
       _ <- tx3.commit().map(_=>())
       lst <- lst.refresh()
 

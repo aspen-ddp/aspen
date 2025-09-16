@@ -41,7 +41,7 @@ object Root {
              guard: AllocationRevisionGuard,
              ordering: KeyOrdering,
              nodeAllocator: NodeAllocator,
-             initialContent: Map[Key, Value] = Map())(implicit t: Transaction): Future[Root] = {
+             initialContent: Map[Key, Value] = Map())(using t: Transaction): Future[Root] = {
 
     given ExecutionContext = client.clientContext
 

@@ -47,7 +47,7 @@ class TieredKeyValueList(val client: AspenClient,
   def set(key: Key,
           value: Value,
           requirement: Option[Either[Boolean, ObjectRevision]] = None)
-         (implicit t: Transaction): Future[Unit] = {
+         (using t: Transaction): Future[Unit] = {
     logger.trace("Beginning TKVL Set Operation")
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
@@ -85,7 +85,7 @@ class TieredKeyValueList(val client: AspenClient,
     }
   }
 
-  def delete(key: Key)(implicit t: Transaction): Future[Unit] = {
+  def delete(key: Key)(using t: Transaction): Future[Unit] = {
     def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.successful(())
@@ -114,7 +114,7 @@ class TieredKeyValueList(val client: AspenClient,
 
   def delete(key: Key, 
              requiredRevision: Option[ObjectRevision],
-             requirements: List[KeyValueUpdate.KeyRequirement])(implicit t: Transaction): Future[Unit] = {
+             requirements: List[KeyValueUpdate.KeyRequirement])(using t: Transaction): Future[Unit] = {
     def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.successful(())

@@ -389,7 +389,7 @@ object Main {
       _=println("------------ New Root Manager---------------")
       frootMgr <- KVObjectRootManager.createNewTree(client, kvos.pointer, Key(100), ByteArrayKeyOrdering,
         new SinglePoolNodeAllocator(client, kvos.pointer.poolId),
-        Map(Key(0) -> Value(Array[Byte](1,2,3))))(tx)
+        Map(Key(0) -> Value(Array[Byte](1,2,3))))(using tx)
       _=println("------------ New Root Manager Step 2---------------")
 
       _ <- tx.commit()
@@ -402,7 +402,7 @@ object Main {
       tkvl = new TieredKeyValueList(client, rootMgr)
 
       _=println("------------ Setting Key(1) ---------------")
-      _ <- tkvl.set(Key(2), Value(Array[Byte](1,2,3)))(tx)
+      _ <- tkvl.set(Key(2), Value(Array[Byte](1,2,3)))(using tx)
 
       _=println("------------ Committing! ---------------")
       _ <- tx.commit()
@@ -541,7 +541,7 @@ object Main {
 
     def deleteErrorEntry(node: KeyValueListNode, key: Key): Future[Unit] =
       val tx = client.newTransaction()
-      val fdelete = node.delete(key)(tx)
+      val fdelete = node.delete(key)(using tx)
       for
         _ <- fdelete
         _ <- tx.commit()
@@ -554,7 +554,7 @@ object Main {
       val fdeletePrep = node.delete(key,
         None,
         List(KeyValueUpdate.TimestampLessThan(key, timestamp)),
-        (_,_) => Future.successful(()))(tx)
+        (_,_) => Future.successful(()))(using tx)
       for
         _ <- fdeletePrep
         _ <- tx.commit()

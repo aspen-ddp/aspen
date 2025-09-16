@@ -21,7 +21,7 @@ abstract class BaseReadDriver(
                                val disableOpportunisticRebuild: Boolean = false
                     ) extends ReadDriver with Logging {
 
-  implicit protected val ec: ExecutionContext
+  given ec: ExecutionContext
 
   logger.info(s"Read UUID $readUUID: Beginning read of ${objectPointer.objectType} object ${objectPointer.id}. Comment: $comment")
 
@@ -182,7 +182,7 @@ object BaseReadDriver {
 
     new BaseReadDriver(client, objectPointer, readUUID, comment) {
 
-      implicit protected val ec: ExecutionContext = this.client.clientContext
+      given ec: ExecutionContext = this.client.clientContext
 
       var hung = false
 

@@ -25,7 +25,7 @@ class DeletionFinalizationAction(val client: AspenClient,
       for {
         pool <- client.getStoragePool(deletedObject.poolId)
         tx = client.newTransaction()
-        _ <- pool.get.allocationTree.delete(Key(deletedObject.id.toBytes))(tx)
+        _ <- pool.get.allocationTree.delete(Key(deletedObject.id.toBytes))(using tx)
         _ <- tx.commit()
       } yield {
         completionPromise.success(())

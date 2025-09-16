@@ -23,7 +23,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
 
   def set(key: Key,
           value: Value,
-          requirement: Option[Either[Boolean, ObjectRevision]] = None)(implicit t: Transaction): Future[Unit] = {
+          requirement: Option[Either[Boolean, ObjectRevision]] = None)(using t: Transaction): Future[Unit] = {
 
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(tkvl.rootManager, 1, newMinimum, newNode, t)
@@ -40,7 +40,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
     }
   }
 
-  def delete(key: Key)(implicit t: Transaction): Future[Unit] = {
+  def delete(key: Key)(using t: Transaction): Future[Unit] = {
     def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
       JoinFinalizationAction.addToTransaction(tkvl.rootManager, 1, delMinimum, delNode, t)
       Future.successful(())
@@ -50,7 +50,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
   }
 
   /** May only be used on nodes that contain both the old and new key */
-  def rename(oldKey: Key, newKey: Key)(implicit t: Transaction): Future[Unit] = {
+  def rename(oldKey: Key, newKey: Key)(using t: Transaction): Future[Unit] = {
     assert(node.keyInRange(oldKey) && node.keyInRange(newKey))
 
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {

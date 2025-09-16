@@ -39,7 +39,7 @@ class SimpleReadDriver(
                         disableOpportunisticRebuild: Boolean) extends BaseReadDriver( client,
   objectPointer, readUUID, comment, disableOpportunisticRebuild) {
 
-  implicit protected val ec: ExecutionContext = client.clientContext
+  given ec: ExecutionContext = client.clientContext
 
   private[this] var task: Option[BackgroundTask.ScheduledTask] = None
 

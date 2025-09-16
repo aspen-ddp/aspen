@@ -83,7 +83,7 @@ class KVObjectRootManager(val client: AspenClient,
     arr
   }
 
-  def prepareRootUpdate(newTier: Int, newRoot: KeyValueObjectPointer)(implicit tx: Transaction): Future[Unit] = {
+  def prepareRootUpdate(newTier: Int, newRoot: KeyValueObjectPointer)(using tx: Transaction): Future[Unit] = {
     getRoot().map { rd =>
       if (rd.root.tier != newTier) {
         val data = rd.root.copy(tier=newTier, orootObject=Some(newRoot)).encode()
@@ -103,7 +103,7 @@ class KVObjectRootManager(val client: AspenClient,
     }
   }
 
-  def createInitialNode(contents: Map[Key,Value])(implicit tx: Transaction): Future[AllocationRevisionGuard] = {
+  def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[AllocationRevisionGuard] = {
     for {
       RData(root, _, _) <- getRoot()
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
@@ -147,7 +147,7 @@ object KVObjectRootManager extends RegisteredTypeFactory with RootManagerFactory
                     key: Key,
                     ordering: KeyOrdering,
                     nodeAllocator: NodeAllocator,
-                    initialContent: Map[Key,Value])(implicit tx: Transaction): Future[Future[KVObjectRootManager]] = {
+                    initialContent: Map[Key,Value])(using tx: Transaction): Future[Future[KVObjectRootManager]] = {
 
     given ExecutionContext = client.clientContext
 

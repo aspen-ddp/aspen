@@ -84,7 +84,7 @@ class KeyValueListNode(val reader: ObjectReader,
              allocator: ObjectAllocator,
              prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
              requirement: Option[Either[Boolean, ObjectRevision]] = None
-            )(implicit tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
+            )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
     logger.trace(s"KeyValueListNode got containing node for key $key. Min: ${node.minimum}")
     KeyValueListNode.insert(node, ordering, key, value, maxNodeSize, allocator, prepareForSplit, requirement)
   }
@@ -94,13 +94,13 @@ class KeyValueListNode(val reader: ObjectReader,
              maxNodeSize: Int,
              allocator: ObjectAllocator,
              prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
-            )(implicit tx: Transaction): Future[Unit] = fetchContainingNode(oldKey).flatMap { node =>
+            )(using tx: Transaction): Future[Unit] = fetchContainingNode(oldKey).flatMap { node =>
     KeyValueListNode.rename(node, ordering, oldKey, newKey, maxNodeSize, allocator, prepareForSplit)
   }
 
   def delete(key: Key,
              prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(())
-            )(implicit tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
+            )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
     KeyValueListNode.delete(node, key, reader, prepareForJoin)
   }
 
@@ -108,7 +108,7 @@ class KeyValueListNode(val reader: ObjectReader,
              requiredRevision: Option[ObjectRevision],
              requirements: List[KeyValueUpdate.KeyRequirement],
              prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit]
-            )(implicit tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
+            )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
     KeyValueListNode.delete(node, key, requiredRevision, requirements, reader, prepareForJoin)
   }
 
@@ -249,7 +249,7 @@ object KeyValueListNode {
                      allocator: ObjectAllocator,
                      prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
                      requirement: Option[Either[Boolean, ObjectRevision]] = None
-                    )(implicit tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
+                    )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
 
     val currentSize = node.contents.foldLeft(0) { (sz, t) =>
       sz + KVObjectState.idaEncodedPairSize(node.pointer.ida, t._1, t._2.value)
@@ -342,7 +342,7 @@ object KeyValueListNode {
                      maxNodeSize: Int,
                      allocator: ObjectAllocator,
                      prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
-                    )(implicit tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
+                    )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
 
     assert(node.contents.contains(oldKey))
 
@@ -427,7 +427,7 @@ object KeyValueListNode {
   def delete(node: KeyValueListNode,
              key: Key,
              reader: ObjectReader,
-             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()))(implicit tx: Transaction, ec: ExecutionContext): Future[Unit] = {
+             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()))(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
 
     if (! node.contents.contains(key))
       Future.successful(())
@@ -471,7 +471,7 @@ object KeyValueListNode {
              requiredRevision: Option[ObjectRevision],
              requirements: List[KeyValueUpdate.KeyRequirement],
              reader: ObjectReader,
-             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit])(implicit tx: Transaction, ec: ExecutionContext): Future[Unit] = {
+             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit])(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
 
     if (!node.contents.contains(key))
       Future.successful(())

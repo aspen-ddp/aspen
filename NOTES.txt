@@ -8,6 +8,9 @@
     Use the following path to the SDK:
         /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home
 
+# Run only a single test suite
+sbt 'testOnly org.aspen_ddp.aspen.common.DataBufferSuite'
+
 # Run single test. Where "min/max" identifies a test containing this substring
 sbt 'testOnly *KeyValueObjectReaderSuite -- -z min/max'
 

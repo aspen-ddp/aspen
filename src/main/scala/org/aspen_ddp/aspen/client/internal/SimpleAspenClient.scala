@@ -41,19 +41,16 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   private val rmgr = new ReadManager(this,
     new SimpleReadDriver.Factory(initialReadDelay, maxReadDelay).apply)
 
-  def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] = {
+  def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
     rmgr.read(pointer, comment).map(_.asInstanceOf[DataObjectState])
-  }
 
-  def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = {
+  def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
     rmgr.read(pointer, comment).map(_.asInstanceOf[KeyValueObjectState])
-  }
 
   private val txManager = new TransactionManager(this, SimpleClientTransactionDriver.factory(txRetransmitDelay))
 
-  def newTransaction(): Transaction = {
-    new TransactionImpl(this, txManager, _ => 0, None)
-  }
+  def newTransaction(): Transaction =
+    TransactionImpl(this, txManager, _ => 0, None)
 
   def getStoragePool(poolId: PoolId): Future[Option[StoragePool]] =
     val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
@@ -184,13 +181,12 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   val objectCache: ObjectCache = new SimpleObjectCache
 
-  def receiveClientResponse(msg: ClientResponse): Unit = msg match {
+  def receiveClientResponse(msg: ClientResponse): Unit = msg match
     case m: ReadResponse => rmgr.receive(m)
     case m: TransactionCompletionResponse => rmgr.receive(m)
     case m: TransactionResolved => txManager.receive(m)
     case m: TransactionFinalized => txManager.receive(m)
     case m: AllocateResponse => allocationManager.receive(m)
-  }
 
   def getSystemAttribute(key: String): Option[String] = attributes.get(key)
   def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value

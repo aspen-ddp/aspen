@@ -20,7 +20,7 @@ object BufferedConsistentRocksDB {
   *  is done and no outstanding commit exists, a commit for that single operation is immediately started.
   *
   */
-class BufferedConsistentRocksDB(val dbPath:Path)(implicit ec: ExecutionContext) {
+class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) {
 
   import BufferedConsistentRocksDB._
 

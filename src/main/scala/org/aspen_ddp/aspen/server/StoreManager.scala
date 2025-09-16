@@ -45,7 +45,7 @@ object StoreManager {
 }
 
 class StoreManager(val rootDir: Path,
-                   implicit val ec: ExecutionContext,
+                   val ec: ExecutionContext,
                    val objectCacheFactory: () => ObjectCache,
                    val net: Messenger,
                    val backgroundTasks: BackgroundTask,
@@ -55,6 +55,8 @@ class StoreManager(val rootDir: Path,
                    val storeLoader: BackendStoreLoader,
                    val heartbeatPeriod: Duration) extends Logging {
   import StoreManager._
+  
+  given ecGiven: ExecutionContext = ec
 
   private val events = new LinkedBlockingQueue[Event]()
 
@@ -143,7 +145,7 @@ class StoreManager(val rootDir: Path,
   def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
     events.put(Repair(storeId, os, completion))
 
-  def shutdown()(implicit ec: ExecutionContext): Future[Unit] = {
+  def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     events.put(Exit())
     shutdownPromise.future
   }

@@ -9,7 +9,7 @@ trait SimpleDriverRecoveryMixin extends StoreManager {
 
   private[this] var periodicTask = backgroundTasks.schedulePeriodic(checkPeriod) { addRecoveryEvent() }
 
-  override def shutdown()(implicit ec: ExecutionContext): Future[Unit] = {
+  override def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     periodicTask.cancel()
     super.shutdown()
   }

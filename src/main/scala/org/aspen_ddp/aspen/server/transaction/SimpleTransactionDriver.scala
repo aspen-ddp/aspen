@@ -37,7 +37,7 @@ class SimpleTransactionDriver(
                               messenger: Messenger,
                               backgroundTasks: BackgroundTask,
                               txd: TransactionDescription,
-                              finalizerFactory: TransactionFinalizer.Factory)(implicit ec: ExecutionContext) extends TransactionDriver(
+                              finalizerFactory: TransactionFinalizer.Factory)(using ec: ExecutionContext) extends TransactionDriver(
   storeId, messenger, backgroundTasks, txd, finalizerFactory) {
 
   private[this] var backoffDelay = initialDelay

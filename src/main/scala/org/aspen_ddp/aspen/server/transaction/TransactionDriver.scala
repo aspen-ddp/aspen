@@ -82,7 +82,7 @@ abstract class TransactionDriver(
                                   val messenger: Messenger,
                                   val backgroundTasks: BackgroundTask,
                                   val txd: TransactionDescription,
-                                  private val finalizerFactory: TransactionFinalizer.Factory)(implicit ec: ExecutionContext) extends Logging {
+                                  private val finalizerFactory: TransactionFinalizer.Factory)(using ec: ExecutionContext) extends Logging {
   def ida: IDA = txd.primaryObject.ida
 
   protected val proposer: Proposer = new Proposer(storeId.poolIndex, ida.width, ida.writeThreshold)

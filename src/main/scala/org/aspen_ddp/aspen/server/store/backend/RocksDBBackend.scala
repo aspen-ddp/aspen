@@ -52,9 +52,11 @@ object RocksDBBackend {
 
 class RocksDBBackend(dbPath:Path,
                      override val storeId: StoreId,
-                     implicit val executionContext: ExecutionContext) extends Backend {
+                     val executionContext: ExecutionContext) extends Backend {
 
   import RocksDBBackend._
+  
+  given ecGiven: ExecutionContext = executionContext
 
   private[this] var chandler: Option[CompletionHandler] = None
 

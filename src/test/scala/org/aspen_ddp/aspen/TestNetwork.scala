@@ -200,9 +200,9 @@ class TestNetwork extends ServerMessenger {
       rfa.create(txd, messenger)
     }
   }
-  
+
   val storeLoader = new BackendStoreLoader {
-    override def loadStoreFromPath(storePath: Path)(implicit ec: ExecutionContext): Option[Backend] = ???
+    override def loadStoreFromPath(storePath: Path)(using ec: ExecutionContext): Option[Backend] = ???
   }
 
   val smgr = new StoreManager(Path.of("/"),

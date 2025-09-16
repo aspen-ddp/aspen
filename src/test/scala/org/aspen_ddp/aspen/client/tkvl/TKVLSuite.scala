@@ -14,7 +14,7 @@ class TKVLSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](2))
     val value = Value(Array[Byte](3))
 
-    implicit val tx1: Transaction = client.newTransaction()
+    given tx1: Transaction = client.newTransaction()
 
     for {
       ikvos <- client.read(radicle)
@@ -52,7 +52,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
     val value2 = Value(new Array[Byte](512*1024))
 
-    implicit val tx1: Transaction = client.newTransaction()
+    given tx1: Transaction = client.newTransaction()
 
     for {
       ikvos <- client.read(radicle)
@@ -96,7 +96,7 @@ class TKVLSuite extends IntegrationTestSuite {
     val key3 = Key(Array[Byte](5))
     val value3 = Value(new Array[Byte](512*1024))
 
-    implicit val tx1: Transaction = client.newTransaction()
+    given tx1: Transaction = client.newTransaction()
 
     for {
       ikvos <- client.read(radicle)
@@ -150,7 +150,7 @@ class TKVLSuite extends IntegrationTestSuite {
     val key3 = Key(Array[Byte](7))
     val value3 = Value(new Array[Byte](512*1024))
 
-    implicit val tx1: Transaction = client.newTransaction()
+    given tx1: Transaction = client.newTransaction()
 
     for {
       ikvos <- client.read(radicle)

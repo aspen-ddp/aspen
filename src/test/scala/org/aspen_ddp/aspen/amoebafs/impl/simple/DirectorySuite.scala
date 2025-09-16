@@ -306,7 +306,8 @@ class DirectorySuite extends FilesSystemTestSuite:
         fprep.foreach(_ => tx.commit())
         fprep.flatMap(fresult => fresult)
       us <- fs.loadBlockDevice(sptr)
-      _ <- fs.client.transact { implicit tx =>
+      _ <- fs.client.transact { tx =>
+        given t: Transaction = tx
         rootDir.prepareHardLink("bar", us)
       }
       us2 <- fs.loadBlockDevice(sptr)

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen
 
-import org.aspen_ddp.aspen.client.KeyValueObjectState
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, ObjectRevisionGuard, Value}
@@ -46,7 +46,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
-    implicit val tx = client.newTransaction()
+    given tx: Transaction = client.newTransaction()
 
     for {
       ikvos <- client.read(radicle)
@@ -79,7 +79,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
-    implicit val tx = client.newTransaction()
+    given tx: Transaction = client.newTransaction()
 
     tx.update(radicle,
       None,
@@ -117,7 +117,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
-    implicit val tx = client.newTransaction()
+    given tx: Transaction = client.newTransaction()
 
     for {
       ikvos <- client.read(radicle)

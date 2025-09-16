@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRefcount, ObjectRevisionGuard, Value}
@@ -13,7 +14,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
-    implicit val tx = client.newTransaction()
+    given tx: Transaction = client.newTransaction()
 
     for {
       ikvos <- client.read(radicle)

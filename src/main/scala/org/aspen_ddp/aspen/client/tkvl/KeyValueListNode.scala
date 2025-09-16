@@ -509,4 +509,56 @@ object KeyValueListNode {
       }
     }
   }
+
+  private def splitAt(node: KeyValueListNode,
+                      ordering: KeyOrdering,
+                      splitAtKey: Key,
+                      optionalDownPointer: Option[KeyValueObjectPointer],
+                      maxNodeSize: Int,
+                      allocator: ObjectAllocator,
+                     )(using tx: Transaction, ec: ExecutionContext): Future[KeyValueListPointer] = 
+
+    require(ordering.compare(splitAtKey, Key.AbsoluteMinimum) > 0)
+    
+    // There is a potential edge case where a full node is split with all
+    // of the contents going into the right node. In this case, there is no
+    // room left to insert the optional down pointer. To avoid this we can
+    // always allocate 2 nodes. The optional down pointer will be always be
+    // inserted into the new left node. If no optional pointer is provided,
+    // the new left node will be empty. Minor performance issue but this 
+    // implementation is aimed at partitioning threes for the purpose of
+    // slow deletion so it should be a non-issue.
+    
+    val (leftContents, rightContents) = node.contents.partition((k,v) => ordering.compare(k, splitAtKey) < 0)
+
+    val newLeftContent = optionalDownPointer match
+      case None => Map()
+      case Some(dptr) => Map(Key.AbsoluteMinimum -> Value(dptr.toArray))
+
+    tx.update(
+      node.pointer,
+      Some(node.revision),
+      Some(node.fullContentLock),
+      Nil,
+      SetMax(splitAtKey) :: DeleteRight() :: rightContent.map((k,v) => Delete(k)))
+    
+    for 
+      newRightPtr <- allocator.allocateKeyValueObject(
+        ObjectRevisionGuard(node.pointer, node.revision),
+        rightContents.map((k,vs) => (k -> vs.value)),
+        Some(splitAtKey),
+        None,
+        None,
+        node.tail.map(p => Value(p.toArray)))
+      
+      newLeftPtr <- allocator.allocateKeyValueObject(
+        ObjectRevisionGuard(node.pointer, node.revision),
+        newLeftContent,
+        None,
+        Some(splitAtKey),
+        None,
+        Some(Value(newRightPtr.toArray)))
+    yield
+      KeyValueListPointer(Key.AbsoluteMinimum, newLeftPtr)
+  
 }

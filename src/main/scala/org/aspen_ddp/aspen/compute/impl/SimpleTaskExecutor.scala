@@ -29,7 +29,7 @@ object SimpleTaskExecutor {
                         executorAllocator: ObjectAllocator,
                         taskStateAllocator: ObjectAllocator,
                         revisionGuard: AllocationRevisionGuard)
-                       (implicit t: Transaction): Future[(KeyValueObjectPointer, SimpleTaskExecutor)] = {
+                       (using t: Transaction): Future[(KeyValueObjectPointer, SimpleTaskExecutor)] = {
 
     given ExecutionContext = client.clientContext
 
@@ -89,7 +89,8 @@ class SimpleTaskExecutor(val client: AspenClient,
         }
       }
     }
-    client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail) { implicit tx =>
+    client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail) { tx =>
+      given tx2: Transaction = tx
       synchronized {
         val guard = ObjectRevisionGuard(executorObject, executorRevision)
         val taskKey = Key(UUID.randomUUID())
@@ -105,7 +106,9 @@ class SimpleTaskExecutor(val client: AspenClient,
   }
 
   private def deallocateTask(task: DurableTaskPointer): Unit = {
-    client.transactUntilSuccessful[Unit] { implicit tx =>
+    client.transactUntilSuccessful[Unit] { tx =>
+      given tx2: Transaction = tx
+      
       client.read(task.kvPointer).map { kvos =>
         val deletes = kvos.contents.keys.map(k => Delete(k)).toList
         tx.update(task.kvPointer, None, None, Nil, deletes)
@@ -121,7 +124,7 @@ class SimpleTaskExecutor(val client: AspenClient,
 
   override def prepareTask(taskType: DurableTaskType,
                            initialState: List[(Key, Array[Byte])])
-                          (implicit tx: Transaction): Future[Future[Option[AnyRef]]] = synchronized {
+                          (using tx: Transaction): Future[Future[Option[AnyRef]]] = synchronized {
 
     val initial = initialState.map(t => Insert(t._1, t._2))
 

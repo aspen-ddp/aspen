@@ -31,7 +31,7 @@ sealed abstract class KeyValueOperation {
     val dataLen = dataLength(ida)
 
     for (bb <- bbArray) {
-      bb.put( opcode.asInstanceOf[Byte] )
+      bb.put( opcode.toByte )
       Varint.putUnsignedInt(bb, dataLen)
     }
 
@@ -41,7 +41,7 @@ sealed abstract class KeyValueOperation {
   final protected def encodeReplicated(bb: ByteBuffer): Unit = {
     val dataLen = dataLength
 
-    bb.put( opcode.asInstanceOf[Byte] )
+    bb.put( opcode.toByte )
     Varint.putUnsignedInt(bb, dataLen)
     putData(bb)
   }
@@ -55,20 +55,20 @@ sealed abstract class KeyValueOperation {
   *           remainder is the kind of encoded entry.
   */
 object KeyValueOperation {
-  val HasRevisionMask: Byte  = (1 << 7).asInstanceOf[Byte]
-  val HasTimestampMask: Byte = (1 << 6).asInstanceOf[Byte]
-  val CodeMask: Byte         = (0xFF & ~(HasRevisionMask | HasTimestampMask)).asInstanceOf[Byte]
+  val HasRevisionMask: Byte  = (1 << 7).toByte
+  val HasTimestampMask: Byte = (1 << 6).toByte
+  val CodeMask: Byte         = (0xFF & ~(HasRevisionMask | HasTimestampMask)).toByte
 
-  val SetMinCode: Byte      = 0.asInstanceOf[Byte] // Replicated
-  val SetMaxCode: Byte      = 1.asInstanceOf[Byte] // Replicated
-  val SetLeftCode: Byte     = 2.asInstanceOf[Byte] // IDA-encoded
-  val SetRightCode: Byte    = 3.asInstanceOf[Byte] // IDA-encoded
-  val InsertCode: Byte      = 4.asInstanceOf[Byte] // IDA-encoded value
-  val DeleteCode: Byte      = 5.asInstanceOf[Byte] // Not stored
-  val DeleteMinCode: Byte   = 6.asInstanceOf[Byte] // Not stored
-  val DeleteMaxCode: Byte   = 7.asInstanceOf[Byte] // Not stored
-  val DeleteLeftCode: Byte  = 8.asInstanceOf[Byte] // Not stored
-  val DeleteRightCode: Byte = 9.asInstanceOf[Byte] // Not stored
+  val SetMinCode: Byte      = 0.toByte // Replicated
+  val SetMaxCode: Byte      = 1.toByte // Replicated
+  val SetLeftCode: Byte     = 2.toByte // IDA-encoded
+  val SetRightCode: Byte    = 3.toByte // IDA-encoded
+  val InsertCode: Byte      = 4.toByte // IDA-encoded value
+  val DeleteCode: Byte      = 5.toByte // Not stored
+  val DeleteMinCode: Byte   = 6.toByte // Not stored
+  val DeleteMaxCode: Byte   = 7.toByte // Not stored
+  val DeleteLeftCode: Byte  = 8.toByte // Not stored
+  val DeleteRightCode: Byte = 9.toByte // Not stored
 
   def getArray(bb: ByteBuffer, nbytes: Int): Array[Byte] = {
     val arr = new Array[Byte](nbytes)

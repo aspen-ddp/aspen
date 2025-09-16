@@ -62,12 +62,12 @@ object DataObjectReaderSuite {
   val t3 = HLCTimestamp(3)
 
   def err(store: Int, e: ReadError.Value): ReadResponse = {
-    ReadResponse(client, StoreId(pool, store.asInstanceOf[Byte]), readUUID, HLCTimestamp.Zero, Left(e))
+    ReadResponse(client, StoreId(pool, store.toByte), readUUID, HLCTimestamp.Zero, Left(e))
   }
 
   def ok(store: Int, rev: ObjectRevision, ts: HLCTimestamp): ReadResponse = {
     val cs = ReadResponse.CurrentState(rev, ObjectRefcount(0,0), ts, 0, None, Set())
-    ReadResponse(client, StoreId(pool, store.asInstanceOf[Byte]), readUUID, HLCTimestamp.Zero, Right(cs))
+    ReadResponse(client, StoreId(pool, store.toByte), readUUID, HLCTimestamp.Zero, Right(cs))
   }
 
 

@@ -40,7 +40,7 @@ class AllocationManager(val client: AspenClient,
                                                     ): Future[PointerType] = {
 
     val hosts = pool.selectStoresForAllocation(objectIDA)
-    val objectData = hosts.map(_.asInstanceOf[Byte]).zip(encodedContent).toMap
+    val objectData = hosts.map(_.toByte).zip(encodedContent).toMap
     val newObjectId = ObjectId(UUID.randomUUID())
 
     val timestamp = HLCTimestamp.now

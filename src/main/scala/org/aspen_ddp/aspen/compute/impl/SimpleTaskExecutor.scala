@@ -12,7 +12,7 @@ import scala.concurrent.{ExecutionContext, Future}
 
 object SimpleTaskExecutor {
 
-  val TaskTypeKey = new Key(Array(0xFF.asInstanceOf[Byte]))
+  val TaskTypeKey = new Key(Array(0xFF.toByte))
 
   def apply(client: AspenClient,
             registeredTasks: Map[UUID, DurableTaskType],

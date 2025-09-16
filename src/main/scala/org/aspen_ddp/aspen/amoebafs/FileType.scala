@@ -23,7 +23,7 @@ object FileType extends Enumeration {
     case S_IFDIR  => Directory
     case S_IFCHR  => CharacterDevice
     case S_IFFIFO => FIFO
-    case _        => throw InvalidPointer((mode & S_IFMT).asInstanceOf[Byte])
+    case _        => throw InvalidPointer((mode & S_IFMT).toByte)
   }
 
   def toMode(value: Value): Int = value match {
@@ -49,7 +49,7 @@ object FileType extends Enumeration {
       case FIFO            => 6
     }
 
-    i.asInstanceOf[Byte]
+    i.toByte
   }
 
   def fromByte(b: Byte): Value = b match {

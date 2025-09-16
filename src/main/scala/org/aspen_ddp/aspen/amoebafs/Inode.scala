@@ -43,7 +43,7 @@ object Inode {
     val mtime = Timespec(bb)
     val atime = Timespec(bb)
     val oxattr = if (bb.get() == 0) None else Some(KeyValueObjectPointer(bb))
-    (encodingFormat.asInstanceOf[Byte], inodeNumber, mode, uid, gid, links, ctime, mtime, atime, oxattr)
+    (encodingFormat.toByte, inodeNumber, mode, uid, gid, links, ctime, mtime, atime, oxattr)
   }
 }
 
@@ -74,7 +74,7 @@ sealed abstract class Inode(val inodeNumber: Long,
     // Base inode encoding version is high nibble, file-type-specific encoding format is low nibble
     val fullVersion = baseEncodingVersion << 4 | (fileTypeEncodingVersion & 0xF)
 
-    bb.put(fullVersion.asInstanceOf[Byte])
+    bb.put(fullVersion.toByte)
     bb.putLong(inodeNumber)
     bb.putInt(mode)
     bb.putInt(uid)
@@ -85,10 +85,10 @@ sealed abstract class Inode(val inodeNumber: Long,
     atime.encodeInto(bb)
     oxattrs match {
       case None =>
-        bb.put(0.asInstanceOf[Byte])
+        bb.put(0.toByte)
 
       case Some(p) =>
-        bb.put(1.asInstanceOf[Byte])
+        bb.put(1.toByte)
         p.encodeInto(bb)
     }
   }
@@ -165,7 +165,7 @@ class DirectoryInode(inodeNumber: Long,
   override def encodeInto(bb: ByteBuffer): Unit = {
     super.encodeInto(bb)
     val mask = oparent.map(_ => 1 << 1).getOrElse(0)
-    bb.put(mask.asInstanceOf[Byte])
+    bb.put(mask.toByte)
     oparent.foreach(_.encodeInto(bb))
     contents.encodeInto(bb)
   }
@@ -226,7 +226,7 @@ class FileInode(inodeNumber: Long,
   override def encodeInto(bb: ByteBuffer): Unit = {
     super.encodeInto(bb)
     bb.putLong(size)
-    bb.put(ocontents.map(_ => 1).getOrElse(0).asInstanceOf[Byte])
+    bb.put(ocontents.map(_ => 1).getOrElse(0).toByte)
     ocontents.foreach(_.encodeInto(bb))
   }
 }

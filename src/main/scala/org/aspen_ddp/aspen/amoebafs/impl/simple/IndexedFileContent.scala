@@ -787,7 +787,7 @@ object IndexedFileContent {
       val sz = 1 + Varint.getUnsignedLongEncodingLength(startOffset) + Varint.getUnsignedLongEncodingLength(end) + content.foldLeft(0)((sz, e) => sz + e.encodedSize)
       val arr = new Array[Byte](sz)
       val bb = ByteBuffer.wrap(arr)
-      bb.put(tier.asInstanceOf[Byte])
+      bb.put(tier.toByte)
       Varint.putUnsignedLong(bb, startOffset)
       Varint.putUnsignedLong(bb, end)
       content.foreach(e => e.encodeInto(bb))

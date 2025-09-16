@@ -5,7 +5,7 @@ import scala.concurrent.duration._
 final class HLCTimestamp private (private val longValue: Long) extends AnyVal with Ordered[HLCTimestamp] {
   def asLong: Long = longValue
   def wallTime: Long = longValue >> 16
-  def logical: Byte = (longValue & 0xFFFFL).asInstanceOf[Byte]
+  def logical: Byte = (longValue & 0xFFFFL).toByte
   def asDuration: Duration = Duration(wallTime, MILLISECONDS)
 
   def compare(t: HLCTimestamp): Int = {

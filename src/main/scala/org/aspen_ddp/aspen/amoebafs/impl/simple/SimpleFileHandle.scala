@@ -50,7 +50,7 @@ class SimpleFileHandle(
       case None => None
       case Some((doffset, db)) =>
         if (offset >= doffset && offset + nbytes <= doffset + db.size)
-          Some(db.slice((offset-doffset).asInstanceOf[Int], nbytes))
+          Some(db.slice((offset-doffset).toInt, nbytes))
         else
           None
     }

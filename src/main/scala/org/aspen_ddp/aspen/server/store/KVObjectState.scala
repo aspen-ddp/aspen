@@ -62,10 +62,10 @@ object KVObjectState {
     val bb = ByteBuffer.allocate(encodedSize(min, max, left, right, contents))
 
     var mask: Byte = 0
-    if (min.nonEmpty)   mask = (mask | 1 << 0).asInstanceOf[Byte]
-    if (max.nonEmpty)   mask = (mask | 1 << 1).asInstanceOf[Byte]
-    if (left.nonEmpty)  mask = (mask | 1 << 2).asInstanceOf[Byte]
-    if (right.nonEmpty) mask = (mask | 1 << 3).asInstanceOf[Byte]
+    if (min.nonEmpty)   mask = (mask | 1 << 0).toByte
+    if (max.nonEmpty)   mask = (mask | 1 << 1).toByte
+    if (left.nonEmpty)  mask = (mask | 1 << 2).toByte
+    if (right.nonEmpty) mask = (mask | 1 << 3).toByte
     bb.put(mask)
     min.foreach { key =>
       Varint.putUnsignedInt(bb, key.bytes.length)
@@ -151,10 +151,10 @@ object KVObjectState {
                  contents: Map[Key, ValueState]): Array[DataBuffer] = {
 
     var mask: Byte = 0
-    if (min.nonEmpty) mask = (mask | 1 << 0).asInstanceOf[Byte]
-    if (max.nonEmpty) mask = (mask | 1 << 1).asInstanceOf[Byte]
-    if (left.nonEmpty) mask = (mask | 1 << 2).asInstanceOf[Byte]
-    if (right.nonEmpty) mask = (mask | 1 << 3).asInstanceOf[Byte]
+    if (min.nonEmpty) mask = (mask | 1 << 0).toByte
+    if (max.nonEmpty) mask = (mask | 1 << 1).toByte
+    if (left.nonEmpty) mask = (mask | 1 << 2).toByte
+    if (right.nonEmpty) mask = (mask | 1 << 3).toByte
 
     val bbArray = new Array[ByteBuffer](ida.width)
 

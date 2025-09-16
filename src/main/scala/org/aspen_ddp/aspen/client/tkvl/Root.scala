@@ -18,13 +18,13 @@ case class Root(tier: Int,
     val arr = new Array[Byte](encodedSize)
     val bb = ByteBuffer.wrap(arr)
     bb.order(ByteOrder.BIG_ENDIAN)
-    bb.put(tier.asInstanceOf[Byte])
+    bb.put(tier.toByte)
     bb.put(ordering.code)
     nodeAllocator.encodeInto(bb)
     orootObject match {
-      case None => bb.put(0.asInstanceOf[Byte])
+      case None => bb.put(0.toByte)
       case Some(rp) =>
-        bb.put(1.asInstanceOf[Byte])
+        bb.put(1.toByte)
         rp.encodeInto(bb)
     }
     arr

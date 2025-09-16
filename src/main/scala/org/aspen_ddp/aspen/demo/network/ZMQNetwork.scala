@@ -177,7 +177,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     poller.register(sendQueuePollItem)
     routerPollItem.foreach(poller.register)
 
-    val heartBeatPeriodMillis = heartbeatPeriod.toMillis.asInstanceOf[Int]
+    val heartBeatPeriodMillis = heartbeatPeriod.toMillis.toInt
     var nextHeartbeat = System.currentTimeMillis() + heartBeatPeriodMillis
 
     while (!Thread.currentThread().isInterrupted) {

@@ -139,7 +139,7 @@ object ObjectPointer {
     val spList = Range(0, indexMaskLen*8).foldLeft(List[StorePointer]()) { (l, idx) =>
       val byte = idx / 8
       val bit = idx % 8
-      val thisStore = indexMask(byte) & (1 << bit).asInstanceOf[Byte]
+      val thisStore = indexMask(byte) & (1 << bit).toByte
 
       if (thisStore != 0) {
         val spArr = if (bb.position() < endPos) {
@@ -150,7 +150,7 @@ object ObjectPointer {
         } else
           EmptyArray
 
-        StorePointer(idx.asInstanceOf[Byte], spArr) :: l
+        StorePointer(idx.toByte, spArr) :: l
       } else
         l
     }
@@ -216,7 +216,7 @@ object ObjectPointer {
     o.storePointers.foreach { sp =>
       val byte = sp.poolIndex / 8
       val bit = sp.poolIndex % 8
-      indexMask(byte) = (indexMask(byte) | 1 << bit).asInstanceOf[Byte]
+      indexMask(byte) = (indexMask(byte) | 1 << bit).toByte
     }
 
     val pointerDataLen = if (o.storePointers.forall( sp => sp.data.length == 0 )) 0 else {
@@ -236,7 +236,7 @@ object ObjectPointer {
     bb.putLong(o.poolId.uuid.getLeastSignificantBits)
     Varint.putUnsignedInt(bb, o.size.getOrElse(0))
     o.ida.serializeIDAType(bb)
-    bb.put(indexMaskLen.asInstanceOf[Byte])
+    bb.put(indexMaskLen.toByte)
     bb.put(indexMask)
     if (pointerDataLen != 0) {
       o.storePointers.foreach { sp =>

@@ -97,7 +97,7 @@ object KeyValueObjectReaderSuite {
     false, KeyValueObjectPointer(ObjectId(objUUID), pool, None, ida, Array()), new UUID(0,0)) {
 
     def err(store: Int, e: ReadError.Value): Unit = {
-      receiveReadResponse(ReadResponse(client, StoreId(pool, store.asInstanceOf[Byte]), this.readUUID, HLCTimestamp.Zero, Left(e)))
+      receiveReadResponse(ReadResponse(client, StoreId(pool, store.toByte), this.readUUID, HLCTimestamp.Zero, Left(e)))
     }
 
     def ok(store: Int,
@@ -131,7 +131,7 @@ object KeyValueObjectReaderSuite {
         odata,
         locks.map(r => TransactionId(r.lastUpdateTxUUID)))
 
-      receiveReadResponse(ReadResponse(client, StoreId(pool, store.asInstanceOf[Byte]), this.readUUID, HLCTimestamp.Zero, Right(cs)))
+      receiveReadResponse(ReadResponse(client, StoreId(pool, store.toByte), this.readUUID, HLCTimestamp.Zero, Right(cs)))
     }
   }
 

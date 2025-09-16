@@ -21,7 +21,7 @@ class BackendStoreLoaderImpl extends BackendStoreLoader with Logging:
       try
         val cfg = StoreConfig.loadStore(cfgFile.toFile)
 
-        val storeId = StoreId(PoolId(cfg.poolUuid), cfg.index.asInstanceOf[Byte])
+        val storeId = StoreId(PoolId(cfg.poolUuid), cfg.index.toByte)
 
         val backend = cfg.backend match
           case b: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)

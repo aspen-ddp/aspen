@@ -44,7 +44,7 @@ case class ObjectRevisionGuard( pointer: ObjectPointer,
   def serialize(): DataBuffer = {
     val arr = new Array[Byte](1 + pointer.encodedSize + 16)
     val bb = ByteBuffer.wrap(arr)
-    bb.put(0.asInstanceOf[Byte])
+    bb.put(0.toByte)
     pointer.encodeInto(bb)
     bb.putLong(requiredRevision.lastUpdateTxUUID.getMostSignificantBits)
     bb.putLong(requiredRevision.lastUpdateTxUUID.getLeastSignificantBits)
@@ -62,7 +62,7 @@ case class KeyRevisionGuard(
     val arr = new Array[Byte](1 + pointer.encodedSize + 16 + key.bytes.length)
     val bb = ByteBuffer.wrap(arr)
     bb.order(ByteOrder.BIG_ENDIAN)
-    bb.put(1.asInstanceOf[Byte])
+    bb.put(1.toByte)
     pointer.encodeInto(bb)
     bb.putLong(keyRevision.lastUpdateTxUUID.getMostSignificantBits)
     bb.putLong(keyRevision.lastUpdateTxUUID.getLeastSignificantBits)

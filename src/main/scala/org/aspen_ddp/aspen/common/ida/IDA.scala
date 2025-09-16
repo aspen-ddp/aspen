@@ -144,9 +144,9 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA {
 
   def serializeIDAType(bb: ByteBuffer): Unit = {
     bb.put(IDA.ReplicationCode)
-    bb.put(width.asInstanceOf[Byte])
-    bb.put(writeThreshold.asInstanceOf[Byte])
-    bb.put(0.asInstanceOf[Byte]) // reserved
+    bb.put(width.toByte)
+    bb.put(writeThreshold.toByte)
+    bb.put(0.toByte) // reserved
   }
 }
 
@@ -173,8 +173,8 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int)
 
   def serializeIDAType(bb: ByteBuffer): Unit = {
     bb.put(IDA.ReplicationCode)
-    bb.put(width.asInstanceOf[Byte])
-    bb.put(restoreThreshold.asInstanceOf[Byte])
-    bb.put(writeThreshold.asInstanceOf[Byte])
+    bb.put(width.toByte)
+    bb.put(restoreThreshold.toByte)
+    bb.put(writeThreshold.toByte)
   }
 }

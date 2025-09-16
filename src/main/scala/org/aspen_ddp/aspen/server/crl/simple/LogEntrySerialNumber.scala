@@ -6,6 +6,6 @@ case class LogEntrySerialNumber(number: Long) extends Ordered[LogEntrySerialNumb
   }
 
   def compare(that: LogEntrySerialNumber): Int = {
-    (this.number - that.number).asInstanceOf[Int]
+    (this.number - that.number).toInt
   }
 }

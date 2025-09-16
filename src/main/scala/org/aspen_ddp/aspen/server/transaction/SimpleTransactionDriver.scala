@@ -91,7 +91,7 @@ class SimpleTransactionDriver(
     if backoffDelay > maxDelay then
       backoffDelay = maxDelay
 
-    val thisDelay = ThreadLocalRandom.current().nextInt(0, backoffDelay.toMillis.asInstanceOf[Int])
+    val thisDelay = ThreadLocalRandom.current().nextInt(0, backoffDelay.toMillis.toInt)
 
     nextTry.cancel()
     nextTry = backgroundTasks.schedule(Duration(thisDelay, MILLISECONDS)):

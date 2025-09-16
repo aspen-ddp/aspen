@@ -85,7 +85,7 @@ object DataBuffer:
   
   def zeroed(nbytes: Int): DataBuffer = if (nbytes == 0) Empty else DataBuffer(ByteBuffer.allocate(nbytes))
   
-  def zeroed(nbytes: Long): DataBuffer = zeroed(nbytes.asInstanceOf[Int])
+  def zeroed(nbytes: Long): DataBuffer = zeroed(nbytes.toInt)
 
   def compact(maxSize: Long, buffers: List[DataBuffer]): (DataBuffer, List[DataBuffer]) = compact(maxSize.toInt, buffers)
 

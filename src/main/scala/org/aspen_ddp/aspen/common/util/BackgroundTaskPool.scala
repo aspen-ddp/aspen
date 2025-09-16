@@ -34,7 +34,7 @@ class BackgroundTaskPool extends BackgroundTask {
 
   def scheduleRandomlyWithinWindow(window: Duration)(fn: => Unit): ScheduledTask = synchronized {
     // TODO: Fix Long -> Int conversion
-    val actualDelay = rand.nextInt(window.length.asInstanceOf[Int])
+    val actualDelay = rand.nextInt(window.length.toInt)
 
     BGTask(sched.schedule(() => fn, actualDelay, window.unit))
   }
@@ -77,7 +77,7 @@ class BackgroundTaskPool extends BackgroundTask {
         if (backoffDelay > maxDelay)
           backoffDelay = maxDelay
 
-        Duration(ThreadLocalRandom.current().nextInt(0, backoffDelay.toMillis.asInstanceOf[Int]), MILLISECONDS)
+        Duration(ThreadLocalRandom.current().nextInt(0, backoffDelay.toMillis.toInt), MILLISECONDS)
       }
       else
         backoffDelay

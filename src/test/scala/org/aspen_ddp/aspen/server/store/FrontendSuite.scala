@@ -178,7 +178,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     assert(backend.get(oid1).isEmpty)
 
-    val txd = TransactionDescription(txid1, its, op1, 1.asInstanceOf[Byte],
+    val txd = TransactionDescription(txid1, its, op1, 1.toByte,
       List(DataUpdate(op1, ObjectRevision(txid1), DataUpdateOperation.Overwrite)),
       List(), None, List(), List())
 

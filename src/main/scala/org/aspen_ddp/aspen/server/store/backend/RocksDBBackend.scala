@@ -33,7 +33,7 @@ object RocksDBBackend {
       case ObjectType.Data => 0
       case ObjectType.KeyValue => 1
     }
-    bb.put(otype.asInstanceOf[Byte])
+    bb.put(otype.toByte)
     metadata.encodeInto(bb)
     bb.put(data)
     arr

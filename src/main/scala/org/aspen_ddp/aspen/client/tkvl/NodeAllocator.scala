@@ -47,7 +47,7 @@ object BootstrapPoolNodeAllocator extends NodeAllocator {
   override def getMaxNodeSize(tier: Int): Int = 1 * 1024 * 1024
 
   override def encodeInto(bb:ByteBuffer): Unit = {
-    bb.put(code.asInstanceOf[Byte])
+    bb.put(code.toByte)
     bb.putLong(poolId.uuid.getMostSignificantBits)
     bb.putLong(poolId.uuid.getLeastSignificantBits)
   }
@@ -77,7 +77,7 @@ class SinglePoolNodeAllocator(val client:AspenClient, val poolId: PoolId) extend
   override def getMaxNodeSize(tier: Int): Int = 1 * 1024 * 1024
 
   override def encodeInto(bb:ByteBuffer): Unit = {
-    bb.put(code.asInstanceOf[Byte])
+    bb.put(code.toByte)
     bb.putLong(poolId.uuid.getMostSignificantBits)
     bb.putLong(poolId.uuid.getLeastSignificantBits)
   }

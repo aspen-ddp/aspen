@@ -22,13 +22,13 @@ object Timespec {
   def apply(millis: Long): Timespec = {
     val sec = millis / 1000
     val nsec = (millis - (sec*1000)) * 1000
-    Timespec(sec, nsec.asInstanceOf[Int])
+    Timespec(sec, nsec.toInt)
   }
 
   def now: Timespec = {
     val ts = System.currentTimeMillis()
     val sec = ts / 1000
     val nsec = (ts - (sec*1000)) * 1000
-    Timespec(sec, nsec.asInstanceOf[Int])
+    Timespec(sec, nsec.toInt)
   }
 }

@@ -147,5 +147,92 @@ class DataBufferSuite extends AnyFunSuite with Matchers:
     remaining should be(Nil)
     bb.position() should be(0)
 
+  test("compact - empty buffer list"):
+    val (compacted, remaining) = DataBuffer.compact(10, Nil)
+    compacted.compareTo(DataBuffer.Empty) should be(0)
+    remaining should be(Nil)
+
+  test("compact - single buffer fits within maxSize"):
+    val buffers = List(bdb(1, 2, 3))
+    val (compacted, remaining) = DataBuffer.compact(5, buffers)
+    compacted.compareTo(bdb(1, 2, 3)) should be(0)
+    remaining should be(Nil)
+
+  test("compact - single buffer exactly matches maxSize"):
+    val buffers = List(bdb(1, 2, 3))
+    val (compacted, remaining) = DataBuffer.compact(3, buffers)
+    compacted.compareTo(bdb(1, 2, 3)) should be(0)
+    remaining should be(Nil)
+
+  test("compact - single buffer larger than maxSize"):
+    val buffers = List(bdb(1, 2, 3, 4, 5))
+    val (compacted, remaining) = DataBuffer.compact(3, buffers)
+    compacted.compareTo(bdb(1, 2, 3)) should be(0)
+    remaining.size should be(1)
+    remaining.head.compareTo(bdb(4, 5)) should be(0)
+
+  test("compact - multiple buffers all fit within maxSize"):
+    val buffers = List(bdb(1, 2), bdb(3, 4), bdb(5, 6))
+    val (compacted, remaining) = DataBuffer.compact(10, buffers)
+    compacted.compareTo(bdb(1, 2, 3, 4, 5, 6)) should be(0)
+    remaining should be(Nil)
+
+  test("compact - multiple buffers exactly fill maxSize"):
+    val buffers = List(bdb(1, 2), bdb(3, 4), bdb(5, 6))
+    val (compacted, remaining) = DataBuffer.compact(6, buffers)
+    compacted.compareTo(bdb(1, 2, 3, 4, 5, 6)) should be(0)
+    remaining should be(Nil)
+
+  test("compact - multiple buffers exceed maxSize, some fit"):
+    val buffers = List(bdb(1, 2), bdb(3, 4), bdb(5, 6, 7))
+    val (compacted, remaining) = DataBuffer.compact(5, buffers)
+    compacted.compareTo(bdb(1, 2, 3, 4, 5)) should be(0)
+    remaining.size should be(1)
+    remaining.head.compareTo(bdb(6, 7)) should be(0)
+
+  test("compact - multiple buffers exceed maxSize, first buffer needs splitting"):
+    val buffers = List(bdb(1, 2, 3, 4, 5), bdb(6, 7))
+    val (compacted, remaining) = DataBuffer.compact(3, buffers)
+    compacted.compareTo(bdb(1, 2, 3)) should be(0)
+    remaining.size should be(2)
+    remaining.head.compareTo(bdb(4, 5)) should be(0)
+    remaining.tail.head.compareTo(bdb(6, 7)) should be(0)
+
+  test("compact - maxSize zero"):
+    val buffers = List(bdb(1, 2, 3))
+    val (compacted, remaining) = DataBuffer.compact(0, buffers)
+    compacted.compareTo(DataBuffer.Empty) should be(0)
+    remaining should be(buffers)
+
+  test("compact - maxSize larger than total size"):
+    val buffers = List(bdb(1, 2), bdb(3, 4))
+    val (compacted, remaining) = DataBuffer.compact(100, buffers)
+    compacted.compareTo(bdb(1, 2, 3, 4)) should be(0)
+    remaining should be(Nil)
+
+  test("compact - buffers with empty buffers in list"):
+    val buffers = List(DataBuffer.Empty, bdb(1, 2), DataBuffer.Empty, bdb(3, 4), DataBuffer.Empty)
+    val (compacted, remaining) = DataBuffer.compact(10, buffers)
+    compacted.compareTo(bdb(1, 2, 3, 4)) should be(0)
+    remaining.forall(_.size == 0) should be(true)
+
+  test("compact - only empty buffers"):
+    val buffers = List(DataBuffer.Empty, DataBuffer.Empty)
+    val (compacted, remaining) = DataBuffer.compact(10, buffers)
+    compacted.compareTo(DataBuffer.Empty) should be(0)
+    remaining.forall(_.size == 0) should be(true)
+
+  test("compact - Long maxSize variant"):
+    val buffers = List(bdb(1, 2, 3))
+    val (compacted, remaining) = DataBuffer.compact(5L, buffers)
+    compacted.compareTo(bdb(1, 2, 3)) should be(0)
+    remaining should be(Nil)
+
+  test("compact - single byte buffer"):
+    val buffers = List(bdb(42))
+    val (compacted, remaining) = DataBuffer.compact(1, buffers)
+    compacted.compareTo(bdb(42)) should be(0)
+    remaining should be(Nil)
+
 
 

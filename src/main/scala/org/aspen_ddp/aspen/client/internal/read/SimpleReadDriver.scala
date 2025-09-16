@@ -41,7 +41,7 @@ class SimpleReadDriver(
 
   given ec: ExecutionContext = client.clientContext
 
-  private[this] var task: Option[BackgroundTask.ScheduledTask] = None
+  private var task: Option[BackgroundTask.ScheduledTask] = None
 
   override def onComplete(): Unit = synchronized {
     logger.trace(s"READ UUID $readUUID: COMPLETE. Cancelling future retransmits")

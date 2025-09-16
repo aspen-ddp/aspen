@@ -28,7 +28,7 @@ trait File extends BaseFile {
 
   def debugReadFully(): Future[Array[Byte]]
 
-  private[this] var openHandles: Set[FileHandle] = Set()
+  private var openHandles: Set[FileHandle] = Set()
 
   def open(): FileHandle = {
     val fh = fs.openFileHandle(this)

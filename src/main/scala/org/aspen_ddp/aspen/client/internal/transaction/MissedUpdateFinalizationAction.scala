@@ -78,7 +78,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
     val key = Key(keyBytes)
 
-    client.retryStrategy.retryUntilSuccessful(onFail _) {
+    client.retryStrategy.retryUntilSuccessful(onFail) {
       logger.trace(s"Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
       for {
         pool <- client.getStoragePool(storeId.poolId)

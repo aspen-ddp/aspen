@@ -4,7 +4,7 @@ import java.io.File
 
 class TempDirManager {
 
-  private [this] val tfile = File.createTempFile("scalatest", "UnitTestTempDir")
+  private  val tfile = File.createTempFile("scalatest", "UnitTestTempDir")
   tfile.delete()
 
   val tdir:File = new File(tfile.toString)

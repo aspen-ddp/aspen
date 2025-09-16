@@ -8,9 +8,9 @@ import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 class BackgroundTaskPool extends BackgroundTask {
-  private [this] var sched = Executors.newScheduledThreadPool(1)
-  private [this] var ec = ExecutionContext.fromExecutorService(sched)
-  private [this] val rand = new java.util.Random
+  private  var sched = Executors.newScheduledThreadPool(1)
+  private  var ec = ExecutionContext.fromExecutorService(sched)
+  private  val rand = new java.util.Random
 
   def shutdown(gracefulShutdownDelay: Duration): Boolean = {
     sched.shutdown()
@@ -54,8 +54,8 @@ class BackgroundTaskPool extends BackgroundTask {
 
   /** Continually retries the function until it returns true */
   protected case class RetryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)(fn: => Boolean) extends ScheduledTask {
-    private[this] var task: Option[ScheduledTask] = None
-    private[this] var backoffDelay = initialDelay
+    private var task: Option[ScheduledTask] = None
+    private var backoffDelay = initialDelay
 
     if (tryNow)
       attempt()

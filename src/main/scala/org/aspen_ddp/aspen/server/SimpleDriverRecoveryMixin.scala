@@ -7,7 +7,7 @@ trait SimpleDriverRecoveryMixin extends StoreManager {
 
   val checkPeriod: Duration = Duration(500, MILLISECONDS)
 
-  private[this] var periodicTask = backgroundTasks.schedulePeriodic(checkPeriod) { addRecoveryEvent() }
+  private var periodicTask = backgroundTasks.schedulePeriodic(checkPeriod) { addRecoveryEvent() }
 
   override def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     periodicTask.cancel()

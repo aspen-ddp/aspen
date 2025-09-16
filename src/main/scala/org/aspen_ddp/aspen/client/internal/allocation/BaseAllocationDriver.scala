@@ -26,11 +26,11 @@ class BaseAllocationDriver (
                              val revisionGuard: AllocationRevisionGuard
                            ) extends AllocationDriver with Logging {
 
-  private[this] val promise = Promise[ObjectPointer]()
+  private val promise = Promise[ObjectPointer]()
 
   def futureResult: Future[ObjectPointer] = promise.future
 
-  private[this] var responses =  Map[Byte, Option[StorePointer]]()
+  private var responses =  Map[Byte, Option[StorePointer]]()
 
   def shutdown(): Unit = {}
 

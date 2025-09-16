@@ -9,8 +9,8 @@ import org.scalatest.matchers.should.Matchers
 
 
 class FileBasedTests extends AnyFunSuite with Matchers with BeforeAndAfter {
-  var tdir:File = _
-  var tdirMgr: TempDirManager = _
+  var tdir:File = scala.compiletime.uninitialized
+  var tdirMgr: TempDirManager = scala.compiletime.uninitialized
 
   before {
     tdirMgr = new TempDirManager

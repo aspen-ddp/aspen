@@ -17,9 +17,9 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
 
   given ExecutionContext = client.clientContext
 
-  private[this] var outstandingReads = Map[UUID, ReadDriver]()
-  private[this] var completionTimes = Map[UUID, (Long, ReadDriver)]()
-  private[this] var completionQueries = Map[UUID, CompletionQuery]()
+  private var outstandingReads = Map[UUID, ReadDriver]()
+  private var completionTimes = Map[UUID, (Long, ReadDriver)]()
+  private var completionQueries = Map[UUID, CompletionQuery]()
 
   private class CompletionQuery(val pointer: ObjectPointer, val transactionUUID: UUID) {
     val queryUUID: UUID = UUID.randomUUID()

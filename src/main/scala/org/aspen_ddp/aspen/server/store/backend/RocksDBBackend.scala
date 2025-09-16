@@ -58,11 +58,11 @@ class RocksDBBackend(dbPath:Path,
   
   given ecGiven: ExecutionContext = executionContext
 
-  private[this] var chandler: Option[CompletionHandler] = None
+  private var chandler: Option[CompletionHandler] = None
 
-  private[this] val db = new BufferedConsistentRocksDB(dbPath)
+  private val db = new BufferedConsistentRocksDB(dbPath)
 
-  private[this] var allocating = Map[ObjectId, (ObjectType.Value, Metadata, DataBuffer)]()
+  private var allocating = Map[ObjectId, (ObjectType.Value, Metadata, DataBuffer)]()
 
   override def close(): Future[Unit] = db.close()
   

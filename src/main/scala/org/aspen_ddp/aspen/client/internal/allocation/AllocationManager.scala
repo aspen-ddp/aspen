@@ -17,7 +17,7 @@ class AllocationManager(val client: AspenClient,
   given ExecutionContext = client.clientContext
 
   // Maps newObjectUUID -> driver
-  private[this] var outstandingAllocations = Map[ObjectId, AllocationDriver]()
+  private var outstandingAllocations = Map[ObjectId, AllocationDriver]()
 
   def shutdown(): Unit = outstandingAllocations.foreach( t => t._2.shutdown() )
 

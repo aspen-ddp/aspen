@@ -94,7 +94,7 @@ class AmoebaNFS(val fs: FileSystem,
   private val NoAcl = new Array[nfsace4](0)
   private val IdMapper = new SimpleIdMap
 
-  private[this] val fileHandles: LoadingCache[Long, FileHandle] = Scaffeine().
+  private val fileHandles: LoadingCache[Long, FileHandle] = Scaffeine().
     maximumSize(fileHandleCacheMax).
     removalListener[Long, FileHandle]( (_,v,_) => v.close()).
     build[Long, FileHandle]((inode: Long) => {

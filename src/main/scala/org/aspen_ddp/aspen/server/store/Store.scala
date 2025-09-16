@@ -43,7 +43,7 @@ class Store(val backend: Backend,
     }
   }
 
-  private[this] val prepareResponseCache = Scaffeine().expireAfterWrite(10.seconds)
+  private val prepareResponseCache = Scaffeine().expireAfterWrite(10.seconds)
     .maximumSize(1000)
     .build[TransactionId, List[TxPrepareResponse]]()
 

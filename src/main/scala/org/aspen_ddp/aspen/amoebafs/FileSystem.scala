@@ -14,7 +14,7 @@ import scala.util.{Failure, Success}
 trait FileSystem extends Logging {
   val uuid: UUID
 
-  private[this] var openFiles: Map[Long, File] = Map()
+  private var openFiles: Map[Long, File] = Map()
 
   def readInode(inodeNumber: Long): Future[(Inode, InodePointer, ObjectRevision)] = {
     given ExecutionContext = executionContext
@@ -151,7 +151,7 @@ trait FileSystem extends Logging {
 
   protected def getCachedFile(inodeNumber: Long): Option[BaseFile] = None
   protected def cacheFile(file: BaseFile): Unit = ()
-  private[this] var loading: Map[Long, Future[BaseFile]] = Map()
+  private var loading: Map[Long, Future[BaseFile]] = Map()
 
   protected val fileFactory: FileFactory
 
@@ -175,7 +175,7 @@ trait FileSystem extends Logging {
 }
 
 object FileSystem {
-  private[this] var loadedFileSystems = Map[UUID, FileSystem]()
+  private var loadedFileSystems = Map[UUID, FileSystem]()
 
   def register(fs: FileSystem): Unit = synchronized {
     loadedFileSystems += (fs.uuid -> fs)

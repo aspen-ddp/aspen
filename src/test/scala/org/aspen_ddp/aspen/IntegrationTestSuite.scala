@@ -12,9 +12,9 @@ import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeAndAfter {
-  var net: TestNetwork = _
-  var client: AspenClient = _
-  var radicle: KeyValueObjectPointer = _
+  var net: TestNetwork = scala.compiletime.uninitialized
+  var client: AspenClient = scala.compiletime.uninitialized
+  var radicle: KeyValueObjectPointer = scala.compiletime.uninitialized
   var testName: String = "NO_TEST"
 
   /*

@@ -11,7 +11,7 @@ import scala.concurrent.Future
 class TransactionManager(val client: AspenClient,
                          defaultDriverFactory: ClientTransactionDriver.Factory) {
 
-  private[this] var transactions = Map[TransactionId, ClientTransactionDriver]()
+  private var transactions = Map[TransactionId, ClientTransactionDriver]()
 
   def shutdown(): Unit = synchronized {
     transactions.values.foreach(_.shutdown())

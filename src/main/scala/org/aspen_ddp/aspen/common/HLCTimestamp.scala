@@ -34,7 +34,7 @@ object HLCTimestamp {
 
   private def currentWallTime: Long = System.currentTimeMillis() << 16
 
-  private[this] var lastObserved: HLCTimestamp = HLCTimestamp(currentWallTime)
+  private var lastObserved: HLCTimestamp = HLCTimestamp(currentWallTime)
 
   def update(seen: HLCTimestamp): Unit = synchronized {
     if (seen > lastObserved)

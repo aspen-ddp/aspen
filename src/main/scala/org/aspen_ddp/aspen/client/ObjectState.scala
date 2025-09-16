@@ -37,7 +37,7 @@ class MetadataObjectState(
 
   override def equals(other: Any): Boolean =
     other match
-      case that: MetadataObjectState => (that canEqual this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount
+      case that: MetadataObjectState => (that `canEqual` this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount
       case _ => false
 
   override def hashCode: Int =
@@ -73,7 +73,7 @@ class DataObjectState(
 
   override def equals(other: Any): Boolean =
     other match
-      case that: DataObjectState => (that canEqual this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount && data == that.data
+      case that: DataObjectState => (that `canEqual` this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount && data == that.data
       case _ => false
 
   override def hashCode: Int =
@@ -191,7 +191,7 @@ class KeyValueObjectState(
           case (None, Some(_)) => false
           case (Some(x), Some(y)) => java.util.Arrays.equals(x.bytes, y.bytes)
 
-        (that canEqual this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount &&
+        (that `canEqual` this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount &&
           minEq && maxEq && leftEq && rightEq && contents == that.contents
       case _ => false
   override def hashCode: Int =

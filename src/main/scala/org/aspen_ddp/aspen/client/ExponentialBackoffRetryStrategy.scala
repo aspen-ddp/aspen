@@ -8,7 +8,7 @@ import scala.util.{Failure, Success}
 
 class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 60 * 1000, initialRetryDelay: Int = 16) extends RetryStrategy {
 
-  private [this] var exit = false
+  private  var exit = false
 
   def shutdown(): Unit = synchronized { exit = true }
 

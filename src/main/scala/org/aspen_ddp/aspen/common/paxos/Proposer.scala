@@ -7,10 +7,10 @@ class Proposer(
 
   require(quorumSize >= numPeers/2 + 1)
 
-  private[this] var localProposal: Option[Boolean] = None
-  private[this] var proposalId = ProposalId.initialProposal(peerId)
-  private[this] var highestProposalId = proposalId
-  private[this] var highestAccepted: Option[(ProposalId, Boolean)] = None
+  private var localProposal: Option[Boolean] = None
+  private var proposalId = ProposalId.initialProposal(peerId)
+  private var highestProposalId = proposalId
+  private var highestAccepted: Option[(ProposalId, Boolean)] = None
 
   private val promisesReceived = new java.util.BitSet(numPeers)
   private val nacksReceived = new java.util.BitSet(numPeers)

@@ -109,8 +109,8 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
 
   given ExecutionContext = fs.executionContext
 
-  private[this] val pendingOps = new java.util.concurrent.ConcurrentLinkedQueue[FileOperation]()
-  private[this] var activeOp: Option[FileOperation] = None
+  private val pendingOps = new java.util.concurrent.ConcurrentLinkedQueue[FileOperation]()
+  private var activeOp: Option[FileOperation] = None
 
   def inode: Inode = synchronized { cachedInode }
   def revision: ObjectRevision = synchronized { cachedInodeRevision }
@@ -180,7 +180,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
     op.result.map(_=>())
   }
 
-  private[this] def beginNextOp(): Unit = synchronized {
+  private def beginNextOp(): Unit = synchronized {
     activeOp match {
       case Some(_) =>
       case None =>
@@ -193,7 +193,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
     }
   }
 
-  private[this] def executeOp(op: FileOperation): Unit = {
+  private def executeOp(op: FileOperation): Unit = {
 
     def onCommitFailure(foo: Throwable): Future[Unit] = {
       //println(s"OnCommitFailure: $foo")
@@ -233,7 +233,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
 
     var retryCount = 0
 
-    fs.retryStrategy.retryUntilSuccessful(onCommitFailure _) {
+    fs.retryStrategy.retryUntilSuccessful(onCommitFailure) {
 
       retryCount += 1
 

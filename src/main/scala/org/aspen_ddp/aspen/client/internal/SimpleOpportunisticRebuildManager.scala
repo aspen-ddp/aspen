@@ -11,7 +11,7 @@ import scala.concurrent.duration.Duration
 
 class SimpleOpportunisticRebuildManager(system: AspenClient) extends OpportunisticRebuildManager {
 
-  private[this] val repairCache = Scaffeine().expireAfterWrite(Duration(10, SECONDS))
+  private val repairCache = Scaffeine().expireAfterWrite(Duration(10, SECONDS))
     .maximumSize(5000)
     .build[ObjectId, Set[Byte]]()
 

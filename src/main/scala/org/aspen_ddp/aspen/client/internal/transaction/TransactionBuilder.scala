@@ -29,20 +29,20 @@ class TransactionBuilder(
 
   import TransactionBuilder._
 
-  private [this] var requirements = List[TransactionRequirement]()
+  private  var requirements = List[TransactionRequirement]()
 
-  private [this] var refcountUpdates = Set[ObjectPointer]()
-  private [this] var updatingObjects = Set[ObjectPointer]() // Tracks UUIDs of all objects being modified
-  private [this] var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects
-  private [this] var dataObjectUpdates = Map[ObjectPointer, DataBuffer]()
-  private [this] var keyValueUpdates = Map[KeyValueObjectPointer, KVUpdate]()
+  private  var refcountUpdates = Set[ObjectPointer]()
+  private  var updatingObjects = Set[ObjectPointer]() // Tracks UUIDs of all objects being modified
+  private  var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects
+  private  var dataObjectUpdates = Map[ObjectPointer, DataBuffer]()
+  private  var keyValueUpdates = Map[KeyValueObjectPointer, KVUpdate]()
 
-  private [this] var finalizationActions = List[SerializedFinalizationAction]()
-  private [this] var notifyOnResolution = Set[StoreId]()
-  private [this] var notes = List[String]()
-  private [this] var addMissedUpdateTrackingFA = true
-  private [this] var missedCommitDelayInMs = 1000
-  private [this] val minimumTimestamp = HLCTimestamp.now
+  private  var finalizationActions = List[SerializedFinalizationAction]()
+  private  var notifyOnResolution = Set[StoreId]()
+  private  var notes = List[String]()
+  private  var addMissedUpdateTrackingFA = true
+  private  var missedCommitDelayInMs = 1000
+  private  val minimumTimestamp = HLCTimestamp.now
 
   def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {

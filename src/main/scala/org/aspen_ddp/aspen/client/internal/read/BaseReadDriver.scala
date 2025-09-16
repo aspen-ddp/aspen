@@ -211,7 +211,7 @@ object BaseReadDriver {
             println(s"**** HUNG READ EVENTUALLY COMPLETED! : $test")
           }
         }
-      }(ec)
+      }(using ec)
     }
   }
 }

@@ -287,7 +287,7 @@ object KeyValueListNode {
       val fullContent = node.contents + (key -> ValueState(value, tx.revision, HLCTimestamp.now))
       val keys = fullContent.keysIterator.toArray
 
-      scala.util.Sorting.quickSort(keys)(ordering)
+      scala.util.Sorting.quickSort(keys)(using ordering)
 
       val sizes = keys.iterator.map { k =>
         val vs = fullContent(k)
@@ -377,7 +377,7 @@ object KeyValueListNode {
       val fullContent = node.contents - oldKey + (newKey -> ValueState(value, tx.revision, HLCTimestamp.now))
       val keys = fullContent.keysIterator.toArray
 
-      scala.util.Sorting.quickSort(keys)(ordering)
+      scala.util.Sorting.quickSort(keys)(using ordering)
 
       val sizes = keys.iterator.map { k =>
         val vs = fullContent(k)

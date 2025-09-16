@@ -40,10 +40,10 @@ class SimpleTransactionDriver(
                               finalizerFactory: TransactionFinalizer.Factory)(using ec: ExecutionContext) extends TransactionDriver(
   storeId, messenger, backgroundTasks, txd, finalizerFactory) {
 
-  private[this] var backoffDelay = initialDelay
-  private[this] var nextTry = backgroundTasks.schedule(initialDelay) { sendPeerMessages() }
+  private var backoffDelay = initialDelay
+  private var nextTry = backgroundTasks.schedule(initialDelay) { sendPeerMessages() }
 
-  private[this] var sendCount = 0
+  private var sendCount = 0
 
   if !designatedLeader then nextRound()
 

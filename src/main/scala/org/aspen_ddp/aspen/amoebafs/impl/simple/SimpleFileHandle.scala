@@ -38,11 +38,11 @@ class SimpleFileHandle(
 
   given ExecutionContext = file.fs.executionContext
 
-  private[this] var writeQueue: Queue[PendingWrite] = Queue()
-  private[this] var ocurrentWrite: Option[PendingWrite] = None
-  private[this] var nbuffered: Int = 0
-  private[this] var writeCount: Int = 0
-  private[this] var readCache: Option[(Long, DataBuffer)] = None
+  private var writeQueue: Queue[PendingWrite] = Queue()
+  private var ocurrentWrite: Option[PendingWrite] = None
+  private var nbuffered: Int = 0
+  private var writeCount: Int = 0
+  private var readCache: Option[(Long, DataBuffer)] = None
 
   // Always try to read a megabyte at a time and serve reads from the cached content if possible
   def read(offset: Long, nbytes: Int): Future[Option[DataBuffer]] = synchronized {
@@ -126,7 +126,7 @@ class SimpleFileHandle(
     }
   }
 
-  private[this] def beginNextWrite(): Unit = synchronized {
+  private def beginNextWrite(): Unit = synchronized {
     if (ocurrentWrite.isEmpty) {
 
       writeQueue.dequeueOption.foreach { t =>

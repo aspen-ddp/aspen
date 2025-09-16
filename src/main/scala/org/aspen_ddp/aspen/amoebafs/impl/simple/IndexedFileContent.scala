@@ -19,7 +19,7 @@ import scala.language.implicitConversions
 class IndexedFileContent(file: SimpleFile, osegmentSize: Option[Int]=None, otierNodeSize: Option[Int]=None) extends Logging {
   import IndexedFileContent._
 
-  private[this] var otail: Option[Tail] = None
+  private var otail: Option[Tail] = None
 
   private val fs = file.fs
 

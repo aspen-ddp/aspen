@@ -24,7 +24,7 @@ class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) {
 
   import BufferedConsistentRocksDB._
 
-  private[this] val db: RocksDB = {
+  private val db: RocksDB = {
     val options = new Options().setCreateIfMissing(true)
     try {
       RocksDB.open(options, dbPath.toString)
@@ -33,13 +33,13 @@ class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) {
     }
   }
 
-  private[this] var nextBatch = new WriteBatch()
-  private[this] var nextPromise = Promise[Unit]()
-  private[this] var commitInProgress = false
-  private[this] var closing: Option[Promise[Unit]] = None
-  private[this] var outsandingOpCount = 0
+  private var nextBatch = new WriteBatch()
+  private var nextPromise = Promise[Unit]()
+  private var commitInProgress = false
+  private var closing: Option[Promise[Unit]] = None
+  private var outsandingOpCount = 0
 
-  private[this] def doNextCommit(): Future[Unit] = {
+  private def doNextCommit(): Future[Unit] = {
     val nbatch = nextBatch
     val npromise = nextPromise
     nextBatch = new WriteBatch()
@@ -49,18 +49,18 @@ class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) {
     npromise.future
   }
 
-  private[this] def beginOperation(): Unit = synchronized {
+  private def beginOperation(): Unit = synchronized {
     if (closing.isDefined) throw DBClosed()
     outsandingOpCount += 1
   }
-  private[this] def endOperation(): Unit = synchronized {
+  private def endOperation(): Unit = synchronized {
     outsandingOpCount -= 1
     if (outsandingOpCount == 0)
       closing.foreach(p => p.success(()))
   }
 
 
-  private[this] def commit(batch:WriteBatch, promise: Promise[Unit]): Unit = Future {
+  private def commit(batch:WriteBatch, promise: Promise[Unit]): Unit = Future {
     val writeOpts = new WriteOptions()
     writeOpts.setSync(true)
 

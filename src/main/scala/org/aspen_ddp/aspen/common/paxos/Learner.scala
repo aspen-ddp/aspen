@@ -4,9 +4,9 @@ class Learner( val numPeers: Int, val quorumSize: Int ):
 
   require(quorumSize >= numPeers/2 + 1)
 
-  private[this] var highestProposalId: Option[ProposalId] = None
-  private[this] val peersAccepted = new java.util.BitSet(numPeers)
-  private[this] var resolvedValue: Option[Boolean] = None
+  private var highestProposalId: Option[ProposalId] = None
+  private val peersAccepted = new java.util.BitSet(numPeers)
+  private var resolvedValue: Option[Boolean] = None
 
   def finalValue: Option[Boolean] = resolvedValue
   def peerBitset: java.util.BitSet = peersAccepted.clone().asInstanceOf[java.util.BitSet]

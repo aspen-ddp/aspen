@@ -26,12 +26,12 @@ class TransactionImpl(val client: AspenClient,
                       transactionDriverStrategy: Option[ClientTransactionDriver.Factory]) extends Transaction with Logging {
 
   val id: TransactionId = TransactionId(UUID.randomUUID())
-  private [this] val promise = Promise[HLCTimestamp]()
-  private [this] var state: Either[HLCTimestamp, TransactionBuilder] = Right(new TransactionBuilder(id, chooseDesignatedLeader, client.clientId))
-  private [this] var invalidated = false
-  private [this] var havePendingUpdates = false
+  private  val promise = Promise[HLCTimestamp]()
+  private  var state: Either[HLCTimestamp, TransactionBuilder] = Right(new TransactionBuilder(id, chooseDesignatedLeader, client.clientId))
+  private  var invalidated = false
+  private  var havePendingUpdates = false
 
-  private [this] val stack = org.aspen_ddp.aspen.common.util.getStack // for debugging
+  private  val stack = org.aspen_ddp.aspen.common.util.getStack // for debugging
 
   def valid: Boolean = synchronized { !invalidated && havePendingUpdates }
 

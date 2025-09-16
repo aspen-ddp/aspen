@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.common.paxos
 class Acceptor(val peerId: Byte,
                initialState: PersistentState = PersistentState(None, None)):
 
-  private[this] var state = initialState
+  private var state = initialState
 
   def persistentState: PersistentState = state
 

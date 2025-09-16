@@ -11,7 +11,7 @@ import scala.concurrent.duration.*
 import scala.language.implicitConversions
 
 class FilesSystemTestSuite  extends IntegrationTestSuite {
-  var fs: FileSystem = _
+  var fs: FileSystem = scala.compiletime.uninitialized
 
   //override def subFixtureSetup(): Unit = {
   def bootstrap(): Future[FileSystem] =

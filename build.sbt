@@ -19,10 +19,10 @@ lazy val root = (project in file(".")).
 
     name         := "aspen",
     version      := "0.1",
-    scalaVersion := "3.3.3",
+    scalaVersion := "3.7.3",
     organization := "org.aspen_ddp",
       
-    scalacOptions ++= Seq("-feature", "-deprecation"), //, "-rewrite", "-source:3.0-migration"),
+    scalacOptions ++= Seq("-feature", "-deprecation"), //, "-rewrite", "-source", "3.7-migration"),
 
     resolvers += "mvnrepository" at "https://mvnrepository.com/artifact/",
     

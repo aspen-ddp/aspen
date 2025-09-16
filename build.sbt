@@ -48,34 +48,6 @@ lazy val root = (project in file(".")).
   
   Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-W", "10", "5")
 
-//parallelExecution in Test := false
-
- enablePlugins(PackPlugin)
-
-/*
- Compile / sourceGenerators += Def.task {
-  val base = (Compile / sourceManaged).value
-
-  // Network Protocol
-  val net_out_dir = (Compile / sourceManaged).value / "com" / "ibm" / "amoeba" / "common" / "network" / "protocol"
-
-  val net_schema = file("schema") / "network_protocol.fbs"
-
-  val net_generate = !net_out_dir.exists() || net_out_dir.listFiles().exists( f => net_schema.lastModified() > f.lastModified() )
-  
-  //println(s"Dir exists $net_out_dir, ${net_out_dir.exists()}")
-
-  //net_out_dir.listFiles().foreach( f => println(s"$f : ${net_schema.lastModified() > f.lastModified()}") )
-
-  if (net_generate) {
-    println(s"Generating Network Protocol Source Files")
-    val stdout:Int = s"flatc --java -o $base schema/network_protocol.fbs".!
-    println(s"Result: $stdout")
-  }
-  
-  net_out_dir.listFiles().toSeq
- }.taskValue
-*/
  Compile / PB.targets := Seq(
   PB.gens.java -> (Compile / sourceManaged).value
  )

@@ -1,7 +1,3 @@
-TODO:
-    * Rewrite Long to ByteBuffer func/conversion to always
-      output a ByteBuffer of 8 bytes. BigInteger might mix
-      sizes for smaller numbers which would break sorting
 
 # Setting up intellij to use a JDK installed by homebrew:
 # homebrew install openjdk

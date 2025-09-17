@@ -518,6 +518,22 @@ object KeyValueListNode {
     }
   }
 
+  /**
+   * Splits the list at the specified key. The original list node will have
+   * its right pointer deleted and the newly allocated node will have its
+   * minimum set to Key.AbsoluteMinimum. The nodes to the right of it will
+   * be preserved as-is.
+   *
+   * Note:
+   * There is a potential edge case where a full node is split with all
+   * of the contents going into the right node. In this case, there is no
+   * room left to insert the optional down pointer. To avoid this we can
+   * always allocate 2 nodes. The optional down pointer will be always be
+   * inserted into the new left node. If no optional pointer is provided,
+   * the new left node will be empty. Minor performance issue but this
+   * implementation is aimed at partitioning trees for the purpose of
+   * slow deletion so it should be a non-issue.
+   */
   private def splitAt(node: KeyValueListNode,
                       ordering: KeyOrdering,
                       splitAtKey: Key,
@@ -526,15 +542,6 @@ object KeyValueListNode {
                      )(using tx: Transaction, ec: ExecutionContext): Future[KeyValueListPointer] = 
 
     require(ordering.compare(splitAtKey, Key.AbsoluteMinimum) > 0)
-    
-    // There is a potential edge case where a full node is split with all
-    // of the contents going into the right node. In this case, there is no
-    // room left to insert the optional down pointer. To avoid this we can
-    // always allocate 2 nodes. The optional down pointer will be always be
-    // inserted into the new left node. If no optional pointer is provided,
-    // the new left node will be empty. Minor performance issue but this 
-    // implementation is aimed at partitioning threes for the purpose of
-    // slow deletion so it should be a non-issue.
     
     val (leftContents, rightContents) = node.contents.partition((k,v) => ordering.compare(k, splitAtKey) < 0)
     

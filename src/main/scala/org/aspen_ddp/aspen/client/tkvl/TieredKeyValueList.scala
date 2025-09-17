@@ -116,32 +116,28 @@ class TieredKeyValueList(val client: AspenClient,
           value: Value,
           requirement: Option[Either[Boolean, ObjectRevision]] = None)
          (using t: Transaction): Future[Unit] = {
-    logger.trace("Beginning TKVL Set Operation")
+    
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
       Future.successful(())
     }
     def empty(tier: Int, ordering: KeyOrdering): Future[Unit] = {
-      logger.trace("Creating Initial TKVL Node")
       rootManager.createInitialNode(Map(key -> value)).map(_=>())
     }
     def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] = {
-      logger.trace("Non Empty TKVL Tree")
-      for {
+      for
         alloc <- rootManager.getAllocatorForTier(0)
-        _=logger.trace("Got allocator for tree")
         maxNodeSize <- rootManager.getMaxNodeSize(0)
-        _=logger.trace("Got max node size")
+
         e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
-        _=logger.trace(s"Got containing node $e")
-        node = e match {
+
+        node = e match
           case Left(_) => throw new BrokenTree()
           case Right(n) => n
-        }
+
         _ <- node.insert(key, value, maxNodeSize, alloc, onSplit, requirement)
-      } yield {
+      yield
         ()
-      }
     }
 
     rootManager.getRootNode().flatMap { t =>

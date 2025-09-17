@@ -44,6 +44,74 @@ class TieredKeyValueList(val client: AspenClient,
     }
   }
 
+  /**
+   * Splits the tree into two trees at the supplied key. All keys comparing
+   * less than splitAtKey will remain in the original tree, the rest will be
+   * moved to a new tree of the same depth as the original. The resulting
+   * KeyValueObjectPointer will be the root of the new tree.
+   *
+   * The splitting operation is completed in a single transaction but note
+   * that race conditions with outstanding split/join finalization actions
+   * could cause errant content to appear in the original (left) tree.
+   * Use with caution.
+   */
+  def splitTree(splitAtKey: Key)
+               (using t: Transaction): Future[KeyValueObjectPointer] = {
+
+    def rinsert(tier: Int,
+                ordering: KeyOrdering,
+                rpath: List[KeyValueListNode],
+                downPointer: KeyValueObjectPointer): Future[KeyValueObjectPointer] = {
+      if rpath.isEmpty then
+        Future.successful(downPointer)
+      else
+        for
+          alloc <- rootManager.getAllocatorForTier(tier)
+          maxNodeSize <- rootManager.getMaxNodeSize(tier)
+          down <- rpath.head.splitAt(ordering, splitAtKey, Some(downPointer), maxNodeSize, alloc)
+          kvp <- rinsert(tier + 1, ordering, rpath.tail, down.pointer)
+        yield
+          kvp
+    }
+
+    def nonEmpty(tier: Int,
+                 ordering: KeyOrdering,
+                 root: KeyValueListNode): Future[KeyValueObjectPointer] = {
+      for
+        e <- fetchContainingNodePath(client, tier, 0, ordering, splitAtKey, root, Set())
+
+        rpath = e match
+          case Left(_) => throw new BrokenTree()
+          case Right(p) => p
+
+        // There will always be a tier0 entry, split that then recurse through
+        // the full path
+        alloc <- rootManager.getAllocatorForTier(0)
+        maxNodeSize <- rootManager.getMaxNodeSize(0)
+
+        down <- rpath.head.splitAt(ordering, splitAtKey, None, maxNodeSize, alloc)
+
+        kvp <- rinsert(0, ordering, rpath, down.pointer)
+      yield
+        kvp
+    }
+
+    rootManager.getRootNode().flatMap { t =>
+      val (tier, ordering, oroot) = t
+      oroot match {
+        case None =>
+          for
+            allocGuard <- rootManager.createInitialNode(Map())
+            alloc <- rootManager.getAllocatorForTier(0)
+            ptr <- alloc.allocateKeyValueObject(allocGuard, Map())
+          yield
+            ptr
+
+        case Some(root) => nonEmpty(tier, ordering, root)
+      }
+    }
+  }
+
   def set(key: Key,
           value: Value,
           requirement: Option[Either[Boolean, ObjectRevision]] = None)
@@ -220,14 +288,14 @@ object TieredKeyValueList {
                                         initialBlacklist: Set[ObjectId],
                                         reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], KeyValueListNode]] = {
     given ExecutionContext = client.clientContext
-    
+
     fetchContainingNodePath(client, currentTier, targetTier, ordering, target,
       currentNode, initialBlacklist).map {
       case Left(l) => Left(l)
       case Right(rpath) => Right(rpath.head)
     }
   }
-  
+
   private[tkvl] def fetchContainingNodePath(client: AspenClient,
                                             currentTier: Int,
                                             targetTier: Int,

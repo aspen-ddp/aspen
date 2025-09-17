@@ -67,8 +67,7 @@ class TieredKeyValueList(val client: AspenClient,
       else
         for
           alloc <- rootManager.getAllocatorForTier(tier)
-          maxNodeSize <- rootManager.getMaxNodeSize(tier)
-          down <- rpath.head.splitAt(ordering, splitAtKey, Some(downPointer), maxNodeSize, alloc)
+          down <- rpath.head.splitAt(ordering, splitAtKey, Some(downPointer), alloc)
           kvp <- rinsert(tier + 1, ordering, rpath.tail, down.pointer)
         yield
           kvp
@@ -87,9 +86,8 @@ class TieredKeyValueList(val client: AspenClient,
         // There will always be a tier0 entry, split that then recurse through
         // the full path
         alloc <- rootManager.getAllocatorForTier(0)
-        maxNodeSize <- rootManager.getMaxNodeSize(0)
 
-        down <- rpath.head.splitAt(ordering, splitAtKey, None, maxNodeSize, alloc)
+        down <- rpath.head.splitAt(ordering, splitAtKey, None, alloc)
 
         kvp <- rinsert(0, ordering, rpath, down.pointer)
       yield
@@ -116,7 +114,7 @@ class TieredKeyValueList(val client: AspenClient,
           value: Value,
           requirement: Option[Either[Boolean, ObjectRevision]] = None)
          (using t: Transaction): Future[Unit] = {
-    
+
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
       Future.successful(())

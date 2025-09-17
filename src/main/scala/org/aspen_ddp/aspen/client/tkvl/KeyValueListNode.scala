@@ -115,10 +115,9 @@ class KeyValueListNode(val reader: ObjectReader,
   def splitAt(ordering: KeyOrdering,
               splitAtKey: Key,
               optionalDownPointer: Option[KeyValueObjectPointer],
-              maxNodeSize: Int,
               allocator: ObjectAllocator,
              )(using tx: Transaction): Future[KeyValueListPointer] = fetchContainingNode(splitAtKey).flatMap { node =>
-    KeyValueListNode.splitAt(node, ordering, splitAtKey, optionalDownPointer, maxNodeSize, allocator)
+    KeyValueListNode.splitAt(node, ordering, splitAtKey, optionalDownPointer, allocator)
   }
 
   def foldLeft[B](initialZ: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] = {
@@ -523,7 +522,6 @@ object KeyValueListNode {
                       ordering: KeyOrdering,
                       splitAtKey: Key,
                       optionalDownPointer: Option[KeyValueObjectPointer],
-                      maxNodeSize: Int,
                       allocator: ObjectAllocator,
                      )(using tx: Transaction, ec: ExecutionContext): Future[KeyValueListPointer] = 
 

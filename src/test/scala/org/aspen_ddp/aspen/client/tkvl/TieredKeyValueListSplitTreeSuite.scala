@@ -113,6 +113,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
   test("splitTree - multiple keys distributed correctly") {
     val treeKey = createKey(0)
+    val newTreeKey = createKey(1)
     val key1 = createKey(1)
     val key2 = createKey(3)
     val key3 = createKey(7)
@@ -161,14 +162,25 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree at key 5
       splitTx = client.newTransaction()
       newRootPtr <- tree.splitTree(splitAtKey)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRootPtr,
+        ByteArrayKeyOrdering, nodeAllocator)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
+
+      newTreeRoot <- fnewTreeRoot
+      newTree <- newTreeRoot.getTree()
 
       // Test access to original tree - should have keys 1,3
       originalValue1 <- tree.get(key1)
       originalValue2 <- tree.get(key2)
       originalValue3 <- tree.get(key3)
       originalValue4 <- tree.get(key4)
+
+      // Test access to new tree - should have keys 7,9
+      newValue1 <- newTree.get(key1)
+      newValue2 <- newTree.get(key2)
+      newValue3 <- newTree.get(key3)
+      newValue4 <- newTree.get(key4)
 
     } yield {
       // Original tree should have keys < 5 (keys 1, 3)
@@ -181,11 +193,23 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Original tree should NOT have keys >= 5 (keys 7, 9)
       originalValue3 should be (None)
       originalValue4 should be (None)
+
+      // New tree should NOT have keys < 5 (keys 1, 3)
+      newValue1 should be (None)
+      newValue2 should be (None)
+
+      // New tree should have keys >= 5 (keys 7, 9)
+      newValue3.isDefined should be (true)
+      newValue3.get.value.bytes(0) should be (70)
+
+      newValue4.isDefined should be (true)
+      newValue4.get.value.bytes(0) should be (90)
     }
   }
 
   test("splitTree - split at exact key") {
     val treeKey = createKey(0)
+    val newTreeKey = createKey(1)
     val key1 = createKey(1)
     val key5 = createKey(5)
     val key7 = createKey(7)
@@ -227,13 +251,23 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree at key 5 (exact match)
       splitTx = client.newTransaction()
       newRootPtr <- tree.splitTree(splitAtKey)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRootPtr,
+        ByteArrayKeyOrdering, nodeAllocator)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
+
+      newTreeRoot <- fnewTreeRoot
+      newTree <- newTreeRoot.getTree()
 
       // Test access to original tree
       originalValue1 <- tree.get(key1)
       originalValue5 <- tree.get(key5)
       originalValue7 <- tree.get(key7)
+
+      // Test access to new tree
+      newValue1 <- newTree.get(key1)
+      newValue5 <- newTree.get(key5)
+      newValue7 <- newTree.get(key7)
 
     } yield {
       // Original tree should have keys < 5 (key 1)
@@ -243,11 +277,22 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Original tree should NOT have keys >= 5 (keys 5, 7)
       originalValue5 should be (None)
       originalValue7 should be (None)
+
+      // New tree should NOT have keys < 5 (key 1)
+      newValue1 should be (None)
+
+      // New tree should have keys >= 5 (keys 5, 7)
+      newValue5.isDefined should be (true)
+      newValue5.get.value.bytes(0) should be (50)
+
+      newValue7.isDefined should be (true)
+      newValue7.get.value.bytes(0) should be (70)
     }
   }
 
   test("splitTree - empty tree after split") {
     val treeKey = createKey(0)
+    val newTreeKey = createKey(1)
     val key1 = createKey(10)
     val value1 = createValue(100)
     val splitAtKey = createKey(5)  // All keys > splitAtKey
@@ -274,22 +319,35 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree
       splitTx = client.newTransaction()
       newRootPtr <- tree.splitTree(splitAtKey)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRootPtr,
+        ByteArrayKeyOrdering, nodeAllocator)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
+
+      newTreeRoot <- fnewTreeRoot
+      newTree <- newTreeRoot.getTree()
 
       // Test access to original tree - should be empty
       originalValue <- tree.get(key1)
       nonExistentValue <- tree.get(createKey(1))
 
+      // Test access to new tree - should have the key
+      newValue <- newTree.get(key1)
+
     } yield {
       // Original tree should be empty since all keys moved to new tree
       originalValue should be (None)
       nonExistentValue should be (None)
+
+      // New tree should have the key that was moved
+      newValue.isDefined should be (true)
+      newValue.get.value.bytes(0) should be (100)
     }
   }
 
   test("splitTree - all keys remain in original tree") {
     val treeKey = createKey(0)
+    val newTreeKey = createKey(1)
     val key1 = createKey(1)
     val key2 = createKey(3)
     val value1 = createValue(10)
@@ -324,12 +382,21 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // Now split the tree
       splitTx = client.newTransaction()
       newRootPtr <- tree.splitTree(splitAtKey)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRootPtr,
+        ByteArrayKeyOrdering, nodeAllocator)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
+
+      newTreeRoot <- fnewTreeRoot
+      newTree <- newTreeRoot.getTree()
 
       // Test access to original tree - should have all keys
       originalValue1 <- tree.get(key1)
       originalValue2 <- tree.get(key2)
+
+      // Test access to new tree - should be empty
+      newValue1 <- newTree.get(key1)
+      newValue2 <- newTree.get(key2)
 
     } yield {
       // Original tree should have all keys since they're all < splitAtKey
@@ -338,6 +405,10 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
 
       originalValue2.isDefined should be (true)
       originalValue2.get.value.bytes(0) should be (30)
+
+      // New tree should be empty since no keys >= splitAtKey
+      newValue1 should be (None)
+      newValue2 should be (None)
     }
   }
 
@@ -378,6 +449,77 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
       // The ID should be valid (non-null UUID)
       newRootPtr.id.uuid.toString should not be empty
       succeed
+    }
+  }
+
+  test("splitTree - empty tree from split can be used") {
+    val treeKey = createKey(0)
+    val newTreeKey = createKey(1)
+    val key1 = createKey(1)
+    val key2 = createKey(3)
+    val value1 = createValue(10)
+    val value2 = createValue(30)
+    val splitAtKey = createKey(10)  // All keys < splitAtKey (new tree will be empty)
+
+    given tx1: Transaction = client.newTransaction()
+
+    for {
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.get.createAllocator(Replication(3,2))
+
+      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+
+      nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
+
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+
+      root <- froot
+      tree <- root.getTree()
+
+      // Insert additional key
+      tx2 = client.newTransaction()
+      _ <- tree.set(key2, value2)(using tx2)
+      _ <- tx2.commit()
+      _ <- waitForTransactionsToComplete()
+
+      // Now split the tree (creating empty new tree)
+      splitTx = client.newTransaction()
+      newRootPtr <- tree.splitTree(splitAtKey)(using splitTx)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, ptr, newTreeKey, true, newRootPtr,
+        ByteArrayKeyOrdering, nodeAllocator)(using splitTx)
+      _ <- splitTx.commit()
+      _ <- waitForTransactionsToComplete()
+
+      newTreeRoot <- fnewTreeRoot
+      newTree <- newTreeRoot.getTree()
+
+      // Verify new tree is empty
+      newValue1 <- newTree.get(key1)
+      newValue2 <- newTree.get(key2)
+
+      // Now add a key to the new tree to verify it's functional
+      newKey = createKey(15)
+      newValueToAdd = createValue(150.toByte)
+      tx3 = client.newTransaction()
+      _ <- newTree.set(newKey, newValueToAdd)(using tx3)
+      _ <- tx3.commit()
+      _ <- waitForTransactionsToComplete()
+
+      // Verify the key was added successfully
+      addedValue <- newTree.get(newKey)
+
+    } yield {
+      // New tree should initially be empty
+      newValue1 should be (None)
+      newValue2 should be (None)
+
+      // New tree should be able to accept new keys
+      addedValue.isDefined should be (true)
+      addedValue.get.value.bytes(0) should be (150.toByte)
     }
   }
 }

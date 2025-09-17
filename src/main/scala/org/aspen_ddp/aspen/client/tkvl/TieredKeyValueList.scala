@@ -206,23 +206,46 @@ class TieredKeyValueList(val client: AspenClient,
 
 object TieredKeyValueList {
 
+  /*
+   Returns Left if the tree is broken or Right with a list of nodes for each
+   tier in the path down to the requested node in reverse order. The top of
+   the tree will be the last node in the list
+   */
   private[tkvl] def fetchContainingNode(client: AspenClient,
                                         currentTier: Int,
                                         targetTier: Int,
                                         ordering: KeyOrdering,
                                         target: Key,
                                         currentNode: KeyValueListNode,
-                                        initialBlacklist: Set[ObjectId]): Future[Either[Set[ObjectId], KeyValueListNode]] = {
+                                        initialBlacklist: Set[ObjectId],
+                                        reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], KeyValueListNode]] = {
+    given ExecutionContext = client.clientContext
+    
+    fetchContainingNodePath(client, currentTier, targetTier, ordering, target,
+      currentNode, initialBlacklist).map {
+      case Left(l) => Left(l)
+      case Right(rpath) => Right(rpath.head)
+    }
+  }
+  
+  private[tkvl] def fetchContainingNodePath(client: AspenClient,
+                                            currentTier: Int,
+                                            targetTier: Int,
+                                            ordering: KeyOrdering,
+                                            target: Key,
+                                            currentNode: KeyValueListNode,
+                                            initialBlacklist: Set[ObjectId],
+                                            reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], List[KeyValueListNode]]] = {
 
     given ExecutionContext = client.clientContext
 
     if (currentTier == targetTier) {
       // Once we're on the right tier, we can rely on consistent right pointers to scan to the
       // containing node
-      currentNode.fetchContainingNode(target).map(n => Right(n))
+      currentNode.fetchContainingNode(target).map(n => Right(n :: reversePath))
     } else {
 
-      val p = Promise[Either[Set[ObjectId], KeyValueListNode]]()
+      val p = Promise[Either[Set[ObjectId], List[KeyValueListNode]]]()
 
       def rtry(candidates: List[(Key, KeyValueObjectPointer)], blacklist: Set[ObjectId]): Unit = {
         if (candidates.isEmpty) {
@@ -230,10 +253,10 @@ object TieredKeyValueList {
         } else {
           fetchNode(client, ordering, targetTier, candidates.head._1, candidates.head._2, blacklist) foreach {
             case Left(blklst) => rtry(candidates.tail, blklst)
-            case Right(next) => fetchContainingNode(client, currentTier-1, targetTier, ordering, target,
-              next, blacklist).foreach {
+            case Right(next) => fetchContainingNodePath(client, currentTier-1, targetTier, ordering, target,
+              next, blacklist, reversePath).foreach {
               case Left(blklst) => p.success(Left(blklst + next.pointer.id))
-              case Right(targetNode) => p.success(Right(targetNode))
+              case Right(rpath) => p.success(Right(rpath))
             }
           }
         }

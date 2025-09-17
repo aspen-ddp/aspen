@@ -17,56 +17,31 @@ class SimpleFile(override val pointer: FilePointer,
 
   import SimpleFile._
 
-  private var oifc: Option[IndexedFileContent] = None
-
-  // This is called whenever file operations fail. Drop the IFC cache as well just to be safe
-  override def refresh(): Future[Unit] =  {
-    synchronized {
-      oifc.foreach(_.dropCache())
-    }
-    super.refresh()
-  }
-
-  private def content: IndexedFileContent = synchronized {
-    if (oifc.isEmpty)
-      oifc = Some(new IndexedFileContent(this, osegmentSize, otierNodeSize))
-    oifc.get
-  }
-
-  override protected def setCachedInode(newInode: Inode, newRevision:ObjectRevision): Unit = synchronized {
-    super.setCachedInode(newInode, newRevision)
-    if (inode.ocontents.isEmpty)
-      oifc = None
-  }
+  private var sfc: SimpleFileContent = new SimpleFileContent(this, osegmentSize, otierNodeSize)
 
   override def inode: FileInode = super.inode.asInstanceOf[FileInode]
 
-  override def inodeState: (FileInode, ObjectRevision) = {
+  override def inodeState: (FileInode, ObjectRevision) =
     val t = super.inodeState
     (t._1.asInstanceOf[FileInode], t._2)
-  }
 
-  override def freeResources(): Future[Unit] = {
+  override def freeResources(): Future[Unit] =
     new SimpleFileHandle(this, 0).truncate(0).map(_ => ())
-  }
 
-  def debugReadFully(): Future[Array[Byte]] = content.debugReadFully()
+  def debugReadFully(): Future[Array[Byte]] = sfc.debugReadFully()
 
-  def read(offset: Long, nbytes: Int): Future[Option[DataBuffer]] = {
-    content.read(offset, nbytes)
-  }
+  def read(offset: Long, nbytes: Int): Future[Option[DataBuffer]] =
+    sfc.read(offset, nbytes)
 
   def write(offset: Long,
-            buffers: List[DataBuffer]): Future[(Long, List[DataBuffer])] = {
+            buffers: List[DataBuffer]): Future[(Long, List[DataBuffer])] =
     val op = Write(this, offset, buffers)
     enqueueOp(op)
     op.writePromise.future
-  }
 
-  def truncate(offset: Long): Future[Future[Unit]] = {
+  def truncate(offset: Long): Future[Future[Unit]] =
     val op = Truncate(this, offset)
     enqueueOp(op).map(_ => op.deleteComplete)
-  }
 }
 
 object SimpleFile {
@@ -79,7 +54,7 @@ object SimpleFile {
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
                            inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = synchronized {
-      file.content.truncate(offset).map { t =>
+      file.sfc.truncate(offset).map { t =>
         val (ws, fdeleteComplete) = t
 
         fdeleteComplete.foreach(_ => p.success(()))
@@ -103,7 +78,7 @@ object SimpleFile {
 
       val totalSize = buffers.foldLeft(0)((sz, db) => sz + db.size)
 
-      file.content.write(offset, buffers).map { ws =>
+      file.sfc.write(offset, buffers).map { ws =>
 
         val nwritten = totalSize - ws.remainingData.foldLeft(0)((sz, db) => sz + db.size)
 

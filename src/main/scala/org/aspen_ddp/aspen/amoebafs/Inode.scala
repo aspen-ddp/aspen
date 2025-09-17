@@ -21,7 +21,7 @@ object Inode {
     val mode = bb.getInt()
     val fileType = FileType.fromMode(mode)
     fileType match {
-      case FileType.File            => FileInode(content)
+      case FileType.File            => FileInode(client, content)
       case FileType.Directory       => DirectoryInode(client, content)
       case FileType.Symlink         => SymlinkInode(content)
       case FileType.UnixSocket      => UnixSocketInode(content)
@@ -173,19 +173,19 @@ class DirectoryInode(inodeNumber: Long,
 
 object FileInode {
 
-  def init(mode: Int, uid: Int, gid: Int): FileInode = {
+  def init(mode: Int, uid: Int, gid: Int, contents: Root): FileInode = {
     val now = Timespec.now
     val correctedMode = FileType.ensureModeFileType(mode, FileType.File)
-    new FileInode(0, correctedMode, uid, gid, 1, now, now, now, None, 0, None)
+    new FileInode(0, correctedMode, uid, gid, 1, now, now, now, None, 0, contents)
   }
 
-  def apply(content: DataBuffer): FileInode = {
+  def apply(client: AspenClient, content: DataBuffer): FileInode = {
     val bb = content.asReadOnlyBuffer()
     val (_, inodeNumber, mode, uid, gid, links, ctime, mtime, atime, oxattrs) = Inode.decode(bb)
     val size = bb.getLong()
-    val ocontents = if (bb.get() == 0) None else Some(DataObjectPointer(bb))
+    val root = Root(client, bb)
 
-    new FileInode(inodeNumber, mode, uid, gid, links, ctime, mtime, atime, oxattrs, size, ocontents)
+    new FileInode(inodeNumber, mode, uid, gid, links, ctime, mtime, atime, oxattrs, size, root)
   }
 }
 
@@ -199,11 +199,14 @@ class FileInode(inodeNumber: Long,
                 atime: Timespec,
                 oxattrs: Option[KeyValueObjectPointer],
                 val size: Long,
-                val ocontents: Option[DataObjectPointer]) extends Inode(inodeNumber, mode, uid, gid, links,
+                val contents: Root) extends Inode(inodeNumber, mode, uid, gid, links,
   ctime, mtime, atime, oxattrs) with Logging {
 
   //logger.info(s"Created FileInode with ocontents ${ocontents.map(dp => dp.uuid)}")
 
+  def updateContent(newSize: Long, newMtime: Timespec): FileInode =
+    new FileInode(inodeNumber, mode, uid, gid, links, ctime, newMtime, atime, oxattrs, newSize, contents)
+    
   override def update(mode: Option[Int] = None, uid: Option[Int] = None, gid: Option[Int] = None,
                       links: Option[Int] = None, ctime: Option[Timespec] = None, mtime: Option[Timespec] = None,
                       atime: Option[Timespec] = None, oxattrs: Option[Option[KeyValueObjectPointer]] = None,
@@ -211,23 +214,17 @@ class FileInode(inodeNumber: Long,
     new FileInode(inodeNumber.getOrElse(this.inodeNumber), mode.getOrElse(this.mode), uid.getOrElse(this.uid),
       gid.getOrElse(this.gid),
       links.getOrElse(this.links), ctime.getOrElse(this.ctime), mtime.getOrElse(this.mtime),
-      atime.getOrElse(this.atime), oxattrs.getOrElse(this.oxattrs), size, ocontents)
+      atime.getOrElse(this.atime), oxattrs.getOrElse(this.oxattrs), size, contents)
   }
-
-  def updateContent(newSize: Long, newMtime: Timespec, newRoot: Option[DataObjectPointer]): FileInode = {
-    new FileInode(inodeNumber, mode, uid, gid, links, ctime, newMtime, atime, oxattrs, newSize,
-      newRoot)
-  }
-
+  
   override def encodedSize: Int = {
-    super.encodedSize + 8 + 1 + ocontents.map(_.encodedSize).getOrElse(0)
+    super.encodedSize + 8 + contents.encodedSize
   }
 
   override def encodeInto(bb: ByteBuffer): Unit = {
     super.encodeInto(bb)
     bb.putLong(size)
-    bb.put(ocontents.map(_ => 1).getOrElse(0).toByte)
-    ocontents.foreach(_.encodeInto(bb))
+    contents.encodeInto(bb)
   }
 }
 

@@ -167,7 +167,7 @@ trait FileSystem extends Logging {
   private[amoebafs] def taskExecutor: TaskExecutor
   private[amoebafs] def defaultInodeAllocator: ObjectAllocator
   private[amoebafs] def defaultSegmentAllocator(): Future[ObjectAllocator]
-  private[amoebafs] def defaultIndexNodeAllocator(tier: Int): Future[ObjectAllocator]
+  private[amoebafs] def defaultFileContentTierAllocator(tier: Int): Future[ObjectAllocator]
   private[amoebafs] def client: AspenClient
   private[amoebafs] def executionContext: ExecutionContext
   private[amoebafs] def getObjectAllocator(id: ObjectAllocatorId): Future[ObjectAllocator]

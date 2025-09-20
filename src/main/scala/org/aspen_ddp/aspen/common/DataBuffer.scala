@@ -32,6 +32,8 @@ final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal:
 
   def hashString: String = DataBuffer.hash(this :: Nil).toHexString
 
+  def str: String = getByteArray.mkString(",")
+
   /** Creates a copy of the wrapped byte buffer content */
   def getByteArray: Array[Byte] =
     val arr = new Array[Byte](size)
@@ -58,9 +60,12 @@ final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal:
     DataBuffer(bb)
 
   def slice(offset: Int): DataBuffer =
-    val bb = buf.asReadOnlyBuffer()
-    bb.position( bb.position() + offset )
-    DataBuffer(bb)
+    if offset == 0 then
+      this
+    else
+      val bb = buf.asReadOnlyBuffer()
+      bb.position( bb.position() + offset )
+      DataBuffer(bb)
 
   def split(offset: Int): (DataBuffer, DataBuffer) = (slice(0, offset), slice(offset))
 
@@ -70,6 +75,11 @@ final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal:
     buf.put(append.asReadOnlyBuffer())
     buf.position(0)
     DataBuffer(buf)
+
+  def zappend(newSize: Int): DataBuffer = if newSize <= size then
+    this
+  else
+    this.append(DataBuffer.zeroed(newSize - size))
 
 
 object DataBuffer:

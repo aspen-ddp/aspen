@@ -105,7 +105,7 @@ class SimpleFileSystem(aclient: AspenClient,
 
   override private[amoebafs] def defaultSegmentAllocator(): Future[ObjectAllocator] = Future.successful(defaultAllocator)
 
-  override private[amoebafs] def defaultIndexNodeAllocator(tier: Int): Future[ObjectAllocator] = Future.successful(defaultAllocator)
+  override private[amoebafs] def defaultFileContentTierAllocator(tier: Int): Future[ObjectAllocator] = Future.successful(defaultAllocator)
 
   override private[amoebafs] def client = aclient
 

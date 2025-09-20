@@ -13,11 +13,11 @@ class SimpleFile(override val pointer: FilePointer,
                  initialInode: FileInode,
                  fs: FileSystem,
                  osegmentSize: Option[Int]=None,
-                 otierNodeSize: Option[Int]=None) extends SimpleBaseFile(pointer, cachedInodeRevision, initialInode, fs) with File {
+                 otierNodeSize: Option[Int]=None) extends SimpleBaseFile(pointer, cachedInodeRevision, initialInode, fs) with File:
 
   import SimpleFile._
 
-  private var sfc: SimpleFileContent = new SimpleFileContent(this, osegmentSize, otierNodeSize)
+  private val sfc: SimpleFileContent = new SimpleFileContent(this, osegmentSize)
 
   override def inode: FileInode = super.inode.asInstanceOf[FileInode]
 
@@ -31,21 +31,22 @@ class SimpleFile(override val pointer: FilePointer,
   def debugReadFully(): Future[Array[Byte]] = sfc.debugReadFully()
 
   def read(offset: Long, nbytes: Int): Future[Option[DataBuffer]] =
-    sfc.read(offset, nbytes)
+    sfc.read(offset, nbytes).map(Some(_))
 
   def write(offset: Long,
             buffers: List[DataBuffer]): Future[(Long, List[DataBuffer])] =
-    val op = Write(this, offset, buffers)
-    enqueueOp(op)
-    op.writePromise.future
+    sfc.initializeContentTree().flatMap: _ =>
+      val op = Write(this, offset, buffers)
+      enqueueOp(op)
+      op.writePromise.future
 
   def truncate(offset: Long): Future[Future[Unit]] =
     val op = Truncate(this, offset)
     enqueueOp(op).map(_ => op.deleteComplete)
-}
 
-object SimpleFile {
-  case class Truncate(file: SimpleFile, offset: Long) extends FileOperation {
+
+object SimpleFile:
+  case class Truncate(file: SimpleFile, offset: Long) extends FileOperation:
 
     private val p = Promise[Unit]()
 
@@ -53,49 +54,38 @@ object SimpleFile {
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = synchronized {
-      file.sfc.truncate(offset).map { t =>
-        val (ws, fdeleteComplete) = t
-
+                           inode: Inode)
+                          (using tx: Transaction, ec: ExecutionContext): Future[(Inode, () => Future[Unit])] =
+      file.sfc.truncate(offset).map: fdeleteComplete =>
         fdeleteComplete.foreach(_ => p.success(()))
 
-        val updatedInode = inode.asInstanceOf[FileInode].updateContent(offset, Timespec.now, ws.newRoot)
+        val updatedInode = inode.asInstanceOf[FileInode].updateContent(offset, Timespec.now)
         tx.overwrite(pointer, revision, updatedInode.toDataBuffer)
-        updatedInode
-      }
-    }
 
-  }
+        (updatedInode, () => Future.successful(()))
 
-  case class Write(file: SimpleFile, offset: Long, buffers: List[DataBuffer]) extends FileOperation {
+  case class Write(file: SimpleFile, offset: Long, buffers: List[DataBuffer]) extends FileOperation:
     val writePromise: Promise[(Long, List[DataBuffer])] = Promise()
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = synchronized {
+                           inode: Inode)
+                          (using tx: Transaction, ec: ExecutionContext): Future[(Inode, () => Future[Unit])] =
 
       val finode = inode.asInstanceOf[FileInode]
 
       val totalSize = buffers.foldLeft(0)((sz, db) => sz + db.size)
 
-      file.sfc.write(offset, buffers).map { ws =>
-
-        val nwritten = totalSize - ws.remainingData.foldLeft(0)((sz, db) => sz + db.size)
-
-        val endOffset = offset + nwritten
-
-        val newSize = if (endOffset > finode.size) endOffset else finode.size
-
-        val updatedInode = inode.asInstanceOf[FileInode].updateContent(newSize, Timespec.now, ws.newRoot)
+      file.sfc.write(offset, buffers).map: result =>
+        val updatedInode = inode.asInstanceOf[FileInode].updateContent(result.newFileSize, Timespec.now)
 
         tx.overwrite(pointer, revision, updatedInode.toDataBuffer)
 
-        tx.result.foreach { _ =>
-          writePromise.success((ws.remainingOffset, ws.remainingData))
-        }
+        tx.result.foreach: _ =>
+          writePromise.success((result.remainingOffset, result.remainingData))
 
-        updatedInode
-      }
-    }
-  }
-}
+        (updatedInode, result.postCommitOp)
+
+
+
+

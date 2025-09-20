@@ -4,10 +4,11 @@ import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
 import org.aspen_ddp.aspen.client.{ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject}
 import org.aspen_ddp.aspen.common.network.ClientId
-import org.aspen_ddp.aspen.common.objects._
+import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
-import org.aspen_ddp.aspen.common.transaction._
+import org.aspen_ddp.aspen.common.transaction.*
+import org.aspen_ddp.aspen.common.util.printStack
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 
 object TransactionBuilder {
@@ -139,8 +140,10 @@ class TransactionBuilder(
 
   def overwrite(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized {
     //println(s"   TXB Overwrite txid $transactionUUID object ${objectPointer.uuid}")
-    if (updatingObjects.contains(objectPointer))
+    if (updatingObjects.contains(objectPointer)) {
+      //printStack()
       throw MultipleDataUpdatesToObject(objectPointer)
+    }
     if (revisionLocks.contains(objectPointer))
       throw ConflictingRequirements(objectPointer)
 
@@ -156,8 +159,10 @@ class TransactionBuilder(
               requirements: List[KeyValueUpdate.KeyRequirement],
               operations: List[KeyValueOperation]): Unit = synchronized {
     //println(s"   TXB KV Append txid $transactionUUID object ${pointer.uuid}")
-    if (updatingObjects.contains(pointer))
+    if (updatingObjects.contains(pointer)) {
+      //printStack()
       throw MultipleDataUpdatesToObject(pointer)
+    }
     if (revisionLocks.contains(pointer))
       throw ConflictingRequirements(pointer)
 

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.amoebafs
 
 import org.aspen_ddp.aspen.client.tkvl.{Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction}
-import org.aspen_ddp.aspen.common.objects.{LexicalKeyOrdering, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{IntegerKeyOrdering, LexicalKeyOrdering, ObjectRevision}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty, InvalidInode}
 import org.aspen_ddp.aspen.amoebafs.impl.simple.CreateFileTask
 import org.apache.logging.log4j.scala.Logging
@@ -251,7 +251,8 @@ trait Directory extends BaseFile with Logging {
   }
 
   def prepareCreateFile(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[FilePointer]] = {
-    val newInode = FileInode.init(mode, uid, gid)
+    val root = Root(0, IntegerKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, pointer.pointer.poolId))
+    val newInode = FileInode.init(mode, uid, gid, root)
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
     val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
     val fdp = for

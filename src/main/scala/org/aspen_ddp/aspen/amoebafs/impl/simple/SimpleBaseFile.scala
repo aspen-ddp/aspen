@@ -20,16 +20,18 @@ object SimpleBaseFile {
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode]
+                           inode: Inode)
+                          (using tx: Transaction, ec: ExecutionContext): Future[(Inode, () => Future[Unit])]
   }
 
   case class Flush() extends FileOperation {
     override def prepareTransaction(pointer: DataObjectPointer,
                                     revision: ObjectRevision,
-                                    inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = {
+                                    inode: Inode)
+                                   (using tx: Transaction, ec: ExecutionContext): Future[(Inode, () => Future[Unit])] = {
       // Nothing to do. Due to serial nature of execution, by the time this method is called, all previous operations
       // have successfully committed
-      Future.successful(inode)
+      Future.successful((inode, () => Future.unit))
     }
   }
 
@@ -39,13 +41,14 @@ object SimpleBaseFile {
 
     def prepareTransaction(pointer: DataObjectPointer,
                            revision: ObjectRevision,
-                           inode: Inode)(using tx: Transaction, ec: ExecutionContext): Future[Inode] = {
+                           inode: Inode)
+                          (using tx: Transaction, ec: ExecutionContext): Future[(Inode, () => Future[Unit])] = {
 
       val updatedInode = update(inode)
 
       tx.overwrite(pointer, revision, updatedInode.toDataBuffer)
 
-      Future.successful(updatedInode)
+      Future.successful((updatedInode, () => Future.unit))
     }
   }
 
@@ -206,7 +209,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
       }.map(_=>())
     }
 
-    def attempt(): Future[(ObjectRevision, Inode)] = {
+    def attempt(): Future[(ObjectRevision, Inode, () => Future[Unit])] = {
       given tx: Transaction = fs.client.newTransaction()
 
       tx.note(s"FileOperation: ${op.getClass.getSimpleName}: ${op.toString}")
@@ -220,11 +223,12 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
           Future.unit.map(_ => arevision) // op added nothing to the transaction
       }
 
-      val fresult = for {
-        updatedInode <- op.prepareTransaction(pointer.pointer, arevision, ainode)
+      val fresult = for
+        (updatedInode, postCommitOp) <- op.prepareTransaction(pointer.pointer, arevision, ainode)
 
         updatedRevision <- commit()
-      } yield (updatedRevision, updatedInode)
+      yield 
+        (updatedRevision, updatedInode, postCommitOp)
 
       fresult.failed.foreach(err => tx.invalidateTransaction(err))
 
@@ -240,23 +244,26 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
       if (retryCount % 10 == 0)
         println(s"Slow/Hung write. Retry count: $retryCount. ${op.getClass.getSimpleName}: ${op.toString}")
 
-      attempt() map { t =>
-        synchronized {
+      val fattempt = attempt()
 
-          val (newRevision, updatedInode) = t
+      //fattempt.failed.foreach: cause =>
+      //  println(s"OP FAILED ${this.getClass.getSimpleName}: $cause")
+
+      fattempt.map: t =>
+        synchronized:
+          val (newRevision, updatedInode, postCommitOp) = t
 
           setCachedInode(updatedInode, newRevision)
+          
+          postCommitOp().foreach: _ =>
+            synchronized:
+              activeOp = None
+              op.promise.success(())
+              beginNextOp()
 
-          activeOp = None
-          op.promise.success(())
-
-          beginNextOp()
-        }
-      }
-
-    }.failed.foreach {
+    }.failed.foreach { cause =>
       // Propagate critical failures to the caller (attempted operation on deleted inode)
-      cause => op.promise.failure(cause)
+      op.promise.failure(cause)
     }
   }
 }

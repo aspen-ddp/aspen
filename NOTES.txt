@@ -1,4 +1,5 @@
 TODO:
+  * Globally replace Future.successful(()) with Future.unit
 
 # Setting up intellij to use a JDK installed by homebrew:
 # homebrew install openjdk

@@ -204,6 +204,9 @@ class FileInode(inodeNumber: Long,
 
   //logger.info(s"Created FileInode with ocontents ${ocontents.map(dp => dp.uuid)}")
 
+  def setContentTree(newContents: Root): FileInode =
+    new FileInode(inodeNumber, mode, uid, gid, links, ctime, mtime, atime, oxattrs, size, newContents)
+
   def updateContent(newSize: Long, newMtime: Timespec): FileInode =
     new FileInode(inodeNumber, mode, uid, gid, links, ctime, newMtime, atime, oxattrs, newSize, contents)
     

@@ -2,9 +2,10 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
-import org.aspen_ddp.aspen.common.objects.ObjectRevisionGuard
+import org.aspen_ddp.aspen.common.objects.{IntegerKeyOrdering, ObjectRevisionGuard}
 import org.aspen_ddp.aspen.amoebafs.impl.simple.CreateFileTask
 import org.aspen_ddp.aspen.amoebafs.{DirectoryInode, DirectoryPointer, FileInode, FileType}
+import org.aspen_ddp.aspen.client.tkvl.{Root, SinglePoolNodeAllocator}
 
 import scala.concurrent.Future
 
@@ -73,9 +74,10 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
   }
 
   test("Create File") {
-    val initInode = FileInode.init(0, 0, 1)
     for {
       fs <- bootstrap()
+      root = Root(0, IntegerKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, radicle.poolId))
+      initInode = FileInode.init(0, 0, 1, root)
       (rootInode, rootPointer, rootRevision) <- fs.readInode(1)
       dir = new SimpleDirectory(rootPointer.asInstanceOf[DirectoryPointer],
         rootRevision, rootInode.asInstanceOf[DirectoryInode], fs)
@@ -92,9 +94,10 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
   }
 
   test("Rename File") {
-    val initInode = FileInode.init(0, 0, 1)
     for {
       fs <- bootstrap()
+      root = Root(0, IntegerKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, radicle.poolId))
+      initInode = FileInode.init(0, 0, 1, root)
       (rootInode, rootPointer, rootRevision) <- fs.readInode(1)
       dir = new SimpleDirectory(rootPointer.asInstanceOf[DirectoryPointer],
         rootRevision, rootInode.asInstanceOf[DirectoryInode], fs)

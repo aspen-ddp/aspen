@@ -128,6 +128,30 @@ object KVObjectRootManager extends RegisteredTypeFactory with RootManagerFactory
 
   val typeUUID: UUID = UUID.fromString("CE36789D-42F1-43F9-9464-E9B44419D8C4")
 
+  /**
+   * @return future to a new KVObjectManager. Future completes after the
+   *         transaction commits
+   */
+  def setNewRoot(client: AspenClient,
+                 hostingObject: KeyValueObjectPointer,
+                 rootKey: Key,
+                 requireKeyNotExist: Boolean,
+                 rootPointer: KeyValueObjectPointer,
+                 ordering: KeyOrdering,
+                 nodeAllocator: NodeAllocator)(using tx:Transaction): Future[KVObjectRootManager] =
+
+    given ExecutionContext = client.clientContext
+
+    val kreqs = if requireKeyNotExist then
+      KeyValueUpdate.DoesNotExist(rootKey) :: Nil
+    else
+      Nil
+    val root = Root(0, ordering, Some(rootPointer), nodeAllocator)
+    tx.update(hostingObject, None, None, kreqs, Insert(rootKey, root.encode()) :: Nil)
+    tx.result.map:  _ =>
+      new KVObjectRootManager(client, rootKey, hostingObject)
+
+
   def createRootManager(client: AspenClient, data: Array[Byte]): KVObjectRootManager = {
     val bb = ByteBuffer.wrap(data)
     bb.order(ByteOrder.BIG_ENDIAN)
@@ -148,26 +172,17 @@ object KVObjectRootManager extends RegisteredTypeFactory with RootManagerFactory
                     key: Key,
                     ordering: KeyOrdering,
                     nodeAllocator: NodeAllocator,
-                    initialContent: Map[Key,Value])(using tx: Transaction): Future[Future[KVObjectRootManager]] = {
+                    initialContent: Map[Key,Value])(using tx: Transaction): Future[Future[KVObjectRootManager]] =
 
     given ExecutionContext = client.clientContext
 
-    val kreqs = KeyValueUpdate.DoesNotExist(key) :: Nil
-
-    if (initialContent.isEmpty) {
+    if initialContent.isEmpty then
       Future.successful(Future.successful(new KVObjectRootManager(client, key, pointer)))
-    } else {
-      for {
+    else
+      for
         alloc <- nodeAllocator.getAllocatorForTier(0)
         kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
         rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(pointer, kvos.revision), initialContent)
-      } yield {
-        val root = Root(0, ordering, Some(rptr), nodeAllocator)
-        tx.update(pointer, None, None, kreqs, Insert(key, root.encode()) :: Nil)
-        tx.result.map { _ =>
-          new KVObjectRootManager(client, key, pointer)
-        }
-      }
-    }
-  }
+      yield
+        setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
 }

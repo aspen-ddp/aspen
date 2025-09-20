@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
 
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 
 trait ObjectReader {
 
@@ -15,4 +15,12 @@ trait ObjectReader {
   def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState]
 
   def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState]
+
+  def readOptional(pointer: DataObjectPointer)(implicit ec: ExecutionContext): Future[Option[DataObjectState]] =
+    read(pointer, "").map(Some(_)).recover:
+      case e: InvalidObject => None
+
+  def readOptional(pointer: KeyValueObjectPointer)(implicit ec: ExecutionContext): Future[Option[KeyValueObjectState]] =
+    read(pointer, "").map(Some(_)).recover:
+      case e: InvalidObject => None
 }

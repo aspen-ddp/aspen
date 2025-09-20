@@ -20,7 +20,9 @@ class SimpleFileRootManager(client: AspenClient,
 
   override def typeId: RootManagerTypeId = RootManagerTypeId(typeUUID)
 
-  private def getRoot(oInodeDos: Option[DataObjectState] = None): Future[RData] = 
+  def getRoot(): Future[Root] = getRData().map(_.root)
+
+  private def getRData(oInodeDos: Option[DataObjectState] = None): Future[RData] = 
     val p = Promise[RData]()
     
     val fInodeDos = oInodeDos match 
@@ -51,19 +53,19 @@ class SimpleFileRootManager(client: AspenClient,
   def getTree(): Future[TieredKeyValueList] = Future.successful(new TieredKeyValueList(client, this))
 
   def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = 
-    getRoot().flatMap: rd =>
+    getRData().flatMap: rd =>
       rd.root.nodeAllocator.getAllocatorForTier(tier)
   
   def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] = 
-    getRoot().map: rd =>
+    getRData().map: rd =>
       (rd.root.tier, rd.root.ordering, rd.onode)
 
   def getMaxNodeSize(tier: Int): Future[Int] = 
-    getRoot().map: rd =>
+    getRData().map: rd =>
       rd.root.nodeAllocator.getMaxNodeSize(tier)
 
   override def getRootRevisionGuard(): Future[AllocationRevisionGuard] = 
-    getRoot().map: rd =>
+    getRData().map: rd =>
       ObjectRevisionGuard(inodePointer, rd.rootRevision)
 
   override def encode(): Array[Byte] =
@@ -95,7 +97,7 @@ class SimpleFileRootManager(client: AspenClient,
   override def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[AllocationRevisionGuard] =
     for
       dos <- client.read(inodePointer)
-      RData(root, _, onode) <- getRoot(Some(dos))
+      RData(root, _, onode) <- getRData(Some(dos))
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
       rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(inodePointer, dos.revision), contents)
     yield 

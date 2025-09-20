@@ -20,8 +20,10 @@ class KVObjectRootManager(val client: AspenClient,
 
   def typeId: RootManagerTypeId = RootManagerTypeId(typeUUID)
 
+  def getRoot(): Future[Root] = getRData().map(_.root)
+  
   /** Returns (numTiers, keyOrdering, rootNode) */
-  private def getRoot(): Future[RData] = {
+  private def getRData(): Future[RData] = {
     val p = Promise[RData]()
 
     client.read(pointer, s"Object hosting TKVL Root for tree $treeKey").onComplete {
@@ -57,19 +59,19 @@ class KVObjectRootManager(val client: AspenClient,
     p.future
   }
 
-  def getTree(): Future[TieredKeyValueList] = getRoot().map { rd =>
+  def getTree(): Future[TieredKeyValueList] = getRData().map { rd =>
     new TieredKeyValueList(client, this)
   }
 
-  def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = getRoot().flatMap { rd =>
+  def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = getRData().flatMap { rd =>
     rd.root.nodeAllocator.getAllocatorForTier(tier)
   }
 
-  def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] = getRoot().map { rd =>
+  def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] = getRData().map { rd =>
     (rd.root.tier, rd.root.ordering, rd.onode)
   }
 
-  def getMaxNodeSize(tier: Int): Future[Int] = getRoot().map { rd =>
+  def getMaxNodeSize(tier: Int): Future[Int] = getRData().map { rd =>
     rd.root.nodeAllocator.getMaxNodeSize(tier)
   }
 
@@ -84,7 +86,7 @@ class KVObjectRootManager(val client: AspenClient,
   }
 
   def prepareRootUpdate(newTier: Int, newRoot: KeyValueObjectPointer)(using tx: Transaction): Future[Unit] = {
-    getRoot().map { rd =>
+    getRData().map { rd =>
       if (rd.root.tier != newTier) {
         val data = rd.root.copy(tier=newTier, orootObject=Some(newRoot)).encode()
 
@@ -97,15 +99,14 @@ class KVObjectRootManager(val client: AspenClient,
   }
 
   def getRootRevisionGuard(): Future[AllocationRevisionGuard] = {
-
-    getRoot().map { rd =>
+    getRData().map { rd =>
       KeyRevisionGuard(pointer, treeKey, rd.rootRevision)
     }
   }
 
   def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[AllocationRevisionGuard] = {
     for {
-      RData(root, _, _) <- getRoot()
+      RData(root, _, _) <- getRData()
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
       kvos <- client.read(pointer, s"Reading root node of TKVL tree $treeKey for createInitialNode")
       rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(pointer, kvos.revision), contents)

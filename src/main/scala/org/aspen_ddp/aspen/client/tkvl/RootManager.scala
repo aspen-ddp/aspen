@@ -7,6 +7,8 @@ import scala.concurrent.Future
 
 trait RootManager {
 
+  def getRoot(): Future[Root]
+  
   /** Returns (numTiers, keyOrdering, rootNode) */
   def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])]
 

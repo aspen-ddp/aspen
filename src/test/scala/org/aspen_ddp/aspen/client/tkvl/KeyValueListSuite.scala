@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRefc
 
 import scala.concurrent.Future
 import scala.language.implicitConversions
+import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 class KeyValueListSuite extends IntegrationTestSuite {
 
@@ -85,6 +86,115 @@ class KeyValueListSuite extends IntegrationTestSuite {
       val vs = v.get
       vs.value.bytes.length should be (1)
       vs.value.bytes(0) should be (5)
+    }
+  }
+
+  test("Delete content with KVPair function") {
+    val key = Key(Array[Byte](1))
+    val value = Value(Array[Byte](2))
+
+    val key2 = Key(Array[Byte](0))
+    val value2 = Value(Array[Byte](5))
+    
+    var deletedKeys: Set[Key] = Set()
+    
+    def deleteKVPair(key: Key, value: ValueState): Future[Unit] = 
+      deletedKeys = deletedKeys + key
+      Future.unit
+
+    for {
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.get.createAllocator(Replication(3, 2))
+
+      tx = client.newTransaction()
+
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+
+      lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
+        ObjectRefcount(0, 1), Map(), None)
+
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
+
+      _ <- tx.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      lst <- lst.refresh()
+
+      tx2 = client.newTransaction()
+      _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
+
+      _ <- tx2.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      lst <- lst.refresh()
+      
+      _ <- KeyValueListNode.deleteContents(client, 
+        KeyValueListPointer(Key.AbsoluteMinimum, lst.pointer), 
+        lst.ordering,
+        Some(deleteKVPair))
+      
+      lst <- lst.refresh()
+
+      v1 <- lst.fetch(key)
+      v2 <- lst.fetch(key2)
+
+    } yield {
+      lst.contents.isEmpty should be (true)
+      v1.isEmpty should be(true)
+      v2.isEmpty should be(true)
+      deletedKeys should be (Set(key, key2))
+    }
+  }
+
+  test("Delete content oneshot") {
+    val key = Key(Array[Byte](1))
+    val value = Value(Array[Byte](2))
+
+    val key2 = Key(Array[Byte](0))
+    val value2 = Value(Array[Byte](5))
+
+    for {
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.get.createAllocator(Replication(3, 2))
+
+      tx = client.newTransaction()
+
+      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+
+      lst = new KeyValueListNode(client, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
+        ObjectRefcount(0, 1), Map(), None)
+
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
+
+      _ <- tx.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      lst <- lst.refresh()
+
+      tx2 = client.newTransaction()
+      _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
+
+      _ <- tx2.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      lst <- lst.refresh()
+
+      _ <- KeyValueListNode.deleteContents(client,
+        KeyValueListPointer(Key.AbsoluteMinimum, lst.pointer),
+        lst.ordering,
+        None)
+
+      lst <- lst.refresh()
+
+      v1 <- lst.fetch(key)
+      v2 <- lst.fetch(key2)
+
+    } yield {
+      lst.contents.isEmpty should be(true)
+      v1.isEmpty should be(true)
+      v2.isEmpty should be(true)
     }
   }
 

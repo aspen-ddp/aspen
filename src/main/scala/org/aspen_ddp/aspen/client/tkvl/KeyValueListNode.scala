@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
-import org.aspen_ddp.aspen.client.{KeyValueObjectState, ObjectAllocator, ObjectReader, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RevisionLock}
@@ -517,6 +517,53 @@ object KeyValueListNode {
       }
     }
   }
+
+  def deleteContents(client: AspenClient,
+                     nodePointer: KeyValueListPointer,
+                     ordering: KeyOrdering,
+                     odeleteKVPair: Option[(Key, ValueState) => Future[Unit]])
+                    (implicit ec: ExecutionContext): Future[Option[KeyValueListPointer]] =
+
+    def deleteOneShot(node: KeyValueListNode): Future[Unit] =
+      val deleteOps = node.contents.keysIterator.map(Delete(_)).toList
+
+      if deleteOps.isEmpty then
+        Future.unit
+      else
+        val fullContentLock = FullContentLock(node.contents.iterator.map(t => KeyRevision(t._1, t._2.revision)).toList)
+        val dtx = client.newTransaction()
+
+        dtx.update(node.pointer, Some(node.revision), Some(fullContentLock), Nil, deleteOps)
+
+        dtx.commit().map(_ => ())
+
+    def deleteOneAtATime(node: KeyValueListNode,
+                         deleteKVPair: (Key, ValueState) => Future[Unit]): Future[Unit] =
+      val pdone = Promise[Unit]()
+
+      def recurse(contents: List[(Key, ValueState)]): Unit =
+        if contents.isEmpty then
+          pdone.success(())
+        else
+          val (key, vs) = contents.head
+          deleteKVPair(key, vs).onComplete:
+            case Failure(_) => recurse(contents.tail)
+            case Success(_) =>
+              val dtx = client.newTransaction()
+              dtx.update(node.pointer, None, None, Nil, List(Delete(key)))
+              dtx.commit().onComplete:
+                case Failure(_) => recurse(contents.tail)
+                case Success(_) => recurse(contents.tail)
+
+      recurse(node.contents.toList)
+
+      pdone.future
+
+    client.read(nodePointer.pointer).flatMap: kvos =>
+      val node = KeyValueListNode(client, nodePointer, ordering, kvos)
+      odeleteKVPair match
+        case None => deleteOneShot(node).map(_ => node.tail)
+        case Some(deleteKVPair) => deleteOneAtATime(node, deleteKVPair).map(_ => node.tail)
 
   /**
    * Splits the list at the specified key. The original list node will have

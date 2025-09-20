@@ -48,7 +48,7 @@ class TieredKeyValueList(val client: AspenClient,
    * Splits the tree into two trees at the supplied key. All keys comparing
    * less than splitAtKey will remain in the original tree, the rest will be
    * moved to a new tree of the same depth as the original. The resulting
-   * KeyValueObjectPointer will be the root of the new tree.
+   * Root object will be the root of the new tree.
    *
    * The splitting operation is completed in a single transaction but note
    * that race conditions with outstanding split/join finalization actions
@@ -56,12 +56,12 @@ class TieredKeyValueList(val client: AspenClient,
    * Use with caution.
    */
   def splitTree(splitAtKey: Key)
-               (using t: Transaction): Future[KeyValueObjectPointer] = {
+               (using t: Transaction): Future[Root] = {
 
     def rinsert(tier: Int,
                 ordering: KeyOrdering,
                 rpath: List[KeyValueListNode],
-                downPointer: KeyValueObjectPointer): Future[KeyValueObjectPointer] = {
+                downPointer: KeyValueObjectPointer): Future[KeyValueObjectPointer] =
       if rpath.isEmpty then
         Future.successful(downPointer)
       else
@@ -71,11 +71,10 @@ class TieredKeyValueList(val client: AspenClient,
           kvp <- rinsert(tier + 1, ordering, rpath.tail, down.pointer)
         yield
           kvp
-    }
 
     def nonEmpty(tier: Int,
                  ordering: KeyOrdering,
-                 root: KeyValueListNode): Future[KeyValueObjectPointer] = {
+                 root: KeyValueListNode): Future[KeyValueObjectPointer] =
       for
         e <- fetchContainingNodePath(client, tier, 0, ordering, splitAtKey, root, Set())
 
@@ -92,11 +91,12 @@ class TieredKeyValueList(val client: AspenClient,
         kvp <- rinsert(0, ordering, rpath, down.pointer)
       yield
         kvp
-    }
 
-    rootManager.getRootNode().flatMap { t =>
-      val (tier, ordering, oroot) = t
-      oroot match {
+    for
+      oldRoot <- rootManager.getRoot()
+      (tier, ordering, oroot) <- rootManager.getRootNode()
+      ptr <- oroot match
+        case Some(root) => nonEmpty(tier, ordering, root)
         case None =>
           for
             allocGuard <- rootManager.createInitialNode(Map())
@@ -104,10 +104,8 @@ class TieredKeyValueList(val client: AspenClient,
             ptr <- alloc.allocateKeyValueObject(allocGuard, Map())
           yield
             ptr
-
-        case Some(root) => nonEmpty(tier, ordering, root)
-      }
-    }
+    yield
+      Root(tier, ordering, Some(ptr), oldRoot.nodeAllocator)
   }
 
   def set(key: Key,

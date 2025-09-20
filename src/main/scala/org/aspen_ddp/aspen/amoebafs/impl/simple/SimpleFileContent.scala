@@ -129,24 +129,20 @@ class SimpleFileContent(file: SimpleFile,
    *  is complete
    */
   def truncate(endOffset: Long)
-              (using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] = ???
-  
-  // TODO: segmentOffset => Add DataObjectState cache. Should be useable by both
-  //       reads and writes. On write tx success, update cache with new object.
-  //       When fetching an object for read or write, pull from cache first. 
-  //       On failed Tx, remove segmentOffset from cache. Scaffiene max 5
-  //       timeout after 1 min of inactivity? 
+              (using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] =
+    val inode = file.inode
 
-  /*
-  Write operation needs to write only one segment at a time. Problem with
-  adding multiple segments is that if a TKVL node split occurs the key
-  requirements added to the transaction could cause the Tx to fail and
-  retries would simply hit the same problem.
-  
-  FileHandle will immediately start the next write operation when the write
-  completes. Should provide decent performance and greatly simplified 
-  implementation
-  */
+    if endOffset > inode.size then
+      write(endOffset - 1, List(DataBuffer.Empty)).map(_ => Future.unit)
+
+    else if inode.size == endOffset then
+      Future.successful(Future.unit)
+
+    else
+      //prepareIndexDeletionTask(fs, root.pointer).map(fdeleteComplete => (fdeleteComplete, None))
+      Future.successful(Future.unit)
+
+
   def write(offset: Long,
             buffers: List[DataBuffer])
            (using tx: Transaction, ec: ExecutionContext): Future[WriteResult] =

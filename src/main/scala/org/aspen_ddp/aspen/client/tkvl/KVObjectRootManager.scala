@@ -39,9 +39,12 @@ class KVObjectRootManager(val client: AspenClient,
               case None => p.success(RData(root, v.revision, None))
               case Some(rootObject) =>
                 client.read(rootObject, s"Root node for TKVL tree $treeKey").onComplete {
-                  case Failure(err) => p.failure(err)
+                  case Failure(err) =>
+                    // Tree has been deleted but the root has not yet been updated
+                    // Return an empty tree root
+                    p.success(RData(root.copy(tier=0, orootObject=None), v.revision, None))
+                    
                   case Success(rootKvos) =>
-
                     val rootLp = KeyValueListPointer(Key.AbsoluteMinimum, rootObject)
                     val node = KeyValueListNode(client, rootLp, root.ordering, rootKvos)
 
@@ -50,7 +53,6 @@ class KVObjectRootManager(val client: AspenClient,
             }
           } catch {
             case err: Throwable =>
-            println(s"Invalid Root: $err")
               p.failure(new InvalidRoot)
           }
         }
@@ -87,14 +89,11 @@ class KVObjectRootManager(val client: AspenClient,
 
   def prepareRootUpdate(newTier: Int, onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit] = {
     getRData().map { rd =>
-      if (rd.root.tier != newTier) {
-        val data = rd.root.copy(tier=newTier, orootObject=onewRoot).encode()
-
-        val reqs = KeyValueUpdate.KeyRevision(treeKey, rd.rootRevision) :: Nil
-        val ops = Insert(treeKey, data) :: Nil
-
-        tx.update(pointer, None, None, reqs, ops)
-      }
+      val data = rd.root.copy(tier=newTier, orootObject=onewRoot).encode()
+      val reqs = KeyValueUpdate.KeyRevision(treeKey, rd.rootRevision) :: Nil
+      val ops = Insert(treeKey, data) :: Nil
+      
+      tx.update(pointer, None, None, reqs, ops)
     }
   }
 

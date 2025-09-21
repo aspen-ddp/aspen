@@ -5,7 +5,9 @@ import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
+import scala.concurrent.Future
 import scala.language.implicitConversions
 
 class TKVLSuite extends IntegrationTestSuite {
@@ -136,6 +138,74 @@ class TKVLSuite extends IntegrationTestSuite {
       val vs = v.get
       vs.value.bytes.length should be (512*1024)
       numTiers should be (1)
+    }
+  }
+
+  test("deleteTree") {
+    val treeKey = Key(Array[Byte](0))
+    val key = Key(Array[Byte](1))
+    val value = Value(Array[Byte](3))
+
+    val key2 = Key(Array[Byte](4))
+    val value2 = Value(new Array[Byte](512 * 1024))
+
+    val key3 = Key(Array[Byte](5))
+    val value3 = Value(new Array[Byte](512 * 1024))
+
+    var deletedKeys = Set[Key]()
+
+    def deleteKV(key: Key, vs: ValueState): Future[Unit] =
+      deletedKeys = deletedKeys + key
+      Future.unit
+
+    given tx1: Transaction = client.newTransaction()
+
+    for {
+      ikvos <- client.read(radicle)
+
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.get.createAllocator(Replication(3, 2))
+
+      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+
+      nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
+
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))
+
+      r <- tx1.commit()
+
+      root <- froot
+      tree <- root.getTree()
+
+      tx = client.newTransaction()
+      _ <- tree.set(key2, value2)(using tx)
+      r <- tx.commit()
+
+      tx = client.newTransaction()
+      _ <- tree.set(key3, value3)(using tx)
+      r <- tx.commit()
+
+      // Wait for background transactions complete since the tree is updated
+      // Asynchronously in the background
+      _ <- waitForTransactionsToComplete()
+
+      tree <- root.getTree()
+      v <- tree.get(key3)
+      (numTiers, _, _) <- tree.rootManager.getRootNode()
+      
+      _ <- tree.deleteTree(Some(deleteKV))
+      
+      (numTiersAfterDelete, _, rootAfterDelete) <- tree.rootManager.getRootNode()
+
+    } yield {
+      v.isEmpty should be(false)
+      val vs = v.get
+      vs.value.bytes.length should be(512 * 1024)
+      numTiers should be(1)
+
+      deletedKeys should be(Set(key, key2, key3))
+      numTiersAfterDelete should be (0)
+      rootAfterDelete.isEmpty should be (true)
     }
   }
 

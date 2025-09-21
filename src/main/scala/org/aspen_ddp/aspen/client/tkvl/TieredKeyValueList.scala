@@ -80,7 +80,7 @@ class TieredKeyValueList(val client: AspenClient,
       
       _ <- onode match
         case None => Future.unit
-        case Some(node) => 
+        case Some(node) =>
           for
             path <- fetchRootNodes(List((tier, node)))
             _ <- rdelete(path)

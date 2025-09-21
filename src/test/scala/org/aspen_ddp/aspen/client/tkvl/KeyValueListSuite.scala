@@ -250,8 +250,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     val key2 = Key(Array[Byte](2))
     val value2 = Value(new Array[Byte](60))
-
-
+    
     var deletedKeys = Set[Key]()
 
     def deleteKV(key: Key, vs: ValueState): Future[Unit] = 

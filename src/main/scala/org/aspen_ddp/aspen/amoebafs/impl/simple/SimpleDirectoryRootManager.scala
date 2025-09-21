@@ -39,9 +39,12 @@ class SimpleDirectoryRootManager(client: AspenClient,
             case None => p.success(RData(root, inodeDos.revision, None))
             case Some(rootObject) =>
               client.read(rootObject).onComplete {
-                case Failure(err) => p.failure(err)
+                case Failure(err) =>
+                  // Tree has been deleted but the root has not yet been updated
+                  // Return an empty tree root
+                  p.success(RData(root.copy(tier=0, orootObject=None), inodeDos.revision, None))
+                  
                 case Success(rootKvos) =>
-
                   val rootLp = KeyValueListPointer(Key.AbsoluteMinimum, rootObject)
                   val node = KeyValueListNode(client, rootLp, root.ordering, rootKvos)
 

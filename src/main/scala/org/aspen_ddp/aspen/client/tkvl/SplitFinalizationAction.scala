@@ -40,7 +40,7 @@ class SplitFinalizationAction(val client: AspenClient,
           alloc <- rootManager.getAllocatorForTier(tier)
           guard <- rootManager.getRootRevisionGuard()
           nroot <- alloc.allocateKeyValueObject(guard, rootContent)
-          _ <- rootManager.prepareRootUpdate(tier, nroot)
+          _ <- rootManager.prepareRootUpdate(tier, Some(nroot))
           _ <- tx.commit()
         } yield ()
       }
@@ -55,16 +55,17 @@ class SplitFinalizationAction(val client: AspenClient,
 
         def prepareInsert(e: Either[Set[ObjectId], KeyValueListNode], nodeSize: Int, alloc: ObjectAllocator): Future[Unit] = {
           e match {
-            case Left(_) => Future.failed(new BrokenTree)
+            case Left(_) =>
+              // Tree is likely being deleted. Not much we can do
+              Future.unit
+              
             case Right(node) =>
-
               def onSplit(min: Key, ptr: KeyValueObjectPointer): Future[Unit] = {
                 SplitFinalizationAction.addToTransaction(rootManager, tier+1, min, ptr, tx)
                 Future.successful(())
               }
 
               node.insert(newMinimum, Value(newNode.toArray), nodeSize, alloc, onSplit).map(_=>())
-
           }
         }
 
@@ -84,7 +85,10 @@ class SplitFinalizationAction(val client: AspenClient,
         val (rootTier, ordering, orootNode) = t
 
         orootNode match {
-          case None => Future.successful(()) // shouldn't be possible
+          case None => 
+            // Tree must have been deleted. Should be safe to ignore
+            Future.successful(()) 
+            
           case Some(rootNode) =>
             if (tier > rootTier)
               createNewRoot(rootTier, ordering, rootNode)

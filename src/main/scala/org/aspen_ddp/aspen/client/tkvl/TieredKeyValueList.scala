@@ -43,7 +43,55 @@ class TieredKeyValueList(val client: AspenClient,
       }
     }
   }
+  
+  def deleteTree(odeleteKVPair: Option[(Key, ValueState) => Future[Unit]]): Future[Unit] =
+    def fetchRootNodes(path: List[(Int, KeyValueListNode)]): Future[List[(Int, KeyValueListNode)]] =
+      val (tier, node) = path.head
+      if tier == 0 then
+        Future.successful(path)
+      else
+        node.contents.get(Key.AbsoluteMinimum) match 
+          case None => Future.successful(path)
+          case Some(vs) =>
+            val downPtr = KeyValueObjectPointer(vs.value.bytes)
+            client.readOptional(downPtr).flatMap:
+              case None => Future.successful(path)
+              case Some(kvos) =>
+                val downlp = KeyValueListPointer(Key.AbsoluteMinimum, downPtr)
+                val downNode = KeyValueListNode(client, downlp, node.ordering, kvos)
+                val nextTierDown = tier - 1
+                fetchRootNodes((nextTierDown, downNode) :: path)
 
+    def rdelete(path: List[(Int, KeyValueListNode)]): Future[Unit] = 
+      if path.isEmpty then
+        Future.unit
+      else 
+        val (tier, node) = path.head
+        val odkv = if tier == 0 then odeleteKVPair else None
+        val kvlp = KeyValueListPointer(Key.AbsoluteMinimum, node.pointer)
+        for 
+          _ <- KeyValueListNode.deleteList(client, kvlp, node.ordering, odkv)
+          _ <- rdelete(path.tail)
+        yield 
+          ()
+    
+    for
+      (tier, ordering, onode) <- rootManager.getRootNode()
+      
+      _ <- onode match
+        case None => Future.unit
+        case Some(node) => 
+          for
+            path <- fetchRootNodes(List((tier, node)))
+            _ <- rdelete(path)
+            tx = client.newTransaction()
+            _ <- rootManager.prepareRootUpdate(0, None)(using tx)
+            _ <- tx.commit()
+          yield
+            ()
+    yield
+      ()
+      
   /**
    * Splits the tree into two trees at the supplied key. All keys comparing
    * less than splitAtKey will remain in the original tree, the rest will be

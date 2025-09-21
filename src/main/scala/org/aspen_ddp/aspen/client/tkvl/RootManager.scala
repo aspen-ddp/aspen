@@ -18,7 +18,7 @@ trait RootManager {
 
   def getMaxNodeSize(tier: Int): Future[Int]
 
-  def prepareRootUpdate(newTier: Int, newRoot: KeyValueObjectPointer)(using tx: Transaction): Future[Unit]
+  def prepareRootUpdate(newTier: Int, onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit]
 
   def getRootRevisionGuard(): Future[AllocationRevisionGuard]
 

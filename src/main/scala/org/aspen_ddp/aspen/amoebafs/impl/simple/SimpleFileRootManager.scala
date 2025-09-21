@@ -75,8 +75,8 @@ class SimpleFileRootManager(client: AspenClient,
     inodePointer.encodeInto(bb)
     arr
 
-  override def prepareRootUpdate(newTier: Int,
-                                 newRoot: KeyValueObjectPointer)(using tx: Transaction): Future[Unit] =
+  override def prepareRootUpdate(newTier: Int, 
+                                 onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit] =
     val p = Promise[Unit]()
 
     client.read(inodePointer).onComplete:
@@ -86,7 +86,7 @@ class SimpleFileRootManager(client: AspenClient,
 
         val root = inode.contents
 
-        val nextRoot = root.copy(tier = newTier, orootObject = Some(newRoot))
+        val nextRoot = root.copy(tier = newTier, orootObject = onewRoot)
         val newInode = inode.setContentTree(nextRoot)
 
         tx.overwrite(inodePointer, inodeDos.revision, newInode.toArray)

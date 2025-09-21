@@ -34,7 +34,7 @@ class JoinFinalizationAction(val client: AspenClient,
         tx.setRefcount(rootNode.pointer, rootNode.refcount, rootNode.refcount.decrement())
 
         for {
-          _ <- rootManager.prepareRootUpdate(tier-1, newRoot)
+          _ <- rootManager.prepareRootUpdate(tier-1, Some(newRoot))
           _ <- tx.commit()
         } yield ()
       }

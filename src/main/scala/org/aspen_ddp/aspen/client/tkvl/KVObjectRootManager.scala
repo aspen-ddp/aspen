@@ -85,10 +85,10 @@ class KVObjectRootManager(val client: AspenClient,
     arr
   }
 
-  def prepareRootUpdate(newTier: Int, newRoot: KeyValueObjectPointer)(using tx: Transaction): Future[Unit] = {
+  def prepareRootUpdate(newTier: Int, onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit] = {
     getRData().map { rd =>
       if (rd.root.tier != newTier) {
-        val data = rd.root.copy(tier=newTier, orootObject=Some(newRoot)).encode()
+        val data = rd.root.copy(tier=newTier, orootObject=onewRoot).encode()
 
         val reqs = KeyValueUpdate.KeyRevision(treeKey, rd.rootRevision) :: Nil
         val ops = Insert(treeKey, data) :: Nil

@@ -52,7 +52,7 @@ class Frontend(val storeId: StoreId,
     ltrs.foreach { trs =>
       val txd = TransactionDescription.deserialize(trs.serializedTxd)
       val locaters = txd.hostedObjectLocaters(storeId)
-      val tx = new Tx(trs, txd, backend, net, crl, statusCache, Nil, locaters)
+      val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, locaters)
       transactions += (txd.transactionId -> tx)
       locaters.foreach(locater => readObjectForTransaction(tx, locater))
     }
@@ -74,6 +74,15 @@ class Frontend(val storeId: StoreId,
   def close(): Future[Unit] = backend.close()
 
   def path: Path = backend.path
+  
+  def commit(os: ObjectState, cs: CommitState, txid: TransactionId): Unit =
+    //println(s"Committing object ${cs.objectId} refcount ${os.metadata.refcount}")
+    if os.metadata.refcount.count == 0 then
+      objectCache.remove(os.objectId)
+    else
+      objectCache.insert(os)
+    backend.commit(cs, txid)
+  
 
   def receiveTransactionMessage(msg: TxMessage): Unit = msg match {
     case m: TxPrepare => receivePrepare(m)
@@ -97,7 +106,7 @@ class Frontend(val storeId: StoreId,
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates)
       val locaters = m.txd.hostedObjectLocaters(m.to)
-      val tx = new Tx(trs, m.txd, backend, net, crl, statusCache, m.preTxRebuilds, locaters)
+      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, locaters)
       transactions += (m.txd.transactionId -> tx)
       tx.receivePrepare(m)
       locaters.foreach(locater => readObjectForTransaction(tx, locater))
@@ -144,6 +153,7 @@ class Frontend(val storeId: StoreId,
   def readObjectForNetwork(clientId: ClientId, readUUID: UUID, locater: Locater): Unit = {
     objectCache.get(locater.objectId) match {
       case Some(os) =>
+        //println(s"Reading Store Cached Object ${locater.objectId} ${os.metadata.refcount}")
         logger.trace(s"Reading Cached object for read $readUUID. Revision ${os.metadata.revision}")
         val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
           os.data.size, Some(os.data), os.lockedWriteTransactions )

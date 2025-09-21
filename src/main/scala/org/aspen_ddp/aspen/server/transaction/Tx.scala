@@ -7,8 +7,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{Backend, CommitError, CommitState}
-import org.aspen_ddp.aspen.server.store.{Locater, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
+import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState}
+import org.aspen_ddp.aspen.server.store.{Frontend, Locater, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
 import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.duration._
@@ -16,7 +16,7 @@ import scala.concurrent.duration._
 
 class Tx( trs: TransactionRecoveryState,
           val txd: TransactionDescription,
-          private val backend: Backend,
+          private val frontend: Frontend,
           private val net: Messenger,
           private val crl: CrashRecoveryLog,
           private val statusCache: TransactionStatusCache,
@@ -100,7 +100,7 @@ class Tx( trs: TransactionRecoveryState,
           val cs = CommitState(os.objectId, os.storePointer, os.metadata, os.objectType, os.data, os.maxSize)
           val txid = TransactionId(r.requiredMetadata.revision.lastUpdateTxUUID)
           // No need to wait for this to complete
-          backend.commit(cs, txid)
+          frontend.commit(os, cs, txid)
         }
       }
     }
@@ -162,7 +162,7 @@ class Tx( trs: TransactionRecoveryState,
       if (!skipped.contains(os.objectId)) {
         val cs = CommitState(os.objectId, os.storePointer, os.metadata, os.objectType, os.data, os.maxSize)
 
-        backend.commit(cs, transactionId)
+        frontend.commit(os, cs, transactionId)
       }
     }
 

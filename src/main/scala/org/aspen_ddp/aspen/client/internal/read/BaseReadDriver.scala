@@ -12,6 +12,7 @@ import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
+import scala.util.{Failure, Success}
 
 abstract class BaseReadDriver(
                                val client: AspenClient,
@@ -200,9 +201,8 @@ object BaseReadDriver {
           hung = true
         }
       }
-
-      readResult.foreach { _ =>
-
+      
+      def cancelCallback(): Unit =
         hangCheckTask.cancel()
         bgTasks.shutdown(Duration(0, SECONDS))
         synchronized {
@@ -211,6 +211,10 @@ object BaseReadDriver {
             println(s"**** HUNG READ EVENTUALLY COMPLETED! : $test")
           }
         }
+
+      readResult.onComplete {
+        case Failure(_) => cancelCallback()
+        case Success(_) => cancelCallback()
       }(using ec)
     }
   }

@@ -125,7 +125,7 @@ object KeyValueObjectReaderSuite {
 
       val cs = ReadResponse.CurrentState(
         oversion._1,
-        ObjectRefcount(0, 0),
+        ObjectRefcount(0, 1),
         oversion._2,
         odata.map(_.size).getOrElse(0),
         odata,

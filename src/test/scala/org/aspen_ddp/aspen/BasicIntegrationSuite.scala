@@ -113,6 +113,43 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     }
   }
 
+  test("Allocate and delete KeyValue object") {
+    val key = Key(Array[Byte](100))
+    val value = Value(Array[Byte](2))
+
+    given tx: Transaction = client.newTransaction()
+
+    tx.update(radicle,
+      None,
+      None,
+      List(KeyValueUpdate.DoesNotExist(key)),
+      List(Insert(key, value.bytes)))
+
+    for {
+      ikvos <- client.read(radicle)
+
+      pool <- client.getStoragePool(Radicle.poolId)
+
+      alloc = pool.get.createAllocator(Replication(3, 2))
+
+      kp <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(key -> value))
+
+      _ <- tx.commit().map(_ => ())
+
+      kvos <- client.read(kp)
+
+      tx2 = client.newTransaction()
+      _ = tx2.setRefcount(kp, kvos.refcount, kvos.refcount.decrement())
+      _ <- tx2.commit()
+      //_=println(s"****************************************")
+      //_=println(s"* Reading delete object ${kp.id}")
+      okvos2 <- client.readOptional(kp)
+      //_=println(s"###### Read Refcount: ${okvos2.get.refcount}")
+    } yield {
+      okvos2.isEmpty should be (true)
+    }
+  }
+
   test("Allocate and update data object") {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))

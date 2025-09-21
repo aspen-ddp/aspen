@@ -18,18 +18,17 @@ class DataObjectReader(metadataOnly: Boolean, pointer: DataObjectPointer, readUU
   override protected def restoreObject(revision:ObjectRevision, refcount: ObjectRefcount, timestamp:HLCTimestamp,
                                        readTime: HLCTimestamp, matchingStoreStates: List[DataObjectStoreState],
                                        allStoreStates: List[DataObjectStoreState], debug: Boolean): ObjectState = {
-
+    
     val sizeOnStore = matchingStoreStates.head.sizeOnStore
 
     val segments = matchingStoreStates.foldLeft(List[(Byte,DataBuffer)]()) { (l, ss) => ss.objectData match {
       case None => l
       case Some(db) => (ss.storeId.poolIndex -> db) :: l
     }}
-
+    
     if (segments.size >= threshold) {
       val data = pointer.ida.restore(segments)
-      val obj = DataObjectState(pointer, revision, refcount, timestamp, readTime, sizeOnStore, data)
-      obj
+      DataObjectState(pointer, revision, refcount, timestamp, readTime, sizeOnStore, data)
     }
     else
       throw BaseObjectReader.NotRestorable(s"Below Threshold")

@@ -523,7 +523,7 @@ object KeyValueListNode {
                  ordering: KeyOrdering,
                  odeleteKVPair: Option[(Key, ValueState) => Future[Unit]])
                 (implicit ec: ExecutionContext): Future[Unit] =
-    
+
     def deleteNode(ptr: KeyValueListPointer,
                    nodeRevision: ObjectRevision,
                    optr: Option[KeyValueListPointer]): Future[Unit] =
@@ -540,7 +540,6 @@ object KeyValueListNode {
         // Lock full content to ensure nothing is inserted while we're trying to
         // delete the node
         tx.update(ptr.pointer, Some(kvos.revision), Some(FullContentLock(List())), Nil, Nil)
-
         tx.setRefcount(ptr.pointer, kvos.refcount, kvos.refcount.decrement())
 
         // Update the right pointer of the start node to point to the next node
@@ -549,7 +548,7 @@ object KeyValueListNode {
         tx.commit().map(_ => ())
       }.recover:
         case _: InvalidObject => ()
-    
+
     def deleteRight(ptr: KeyValueListPointer): Future[Option[KeyValueListPointer]] =
       client.retryStrategy.retryUntilSuccessful:
         for
@@ -557,16 +556,12 @@ object KeyValueListNode {
           // object revision
           nodeKvos <- client.read(nodePointer.pointer).recover:
             case e:InvalidObject => throw StopRetrying(e)
-            
           optr <- deleteContents(client, ptr, ordering, odeleteKVPair)
-          
-          _ <- optr match 
-            case None => Future.unit
-            case Some(ptr) => deleteNode(ptr, nodeKvos.revision, Some(ptr))
+          _ <- deleteNode(ptr, nodeKvos.revision, Some(ptr))
         yield
           optr
-          
-    def deleteRootNode(): Future[Unit] = 
+
+    def deleteRootNode(): Future[Unit] =
       def tryDelete(kvos: KeyValueObjectState): Future[Unit] =
         val tx = client.newTransaction()
         if kvos.contents.nonEmpty then
@@ -574,7 +569,7 @@ object KeyValueListNode {
         tx.update(kvos.pointer, Some(kvos.revision), Some(FullContentLock(List())), Nil, Nil)
         tx.setRefcount(kvos.pointer, kvos.refcount, kvos.refcount.decrement())
         tx.commit().map(_ => ())
-        
+
       client.retryStrategy.retryUntilSuccessful:
         for
           _ <- deleteContents(client, nodePointer, ordering, odeleteKVPair)
@@ -584,30 +579,30 @@ object KeyValueListNode {
             case Some(kvos) => tryDelete(kvos)
         yield
           ()
-          
+
     val allRightNodesDeleted = Promise[Unit]()
-    
+
     def recurse(optr: Option[KeyValueListPointer]): Unit =
-      optr match 
+      optr match
         case None => allRightNodesDeleted.success(())
         case Some(rptr) => deleteRight(rptr).map(recurse)
-        
+
     for
       okvos <- client.readOptional(nodePointer.pointer)
       _ <- okvos match
         case None => Future.unit
-        
+
         case Some(kvos) =>
           val node = KeyValueListNode(client, nodePointer, ordering, kvos)
-          
+
           // Kick off potentially long recursion
           recurse(node.tail)
-          
+
           allRightNodesDeleted.future.flatMap: _ =>
             deleteRootNode()
     yield
       ()
-  
+
   def deleteContents(client: AspenClient,
                      nodePointer: KeyValueListPointer,
                      ordering: KeyOrdering,
@@ -656,7 +651,7 @@ object KeyValueListNode {
         case Some(deleteKVPair) => deleteOneAtATime(node, deleteKVPair).map(_ => node.tail)
     } recover:
       case _: InvalidObject => None // already deleted
-      case t: Throwable => 
+      case t: Throwable =>
         println(s"Unexpected error while deleting KeyValueListNode content ${nodePointer.pointer.id}: $t")
         None
 

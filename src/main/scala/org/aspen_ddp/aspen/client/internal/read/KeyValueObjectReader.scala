@@ -29,7 +29,7 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
   override protected def restoreObject(revision:ObjectRevision, refcount: ObjectRefcount, timestamp:HLCTimestamp,
                                        readTime: HLCTimestamp, matchingStoreStates: List[KeyValueObjectStoreState],
                                        allStoreStates: List[KeyValueObjectStoreState], debug: Boolean): ObjectState = {
-
+    //println(s"ATTEMPTING TO Restore object with refcount ${refcount}")
     if (debug)
       println(s"DEBUG KV Restore Object")
     val storeStates = allStoreStates

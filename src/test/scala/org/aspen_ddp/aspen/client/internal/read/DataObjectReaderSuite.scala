@@ -1,9 +1,8 @@
 package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
-
-import org.aspen_ddp.aspen.client.{CorruptedObject, InvalidObject, ObjectState}
-import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.client.{CorruptedObject, DataObjectState, InvalidObject, ObjectState}
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ReadError}
@@ -28,7 +27,8 @@ object DataObjectReaderSuite {
                                          readTime: HLCTimestamp, matchingStoreStates: List[DataObjectStoreState],
                                          allStoreStates: List[DataObjectStoreState], debug: Boolean): ObjectState = {
       rstates = Some(matchingStoreStates)
-      null
+      val s = matchingStoreStates.head
+      DataObjectState(pointer, revision, refcount, timestamp, readTime, 0, DataBuffer.Empty)
     }
   }
 

@@ -174,7 +174,13 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
       else {
         try {
           val restoredObject = restoreObject(revision, refcount, timestamp, readTime, matchingStoreStates, allStoreStates, debug)
-          endResult = Some(Right(restoredObject))
+          
+          // Check if the object was recently deleted but the state hasn't yet been
+          // flushed out of the backends
+          if restoredObject.refcount.count > 0 then
+            endResult = Some(Right(restoredObject))
+          else
+            endResult = Some(Left(InvalidObject(pointer)))
         } catch {
           case NotRestorable(reason) =>
             if (debug)

@@ -83,7 +83,6 @@ class Frontend(val storeId: StoreId,
       objectCache.insert(os)
     backend.commit(cs, txid)
   
-
   def receiveTransactionMessage(msg: TxMessage): Unit = msg match {
     case m: TxPrepare => receivePrepare(m)
     case m: TxAccept => transactions.get(m.transactionId).foreach(tx => tx.receiveAccept(m))
@@ -244,7 +243,7 @@ class Frontend(val storeId: StoreId,
       val cs = CommitState(os.objectId, os.storePointer, os.metadata, os.objectType, os.data, os.maxSize)
       val txid = TransactionId(op.revision.lastUpdateTxUUID)
       // No need to wait for this to complete
-      backend.commit(cs, txid)
+      commit(os, cs, txid)
     }
   }
 

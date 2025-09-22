@@ -15,17 +15,15 @@ object SimpleTaskExecutor {
   val TaskTypeKey = Key(UUID.fromString("f13fbfd4-85fa-449c-b279-9859ee5e7de0"))
 
   def apply(client: AspenClient,
-            registeredTasks: Map[UUID, DurableTaskFactory],
             taskStateAllocator: ObjectAllocator,
             executorObject: KeyValueObjectPointer): Future[SimpleTaskExecutor] = {
 
     given ExecutionContext = client.clientContext
 
-    client.read(executorObject).map( kvos => new SimpleTaskExecutor(client, registeredTasks, taskStateAllocator, kvos))
+    client.read(executorObject).map( kvos => new SimpleTaskExecutor(client, taskStateAllocator, kvos))
   }
 
   def createNewExecutor(client: AspenClient,
-                        registeredTasks: Map[UUID, DurableTaskFactory],
                         executorAllocator: ObjectAllocator,
                         taskStateAllocator: ObjectAllocator,
                         revisionGuard: AllocationRevisionGuard)
@@ -37,13 +35,12 @@ object SimpleTaskExecutor {
       executor <- executorAllocator.allocateKeyValueObject(revisionGuard, Map())
       kvos <- client.read(executor)
     } yield {
-      (executor, new SimpleTaskExecutor(client, registeredTasks, taskStateAllocator, kvos))
+      (executor, new SimpleTaskExecutor(client, taskStateAllocator, kvos))
     }
   }
 }
 
 class SimpleTaskExecutor(val client: AspenClient,
-                         val registeredTasks: Map[UUID, DurableTaskFactory],
                          val taskStateAllocator: ObjectAllocator,
                          kvos: KeyValueObjectState) extends TaskExecutor {
 
@@ -67,7 +64,7 @@ class SimpleTaskExecutor(val client: AspenClient,
           else {
             val taskType = byte2uuid(kvos.contents(TaskTypeKey).value.bytes)
 
-            registeredTasks.get(taskType) match {
+            client.typeRegistry.getType[DurableTaskFactory](taskType) match {
               case None => // TODO Log a warning. This should not be possible
                 inactive = taskPointer :: inactive
 

@@ -68,7 +68,7 @@ object SimpleFileSystem {
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
       defaultAllocator = new SinglePoolObjectAllocator(client, rootPool.get, fsRoot.ida, None)
       executorRoot = KeyValueObjectPointer(kvos.contents(TaskExecutorRootKey).value.bytes)
-      executor <- SimpleTaskExecutor(client, StaticTaskTypeRegistry.registeredTasks, defaultAllocator, executorRoot)
+      executor <- SimpleTaskExecutor(client, defaultAllocator, executorRoot)
     yield
       new SimpleFileSystem(client, kvos, defaultAllocator, executor, numContextThreads)
 

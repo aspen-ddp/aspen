@@ -1,19 +1,18 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import java.util.UUID
-
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, TaskExecutor}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor}
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
-import org.aspen_ddp.aspen.amoebafs.{FileSystem, Inode, InodePointer}
+import org.aspen_ddp.aspen.amoebafs.{File, FilePointer, FileSystem, Inode, InodePointer}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 import scala.language.implicitConversions
 
-object UnlinkFileTask extends DurableTaskFactory {
+object UnlinkFileTask extends DurableTaskFactory:
   val typeUUID: UUID = UUID.fromString("B02539DC-3AE1-4E50-B52B-A5EFA6B5B330")
 
   private val FileSystemUUIDKey = Key(1)
@@ -23,7 +22,7 @@ object UnlinkFileTask extends DurableTaskFactory {
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
                  revision: ObjectRevision,
-                 state: Map[Key, KeyValueObjectState.ValueState]): DurableTask = {
+                 state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
 
     val fsUUID = byte2uuid(state(FileSystemUUIDKey).value.bytes)
     val ptr = InodePointer(state(InodePointerKey).value.bytes)
@@ -31,19 +30,17 @@ object UnlinkFileTask extends DurableTaskFactory {
     val fs = FileSystem.getRegisteredFileSystem(fsUUID).get
 
     new UnlinkFileTask(pointer, fs, ptr)
-  }
 
   def prepareTask(fileSystem: FileSystem,
-                  inodePointer: InodePointer)(using tx: Transaction): Future[Future[Option[AnyRef]]] = {
+                  inodePointer: InodePointer)(using tx: Transaction): Future[Future[Option[AnyRef]]] =
     val istate = List((FileSystemUUIDKey -> uuid2byte(fileSystem.uuid)),
       (InodePointerKey -> inodePointer.toArray))
     fileSystem.taskExecutor.prepareTask(this, istate)
-  }
-}
+
 
 class UnlinkFileTask(val taskPointer: DurableTaskPointer,
                      val fs: FileSystem,
-                     val iptr: InodePointer) extends DurableTask {
+                     val iptr: InodePointer) extends DurableTask:
 
   import UnlinkFileTask._
 
@@ -55,58 +52,55 @@ class UnlinkFileTask(val taskPointer: DurableTaskPointer,
 
   doNextStep()
 
-  def doNextStep(): Unit = {
-    for {
+  def doNextStep(): Unit =
+    for
       kvos <- fs.client.read(taskPointer.kvPointer)
       (inode, _, revision) <- fs.readInode(iptr)
+      file <- fs.loadFile(FilePointer(iptr.number, iptr.pointer))
       step = kvos.contents(StepKey)
-    } yield {
-      step.value.bytes(0) match {
-        case 0 => decrementLinkCount(step.revision, inode, revision) onComplete {
+    yield
+      step.value.bytes(0) match
+        case 0 => decrementLinkCount(step.revision, inode, revision) onComplete:
           case Failure(_) => doNextStep()
           case Success(_) => doNextStep()
-        }
 
-        case 1 => checkForDeletion(step.revision, inode, revision) onComplete {
+        case 1 => checkForDeletion(step.revision, inode, revision, file) onComplete:
           case Failure(_) => doNextStep()
           case Success(_) => doNextStep()
-        }
 
-        case _ => synchronized {
-          if (! promise.isCompleted) {
-            promise.success(None)
-          }
-        }
-      }
-    }
-  }
+        case _ =>
+          synchronized:
+            if ! promise.isCompleted then
+              promise.success(None)
 
   def decrementLinkCount(stepRevision: ObjectRevision,
                          inode: Inode,
-                         revision: ObjectRevision): Future[Unit] = {
-
+                         revision: ObjectRevision): Future[Unit] =
     val nextStep = Insert(StepKey, Array[Byte](1)) :: Nil
     val newLinks = inode.links - 1
-    val tx = fs.client.newTransaction()
+    given tx: Transaction = fs.client.newTransaction()
+
     tx.overwrite(iptr.pointer, revision, inode.update(links=Some(newLinks)).toArray)
     tx.update(taskPointer.kvPointer, None, None, KeyRevision(StepKey, stepRevision) :: Nil, nextStep)
     tx.commit().map(_=>())
-  }
 
   def checkForDeletion(stepRevision: ObjectRevision,
                        inode: Inode,
-                       revision: ObjectRevision): Future[Unit] = {
+                       revision: ObjectRevision,
+                       file: File): Future[Unit] =
     val nextStep = Insert(StepKey, Array[Byte](2)) :: Nil
+
     given tx: Transaction = fs.client.newTransaction()
 
-    tx.update(taskPointer.kvPointer, None, None, KeyRevision(StepKey, stepRevision) :: Nil, nextStep)
+    val fdelete = inode.links match
+      case 0 =>
+        file.freeResources().map: _ =>
+          fs.inodeTable.delete(iptr)
+          tx.setRefcount(iptr.pointer, ObjectRefcount(0, 1), ObjectRefcount(1, 0))
 
-    if (inode.links == 0) {
-      // TODO delete file content
-      fs.inodeTable.delete(iptr)
-      tx.setRefcount(iptr.pointer, ObjectRefcount(0,1), ObjectRefcount(1,0))
-    }
+      case _ => Future.unit
 
-    tx.commit().map(_=>())
-  }
-}
+    fdelete.flatMap: _ =>
+      tx.update(taskPointer.kvPointer, None, None, KeyRevision(StepKey, stepRevision) :: Nil, nextStep)
+      tx.commit().map(_ => ())
+

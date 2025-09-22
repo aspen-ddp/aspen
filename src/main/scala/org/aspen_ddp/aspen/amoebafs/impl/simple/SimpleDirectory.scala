@@ -2,19 +2,26 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
-import org.aspen_ddp.aspen.client.{StopRetrying, Transaction}
-import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.tkvl.{Root, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, Directory, DirectoryEntry, DirectoryInode, DirectoryPointer, FileSystem, InodePointer}
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer}
 
-import scala.concurrent.Future
+import java.util.UUID
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 class SimpleDirectory(override val pointer: DirectoryPointer,
                       cachedInodeRevision: ObjectRevision,
                       initialInode: DirectoryInode,
                       fs: FileSystem) extends SimpleBaseFile(pointer, cachedInodeRevision, initialInode, fs) with Directory with Logging {
+
+  import SimpleDirectory.*
+
+  override def inode: DirectoryInode = super.inode.asInstanceOf[DirectoryInode]
 
   def tree: TieredKeyValueList = {
     val rootManager = new SimpleDirectoryRootManager(fs.client, pointer.pointer)
@@ -115,46 +122,115 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     } yield ()
   }
 
-  override def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit] = {
-    val oldKey = Key(oldName)
-    val newKey = Key(newName)
-    val tr = tree
-    for {
-      oa <- tr.getContainingNode(oldKey)
-      ob <- tr.getContainingNode(newKey)
-      _ <- (oa, ob) match {
-        case (Some(a), Some(b)) =>
-          if (b.contains(newKey))
-            throw DirectoryEntryExists(this.pointer, newName)
-          if (!a.contains(oldKey)) {
-            Future.failed(DirectoryEntryDoesNotExist(pointer, oldKey.stringValue))
-          } else {
-            if (a.nodeUUID == b.nodeUUID)
-              a.rename(oldKey, newKey)
-            else {
-              Future.sequence(List(a.delete(oldKey), b.set(newKey, a.get(oldKey).get.value)))
-            }
-          }
-        case _ => Future.failed(DirectoryEntryDoesNotExist(pointer, oldName))
-      }
-    } yield {
+  override def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit] =
+    if oldName == newName then
+      Future.unit
+    else
+      val oldKey = Key(oldName)
+      val newKey = Key(newName)
+      val tr = tree
+      for
+        oa <- tr.getContainingNode(oldKey)
+        ob <- tr.getContainingNode(newKey)
+        _ <- (oa, ob) match
+          case (Some(a), Some(b)) =>
+            if (b.contains(newKey))
+              throw DirectoryEntryExists(this.pointer, newName)
 
-    }
-  }
+            if !a.contains(oldKey) then
+              Future.failed(DirectoryEntryDoesNotExist(pointer, oldKey.stringValue))
+            else
+              // If the directory entry already exists, unlink it
+              b.get(oldName).foreach: vs =>
+                UnlinkFileTask.prepareTask(fs, InodePointer(vs.value.bytes))
+
+              if a.nodeUUID == b.nodeUUID then
+                a.rename(oldKey, newKey)
+              else
+                Future.sequence(List(a.delete(oldKey), b.set(newKey, a.get(oldKey).get.value)))
+
+          case _ => Future.failed(DirectoryEntryDoesNotExist(pointer, oldName))
+      yield
+        ()
 
   override def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit] = {
     prepareInsert(name, file.pointer)
   }
 
-  /** Ensures the directory is empty and that all resources are cleaned up if the transaction successfully commits
-    */
-  override def prepareForDirectoryDeletion()(using tx: Transaction): Future[Unit] = {
-    // TODO: protect against race conditions during directory deletion
-    getContents().map { contents =>
-      if (contents.nonEmpty)
-        throw DirectoryNotEmpty(pointer)
-    }
-  }
+  override def freeResources(): Future[Unit] =
+    given ExecutionContext = fs.executionContext
 
-
+    fs.client.retryStrategy.retryUntilSuccessful:
+      inode.contents.orootObject match
+        case None => Future.unit
+        case Some(root) =>
+          val tx = fs.client.newTransaction()
+          DeleteDirectoryContentTask.prepareTask(fs, pointer)(using tx)
+          tx.commit().map(_ => ())
 }
+
+object SimpleDirectory:
+  object DeleteDirectoryContentTask extends DurableTaskFactory:
+    private val FileSystemUUIDKey: Key = Key(1)
+    private val InodePointerKey: Key = Key(2)
+
+    val typeUUID: UUID = UUID.fromString("c1fb782f-7f13-4921-8ddf-155123445730")
+
+    override def createTask(client: AspenClient,
+                            pointer: DurableTaskPointer,
+                            revision: ObjectRevision,
+                            state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+      val fsUUID = byte2uuid(state(FileSystemUUIDKey).value.bytes)
+      val dptr = InodePointer(state(InodePointerKey).value.bytes).asInstanceOf[DirectoryPointer]
+
+      val fs = FileSystem.getRegisteredFileSystem(fsUUID).get
+
+      new DeleteDirectoryContentTask(client, pointer, revision, state, fs, dptr)
+
+    /** Returns a Future that completes then the task creation is prepared for commit of the transaction.
+     * The inner future completes when the task finishes
+     */
+    def prepareTask(fs: FileSystem,
+                    directoryPointer: DirectoryPointer)
+                   (using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] =
+      fs.taskExecutor.prepareTask(
+        DeleteDirectoryContentTask,
+        List(
+          FileSystemUUIDKey -> uuid2byte(fs.uuid),
+          InodePointerKey -> directoryPointer.toArray
+        )
+      ).map: fcomplete =>
+        fcomplete.map(_ => ())
+
+  class DeleteDirectoryContentTask private(client: AspenClient,
+                                           val taskPointer: DurableTaskPointer,
+                                           revision: ObjectRevision,
+                                           initialState: Map[Key, KeyValueObjectState.ValueState],
+                                           fs: FileSystem,
+                                           directoryPointer: DirectoryPointer
+                                          ) extends DurableTask:
+
+    given ExecutionContext = client.clientContext
+
+    private val promise = Promise[Option[AnyRef]]()
+
+    def completed: Future[Option[AnyRef]] = promise.future
+
+    resume()
+
+    def resume(): Unit =
+
+      // Although directory deletion is protected by isEmpty checks, race
+      // conditions could allow the directory to be deleted between the
+      // check and the removal from the parent directory. Simply delete any
+      // content found
+      def deleteEntry(key: Key, vs: ValueState): Future[Unit] =
+        client.transactUntilSuccessful: tx =>
+          UnlinkFileTask.prepareTask(fs, InodePointer(vs.value.bytes))(using tx).map(_ => ())
+
+      val rootManager = new SimpleDirectoryRootManager(client, directoryPointer.pointer)
+      val tree = new TieredKeyValueList(fs.client, rootManager)
+
+      client.retryStrategy.retryUntilSuccessful:
+        tree.deleteTree(Some(deleteEntry)).map: _ =>
+          promise.success(None)

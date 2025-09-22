@@ -151,9 +151,20 @@ class SimpleFileContent(file: SimpleFile,
             tx.overwrite(dos.pointer, dos.revision, newDb)
             dosCache.invalidate(segment.segmentBeginOffset)
         newRoot <- contentTree.splitTree(Key(segment.segmentBeginOffset), true)
-        fcomplete <- prepareFileDeletionTask(fs, newRoot)
+        fcomplete <- DeleteFileContentTask.prepareTask(fs, newRoot)
       yield
         fcomplete
+        
+  def deleteFile(): Future[Unit] = 
+    given ExecutionContext = fs.executionContext
+    fs.client.retryStrategy.retryUntilSuccessful:
+      val inode = file.inode
+      inode.contents.orootObject match
+        case None => Future.unit
+        case Some(root) => 
+          val tx = fs.client.newTransaction()
+          DeleteFileContentTask.prepareTask(fs, inode.contents)(using tx)
+          tx.commit().map(_ => ())
 
   def write(offset: Long,
             buffers: List[DataBuffer])
@@ -265,8 +276,8 @@ object SimpleFileContent:
       bb.put(buffs.head)
       rfill(bb, buffs.tail)
 
-  object DeleteFileTask extends DurableTaskFactory:
-    val RootPointerKey: Key = Key(1)
+  object DeleteFileContentTask extends DurableTaskFactory:
+    private val RootPointerKey: Key = Key(1)
 
     val typeUUID: UUID = UUID.fromString("c1fb782f-7f13-4921-8ddf-155123445730")
 
@@ -274,30 +285,30 @@ object SimpleFileContent:
                             pointer: DurableTaskPointer,
                             revision: ObjectRevision,
                             state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
-      new DeleteFileTask(client, pointer, revision, state)
+      new DeleteFileContentTask(client, pointer, revision, state)
   
-  /** Returns a Future that completes then the task creation is prepared for commit of the transaction. The inner future
-    * completes when the index completion task finishes
-    */
-  private def prepareFileDeletionTask(fs: FileSystem,
-                                      root: Root)
-                                      (using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] =
-    fs.taskExecutor.prepareTask(
-      DeleteFileTask,
-      List((DeleteFileTask.RootPointerKey, root.encode()))
-    ).map: fcomplete => 
-      fcomplete.map(_ => ()) 
+    /** Returns a Future that completes then the task creation is prepared for commit of the transaction. The inner future
+      * completes when the index completion task finishes
+      */
+    def prepareTask(fs: FileSystem,
+                    root: Root)
+                   (using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] =
+      fs.taskExecutor.prepareTask(
+        DeleteFileContentTask,
+        List(DeleteFileContentTask.RootPointerKey -> root.encode())
+      ).map: fcomplete => 
+        fcomplete.map(_ => ()) 
   
   /** Deletes an index. Note this this implementation is NOT for indicies with shared data. That would require
     *  exactly-once reference count decrements which this implementation does not currently enforce.
     */
-  class DeleteFileTask private(client: AspenClient,
-                               val taskPointer: DurableTaskPointer,
-                               revision: ObjectRevision,
-                               initialState: Map[Key, KeyValueObjectState.ValueState]
+  class DeleteFileContentTask private(client: AspenClient,
+                                      val taskPointer: DurableTaskPointer,
+                                      revision: ObjectRevision,
+                                      initialState: Map[Key, KeyValueObjectState.ValueState]
                                 ) extends DurableTask:
 
-    import DeleteFileTask.*
+    import DeleteFileContentTask.*
 
     given ExecutionContext = client.clientContext
 

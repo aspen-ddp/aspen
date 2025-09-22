@@ -39,10 +39,6 @@ trait Directory extends BaseFile with Logging {
 
   def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit]
 
-  /** Ensures the directory is empty and that all resources are cleaned up if the transaction successfully commits
-    */
-  def prepareForDirectoryDeletion()(using tx: Transaction): Future[Unit]
-
   private def retryUntilSuccessfulOr[T](prepare: Transaction => Future[T])
                                        (checkForErrors: => Future[Unit]): Future[T] = {
     def onFail(err: Throwable): Future[Unit] =

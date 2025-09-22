@@ -78,6 +78,21 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     } yield ()
   }
 
+  private def checkForDeletion(ptr: InodePointer)(using tx: Transaction): Future[Unit] = ptr match
+    case dptr: DirectoryPointer =>
+      for
+        d <- fs.loadDirectory(dptr)
+        (_, revision) <- d.getInode()
+        isEmpty <- d.isEmpty()
+      yield
+        if !isEmpty then
+          throw DirectoryNotEmpty(dptr)
+        else
+          // Use this to ensure that no entries are added to the directory
+          // while we're in the process of deleting it
+          tx.bumpVersion(d.pointer.pointer, revision)
+    case _ => Future.unit
+
   override def prepareDelete(name: String, decref: Boolean)(using tx: Transaction): Future[Unit] = {
     val key = Key(name)
 
@@ -85,23 +100,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
       case None => Future.failed(DirectoryEntryDoesNotExist(pointer, name))
       case Some(vs) =>
         val fptr = InodePointer(vs.value.bytes)
-        val fcheck = fptr match {
-          case dptr: DirectoryPointer =>
-            for {
-              d <- fs.loadDirectory(dptr)
-              (_, revision) <- d.getInode()
-              isEmpty <- d.isEmpty()
-            } yield {
-              if (!isEmpty) {
-                throw  DirectoryNotEmpty(dptr)
-              } else {
-                // Use this to ensure that no entries are added to the directory
-                // while we're in the process of deleting it
-                tx.bumpVersion(d.pointer.pointer, revision)
-              }
-            }
-          case _ => Future.successful(())
-        }
+        val fcheck = checkForDeletion(fptr)
 
         for {
           _ <- fcheck
@@ -141,13 +140,28 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
               Future.failed(DirectoryEntryDoesNotExist(pointer, oldKey.stringValue))
             else
               // If the directory entry already exists, unlink it
-              b.get(oldName).foreach: vs =>
-                UnlinkFileTask.prepareTask(fs, InodePointer(vs.value.bytes))
+              val oldNameVs = b.get(oldName)
 
-              if a.nodeUUID == b.nodeUUID then
-                a.rename(oldKey, newKey)
-              else
-                Future.sequence(List(a.delete(oldKey), b.set(newKey, a.get(oldKey).get.value)))
+              def prepRename(): Future[Unit] =
+                if a.nodeUUID == b.nodeUUID then
+                  a.rename(oldKey, newKey)
+                else
+                  val keyValue = a.get(oldKey).get.value
+                  Future.sequence(List(
+                    a.delete(oldKey),
+                    b.set(newKey, keyValue))).map(_ => ())
+
+              for
+                _ <- oldNameVs match
+                  case None => Future.unit
+                  case Some(vs) =>
+                    val iptr = InodePointer(vs.value.bytes)
+                    checkForDeletion(iptr).flatMap: _ =>
+                      UnlinkFileTask.prepareTask(fs, iptr)
+
+                _ <- prepRename()
+              yield
+                ()
 
           case _ => Future.failed(DirectoryEntryDoesNotExist(pointer, oldName))
       yield

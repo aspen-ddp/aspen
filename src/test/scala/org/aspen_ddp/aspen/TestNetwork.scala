@@ -277,7 +277,7 @@ class TestNetwork extends ServerMessenger {
     val bgTasks = new BackgroundTaskPool
 
     val p = Promise[Unit]()
-    val pollDelay = Duration(5, MILLISECONDS)
+    val pollDelay = Duration(10, MILLISECONDS)
 
     var count = 1
 

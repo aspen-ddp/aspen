@@ -135,7 +135,7 @@ class SimpleDirectoryRootManager(client: AspenClient,
   }
 }
 
-object SimpleDirectoryRootManager extends RegisteredTypeFactory with RootManagerFactory {
+object SimpleDirectoryRootManager extends RootManagerFactory {
   val typeUUID: UUID = UUID.fromString("52887CBE-0D2B-43C8-80FA-999DA177392D")
 
   private case class RData(root: Root, rootRevision: ObjectRevision, onode: Option[KeyValueListNode])

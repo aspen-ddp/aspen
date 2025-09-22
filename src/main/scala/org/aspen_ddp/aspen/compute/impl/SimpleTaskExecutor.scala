@@ -5,17 +5,17 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision, ObjectRevisionGuard}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.compute.{DurableTaskPointer, DurableTaskType, TaskExecutor}
+import org.aspen_ddp.aspen.compute.{DurableTaskPointer, DurableTaskFactory, TaskExecutor}
 import org.aspen_ddp.aspen.common.util.{uuid2byte, byte2uuid}
 
 import scala.concurrent.{ExecutionContext, Future}
 
 object SimpleTaskExecutor {
 
-  val TaskTypeKey = new Key(Array(0xFF.toByte))
+  val TaskTypeKey = Key(UUID.fromString("f13fbfd4-85fa-449c-b279-9859ee5e7de0"))
 
   def apply(client: AspenClient,
-            registeredTasks: Map[UUID, DurableTaskType],
+            registeredTasks: Map[UUID, DurableTaskFactory],
             taskStateAllocator: ObjectAllocator,
             executorObject: KeyValueObjectPointer): Future[SimpleTaskExecutor] = {
 
@@ -25,7 +25,7 @@ object SimpleTaskExecutor {
   }
 
   def createNewExecutor(client: AspenClient,
-                        registeredTasks: Map[UUID, DurableTaskType],
+                        registeredTasks: Map[UUID, DurableTaskFactory],
                         executorAllocator: ObjectAllocator,
                         taskStateAllocator: ObjectAllocator,
                         revisionGuard: AllocationRevisionGuard)
@@ -43,7 +43,7 @@ object SimpleTaskExecutor {
 }
 
 class SimpleTaskExecutor(val client: AspenClient,
-                         val registeredTasks: Map[UUID, DurableTaskType],
+                         val registeredTasks: Map[UUID, DurableTaskFactory],
                          val taskStateAllocator: ObjectAllocator,
                          kvos: KeyValueObjectState) extends TaskExecutor {
 
@@ -122,7 +122,7 @@ class SimpleTaskExecutor(val client: AspenClient,
     }
   }
 
-  override def prepareTask(taskType: DurableTaskType,
+  override def prepareTask(taskType: DurableTaskFactory,
                            initialState: List[(Key, Array[Byte])])
                           (using tx: Transaction): Future[Future[Option[AnyRef]]] = synchronized {
 

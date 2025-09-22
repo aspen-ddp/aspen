@@ -191,4 +191,49 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       file.inode.size should be(w.length)
       a.get.getByteArray should be(r)
 
+  test("Truncate empty file"):
+    for
+      file <- boot(Some(5))
+      fcomplete <- file.truncate(0)
+      a <- readFully(file)
+      _ <- fcomplete
+    yield
+      file.inode.size should be(0)
+
+  test("Truncate extends file"):
+    for
+      file <- boot(Some(5))
+      fcomplete <- file.truncate(6)
+      a <- readFully(file)
+      _ <- fcomplete
+    yield
+      file.inode.size should be(6)
+      a should be(Array[Byte](0, 0, 0, 0, 0, 0))
+
+  test("Truncate shortens segment"):
+    val w = Array[Byte](1, 2, 3, 4, 5)
+    for
+      file <- boot(Some(5))
+      (remainingOffset, remainingData) <- file.write(0, w)
+      fcomplete <- file.truncate(3)
+      a <- readFully(file)
+      _ <- fcomplete
+      a <- file.debugReadFully()
+    yield
+      file.inode.size should be(3)
+      a should be(Array[Byte](1,2,3))
+
+  test("Truncate deletes segments"):
+    val w = Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+    for
+      file <- boot(Some(5))
+      (remainingOffset, remainingData) <- file.write(0, w)
+      _ <- file.write(remainingOffset, remainingData)
+      fcomplete <- file.truncate(3)
+      a <- readFully(file)
+      _ <- fcomplete
+      a <- file.debugReadFully()
+    yield
+      file.inode.size should be(3)
+      a should be(Array[Byte](1, 2, 3))
 

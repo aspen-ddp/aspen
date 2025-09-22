@@ -3,14 +3,15 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import java.nio.ByteBuffer
 import java.util.UUID
 import com.github.blemale.scaffeine.{Cache, Scaffeine}
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, InvalidObject, KeyValueObjectState, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, InvalidObject, KeyValueObjectState, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectRevisionGuard, Value}
 import org.aspen_ddp.aspen.common.util.{Varint, db2string}
-import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskType}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer}
 import org.aspen_ddp.aspen.amoebafs.{FileInode, FileSystem}
 import org.apache.logging.log4j.scala.{Logger, Logging}
-import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
+import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TieredKeyValueList}
 
 import scala.annotation.tailrec
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -139,9 +140,20 @@ class SimpleFileContent(file: SimpleFile,
       Future.successful(Future.unit)
 
     else
-      //prepareIndexDeletionTask(fs, root.pointer).map(fdeleteComplete => (fdeleteComplete, None))
-      Future.successful(Future.unit)
-
+      val segment = getSegmentOffset(endOffset)
+      for
+        odos <- readSegment(segment.segmentBeginOffset)
+        _ = odos.map: dos =>
+            val newDb = if dos.data.size >= segment.offsetWithinSegment then
+              dos.data.slice(0, segment.offsetWithinSegment)
+            else
+              dos.data.zappend(segment.offsetWithinSegment)
+            tx.overwrite(dos.pointer, dos.revision, newDb)
+            dosCache.invalidate(segment.segmentBeginOffset)
+        newRoot <- contentTree.splitTree(Key(segment.segmentBeginOffset), true)
+        fcomplete <- prepareFileDeletionTask(fs, newRoot)
+      yield
+        fcomplete
 
   def write(offset: Long,
             buffers: List[DataBuffer])
@@ -176,6 +188,8 @@ class SimpleFileContent(file: SimpleFile,
         HLCTimestamp.now,
         dos.pointer.ida.calculateEncodedSegmentLength(db.size),
         db)
+
+      tx.overwrite(dos.pointer, dos.revision, db)
 
       Future.successful(newDos, remaining)
 
@@ -251,43 +265,39 @@ object SimpleFileContent:
       bb.put(buffs.head)
       rfill(bb, buffs.tail)
 
-  object DeleteIndexTask:
+  object DeleteFileTask extends DurableTaskFactory:
     val RootPointerKey: Key = Key(1)
 
-    object TaskType extends DurableTaskType:
+    val typeUUID: UUID = UUID.fromString("c1fb782f-7f13-4921-8ddf-155123445730")
 
-      val typeUUID: UUID = UUID.fromString("c1fb782f-7f13-4921-8ddf-155123445730")
-
-      override def createTask(client: AspenClient,
-                              pointer: DurableTaskPointer,
-                              revision: ObjectRevision,
-                              state: Map[Key, KeyValueObjectState.ValueState]): DurableTask = 
-        new DeleteIndexTask(client, pointer, revision, state)
-  end DeleteIndexTask
+    override def createTask(client: AspenClient,
+                            pointer: DurableTaskPointer,
+                            revision: ObjectRevision,
+                            state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+      new DeleteFileTask(client, pointer, revision, state)
   
   /** Returns a Future that completes then the task creation is prepared for commit of the transaction. The inner future
     * completes when the index completion task finishes
     */
-  private def prepareIndexDeletionTask(
-                                        fs: FileSystem,
-                                        root: KeyValueObjectPointer)
+  private def prepareFileDeletionTask(fs: FileSystem,
+                                      root: Root)
                                       (using tx: Transaction, ec: ExecutionContext): Future[Future[Unit]] =
     fs.taskExecutor.prepareTask(
-      DeleteIndexTask.TaskType,
-      List((DeleteIndexTask.RootPointerKey, root.toArray))
+      DeleteFileTask,
+      List((DeleteFileTask.RootPointerKey, root.encode()))
     ).map: fcomplete => 
       fcomplete.map(_ => ()) 
   
   /** Deletes an index. Note this this implementation is NOT for indicies with shared data. That would require
     *  exactly-once reference count decrements which this implementation does not currently enforce.
     */
-  class DeleteIndexTask private (client: AspenClient,
-                                 val taskPointer: DurableTaskPointer,
-                                 revision: ObjectRevision,
-                                 initialState: Map[Key, KeyValueObjectState.ValueState]
+  class DeleteFileTask private(client: AspenClient,
+                               val taskPointer: DurableTaskPointer,
+                               revision: ObjectRevision,
+                               initialState: Map[Key, KeyValueObjectState.ValueState]
                                 ) extends DurableTask:
 
-    import DeleteIndexTask.*
+    import DeleteFileTask.*
 
     given ExecutionContext = client.clientContext
 
@@ -297,24 +307,26 @@ object SimpleFileContent:
 
     resume()
 
-    def resume(): Unit = {
-      def deletDataSegment(ptr: DataObjectPointer): Future[Unit] =
+    def resume(): Unit =
+
+      def deleteDataSegment(key: Key, vs: ValueState): Future[Unit] =
+        val segmentPointer = DataObjectPointer(vs.value.bytes)
+
         client.retryStrategy.retryUntilSuccessful:
-          client.read(ptr).flatMap{ dos =>
-            given tx: Transaction = client.newTransaction()
-            tx.setRefcount(dos.pointer, dos.refcount, dos.refcount.decrement())
-            tx.commit().map(_ => ())
-          } recover:
-            case _: InvalidObject => () // already deleted
-            case t: Throwable => println(s"Unexpected error while deleting truncated data node ${ptr.id}: $t")
+          client.readOptional(segmentPointer).flatMap:
+            case None => Future.unit
+            case Some(dos) =>
+              given tx: Transaction = client.newTransaction()
+              tx.setRefcount(dos.pointer, dos.refcount, dos.refcount.decrement())
+              tx.commit().map(_ => ())
 
       client.retryStrategy.retryUntilSuccessful:
-        for 
-          kvos <- client.read(taskPointer.kvPointer)
-          root = kvos.contents(RootPointerKey)
-          //_ <- rdelete(KeyValueObjectPointer(root.value.bytes))
-        yield 
+        val contentTree = new TieredKeyValueList(
+          client,
+          KVObjectRootManager(client, RootPointerKey, taskPointer.kvPointer))
+
+        contentTree.deleteTree(Some(deleteDataSegment)).map: _ =>
           promise.success(None)
-    }
+
   
 

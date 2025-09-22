@@ -119,7 +119,7 @@ class SimpleFileRootManager(client: AspenClient,
       ObjectRevisionGuard(inodePointer, dos.revision)
       
 
-object SimpleFileRootManager extends RegisteredTypeFactory with RootManagerFactory:
+object SimpleFileRootManager extends RootManagerFactory:
   val typeUUID: UUID = UUID.fromString("51936423-bbd1-4500-b60d-b4c557b69f24")
 
   private case class RData(root: Root, rootRevision: ObjectRevision, onode: Option[KeyValueListNode])

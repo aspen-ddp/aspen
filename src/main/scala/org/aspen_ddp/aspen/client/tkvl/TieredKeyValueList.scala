@@ -69,6 +69,7 @@ class TieredKeyValueList(val client: AspenClient,
         val (tier, node) = path.head
         val odkv = if tier == 0 then odeleteKVPair else None
         val kvlp = KeyValueListPointer(Key.AbsoluteMinimum, node.pointer)
+
         for 
           _ <- KeyValueListNode.deleteList(client, kvlp, node.ordering, odkv)
           _ <- rdelete(path.tail)
@@ -96,14 +97,16 @@ class TieredKeyValueList(val client: AspenClient,
    * Splits the tree into two trees at the supplied key. All keys comparing
    * less than splitAtKey will remain in the original tree, the rest will be
    * moved to a new tree of the same depth as the original. The resulting
-   * Root object will be the root of the new tree.
+   * Root object will be the root of the new tree. If the inclusive parameter
+   * is set to true, the key exactly matching splitAtKey will be kept in
+   * the original tree. Otherwise it will wind up in the new tree
    *
    * The splitting operation is completed in a single transaction but note
    * that race conditions with outstanding split/join finalization actions
    * could cause errant content to appear in the original (left) tree.
    * Use with caution.
    */
-  def splitTree(splitAtKey: Key)
+  def splitTree(splitAtKey: Key, inclusive: Boolean = false)
                (using t: Transaction): Future[Root] = {
 
     def rinsert(tier: Int,
@@ -113,9 +116,10 @@ class TieredKeyValueList(val client: AspenClient,
       if rpath.isEmpty then
         Future.successful(downPointer)
       else
+        val odown = if tier > 0 then Some(downPointer) else None
         for
           alloc <- rootManager.getAllocatorForTier(tier)
-          down <- rpath.head.splitAt(ordering, splitAtKey, Some(downPointer), alloc)
+          down <- rpath.head.splitAt(ordering, splitAtKey, inclusive, odown, alloc)
           kvp <- rinsert(tier + 1, ordering, rpath.tail, down.pointer)
         yield
           kvp
@@ -134,7 +138,7 @@ class TieredKeyValueList(val client: AspenClient,
         // the full path
         alloc <- rootManager.getAllocatorForTier(0)
 
-        down <- rpath.head.splitAt(ordering, splitAtKey, None, alloc)
+        down <- rpath.head.splitAt(ordering, splitAtKey, inclusive, None, alloc)
 
         kvp <- rinsert(0, ordering, rpath, down.pointer)
       yield

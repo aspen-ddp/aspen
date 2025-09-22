@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyRevisionGuard, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskType, TaskExecutor}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, TaskExecutor}
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
 import org.aspen_ddp.aspen.amoebafs.{DirectoryPointer, FileSystem, Inode, InodePointer}
 
@@ -14,7 +14,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 import scala.language.implicitConversions
 
-object CreateFileTask extends DurableTaskType {
+object CreateFileTask extends DurableTaskFactory {
   val typeUUID: UUID = UUID.fromString("48A4F255-7B78-4D7F-B8AB-D9301B8CDA40")
 
   private val FileSystemUUIDKey  = Key(1)

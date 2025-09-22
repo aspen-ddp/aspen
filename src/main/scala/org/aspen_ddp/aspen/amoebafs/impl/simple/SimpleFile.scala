@@ -57,7 +57,9 @@ object SimpleFile:
                            inode: Inode)
                           (using tx: Transaction, ec: ExecutionContext): Future[(Inode, () => Future[Unit])] =
       file.sfc.truncate(offset).map: fdeleteComplete =>
-        fdeleteComplete.foreach(_ => p.success(()))
+
+        tx.result.foreach: _ =>
+          fdeleteComplete.foreach(_ => p.success(()))
 
         val updatedInode = inode.asInstanceOf[FileInode].updateContent(offset, Timespec.now)
         tx.overwrite(pointer, revision, updatedInode.toDataBuffer)

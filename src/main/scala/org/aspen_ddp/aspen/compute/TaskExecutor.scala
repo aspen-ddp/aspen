@@ -7,7 +7,7 @@ import scala.concurrent.Future
 
 trait TaskExecutor {
   def prepareTask(
-                   taskType: DurableTaskType,
+                   taskType: DurableTaskFactory,
                    initialState: List[(Key, Array[Byte])])(using tx: Transaction): Future[Future[Option[AnyRef]]]
 
 }

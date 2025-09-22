@@ -114,10 +114,11 @@ class KeyValueListNode(val reader: ObjectReader,
 
   def splitAt(ordering: KeyOrdering,
               splitAtKey: Key,
+              inclusive: Boolean,
               optionalDownPointer: Option[KeyValueObjectPointer],
               allocator: ObjectAllocator,
              )(using tx: Transaction): Future[KeyValueListPointer] = fetchContainingNode(splitAtKey).flatMap { node =>
-    KeyValueListNode.splitAt(node, ordering, splitAtKey, optionalDownPointer, allocator)
+    KeyValueListNode.splitAt(node, ordering, splitAtKey, inclusive, optionalDownPointer, allocator)
   }
 
   def foldLeft[B](initialZ: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] = {
@@ -674,13 +675,20 @@ object KeyValueListNode {
   private def splitAt(node: KeyValueListNode,
                       ordering: KeyOrdering,
                       splitAtKey: Key,
+                      inclusive: Boolean,
                       optionalDownPointer: Option[KeyValueObjectPointer],
                       allocator: ObjectAllocator,
                      )(using tx: Transaction, ec: ExecutionContext): Future[KeyValueListPointer] = 
 
     require(ordering.compare(splitAtKey, Key.AbsoluteMinimum) > 0)
+
+    def cmp(k: Key, v: ValueState): Boolean =
+      if inclusive then
+        ordering.compare(k, splitAtKey) <= 0
+      else
+        ordering.compare(k, splitAtKey) < 0
     
-    val (leftContents, rightContents) = node.contents.partition((k,v) => ordering.compare(k, splitAtKey) < 0)
+    val (leftContents, rightContents) = node.contents.partition(cmp)
     
     val newLeftContent = optionalDownPointer match
       case None => Map()

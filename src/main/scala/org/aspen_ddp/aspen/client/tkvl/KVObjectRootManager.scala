@@ -121,7 +121,7 @@ class KVObjectRootManager(val client: AspenClient,
   }
 }
 
-object KVObjectRootManager extends RegisteredTypeFactory with RootManagerFactory {
+object KVObjectRootManager extends RootManagerFactory {
 
   private case class RData(root: Root, rootRevision: ObjectRevision, onode: Option[KeyValueListNode])
 

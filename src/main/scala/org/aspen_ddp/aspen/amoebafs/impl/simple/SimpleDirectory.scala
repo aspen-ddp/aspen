@@ -167,9 +167,10 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
       yield
         ()
 
-  override def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit] = {
-    prepareInsert(name, file.pointer)
-  }
+  override def prepareHardLink(name: String, file: BaseFile)(using tx: Transaction): Future[Unit] =
+    getEntry(name).flatMap:
+      case None => prepareInsert(name, file.pointer)
+      case Some(_) => throw DirectoryEntryExists(this.pointer, name)
 
   override def freeResources(): Future[Unit] =
     given ExecutionContext = fs.executionContext

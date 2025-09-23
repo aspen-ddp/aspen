@@ -87,6 +87,7 @@ class SimpleFileHandle(
   }
 
   def write(offset: Long, buffers: List[DataBuffer]): Future[Unit] = synchronized {
+    readCache = None
 
     val copies = buffers.map(_.copy())
 
@@ -139,6 +140,9 @@ class SimpleFileHandle(
         ocurrentWrite = Some(pw)
 
         def writeSome(offset: Long, buffers: List[DataBuffer]): Unit = {
+          synchronized:
+            readCache = None
+            
           logger.info(s"  write ${pw.writeNumber}: writeSome(offset=$offset, bufferCount=${buffers.length}, nbytes=${buffers.foldLeft(0)((sz,b) => sz+b.remaining())})")
           val sb = new StringBuilder
           buffers.foldLeft(offset) { (off, db) =>
@@ -152,7 +156,6 @@ class SimpleFileHandle(
 
             if (remainingBuffers.isEmpty) {
               synchronized {
-                readCache = None
                 nbuffered -= pw.nbytes
                 ocurrentWrite = None
                 logger.info(s"Completed write ${pw.writeNumber} at offset ${pw.offset}, endOffset ${pw.endOffset}")

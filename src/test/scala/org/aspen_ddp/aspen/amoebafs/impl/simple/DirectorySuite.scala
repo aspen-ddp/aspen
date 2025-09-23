@@ -209,7 +209,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       fooptr <- cdir(rootDir, "foo", mode=0, uid=1, gid=2)
       _ <- cdir(rootDir, "bar", mode=0, uid=1, gid=2)
       foo <- fs.lookup(fooptr)
-      _ <- rootDir.hardLink("bar", foo)
+      _ <- recoverToSucceededIf[DirectoryEntryExists](rootDir.hardLink("bar", foo))
     yield
       initialContent.length should be (0)
 

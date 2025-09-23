@@ -56,34 +56,28 @@ trait Directory extends BaseFile with Logging {
     }
   }
 
-  private def retryCreationOr[T](prepare: Transaction => Future[Future[T]])
-                                (checkForErrors: => Future[Unit]): Future[T] = {
+  private def retryCreation[T](prepare: Transaction => Future[Future[T]]): Future[T] =
     val p = Promise[T]()
 
-    def onFail(err: Throwable): Future[Unit] = {
-      err match {
+    def onFail(err: Throwable): Future[Unit] =
+      err match
         case e: InvalidInode => throw StopRetrying(e)
         case e: FatalReadError => throw StopRetrying(e)
-        case _ => refresh().recover {
+        case e: DirectoryEntryExists => throw StopRetrying(e)
+        case _ => refresh().recover:
           case e: InvalidInode => throw StopRetrying(e)
           case other => throw other
-        }.flatMap(_ => checkForErrors)
-      }
-    }
 
-    val fcreate = fs.client.transactUntilSuccessfulWithRecovery(onFail) { tx =>
+    val fcreate = fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prepare(tx)
-    }
 
-    fcreate.foreach { ft =>
+    fcreate.foreach: ft =>
       ft.foreach(p.success)
       ft.failed.foreach(p.failure)
-    }
 
     fcreate.failed.foreach(p.failure)
 
     p.future
-  }
 
   def insert(name: String, fpointer: InodePointer, incref: Boolean=true): Future[Unit] =
     def onFail(err: Throwable): Future[Unit] =
@@ -145,99 +139,48 @@ trait Directory extends BaseFile with Logging {
     }
   }
 
-  def createDirectory(name: String, mode: Int, uid: Int, gid: Int): Future[DirectoryPointer] = {
-    retryCreationOr { tx =>
+  def createDirectory(name: String, mode: Int, uid: Int, gid: Int): Future[DirectoryPointer] =
+    retryCreation: tx =>
       given Transaction = tx
       prepareCreateDirectory(name, mode, uid, gid)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
 
-  def createFile(name: String, mode: Int, uid: Int, gid: Int): Future[FilePointer] = {
-    retryCreationOr { tx =>
+  def createFile(name: String, mode: Int, uid: Int, gid: Int): Future[FilePointer] =
+    retryCreation: tx =>
       given Transaction = tx
       prepareCreateFile(name, mode, uid, gid)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
 
-  def createSymlink(name: String, mode: Int, uid: Int, gid: Int, link: String): Future[SymlinkPointer] = {
-    retryCreationOr { tx =>
+  def createSymlink(name: String, mode: Int, uid: Int, gid: Int, link: String): Future[SymlinkPointer] =
+    retryCreation: tx =>
       given Transaction = tx
       prepareCreateSymlink(name, mode, uid, gid, link)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
 
-  def createUnixSocket(name: String, mode: Int, uid: Int, gid: Int): Future[UnixSocketPointer] = {
-    retryCreationOr { tx =>
+  def createUnixSocket(name: String, mode: Int, uid: Int, gid: Int): Future[UnixSocketPointer] =
+    retryCreation: tx =>
       given Transaction = tx
       prepareCreateUnixSocket(name, mode, uid, gid)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
 
-  def createFIFO(name: String, mode: Int, uid: Int, gid: Int): Future[FIFOPointer] = {
-    retryCreationOr { tx =>
+  def createFIFO(name: String, mode: Int, uid: Int, gid: Int): Future[FIFOPointer] =
+    retryCreation: tx =>
       given Transaction = tx
       prepareCreateFIFO(name, mode, uid, gid)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
 
-  def createCharacterDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int): Future[CharacterDevicePointer] = {
-    retryCreationOr { tx =>
+  def createCharacterDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int): Future[CharacterDevicePointer] =
+    retryCreation: tx =>
       given Transaction = tx
       prepareCreateCharacterDevice(name, mode, uid, gid, rdev)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
 
-  def createBlockDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int): Future[BlockDevicePointer] = {
-    retryCreationOr { tx =>
+  def createBlockDevice(name: String, mode: Int, uid: Int, gid: Int, rdev: Int): Future[BlockDevicePointer] =
+    retryCreation: tx =>
       given Transaction = tx
       prepareCreateBlockDevice(name, mode, uid, gid, rdev)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
 
-  def prepareSetParentDirectory(parent: Directory)(using tx: Transaction, ec: ExecutionContext): Unit = {
+  def prepareSetParentDirectory(parent: Directory)(using tx: Transaction, ec: ExecutionContext): Unit =
     val updatedInode = inode.asInstanceOf[DirectoryInode].setParentDirectory(Some(parent.pointer))
 
     tx.overwrite(pointer.pointer, revision, updatedInode.toDataBuffer)
 
-    tx.result.foreach { _ =>
+    tx.result.foreach: _ =>
       setCachedInode(updatedInode, tx.revision)
-    }
-  }
 
   def prepareCreateDirectory(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[DirectoryPointer]] = {
     val root = Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, pointer.pointer.poolId))

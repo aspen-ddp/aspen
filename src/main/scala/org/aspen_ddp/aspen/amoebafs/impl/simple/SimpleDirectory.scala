@@ -54,12 +54,13 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
   override def prepareInsert(name: String,
                              pointer: InodePointer,
                              incref: Boolean)(using tx: Transaction): Future[Unit] = {
-    val fcheck = tree.getContainingNode(name).map { onode =>
-      onode.map { node =>
-        if (node.contains(name))
+    val fcheck = tree.getContainingNode(name).flatMap:
+      case None => Future.unit
+      case Some(node) =>
+        if node.contains(name) then
           prepareDelete(name, true)
-      }
-    }
+        else
+          Future.unit
 
     val fincref = if (incref) {
       fs.readInode(pointer) map { t =>
@@ -74,24 +75,26 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     for {
       _ <- fcheck
       _ <- fincref
-      _ <- tree.set(Key(name), Value(pointer.toArray), Some(Left(true)))
+      _ <- tree.set(Key(name), Value(pointer.toArray))
     } yield ()
   }
 
-  private def checkForDeletion(ptr: InodePointer)(using tx: Transaction): Future[Unit] = ptr match
-    case dptr: DirectoryPointer =>
-      for
-        d <- fs.loadDirectory(dptr)
-        (_, revision) <- d.getInode()
-        isEmpty <- d.isEmpty()
-      yield
-        if !isEmpty then
-          throw DirectoryNotEmpty(dptr)
-        else
-          // Use this to ensure that no entries are added to the directory
-          // while we're in the process of deleting it
-          tx.bumpVersion(d.pointer.pointer, revision)
-    case _ => Future.unit
+  private def checkForDeletion(ptr: InodePointer)(using tx: Transaction): Future[Unit] =
+    ptr match
+      case dptr: DirectoryPointer =>
+        for
+          d <- fs.loadDirectory(dptr)
+          (_, revision) <- d.getInode()
+          isEmpty <- d.isEmpty()
+        yield
+          if !isEmpty then
+            throw DirectoryNotEmpty(dptr)
+          else
+            // Use this to ensure that no entries are added to the directory
+            // while we're in the process of deleting it
+            tx.bumpVersion(d.pointer.pointer, revision)
+
+      case _ => Future.unit
 
   override def prepareDelete(name: String, decref: Boolean)(using tx: Transaction): Future[Unit] = {
     val key = Key(name)
@@ -133,14 +136,11 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
         ob <- tr.getContainingNode(newKey)
         _ <- (oa, ob) match
           case (Some(a), Some(b)) =>
-            if (b.contains(newKey))
-              throw DirectoryEntryExists(this.pointer, newName)
-
             if !a.contains(oldKey) then
               Future.failed(DirectoryEntryDoesNotExist(pointer, oldKey.stringValue))
             else
               // If the directory entry already exists, unlink it
-              val oldNameVs = b.get(oldName)
+              val newNameVs = a.get(newName)
 
               def prepRename(): Future[Unit] =
                 if a.nodeUUID == b.nodeUUID then
@@ -152,7 +152,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
                     b.set(newKey, keyValue))).map(_ => ())
 
               for
-                _ <- oldNameVs match
+                _ <- newNameVs match
                   case None => Future.unit
                   case Some(vs) =>
                     val iptr = InodePointer(vs.value.bytes)

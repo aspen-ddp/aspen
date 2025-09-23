@@ -15,8 +15,6 @@ trait Directory extends BaseFile with Logging {
 
   private given ExecutionContext = fs.executionContext
 
-  //def inode: DirectoryInode
-
   def getInode(): Future[(DirectoryInode, ObjectRevision)] =
     fs.readInode(pointer).map(t => (t._1.asInstanceOf[DirectoryInode], t._3))
 
@@ -87,18 +85,21 @@ trait Directory extends BaseFile with Logging {
     p.future
   }
 
-  def insert(name: String, fpointer: InodePointer, incref: Boolean=true): Future[Unit] = {
-    retryUntilSuccessfulOr { tx =>
-      given Transaction = tx
-      prepareInsert(name, fpointer, incref)
-    }{
-      getEntry(name).map {
-        case None =>
-        case Some(_) => throw StopRetrying(DirectoryEntryExists(pointer, name))
-      }
-    }
-  }
+  def insert(name: String, fpointer: InodePointer, incref: Boolean=true): Future[Unit] =
+    def onFail(err: Throwable): Future[Unit] =
+      err match
+        case e: InvalidInode => throw StopRetrying(e)
+        case e: FatalReadError => throw StopRetrying(e)
+        case e: DirectoryNotEmpty => throw StopRetrying(e)
+        case e: DirectoryEntryExists => throw StopRetrying(e)
+        case _ =>
+          logger.info(s"insert error $err")
+          refresh().recover:
+            case e: InvalidInode => throw StopRetrying(e)
+            case other => throw other
 
+    fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      prepareInsert(name, fpointer, incref)(using tx)
 
   def delete(name: String, decref: Boolean=true): Future[Unit] = {
     retryUntilSuccessfulOr { tx =>
@@ -113,17 +114,22 @@ trait Directory extends BaseFile with Logging {
   }
 
   def rename(oldName: String, newName: String): Future[Unit] = {
-    retryUntilSuccessfulOr { tx =>
+    def onFail(err: Throwable): Future[Unit] =
+      err match
+        case e: InvalidInode => throw StopRetrying(e)
+        case e: FatalReadError => throw StopRetrying(e)
+        case e: DirectoryNotEmpty => throw StopRetrying(e)
+        case e: DirectoryEntryExists => throw StopRetrying(e)
+        case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
+        case _ =>
+          logger.info(s"rename error $err")
+          refresh().recover:
+            case e: InvalidInode => throw StopRetrying(e)
+            case other => throw other
+
+    fs.client.transactUntilSuccessfulWithRecovery(onFail) { tx =>
       given Transaction = tx
       prepareRename(oldName, newName)
-    }{
-      Future.sequence(getEntry(oldName) :: getEntry(newName) :: Nil).map { lst =>
-        if (lst.head.isEmpty)
-          throw StopRetrying(DirectoryEntryDoesNotExist(pointer, oldName))
-
-        if (lst.tail.head.nonEmpty)
-          throw StopRetrying(DirectoryEntryExists(pointer, newName))
-      }
     }
   }
 
@@ -243,6 +249,7 @@ trait Directory extends BaseFile with Logging {
       of <- fof
     yield
       of.get.asInstanceOf[DirectoryPointer]
+
     raw.map(_ => fdp)
   }
 

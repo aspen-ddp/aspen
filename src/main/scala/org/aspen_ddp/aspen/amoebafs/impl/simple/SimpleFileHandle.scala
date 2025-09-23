@@ -65,7 +65,10 @@ class SimpleFileHandle(
           case Some(data) =>
             synchronized {
               readCache = Some((offset, data))
-              Some(data.slice(0, nbytes))
+              if data.size >= nbytes then
+                Some(data.slice(0, nbytes))
+              else
+                Some(data)
             }
         }
     }

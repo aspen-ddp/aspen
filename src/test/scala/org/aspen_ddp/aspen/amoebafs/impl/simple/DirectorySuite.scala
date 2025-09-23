@@ -134,15 +134,28 @@ class DirectorySuite extends FilesSystemTestSuite:
     yield
       initialContent.length should be (0)
 
-  test("Insert file fails if file already exists"):
+  test("Insert file succeeds if file already exists"):
     for
       fs <- bootstrap()
       rootDir <- fs.loadRoot()
       initialContent <- rootDir.getContents()
       _ <- cdir(rootDir, "foo", mode=0, uid=1, gid=2)
-      _ <- recoverToSucceededIf[DirectoryEntryExists](rootDir.insert("foo",rootDir.pointer))
+      _ <- rootDir.insert("foo", rootDir.pointer)
     yield
       initialContent.length should be (0)
+
+  test("Insert file fails if file is a non-empty directory"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      initialContent <- rootDir.getContents()
+      dp <- cdir(rootDir, "foo", mode = 0, uid = 1, gid = 2)
+      d <- fs.loadDirectory(dp)
+      _ <- cdir(d, "subdir", mode=0, uid=1, gid=2)
+      e <- d.isEmpty()
+      _ <- recoverToSucceededIf[DirectoryNotEmpty](rootDir.insert("foo", rootDir.pointer))
+    yield
+      initialContent.length should be(0)
 
   test("Delete file fails if file does not exist"):
     for
@@ -164,18 +177,31 @@ class DirectorySuite extends FilesSystemTestSuite:
     yield
       initialContent.length should be (0)
 
-  test("Rename file fails if destination file exists"):
+  test("Rename fails if destination file is a non-empty directory"):
     for
       fs <- bootstrap()
       rootDir <- fs.loadRoot()
       initialContent <- rootDir.getContents()
       _ <- cdir(rootDir, "foo", mode=0, uid=1, gid=2)
-      _ <- cdir(rootDir, "bar", mode=0, uid=1, gid=2)
-      _ <- recoverToSucceededIf[DirectoryEntryExists](rootDir.rename("foo", "bar"))
+      barPtr <- cdir(rootDir, "bar", mode=0, uid=1, gid=2)
+      barDir <- fs.loadDirectory(barPtr)
+      _ <- cdir(barDir, "bar_subdir", mode=0, uid=1, gid=2)
+      _ <- recoverToSucceededIf[DirectoryNotEmpty](rootDir.rename("foo", "bar"))
     yield
       initialContent.length should be (0)
 
-  test("HardLink file fails if destination file exists"):
+  test("Rename file succeeds if destination file exists"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      initialContent <- rootDir.getContents()
+      _ <- cdir(rootDir, "foo", mode = 0, uid = 1, gid = 2)
+      _ <- cdir(rootDir, "bar", mode = 0, uid = 1, gid = 2)
+      _ <- rootDir.rename("foo", "bar")
+    yield
+      initialContent.length should be(0)
+
+  test("HardLink file succeeds if destination file exists"):
     for
       fs <- bootstrap()
       rootDir <- fs.loadRoot()
@@ -183,7 +209,7 @@ class DirectorySuite extends FilesSystemTestSuite:
       fooptr <- cdir(rootDir, "foo", mode=0, uid=1, gid=2)
       _ <- cdir(rootDir, "bar", mode=0, uid=1, gid=2)
       foo <- fs.lookup(fooptr)
-      _ <- recoverToSucceededIf[DirectoryEntryExists](rootDir.hardLink("bar", foo))
+      _ <- rootDir.hardLink("bar", foo)
     yield
       initialContent.length should be (0)
 

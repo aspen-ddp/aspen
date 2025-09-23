@@ -17,7 +17,7 @@ import org.dcache.nfs.v4.{NfsIdMapping, SimpleIdMap}
 import org.dcache.nfs.v4.xdr.nfsace4
 import org.dcache.nfs.vfs.{AclCheckable, DirectoryEntry, DirectoryStream, FsStat, Inode, Stat, VirtualFileSystem}
 
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.concurrent.duration.Duration
 
 
@@ -331,54 +331,55 @@ class AmoebaNFS(val fs: FileSystem,
 
     logger.info(s"move $oldName to $newName. Src ${s.inodeNumber} Dst ${d.inodeNumber}")
 
-    blockingCall { s.getEntry(oldName) } match {
-      case None => throw new NoEntException(s"$oldName does not exist")
+    val fcomplete = if s.inode.inodeNumber == d.inode.inodeNumber then
+      s.rename(oldName, newName).map(_ => true)
+    else
+      blockingCall { s.getEntry(oldName) } match
+        case None => throw new NoEntException(s"$oldName does not exist")
+        case Some(iptr) =>
+          val odir = iptr.ftype match
+            case FileType.Directory => Some(getDirectory(iptr.number))
+            case _ => None
 
-      case Some(iptr) =>
+          val refreshOnFailure = s :: d :: odir.map(t => t :: Nil).getOrElse(Nil)
 
-        val odir = iptr.ftype match {
-          case FileType.Directory => Some(getDirectory(iptr.number))
-          case _ => None
-        }
+          def onFail(err: Throwable): Future[Unit] = err match
+            case e: InvalidInode => throw StopRetrying(e)
+            case e: DirectoryEntryExists => throw StopRetrying(e)
+            case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
+            case e: FatalReadError => throw StopRetrying(e)
+            case _ =>
+              val refreshOld = s.getEntry(oldName)
+              val refreshNew = d.getEntry(newName)
+              for
+                _ <- Future.sequence(refreshOnFailure.map(_.refresh())).map(_ => ())
+                oldf <- refreshOld
+                newf <- refreshNew
+              yield
+                if (oldf.isEmpty)
+                  throw StopRetrying(DirectoryEntryDoesNotExist(s.pointer, oldName))
+                if (newf.nonEmpty)
+                  throw StopRetrying(DirectoryEntryExists(d.pointer, newName))
 
-        val refreshOnFailure = s :: d :: odir.map(t => t :: Nil).getOrElse(Nil)
+          val p = Promise[Boolean]()
 
-        def onFail(err: Throwable): Future[Unit] = err match {
-          case e: InvalidInode => throw StopRetrying(e)
-          case e: DirectoryEntryExists => throw StopRetrying(e)
-          case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
-          case e: FatalReadError => throw StopRetrying(e)
-          case _ =>
-            val refreshOld = s.getEntry(oldName)
-            val refreshNew = d.getEntry(newName)
-            for {
-              _ <- Future.sequence(refreshOnFailure.map(_.refresh())).map(_ => ())
-              oldf <- refreshOld
-              newf <- refreshNew
-            } yield {
-              if (oldf.isEmpty)
-                throw StopRetrying(DirectoryEntryDoesNotExist(s.pointer, oldName))
-              if (newf.nonEmpty)
-                throw StopRetrying(DirectoryEntryExists(d.pointer, newName))
-            }
-        }
+          fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+            given t: Transaction = tx
 
-        fs.client.transactUntilSuccessfulWithRecovery(onFail) {  tx =>
+            s.prepareDelete(oldName, decref = false)
+            d.prepareInsert(newName, iptr, incref = false)
 
-          given t: Transaction = tx
+            odir.foreach: tdir =>
+              tdir.prepareSetParentDirectory(d)
 
-          s.prepareDelete(oldName, decref = false)
-          d.prepareInsert(newName, iptr, incref = false)
+            tx.result.foreach: _ =>
+              p.success(true)
 
-          odir.foreach { tdir =>
-            tdir.prepareSetParentDirectory(d)
-          }
+            Future.unit
 
-          Future.unit
-        }
+          p.future
 
-        true
-    }
+    blockingCall( fcomplete )
   }
 
   /**

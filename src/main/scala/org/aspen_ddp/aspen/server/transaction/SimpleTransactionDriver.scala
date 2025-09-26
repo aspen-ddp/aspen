@@ -14,31 +14,28 @@ import scala.concurrent.duration.*
 object SimpleTransactionDriver {
 
   def factory(initialDelay: Duration, maxDelay: Duration): TransactionDriver.Factory =
-
-    import scala.concurrent.ExecutionContext.Implicits.global
-
     new TransactionDriver.Factory:
-      def create(
+      def create( executionContext: ExecutionContext,
                   storeId: StoreId,
                   messenger: Messenger,
                   backgroundTasks: BackgroundTask,
                   txd: TransactionDescription,
                   finalizerFactory: TransactionFinalizer.Factory): TransactionDriver =
-        new SimpleTransactionDriver(initialDelay, maxDelay, storeId, messenger, backgroundTasks, txd, finalizerFactory)
+        new SimpleTransactionDriver(executionContext, initialDelay, maxDelay, storeId, messenger, backgroundTasks, txd, finalizerFactory)
 }
 
 /** Provides a store-side transaction driver with a very simple retransmit strategy and exponential backoff mechanism
   *  for dealing with Paxos contention.
   */
-class SimpleTransactionDriver(
+class SimpleTransactionDriver(executionContext: ExecutionContext,
                               val initialDelay: Duration,
                               val maxDelay: Duration,
                               storeId: StoreId,
                               messenger: Messenger,
                               backgroundTasks: BackgroundTask,
                               txd: TransactionDescription,
-                              finalizerFactory: TransactionFinalizer.Factory)(using ec: ExecutionContext) extends TransactionDriver(
-  storeId, messenger, backgroundTasks, txd, finalizerFactory) {
+                              finalizerFactory: TransactionFinalizer.Factory) extends TransactionDriver(
+  storeId, messenger, backgroundTasks, txd, finalizerFactory)(using executionContext) {
 
   private var backoffDelay = initialDelay
   private var nextTry = backgroundTasks.schedule(initialDelay) { sendPeerMessages() }

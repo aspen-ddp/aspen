@@ -142,7 +142,7 @@ class SimpleFileHandle(
         def writeSome(offset: Long, buffers: List[DataBuffer]): Unit = {
           synchronized:
             readCache = None
-            
+
           logger.info(s"  write ${pw.writeNumber}: writeSome(offset=$offset, bufferCount=${buffers.length}, nbytes=${buffers.foldLeft(0)((sz,b) => sz+b.remaining())})")
           val sb = new StringBuilder
           buffers.foldLeft(offset) { (off, db) =>

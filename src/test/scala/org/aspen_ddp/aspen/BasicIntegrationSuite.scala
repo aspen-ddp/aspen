@@ -11,11 +11,11 @@ import scala.language.implicitConversions
 
 class BasicIntegrationSuite extends IntegrationTestSuite {
 
-  test("Read radicle") {
+  atest("Read radicle") {
     client.read(radicle).map( kvos => kvos.contents.isEmpty should be (false) )
   }
 
-  test("Insert key value pair into radicle") {
+  atest("Insert key value pair into radicle") {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
@@ -42,7 +42,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Allocate data object") {
+  atest("Allocate data object") {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
@@ -75,7 +75,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Allocate KeyValue object") {
+  atest("Allocate KeyValue object") {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
@@ -113,7 +113,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Allocate and delete KeyValue object") {
+  atest("Allocate and delete KeyValue object") {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 
@@ -150,7 +150,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Allocate and update data object") {
+  atest("Allocate and update data object") {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))
 

@@ -161,7 +161,7 @@ class StoreManager(val rootDir: Path,
   /** Placeholder for mixin class to implement transaction and allocation recovery */
   protected def handleRecoveryEvent(): Unit = ()
 
-  def hasEvents: Boolean = {
+  def hasEvents: Boolean = synchronized {
     events.size() != 0
   }
 
@@ -192,7 +192,6 @@ class StoreManager(val rootDir: Path,
         }
 
       case ClientReq(msg) => stores.get(msg.toStore).foreach { store =>
-
         msg match {
           case a: Allocate => store.frontend.allocateObject(a)
 
@@ -223,7 +222,7 @@ class StoreManager(val rootDir: Path,
         handleRecoveryEvent()
 
       case LoadStore(backend, p) =>
-        val store = new Store(backend, objectCacheFactory(), net, backgroundTasks, crl,
+        val store = new Store(ec, backend, objectCacheFactory(), net, backgroundTasks, crl,
           txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8)
         backend.setCompletionHandler(ioHandler)
         stores += (backend.storeId -> store)

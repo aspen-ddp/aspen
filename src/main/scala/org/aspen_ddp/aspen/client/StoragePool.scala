@@ -58,9 +58,9 @@ trait StoragePool {
   /*
   val poolDefinitionPointer: KeyValueObjectPointer
 
-  def getAllocationTree(retryStrategy: RetryStrategy)(using ec: ExecutionContext): Future[MutableTieredKeyValueList]
+  def getAllocationTree(retryStrategy: RetryStrategy)(using executionContext: ExecutionContext): Future[MutableTieredKeyValueList]
 
-  def getAllocatedObjectsIterator()(using ec: ExecutionContext): Future[AllocatedObjectsIterator]
+  def getAllocatedObjectsIterator()(using executionContext: ExecutionContext): Future[AllocatedObjectsIterator]
 
   /** The entries of this array describe which storage host that currently owns store with the corresponding index */
   def storageHosts: Array[StorageHost]
@@ -77,11 +77,11 @@ trait StoragePool {
   def createMissedUpdateHandler(
                                  transactionUUID: UUID,
                                  pointer: ObjectPointer,
-                                 missedStores: List[Byte])(using ec: ExecutionContext): MissedUpdateHandler
+                                 missedStores: List[Byte])(using executionContext: ExecutionContext): MissedUpdateHandler
 
-  def createMissedUpdateIterator(poolIndex: Byte)(using ec: ExecutionContext): MissedUpdateIterator
+  def createMissedUpdateIterator(poolIndex: Byte)(using executionContext: ExecutionContext): MissedUpdateIterator
 
-  def refresh()(using ec: ExecutionContext): Future[StoragePool]
+  def refresh()(using executionContext: ExecutionContext): Future[StoragePool]
 
    */
 }

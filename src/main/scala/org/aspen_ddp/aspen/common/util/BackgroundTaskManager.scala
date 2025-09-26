@@ -1,16 +1,28 @@
 package org.aspen_ddp.aspen.common.util
 
 import java.util.concurrent.{Executors, ScheduledFuture, ThreadLocalRandom, TimeUnit}
-
 import org.aspen_ddp.aspen.common.util.BackgroundTask.ScheduledTask
 
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
-class BackgroundTaskPool extends BackgroundTask {
-  private  var sched = Executors.newScheduledThreadPool(1)
-  private  var ec = ExecutionContext.fromExecutorService(sched)
+object BackgroundTaskManager:
+
+  // Not much we can do if the scheduler has been shut down. Most likely the client
+  // has been shut down and background finalization tasks are continuing to retry.
+  // This object will be returned by the schedule* methods which should allow for
+  // a clean shutdown
+  object ShutdownTask extends ScheduledTask:
+    def cancel(): Unit = ()
+
+
+class BackgroundTaskManager(val executionContext: ExecutionContext) extends BackgroundTask {
+  import BackgroundTaskManager.*
+
+  private  val sched = Executors.newScheduledThreadPool(1)
   private  val rand = new java.util.Random
+
+  given ExecutionContext = executionContext
 
   def shutdown(gracefulShutdownDelay: Duration): Boolean = {
     sched.shutdown()
@@ -18,25 +30,25 @@ class BackgroundTaskPool extends BackgroundTask {
     sched.isTerminated
   }
 
-  def resizeThreadPool(numThreads: Int): Unit = synchronized {
-    sched.shutdown() // Previously submitted tasks will be executed before the pool is destroyed
-    sched = Executors.newScheduledThreadPool(numThreads)
-    ec = ExecutionContext.fromExecutorService(sched)
-  }
-
   private case class BGTask[T](sf: ScheduledFuture[T]) extends ScheduledTask {
     override def cancel(): Unit = sf.cancel(false)
   }
 
   def schedule(delay: Duration)(fn: => Unit): ScheduledTask = synchronized {
-    BGTask(sched.schedule( () => fn , delay.length, delay.unit))
+    try
+      BGTask(sched.schedule( () => Future.unit.map(_ => fn), delay.length, delay.unit))
+    catch
+      case _: java.util.concurrent.RejectedExecutionException => ShutdownTask
   }
 
   def scheduleRandomlyWithinWindow(window: Duration)(fn: => Unit): ScheduledTask = synchronized {
     // TODO: Fix Long -> Int conversion
     val actualDelay = rand.nextInt(window.length.toInt)
 
-    BGTask(sched.schedule(() => fn, actualDelay, window.unit))
+    try
+      BGTask(sched.schedule(() => Future.unit.map(_ => fn), actualDelay, window.unit))
+    catch
+      case _: java.util.concurrent.RejectedExecutionException => ShutdownTask
   }
 
   /** initialDelay uses the same units as the period
@@ -45,7 +57,10 @@ class BackgroundTaskPool extends BackgroundTask {
     */
   def schedulePeriodic(period: Duration, callNow: Boolean=false)(fn: => Unit): ScheduledTask = synchronized {
     val initialDelay = if (callNow) 0L else period.length
-    BGTask(sched.scheduleAtFixedRate(() => fn, initialDelay, period.length, period.unit))
+    try
+      BGTask(sched.scheduleAtFixedRate(() => Future.unit.map(_ => fn), initialDelay, period.length, period.unit))
+    catch
+      case _: java.util.concurrent.RejectedExecutionException => ShutdownTask
   }
 
   def retryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)(fn: => Boolean): ScheduledTask = {
@@ -58,7 +73,7 @@ class BackgroundTaskPool extends BackgroundTask {
     private var backoffDelay = initialDelay
 
     if (tryNow)
-      attempt()
+      Future.unit.map(_ => attempt())
     else
       reschedule(false)
 

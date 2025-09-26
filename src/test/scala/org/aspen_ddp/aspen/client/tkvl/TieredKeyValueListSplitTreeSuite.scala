@@ -11,7 +11,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
   def createKey(byte: Byte): Key = Key(Array(byte))
   def createValue(byte: Byte): Value = Value(Array(byte))
 
-  test("splitTree - simple single key case") {
+  atest("splitTree - simple single key case") {
     val treeKey = createKey(0)
     val key1 = createKey(1)
     val value1 = createValue(10)
@@ -52,7 +52,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitTree - key should move to new tree") {
+  atest("splitTree - key should move to new tree") {
     val treeKey = createKey(0)
     val newTreeKey = createKey(1)
     val key1 = createKey(10)  // This key is >= splitAtKey
@@ -111,7 +111,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitTree - multiple keys distributed correctly") {
+  atest("splitTree - multiple keys distributed correctly") {
     val treeKey = createKey(0)
     val newTreeKey = createKey(1)
     val key1 = createKey(1)
@@ -207,7 +207,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitTree - split at exact key") {
+  atest("splitTree - split at exact key") {
     val treeKey = createKey(0)
     val newTreeKey = createKey(1)
     val key1 = createKey(1)
@@ -290,7 +290,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitTree - empty tree after split") {
+  atest("splitTree - empty tree after split") {
     val treeKey = createKey(0)
     val newTreeKey = createKey(1)
     val key1 = createKey(10)
@@ -345,7 +345,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitTree - all keys remain in original tree") {
+  atest("splitTree - all keys remain in original tree") {
     val treeKey = createKey(0)
     val newTreeKey = createKey(1)
     val key1 = createKey(1)
@@ -412,7 +412,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitTree - returns valid pointer") {
+  atest("splitTree - returns valid pointer") {
     val treeKey = createKey(0)
     val key1 = createKey(1)
     val value1 = createValue(10)
@@ -452,7 +452,7 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitTree - empty tree from split can be used") {
+  atest("splitTree - empty tree from split can be used") {
     val treeKey = createKey(0)
     val newTreeKey = createKey(1)
     val key1 = createKey(1)

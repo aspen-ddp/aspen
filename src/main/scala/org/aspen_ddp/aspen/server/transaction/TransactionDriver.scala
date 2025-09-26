@@ -20,7 +20,7 @@ object TransactionDriver {
   trait Factory {
     def failedDriverDuration: Duration = Duration(2, SECONDS)
 
-    def create(
+    def create( ec: ExecutionContext,
                 storeId: StoreId,
                 messenger:Messenger,
                 backgroundTasks: BackgroundTask,
@@ -30,15 +30,15 @@ object TransactionDriver {
 
   object noErrorRecoveryFactory extends Factory {
 
-    import scala.concurrent.ExecutionContext.Implicits.global
-
-    class NoRecoveryTransactionDriver(
+    class NoRecoveryTransactionDriver( ec: ExecutionContext,
                                        storeId: StoreId,
                                        messenger: Messenger,
                                        backgroundTasks: BackgroundTask,
                                        txd: TransactionDescription,
                                        finalizerFactory: TransactionFinalizer.Factory) extends TransactionDriver(
-      storeId, messenger, backgroundTasks, txd, finalizerFactory) {
+      storeId, messenger, backgroundTasks, txd, finalizerFactory)(using ec) {
+
+      given ExecutionContext = ec
 
       var hung = false
 
@@ -65,13 +65,13 @@ object TransactionDriver {
       }
     }
 
-    def create(
+    def create( ec: ExecutionContext,
                 storeId: StoreId,
                 messenger:Messenger,
                 backgroundTasks: BackgroundTask,
                 txd: TransactionDescription,
                 finalizerFactory: TransactionFinalizer.Factory): TransactionDriver = {
-      new NoRecoveryTransactionDriver(storeId, messenger, backgroundTasks, txd, finalizerFactory)
+      new NoRecoveryTransactionDriver(ec, storeId, messenger, backgroundTasks, txd, finalizerFactory)
     }
   }
 }

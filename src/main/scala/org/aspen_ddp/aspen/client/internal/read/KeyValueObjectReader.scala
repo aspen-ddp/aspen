@@ -32,6 +32,7 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
     //println(s"ATTEMPTING TO Restore object with refcount ${refcount}")
     if (debug)
       println(s"DEBUG KV Restore Object")
+
     val storeStates = allStoreStates
 
     val min = if (matchingStoreStates.count(_.kvoss.minimum.nonEmpty) >= threshold)
@@ -55,6 +56,9 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
       None
     }
 
+    if (debug)
+      println(s"DEBUG KV Restore Object pre max")
+
     val right = if (matchingStoreStates.head.kvoss.right.nonEmpty) {
       val lright = matchingStoreStates.flatMap { ss => ss.kvoss.right.map(v => ss.storeId.poolIndex -> v.bytes) }
 
@@ -67,6 +71,9 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
       None
     }
 
+    if (debug)
+      println(s"DEBUG KV Restore Object pre kv")
+
     val kvrestores = storeStates.foldLeft(Map[Key, List[Segment]]()) { (m, ss) =>
       ss.kvoss.contents.iterator.foldLeft(m) { (subm, v) =>
         val x = subm.get(v._1) match {
@@ -75,14 +82,19 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
         }
         subm + (v._1 -> x)
       }
-    }.map(t => t._1 -> resolve(s"Key(${t._1}", storeStates, t._2))
+    }.map(t => t._1 -> resolve(t._1, storeStates, t._2, debug))
 
     val contents = kvrestores.foldLeft(Map[Key,KeyValueObjectState.ValueState]()) { (m, t) => t._2 match {
       case None => m
       case Some(r) =>
+        if (debug)
+          println(s"Creating value state for key ${t._1}.")
         val v = Value(pointer.ida.restoreArray(r.slices.map(t => t._1 -> t._2.bytes)))
         m + (t._1 -> KeyValueObjectState.ValueState(v, r.revision, r.timestamp))
     }}
+
+    if (debug)
+      println(s"Restored Contents: $contents")
 
     new KeyValueObjectState(pointer, revision, refcount, timestamp, readTime, min, max, left, right, contents)
   }
@@ -92,9 +104,10 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
     storeStates.exists(_.lockedWriteTransactions.contains(TransactionId(rev.lastUpdateTxUUID)))
   }
 
-  private def resolve[T](what: String,
+  private def resolve[T](key: Key,
                          storeStates: List[KeyValueObjectStoreState],
-                         segments: List[Segment]): Option[Restorable] = if (segments.isEmpty) None else {
+                         segments: List[Segment],
+                         debug: Boolean): Option[Restorable] = if (segments.isEmpty) None else {
 
     //println("HELLO")
     val highestRevision = segments.foldLeft((HLCTimestamp.Zero, ObjectRevision.Null)) { (h,s) =>
@@ -114,6 +127,8 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
     val mismatching = storeStates.size - matching
 
     //println(s"Highest Revision: $highestRevision, matching size ${matching}. Matching: $matches")
+    if (debug)
+      println(s"Restoring key $key. nMatch: ${matching} thresh: $threshold")
 
     if (matching < threshold) {
       // If we cannot restore even though we have a threshold number of responses, we need to determine whether
@@ -125,7 +140,7 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
       val potential = width - matching - mismatching
 
       if (matching + potential >= threshold || anyStoreHasLocked(highestRevision, storeStates))
-        throw BaseObjectReader.NotRestorable(s"KVObject $what is below threshold")
+        throw BaseObjectReader.NotRestorable(s"KVObject $key is below threshold")
       else
         None // Item deleted
     } else {

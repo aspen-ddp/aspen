@@ -12,12 +12,12 @@ import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver,
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientRequest, ClientResponse, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
+import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientRequest, ClientResponse, Read, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
-import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskPool}
+import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreManager, transaction}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
@@ -63,26 +63,11 @@ object TestNetwork {
     override def createCRL(): CrashRecoveryLog = new TestCRL()
   }
 
-  /*
-  class NullFinalizer extends TransactionFinalizer {
-    override def complete: Future[Unit] = Future.successful(())
+  class TClient(executionContext: ExecutionContext,
+                msngr: ClientMessenger,
+                val radicle: KeyValueObjectPointer) extends AspenClient {
 
-    override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = ()
-
-
-    override def debugStatus: List[(String, Boolean)] = Nil
-
-    override def cancel(): Unit = ()
-  }
-
-  object NullFinalizer extends TransactionFinalizer.Factory {
-    override def create(txd: TransactionDescription, messenger: ServerMessenger): TransactionFinalizer = new NullFinalizer
-  }
-  */
-
-  class TClient(msngr: ClientMessenger, val radicle: KeyValueObjectPointer) extends AspenClient {
-
-    import scala.concurrent.ExecutionContext.Implicits.global
+    given ExecutionContext = executionContext
 
     var attributes: Map[String, String] = Map()
 
@@ -91,6 +76,9 @@ object TestNetwork {
     val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
 
     val typeRegistry: TypeRegistry = new TypeRegistry(StaticTypeRegistry.types.toMap)
+
+    val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
+    val backgroundTasks: BackgroundTask = new BackgroundTaskManager(executionContext)
 
     val rmgr = new ReadManager(this, BaseReadDriver.noErrorRecoveryReadDriver)
 
@@ -136,11 +124,7 @@ object TestNetwork {
     
     override def shutdown(): Unit = backgroundTasks.shutdown(Duration(50, MILLISECONDS))
 
-    val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
-
-    def backgroundTasks: BackgroundTask = new BackgroundTaskPool
-
-    def clientContext: ExecutionContext = scala.concurrent.ExecutionContext.Implicits.global
+    def clientContext: ExecutionContext = executionContext//scala.concurrent.ExecutionContext.Implicits.global
 
     def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
 
@@ -165,7 +149,7 @@ object TestNetwork {
 }
 
 
-class TestNetwork extends ServerMessenger {
+class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
   import TestNetwork._
 
   val objectCacheFactory: () => SimpleLRUObjectCache = () => new SimpleLRUObjectCache(1000)
@@ -206,7 +190,7 @@ class TestNetwork extends ServerMessenger {
   }
 
   val smgr = new StoreManager(Path.of("/"),
-    scala.concurrent.ExecutionContext.Implicits.global,
+    executionContext,
     objectCacheFactory, this, BackgroundTask.NoBackgroundTasks,
     TestCRL, FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
     storeLoader,
@@ -216,8 +200,18 @@ class TestNetwork extends ServerMessenger {
   smgr.loadStore(store1)
   smgr.loadStore(store2)
 
-  def handleEvents(): Unit = synchronized {
-    smgr.handleEvents()
+  var otestThreadId: Option[Long] = None
+
+  def handleEvents(): Unit = {
+    otestThreadId match
+      case None => otestThreadId = Some(Thread.currentThread().threadId())
+      case Some(testThreadId) =>
+        if testThreadId != Thread.currentThread().threadId() then
+          println(s"*********** Current thread ${Thread.currentThread().threadId()} != testThreadId $testThreadId")
+          printStack()
+
+    synchronized:
+      smgr.handleEvents()
   }
 
   private val cliMessenger = new ClientMessenger {
@@ -237,8 +231,7 @@ class TestNetwork extends ServerMessenger {
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
   }
 
-  val client = new TClient(cliMessenger, radicle)
-
+  val client = new TClient(executionContext, cliMessenger, radicle)
   FinalizerFactory.client = client
 
   // process load store events
@@ -260,13 +253,16 @@ class TestNetwork extends ServerMessenger {
     handleEvents()
     msg.foreach(smgr.receiveTransactionMessage)
     handleEvents()
-  }//msg.foreach(sendTransactionMessage)
+  }
+
+  def hasTransactions: Boolean = smgr.hasTransactions
 
   def printTransactionStatus(): Unit = {
-    val test = client.getSystemAttribute("unittest.name")
-    println(s"*********** Transaction Status. Hung Test: $test ***********")
-    smgr.logTransactionStatus(s => println(s))
-    println("******************************************")
+    if smgr.hasTransactions then
+      val test = client.getSystemAttribute("unittest.name")
+      println(s"*********** Transaction Status. Hung Test: $test ***********")
+      smgr.logTransactionStatus(s => println(s))
+      println("******************************************")
   }
 
   def waitForTransactionsToComplete(): Future[Unit] = {
@@ -274,26 +270,22 @@ class TestNetwork extends ServerMessenger {
 
     handleEvents()
 
-    val bgTasks = new BackgroundTaskPool
-
     val p = Promise[Unit]()
     val pollDelay = Duration(100, MILLISECONDS)
 
-    var count = 1
-
-    def check(): Unit = {
-      if (!smgr.hasTransactions) {
-        bgTasks.shutdown(pollDelay)
-        p.success(())
-      } else {
+    val myRunnable: Runnable = () => {
+      var count = 0
+      while smgr.hasTransactions do
         count += 1
         if (count == 20)
           printTransactionStatus()
-        bgTasks.schedule(pollDelay)(check())
-      }
+        Thread.sleep(100) // Simulate some work
+      p.success(())
     }
 
-    bgTasks.schedule(pollDelay)(check())
+    val checkerThread = new Thread(myRunnable, "waitForTransactionCompleteThread")
+
+    checkerThread.start()
 
     p.future
   }

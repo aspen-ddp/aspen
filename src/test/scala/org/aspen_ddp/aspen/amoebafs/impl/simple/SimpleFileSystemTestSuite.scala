@@ -13,7 +13,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
 
   def async_sleep(msec: Int): Future[Unit] = Future {Thread.sleep(msec)}
 
-  test("Load root directory pointer") {
+  atest("Load root directory pointer") {
     for {
       fs <- bootstrap()
       (rootInode, _, _) <- fs.readInode(1)
@@ -22,7 +22,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
     }
   }
 
-  test("Change file uid") {
+  atest("Change file uid") {
     for {
       fs <- bootstrap()
       (rootInode, rootPointer, rootRevision) <- fs.readInode(1)
@@ -38,7 +38,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
     }
   }
 
-  test("Change file gid") {
+  atest("Change file gid") {
     for {
       fs <- bootstrap()
       (rootInode, rootPointer, rootRevision) <- fs.readInode(1)
@@ -54,7 +54,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
     }
   }
 
-  test("Prepare hardlink") {
+  atest("Prepare hardlink") {
     for {
       fs <- bootstrap()
       (rootInode, rootPointer, rootRevision) <- fs.readInode(1)
@@ -73,7 +73,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
     }
   }
 
-  test("Create File") {
+  atest("Create File") {
     for {
       fs <- bootstrap()
       root = Root(0, IntegerKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, radicle.poolId))
@@ -93,7 +93,7 @@ class SimpleFileSystemTestSuite extends FilesSystemTestSuite {
     }
   }
 
-  test("Rename File") {
+  atest("Rename File") {
     for {
       fs <- bootstrap()
       root = Root(0, IntegerKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, radicle.poolId))

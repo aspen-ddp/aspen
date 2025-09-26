@@ -1,10 +1,8 @@
 package org.aspen_ddp.aspen
 
-import java.util.concurrent.TimeoutException
-
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer
-import org.scalatest.{BeforeAndAfter, FutureOutcome}
+import org.scalatest.{FutureOutcome, Tag, compatible}
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -17,27 +15,18 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   var radicle: KeyValueObjectPointer = scala.compiletime.uninitialized
   var testName: String = "NO_TEST"
 
-  /*
-  after {
-    try {
-      Await.result(net.waitForTransactionsToComplete(), Duration(5000, MILLISECONDS))
-    } catch {
-      case e: TimeoutException =>
-        println(s"TEST LEFT TRANSACTIONS UNFINISHED: $testName")
-        net.printTransactionStatus()
-        throw e
-    }
-
-    net = null
-    client = null
-    radicle = null
-    testName = "NO_TEST"
-  }*/
   def subFixtureSetup(): Unit = {}
   def subFixtureTeardown(): Unit = ()
 
+  inline def atest(testName: String, testTags: Tag*)(testFun: => Future[compatible.Assertion]): Unit = {
+    test(testName, testTags*):
+      testFun.flatMap: result =>
+        net.waitForTransactionsToComplete().map: _ =>
+          result
+  }
+
   override def withFixture(test: NoArgAsyncTest): FutureOutcome = {
-    net = new TestNetwork
+    net = new TestNetwork(executionContext)
     client = net.client
     testName = test.name
     radicle = net.radicle
@@ -48,14 +37,6 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
     complete {
       super.withFixture(test)
     } lastly {
-      try {
-        Await.result(net.waitForTransactionsToComplete(), Duration(5000, MILLISECONDS))
-      } catch {
-        case e: TimeoutException =>
-          println(s"TEST LEFT TRANSACTIONS UNFINISHED: $testName")
-          net.printTransactionStatus()
-          throw e
-      }
 
       subFixtureTeardown()
       client.shutdown()
@@ -70,17 +51,5 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   def waitForTransactionsToComplete(): Future[Unit] = net.waitForTransactionsToComplete()
 
   def handleEvents(): Unit = net.handleEvents()
-
-  def waitForIt(errMsg: String)(fn: => Boolean): Future[Unit] = Future {
-
-    var count = 0
-    while (!fn && count < 500) {
-      count += 1
-      Thread.sleep(5)
-    }
-
-    if (count >= 500)
-      throw new Exception(errMsg)
-  }
 
 }

@@ -31,7 +31,7 @@ trait Directory extends BaseFile with Logging {
 
   def prepareInsert(name: String, pointer: InodePointer, incref: Boolean=true)(using tx: Transaction): Future[Unit]
 
-  def prepareDelete(name: String, decref: Boolean=true)(using tx: Transaction): Future[Unit]
+  def prepareDelete(name: String, decref: Boolean=true)(using tx: Transaction): Future[Future[Unit]]
 
   def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit]
 
@@ -95,7 +95,7 @@ trait Directory extends BaseFile with Logging {
     fs.client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prepareInsert(name, fpointer, incref)(using tx)
 
-  def delete(name: String, decref: Boolean=true): Future[Unit] = {
+  def delete(name: String, decref: Boolean=true): Future[Future[Unit]] = {
     retryUntilSuccessfulOr { tx =>
       given Transaction = tx
       prepareDelete(name, decref)
@@ -108,6 +108,9 @@ trait Directory extends BaseFile with Logging {
   }
 
   def rename(oldName: String, newName: String): Future[Unit] = {
+    if oldName == newName then
+      return Future.unit
+
     def onFail(err: Throwable): Future[Unit] =
       err match
         case e: InvalidInode => throw StopRetrying(e)

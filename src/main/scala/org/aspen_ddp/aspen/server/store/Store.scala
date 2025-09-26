@@ -13,10 +13,11 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFin
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 
-import scala.concurrent.{Future, Promise}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.*
 
-class Store(val backend: Backend,
+class Store(val executionContext: ExecutionContext,
+            val backend: Backend,
             val objectCache: ObjectCache,
             val net: Messenger,
             val backgroundTasks: BackgroundTask,
@@ -50,7 +51,7 @@ class Store(val backend: Backend,
   def driveTransaction(txd: TransactionDescription): Unit = synchronized {
     if (!transactionDrivers.contains(txd.transactionId)) {
 
-      val driver = txDriverFactory.create(storeId, net, backgroundTasks, txd, finalizerFactory)
+      val driver = txDriverFactory.create(executionContext, storeId, net, backgroundTasks, txd, finalizerFactory)
 
       transactionDrivers += txd.transactionId -> driver
 

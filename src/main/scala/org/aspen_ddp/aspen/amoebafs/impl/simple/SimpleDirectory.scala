@@ -65,7 +65,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     val fincref = if (incref) {
       fs.readInode(pointer) map { t =>
         val (finode, _, frevision) = t
-        val updatedInode = finode.update(links=Some(inode.links+1))
+        val updatedInode = finode.update(links=Some(finode.links+1))
         tx.overwrite(pointer.pointer, frevision, updatedInode.toArray)
       }
     } else {
@@ -96,32 +96,32 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
 
       case _ => Future.unit
 
-  override def prepareDelete(name: String, decref: Boolean)(using tx: Transaction): Future[Unit] = {
+  override def prepareDelete(name: String, decref: Boolean)(using tx: Transaction): Future[Future[Unit]] = {
     val key = Key(name)
 
-    def onptr(ovs: Option[ValueState]): Future[Unit] = ovs match {
+    def onptr(ovs: Option[ValueState]): Future[Future[Unit]] = ovs match
       case None => Future.failed(DirectoryEntryDoesNotExist(pointer, name))
       case Some(vs) =>
         val fptr = InodePointer(vs.value.bytes)
         val fcheck = checkForDeletion(fptr)
 
-        for {
+        for
           _ <- fcheck
           _ <- tree.delete(key)
-          _ <- if (decref) {
-            UnlinkFileTask.prepareTask(fs, fptr)
-          } else {
-            Future.successful(())
-          }
-        } yield {
-          tx.result.map(_=>())
-        }
-    }
+          ftaskComplete <- if (decref)
+            UnlinkFileTask.prepareTask(fs, fptr).map: f =>
+              f.map(_ => ())
+          else
+            Future.successful(Future.unit)
 
-    for {
+        yield
+          ftaskComplete
+
+    for
       ovs <- tree.get(key)
-      _ <- onptr(ovs)
-    } yield ()
+      ftaskComplete <- onptr(ovs)
+    yield
+      ftaskComplete
   }
 
   override def prepareRename(oldName: String, newName: String)(using tx: Transaction): Future[Unit] =

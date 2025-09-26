@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskPool}
+import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskManager}
 import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -138,8 +138,8 @@ abstract class BaseReadDriver(
                 case kvos: KeyValueObjectState => logger.info(s"Read UUID $readUUID: Successfully read KeyValueObject ${objectPointer.id} Rev ${kvos.revision} Ref ${kvos.refcount} Num Entries ${kvos.contents.size}")
                 case mos: MetadataObjectState => logger.info(s"Read UUID $readUUID: Successfully read MetadataObject ${objectPointer.id} Rev ${mos.revision} Ref ${mos.refcount}")
               }
-              onComplete()
               promise.success(obj)
+              onComplete()
           }
         }
 
@@ -172,50 +172,34 @@ abstract class BaseReadDriver(
 
 }
 
-object BaseReadDriver {
+object BaseReadDriver:
 
   def noErrorRecoveryReadDriver(
                                  client: AspenClient,
                                  objectPointer: ObjectPointer,
                                  readUUID:UUID,
                                  comment: String,
-                                 disableOpportunisticRebuild: Boolean): ReadDriver = {
+                                 disableOpportunisticRebuild: Boolean): ReadDriver =
 
-    new BaseReadDriver(client, objectPointer, readUUID, comment) {
+    new BaseReadDriver(client, objectPointer, readUUID, comment):
 
       given ec: ExecutionContext = this.client.clientContext
 
       var hung = false
+      val test = this.client.getSystemAttribute("unittest.name").getOrElse("UNKNOWN TEST")
 
-      val bgTasks = new BackgroundTaskPool
+      val myRunnable: Runnable = () =>
+        var count = 0
+        while ! promise.isCompleted && !hung do
+          Thread.sleep(10) // Simulate some work
+          count += 1
+          if (count == 200)
+            hung = true
 
-      val hangCheckTask: BackgroundTask.ScheduledTask = bgTasks.schedule(Duration(2, SECONDS)) {
-        val test = this.client.getSystemAttribute("unittest.name").getOrElse("UNKNOWN TEST")
-        //println(s"**** HUNG READ: $test")
+            objectReader.debugLogStatus(s"*** HUNG READ in test $test", println)
 
-        objectReader.debugLogStatus(s"*** HUNG READ in test $test", println)
-        // KeyValueObjectCodec.isRestorable(objectPointer.ida,
-        //   storeStates.valuesIterator.map(ss => ss.asInstanceOf[KeyValueObjectStoreState].kvoss).toList)
+      val checkerThread = new Thread(myRunnable, "waitForReadCompleteThread")
 
-        synchronized {
-          hung = true
-        }
-      }
-      
-      def cancelCallback(): Unit =
-        hangCheckTask.cancel()
-        bgTasks.shutdown(Duration(0, SECONDS))
-        synchronized {
-          if (hung) {
-            val test = this.client.getSystemAttribute("unittest.name").getOrElse("UNKNOWN TEST")
-            println(s"**** HUNG READ EVENTUALLY COMPLETED! : $test")
-          }
-        }
+      checkerThread.start()
 
-      readResult.onComplete {
-        case Failure(_) => cancelCallback()
-        case Success(_) => cancelCallback()
-      }(using ec)
-    }
-  }
-}
+

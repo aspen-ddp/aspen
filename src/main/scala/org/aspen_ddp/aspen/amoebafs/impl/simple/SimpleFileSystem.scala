@@ -83,14 +83,9 @@ class SimpleFileSystem(aclient: AspenClient,
 
   import SimpleFileSystem._
 
-  private val sched = Executors.newScheduledThreadPool(numContextThreads)
-
   override val uuid: UUID =  byte2uuid(fsRoot.contents(FileSystemUUIDKey).value.bytes)
 
-  override def shutdown(): Unit = {
-    sched.shutdown()
-    sched.awaitTermination(5, TimeUnit.SECONDS)
-  }
+  override def shutdown(): Unit = ()
 
   def defaultSegmentSize: Int = 4 * 1024 * 1024
   def defaultFileIndexNodeSize(iter: Int): Int = 1024*1024
@@ -109,7 +104,7 @@ class SimpleFileSystem(aclient: AspenClient,
 
   override private[amoebafs] def client = aclient
 
-  override private[amoebafs] val executionContext: scala.concurrent.ExecutionContext = ExecutionContext.fromExecutorService(sched)
+  override private[amoebafs] val executionContext: scala.concurrent.ExecutionContext = client.clientContext //ExecutionContext.fromExecutorService(sched)
 
   override private[amoebafs] def getObjectAllocator(id: ObjectAllocatorId) = Future.successful(defaultAllocator)
 

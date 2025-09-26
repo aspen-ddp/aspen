@@ -30,14 +30,14 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       arr <- file.debugReadFully()
     yield arr
 
-  test("Read empty File"):
+  atest("Read empty File"):
     for
       file <- boot()
       a <- readFully(file)
     yield
       a.length should be (0)
 
-  test("Read write empty file"):
+  atest("Read write empty file"):
     val w = Array[Byte](5)
     for
       file <- boot()
@@ -49,7 +49,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       remainingData should be (Nil)
       a should be (w)
 
-  test("Read past end of file returns empty DataBuffer"):
+  atest("Read past end of file returns empty DataBuffer"):
     val w = Array[Byte](5)
     for
       file <- boot()
@@ -63,7 +63,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       a should be(w)
       b.get should be (DataBuffer.Empty)
 
-  test("Read write empty file with hole"):
+  atest("Read write empty file with hole"):
     val w = Array[Byte](5)
     val e = Array[Byte](0,0,5)
     for
@@ -76,7 +76,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       remainingData should be (Nil)
       a should be (e)
 
-  test("Read write empty file with hole, multi-segment"):
+  atest("Read write empty file with hole, multi-segment"):
     val w = Array[Byte](5)
     val e = Array[Byte](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5)
     for
@@ -89,7 +89,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       remainingData should be(Nil)
       a should be(e)
 
-  test("Read write into empty segment mid file"):
+  atest("Read write into empty segment mid file"):
     val w = Array[Byte](5)
     val e = Array[Byte](0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5)
     val f = Array[Byte](0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5)
@@ -108,7 +108,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       a should be(e)
       b should be(f)
 
-  test("Read write empty file with full segment hole"):
+  atest("Read write empty file with full segment hole"):
     val w = Array[Byte](5)
     val e = Array[Byte](0,0,0,0,0,0,5)
     for
@@ -121,7 +121,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       remainingData should be (Nil)
       a should be (e)
 
-  test("Write past single segment"):
+  atest("Write past single segment"):
     val w = Array[Byte](1,2,3,4,5,6,7,8,9)
     val e = Array[Byte](1,2,3,4,5)
     val r = Array[Byte](6,7,8,9)
@@ -137,7 +137,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       remainingData.head.getByteArray should be (r)
       a.get.getByteArray should be (e)
 
-  test("Resume write"):
+  atest("Resume write"):
     val w = Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9)
     for
       file <- boot(Some(5))
@@ -149,7 +149,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       file.inode.size should be(w.length)
       a.get.getByteArray should be(w)
 
-  test("Overwrite segment - head"):
+  atest("Overwrite segment - head"):
     val w = Array[Byte](1, 2, 3, 4, 5)
     val x = Array[Byte](9)
     val r = Array[Byte](9, 2, 3, 4, 5)
@@ -163,7 +163,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       file.inode.size should be(w.length)
       a.get.getByteArray should be(r)
 
-  test("Overwrite segment - middle"):
+  atest("Overwrite segment - middle"):
     val w = Array[Byte](1, 2, 3, 4, 5)
     val x = Array[Byte](9)
     val r = Array[Byte](1, 9, 3, 4, 5)
@@ -177,7 +177,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       file.inode.size should be(w.length)
       a.get.getByteArray should be(r)
 
-  test("Overwrite segment - end"):
+  atest("Overwrite segment - end"):
     val w = Array[Byte](1, 2, 3, 4, 5)
     val x = Array[Byte](9)
     val r = Array[Byte](1, 2, 3, 4, 9)
@@ -191,7 +191,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       file.inode.size should be(w.length)
       a.get.getByteArray should be(r)
 
-  test("Truncate empty file"):
+  atest("Truncate empty file"):
     for
       file <- boot(Some(5))
       fcomplete <- file.truncate(0)
@@ -200,7 +200,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
     yield
       file.inode.size should be(0)
 
-  test("Truncate extends file"):
+  atest("Truncate extends file"):
     for
       file <- boot(Some(5))
       fcomplete <- file.truncate(6)
@@ -210,7 +210,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       file.inode.size should be(6)
       a should be(Array[Byte](0, 0, 0, 0, 0, 0))
 
-  test("Truncate shortens segment"):
+  atest("Truncate shortens segment"):
     val w = Array[Byte](1, 2, 3, 4, 5)
     for
       file <- boot(Some(5))
@@ -223,7 +223,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
       file.inode.size should be(3)
       a should be(Array[Byte](1,2,3))
 
-  test("Truncate deletes segments"):
+  atest("Truncate deletes segments"):
     val w = Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
     for
       file <- boot(Some(5))

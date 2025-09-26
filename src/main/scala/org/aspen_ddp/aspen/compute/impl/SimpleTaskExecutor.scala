@@ -122,7 +122,6 @@ class SimpleTaskExecutor(val client: AspenClient,
   override def prepareTask(taskType: DurableTaskFactory,
                            initialState: List[(Key, Array[Byte])])
                           (using tx: Transaction): Future[Future[Option[AnyRef]]] = synchronized {
-
     val initial = initialState.map(t => Insert(t._1, t._2))
 
     val ins = Insert(TaskTypeKey,uuid2byte(taskType.typeUUID)) :: initial
@@ -148,6 +147,7 @@ class SimpleTaskExecutor(val client: AspenClient,
         client.read(taskPointer.kvPointer).flatMap { kvos =>
           synchronized {
             val task = taskType.createTask(client, taskPointer, kvos.revision, kvos.contents)
+
             active += taskPointer
             task.completed.foreach { _ =>
               deallocateTask(taskPointer)

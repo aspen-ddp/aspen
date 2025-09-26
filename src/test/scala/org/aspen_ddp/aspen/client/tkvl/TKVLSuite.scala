@@ -4,14 +4,14 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, ObjectRevisionGuard, Value}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 import scala.concurrent.Future
 import scala.language.implicitConversions
 
 class TKVLSuite extends IntegrationTestSuite {
-  test("Create new tree") {
+  atest("Create new tree") {
     val treeKey = Key(Array[Byte](1))
     val key = Key(Array[Byte](2))
     val value = Value(Array[Byte](3))
@@ -45,7 +45,7 @@ class TKVLSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Insert into tree") {
+  atest("Insert into tree") {
     val treeKey = Key(Array[Byte](0))
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](3))
@@ -87,7 +87,50 @@ class TKVLSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Splitting tree insertion") {
+  atest("Many inserts and foreach") {
+    val treeKey = Key(Array[Byte](0))
+    val value = Value(Array[Byte](3))
+    var insertedKeys = Set[Key]()
+    var readKeys = Set[Key]()
+
+    def insert(tree: TieredKeyValueList, key: Key): Future[Unit] =
+      val tx: Transaction = client.newTransaction()
+      tree.set(key, value)(using tx).map: _ =>
+        tx.commit().map: _ =>
+          insertedKeys = insertedKeys + key
+
+    def foreachKV(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      readKeys = readKeys + key
+      Future.unit
+
+    given tx1: Transaction = client.newTransaction()
+
+    for
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.get.createAllocator(Replication(3, 2))
+
+      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+
+      nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
+
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, IntegerKeyOrdering, nodeAllocator, Map())
+
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+
+      root <- froot
+      tree <- root.getTree()
+
+      _ <- Future.sequence((1 to 100).map(i => insert(tree, Key(i))))
+
+      _ <- tree.foreach(foreachKV)
+
+    yield
+      readKeys should be (insertedKeys)
+  }
+
+  atest("Splitting tree insertion") {
     val treeKey = Key(Array[Byte](0))
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](3))
@@ -141,7 +184,7 @@ class TKVLSuite extends IntegrationTestSuite {
     }
   }
 
-  test("deleteTree") {
+  atest("deleteTree") {
     val treeKey = Key(Array[Byte](0))
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](3))
@@ -209,7 +252,7 @@ class TKVLSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Joining tree deletion with tier reduction") {
+  atest("Joining tree deletion with tier reduction") {
     val treeKey = Key(Array[Byte](0))
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](3))

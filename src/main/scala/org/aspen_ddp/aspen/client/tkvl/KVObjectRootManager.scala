@@ -175,6 +175,16 @@ object KVObjectRootManager extends RootManagerFactory {
 
     given ExecutionContext = client.clientContext
 
+    // TODO: Re-evaluate this. Unconditionally create the root node due to errors
+    //       in unit tests complaining about transactions having no requirements
+    //       if this method doesn't do anything.
+    for
+      alloc <- nodeAllocator.getAllocatorForTier(0)
+      kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
+      rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(pointer, kvos.revision), initialContent)
+    yield
+      setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
+    /*
     if initialContent.isEmpty then
       Future.successful(Future.successful(new KVObjectRootManager(client, key, pointer)))
     else
@@ -184,4 +194,5 @@ object KVObjectRootManager extends RootManagerFactory {
         rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(pointer, kvos.revision), initialContent)
       yield
         setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
+     */
 }

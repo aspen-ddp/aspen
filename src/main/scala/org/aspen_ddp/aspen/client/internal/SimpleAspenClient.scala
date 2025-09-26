@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientRes
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{KeyRequirement, KeyRevision}
-import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskPool, byte2uuid, uuid2byte}
+import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskManager, byte2uuid, uuid2byte}
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -168,7 +168,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
 
-  def backgroundTasks: BackgroundTask = new BackgroundTaskPool
+  val backgroundTasks: BackgroundTask = new BackgroundTaskManager(executionContext)
 
   def clientContext: ExecutionContext = executionContext
 

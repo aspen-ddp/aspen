@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 class KeyValueListSuite extends IntegrationTestSuite {
 
-  test("Insert into empty list") {
+  atest("Insert into empty list") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
@@ -45,7 +45,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Insert into empty non empty list") {
+  atest("Insert into empty non empty list") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
@@ -89,7 +89,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Delete content with KVPair function") {
+  atest("Delete content with KVPair function") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
@@ -147,7 +147,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Delete content oneshot") {
+  atest("Delete content oneshot") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
@@ -198,7 +198,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("split") {
+  atest("split") {
     val key = Key(Array[Byte](1))
     val value = Value(new Array[Byte](60))
 
@@ -244,7 +244,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Delete list") {
+  atest("Delete list") {
     val key = Key(Array[Byte](1))
     val value = Value(new Array[Byte](60))
 
@@ -295,7 +295,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("End split") {
+  atest("End split") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
@@ -340,7 +340,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Push out split") {
+  atest("Push out split") {
     val key = Key(Array[Byte](2))
     val value = Value(Array[Byte](2))
 
@@ -384,7 +384,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Multiple push out split") {
+  atest("Multiple push out split") {
     val key = Key(Array[Byte](5))
     val value = Value(Array[Byte](2))
 
@@ -439,7 +439,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Join on delete to empty node") {
+  atest("Join on delete to empty node") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 
@@ -511,7 +511,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  test("Simple Delete") {
+  atest("Simple Delete") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 

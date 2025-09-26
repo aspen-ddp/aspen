@@ -34,7 +34,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       odata.map(_.getByteArray).getOrElse(Array.empty[Byte])
 
-  test("Write consecutive data blocks"):
+  atest("Write consecutive data blocks"):
     val data1 = Array[Byte](1, 2, 3, 4, 5)
     val data2 = Array[Byte](6, 7, 8, 9, 10)
     val expected = Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
@@ -48,7 +48,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (expected)
 
-  test("Write consecutive data blocks with buffering"):
+  atest("Write consecutive data blocks with buffering"):
     val data1 = Array[Byte](1, 2, 3)
     val data2 = Array[Byte](4, 5, 6)
     val data3 = Array[Byte](7, 8, 9)
@@ -64,7 +64,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (expected)
 
-  test("Write out-of-order data blocks direct-io"):
+  atest("Write out-of-order data blocks direct-io"):
     val data1 = Array[Byte](1, 2, 3)    // offset 0
     val data2 = Array[Byte](7, 8, 9)    // offset 6
     val data3 = Array[Byte](4, 5, 6)    // offset 3 (fills gap)
@@ -80,7 +80,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (expected)
 
-  test("Write out-of-order data blocks with buffering"):
+  atest("Write out-of-order data blocks with buffering"):
     val data1 = Array[Byte](1, 2, 3) // offset 0
     val data2 = Array[Byte](7, 8, 9) // offset 6
     val data3 = Array[Byte](4, 5, 6) // offset 3 (fills gap)
@@ -96,7 +96,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be(expected)
 
-  test("Write out-of-order with gaps"):
+  atest("Write out-of-order with gaps"):
     val data1 = Array[Byte](1, 2)       // offset 0
     val data2 = Array[Byte](7, 8)       // offset 6 (creates gap 2-5)
     val expected = Array[Byte](1, 2, 0, 0, 0, 0, 7, 8) // zeros fill gaps
@@ -110,7 +110,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (expected)
 
-  test("Buffered writes return same promise for consecutive operations"):
+  atest("Buffered writes return same promise for consecutive operations"):
     val data1 = Array[Byte](1, 2, 3)
     val data2 = Array[Byte](4, 5, 6)
 
@@ -128,7 +128,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
       content should be (Array[Byte](1, 2, 3, 4, 5, 6))
     }
 
-  test("Large write exceeding buffer size returns completion future"):
+  atest("Large write exceeding buffer size returns completion future"):
     val largeData = Array.fill[Byte](200)(42) // Larger than buffer
 
     for
@@ -140,7 +140,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (largeData)
 
-  test("Write with prepend merging (out-of-order that prepends to existing write)"):
+  atest("Write with prepend merging (out-of-order that prepends to existing write)"):
     val data1 = Array[Byte](4, 5, 6)    // offset 3
     val data2 = Array[Byte](1, 2, 3)    // offset 0 (should prepend to first write)
     val expected = Array[Byte](1, 2, 3, 4, 5, 6)
@@ -154,7 +154,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (expected)
 
-  test("Write with append merging (consecutive writes that append)"):
+  atest("Write with append merging (consecutive writes that append)"):
     val data1 = Array[Byte](1, 2, 3)    // offset 0
     val data2 = Array[Byte](4, 5, 6)    // offset 3 (should append to first write)
     val expected = Array[Byte](1, 2, 3, 4, 5, 6)
@@ -168,7 +168,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (expected)
 
-  test("Multiple data buffers in single write"):
+  atest("Multiple data buffers in single write"):
     val buf1 = DataBuffer(Array[Byte](1, 2))
     val buf2 = DataBuffer(Array[Byte](3, 4))
     val buf3 = DataBuffer(Array[Byte](5, 6))
@@ -182,7 +182,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
     yield
       content should be (expected)
 
-  test("Complex interleaved writes with different buffer configurations"):
+  atest("Complex interleaved writes with different buffer configurations"):
     val writeBufferSize = 50
 
     for
@@ -206,7 +206,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
       val expected = Array[Byte](0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
       content should be (expected)
 
-  test("Flush waits for all pending writes to complete"):
+  atest("Flush waits for all pending writes to complete"):
     val data1 = Array[Byte](1, 2, 3)
     val data2 = Array[Byte](4, 5, 6)
 
@@ -222,7 +222,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
       content1 should be (data1)
       content2 should be (data2)
 
-  test("Read caching works correctly after writes"):
+  atest("Read caching works correctly after writes"):
     val data = Array[Byte](1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
 
     for
@@ -243,7 +243,7 @@ class SimpleFileHandleSuite extends FilesSystemTestSuite:
       content2 should be (Array[Byte](3, 4, 5))
       content3 should be (Array[Byte](9, 10))
 
-  test("Write invalidates read cache"):
+  atest("Write invalidates read cache"):
     val data1 = Array[Byte](1, 2, 3, 4, 5)
     val data2 = Array[Byte](10, 20, 30)
 

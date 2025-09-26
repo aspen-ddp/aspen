@@ -46,6 +46,7 @@ class SimpleReadDriver(
   override def onComplete(): Unit = synchronized {
     logger.trace(s"READ UUID $readUUID: COMPLETE. Cancelling future retransmits")
     task.foreach(_.cancel())
+    task = None
   }
 
   override def begin(): Unit = synchronized {

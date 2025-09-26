@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRequirement}
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskPool, YamlFormat, someOrThrow}
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat, someOrThrow}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.amoebafs.FileSystem
 import org.aspen_ddp.aspen.demo.network.{ZCnCBackend, ZCnCFrontend, ZMQNetwork, ZStoreTransferBackend}
@@ -658,7 +658,7 @@ object Main {
       ec,
       objectCacheFactory,
       nodeNet,
-      new BackgroundTaskPool,
+      new BackgroundTaskManager(ec),
       simpleCrl,
       txFinalizerFactory,
       SimpleTransactionDriver.factory(txRetryDelay, txRetryCap),

@@ -42,7 +42,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   def createKey(byte: Byte): Key = Key(Array(byte))
   def createValue(byte: Byte): Value = Value(Array(byte))
 
-  test("splitAt - basic split with keys on both sides") {
+  atest("splitAt - basic split with keys on both sides") {
     given tx: Transaction = client.newTransaction()
 
     val key1 = createKey(1)
@@ -101,7 +101,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - inclusive basic split with keys on both sides") {
+  atest("splitAt - inclusive basic split with keys on both sides") {
     given tx: Transaction = client.newTransaction()
 
     val key1 = createKey(1)
@@ -159,7 +159,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - all keys go to right side") {
+  atest("splitAt - all keys go to right side") {
     given tx: Transaction = client.newTransaction()
 
     val key3 = createKey(3)
@@ -204,7 +204,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - all keys go to left side") {
+  atest("splitAt - all keys go to left side") {
     given tx: Transaction = client.newTransaction()
 
     val key1 = createKey(1)
@@ -249,7 +249,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - with down pointer") {
+  atest("splitAt - with down pointer") {
     given tx: Transaction = client.newTransaction()
 
     val key2 = createKey(2)
@@ -296,7 +296,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - empty node") {
+  atest("splitAt - empty node") {
     given tx: Transaction = client.newTransaction()
 
     val contents = Map.empty[Key, Value]
@@ -327,7 +327,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - single key exactly at split point") {
+  atest("splitAt - single key exactly at split point") {
     given tx: Transaction = client.newTransaction()
 
     val key3 = createKey(3)
@@ -364,7 +364,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - node with existing tail pointer") {
+  atest("splitAt - node with existing tail pointer") {
     given tx: Transaction = client.newTransaction()
 
     val key1 = createKey(1)
@@ -416,7 +416,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - require splitAtKey > AbsoluteMinimum") {
+  atest("splitAt - require splitAtKey > AbsoluteMinimum") {
     given tx: Transaction = client.newTransaction()
 
     val contents = Map(createKey(1) -> createValue(10))
@@ -436,7 +436,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - preserves value data integrity") {
+  atest("splitAt - preserves value data integrity") {
     given tx: Transaction = client.newTransaction()
 
     val key1 = createKey(1)
@@ -477,7 +477,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     }
   }
 
-  test("splitAt - large number of keys") {
+  atest("splitAt - large number of keys") {
     given tx: Transaction = client.newTransaction()
 
     val numKeys = 20

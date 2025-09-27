@@ -50,7 +50,7 @@ class SimpleReadDriver(
   }
 
   override def begin(): Unit = synchronized {
-    task = Some(client.backgroundTasks.retryWithExponentialBackoff(tryNow=false, initialDelay=initialDelay, maxDelay=maxDelay) {
+    task = Some(client.backgroundTaskManager.retryWithExponentialBackoff(tryNow=false, initialDelay=initialDelay, maxDelay=maxDelay) {
       super.begin()
       false
     })

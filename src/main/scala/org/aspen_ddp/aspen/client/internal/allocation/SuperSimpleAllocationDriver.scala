@@ -52,7 +52,7 @@ class SuperSimpleAllocationDriver(retransmitDelay: Duration,
   given ExecutionContext = client.clientContext
 
   private var retries = 0
-  private val retryTask = client.backgroundTasks.schedulePeriodic(period=retransmitDelay) {
+  private val retryTask = client.backgroundTaskManager.schedulePeriodic(period=retransmitDelay) {
     synchronized {
       retries += 1
       if (retries % 3 == 0)

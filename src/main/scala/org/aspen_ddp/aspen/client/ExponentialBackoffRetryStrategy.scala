@@ -31,7 +31,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
       val rand = new java.util.Random
       val delay = rand.nextInt(window)
 
-      client.backgroundTasks.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
+      client.backgroundTaskManager.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)
       }
 
@@ -78,7 +78,7 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
       val rand = new java.util.Random
       val delay = rand.nextInt(window)
 
-      client.backgroundTasks.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
+      client.backgroundTaskManager.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)
       }
 

@@ -82,7 +82,7 @@ object BaseReadDriverSuite {
 
     val retryStrategy: RetryStrategy = null
 
-    def backgroundTasks: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager
+    def backgroundTaskManager: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager
 
     def clientContext: ExecutionContext = scala.concurrent.ExecutionContext.Implicits.global
 

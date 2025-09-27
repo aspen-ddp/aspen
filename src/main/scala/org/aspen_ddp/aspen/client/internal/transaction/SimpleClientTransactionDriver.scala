@@ -34,7 +34,7 @@ class SimpleClientTransactionDriver(
   private var retries = 0
   private var complete = false
 
-  private val task = client.backgroundTasks.schedulePeriodic(retransmitDelay) {
+  private val task = client.backgroundTaskManager.schedulePeriodic(retransmitDelay) {
     val send = synchronized {
       if (complete)
         false

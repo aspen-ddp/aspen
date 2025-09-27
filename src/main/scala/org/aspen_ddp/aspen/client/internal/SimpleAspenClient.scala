@@ -164,11 +164,11 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     }
 
 
-  override def shutdown(): Unit = backgroundTasks.shutdown(Duration(50, MILLISECONDS))
+  override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 
   val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
 
-  val backgroundTasks: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
+  val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
 
   def clientContext: ExecutionContext = executionContext
 

@@ -38,7 +38,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   }
 
   def execute(): Unit = synchronized {
-    markTask = Some(client.backgroundTasks.schedule(MissedUpdateFinalizationAction.errorTimeout) {
+    markTask = Some(client.backgroundTaskManager.schedule(MissedUpdateFinalizationAction.errorTimeout) {
       markMissedUpdates()
     })
   }

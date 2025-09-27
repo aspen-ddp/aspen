@@ -78,7 +78,7 @@ object TestNetwork {
     val typeRegistry: TypeRegistry = new TypeRegistry(StaticTypeRegistry.types.toMap)
 
     val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
-    val backgroundTasks: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
+    val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
 
     val rmgr = new ReadManager(this, BaseReadDriver.noErrorRecoveryReadDriver)
 
@@ -122,7 +122,7 @@ object TestNetwork {
 
     def getHost(hostName: String): Future[Option[Host]] = getHost(HostId(new UUID(0,0)))
     
-    override def shutdown(): Unit = backgroundTasks.shutdown(Duration(50, MILLISECONDS))
+    override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 
     def clientContext: ExecutionContext = executionContext//scala.concurrent.ExecutionContext.Implicits.global
 

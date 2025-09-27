@@ -92,7 +92,7 @@ trait AspenClient extends ObjectReader {
 
   def retryStrategy: RetryStrategy
 
-  def backgroundTasks: BackgroundTaskManager
+  def backgroundTaskManager: BackgroundTaskManager
 
   def clientContext: ExecutionContext
 

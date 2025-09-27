@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, Finalization
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription}
-import org.aspen_ddp.aspen.common.util.BackgroundTask.ScheduledTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}

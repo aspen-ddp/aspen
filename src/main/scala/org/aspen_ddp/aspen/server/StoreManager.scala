@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler}
@@ -48,7 +48,7 @@ class StoreManager(val rootDir: Path,
                    val ec: ExecutionContext,
                    val objectCacheFactory: () => ObjectCache,
                    val net: Messenger,
-                   val backgroundTasks: BackgroundTask,
+                   val backgroundTasks: BackgroundTaskManager,
                    crlFactory: CrashRecoveryLogFactory,
                    val finalizerFactory: TransactionFinalizer.Factory,
                    val txDriverFactory: TransactionDriver.Factory,

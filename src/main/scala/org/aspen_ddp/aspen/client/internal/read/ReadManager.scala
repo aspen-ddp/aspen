@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.{ReadResponse, TransactionCompletionQu
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
@@ -50,7 +50,7 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
     * read threshold is achieved will still make their way to the read driver and potentially result in opportunistic
     * rebuild messages.
     */
-  val pruneStaleReadsTask: BackgroundTask.ScheduledTask = client.backgroundTasks.schedulePeriodic(Duration(1, SECONDS)) {
+  val pruneStaleReadsTask: BackgroundTaskManager.ScheduledTask = client.backgroundTasks.schedulePeriodic(Duration(1, SECONDS)) {
     val completionSnap = synchronized { completionTimes }
     val now = System.nanoTime()/1000000
     val prune = completionSnap.filter( t => (now - t._2._1) > client.opportunisticRebuildManager.slowReadReplyDuration.toMillis )

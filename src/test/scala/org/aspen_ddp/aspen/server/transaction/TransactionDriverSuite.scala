@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId}
-import org.aspen_ddp.aspen.common.util.BackgroundTask.NoBackgroundTasks
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.NoBackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.transaction.TransactionFinalizer.Factory
 import org.scalatest.funsuite.AnyFunSuite
@@ -54,7 +54,7 @@ object TransactionDriverSuite {
              messenger: Messenger,
              initialPrepare: TxPrepare,
              finalizerFactory: Factory,
-             onComplete: TransactionId => Unit) extends TransactionDriver(storeId, messenger, NoBackgroundTasks, initialPrepare.txd, finalizerFactory) {
+             onComplete: TransactionId => Unit) extends TransactionDriver(storeId, messenger, NoBackgroundTaskManager, initialPrepare.txd, finalizerFactory) {
     override protected def onFinalized(committed: Boolean): Unit = {
       super.onFinalized(committed)
       onComplete(txd.transactionId)

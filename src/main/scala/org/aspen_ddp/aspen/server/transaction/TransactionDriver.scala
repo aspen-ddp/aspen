@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.paxos
 import org.aspen_ddp.aspen.common.paxos.{Learner, Proposer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionDisposition, TransactionStatus}
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.apache.logging.log4j.scala.Logging
 
@@ -20,29 +20,29 @@ object TransactionDriver {
   trait Factory {
     def failedDriverDuration: Duration = Duration(2, SECONDS)
 
-    def create( ec: ExecutionContext,
-                storeId: StoreId,
-                messenger:Messenger,
-                backgroundTasks: BackgroundTask,
-                txd: TransactionDescription,
-                finalizerFactory: TransactionFinalizer.Factory): TransactionDriver
+    def create(ec: ExecutionContext,
+               storeId: StoreId,
+               messenger:Messenger,
+               backgroundTasks: BackgroundTaskManager,
+               txd: TransactionDescription,
+               finalizerFactory: TransactionFinalizer.Factory): TransactionDriver
   }
 
   object noErrorRecoveryFactory extends Factory {
 
-    class NoRecoveryTransactionDriver( ec: ExecutionContext,
-                                       storeId: StoreId,
-                                       messenger: Messenger,
-                                       backgroundTasks: BackgroundTask,
-                                       txd: TransactionDescription,
-                                       finalizerFactory: TransactionFinalizer.Factory) extends TransactionDriver(
+    class NoRecoveryTransactionDriver(ec: ExecutionContext,
+                                      storeId: StoreId,
+                                      messenger: Messenger,
+                                      backgroundTasks: BackgroundTaskManager,
+                                      txd: TransactionDescription,
+                                      finalizerFactory: TransactionFinalizer.Factory) extends TransactionDriver(
       storeId, messenger, backgroundTasks, txd, finalizerFactory)(using ec) {
 
       given ExecutionContext = ec
 
       var hung = false
 
-      val hangCheckTask: BackgroundTask.ScheduledTask = backgroundTasks.schedule(Duration(10, SECONDS)) {
+      val hangCheckTask: BackgroundTaskManager.ScheduledTask = backgroundTasks.schedule(Duration(10, SECONDS)) {
         //val test = messenger.system.map(_.getSystemAttribute("unittest.name").getOrElse("UNKNOWN TEST"))
         //println(s"**** HUNG TRANSACTION: $test")
         println(s"**** HUNG TRANSACTION")
@@ -65,12 +65,12 @@ object TransactionDriver {
       }
     }
 
-    def create( ec: ExecutionContext,
-                storeId: StoreId,
-                messenger:Messenger,
-                backgroundTasks: BackgroundTask,
-                txd: TransactionDescription,
-                finalizerFactory: TransactionFinalizer.Factory): TransactionDriver = {
+    def create(ec: ExecutionContext,
+               storeId: StoreId,
+               messenger:Messenger,
+               backgroundTasks: BackgroundTaskManager,
+               txd: TransactionDescription,
+               finalizerFactory: TransactionFinalizer.Factory): TransactionDriver = {
       new NoRecoveryTransactionDriver(ec, storeId, messenger, backgroundTasks, txd, finalizerFactory)
     }
   }
@@ -80,7 +80,7 @@ object TransactionDriver {
 abstract class TransactionDriver(
                                   val storeId: StoreId,
                                   val messenger: Messenger,
-                                  val backgroundTasks: BackgroundTask,
+                                  val backgroundTasks: BackgroundTaskManager,
                                   val txd: TransactionDescription,
                                   private val finalizerFactory: TransactionFinalizer.Factory)(using ec: ExecutionContext) extends Logging {
   def ida: IDA = txd.primaryObject.ida

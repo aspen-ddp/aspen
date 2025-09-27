@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPoin
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.server.store.backend.BackendType
@@ -82,7 +82,7 @@ object BaseReadDriverSuite {
 
     val retryStrategy: RetryStrategy = null
 
-    def backgroundTasks: BackgroundTask = BackgroundTask.NoBackgroundTasks
+    def backgroundTasks: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager
 
     def clientContext: ExecutionContext = scala.concurrent.ExecutionContext.Implicits.global
 

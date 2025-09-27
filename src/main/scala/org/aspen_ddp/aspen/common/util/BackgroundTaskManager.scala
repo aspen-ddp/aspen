@@ -1,22 +1,20 @@
 package org.aspen_ddp.aspen.common.util
 
 import java.util.concurrent.{Executors, ScheduledFuture, ThreadLocalRandom, TimeUnit}
-import org.aspen_ddp.aspen.common.util.BackgroundTask.ScheduledTask
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
-object BackgroundTaskManager:
-
-  // Not much we can do if the scheduler has been shut down. Most likely the client
-  // has been shut down and background finalization tasks are continuing to retry.
-  // This object will be returned by the schedule* methods which should allow for
-  // a clean shutdown
-  object ShutdownTask extends ScheduledTask:
-    def cancel(): Unit = ()
-
-
-class BackgroundTaskManager(val executionContext: ExecutionContext) extends BackgroundTask {
+/**
+ * Spawns a background thread to use for scheduling the execution of the call by name
+ * code blocks passed to the various scheduling methods. The ExecutionContext passed to
+ * the constructor will be used for executing all of the scheduled functions. The
+ * background thread is used purely for scheduling purposes.
+ * 
+ * Note that "Future.unit.map(_ => fn)" in the class implementation is used to pass the
+ * call by name parameter to the given ExecutionContext.
+ */
+class BackgroundTaskManager(protected val executionContext: ExecutionContext) {
   import BackgroundTaskManager.*
 
   private  val sched = Executors.newScheduledThreadPool(1)
@@ -101,3 +99,31 @@ class BackgroundTaskManager(val executionContext: ExecutionContext) extends Back
     }
   }
 }
+
+object BackgroundTaskManager:
+
+  trait ScheduledTask:
+    def cancel(): Unit
+
+  // Not much we can do if the scheduler has been shut down. Most likely the client
+  // has been shut down and background finalization tasks are continuing to retry.
+  // This object will be returned by the schedule* methods which should allow for
+  // a clean shutdown
+  object ShutdownTask extends ScheduledTask:
+    def cancel(): Unit = ()
+
+  // We'll ust the global execution context as the argument to the base class since
+  // we have to provide something. It'll never be used though due to the overridden
+  // methods doing nothing
+  object NoBackgroundTaskManager extends BackgroundTaskManager(scala.concurrent.ExecutionContext.Implicits.global):
+
+    override def shutdown(gracefulShutdownDelay: Duration): Boolean = true
+
+    override def schedule(delay: Duration)(fn: => Unit): ScheduledTask = ShutdownTask
+
+    override def scheduleRandomlyWithinWindow(window: Duration)(fn: => Unit): ScheduledTask = ShutdownTask
+
+    override def schedulePeriodic(period: Duration, callNow: Boolean)(fn: => Unit): ScheduledTask = ShutdownTask
+
+    override def retryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)(fn: => Boolean): ScheduledTask = ShutdownTask
+  

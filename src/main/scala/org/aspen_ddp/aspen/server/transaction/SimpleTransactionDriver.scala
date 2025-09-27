@@ -4,7 +4,7 @@ import java.util.concurrent.ThreadLocalRandom
 import org.aspen_ddp.aspen.common.network.{TxPrepare, TxResolved}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.apache.logging.log4j.scala.Logger
 
@@ -15,12 +15,12 @@ object SimpleTransactionDriver {
 
   def factory(initialDelay: Duration, maxDelay: Duration): TransactionDriver.Factory =
     new TransactionDriver.Factory:
-      def create( executionContext: ExecutionContext,
-                  storeId: StoreId,
-                  messenger: Messenger,
-                  backgroundTasks: BackgroundTask,
-                  txd: TransactionDescription,
-                  finalizerFactory: TransactionFinalizer.Factory): TransactionDriver =
+      def create(executionContext: ExecutionContext,
+                 storeId: StoreId,
+                 messenger: Messenger,
+                 backgroundTasks: BackgroundTaskManager,
+                 txd: TransactionDescription,
+                 finalizerFactory: TransactionFinalizer.Factory): TransactionDriver =
         new SimpleTransactionDriver(executionContext, initialDelay, maxDelay, storeId, messenger, backgroundTasks, txd, finalizerFactory)
 }
 
@@ -32,7 +32,7 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
                               val maxDelay: Duration,
                               storeId: StoreId,
                               messenger: Messenger,
-                              backgroundTasks: BackgroundTask,
+                              backgroundTasks: BackgroundTaskManager,
                               txd: TransactionDescription,
                               finalizerFactory: TransactionFinalizer.Factory) extends TransactionDriver(
   storeId, messenger, backgroundTasks, txd, finalizerFactory)(using executionContext) {

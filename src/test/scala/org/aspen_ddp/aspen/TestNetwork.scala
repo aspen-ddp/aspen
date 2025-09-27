@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
-import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskManager, printStack}
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreManager, transaction}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
@@ -78,7 +78,7 @@ object TestNetwork {
     val typeRegistry: TypeRegistry = new TypeRegistry(StaticTypeRegistry.types.toMap)
 
     val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
-    val backgroundTasks: BackgroundTask = new BackgroundTaskManager(executionContext)
+    val backgroundTasks: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
 
     val rmgr = new ReadManager(this, BaseReadDriver.noErrorRecoveryReadDriver)
 
@@ -191,7 +191,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
 
   val smgr = new StoreManager(Path.of("/"),
     executionContext,
-    objectCacheFactory, this, BackgroundTask.NoBackgroundTasks,
+    objectCacheFactory, this, BackgroundTaskManager.NoBackgroundTaskManager,
     TestCRL, FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
     storeLoader,
     Duration(5, SECONDS))

@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPoin
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.server.store.backend.BackendType
 
@@ -92,7 +92,7 @@ trait AspenClient extends ObjectReader {
 
   def retryStrategy: RetryStrategy
 
-  def backgroundTasks: BackgroundTask
+  def backgroundTasks: BackgroundTaskManager
 
   def clientContext: ExecutionContext
 

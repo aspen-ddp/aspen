@@ -7,7 +7,6 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.util.{BackgroundTask, BackgroundTaskManager}
 import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}

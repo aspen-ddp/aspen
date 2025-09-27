@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.BackendStoreLoader
@@ -13,9 +13,9 @@ import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.Duration
 
 class SingleThreadedStoreManager(rootDir: Path,
-                                 ec: ExecutionContext,objectCacheFactory: () => ObjectCache,
+                                 ec: ExecutionContext, objectCacheFactory: () => ObjectCache,
                                  net: Messenger,
-                                 backgroundTasks: BackgroundTask,
+                                 backgroundTasks: BackgroundTaskManager,
                                  crlFactory: CrashRecoveryLogFactory,
                                  finalizerFactory: TransactionFinalizer.Factory,
                                  txDriverFactory: TransactionDriver.Factory,

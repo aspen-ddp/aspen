@@ -4,7 +4,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.Duration
@@ -41,7 +41,7 @@ class SimpleReadDriver(
 
   given ec: ExecutionContext = client.clientContext
 
-  private var task: Option[BackgroundTask.ScheduledTask] = None
+  private var task: Option[BackgroundTaskManager.ScheduledTask] = None
 
   override def onComplete(): Unit = synchronized {
     logger.trace(s"READ UUID $readUUID: COMPLETE. Cancelling future retransmits")

@@ -4,7 +4,7 @@ import com.github.blemale.scaffeine.Scaffeine
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId, TransactionStatus}
-import org.aspen_ddp.aspen.common.util.BackgroundTask
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -20,7 +20,7 @@ class Store(val executionContext: ExecutionContext,
             val backend: Backend,
             val objectCache: ObjectCache,
             val net: Messenger,
-            val backgroundTasks: BackgroundTask,
+            val backgroundTasks: BackgroundTaskManager,
             val crl: CrashRecoveryLog,
             val txStatusCache: TransactionStatusCache,
             val finalizerFactory: TransactionFinalizer.Factory,

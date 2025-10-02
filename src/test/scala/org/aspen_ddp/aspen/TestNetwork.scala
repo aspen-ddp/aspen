@@ -22,7 +22,7 @@ import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreM
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.{BackendStoreLoader, Bootstrap}
-import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendType, MapBackend}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
@@ -114,7 +114,7 @@ object TestNetwork {
     override def newStoragePool(newPoolName: String,
                        hostCncFrontends: List[CnCFrontend],
                        ida: IDA,
-                       backendType: BackendType): Future[StoragePool] = ???
+                       backendType: BackendConfig): Future[StoragePool] = ???
 
     protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
 

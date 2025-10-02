@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, Transacti
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
-import org.aspen_ddp.aspen.server.store.backend.BackendType
+import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.common.ida.IDA
 
@@ -72,7 +72,7 @@ object BaseReadDriverSuite {
     override def newStoragePool(newPoolName: String,
                        hostCncFrontends: List[CnCFrontend],
                        ida: IDA,
-                       backendType: BackendType): Future[StoragePool] = ???
+                       backendType: BackendConfig): Future[StoragePool] = ???
 
     protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
 

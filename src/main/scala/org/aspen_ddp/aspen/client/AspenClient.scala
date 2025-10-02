@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
-import org.aspen_ddp.aspen.server.store.backend.BackendType
+import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -43,7 +43,7 @@ trait AspenClient extends ObjectReader {
   def newStoragePool(newPoolName: String,
                      hostCncFrontends: List[CnCFrontend],
                      ida: IDA,
-                     backendType: BackendType): Future[StoragePool] =
+                     backendType: BackendConfig): Future[StoragePool] =
 
     given ExecutionContext = this.clientContext
 

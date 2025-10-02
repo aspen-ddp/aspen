@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.server.cnc
 import org.aspen_ddp.aspen.server.cnc.{NewStore, ShutdownStore, TransferStore}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, TransactionRecoveryState}
-import org.aspen_ddp.aspen.server.store.backend.{BackendType, RocksDBType}
+import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, RocksDBConfig}
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.jdk.CollectionConverters.*
@@ -1114,11 +1114,11 @@ object Codec extends Logging:
 
   // CnC Messages -----------------------------------------------------------------
 
-  def encodeBackendType(o: BackendType): codec.BackendType = o match
-    case RocksDBType() => codec.BackendType.BACKEND_TYPE_ROCKS_DB
+  def encodeBackendType(o: BackendConfig): codec.BackendType = o match
+    case RocksDBConfig() => codec.BackendType.BACKEND_TYPE_ROCKS_DB
 
-  def decodeBackendType(m: codec.BackendType): BackendType = m match
-    case codec.BackendType.BACKEND_TYPE_ROCKS_DB => RocksDBType()
+  def decodeBackendType(m: codec.BackendType): BackendConfig = m match
+    case codec.BackendType.BACKEND_TYPE_ROCKS_DB => RocksDBConfig()
     case f => throw new EncodingError(f"Invalid Backend Type: $f")
 
 

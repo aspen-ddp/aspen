@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.util.someOrThrow
 import org.aspen_ddp.aspen.demo.StoreConfig
 import org.aspen_ddp.aspen.server.StoreManager
 import org.aspen_ddp.aspen.server.cnc.*
-import org.aspen_ddp.aspen.server.store.backend.{RocksDBBackend, RocksDBType}
+import org.aspen_ddp.aspen.server.store.backend.{RocksDBBackend, RocksDBConfig}
 import org.apache.logging.log4j.scala.Logging
 import org.zeromq.SocketType
 
@@ -85,7 +85,7 @@ class ZCnCBackend(val network: ZMQNetwork,
 
   def onNewStore(msg: NewStore): Unit =
     val backend = msg.backendType match
-      case b: RocksDBType =>
+      case b: RocksDBConfig =>
         val dir = storesDir.resolve(s"${msg.storeId.poolId.uuid}:${msg.storeId.poolIndex}")
         Files.createDirectories(dir)
         Files.writeString(dir.resolve("store_config.yaml"),

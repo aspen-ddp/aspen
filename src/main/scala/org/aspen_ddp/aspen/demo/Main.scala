@@ -27,7 +27,7 @@ import org.aspen_ddp.aspen.server.cnc.TransferStore
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, SimpleDriverRecoveryMixin, StoreManager}
 import org.aspen_ddp.aspen.server.store.Bootstrap
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBType}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
 import org.dcache.nfs.ExportFile
@@ -870,7 +870,7 @@ object Main {
     for
       hlist <- Future.sequence(hosts.map(getHost))
       frontends = hlist.map(host => new ZCnCFrontend(network, host))
-      sp <- client.newStoragePool(newPoolName, frontends, ida, RocksDBType())
+      sp <- client.newStoragePool(newPoolName, frontends, ida, RocksDBConfig())
     yield
       println("******************************************")
       println(f"* New Pool Created: ${sp.poolId}")

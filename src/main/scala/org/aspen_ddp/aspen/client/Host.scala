@@ -17,6 +17,13 @@ case class Host(hostId: HostId,
                 address: String,
                 dataPort: Int,
                 cncPort: Int,
-                storeTransferPort: Int):
+                storeTransferPort: Int,
+                storageDevices: Set[StorageDeviceId]):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
+  
+  def addStorageDevice(deviceId: StorageDeviceId): Host =
+    this.copy(storageDevices = storageDevices + deviceId)
+
+  def removeStorageDevice(deviceId: StorageDeviceId): Host =
+    this.copy(storageDevices = storageDevices + deviceId)

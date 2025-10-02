@@ -491,6 +491,7 @@ message Host {
   uint32 dataPort = 4;
   uint32 cncPort = 5;
   uint32 storeTransferPort = 6;
+  repeated StorageDeviceId storageDevices = 7;
 }
 
 //---------------------------------------------------------------------------
@@ -554,12 +555,12 @@ enum StorageDeviceStoreStatus {
 }
 
 message StorageDeviceStoreEntry {
-  StoreId store_id = 1;
-  StorageDeviceStoreStatus status = 2;
-  StorageDeviceId transfer_device = 3; // Optional field
+  StorageDeviceStoreStatus status = 1;
+  StorageDeviceId transfer_device = 2; // Optional field
 }
 
 message StorageDevice {
   StorageDeviceId storage_device_id = 1;
-  repeated StorageDeviceStoreEntry stores = 2;
+  UUID host_id = 2; // Optional field
+  map<string, StorageDeviceStoreEntry> stores = 3; // Key is serialized StoreId
 }

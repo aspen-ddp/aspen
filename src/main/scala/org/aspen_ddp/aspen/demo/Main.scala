@@ -310,7 +310,7 @@ object Main {
                          onnet: Option[(NetworkBridge, ZMQNetwork)]=None): (AspenClient, ZMQNetwork, KeyValueObjectPointer) = {
 
     val hosts = cfg.nodes.zipWithIndex.map { (node, index) =>
-      HostId(new UUID(0, index)) -> Host(HostId(new UUID(0, index)), node.name, node.host, node.dataPort, node.cncPort, node.storeTransferPort)
+      HostId(new UUID(0, index)) -> Host(HostId(new UUID(0, index)), node.name, node.host, node.dataPort, node.cncPort, node.storeTransferPort, Set.empty)
     }.toMap
 
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(cfg, None, None))

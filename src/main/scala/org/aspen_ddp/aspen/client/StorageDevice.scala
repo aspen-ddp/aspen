@@ -15,12 +15,23 @@ object StorageDevice:
   enum StoreStatus:
     case Initializing, Active, TransferringIn, TransferringOut, Rebuilding
 
-  case class StoreEntry(storeId: StoreId,
-                        status: StoreStatus,
+  case class StoreEntry(status: StoreStatus,
                         transferDevice: Option[StorageDeviceId])
 
 
-class StorageDevice(val storageDeviceId: StorageDeviceId, 
-                    val stores: Set[StorageDevice.StoreEntry]):
+case class StorageDevice(storageDeviceId: StorageDeviceId,
+                         ohostId: Option[HostId],
+                         stores: Map[StoreId, StorageDevice.StoreEntry]):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
+  
+  def setHost(ohostId: Option[HostId]): StorageDevice =
+    this.copy(ohostId=ohostId)
+
+  def setStoreEntry(storeId: StoreId, 
+                    status: StorageDevice.StoreStatus,
+                    transferDevice: Option[StorageDeviceId]): StorageDevice =
+    this.copy(stores=stores + (storeId -> StorageDevice.StoreEntry(status, transferDevice)))
+
+  def removeStore(storeId: StoreId): StorageDevice =
+    this.copy(stores=stores - storeId)

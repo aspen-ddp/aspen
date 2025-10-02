@@ -1100,6 +1100,10 @@ object Codec extends Logging:
     builder.setCncPort(o.cncPort)
     builder.setStoreTransferPort(o.storeTransferPort)
 
+    o.storageDevices.foreach { deviceId =>
+      builder.addStorageDevices(encode(deviceId))
+    }
+
     builder.build
 
   def decode(m: codec.Host): Host =
@@ -1109,8 +1113,9 @@ object Codec extends Logging:
     val dataPort = m.getDataPort
     val cncPort = m.getCncPort
     val storeTransferPort = m.getStoreTransferPort
+    val storageDevices = m.getStorageDevicesList.asScala.map(decode).toSet
 
-    Host(hostId, name, address, dataPort, cncPort, storeTransferPort)
+    Host(hostId, name, address, dataPort, cncPort, storeTransferPort, storageDevices)
 
   // CnC Messages -----------------------------------------------------------------
 
@@ -1204,7 +1209,6 @@ object Codec extends Logging:
 
   def encode(o: StorageDevice.StoreEntry): codec.StorageDeviceStoreEntry =
     val builder = codec.StorageDeviceStoreEntry.newBuilder()
-      .setStoreId(encode(o.storeId))
       .setStatus(encodeStorageDeviceStoreStatus(o.status))
 
     o.transferDevice.foreach: device =>
@@ -1213,29 +1217,44 @@ object Codec extends Logging:
     builder.build
 
   def decode(m: codec.StorageDeviceStoreEntry): StorageDevice.StoreEntry =
-    val storeId = decode(m.getStoreId)
     val status = decodeStorageDeviceStoreStatus(m.getStatus)
     val transferDevice = if m.hasTransferDevice then
       Some(decode(m.getTransferDevice))
     else
       None
 
-    StorageDevice.StoreEntry(storeId, status, transferDevice)
+    StorageDevice.StoreEntry(status, transferDevice)
 
 
   def encode(o: StorageDevice): codec.StorageDevice =
     val builder = codec.StorageDevice.newBuilder()
       .setStorageDeviceId(encode(o.storageDeviceId))
 
-    o.stores.foreach: storeEntry =>
-      builder.addStores(encode(storeEntry))
+    o.ohostId.foreach: hostId =>
+      builder.setHostId(encodeUUID(hostId.uuid))
+
+    o.stores.foreach: (storeId, storeEntry) =>
+      // Serialize StoreId as string key
+      val storeIdKey = s"${storeId.poolId.uuid}:${storeId.poolIndex}"
+      builder.putStores(storeIdKey, encode(storeEntry))
 
     builder.build
 
   def decode(m: codec.StorageDevice): StorageDevice =
     val storageDeviceId = decode(m.getStorageDeviceId)
-    val stores = m.getStoresList.asScala.map(decode).toSet
+    val ohostId = if m.hasHostId then
+      Some(HostId(decodeUUID(m.getHostId)))
+    else
+      None
+    val stores = m.getStoresMap.asScala.map: (key, entry) =>
+      // Deserialize StoreId from string key
+      val parts = key.split(":")
+      val poolUuid = java.util.UUID.fromString(parts(0))
+      val poolIndex = parts(1).toByte
+      val storeId = StoreId(PoolId(poolUuid), poolIndex)
+      storeId -> decode(entry)
+    .toMap
 
-    new StorageDevice(storageDeviceId, stores)
+    new StorageDevice(storageDeviceId, ohostId, stores)
 
 

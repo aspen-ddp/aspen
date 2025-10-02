@@ -30,6 +30,7 @@ Host walks all StorageDevices
 When transfer ends successfully
   * Remove 'transferring-out' marker file
   * os.rename from <device-root>/transferring-in/<storeId> to <device-root>/<storeId>
+  * Load store
   * trigger storge device state check process mentioned above
      (Process will see that the store is loaded and will update the state)
 

@@ -1,3 +1,61 @@
+
+Add StorageDeviceState
+  - contains host uuid
+  - contains StoreIds and current state
+    - Initializing, TransferringIn, TransferringOut, or Active
+
+Add HostState
+  - Contains network endpoint config
+  - Contains list of StorageDevice UUIDs
+
+Host walks all StorageDevices
+  1. Load all stores on all devices
+    * Ignore stores that have the 'transferring-out' marker file
+  2. For each storage device
+    storageDeviceStateCheck():
+    * Lookup storage device state
+      * If state.host-id != current host-id
+         In single Tx:
+            Update StorageState object to point to new host
+            Update the PoolConfig for each store to point to new host
+      * For each store
+         - If Initializing, crete store and update storage device state to Active
+         - If TransferringIn,
+            - Check to see if store is already loaded.
+              - In Tx
+                update state to Active
+                update PoolConfig to reflect new host and device
+            - Else, if not already transferring, start
+
+When transfer ends successfully
+  * Remove 'transferring-out' marker file
+  * os.rename from <device-root>/transferring-in/<storeId> to <device-root>/<storeId>
+  * trigger storge device state check process mentioned above
+     (Process will see that the store is loaded and will update the state)
+
+To begin transfer:
+  * Verify source and host devices are different (would be a mess otherwise)
+  * In Tx
+    update source drive state to set TransferringOut
+    update target drive state to TransferringIn
+  * Use CnC to ask destination host to trigger a deviceStateCheck
+
+On CnC transfer out request:
+  * If active, take store offline
+  * generate crl log
+  * create 'transferring-out' marker file
+
+To create new pool:
+  1. Identify all the newStoreId, StorageDevice pairings
+    - Collect into StorageDevice, List[newStoreIds]
+  2. in single Tx
+    * Create PoolConfig object
+    * insert into TKVL
+    * Update each StorageDeviceState to include new storeIds in Initializing state
+  3. For each StorageDevice touched, use CnC to trigger a deviceStateCheck
+
+-----------------------------------------------------------
+
 TODO:
   * Globally replace Future.successful(()) with Future.unit
 

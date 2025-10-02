@@ -536,3 +536,30 @@ message CnCReply {
     CnCOk ok = 1;
   }
 }
+
+//---------------------------------------------------------------------------
+//- Storage Device Messages
+//---------------------------------------------------------------------------
+
+message StorageDeviceId {
+  UUID device_uuid = 1;
+}
+
+enum StorageDeviceStoreStatus {
+  STORAGE_DEVICE_STORE_STATUS_INITIALIZING = 0;
+  STORAGE_DEVICE_STORE_STATUS_ACTIVE = 1;
+  STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN = 2;
+  STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT = 3;
+  STORAGE_DEVICE_STORE_STATUS_REBUILDING = 4;
+}
+
+message StorageDeviceStoreEntry {
+  StoreId store_id = 1;
+  StorageDeviceStoreStatus status = 2;
+  StorageDeviceId transfer_device = 3; // Optional field
+}
+
+message StorageDevice {
+  StorageDeviceId storage_device_id = 1;
+  repeated StorageDeviceStoreEntry stores = 2;
+}

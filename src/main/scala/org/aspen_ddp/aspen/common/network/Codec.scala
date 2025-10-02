@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.network
 
 import com.google.protobuf.ByteString
-import org.aspen_ddp.aspen.client.{Host, HostId, StoragePool}
+import org.aspen_ddp.aspen.client.{Host, HostId, StorageDevice, StorageDeviceId, StoragePool}
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.codec.ObjectReadError
@@ -1175,5 +1175,67 @@ object Codec extends Logging:
   def decode(m: codec.CnCError): cnc.Error =
     cnc.Error(m.getMessage)
 
+  // Storage Device Messages -----------------------------------------------------------------
 
-  
+  def encode(o: StorageDeviceId): codec.StorageDeviceId =
+    codec.StorageDeviceId.newBuilder()
+      .setDeviceUuid(encodeUUID(o.uuid))
+      .build
+
+  def decode(m: codec.StorageDeviceId): StorageDeviceId =
+    StorageDeviceId(decodeUUID(m.getDeviceUuid))
+
+
+  def encodeStorageDeviceStoreStatus(o: StorageDevice.StoreStatus): codec.StorageDeviceStoreStatus = o match
+    case StorageDevice.StoreStatus.Initializing => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING
+    case StorageDevice.StoreStatus.Active => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE
+    case StorageDevice.StoreStatus.TransferringIn => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN
+    case StorageDevice.StoreStatus.TransferringOut => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT
+    case StorageDevice.StoreStatus.Rebuilding => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING
+
+  def decodeStorageDeviceStoreStatus(m: codec.StorageDeviceStoreStatus): StorageDevice.StoreStatus = m match
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING => StorageDevice.StoreStatus.Initializing
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE => StorageDevice.StoreStatus.Active
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN => StorageDevice.StoreStatus.TransferringIn
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT => StorageDevice.StoreStatus.TransferringOut
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING => StorageDevice.StoreStatus.Rebuilding
+    case f => throw new EncodingError(f"Invalid StorageDeviceStoreStatus: $f")
+
+
+  def encode(o: StorageDevice.StoreEntry): codec.StorageDeviceStoreEntry =
+    val builder = codec.StorageDeviceStoreEntry.newBuilder()
+      .setStoreId(encode(o.storeId))
+      .setStatus(encodeStorageDeviceStoreStatus(o.status))
+
+    o.transferDevice.foreach: device =>
+      builder.setTransferDevice(encode(device))
+
+    builder.build
+
+  def decode(m: codec.StorageDeviceStoreEntry): StorageDevice.StoreEntry =
+    val storeId = decode(m.getStoreId)
+    val status = decodeStorageDeviceStoreStatus(m.getStatus)
+    val transferDevice = if m.hasTransferDevice then
+      Some(decode(m.getTransferDevice))
+    else
+      None
+
+    StorageDevice.StoreEntry(storeId, status, transferDevice)
+
+
+  def encode(o: StorageDevice): codec.StorageDevice =
+    val builder = codec.StorageDevice.newBuilder()
+      .setStorageDeviceId(encode(o.storageDeviceId))
+
+    o.stores.foreach: storeEntry =>
+      builder.addStores(encode(storeEntry))
+
+    builder.build
+
+  def decode(m: codec.StorageDevice): StorageDevice =
+    val storageDeviceId = decode(m.getStorageDeviceId)
+    val stores = m.getStoresList.asScala.map(decode).toSet
+
+    new StorageDevice(storageDeviceId, stores)
+
+

@@ -498,13 +498,13 @@ message Host {
 //- CnC Messages
 //---------------------------------------------------------------------------
 
-enum BackendType {
-  BACKEND_TYPE_ROCKS_DB = 0;
+enum BackendConfig {
+  BACKEND_CONFIG_ROCKS_DB = 0;
 }
 
 message NewStore {
   StoreId storeId = 1;
-  BackendType backendType = 2;
+  BackendConfig backendConfig = 2;
 }
 
 message ShutdownStore {

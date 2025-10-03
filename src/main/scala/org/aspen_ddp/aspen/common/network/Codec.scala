@@ -1119,25 +1119,25 @@ object Codec extends Logging:
 
   // CnC Messages -----------------------------------------------------------------
 
-  def encodeBackendType(o: BackendConfig): codec.BackendType = o match
-    case RocksDBConfig() => codec.BackendType.BACKEND_TYPE_ROCKS_DB
+  def encodeBackendConfig(o: BackendConfig): codec.BackendConfig = o match
+    case RocksDBConfig() => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
 
-  def decodeBackendType(m: codec.BackendType): BackendConfig = m match
-    case codec.BackendType.BACKEND_TYPE_ROCKS_DB => RocksDBConfig()
-    case f => throw new EncodingError(f"Invalid Backend Type: $f")
+  def decodeBackendConfig(m: codec.BackendConfig): BackendConfig = m match
+    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig()
+    case f => throw new EncodingError(f"Invalid Backend Config: $f")
 
 
   def encode(o: NewStore): codec.NewStore =
     val builder = codec.NewStore.newBuilder()
 
     builder.setStoreId(encode(o.storeId))
-    builder.setBackendType(encodeBackendType(o.backendType))
+    builder.setBackendConfig(encodeBackendConfig(o.backendType))
 
     builder.build
 
   def decode(m: codec.NewStore): NewStore =
     val storeId = decode(m.getStoreId)
-    val backendType = decodeBackendType(m.getBackendType)
+    val backendType = decodeBackendConfig(m.getBackendConfig)
 
     NewStore(storeId, backendType)
 

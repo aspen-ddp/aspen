@@ -559,8 +559,13 @@ message StorageDeviceStoreEntry {
   StorageDeviceId transfer_device = 2; // Optional field
 }
 
+message StorageDeviceStoreKeyValue {
+  bytes store_id = 1; // Serialized StoreId
+  StorageDeviceStoreEntry entry = 2;
+}
+
 message StorageDevice {
   StorageDeviceId storage_device_id = 1;
   UUID host_id = 2; // Optional field
-  map<string, StorageDeviceStoreEntry> stores = 3; // Key is serialized StoreId
+  repeated StorageDeviceStoreKeyValue stores = 3;
 }

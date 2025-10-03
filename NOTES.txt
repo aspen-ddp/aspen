@@ -1,3 +1,5 @@
+ServerMessenger
+  - getCnCFrontend(hostId: HostId): Future[CnCFrontend]
 
 Add StorageDeviceState
   - contains host uuid

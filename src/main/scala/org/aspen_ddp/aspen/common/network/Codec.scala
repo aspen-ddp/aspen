@@ -1234,9 +1234,11 @@ object Codec extends Logging:
       builder.setHostId(encodeUUID(hostId.uuid))
 
     o.stores.foreach: (storeId, storeEntry) =>
-      // Serialize StoreId as string key
-      val storeIdKey = s"${storeId.poolId.uuid}:${storeId.poolIndex}"
-      builder.putStores(storeIdKey, encode(storeEntry))
+      val keyValue = codec.StorageDeviceStoreKeyValue.newBuilder()
+        .setStoreId(ByteString.copyFrom(storeId.toBytes))
+        .setEntry(encode(storeEntry))
+        .build()
+      builder.addStores(keyValue)
 
     builder.build
 
@@ -1246,13 +1248,10 @@ object Codec extends Logging:
       Some(HostId(decodeUUID(m.getHostId)))
     else
       None
-    val stores = m.getStoresMap.asScala.map: (key, entry) =>
-      // Deserialize StoreId from string key
-      val parts = key.split(":")
-      val poolUuid = java.util.UUID.fromString(parts(0))
-      val poolIndex = parts(1).toByte
-      val storeId = StoreId(PoolId(poolUuid), poolIndex)
-      storeId -> decode(entry)
+    val stores = m.getStoresList.asScala.map: keyValue =>
+      val storeId = StoreId(keyValue.getStoreId.toByteArray)
+      val entry = decode(keyValue.getEntry)
+      storeId -> entry
     .toMap
 
     new StorageDevice(storageDeviceId, ohostId, stores)

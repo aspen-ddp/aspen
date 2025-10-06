@@ -4,8 +4,7 @@ import org.aspen_ddp.aspen.client.{Host, HostId}
 
 import java.io.{File, FileInputStream}
 import java.util.UUID
-import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
-import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.yaml.snakeyaml.Yaml
@@ -15,8 +14,9 @@ import org.yaml.snakeyaml.constructor.SafeConstructor
 aspen-system-id:  BF1049AD-D2A8-4D17-8080-E01A4678C8B3
 bootstrap-ida:
   type: replication
-  width: 3
+  read-threshold: 2
   write-threshold: 2
+  width: 3
 bootstrap-hosts:
   - host-id: AA1049AD-D2A8-4D17-8080-E01A4678C8B3
     name: node_a
@@ -33,15 +33,27 @@ bootstrap-hosts:
 object BootstrapConfig:
 
   object ReplicationFormat extends YObject[IDA]:
-    val width: Required[Int]          = Required("width",            YInt)
-    val writeThreshold: Required[Int] = Required("write-threshold",  YInt)
+    val readThreshold: Optional[Int]  = Optional("read-threshold", YInt)
+    val writeThreshold: Required[Int] = Required("write-threshold", YInt)
+    val width: Required[Int]          = Required("width", YInt)
 
-    val attrs: List[Attr] = width :: writeThreshold :: Nil
+    val attrs: List[Attr] = readThreshold :: writeThreshold :: width :: Nil
 
     def create(o: Object): IDA = Replication(width.get(o), writeThreshold.get(o))
 
-  val IDAOptions =  Map("replication" -> ReplicationFormat)
+  object ReedSolomonFormat extends YObject[IDA]:
+    val readThreshold: Required[Int]  = Required("read-threshold", YInt)
+    val writeThreshold: Required[Int] = Required("write-threshold", YInt)
+    val width: Required[Int]          = Required("width", YInt)
 
+    val attrs: List[Attr] = readThreshold :: writeThreshold :: width :: Nil
+
+    def create(o: Object): IDA = ReedSolomon(width.get(o), readThreshold.get(o), writeThreshold.get(o))
+
+  val IDAOptions =  Map(
+    "replication" -> ReplicationFormat,
+    "reed-solomon" -> ReedSolomonFormat
+  )
 
   case class BootstrapIDA(ida: IDA, maxObjectSize: Option[Int])
 
@@ -52,7 +64,6 @@ object BootstrapConfig:
     val attrs: List[Attr] = ida :: maxObjectSize :: Nil
 
     def create(o: Object): BootstrapIDA = BootstrapIDA(ida.get(o), maxObjectSize.get(o))
-
 
   case class BootstrapHost(hostId: HostId,
                            name: String,
@@ -82,7 +93,6 @@ object BootstrapConfig:
       storeTransferPort.get(o),
       stores.get(o)
     )
-
 
   case class Config(aspenSystemId: UUID, bootstrapIDA: IDA, hosts: List[BootstrapHost]):
     // Validate config
@@ -119,8 +129,12 @@ object BootstrapConfig:
     sb.append(s"aspen-system-id: $aspenSystemId\n")
     sb.append(s"bootstrap-ida:\n")
     sb.append(s"  type: ${ida.name}\n")
-    sb.append(s"  width: ${ida.width}\n")
+    ida match
+      case _:Replication =>
+      case _:ReedSolomon =>
+        sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
     sb.append(s"  write-threshold: ${ida.writeThreshold}\n")
+    sb.append(s"  width: ${ida.width}\n")
     sb.append("bootstrap-hosts:")
     hosts.foreach: host =>
       val storesOnHost = storeMap.filter(t => t._2 == host.hostId).map(t => t._1)

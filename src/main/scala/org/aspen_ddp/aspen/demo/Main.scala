@@ -141,14 +141,14 @@ object Main {
                 failure("IDA type must be Replication or Reed-Solomon")
             },
 
-          arg[Int]("<width>").text("Number of hosts holding slices/replicas").
-            action((x, c) => c.copy(width = x)),
-
           arg[Int]("<read-threshold>").text("Minimum number of slices/replicas that must be read to reconstruct an object").
             action((x, c) => c.copy(readThreshold = x)),
 
           arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
             action((x, c) => c.copy(writeThreshold = x)),
+
+          arg[Int]("<width>").text("Number of hosts holding slices/replicas").
+            action((x, c) => c.copy(width = x)),
         )
 
       cmd("debug").text("Runs debugging code").
@@ -169,7 +169,7 @@ object Main {
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
             validate( x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x")),
-          
+
           arg[File]("<host-directory>").text("Host Directory").
             action( (x, c) => c.copy(hostDirectory=x)).
             validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
@@ -288,7 +288,7 @@ object Main {
         def bootstrapConfig: BootstrapConfig.Config =
           println(s"Loading BootstrapConfig ${cfg.bootstrapConfigFile}")
           BootstrapConfig.loadBootstrapConfig(cfg.bootstrapConfigFile)
-          
+
         try
           //println(s"Config file: $config")
           cfg.mode match
@@ -331,7 +331,7 @@ object Main {
 
   def createAmoebaClient(cfg: BootstrapConfig.Config,
                          onnet: Option[(NetworkBridge, ZMQNetwork)]=None): (AspenClient, ZMQNetwork, KeyValueObjectPointer) = {
-    
+
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(cfg, None, None))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
@@ -642,10 +642,10 @@ object Main {
     given ExecutionContext = ec
 
     val cfgFile = hostDir.resolve("aspen-host-config.yaml")
-    
+
     if ! Files.exists(cfgFile) then
       throw Exception(s"Host config file not found: $cfgFile")
-    
+
     val hostCfg = HostConfig.loadHostConfig(cfgFile.toFile)
     setLog4jConfigFile(hostCfg.log4jConfigFile)
 
@@ -732,23 +732,23 @@ object Main {
                 storeTransferPort: Int): Unit = {
 
     val hostDirectory = baseDirectory.resolve("bootstrap-host")
-    
+
     if Files.exists(hostDirectory) then
       throw new Exception(s"Bootstrap host directory exists: $hostDirectory")
-      
+
     val sched = Executors.newScheduledThreadPool(1)
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
-    
+
     val storageDevicesDir = hostDirectory.resolve("storage-devices")
     val bootstrapDevDir = storageDevicesDir.resolve("bootstrap-device")
-    
+
     Files.createDirectories(hostDirectory)
     Files.createDirectories(storageDevicesDir)
     Files.createDirectories(bootstrapDevDir)
 
     val aspenSystemId = UUID.randomUUID()
-    
+
     val hostConfig = HostConfig(
       HostId(UUID.randomUUID()),
       aspenSystemId,
@@ -760,20 +760,20 @@ object Main {
       new File("../log4j-conf.xml"),
       HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300)
     )
-    
+
     Files.write(
-      hostDirectory.resolve("aspen-host-config.yaml"),
+      hostDirectory.resolve(HostConfig.configFilename),
       hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
     )
 
     val storageDevConfig = StorageDeviceConfig(StorageDeviceId(UUID.randomUUID()), aspenSystemId)
-    
+
     Files.write(
-      bootstrapDevDir.resolve("aspen-storage-device-config.yaml"),
+      bootstrapDevDir.resolve(StorageDevice.configFilename),
       storageDevConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
     )
 
-    val bootstrapStores = 
+    val bootstrapStores =
       for
         poolIndex <- 0 until bootstrapIda.width
       yield
@@ -781,23 +781,23 @@ object Main {
         val storeId = StoreId(PoolId.BootstrapPoolId, poolIndex.toByte)
         val storeRoot = bootstrapDevDir.resolve(storeId.toString)
         val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB())
-  
+
         println(s"Creating data store $storeId. Path $storeRoot")
         mkdirectory(storeRoot)
         Files.write(
-          storeRoot.resolve("store-config.yaml"),
+          storeRoot.resolve(StoreConfig.configFilename),
           storeConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
         )
         new RocksDBBackend(storeRoot, storeId, ec)
-        
+
     val bootstrapStorageDevice = StorageDevice(
       storageDevConfig.storageDeviceId,
       Some(hostConfig.hostId),
-      bootstrapStores.map(backend => 
+      bootstrapStores.map(backend =>
         backend.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None)
       ).toMap
     )
-    
+
     val bootstrapHost = Host(
       hostConfig.hostId,
       "bootstrap-host",

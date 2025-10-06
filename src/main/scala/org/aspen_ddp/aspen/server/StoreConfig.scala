@@ -23,6 +23,8 @@ case class StoreConfig(storeId: StoreId, backend: StoreConfig.StorageBackend):
 
 object StoreConfig extends YObject[StoreConfig]:
 
+  val configFilename = "aspen-store-config.yaml"
+  
   sealed abstract class StorageBackend:
     def name: String
 

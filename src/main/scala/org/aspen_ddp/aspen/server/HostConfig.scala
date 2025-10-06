@@ -26,7 +26,7 @@ case class HostConfig(hostId: HostId,
                       storeTransferPort: Int,
                       log4jConfigFile: File,
                       crl: HostConfig.CRLBackend):
-  def yamlConfig: String = 
+  def yamlConfig: String =
     val base = s"""host-id: $hostId
        |aspen-system-id: $aspenSystemId
        |name: $name
@@ -37,18 +37,20 @@ case class HostConfig(hostId: HostId,
        |log4j-config: $log4jConfigFile
        |crl:
        |""".stripMargin
-    
+
     val crlCfg = crl match
       case s: HostConfig.SimpleCRL =>
         s"""  storage-engine: simple-crl
            |  num-streams: ${s.numStreams}
            |  max-file-size-mb: ${s.fileSizeMb}
            |""".stripMargin
-    
+
     base + crlCfg
 
 
 object HostConfig extends YObject[HostConfig]:
+
+  val configFilename = "aspen-host-config.yaml"
 
   sealed abstract class CRLBackend
 
@@ -63,7 +65,7 @@ object HostConfig extends YObject[HostConfig]:
     def create(o: Object): SimpleCRL = SimpleCRL(
       numStreams.get(o).getOrElse(3),
       fileSize.get(o).getOrElse(300))
-  
+
   val hostId: Required[HostId]         = Required("host-id", HostId.YHostId)
   val aspenSystemId: Required[UUID]    = Required("aspen-system-id", YUUID)
   val name: Required[String]           = Required("name", YString)
@@ -97,7 +99,7 @@ object HostConfig extends YObject[HostConfig]:
     log4jConf.get(o),
     crl.get(o)
   )
-  
+
   def loadHostConfig(file: File): HostConfig =
     val yaml = new Yaml(new SafeConstructor)
     val y = yaml.load[java.util.AbstractMap[Object, Object]](new FileInputStream(file))

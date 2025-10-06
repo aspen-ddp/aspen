@@ -18,9 +18,11 @@ object StorageDeviceId:
         catch
           case t: Throwable => throw new FormatError(s"Invalid UUID: $t")
       case _ => throw new FormatError(s"String Required")
-      
+
 
 object StorageDevice:
+
+  val configFilename = "aspen-storage-device-config.yaml"
 
   def apply(buff: Array[Byte]): StorageDevice = Codec.decode(codec.StorageDevice.parseFrom(buff))
   

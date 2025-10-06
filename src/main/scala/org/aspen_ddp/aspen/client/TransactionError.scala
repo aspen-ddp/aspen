@@ -23,8 +23,8 @@ final case class PostCommitTransactionModification() extends TransactionCreation
 /** Used when procedure adding content to a transaction detects a logical flaw that causes the overall
   * Transaction to become invalid.
   *
-  * For example, while attempting to insert key/value pairs into a BTree node it could be discovered that one or more
-  * of the keys is outside the valid key range owned by the node. In this case, the transaction cannot be allowed to
+  * For example, while attempting to insert key/value pairs into a BTree host it could be discovered that one or more
+  * of the keys is outside the valid key range owned by the host. In this case, the transaction cannot be allowed to
   * succeed so the transaction will be failed and the "reason" attribute will be set to an instance of KeyOutOfRange.
   *
   */

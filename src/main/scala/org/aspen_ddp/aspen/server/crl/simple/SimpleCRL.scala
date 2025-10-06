@@ -71,6 +71,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
                          r: Recovery.Result) extends CrashRecoveryLog with Logging:
 
   import SimpleCRL._
+  
+  val numStreams: Int = files.size
 
   private val writer = StreamWriter(maxSizeInBytes, files)
   private var currentStream: Int = r.activeStreamId.number

@@ -439,7 +439,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
-  atest("Join on delete to empty node") {
+  atest("Join on delete to empty host") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))
 

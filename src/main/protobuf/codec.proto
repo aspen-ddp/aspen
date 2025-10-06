@@ -399,8 +399,8 @@ message AllocateResponse {
 //- Node Support Message
 //---------------------------------------------------------------------------
 
-message NodeHeartbeat {
-  string from = 1;
+message HostHeartbeat {
+  UUID fromHostId = 1;
 }
 
 
@@ -426,7 +426,7 @@ message Message {
     TransactionCompletionResponse transaction_completion_response = 15;
     TransactionResolved tx_resolved = 16;
     TransactionFinalized tx_finalized = 17;
-    NodeHeartbeat node_heartbeat = 18;
+    HostHeartbeat host_heartbeat = 18;
     TxStatusRequest status_request = 19;
     TxStatusResponse status_response = 20;
   }

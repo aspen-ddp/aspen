@@ -319,9 +319,9 @@ class TieredKeyValueList(val client: AspenClient,
 object TieredKeyValueList {
 
   /*
-   Returns Left if the tree is broken or Right with a list of nodes for each
-   tier in the path down to the requested node in reverse order. The top of
-   the tree will be the last node in the list
+   Returns Left if the tree is broken or Right with a list of hosts for each
+   tier in the path down to the requested host in reverse order. The top of
+   the tree will be the last host in the list
    */
   private[tkvl] def fetchContainingNode(client: AspenClient,
                                         currentTier: Int,
@@ -353,7 +353,7 @@ object TieredKeyValueList {
 
     if (currentTier == targetTier) {
       // Once we're on the right tier, we can rely on consistent right pointers to scan to the
-      // containing node
+      // containing host
       currentNode.fetchContainingNode(target).map(n => Right(n :: reversePath))
     } else {
 

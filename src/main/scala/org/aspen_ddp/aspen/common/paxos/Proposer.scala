@@ -34,7 +34,7 @@ class Proposer(
     else
       None
 
-  /** Sets the proposal value for this node. Once set, it cannot be unset. Subsequent calls are ignored.*/
+  /** Sets the proposal value for this host. Once set, it cannot be unset. Subsequent calls are ignored.*/
   def setLocalProposal(value:Boolean): Unit = if localProposal.isEmpty then localProposal = Some(value)
 
   /** Used to reduce the chance of receiving Nacks to our Prepare messages */

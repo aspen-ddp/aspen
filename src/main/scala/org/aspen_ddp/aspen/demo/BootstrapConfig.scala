@@ -1,40 +1,36 @@
 package org.aspen_ddp.aspen.demo
 
+import org.aspen_ddp.aspen.client.{Host, HostId}
+
 import java.io.{File, FileInputStream}
 import java.util.UUID
-
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
-import org.aspen_ddp.aspen.common.util.YamlFormat._
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.constructor.SafeConstructor
 
 /*
+aspen-system-id:  BF1049AD-D2A8-4D17-8080-E01A4678C8B3
 bootstrap-ida:
   type: replication
   width: 3
   write-threshold: 2
-
-bootstrap-storage-nodes:
-  - name: node_a
+bootstrap-hosts:
+  - host-id: AA1049AD-D2A8-4D17-8080-E01A4678C8B3
+    name: node_a
     host: 127.0.0.1
     data-port: 5000
     cnc-port: 5001
     store-transfer-port: 5002
-
-  - name: node_b
-    host: 127.0.0.1
-    data-port: 5010
-    cnc-port: 5011
-    store-transfer-port: 5012
-
-  - name: node_c
-    host: 127.0.0.1
-    data-port: 5020
-    cnc-port: 5021
-    store-transfer-port: 5022
+    stores:
+      - 00000000-0000-0000-0000-000000000000:0
+      - 00000000-0000-0000-0000-000000000000:1
+      - 00000000-0000-0000-0000-000000000000:2
 */
 
-object BootstrapConfig {
+object BootstrapConfig:
 
   object ReplicationFormat extends YObject[IDA]:
     val width: Required[Int]          = Required("width",            YInt)
@@ -58,37 +54,87 @@ object BootstrapConfig {
     def create(o: Object): BootstrapIDA = BootstrapIDA(ida.get(o), maxObjectSize.get(o))
 
 
-  case class StorageNode(name: String, host: String, dataPort: Int, cncPort: Int, storeTransferPort: Int)
+  case class BootstrapHost(hostId: HostId,
+                           name: String,
+                           address: String,
+                           dataPort: Int,
+                           cncPort: Int,
+                           storeTransferPort: Int,
+                           stores: List[StoreId])
 
-  object StorageNode extends YObject[StorageNode]:
-    val name: Required[String]  = Required("name", YString)
-    val host: Required[String]  = Required("host", YString)
-    val dataPort: Required[Int] = Required("data-port", YInt)
-    val cncPort: Required[Int]  = Required("cnc-port", YInt)
-    val storeTransferPort: Required[Int]  = Required("store-transfer-port", YInt)
+  object BootstrapHost extends YObject[BootstrapHost]:
+    val hostId: Required[HostId]         = Required("host-id", HostId.YHostId)
+    val name: Required[String]           = Required("name", YString)
+    val address: Required[String]        = Required("address", YString)
+    val dataPort: Required[Int]          = Required("data-port", YInt)
+    val cncPort: Required[Int]           = Required("cnc-port", YInt)
+    val storeTransferPort: Required[Int] = Required("store-transfer-port", YInt)
+    val stores: Required[List[StoreId]]  = Required("stores", YList(StoreId.YStoreId))
+
+    val attrs: List[Attr] = hostId :: name :: address :: dataPort :: cncPort :: storeTransferPort :: stores :: Nil
+
+    def create(o: Object): BootstrapHost = BootstrapHost(
+      hostId.get(o),
+      name.get(o),
+      address.get(o),
+      dataPort.get(o),
+      cncPort.get(o),
+      storeTransferPort.get(o),
+      stores.get(o)
+    )
 
 
-    val attrs: List[Attr] = name :: host :: dataPort :: cncPort :: storeTransferPort :: Nil
-
-    def create(o: Object): StorageNode = StorageNode(name.get(o), host.get(o), dataPort.get(o), cncPort.get(o), storeTransferPort.get(o))
-
-
-  case class Config(bootstrapIDA: IDA, nodes: List[StorageNode]):
+  case class Config(aspenSystemId: UUID, bootstrapIDA: IDA, hosts: List[BootstrapHost]):
     // Validate config
-    if nodes.length != bootstrapIDA.width then
-      throw new FormatError("Number of nodes must exactly match the Bootstrap IDA width")
+    if hosts.length != bootstrapIDA.width then
+      throw new FormatError("Number of hosts must exactly match the Bootstrap IDA width")
 
   object Config extends YObject[Config]:
-    val bootstrapIDA: Required[IDA]        = Required("bootstrap-ida",           Choice("type", Map("replication" -> ReplicationFormat)))
-    val nodes: Required[List[StorageNode]] = Required("bootstrap-storage-nodes", YList(StorageNode))
+    val aspenSystemId: Required[UUID]        = Required("aspen-system-id", YUUID)
+    val bootstrapIDA: Required[IDA]          = Required("bootstrap-ida",   Choice("type", Map("replication" -> ReplicationFormat)))
+    val hosts: Required[List[BootstrapHost]] = Required("bootstrap-hosts", YList(BootstrapHost))
 
-    val attrs: List[Attr] = bootstrapIDA :: nodes :: Nil
+    val attrs: List[Attr] = aspenSystemId :: bootstrapIDA :: hosts :: Nil
 
-    def create(o: Object): Config = Config( bootstrapIDA.get(o), nodes.get(o) )
+    def create(o: Object): Config = Config( aspenSystemId.get(o), bootstrapIDA.get(o), hosts.get(o) )
 
 
   def loadBootstrapConfig(file: File): Config =
     val yaml = new Yaml(new SafeConstructor)
     val y = yaml.load[java.util.AbstractMap[Object,Object]](new FileInputStream(file))
     Config.create(y)
-}
+
+
+  def generateBootstrapConfig(aspenSystemId: UUID,
+                              ida: IDA,
+                              hosts: List[Host],
+                              storeMap: List[(StoreId, HostId)]): String =
+    val hostIdSet = hosts.map(_.hostId).toSet
+
+    storeMap.foreach: (_, hostId) =>
+      require(hostIdSet.contains(hostId))
+
+    val sb = StringBuilder()
+
+    sb.append(s"aspen-system-id: $aspenSystemId\n")
+    sb.append(s"bootstrap-ida:\n")
+    sb.append(s"  type: ${ida.name}\n")
+    sb.append(s"  width: ${ida.width}\n")
+    sb.append(s"  write-threshold: ${ida.writeThreshold}\n")
+    sb.append("bootstrap-hosts:")
+    hosts.foreach: host =>
+      val storesOnHost = storeMap.filter(t => t._2 == host.hostId).map(t => t._1)
+
+      require(storesOnHost.nonEmpty)
+
+      sb.append(f"  - host-id: ${host.hostId.uuid}\n")
+      sb.append(f"    name: ${host.name}\n")
+      sb.append(f"    address: ${host.address}\n")
+      sb.append(f"    data-port: ${host.dataPort}\n")
+      sb.append(f"    cnc-port: ${host.cncPort}\n")
+      sb.append(f"    store-transfer-port: ${host.storeTransferPort}\n")
+      sb.append(f"    stores:\n")
+      storesOnHost.foreach: storeId =>
+        sb.append(f"      - $storeId\n")
+
+    sb.toString

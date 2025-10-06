@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.someOrThrow
-import org.aspen_ddp.aspen.demo.StoreConfig
+import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.StoreManager
 import org.aspen_ddp.aspen.server.cnc.*
 import org.aspen_ddp.aspen.server.store.backend.{RocksDBBackend, RocksDBConfig}

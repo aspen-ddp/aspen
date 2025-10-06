@@ -49,7 +49,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
     node.delete(key, onJoin)
   }
 
-  /** May only be used on nodes that contain both the old and new key */
+  /** May only be used on hosts that contain both the old and new key */
   def rename(oldKey: Key, newKey: Key)(using t: Transaction): Future[Unit] = {
     assert(node.keyInRange(oldKey) && node.keyInRange(newKey))
 

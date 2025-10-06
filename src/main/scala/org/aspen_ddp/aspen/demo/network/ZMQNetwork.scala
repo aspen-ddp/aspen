@@ -7,36 +7,50 @@ import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, NodeHeartbeat, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostHeartbeat, TxMessage}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.client.HostId
+import org.aspen_ddp.aspen.demo.BootstrapConfig
 import org.zeromq.ZMQ.{DONTWAIT, PollItem}
 import org.zeromq.{SocketType, ZContext, ZMQ}
 
 import scala.concurrent.duration.Duration
 
 object ZMQNetwork {
-  class SocketState(val nodeName: String,
-                    var dealer: ZMQ.Socket)
 
-  class NodeState(val nodeName: String,
-                  var lastHeartbeatTime: Long,
-                  var isOnline: Boolean) extends Logging {
+  class HostState(val hostId: HostId,
+                  val hostName: String,
+                  val address: String,
+                  val port: Int,
+                  val oinitialHeartbeat: Option[Array[Byte]],
+                  context: ZContext,
+                  clientId: ClientId) extends Logging:
 
-    def heartbeatReceived(): Unit = {
+    var lastHeartbeatTime: Long = 0
+    var isOnline: Boolean = false
+    val dealer: ZMQ.Socket = context.createSocket(SocketType.DEALER)
+    val pollItem: PollItem = new PollItem(dealer, ZMQ.Poller.POLLIN)
+    
+    dealer.setIdentity(clientId.toBytes)
+    dealer.connect(s"tcp://$address:$port")
+    
+    oinitialHeartbeat.foreach: msg =>
+      dealer.send(msg)
+    
+    def heartbeatReceived(): Unit =
       lastHeartbeatTime = System.nanoTime()
       if (!isOnline)
-        logger.info(s"Node $nodeName is Online")
+        logger.info(s"Node $hostName is Online")
       isOnline = true
-    }
-    def setOffline(): Unit = {
+    
+    def setOffline(): Unit = 
       if (isOnline)
-        logger.info(s"Node $nodeName is Offline")
+        logger.info(s"Node $hostName is Offline")
       isOnline = false
-    }
-  }
+  
 
   sealed abstract class SendQueueMsg
   case class SendClientRequest(msg: ClientRequest) extends SendQueueMsg
@@ -78,9 +92,10 @@ object ZMQNetwork {
 }
 
 class ZMQNetwork(val oclientId: Option[ClientId],
-                 val nodes: Map[String, (String, Int)], // NodeName -> (hostname, port)
-                 val stores: Map[StoreId, String], // StoreId -> NodeName
-                 val storageNode: Option[(String, String, Int)], // (NodeName, hostname/IP, port)
+                 val bootstrapConfig: BootstrapConfig.Config,
+                 //val nodes: Map[String, (String, Int)], // NodeName -> (hostname, port)
+                 //val stores: Map[StoreId, String], // StoreId -> NodeName
+                 val ohostNode: Option[(HostId, Int)], // (Hostid, data port)
                  val heartbeatPeriod: Duration,
                  val onClientResponseReceived: ClientResponse => Unit,
                  val onClientRequestReceived: ClientRequest => Unit,
@@ -98,8 +113,6 @@ class ZMQNetwork(val oclientId: Option[ClientId],
 
   private var lastRouterMessageReceived = System.nanoTime()
 
-  private var nodeStates: Map[String, NodeState] = nodes.map{t => t._1 -> new NodeState(t._1, 0, false)}
-
   private val sendQueueSocket = context.createSocket(SocketType.DEALER)
   sendQueueSocket.bind("inproc://send-message-queued")
 
@@ -112,115 +125,128 @@ class ZMQNetwork(val oclientId: Option[ClientId],
 
   private val sendQueuePollItem = new PollItem(sendQueueSocket, ZMQ.Poller.POLLIN)
 
-  private val routerSocket = storageNode.map { t =>
-    val (_, _, port) = t
+  private val orouterSocket = ohostNode.map: (_, port) =>
     val router = context.createSocket(SocketType.ROUTER)
     router.bind(s"tcp://*:$port")
     router
-  }
-
-  private val heartbeatMessage = storageNode.map { t =>
-    val (nodeName, _, _) = t
-    ProtobufMessageEncoder.encodeMessage(NodeHeartbeat(nodeName))
-  }
-
-  case class Peer(nodeName: String, dealer: ZMQ.Socket, pollItem: PollItem)
-
-  private val dealers = nodes.map { t =>
-    val (nodeName, (host, port)) = t
-    val dealer = context.createSocket(SocketType.DEALER)
-    dealer.setIdentity(clientId.toBytes)
-    dealer.connect(s"tcp://$host:$port")
-    heartbeatMessage.foreach(msg => dealer.send(msg))
-    Peer(nodeName, dealer, new PollItem(dealer, ZMQ.Poller.POLLIN))
-  }.toArray
-
-  private val peers = dealers.map(p => p.nodeName -> p).toMap
-
-  private val routerPollItem = routerSocket.map { router =>
+  
+  private val orouterPollItem = orouterSocket.map: router =>
     new PollItem(router, ZMQ.Poller.POLLIN)
-  }
+
+  private val oheartbeatMessage = ohostNode.map: (hostId, _) =>
+    ProtobufMessageEncoder.encodeMessage(HostHeartbeat(hostId))
+  
+  private var storeToHost: Map[StoreId, HostId] =
+    bootstrapConfig.hosts.flatMap { host =>
+      host.stores.map(storeId => storeId -> host.hostId)
+    }.toMap
+
+  private var hostStates: Map[HostId, HostState] = bootstrapConfig.hosts.map { host =>
+    host.hostId -> HostState(
+      host.hostId,
+      host.name,
+      host.address,
+      host.dataPort,
+      oheartbeatMessage,
+      context,
+      clientId
+    )
+  }.toMap
 
   def clientMessenger: ClientMessenger = new CliMessenger(this)
 
   def serverMessenger: ServerMessenger = new SrvMessenger(this)
-
+  
+  def getHostForStore(storeId: StoreId, msg: SendQueueMsg): Option[HostState] =
+    synchronized:
+      storeToHost.get(storeId).flatMap(hostId => hostStates.get(hostId))
+  
   // Queue message in concurrent linked list and send an empty message to the queue socket
   // to wake the IO thread if it's sleeping in a call to poll()
   def queueMessageForSend(msg: SendQueueMsg): Unit =
     sendQueue.add(msg)
     sendQueueClientSocket.get().send("")
 
-  private def heartbeat(): Unit = {
-    val offlineThreshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
-    nodeStates.foreach { t =>
-      val (_, ns) = t
-      if (ns.lastHeartbeatTime <= offlineThreshold && ns.isOnline) {
-        ns.setOffline()
-      }
-    }
-    heartbeatMessage.foreach { msg =>
-      logger.trace("Sending node heartbeat to peers")
-      dealers.foreach(_.dealer.send(msg))
-    }
-  }
-
+  private def heartbeat(): Unit =
+    synchronized:
+      val offlineThreshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
+      
+      hostStates.valuesIterator.foreach: host =>
+        if host.lastHeartbeatTime <= offlineThreshold && host.isOnline then
+          host.setOffline()
+        oheartbeatMessage.foreach: msg =>
+          host.dealer.send(msg)
+  
   def ioThread(): Unit = {
 
-    val (size, routerSocketIndex) = routerPollItem match
-      case Some(_) => (dealers.length + 2, dealers.length + 1)
-      case None => (dealers.length + 1, -1)
-
-    var poller = context.createPoller(size)
-
-    dealers.foreach(peer => poller.register(peer.pollItem))
-    poller.register(sendQueuePollItem)
-    routerPollItem.foreach(poller.register)
+    val routerPoll = orouterPollItem match
+      case Some(_) => 1
+      case None => 0
 
     val heartBeatPeriodMillis = heartbeatPeriod.toMillis.toInt
     var nextHeartbeat = System.currentTimeMillis() + heartBeatPeriodMillis
+    
+    var hostsArray: Array[HostState] = null
+    var poller: ZMQ.Poller = null
+    
+    def recreatePoller(): Unit = synchronized {
+      // Unregister
+      if hostsArray != null then
+        hostsArray.foreach(host => poller.unregister(host.dealer))
+        orouterSocket.foreach(poller.unregister)
+        poller.unregister(sendQueueSocket)
+      
+      // Recreate hostArray to pick up any new connections
+      hostsArray = hostStates.valuesIterator.toArray
+      // Poller size is size of hosts array plus one for sendQueue plus 0 or 1
+      // depending on if we have a router socket or not
+      poller = context.createPoller(hostsArray.length + 1 + routerPoll)
 
+      hostsArray.foreach(host => poller.register(host.pollItem))
+      poller.register(sendQueuePollItem)
+      orouterPollItem.foreach(poller.register)
+    }
+
+    recreatePoller()
+    
     while (!Thread.currentThread().isInterrupted) {
       val now = System.currentTimeMillis()
 
-      if (now >= nextHeartbeat) {
+      if now >= nextHeartbeat then
         nextHeartbeat = now + heartBeatPeriodMillis
         heartbeat()
-      }
 
-      try {
+      try 
         val timeToNextHB = nextHeartbeat - now
         if timeToNextHB > 0 then
           //logger.trace(s"*** SLEEPING. Time to next HB: $timeToNextHB")
           poller.poll(timeToNextHB)
           //logger.trace(s"*** Woke from poll. Time to next HB: ${nextHeartbeat - System.currentTimeMillis()}")
-      } catch {
+      catch 
         case e: Throwable =>
           logger.warn(s"Poll method threw an exception. Creating a new poller. Error: $e")
+          recreatePoller()
 
-          dealers.foreach(peer => poller.unregister(peer.dealer))
-          routerSocket.foreach(poller.unregister)
-
-          poller = context.createPoller(dealers.length + 1)
-
-          dealers.foreach(peer => poller.register(peer.pollItem))
-          routerPollItem.foreach(poller.register)
-      }
-
-      for (i <- dealers.indices) {
-        if (poller.pollin(i)) {
-          var msg = dealers(i).dealer.recv(ZMQ.DONTWAIT)
+      // Process messages coming from hosts
+      for i <- hostsArray.indices do
+        if poller.pollin(i) then
+          var msg = hostsArray(i).dealer.recv(ZMQ.DONTWAIT)
           while msg != null do
             try
               onDealerMessageReceived(msg)
             catch
               case t: Throwable => logger.error(s"**** Error in onDealerMessageReceived: $t", t)
-            msg = dealers(i).dealer.recv(ZMQ.DONTWAIT)
-        }
-      }
+            msg = hostsArray(i).dealer.recv(ZMQ.DONTWAIT)
 
-      routerSocket.foreach { router =>
-        if (poller.pollin(routerSocketIndex)) {
+      // Process messages from sendQueue
+      if poller.pollin(hostsArray.length) then
+        var msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
+        while msg != null do
+          msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
+          
+      // Process messages sent to our local host
+      orouterSocket.foreach: router =>
+        if poller.pollin(hostsArray.length + 1) then
           var from = router.recv(ZMQ.DONTWAIT)
           var msg = router.recv(ZMQ.DONTWAIT)
           while from != null && msg != null do
@@ -230,32 +256,32 @@ class ZMQNetwork(val oclientId: Option[ClientId],
               case t: Throwable => logger.error(s"**** Error in onRouterMessageReceived: $t", t)
             from = router.recv(ZMQ.DONTWAIT)
             msg = router.recv(ZMQ.DONTWAIT)
-        }
-      }
-
-      if poller.pollin(dealers.length) then
-        var msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
-        while msg != null do
-          msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
 
       var qmsg = sendQueue.poll()
       while qmsg != null do
         qmsg match
           case SendClientRequest(msg) =>
             logger.trace(s"Sending $msg")
-            peers(stores(msg.toStore)).dealer.send(ProtobufMessageEncoder.encodeMessage(msg))
+            getHostForStore(msg.toStore, SendClientRequest(msg)).foreach: host =>
+              host.dealer.send(ProtobufMessageEncoder.encodeMessage(msg))
+            
           case SendClientTransactionMessage(msg) =>
             logger.trace(s"Sending $msg")
-            peers(stores(msg.to)).dealer.send(ProtobufMessageEncoder.encodeMessage(msg))
+            getHostForStore(msg.to, SendClientTransactionMessage(msg)).foreach: host =>
+              host.dealer.send(ProtobufMessageEncoder.encodeMessage(msg))
+            
           case SendClientResponse(msg) =>
             logger.trace(s"Sending $msg")
             clients.get(msg.toClient).foreach: zmqIdentity =>
-              routerSocket.foreach: router =>
+              orouterSocket.foreach: router =>
                 router.send(zmqIdentity, ZMQ.SNDMORE)
                 router.send(ProtobufMessageEncoder.encodeMessage(msg))
+                
           case SendServerTransactionMessage(msg) =>
             logger.trace(s"Sending $msg")
-            peers(stores(msg.to)).dealer.send(ProtobufMessageEncoder.encodeMessage(msg))
+            getHostForStore(msg.to, SendServerTransactionMessage(msg)).foreach: host =>
+              host.dealer.send(ProtobufMessageEncoder.encodeMessage(msg))
+            
         qmsg = sendQueue.poll()
     }
 
@@ -318,14 +344,14 @@ class ZMQNetwork(val oclientId: Option[ClientId],
         logger.error(s"******* PARSE ROUTER MESSAGE ERROR: $t", t)
         throw t
 
-    if m.hasNodeHeartbeat then
-      val msg = Codec.decode(m.getNodeHeartbeat)
+    if m.hasHostHeartbeat then
+      val msg = Codec.decode(m.getHostHeartbeat)
       logger.trace(s"Got $msg")
-      nodeStates.get(msg.nodeName) match
+      hostStates.get(msg.hostId) match
         case None =>
-          val ns = new NodeState(msg.nodeName,0, false)
-          ns.heartbeatReceived()
-          nodeStates += msg.nodeName -> ns
+          //val ns = new HostState(msg.nodeName,0, false)
+          //ns.heartbeatReceived()
+          //nodeStates += msg.nodeName -> ns
         case Some(ns) => ns.heartbeatReceived()
 
     else if m.hasRead then

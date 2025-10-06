@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.internal.{OpportunisticRebuildManager, StaticTypeRegistry}
 import org.aspen_ddp.aspen.client.internal.allocation.{AllocationManager, BaseAllocationDriver}
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, Host, HostId, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, Host, HostId, KeyValueObjectState, ObjectCache, RetryStrategy, StorageDevice, StorageDeviceId, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{BaseReadDriver, ReadManager}
@@ -35,6 +35,8 @@ import scala.language.implicitConversions
 
 
 object TestNetwork {
+
+  val bootstrapHost = Host(HostId(new UUID(0,0)), "testhost", "localhost", 1234, 1235, 1236, Set())
 
   class TestCRL extends CrashRecoveryLog {
     override def getFullRecoveryState(storeId: StoreId): (List[TransactionRecoveryState], List[AllocationRecoveryState]) = (Nil, Nil)
@@ -118,7 +120,7 @@ object TestNetwork {
 
     protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
 
-    def getHost(hostId: HostId): Future[Option[Host]] = Future.successful(Some(Host(HostId(new UUID(0,0)), "testhost", "localhost", 1234, 1235, 1236)))
+    def getHost(hostId: HostId): Future[Option[Host]] = Future.successful(Some(bootstrapHost))
 
     def getHost(hostName: String): Future[Option[Host]] = getHost(HostId(new UUID(0,0)))
     
@@ -166,11 +168,22 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
 
   var handleDepth = 0
 
-  val radicle: KeyValueObjectPointer = Bootstrap.initialize(ida,
-    List(store0, store1, store2), List(
-      ("node1", new UUID(0,0)),
-      ("node2", new UUID(0,1)),
-      ("node3", new UUID(0,2))))
+  val bootstrapSD = StorageDevice(
+    StorageDeviceId(new UUID(0, 0)),
+    Some(bootstrapHost.hostId),
+    Map(
+      store0.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None),
+      store1.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None),
+      store2.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None)
+    )
+  )
+
+  val radicle: KeyValueObjectPointer = Bootstrap.initialize(
+    new UUID(0,0),
+    ida,
+    bootstrapHost,
+    bootstrapSD,
+    List(store0, store1, store2))
 
   // All transactions will miss the third store. Don't wait long before updating the
   // error tree

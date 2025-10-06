@@ -27,8 +27,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
                         initialReadDelay: Duration,
                         maxReadDelay: Duration,
                         txRetransmitDelay: Duration,
-                        allocationRetransmitDelay: Duration,
-                        bootstrapHosts: Map[HostId, Host]) extends AspenClient {
+                        allocationRetransmitDelay: Duration) extends AspenClient {
   
   given ec: ExecutionContext = executionContext
 
@@ -142,10 +141,6 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       SimpleStoragePool(this, poolKvos)
 
   def getHost(hostId: HostId): Future[Option[Host]] =
-    bootstrapHosts.get(hostId) match
-      case Some(host) => return Future.successful(Some(host))
-      case None =>
-
     val root = new KVObjectRootManager(this, Radicle.HostsTreeKey, radicle)
     val tkvl = new TieredKeyValueList(this, root)
     for

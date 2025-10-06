@@ -36,11 +36,11 @@ class SimpleFileContent(file: SimpleFile,
     val rootManager = new SimpleFileRootManager(fs.client, file.pointer.pointer)
     new TieredKeyValueList(fs.client, rootManager)
 
-  /** If the root node has already been created, immediately return the tree.
-   *  Otherwise, use a new transaction to create the root node and then
+  /** If the root host has already been created, immediately return the tree.
+   *  Otherwise, use a new transaction to create the root host and then
    *  refresh the file to update the cached inode state. This prevents
    *  duplicated attempts to update the inode object on the first write. Once
-   *  for creating the root node and once for updating the inode mtime
+   *  for creating the root host and once for updating the inode mtime
    */
   def initializeContentTree()(using ec: ExecutionContext): Future[TieredKeyValueList] =
     file.inode.contents.orootObject match

@@ -25,7 +25,7 @@ class KeyValueListNode(val reader: ObjectReader,
 
   def maximum: Option[Key] = tail.map(rp => rp.minimum)
 
-  def refresh(): Future[KeyValueListNode] = reader.read(pointer, s"Refresh KVListNode node ${pointer.id}. Minimum: $minimum").map { kvos =>
+  def refresh(): Future[KeyValueListNode] = reader.read(pointer, s"Refresh KVListNode host ${pointer.id}. Minimum: $minimum").map { kvos =>
     new KeyValueListNode(reader, pointer, ordering, minimum,
       kvos.revision, kvos.refcount, kvos.contents, kvos.right.map(v => KeyValueListPointer(v.bytes)))
   }
@@ -44,7 +44,7 @@ class KeyValueListNode(val reader: ObjectReader,
 
     val p = Promise[KeyValueListNode]()
 
-    def scan(right: KeyValueListPointer): Unit = reader.read(right.pointer, s"Scanning right KVListNode node ${pointer.id}. Minimum: $minimum. target: $target") onComplete {
+    def scan(right: KeyValueListPointer): Unit = reader.read(right.pointer, s"Scanning right KVListNode host ${pointer.id}. Minimum: $minimum. target: $target") onComplete {
       case Failure(err) => p.failure(err)
 
       case Success(kvos) =>
@@ -85,7 +85,7 @@ class KeyValueListNode(val reader: ObjectReader,
              prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
              requirement: Option[Either[Boolean, ObjectRevision]] = None
             )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
-    logger.trace(s"KeyValueListNode got containing node for key $key. Min: ${node.minimum}")
+    logger.trace(s"KeyValueListNode got containing host for key $key. Min: ${node.minimum}")
     KeyValueListNode.insert(node, ordering, key, value, maxNodeSize, allocator, prepareForSplit, requirement)
   }
 
@@ -130,7 +130,7 @@ class KeyValueListNode(val reader: ObjectReader,
       node.tail match {
         case None => p.success(newz)
 
-        case Some(nodeTail) => reader.read(nodeTail.pointer, s"foldLeft() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
+        case Some(nodeTail) => reader.read(nodeTail.pointer, s"foldLeft() KVListNode host ${pointer.id}. Minimum: $minimum.") onComplete {
 
           case Failure(err) => p.failure(err)
 
@@ -168,7 +168,7 @@ class KeyValueListNode(val reader: ObjectReader,
               p.success(())
 
             case Some(nodeTail) =>
-              reader.read(nodeTail.pointer, s"foreach() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
+              reader.read(nodeTail.pointer, s"foreach() KVListNode host ${pointer.id}. Minimum: $minimum.") onComplete {
 
                 case Failure(err) =>
                   p.failure(err)
@@ -214,7 +214,7 @@ class KeyValueListNode(val reader: ObjectReader,
               if ordering.compare(maxKey, minimum) < 0 then
                 p.success(())
               else
-                reader.read(nodeTail.pointer, s"foreachInRange() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
+                reader.read(nodeTail.pointer, s"foreachInRange() KVListNode host ${pointer.id}. Minimum: $minimum.") onComplete {
 
                   case Failure(err) =>
                     p.failure(err)
@@ -249,7 +249,7 @@ object KeyValueListNode {
       kvos.refcount, kvos.contents, kvos.right.map(v => KeyValueListPointer(v.bytes)))
   }
 
-  // Implemented as a non-class member to prevent accidental use of member variables instead of "node." attributes
+  // Implemented as a non-class member to prevent accidental use of member variables instead of "host." attributes
   private def insert(node: KeyValueListNode,
                      ordering: KeyOrdering,
                      key: Key,
@@ -343,7 +343,7 @@ object KeyValueListNode {
     }
   }
 
-  // Implemented as a non-class member to prevent accidental use of member variables instead of "node." attributes
+  // Implemented as a non-class member to prevent accidental use of member variables instead of "host." attributes
   private def rename(node: KeyValueListNode,
                      ordering: KeyOrdering,
                      oldKey: Key,
@@ -451,7 +451,7 @@ object KeyValueListNode {
             Future.successful(())
 
           case Some(rp) =>
-            reader.read(rp.pointer, s"Deleting key from KVListNode node ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
+            reader.read(rp.pointer, s"Deleting key from KVListNode host ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
               var ops: List[KeyValueOperation] = Delete(key) :: Nil
               kvos.right match {
                 case None => ops = DeleteRight() :: ops
@@ -495,7 +495,7 @@ object KeyValueListNode {
             Future.successful(())
 
           case Some(rp) =>
-            reader.read(rp.pointer, s"Deleting key from KVListNode node ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
+            reader.read(rp.pointer, s"Deleting key from KVListNode host ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
               var ops: List[KeyValueOperation] = Delete(key) :: Nil
               kvos.right match {
                 case None => ops = DeleteRight() :: ops
@@ -539,11 +539,11 @@ object KeyValueListNode {
           case Some(ptr) => SetRight(ptr.toArray)
 
         // Lock full content to ensure nothing is inserted while we're trying to
-        // delete the node
+        // delete the host
         tx.update(ptr.pointer, Some(kvos.revision), Some(FullContentLock(List())), Nil, Nil)
         tx.setRefcount(ptr.pointer, kvos.refcount, kvos.refcount.decrement())
 
-        // Update the right pointer of the start node to point to the next node
+        // Update the right pointer of the start host to point to the next host
         // in the chain
         tx.update(nodePointer.pointer, Some(nodeRevision), None, Nil, List(op))
         tx.commit().map(_ => ())
@@ -553,7 +553,7 @@ object KeyValueListNode {
     def deleteRight(ptr: KeyValueListPointer): Future[Option[KeyValueListPointer]] =
       client.retryStrategy.retryUntilSuccessful:
         for
-          // reread the root node each time to ensure we have an accurate
+          // reread the root host each time to ensure we have an accurate
           // object revision
           nodeKvos <- client.read(nodePointer.pointer).recover:
             case e:InvalidObject => throw StopRetrying(e)
@@ -657,18 +657,18 @@ object KeyValueListNode {
         None
 
   /**
-   * Splits the list at the specified key. The original list node will have
-   * its right pointer deleted and the newly allocated node will have its
-   * minimum set to Key.AbsoluteMinimum. The nodes to the right of it will
+   * Splits the list at the specified key. The original list host will have
+   * its right pointer deleted and the newly allocated host will have its
+   * minimum set to Key.AbsoluteMinimum. The hosts to the right of it will
    * be preserved as-is.
    *
    * Note:
-   * There is a potential edge case where a full node is split with all
-   * of the contents going into the right node. In this case, there is no
+   * There is a potential edge case where a full host is split with all
+   * of the contents going into the right host. In this case, there is no
    * room left to insert the optional down pointer. To avoid this we can
-   * always allocate 2 nodes. The optional down pointer will be always be
-   * inserted into the new left node. If no optional pointer is provided,
-   * the new left node will be empty. Minor performance issue but this
+   * always allocate 2 hosts. The optional down pointer will be always be
+   * inserted into the new left host. If no optional pointer is provided,
+   * the new left host will be empty. Minor performance issue but this
    * implementation is aimed at partitioning trees for the purpose of
    * slow deletion so it should be a non-issue.
    */

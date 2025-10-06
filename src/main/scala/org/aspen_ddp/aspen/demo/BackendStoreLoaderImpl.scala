@@ -4,6 +4,7 @@ import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.printStack
+import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.store.BackendStoreLoader
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend}
 
@@ -19,12 +20,10 @@ class BackendStoreLoaderImpl extends BackendStoreLoader with Logging:
     if Files.exists(cfgFile) then
 
       try
-        val cfg = StoreConfig.loadStore(cfgFile.toFile)
-
-        val storeId = StoreId(PoolId(cfg.poolUuid), cfg.index.toByte)
+        val cfg = StoreConfig.loadStoreConfig(cfgFile.toFile)
 
         val backend = cfg.backend match
-          case b: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
+          case b: StoreConfig.RocksDB => new RocksDBBackend(storePath, cfg.storeId, ec)
 
         Some(backend)
       catch

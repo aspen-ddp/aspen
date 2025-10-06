@@ -1,3 +1,61 @@
+** For ZNetwork
+  - If have store -> HostId mapping, send directly
+  - If not, Lookup via AspenClient
+    When Future resolves, enter synchronized block
+      1. if HostId not in pendingConnectionsSet, create new socket and update set
+      2. encuque AddHostConnection(zmqsocket and stuff)
+      3. enqueue the original message to be sent
+  - When get AddHostConnection message:
+      1. add new host connection to map
+
+
+Add StorageDeviceTree to radicle
+Add BootstrapConfigKey and yaml value to radicle
+
+Bootstrap
+  - Pass in the bootstrap Host config object
+    * Should use generated Host ID and Storage Device
+  - Always create all the bootstrap stores within the bootstrap StorageDevice
+    * They have to be transferred out
+
+Create ConfigStateManager
+  - Encapsulates the PoolConfig, Host, StorageDevice implementation
+  - Takes client & bootstrapConfig args
+
+StoreManager
+  - Switch to managing drives that contain stores
+  - For now use host_config.yaml
+     - Lists network ports
+     - List path to each StorageDevice
+
+Create HostResolver
+  - Takes AspenClient as argument
+  - Takes BootstrapConfig as argument
+     - Allows bootstrap pool storeId and host lookups without consulting client
+  - Responsible for looking up HostId -> Host and StoreId -> Host
+  - Handles caching
+  - member variable of client?
+    - Would make it easy for cache invalidation messages to come in from external
+      sources
+
+Add RefreshBootstrapConfig CnC message
+  - Lookup bootsrap PoolConfig
+  - Lookup host info for each storeId
+     - Dump hosts to top of yaml file
+     - Dump storeId -> hostId mapping
+  - Store this in BootstrapConfigKey in Radicle
+
+After migrating bootstrap store, send RefreshBootstrapConfig CnC message to each
+host.
+  - Will need a way to propagate this across all clients.
+  - gossip protocol?
+  - clients periodically poll a host for latest BootstrapConfig hash?
+
+Update ZMQNetwork to use the NetworkResolver or maybe just client
+  - Set resolver after creation (must create network instance before client)
+  - Can probably just set the resolver to null in constructor
+    - Will be set before first use so should be fine
+
 ServerMessenger
   - getCnCFrontend(hostId: HostId): Future[CnCFrontend]
 

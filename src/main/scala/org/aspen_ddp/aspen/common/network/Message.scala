@@ -1,7 +1,8 @@
 package org.aspen_ddp.aspen.common.network
 
-import java.util.UUID
+import org.aspen_ddp.aspen.client.HostId
 
+import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
@@ -10,7 +11,7 @@ import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOppor
 
 sealed abstract class Message
 
-case class NodeHeartbeat(nodeName:String) extends Message
+case class HostHeartbeat(hostId: HostId) extends Message
 
 sealed abstract class ClientRequest extends Message {
   val toStore: StoreId

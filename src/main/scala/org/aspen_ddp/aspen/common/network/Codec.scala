@@ -959,13 +959,13 @@ object Codec extends Logging:
     AllocateResponse(toClient, fromStore, allocTxId, newObjId, storePointer)
 
 
-  def encode(o: NodeHeartbeat): codec.NodeHeartbeat =
-    codec.NodeHeartbeat.newBuilder()
-      .setFrom(o.nodeName)
+  def encode(o: HostHeartbeat): codec.HostHeartbeat =
+    codec.HostHeartbeat.newBuilder()
+      .setFromHostId(encodeUUID(o.hostId.uuid))
       .build
 
-  def decode(m: codec.NodeHeartbeat): NodeHeartbeat =
-    NodeHeartbeat(m.getFrom)
+  def decode(m: codec.HostHeartbeat): HostHeartbeat =
+    HostHeartbeat(HostId(decodeUUID(m.getFromHostId)))
     
   // ----------------------- Non Network Messages -----------------------
 

@@ -5,7 +5,7 @@ import java.nio.file.{Files, Path, Paths}
 import java.util.concurrent.Executors
 import org.aspen_ddp.aspen.AmoebaError
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, Host, HostId, KeyValueObjectState, MetadataObjectState, ObjectAllocator, ObjectState, StoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, Host, HostId, KeyValueObjectState, MetadataObjectState, ObjectAllocator, ObjectState, StorageDevice, StorageDeviceId, StoragePool}
 import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
 import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, Root, SinglePoolNodeAllocator, TieredKeyValueList}
@@ -25,7 +25,7 @@ import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
 import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS
 import org.aspen_ddp.aspen.server.cnc.TransferStore
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
-import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, SimpleDriverRecoveryMixin, StoreManager}
+import org.aspen_ddp.aspen.server.{HostConfig, RegisteredTransactionFinalizerFactory, SimpleDriverRecoveryMixin, StorageDeviceConfig, StoreConfig, StoreManager}
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
@@ -39,6 +39,7 @@ import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
 import org.apache.logging.log4j.scala.Logging
 
+import java.nio.charset.StandardCharsets
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
@@ -89,10 +90,10 @@ object Main {
   val AmoebafsKey: Key = Key("amoeba")
 
   case class Args(mode:String="",
-                  nodeConfigFile:File=null,
+                  hostDirectory:File=null,
                   bootstrapConfigFile:File=null,
                   log4jConfigFile: File=null,
-                  nodeName:String="",
+                  hostName:String="",
                   storeName:String="",
                   host:String="",
                   port:Int=0,
@@ -130,9 +131,24 @@ object Main {
       cmd("bootstrap").text("Bootstrap a new Amoeba system").
         action( (_,c) => c.copy(mode="bootstrap")).
         children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action( (x, c) => c.copy(bootstrapConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
+          arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
+            action((x, c) => c.copy(idaType = x.toLowerCase())).
+            validate { x =>
+              val xl = x.toLowerCase
+              if xl == "replication" || xl == "reed-solomon" then
+                success
+              else
+                failure("IDA type must be Replication or Reed-Solomon")
+            },
+
+          arg[Int]("<width>").text("Number of hosts holding slices/replicas").
+            action((x, c) => c.copy(width = x)),
+
+          arg[Int]("<read-threshold>").text("Minimum number of slices/replicas that must be read to reconstruct an object").
+            action((x, c) => c.copy(readThreshold = x)),
+
+          arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
+            action((x, c) => c.copy(writeThreshold = x)),
         )
 
       cmd("debug").text("Runs debugging code").
@@ -147,17 +163,16 @@ object Main {
             validate( x => if (x.exists()) success else failure(s"Log4j Config file does not exist: $x"))
         )
 
-      cmd("node").text("Starts an Amoeba Storage Node").
-        action( (_,c) => c.copy(mode="node")).
+      cmd("host").text("Starts an Amoeba Storage Host").
+        action( (_,c) => c.copy(mode="host")).
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
             validate( x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x")),
-
-          //arg[String]("<node-name>").text("Storage Node Name").action((x,c) => c.copy(nodeName=x))
-          arg[File]("<node-config-file>").text("Node Configuration File").
-            action( (x, c) => c.copy(nodeConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Node Config file does not exist: $x"))
+          
+          arg[File]("<host-directory>").text("Host Directory").
+            action( (x, c) => c.copy(hostDirectory=x)).
+            validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
         )
 
       cmd("nfs").text("Launches a Amoeba NFS server").
@@ -270,15 +285,15 @@ object Main {
 
     parser.parse(args, Args()) match
       case Some(cfg) =>
-        //
-        try
+        def bootstrapConfig: BootstrapConfig.Config =
           println(s"Loading BootstrapConfig ${cfg.bootstrapConfigFile}")
-          val bootstrapConfig = BootstrapConfig.loadBootstrapConfig(cfg.bootstrapConfigFile)
-          println(s"Successful config: $cfg")
+          BootstrapConfig.loadBootstrapConfig(cfg.bootstrapConfigFile)
+          
+        try
           //println(s"Config file: $config")
           cfg.mode match
-            case "bootstrap" => bootstrap(bootstrapConfig, Paths.get("demo/bootstrap"))
-            case "node" => node(bootstrapConfig, StorageNodeConfig.loadStorageNode(cfg.nodeConfigFile))
+            case "bootstrap" => bootstrap(createIDA(cfg), Paths.get("demo"), 4750, 4751, 4752)
+            case "host" => host(bootstrapConfig, cfg.hostDirectory.toPath)
             case "amoeba" => amoeba_server(cfg.log4jConfigFile, bootstrapConfig)
             case "debug" => run_debug_code(cfg.log4jConfigFile, bootstrapConfig)
             case "rebuild" => rebuild(cfg.log4jConfigFile, cfg.storeName, bootstrapConfig)
@@ -290,17 +305,25 @@ object Main {
       case None =>
   }
 
+  def createIDA(args: Args): IDA =
+    require(args.width >= args.readThreshold && args.width >= args.writeThreshold)
+    require(args.readThreshold <= args.writeThreshold)
+    args.idaType match
+      case "replication" => Replication(args.width, args.writeThreshold)
+      case "reed-solomon" => ReedSolomon(args.width, args.readThreshold, args.writeThreshold)
+      case _ => throw new Exception(s"Invalid IDA type: ${args.idaType}")
+
   def createNetwork(cfg:BootstrapConfig.Config,
-                    storageNode: Option[(String, String, Int)],
+                    ohostNode: Option[(HostId, Int)],
                     oclientId: Option[ClientId]): (NetworkBridge, ZMQNetwork) = {
     val b = new NetworkBridge
-    val nodes = cfg.nodes.map(ds => ds.name -> (ds.host, ds.dataPort)).toMap
-    val stores = cfg.nodes.zipWithIndex.map { (node, index) =>
-      StoreId(PoolId(new UUID(0,0)), index.toByte) -> node.name
-    }.toMap
+    //val nodes = cfg.hosts.map(ds => ds.name -> (ds.host, ds.dataPort)).toMap
+    //val stores = cfg.hosts.zipWithIndex.map { (host, index) =>
+    //  StoreId(PoolId(new UUID(0,0)), index.toByte) -> host.name
+    //}.toMap
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    (b, new ZMQNetwork(oclientId, nodes, stores, storageNode, heartbeatPeriod,
+    (b, new ZMQNetwork(oclientId, cfg, ohostNode, heartbeatPeriod,
       b.onClientResponseReceived,
       b.onClientRequestReceived,
       b.onTransactionMessageReceived))
@@ -308,11 +331,7 @@ object Main {
 
   def createAmoebaClient(cfg: BootstrapConfig.Config,
                          onnet: Option[(NetworkBridge, ZMQNetwork)]=None): (AspenClient, ZMQNetwork, KeyValueObjectPointer) = {
-
-    val hosts = cfg.nodes.zipWithIndex.map { (node, index) =>
-      HostId(new UUID(0, index)) -> Host(HostId(new UUID(0, index)), node.name, node.host, node.dataPort, node.cncPort, node.storeTransferPort, Set.empty)
-    }.toMap
-
+    
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(cfg, None, None))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
@@ -332,8 +351,7 @@ object Main {
       initialReadDelay,
       maxReadDelay,
       txRetransmitDelay,
-      allocationRetransmitDelay,
-      hosts),  nnet, radicle)
+      allocationRetransmitDelay),  nnet, radicle)
 
     networkBridge.oclient = Some(ret._1)
 
@@ -616,18 +634,24 @@ object Main {
         }
 
 
-  def node(bootstrapCfg: BootstrapConfig.Config,
-           nodeCfg: StorageNodeConfig.StorageNode): Unit = {
+  def host(bootstrapCfg: BootstrapConfig.Config,
+           hostDir: Path): Unit = {
 
     val sched = Executors.newScheduledThreadPool(3)
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
 
-    setLog4jConfigFile(nodeCfg.log4jConfigFile)
+    val cfgFile = hostDir.resolve("aspen-host-config.yaml")
+    
+    if ! Files.exists(cfgFile) then
+      throw Exception(s"Host config file not found: $cfgFile")
+    
+    val hostCfg = HostConfig.loadHostConfig(cfgFile.toFile)
+    setLog4jConfigFile(hostCfg.log4jConfigFile)
 
-    val simpleCrl = nodeCfg.crl match {
-      case b: StorageNodeConfig.SimpleCRL =>
-        val crlRoot = Paths.get(s"${nodeCfg.rootDir}/crl")
+    val simpleCrl = hostCfg.crl match {
+      case b: HostConfig.SimpleCRL =>
+        val crlRoot = hostDir.resolve("crl")
         if ! Files.exists(crlRoot) then
           mkdirectory(crlRoot)
         SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024)
@@ -635,9 +659,7 @@ object Main {
 
     val objectCacheFactory = () => new SimpleLRUObjectCache(100)
 
-    val nodeEndpoint = Some(nodeCfg.name, nodeCfg.endpoint.host, nodeCfg.endpoint.dataPort)
-
-    val (networkBridge, nnet) = createNetwork(bootstrapCfg, nodeEndpoint, None)
+    val (networkBridge, nnet) = createNetwork(bootstrapCfg, Some((hostCfg.hostId, hostCfg.dataPort)), None)
 
     val (client, network, _) = createAmoebaClient(bootstrapCfg, Some((networkBridge, nnet)))
 
@@ -654,7 +676,7 @@ object Main {
     val nodeNet = nnet.serverMessenger
 
     val storeManager = new StoreManager(
-      nodeCfg.rootDir,
+      hostDir,
       ec,
       objectCacheFactory,
       nodeNet,
@@ -679,15 +701,15 @@ object Main {
     val cncBackend = new ZCnCBackend(
       nnet,
       client,
-      nodeCfg.rootDir.resolve("stores"),
+      hostDir.resolve("stores"), // TODO: FIX ME
       storeManager :: Nil,
-      nodeCfg.endpoint.cncPort)
+      hostCfg.cncPort)
 
-    client.getHost(nodeCfg.name).foreach:
-      case None => throw new Exception(s"Invalid Host Name: ${nodeCfg.name}")
+    client.getHost(hostCfg.name).foreach:
+      case None => throw new Exception(s"Invalid Host Name: ${hostCfg.name}")
       case Some(host) =>
         val transferBackend = new ZStoreTransferBackend(
-          nodeCfg.endpoint.storeTransferPort,
+          hostCfg.storeTransferPort,
           network,
           host.hostId,
           client,
@@ -703,32 +725,95 @@ object Main {
     Files.createDirectories(p)
   }
 
-  def bootstrap(cfg: BootstrapConfig.Config, storesDir: Path): Unit = {
+  def bootstrap(bootstrapIda: IDA,
+                baseDirectory: Path, // "demo" directory
+                dataPort: Int,
+                cncPort: Int,
+                storeTransferPort: Int): Unit = {
 
+    val hostDirectory = baseDirectory.resolve("bootstrap-host")
+    
+    if Files.exists(hostDirectory) then
+      throw new Exception(s"Bootstrap host directory exists: $hostDirectory")
+      
     val sched = Executors.newScheduledThreadPool(1)
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
+    
+    val storageDevicesDir = hostDirectory.resolve("storage-devices")
+    val bootstrapDevDir = storageDevicesDir.resolve("bootstrap-device")
+    
+    Files.createDirectories(hostDirectory)
+    Files.createDirectories(storageDevicesDir)
+    Files.createDirectories(bootstrapDevDir)
 
-    val bootstrapStores = cfg.nodes.zipWithIndex.map: (node, poolIndex) =>
+    val aspenSystemId = UUID.randomUUID()
+    
+    val hostConfig = HostConfig(
+      HostId(UUID.randomUUID()),
+      aspenSystemId,
+      "bootstrap-host",
+      "127.0.0.1",
+      dataPort,
+      cncPort,
+      storeTransferPort,
+      new File("../log4j-conf.xml"),
+      HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300)
+    )
+    
+    Files.write(
+      hostDirectory.resolve("aspen-host-config.yaml"),
+      hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
+    )
 
-      val dataStoreId = StoreId(PoolId(new UUID(0,0)), poolIndex.toByte)
+    val storageDevConfig = StorageDeviceConfig(StorageDeviceId(UUID.randomUUID()), aspenSystemId)
+    
+    Files.write(
+      bootstrapDevDir.resolve("aspen-storage-device-config.yaml"),
+      storageDevConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
+    )
 
-      val storeRoot = storesDir.resolve(s"${dataStoreId.poolId.uuid}:$poolIndex")
+    val bootstrapStores = 
+      for
+        poolIndex <- 0 until bootstrapIda.width
+      yield
 
-      println(s"Creating data store $dataStoreId. Path $storeRoot")
-      mkdirectory(storeRoot)
-      Files.writeString(storeRoot.resolve("store_config.yaml"),
-      s"""
-          |pool-uuid: "00000000-0000-0000-0000-000000000000"
-          |store-index: $poolIndex
-          |backend:
-          |  storage-engine: rocksdb
-          |""".stripMargin)
-      new RocksDBBackend(storeRoot, dataStoreId, ec)
+        val storeId = StoreId(PoolId.BootstrapPoolId, poolIndex.toByte)
+        val storeRoot = bootstrapDevDir.resolve(storeId.toString)
+        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB())
+  
+        println(s"Creating data store $storeId. Path $storeRoot")
+        mkdirectory(storeRoot)
+        Files.write(
+          storeRoot.resolve("store-config.yaml"),
+          storeConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
+        )
+        new RocksDBBackend(storeRoot, storeId, ec)
+        
+    val bootstrapStorageDevice = StorageDevice(
+      storageDevConfig.storageDeviceId,
+      Some(hostConfig.hostId),
+      bootstrapStores.map(backend => 
+        backend.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None)
+      ).toMap
+    )
+    
+    val bootstrapHost = Host(
+      hostConfig.hostId,
+      "bootstrap-host",
+      "127.0.0.1",
+      hostConfig.dataPort,
+      hostConfig.cncPort,
+      hostConfig.storeTransferPort,
+      Set(storageDevConfig.storageDeviceId)
+    )
 
-    val radicle = Bootstrap.initialize(cfg.bootstrapIDA,
-      bootstrapStores,
-      cfg.nodes.zipWithIndex.map((n, idx) => (n.name, new UUID(0, idx))))
+    val radicle = Bootstrap.initialize(
+      aspenSystemId,
+      bootstrapIda,
+      bootstrapHost,
+      bootstrapStorageDevice,
+      bootstrapStores.toList)
 
     // Print yaml representation of Radicle Pointer
     println("# NHucleus Pointer Definition")
@@ -774,19 +859,17 @@ object Main {
     val storeIndex = Integer.parseInt(arr(1))
 
     var store: Backend = null
-    var poolId: PoolId = PoolId(new UUID(0,0))
-    var storeId: StoreId = StoreId(poolId, 0.toByte)
+    var storeId: StoreId = null
 
-    cfg.nodes.zipWithIndex.foreach: (node, index) =>
-      Path.of(s"demo/${node.name}/stores").toFile.listFiles.toList.foreach: storeFn =>
-        val cfg = StoreConfig.loadStore(storeFn.toPath.resolve("store_config.yaml").toFile)
-        if poolUuid == cfg.poolUuid && storeIndex == cfg.index then
-          poolId = PoolId(cfg.poolUuid)
-          storeId = StoreId(poolId, cfg.index.toByte)
+    cfg.hosts.zipWithIndex.foreach: (node, index) =>
+      Path.of(s"demo/bootstrap-host/storage-devices/bootstrap-device").toFile.listFiles.toList.foreach: storeFn =>
+        val cfg = StoreConfig.loadStoreConfig(storeFn.toPath.resolve("store-config.yaml").toFile)
+        if poolUuid == cfg.storeId.poolId && storeIndex == cfg.storeId.poolIndex then
           cfg.backend match {
             case b: StoreConfig.RocksDB =>
-              println(s"Rebuilding data store $poolUuid:$storeIndex. Path $storeFn")
-              store = new RocksDBBackend(storeFn.toPath, storeId, client.clientContext)
+              println(s"Rebuilding data store ${cfg.storeId}. Path $storeFn")
+              storeId = cfg.storeId
+              store = new RocksDBBackend(storeFn.toPath, cfg.storeId, client.clientContext)
           }
 
     assert(store != null)
@@ -822,7 +905,7 @@ object Main {
         println(f"Rebuilt object ${os.id}")
 
     for
-      opool <- client.getStoragePool(poolId)
+      opool <- client.getStoragePool(storeId.poolId)
       allocTree = opool.get.allocationTree
       _ <- allocTree.foreach(rebuildObject)
     yield

@@ -8,8 +8,8 @@ import org.aspen_ddp.aspen.common.objects.Metadata
 
 object ProtobufMessageEncoder:
 
-  def encodeMessage(msg: NodeHeartbeat): Array[Byte] = {
-    val arr = codec.Message.newBuilder().setNodeHeartbeat(Codec.encode(msg)).build.toByteArray
+  def encodeMessage(msg: HostHeartbeat): Array[Byte] = {
+    val arr = codec.Message.newBuilder().setHostHeartbeat(Codec.encode(msg)).build.toByteArray
 
     val msgarr = new Array[Byte](4 + arr.length)
     val bb = ByteBuffer.wrap(msgarr)

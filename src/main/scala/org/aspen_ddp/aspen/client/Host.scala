@@ -2,10 +2,22 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.common.util.YamlFormat.{Format, FormatError}
 
 import java.util.UUID
 
 final case class HostId(uuid: UUID) extends AnyVal
+
+object HostId:
+
+  object YHostId extends Format[HostId]:
+    override def format(o: Object): HostId = o match
+      case v: java.lang.String =>
+        try
+          HostId(UUID.fromString(v))
+        catch
+          case t: Throwable => throw new FormatError(s"Invalid UUID: $t")
+      case _ => throw new FormatError(s"String Required")
 
 
 object Host:

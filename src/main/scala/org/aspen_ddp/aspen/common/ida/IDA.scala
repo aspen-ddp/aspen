@@ -35,6 +35,9 @@ object IDA {
 
 sealed abstract class IDA extends Ordered[IDA] {
 
+  /** Algorithm name like "replication" or "reed-solomon" */
+  def name: String
+  
   /** Number of slices/replicas */
   def width: Int
 
@@ -108,6 +111,8 @@ sealed abstract class IDA extends Ordered[IDA] {
 
 case class Replication(width: Int, writeThreshold: Int) extends IDA {
 
+  def name: String = "replication"
+  
   def restoreThreshold: Int = 1
 
   def consistentRestoreThreshold: Int = width / 2 + 1
@@ -153,6 +158,8 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA {
 case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int)
   extends IDA {
 
+  def name: String = "reed-solomon"
+  
   def consistentRestoreThreshold: Int = restoreThreshold
 
   def restore(segments: List[(Byte,DataBuffer)]): DataBuffer = throw new IDANotSupportedError

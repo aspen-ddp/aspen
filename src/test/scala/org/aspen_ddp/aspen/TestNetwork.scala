@@ -21,7 +21,7 @@ import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreManager, transaction}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
-import org.aspen_ddp.aspen.server.store.{BackendStoreLoader, Bootstrap}
+import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
@@ -198,17 +198,16 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     }
   }
 
-  val storeLoader = new BackendStoreLoader {
-    override def loadStoreFromPath(storePath: Path)(using ec: ExecutionContext): Option[Backend] = ???
-  }
-
   val smgr = new StoreManager(
     new UUID(0,0),
     Path.of("/"),
     executionContext,
-    objectCacheFactory, this, BackgroundTaskManager.NoBackgroundTaskManager,
-    TestCRL, FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,
-    storeLoader,
+    objectCacheFactory,
+    this,
+    BackgroundTaskManager.NoBackgroundTaskManager,
+    TestCRL,
+    FinalizerFactory,
+    TransactionDriver.noErrorRecoveryFactory,
     Duration(5, SECONDS))
   
   smgr.loadStore(store0)
@@ -226,7 +225,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
           printStack()
 
     synchronized:
-      smgr.handleEvents()
+      smgr.testingOnlyHandleEvents()
   }
 
   private val cliMessenger = new ClientMessenger {
@@ -250,7 +249,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
   FinalizerFactory.client = client
 
   // process load store events
-  smgr.handleEvents()
+  smgr.testingOnlyHandleEvents()
 
   override def sendClientResponse(msg: ClientResponse): Unit = {
     handleEvents()

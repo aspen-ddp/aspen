@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
-import org.aspen_ddp.aspen.server.store.{BackendStoreLoader, Frontend, Store}
+import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend}
@@ -55,7 +55,6 @@ class StoreManager(val aspenSystemId: UUID,
                    crlFactory: CrashRecoveryLogFactory,
                    val finalizerFactory: TransactionFinalizer.Factory,
                    val txDriverFactory: TransactionDriver.Factory,
-                   val storeLoader: BackendStoreLoader,
                    val heartbeatPeriod: Duration) extends Logging {
   import StoreManager._
   
@@ -185,7 +184,7 @@ class StoreManager(val aspenSystemId: UUID,
   }
 
   /** Handles all events in the event queue. Returns when the queue is empty */
-  def handleEvents(): Unit = {
+  def testingOnlyHandleEvents(): Unit = {
     var event = events.poll(0, TimeUnit.NANOSECONDS)
     while (event != null) {
       handleEvent(event)

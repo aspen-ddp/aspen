@@ -685,7 +685,6 @@ object Main {
       simpleCrl,
       txFinalizerFactory,
       SimpleTransactionDriver.factory(txRetryDelay, txRetryCap),
-      new BackendStoreLoaderImpl,
       txHeartbeatPeriod,
     ) with SimpleDriverRecoveryMixin
 

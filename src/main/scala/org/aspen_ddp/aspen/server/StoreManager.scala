@@ -192,11 +192,6 @@ class StoreManager(val aspenSystemId: UUID,
     }
   }
 
-  /** Preforms a blocking poll on the event queue, awaitng the delivery of an event */
-  protected def awaitEvent(): Unit = {
-    handleEvent(events.poll(1, TimeUnit.DAYS))
-  }
-
   private def handleEvent(event: Event): Unit = synchronized {
     event match {
 

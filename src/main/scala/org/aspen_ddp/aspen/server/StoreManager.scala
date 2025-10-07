@@ -197,7 +197,7 @@ class StoreManager(val aspenSystemId: UUID,
     handleEvent(events.poll(1, TimeUnit.DAYS))
   }
 
-  private def handleEvent(event: Event): Unit = {
+  private def handleEvent(event: Event): Unit = synchronized {
     event match {
 
       case IOCompletion(op) => stores.get(op.storeId).foreach { store =>

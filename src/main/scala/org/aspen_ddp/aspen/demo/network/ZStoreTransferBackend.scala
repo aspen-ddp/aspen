@@ -16,10 +16,10 @@ class ZStoreTransferBackend(val transferPort: Int,
                             val storeManager: StoreManager) extends Logging:
 
   logger.info("Starting StoreTransferBackend")
-  val incomingDir = storeManager.storesDir.resolve("incoming")
+  //val incomingDir = storeManager.storesDir.resolve("incoming")
 
-  if ! Files.exists(incomingDir) then
-    Files.createDirectories(incomingDir)
+  //if ! Files.exists(incomingDir) then
+  //  Files.createDirectories(incomingDir)
 
   private val rthread = new Thread {
     override def run(): Unit = rcvThread()
@@ -46,7 +46,7 @@ class ZStoreTransferBackend(val transferPort: Int,
             logger.info(s"Beginning transfer of store ${storeId.directoryName}")
             val pb = new ProcessBuilder()
             pb.command("tar", "-xzf", "-")
-            pb.directory(incomingDir.toFile)
+            //pb.directory(incomingDir.toFile)
 
             val process = pb.start
             imap += (storeId -> process)
@@ -57,9 +57,9 @@ class ZStoreTransferBackend(val transferPort: Int,
           ps.getOutputStream.close()
           ps.waitFor() // Block here till process exits
           imap -= storeId
-          val storeDir = storeManager.storesDir.resolve(storeId.directoryName)
-          Files.move(incomingDir.resolve(storeId.directoryName), storeDir)
-          storeManager.loadStoreById(storeId)
+          //val storeDir = storeManager.storesDir.resolve(storeId.directoryName)
+          //Files.move(incomingDir.resolve(storeId.directoryName), storeDir)
+          //storeManager.loadStoreById(storeId)
           logger.info(s"Completed transfer of store ${storeId.directoryName}")
 
           given ExecutionContext = client.clientContext
@@ -69,6 +69,7 @@ class ZStoreTransferBackend(val transferPort: Int,
 
         else
           ps.getOutputStream.write(data)
-
+          
+ 
 
 

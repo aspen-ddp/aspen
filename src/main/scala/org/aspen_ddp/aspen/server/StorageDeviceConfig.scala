@@ -22,6 +22,8 @@ case class StorageDeviceConfig(storageDeviceId: StorageDeviceId,
 
 object StorageDeviceConfig extends YObject[StorageDeviceConfig]:
 
+  val configFilename = "aspen-storage-device-config.yaml"
+  
   val storageDeviceId: Required[StorageDeviceId] = Required("storage-device-id", StorageDeviceId.YStorageDeviceId)
   val aspenSystemId: Required[UUID]              = Required("aspen-system-id", YUUID)
 

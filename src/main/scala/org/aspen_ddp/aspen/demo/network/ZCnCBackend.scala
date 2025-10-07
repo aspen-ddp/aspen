@@ -21,8 +21,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
 
 class ZCnCBackend(val network: ZMQNetwork,
                   val client: AspenClient,
-                  val storesDir: Path,
-                  val storeManagers: List[StoreManager],
+                  val storesManager: StoreManager,
                   val cncPort: Int) extends Logging:
 
   private val completionQueue = new LinkedBlockingQueue[String]()
@@ -59,17 +58,17 @@ class ZCnCBackend(val network: ZMQNetwork,
           if cmsg.hasNewStore then
             val message = Codec.decode(cmsg.getNewStore)
             logger.trace(s"Got CnC message $message")
-            onNewStore(message)
+            //onNewStore(message)
 
           if cmsg.hasShutdownStore then
             val message = Codec.decode(cmsg.getShutdownStore)
             logger.trace(s"Got CnC message $message")
-            onShutdownStore(message)
+            //onShutdownStore(message)
 
           if cmsg.hasTransferStore then
             val message = Codec.decode(cmsg.getTransferStore)
             logger.trace(s"Got CnC message $message")
-            onTransferStore(message)
+            //onTransferStore(message)
 
           // Wait for operation completion
           val m = completionQueue.take()
@@ -82,7 +81,7 @@ class ZCnCBackend(val network: ZMQNetwork,
 
           repSocket.send(rmsg)
 
-
+/*
   def onNewStore(msg: NewStore): Unit =
     val backend = msg.backendType match
       case b: RocksDBConfig =>
@@ -120,6 +119,6 @@ class ZCnCBackend(val network: ZMQNetwork,
           stf.send(msg.storeId, host.address, host.storeTransferPort)
 
 
-
+ */
 
 

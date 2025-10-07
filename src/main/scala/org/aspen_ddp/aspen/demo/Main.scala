@@ -676,6 +676,7 @@ object Main {
     val nodeNet = nnet.serverMessenger
 
     val storeManager = new StoreManager(
+      bootstrapCfg.aspenSystemId,
       hostDir,
       ec,
       objectCacheFactory,
@@ -701,8 +702,7 @@ object Main {
     val cncBackend = new ZCnCBackend(
       nnet,
       client,
-      hostDir.resolve("stores"), // TODO: FIX ME
-      storeManager :: Nil,
+      storeManager,
       hostCfg.cncPort)
 
     client.getHost(hostCfg.name).foreach:
@@ -769,7 +769,7 @@ object Main {
     val storageDevConfig = StorageDeviceConfig(StorageDeviceId(UUID.randomUUID()), aspenSystemId)
 
     Files.write(
-      bootstrapDevDir.resolve(StorageDevice.configFilename),
+      bootstrapDevDir.resolve(StorageDeviceConfig.configFilename),
       storageDevConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
     )
 

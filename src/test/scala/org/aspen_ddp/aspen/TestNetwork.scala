@@ -202,7 +202,9 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     override def loadStoreFromPath(storePath: Path)(using ec: ExecutionContext): Option[Backend] = ???
   }
 
-  val smgr = new StoreManager(Path.of("/"),
+  val smgr = new StoreManager(
+    new UUID(0,0),
+    Path.of("/"),
     executionContext,
     objectCacheFactory, this, BackgroundTaskManager.NoBackgroundTaskManager,
     TestCRL, FinalizerFactory, TransactionDriver.noErrorRecoveryFactory,

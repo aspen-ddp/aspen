@@ -22,8 +22,6 @@ object StorageDeviceId:
 
 object StorageDevice:
 
-  val configFilename = "aspen-storage-device-config.yaml"
-
   def apply(buff: Array[Byte]): StorageDevice = Codec.decode(codec.StorageDevice.parseFrom(buff))
   
   enum StoreStatus:

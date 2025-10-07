@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
+import org.aspen_ddp.aspen.client.{StorageDevice, StorageDeviceId, ObjectState as ClientObjectState}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -19,32 +19,35 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+import java.util.UUID
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
-object StoreManager {
-  sealed abstract class Event
+object StoreManager:
+  private sealed abstract class Event
 
-  case class IOCompletion(op: Completion) extends Event
-  case class TransactionMessage(msg: TxMessage) extends Event
-  case class ClientReq(msg: ClientRequest) extends Event
-  case class Repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]) extends Event
-  case class LoadStore(backend: Backend, completion: Promise[Unit]) extends Event
-  case class LoadStoreById(storeId: StoreId) extends Event
-  case class Exit() extends Event
-  case class RecoveryEvent() extends Event
-  case class HeartbeatEvent() extends Event
-  case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
+  private case class IOCompletion(op: Completion) extends Event
+  private case class TransactionMessage(msg: TxMessage) extends Event
+  private case class ClientReq(msg: ClientRequest) extends Event
+  private case class Repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]) extends Event
+  private case class LoadStore(backend: Backend, completion: Promise[Unit]) extends Event
+  private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
+  private case class Exit() extends Event
+  private case class RecoveryEvent() extends Event
+  private case class HeartbeatEvent() extends Event
+  private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
 
-  class IOHandler(mgr: StoreManager) extends CompletionHandler {
-    override def complete(op: Completion): Unit = {
+  class IOHandler(mgr: StoreManager) extends CompletionHandler:
+    override def complete(op: Completion): Unit =
       mgr.events.add(IOCompletion(op))
-    }
-  }
-  
-}
 
-class StoreManager(val rootDir: Path,
+  class StorageDeviceState(val storageDeviceId: StorageDeviceId,
+                           val devicePath: Path):
+    var loadedStores: Set[StoreId] = Set()
+
+
+class StoreManager(val aspenSystemId: UUID,
+                   val rootDir: Path,
                    val ec: ExecutionContext,
                    val objectCacheFactory: () => ObjectCache,
                    val net: Messenger,
@@ -71,42 +74,58 @@ class StoreManager(val rootDir: Path,
   protected var shutdownCalled = false
   private val shutdownPromise: Promise[Unit] = Promise()
 
-  val storesDir: Path = rootDir.resolve("stores")
+  val storageDevicesDir: Path = rootDir.resolve("storage-devices")
 
-  def start(): Unit = {
-    threadPool.submit(new Runnable {
-      override def run(): Unit = {
-        while (!shutdownCalled) {
-          var event = events.poll(3, TimeUnit.SECONDS)
-          while (event != null) {
-            handleEvent(event)
-            event = events.poll(0, TimeUnit.SECONDS)
-          }
-        }
-      }
-    })
-  }
+  protected var storageDevices: Map[StorageDeviceId, StorageDeviceState] = Map()
+  protected var stores: Map[StoreId, Store] = Map()
 
   backgroundTasks.schedulePeriodic(heartbeatPeriod) {
     events.put(HeartbeatEvent())
   }
 
-  protected var stores: Map[StoreId, Store] = Map()
+  if ! Files.isDirectory(storageDevicesDir) then
+    logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
+  else
+    storageDevicesDir.toFile.listFiles().foreach: sdFile =>
+      tryLoadDevice(sdFile)
 
-  val filesArray = rootDir.resolve("stores").toFile.listFiles()
+  private def tryLoadDevice(sdFile: File): Unit =
+    val storageDevicePath = sdFile.toPath
+    val sdCfgPath = storageDevicePath.resolve(StorageDeviceConfig.configFilename)
 
-  if filesArray != null then
-    filesArray.toList.filter{ fn =>
-      Files.exists(fn.toPath.resolve("store_config.yaml"))
-    }.foreach: fn =>
-      loadStoreFromPath(fn.toPath)
-  
-  protected def loadStoreFromPath(storePath: Path): Unit =
-    storeLoader.loadStoreFromPath(storePath) match
-      case None => logger.info(s"Skipping non-store directory: ${storePath}")
-      case Some(backend) =>
-        logger.info(s"Loading store $storePath")
-        loadStore(backend)
+    if Files.isDirectory(sdFile.toPath) && Files.exists(sdCfgPath) then
+      val sdCfg = StorageDeviceConfig.loadHostConfig(sdCfgPath.toFile)
+      if sdCfg.aspenSystemId != aspenSystemId then
+        logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+      else
+        val sds = new StorageDeviceState(sdCfg.storageDeviceId, storageDevicePath)
+        storageDevices += sdCfg.storageDeviceId -> sds
+        sdFile.listFiles.foreach: potentialStoreFile =>
+          tryLoadStore(sds, potentialStoreFile)
+
+  private def tryLoadStore(sds: StorageDeviceState, potentialStoreFile: File): Unit =
+    val storeCfgPath = potentialStoreFile.toPath.resolve(StoreConfig.configFilename)
+    if Files.exists(storeCfgPath) then
+      val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath.toFile)
+      val backend = storeCfg.backend match
+        case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
+      sds.loadedStores += backend.storeId
+      logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
+      loadStore(backend)
+
+  def start(): Unit =
+    threadPool.submit(new Runnable {
+      override def run(): Unit =
+        while !shutdownCalled do
+          var event = events.poll(3, TimeUnit.SECONDS)
+          while (event != null)
+            handleEvent(event)
+            event = events.poll(0, TimeUnit.SECONDS)
+    })
+
+  def getDevicePath(storageDeviceId: StorageDeviceId): Option[Path] = synchronized {
+    storageDevices.get(storageDeviceId).map(_.devicePath)
+  }
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
@@ -131,8 +150,8 @@ class StoreManager(val rootDir: Path,
     p.future
   }
 
-  def loadStoreById(storeId: StoreId): Unit =
-    events.put(LoadStoreById(storeId))
+  def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
+    events.put(LoadStoreById(storageDeviceId, storeId))
 
   def receiveTransactionMessage(msg: TxMessage): Unit = {
     events.put(TransactionMessage(msg))
@@ -235,9 +254,9 @@ class StoreManager(val rootDir: Path,
         else
           p.success(())
 
-      case LoadStoreById(storeId) =>
-        if ! stores.contains(storeId) then
-          loadStoreFromPath(storesDir.resolve(storeId.directoryName))
+      case LoadStoreById(storageDeviceId, storeId) =>
+        storageDevices.get(storageDeviceId).foreach: sds =>
+          tryLoadStore(sds, sds.devicePath.resolve(storeId.directoryName).toFile)
         
       case HeartbeatEvent() =>
         //logger.trace("Main loop got heartbeat event")

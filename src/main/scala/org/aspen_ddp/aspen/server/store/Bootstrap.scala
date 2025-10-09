@@ -24,10 +24,10 @@ object Bootstrap:
                  stores: List[Backend]): KeyValueObjectPointer = {
 
     require( ida.width == stores.length )
-    
+
     val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
       aspenSystemId = aspenSystemId,
-      ida = ida, 
+      ida = ida,
       hosts = List(bootstrapHost),
       storeMap = stores.map(backend => backend.storeId -> bootstrapHost.hostId)
     )
@@ -37,6 +37,8 @@ object Bootstrap:
       ObjectRefcount(1,1),
       HLCTimestamp.now
     )
+
+    var allocTreeContent: List[(Key, Array[Byte])] = Nil
 
     def allocate(content: List[(Key, Array[Byte])] = Nil,
                  objectId: Option[ObjectId] = None): KeyValueObjectPointer = {
@@ -53,7 +55,11 @@ object Bootstrap:
         store.bootstrapAllocate(oid, ObjectType.KeyValue, bootstrapMetadata, storeData)
       }
 
-      KeyValueObjectPointer(oid, Radicle.poolId, None, ida, storePointers)
+      val p = KeyValueObjectPointer(oid, Radicle.poolId, None, ida, storePointers)
+
+      allocTreeContent = (Key(p.id.uuid) -> p.toArray) :: allocTreeContent
+
+      p
     }
 
     def overwrite(pointer: KeyValueObjectPointer,
@@ -75,7 +81,7 @@ object Bootstrap:
 
     val storeHosts = (0 until ida.width).map(_ => bootstrapHost.hostId).toArray
 
-    val poolConfig = SimpleStoragePool.encode(Radicle.poolId, "bootstrap", ida.width, ida, storeHosts, None)
+    val poolConfig = SimpleStoragePool.encode(Radicle.poolId, "aspen-bootstrap", ida.width, ida, storeHosts, None)
     val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), BootstrapPoolNodeAllocator).encode()
     val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), BootstrapPoolNodeAllocator).encode()
 
@@ -93,23 +99,29 @@ object Bootstrap:
       BootstrapPoolNodeAllocator)
 
     val poolNameTreeRootObj = allocate(List(
-      Key("bootstrap") -> uuid2byte(Radicle.poolId.uuid)
+      Key("aspen-bootstrap") -> uuid2byte(Radicle.poolId.uuid)
     ))
     val poolNameTree = Root(0,
       ByteArrayKeyOrdering,
       Some(poolNameTreeRootObj),
       BootstrapPoolNodeAllocator)
 
+    val storageDevicePtr = allocate(List(
+      StorageDevice.StateKey ->  bootstrapStorageDevice.encode()
+    ))
     val storageDeviceTreeRootObj = allocate(List(
-      Key(bootstrapStorageDevice.storageDeviceId.uuid) -> bootstrapStorageDevice.encode()
+      Key(bootstrapStorageDevice.storageDeviceId.uuid) -> storageDevicePtr.toArray
     ))
     val storageDeviceTree = Root(0,
       ByteArrayKeyOrdering,
       Some(storageDeviceTreeRootObj),
       BootstrapPoolNodeAllocator)
 
+    val hostPtr = allocate(List(
+      Host.StateKey -> bootstrapHost.encode()
+    ))
     val hostsTreeRootObj = allocate(List(
-      Key(bootstrapHost.hostId.uuid) -> bootstrapHost.encode()
+      Key(bootstrapHost.hostId.uuid) -> hostPtr.toArray
     ))
     val hostsTree = Root(0,
       ByteArrayKeyOrdering,
@@ -136,17 +148,7 @@ object Bootstrap:
 
     val radicle = allocate(radicleContent, Some(Radicle.objectId))
 
-    overwrite(allocTreeRoot, List(
-      Key(errTreeRoot.id.uuid) -> errTreeRoot.toArray,
-      Key(allocTreeRoot.id.uuid) -> allocTreeRoot.toArray,
-      Key(poolPointer.id.uuid) -> poolPointer.toArray,
-      Key(poolTreeRoot.id.uuid) -> poolTreeRoot.toArray,
-      Key(poolNameTreeRootObj.id.uuid) -> poolNameTreeRootObj.toArray,
-      Key(storageDeviceTreeRootObj.id.uuid) -> storageDeviceTreeRootObj.toArray,
-      Key(hostsTreeRootObj.id.uuid) -> hostsTreeRootObj.toArray,
-      Key(hostsNameTreeRootObj.id.uuid) -> hostsNameTreeRootObj.toArray,
-      Key(radicle.id.uuid) -> radicle.toArray
-    ))
+    overwrite(allocTreeRoot, allocTreeContent)
 
     if false then
       println(s"ErrorTreeRoot: ${errTreeRoot.id.uuid}")

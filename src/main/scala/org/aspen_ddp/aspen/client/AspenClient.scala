@@ -34,9 +34,9 @@ trait AspenClient extends ObjectReader {
 
   def newTransaction(): Transaction
 
-  def getStoragePool(poolId: PoolId): Future[Option[StoragePool]]
+  def getStoragePool(poolId: PoolId): Future[StoragePool]
 
-  def getStoragePool(poolName: String): Future[Option[StoragePool]]
+  def getStoragePool(poolName: String): Future[StoragePool]
 
   private[aspen] def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit]
 
@@ -62,9 +62,9 @@ trait AspenClient extends ObjectReader {
 
   protected def createStoragePool(config: StoragePool.Config): Future[StoragePool]
 
-  def getHost(hostId: HostId): Future[Option[Host]]
+  def getHost(hostId: HostId): Future[Host]
 
-  def getHost(hostName: String): Future[Option[Host]]
+  def getHost(hostName: String): Future[Host]
 
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()

@@ -63,9 +63,9 @@ object BaseReadDriverSuite {
 
     def newTransaction(): Transaction = null
 
-    def getStoragePool(poolId: PoolId): Future[Option[StoragePool]] = null
+    def getStoragePool(poolId: PoolId): Future[StoragePool] = null
 
-    def getStoragePool(poolName: String): Future[Option[StoragePool]] = null
+    def getStoragePool(poolName: String): Future[StoragePool] = null
 
     override def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit] = ???
 
@@ -76,9 +76,9 @@ object BaseReadDriverSuite {
 
     protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
 
-    def getHost(hostId: HostId): Future[Option[Host]] = null
+    def getHost(hostId: HostId): Future[Host] = null
 
-    def getHost(hostName: String): Future[Option[Host]] = null
+    def getHost(hostName: String): Future[Host] = null
 
     val retryStrategy: RetryStrategy = null
 

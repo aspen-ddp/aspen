@@ -58,7 +58,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
         List(Insert(key, value.bytes)))
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       dp <- alloc.allocateDataObject(ObjectRevisionGuard(radicle, ikvos.revision), Array[Byte](0))
 
@@ -92,7 +92,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
 
       pool <- client.getStoragePool(Radicle.poolId)
 
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       kp <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(key -> value))
 
@@ -130,7 +130,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
 
       pool <- client.getStoragePool(Radicle.poolId)
 
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       kp <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(key -> value))
 
@@ -166,7 +166,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
         List(Insert(key, value.bytes)))
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       dp <- alloc.allocateDataObject(ObjectRevisionGuard(radicle, ikvos.revision), Array[Byte](0))
 

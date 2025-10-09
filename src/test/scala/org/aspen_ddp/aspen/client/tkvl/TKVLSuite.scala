@@ -21,7 +21,7 @@ class TKVLSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
 
@@ -59,7 +59,7 @@ class TKVLSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
 
@@ -108,7 +108,7 @@ class TKVLSuite extends IntegrationTestSuite {
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
 
@@ -147,7 +147,7 @@ class TKVLSuite extends IntegrationTestSuite {
       ikvos <- client.read(radicle)
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
 
@@ -207,7 +207,7 @@ class TKVLSuite extends IntegrationTestSuite {
       ikvos <- client.read(radicle)
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
 
@@ -268,7 +268,7 @@ class TKVLSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
 

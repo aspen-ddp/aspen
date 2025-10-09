@@ -373,8 +373,8 @@ object Main {
       case None =>
         println("Creating Amoeba")
         val guard = ObjectRevisionGuard(kvos.pointer, kvos.revision)
-        client.getStoragePool(kvos.pointer.poolId).flatMap { opool =>
-          val allocator = new SinglePoolObjectAllocator(client, opool.get, kvos.pointer.ida, None)
+        client.getStoragePool(kvos.pointer.poolId).flatMap { pool =>
+          val allocator = new SinglePoolObjectAllocator(client, pool, kvos.pointer.ida, None)
           SimpleFileSystem.bootstrap(client, guard, allocator, kvos.pointer, AmoebafsKey)
         }
     }
@@ -483,7 +483,7 @@ object Main {
       kvos <- client.read(radicle)
       _ = println("------------ Getting Storage Pool---------------")
       pool <- client.getStoragePool(kvos.pointer.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
       _ = println("------------ Allocating Data Object ---------------")
       key = Key(100)
       dptr <- allocObject(kvos.contents.get(key), kvos, alloc)
@@ -624,8 +624,8 @@ object Main {
       min(0) = storeId.poolIndex
       max(0) = (storeId.poolIndex + 1).toByte
       for
-        opool <- client.getStoragePool(storeId.poolId)
-        _ <- opool.get.errorTree.foreachInRange(Key(min), Key(max), repairOne(opool.get, storeId))
+        pool <- client.getStoragePool(storeId.poolId)
+        _ <- pool.errorTree.foreachInRange(Key(min), Key(max), repairOne(pool, storeId))
       yield
         println(s"*** Repair Process Complete for Store ${storeId} ***")
         Future {
@@ -704,15 +704,13 @@ object Main {
       storeManager,
       hostCfg.cncPort)
 
-    client.getHost(hostCfg.name).foreach:
-      case None => throw new Exception(s"Invalid Host Name: ${hostCfg.name}")
-      case Some(host) =>
-        val transferBackend = new ZStoreTransferBackend(
-          hostCfg.storeTransferPort,
-          network,
-          host.hostId,
-          client,
-          storeManager)
+    client.getHost(hostCfg.name).foreach: host =>
+      val transferBackend = new ZStoreTransferBackend(
+        hostCfg.storeTransferPort,
+        network,
+        host.hostId,
+        client,
+        storeManager)
 
     // Kickoff repair loop
     repair(client, storeManager)
@@ -904,8 +902,8 @@ object Main {
         println(f"Rebuilt object ${os.id}")
 
     for
-      opool <- client.getStoragePool(storeId.poolId)
-      allocTree = opool.get.allocationTree
+      pool <- client.getStoragePool(storeId.poolId)
+      allocTree = pool.allocationTree
       _ <- allocTree.foreach(rebuildObject)
     yield
       store.rebuildFlush()
@@ -944,10 +942,7 @@ object Main {
       case "reed-solomon" => ReedSolomon(width, readThreshold, writeThreshold)
       case _ => throw new Exception(s"Invalid IDA type: $idaType")
 
-    def getHost(name: String): Future[Host] =
-      client.getHost(name).map:
-        case None => throw new Exception(f"Host name not found: $name")
-        case Some(host) => host
+    def getHost(name: String): Future[Host] = client.getHost(name)
 
     for
       hlist <- Future.sequence(hosts.map(getHost))
@@ -980,10 +975,10 @@ object Main {
     val storeId = StoreId(storeName)
 
     for
-      newHost <- someOrThrow(client.getHost(hostName), new Exception(f"Host name not found: $hostName"))
-      sp <- someOrThrow(client.getStoragePool(storeId.poolId), new Exception(f"StoragePool not found ${storeId.poolId}"))
+      newHost <- client.getHost(hostName)
+      sp <- client.getStoragePool(storeId.poolId)
       curHostId = sp.storeHosts(storeId.poolIndex)
-      currentHost <- someOrThrow(client.getHost(curHostId), new Exception(f"Host name not found: $curHostId"))
+      currentHost <- client.getHost(curHostId)
 
       zfrontend = new ZCnCFrontend(network, currentHost)
       _ <- zfrontend.send(TransferStore(storeId, newHost.hostId))

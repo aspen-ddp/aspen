@@ -23,7 +23,7 @@ class AllocationFinalizationAction(val client: AspenClient,
 
   def execute(): Unit = client.retryStrategy.retryUntilSuccessful {
     for {
-      pool <- someOrThrow(client.getStoragePool(newObject.poolId), StopRetrying(new Exception("Storage Pool Does Not Exist")))
+      pool <- client.getStoragePool(newObject.poolId)
       tx = client.newTransaction()
       _ <- pool.allocationTree.set(Key(newObject.id.toBytes), Value(newObject.toArray))(using tx)
       _ <- tx.commit()

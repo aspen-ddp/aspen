@@ -22,7 +22,7 @@ object SimpleStoragePool {
 
   def apply(client: AspenClient, kvos: KeyValueObjectState): SimpleStoragePool = {
 
-    val cfg = StoragePool.Config(kvos.contents(StoragePool.ConfigKey).value.bytes)
+    val cfg = StoragePool.Config(kvos)
 
     val allocTree = new TieredKeyValueList(client,
       new KVObjectRootManager(client, StoragePool.AllocationTreeKey, kvos.pointer))

@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.Key
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.codec
 
-object StoragePool {
+object StoragePool:
   private [aspen] val ConfigKey = Key(Array[Byte](0))
   private [aspen] val ErrorTreeKey = Key(Array[Byte](1))
   private [aspen] val AllocationTreeKey = Key(Array[Byte](2))
@@ -26,7 +26,8 @@ object StoragePool {
   object Config:
     def apply(cfg: Array[Byte]): Config = Codec.decode(codec.PoolConfig.parseFrom(cfg))
 
-}
+    def apply(kvos: KeyValueObjectState): Config = Config(kvos.contents(ConfigKey).value.bytes)
+  
 
 trait StoragePool {
 

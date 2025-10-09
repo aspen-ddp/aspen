@@ -47,33 +47,31 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     rmgr.read(pointer, comment).map(_.asInstanceOf[KeyValueObjectState])
 
   private val txManager = new TransactionManager(this, SimpleClientTransactionDriver.factory(txRetransmitDelay))
+  
+  private def getTree(treeKey: Key): TieredKeyValueList =
+    val root = new KVObjectRootManager(this, treeKey, radicle)
+    new TieredKeyValueList(this, root)
 
   def newTransaction(): Transaction =
     TransactionImpl(this, txManager, _ => 0, None)
 
-  def getStoragePool(poolId: PoolId): Future[Option[StoragePool]] =
-    val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
-    val tkvl = new TieredKeyValueList(this, root)
+  def getStoragePool(poolId: PoolId): Future[StoragePool] =
+    val tkvl = getTree(Radicle.PoolTreeKey)
 
     tkvl.get(Key(poolId.uuid)).flatMap:
-      case None => Future.successful(None)
+      case None => Future.failed(new NoSuchElementException(poolId.toString))
       case Some(poolPtr) => read(KeyValueObjectPointer(poolPtr.value.bytes)).map: poolKvos =>
-        Some(SimpleStoragePool(this, poolKvos))
+        SimpleStoragePool(this, poolKvos)
 
-  def getStoragePool(poolName: String): Future[Option[StoragePool]] =
-    if poolName.toLowerCase == "bootstrap" then
-      getStoragePool(PoolId(new UUID(0,0)))
-    else
-      val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
-      val tkvl = new TieredKeyValueList(this, root)
+  def getStoragePool(poolName: String): Future[StoragePool] =
+    val tkvl = getTree(Radicle.PoolNameTreeKey)
 
-      tkvl.get(Key(poolName)).flatMap:
-        case None => Future.successful(None)
-        case Some(poolIdBytes) => getStoragePool(PoolId(byte2uuid(poolIdBytes.value.bytes)))
+    tkvl.get(Key(poolName)).flatMap:
+      case None => Future.failed(new NoSuchElementException(poolName))
+      case Some(poolIdBytes) => getStoragePool(PoolId(byte2uuid(poolIdBytes.value.bytes)))
 
   override def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit] =
-    val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
-    val tkvl = new TieredKeyValueList(this, root)
+    val tkvl = getTree(Radicle.PoolTreeKey)
 
     given tx: Transaction = newTransaction()
     
@@ -130,8 +128,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       yield poolPtr
     
     for
-      obsPool <- getStoragePool("bootstrap")
-      bsPool = obsPool.get
+      bsPool <- getStoragePool(PoolId.BootstrapPoolId)
       poolPtr <- createPoolObj(bsPool.defaultAllocator)
       _ <- tkvl.set(Key(config.poolId.uuid), Value(poolPtr.toArray))
       _ <- nameTkvl.set(Key(config.name), Value(uuid2byte(config.poolId.uuid)))
@@ -140,24 +137,22 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     yield
       SimpleStoragePool(this, poolKvos)
 
-  def getHost(hostId: HostId): Future[Option[Host]] =
+  def getHost(hostId: HostId): Future[Host] =
     val root = new KVObjectRootManager(this, Radicle.HostsTreeKey, radicle)
     val tkvl = new TieredKeyValueList(this, root)
     for
       ohostValue <- tkvl.get(Key(hostId.uuid))
     yield
       ohostValue match
-        case Some(hostValue) => Some(Host(hostValue.value.bytes))
-        case None => None
+        case Some(hostValue) => Host(hostValue.value.bytes)
+        case None => throw new NoSuchElementException(hostId.toString)
 
-  def getHost(hostName: String): Future[Option[Host]] =
+  def getHost(hostName: String): Future[Host] =
     val root = new KVObjectRootManager(this, Radicle.HostsNameTreeKey, radicle)
     val tkvl = new TieredKeyValueList(this, root)
-    tkvl.get(Key(hostName)).flatMap {
+    tkvl.get(Key(hostName)).flatMap:
         case Some(uuid) => getHost(HostId(byte2uuid(uuid.value.bytes)))
-        case None => Future.successful(None)
-    }
-
+        case None => throw new NoSuchElementException(hostName)
 
   override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 

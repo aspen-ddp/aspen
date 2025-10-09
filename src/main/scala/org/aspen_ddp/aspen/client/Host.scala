@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.common.objects.Key
 import org.aspen_ddp.aspen.common.util.YamlFormat.{Format, FormatError}
 
 import java.util.UUID
@@ -21,6 +22,8 @@ object HostId:
 
 
 object Host:
+  private [aspen] val StateKey = Key(Array[Byte](0))
+
   def apply(buff: Array[Byte]): Host = Codec.decode(codec.Host.parseFrom(buff))
 
 

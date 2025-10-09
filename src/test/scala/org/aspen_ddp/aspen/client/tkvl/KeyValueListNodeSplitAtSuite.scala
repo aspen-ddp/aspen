@@ -17,7 +17,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       contentStates = contents.map((k, v) => k -> ValueState(v, tx.revision, HLCTimestamp.now))
 
@@ -61,7 +61,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
       _ <- tx.commit().map(_=>())
@@ -120,7 +120,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, true, None, alloc)
       _ <- tx.commit().map(_ => ())
@@ -176,7 +176,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
       _ <- tx.commit().map(_=>())
@@ -221,7 +221,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
       _ <- tx.commit().map(_=>())
@@ -264,7 +264,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       // Create a down pointer to include
       downContents = Map(createKey(10) -> createValue(100))
@@ -305,7 +305,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
       _ <- tx.commit().map(_=>())
@@ -339,7 +339,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
       _ <- tx.commit().map(_=>())
@@ -386,7 +386,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       node <- createNode(contents, tail = Some(tailPtr))
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       splitAtKey = createKey(2)
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
@@ -424,7 +424,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       result <- node.splitAt(ByteArrayKeyOrdering, Key.AbsoluteMinimum, false, None, alloc).recover {
         case _: IllegalArgumentException => "IllegalArgumentException caught"
@@ -454,7 +454,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
       _ <- tx.commit().map(_=>())
@@ -490,7 +490,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     for {
       node <- createNode(contents)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
       _ <- tx.commit().map(_=>())

@@ -22,7 +22,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       ikvos <- client.read(radicle)
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
 
@@ -55,7 +55,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       tx = client.newTransaction()
 
@@ -105,7 +105,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       tx = client.newTransaction()
 
@@ -157,7 +157,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       tx = client.newTransaction()
 
@@ -208,7 +208,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       tx = client.newTransaction()
 
@@ -260,7 +260,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator(Replication(3, 2))
 
       tx = client.newTransaction()
 
@@ -305,7 +305,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       tx = client.newTransaction()
 
@@ -350,7 +350,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       tx = client.newTransaction()
 
@@ -397,7 +397,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       tx = client.newTransaction()
 
@@ -452,7 +452,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       tx = client.newTransaction()
 
@@ -524,7 +524,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.get.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator(Replication(3,2))
 
       tx = client.newTransaction()
 

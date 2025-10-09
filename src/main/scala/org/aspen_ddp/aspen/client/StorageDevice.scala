@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.common.objects.Key
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.{Format, FormatError}
 
@@ -21,6 +22,8 @@ object StorageDeviceId:
 
 
 object StorageDevice:
+
+  private [aspen] val StateKey = Key(Array[Byte](0))
 
   def apply(buff: Array[Byte]): StorageDevice = Codec.decode(codec.StorageDevice.parseFrom(buff))
   

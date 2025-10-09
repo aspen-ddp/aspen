@@ -1,4 +1,19 @@
-** For ZNetwork
+Switch StorageDevice and Host trees to hold pointers to KV Objects
+Each storage device and host is stored in a separate object
+  - Allows Tx to update multiple entities at once where TKVL values cannot be
+
+* add private[aspen] getHostPointer, storageDevice, and pool
+* implement getHost/Pool/SD in terms of the get Pointer
+* Rather than getTree, just create a val for each TKVL tree in the Radicle
+  simplifies code
+
+Modify StoragePool.Config to:
+  1. drop numberOfStores (use stores.length)
+  2. rename storeHosts to stores
+  3. change stores to Array[StoreState]
+  4. add case StoreState(HostId, StorageDeviceId)
+
+For ZNetwork
   - If have store -> HostId mapping, send directly
   - If not, Lookup via AspenClient
     When Future resolves, enter synchronized block

@@ -98,16 +98,16 @@ object TestNetwork {
       new TransactionImpl(this, txManager, _ => 0, None)
     }
 
-    def getStoragePool(poolName: String): Future[Option[StoragePool]] = ???
+    def getStoragePool(poolName: String): Future[StoragePool] = ???
 
-    def getStoragePool(poolId: PoolId): Future[Option[StoragePool]] = {
+    def getStoragePool(poolId: PoolId): Future[StoragePool] = {
       val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
       val tkvl = new TieredKeyValueList(this, root)
       for {
         poolPtr <- tkvl.get(Key(poolId.uuid))
         poolKvos <- read(KeyValueObjectPointer(poolPtr.get.value.bytes))
       } yield {
-        Some(SimpleStoragePool(this, poolKvos))
+        SimpleStoragePool(this, poolKvos)
       }
     }
 
@@ -120,9 +120,9 @@ object TestNetwork {
 
     protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
 
-    def getHost(hostId: HostId): Future[Option[Host]] = Future.successful(Some(bootstrapHost))
+    def getHost(hostId: HostId): Future[Host] = Future.successful(bootstrapHost)
 
-    def getHost(hostName: String): Future[Option[Host]] = getHost(HostId(new UUID(0,0)))
+    def getHost(hostName: String): Future[Host] = getHost(HostId(new UUID(0,0)))
     
     override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 

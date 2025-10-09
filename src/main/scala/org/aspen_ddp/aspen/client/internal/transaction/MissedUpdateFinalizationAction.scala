@@ -84,7 +84,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
         pool <- client.getStoragePool(storeId.poolId)
         tx = client.newTransaction()
         _ = tx.disableMissedUpdateTracking()
-        _ <- pool.get.errorTree.set(key, Value(Array()))(using tx)
+        _ <- pool.errorTree.set(key, Value(Array()))(using tx)
         _ <- tx.commit()
       } yield {
         logger.trace(s"COMPLETED - Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")

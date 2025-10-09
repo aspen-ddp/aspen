@@ -6,8 +6,8 @@ import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.tkvl.{BootstrapPoolNodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, KeyValueObjectPointer, KeyValueOperation, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.common.util.uuid2byte
@@ -81,7 +81,7 @@ object Bootstrap:
 
     val storeHosts = (0 until ida.width).map(_ => bootstrapHost.hostId).toArray
 
-    val poolConfig = SimpleStoragePool.encode(Radicle.poolId, "aspen-bootstrap", ida.width, ida, storeHosts, None)
+    val poolConfig = SimpleStoragePool.encode(PoolId.BootstrapPoolId, PoolId.BootstrapPoolName, ida.width, ida, storeHosts, None)
     val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), BootstrapPoolNodeAllocator).encode()
     val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), BootstrapPoolNodeAllocator).encode()
 
@@ -99,10 +99,10 @@ object Bootstrap:
       BootstrapPoolNodeAllocator)
 
     val poolNameTreeRootObj = allocate(List(
-      Key("aspen-bootstrap") -> uuid2byte(Radicle.poolId.uuid)
+      Key(PoolId.BootstrapPoolName) -> uuid2byte(Radicle.poolId.uuid)
     ))
     val poolNameTree = Root(0,
-      ByteArrayKeyOrdering,
+      LexicalKeyOrdering,
       Some(poolNameTreeRootObj),
       BootstrapPoolNodeAllocator)
 

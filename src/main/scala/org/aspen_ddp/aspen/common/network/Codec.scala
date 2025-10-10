@@ -1065,29 +1065,39 @@ object Codec extends Logging:
       initialRefcount, timestamp, transactionId, serializedRevisionGuard)
 
 
+  def encode(o: StoragePool.StoreEntry): codec.PoolStoreEntry =
+    codec.PoolStoreEntry.newBuilder()
+      .setHostId(encodeUUID(o.hostId.uuid))
+      .setStorageDeviceId(encode(o.storageDeviceId))
+      .build
+
+  def decode(m: codec.PoolStoreEntry): StoragePool.StoreEntry =
+    val hostId = HostId(decodeUUID(m.getHostId))
+    val storageDeviceId = decode(m.getStorageDeviceId)
+    StoragePool.StoreEntry(hostId, storageDeviceId)
+
+
   def encode(o: StoragePool.Config): codec.PoolConfig =
     val builder = codec.PoolConfig.newBuilder()
 
     builder.setPoolId(encodeUUID(o.poolId.uuid))
     builder.setName(o.name)
-    builder.setNumberOfStores(o.numberOfStores)
     builder.setDefaultIDA(encode(o.defaultIDA))
     builder.setMaxObjectSize(o.maxObjectSize.getOrElse(0))
 
-    o.storeHosts.foreach: h =>
-      builder.addStoreHosts(encodeUUID(h.uuid))
+    o.stores.foreach: storeEntry =>
+      builder.addStores(encode(storeEntry))
 
     builder.build
 
   def decode(m: codec.PoolConfig): StoragePool.Config =
     val poolId = PoolId(decodeUUID(m.getPoolId))
     val name = m.getName
-    val numberOfStores = m.getNumberOfStores
     val defaultIDA = decode(m.getDefaultIDA)
     val maxObjectSize = if m.getMaxObjectSize == 0 then None else Some(m.getMaxObjectSize)
-    val storeHosts = m.getStoreHostsList.asScala.map(uuid => HostId(decodeUUID(uuid))).toArray
+    val stores = m.getStoresList.asScala.map(decode).toArray
 
-    StoragePool.Config(poolId, name, numberOfStores, defaultIDA, maxObjectSize, storeHosts)
+    StoragePool.Config(poolId, name, defaultIDA, maxObjectSize, stores)
 
 
   def encode(o: Host): codec.Host =

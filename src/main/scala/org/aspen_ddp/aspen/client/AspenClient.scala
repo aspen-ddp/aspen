@@ -67,22 +67,7 @@ trait AspenClient extends ObjectReader:
   def newStoragePool(newPoolName: String,
                      hostCncFrontends: List[CnCFrontend],
                      ida: IDA,
-                     backendType: BackendConfig): Future[StoragePool] =
-
-    given ExecutionContext = this.clientContext
-
-    val newPoolId = PoolId(UUID.randomUUID())
-
-    for
-      _ <- Future.sequence(hostCncFrontends.zipWithIndex.map { (fend, idx) =>
-        fend.send(NewStore(StoreId(newPoolId, idx.toByte), backendType))
-      })
-      poolCfg = StoragePool.Config(
-        newPoolId, newPoolName, ida.width, ida, None, hostCncFrontends.map(_.host.hostId).toArray
-      )
-      newStoragePool <- createStoragePool(poolCfg)
-    yield
-      newStoragePool
+                     backendType: BackendConfig): Future[StoragePool] = ???
 
   protected def createStoragePool(config: StoragePool.Config): Future[StoragePool]
 

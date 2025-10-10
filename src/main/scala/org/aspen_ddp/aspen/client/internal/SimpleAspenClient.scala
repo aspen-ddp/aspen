@@ -86,8 +86,8 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
     given tx: Transaction = newTransaction()
     
-    def updateConfig(config: StoragePool.Config): Unit =
-      config.storeHosts(storeId.poolIndex) = newHostId
+    def updateConfig(config: StoragePool.Config): Unit = ()
+      //config.stores(storeId.poolIndex) = newHostId
 
     for
       poolPtr <- getStoragePoolPointer(storeId.poolId)

@@ -475,13 +475,17 @@ message StoreCRLEntry {
   }
 }
 
+message PoolStoreEntry {
+  UUID hostId = 1;
+  StorageDeviceId storageDeviceId = 2;
+}
+
 message PoolConfig {
   UUID poolId = 1;
   string name = 2;
-  uint32 numberOfStores = 3;
-  IDA defaultIDA = 4;
-  uint32 maxObjectSize = 5;
-  repeated UUID storeHosts = 6;
+  IDA defaultIDA = 3;
+  uint32 maxObjectSize = 4;
+  repeated PoolStoreEntry stores = 5;
 }
 
 message Host {

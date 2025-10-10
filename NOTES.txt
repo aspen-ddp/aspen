@@ -1,12 +1,4 @@
 
-Modify StoragePool.Config to:
-  1. drop numberOfStores (use stores.length)
-  2. rename storeHosts to stores
-  3. change stores to Array[StoreState]
-  4. add case StoreState(HostId, StorageDeviceId)
-  5. remove SimpleAspenClient.updateHost to modify pool config?
-     - Move to StoreManager?
-
 For ZNetwork
   - If have store -> HostId mapping, send directly
   - If not, Lookup via AspenClient
@@ -27,6 +19,11 @@ Create HostResolver
     - Would make it easy for cache invalidation messages to come in from external
       sources
 
+Update ZMQNetwork to use the NetworkResolver or maybe just client
+  - Set resolver after creation (must create network instance before client)
+  - Can probably just set the resolver to null in constructor
+    - Will be set before first use so should be fine
+
 Add RefreshBootstrapConfig CnC message
   - Lookup bootsrap PoolConfig
   - Lookup host info for each storeId
@@ -39,11 +36,6 @@ host.
   - Will need a way to propagate this across all clients.
   - gossip protocol?
   - clients periodically poll a host for latest BootstrapConfig hash?
-
-Update ZMQNetwork to use the NetworkResolver or maybe just client
-  - Set resolver after creation (must create network instance before client)
-  - Can probably just set the resolver to null in constructor
-    - Will be set before first use so should be fine
 
 ServerMessenger
   - getCnCFrontend(hostId: HostId): Future[CnCFrontend]

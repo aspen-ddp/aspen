@@ -79,9 +79,11 @@ object Bootstrap:
     val errTreeRoot = allocate()
     val allocTreeRoot = allocate()
 
-    val storeHosts = (0 until ida.width).map(_ => bootstrapHost.hostId).toArray
-
-    val poolConfig = SimpleStoragePool.encode(PoolId.BootstrapPoolId, PoolId.BootstrapPoolName, ida.width, ida, storeHosts, None)
+    val storeEntrys = (0 until ida.width).map{ _ => 
+      StoragePool.StoreEntry(bootstrapHost.hostId, bootstrapStorageDevice.storageDeviceId)
+    }.toArray
+    
+    val poolConfig = StoragePool.Config(PoolId.BootstrapPoolId, PoolId.BootstrapPoolName, ida, None, storeEntrys).encode()
     val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), BootstrapPoolNodeAllocator).encode()
     val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), BootstrapPoolNodeAllocator).encode()
 

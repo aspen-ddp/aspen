@@ -980,7 +980,7 @@ object Main {
       hostId <- client.getHostId(hostName)
       newHost <- client.getHost(hostId)
       sp <- client.getStoragePool(storeId.poolId)
-      curHostId = sp.storeHosts(storeId.poolIndex)
+      curHostId = sp.stores(storeId.poolIndex).hostId
       currentHost <- client.getHost(curHostId)
 
       zfrontend = new ZCnCFrontend(network, currentHost)

@@ -12,22 +12,25 @@ object StoragePool:
   private [aspen] val ConfigKey = Key(Array[Byte](0))
   private [aspen] val ErrorTreeKey = Key(Array[Byte](1))
   private [aspen] val AllocationTreeKey = Key(Array[Byte](2))
+  
+  case class StoreEntry(hostId: HostId, storageDeviceId: StorageDeviceId)
 
   final case class Config(
-                         poolId: PoolId,
-                         name: String,
-                         numberOfStores: Int,
-                         defaultIDA: IDA,
-                         maxObjectSize: Option[Int],
-                         storeHosts: Array[HostId]
+                           poolId: PoolId,
+                           name: String,
+                           defaultIDA: IDA,
+                           maxObjectSize: Option[Int],
+                           stores: Array[StoreEntry]
                          ):
+    def numberOfStores: Int = stores.length
+
     def encode(): Array[Byte] = Codec.encode(this).toByteArray
 
   object Config:
     def apply(cfg: Array[Byte]): Config = Codec.decode(codec.PoolConfig.parseFrom(cfg))
 
     def apply(kvos: KeyValueObjectState): Config = Config(kvos.contents(ConfigKey).value.bytes)
-  
+
 
 trait StoragePool {
 
@@ -41,7 +44,7 @@ trait StoragePool {
 
   val defaultIDA: IDA
 
-  val storeHosts: Array[HostId]
+  val stores: Array[StoragePool.StoreEntry]
 
   def supportsIDA(ida: IDA): Boolean
 

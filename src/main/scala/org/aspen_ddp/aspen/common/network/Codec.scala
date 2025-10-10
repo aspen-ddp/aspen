@@ -1229,9 +1229,8 @@ object Codec extends Logging:
   def encode(o: StorageDevice): codec.StorageDevice =
     val builder = codec.StorageDevice.newBuilder()
       .setStorageDeviceId(encode(o.storageDeviceId))
-
-    o.ohostId.foreach: hostId =>
-      builder.setHostId(encodeUUID(hostId.uuid))
+    
+    builder.setHostId(encodeUUID(o.hostId.uuid))
 
     o.stores.foreach: (storeId, storeEntry) =>
       val keyValue = codec.StorageDeviceStoreKeyValue.newBuilder()
@@ -1244,16 +1243,13 @@ object Codec extends Logging:
 
   def decode(m: codec.StorageDevice): StorageDevice =
     val storageDeviceId = decode(m.getStorageDeviceId)
-    val ohostId = if m.hasHostId then
-      Some(HostId(decodeUUID(m.getHostId)))
-    else
-      None
+    val hostId = HostId(decodeUUID(m.getHostId))
     val stores = m.getStoresList.asScala.map: keyValue =>
       val storeId = StoreId(keyValue.getStoreId.toByteArray)
       val entry = decode(keyValue.getEntry)
       storeId -> entry
     .toMap
 
-    new StorageDevice(storageDeviceId, ohostId, stores)
+    new StorageDevice(storageDeviceId, hostId, stores)
 
 

@@ -35,13 +35,13 @@ object StorageDevice:
 
 
 case class StorageDevice(storageDeviceId: StorageDeviceId,
-                         ohostId: Option[HostId],
+                         hostId: HostId,
                          stores: Map[StoreId, StorageDevice.StoreEntry]):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
   
-  def setHost(ohostId: Option[HostId]): StorageDevice =
-    this.copy(ohostId=ohostId)
+  def setHost(hostId: HostId): StorageDevice =
+    this.copy(hostId=hostId)
 
   def setStoreEntry(storeId: StoreId, 
                     status: StorageDevice.StoreStatus,

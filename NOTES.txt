@@ -1,6 +1,3 @@
-Switch StorageDevice and Host trees to hold pointers to KV Objects
-Each storage device and host is stored in a separate object
-  - Allows Tx to update multiple entities at once where TKVL values cannot be
 
 * add private[aspen] getHostPointer, storageDevice, and pool
 * implement getHost/Pool/SD in terms of the get Pointer
@@ -12,6 +9,8 @@ Modify StoragePool.Config to:
   2. rename storeHosts to stores
   3. change stores to Array[StoreState]
   4. add case StoreState(HostId, StorageDeviceId)
+  5. remove SimpleAspenClient.updateHost to modify pool config?
+     - Move to StoreManager?
 
 For ZNetwork
   - If have store -> HostId mapping, send directly

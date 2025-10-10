@@ -789,7 +789,7 @@ object Main {
 
     val bootstrapStorageDevice = StorageDevice(
       storageDevConfig.storageDeviceId,
-      Some(hostConfig.hostId),
+      hostConfig.hostId,
       bootstrapStores.map(backend =>
         backend.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None)
       ).toMap

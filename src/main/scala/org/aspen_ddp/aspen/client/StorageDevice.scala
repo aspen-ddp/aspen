@@ -27,6 +27,9 @@ object StorageDevice:
 
   def apply(buff: Array[Byte]): StorageDevice = Codec.decode(codec.StorageDevice.parseFrom(buff))
   
+  def apply(kvos: KeyValueObjectState): StorageDevice = 
+    StorageDevice(kvos.contents(StateKey).value.bytes)
+  
   enum StoreStatus:
     case Initializing, Active, TransferringIn, TransferringOut, Rebuilding
 

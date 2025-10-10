@@ -704,7 +704,7 @@ object Main {
       storeManager,
       hostCfg.cncPort)
 
-    client.getHost(hostCfg.name).foreach: host =>
+    client.getHost(hostCfg.hostId).foreach: host =>
       val transferBackend = new ZStoreTransferBackend(
         hostCfg.storeTransferPort,
         network,
@@ -942,7 +942,9 @@ object Main {
       case "reed-solomon" => ReedSolomon(width, readThreshold, writeThreshold)
       case _ => throw new Exception(s"Invalid IDA type: $idaType")
 
-    def getHost(name: String): Future[Host] = client.getHost(name)
+    def getHost(name: String): Future[Host] = 
+      client.getHostId(name).flatMap: hostId =>
+        client.getHost(hostId)
 
     for
       hlist <- Future.sequence(hosts.map(getHost))
@@ -975,7 +977,8 @@ object Main {
     val storeId = StoreId(storeName)
 
     for
-      newHost <- client.getHost(hostName)
+      hostId <- client.getHostId(hostName)
+      newHost <- client.getHost(hostId)
       sp <- client.getStoragePool(storeId.poolId)
       curHostId = sp.storeHosts(storeId.poolIndex)
       currentHost <- client.getHost(curHostId)

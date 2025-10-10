@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
-import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, Host, HostId, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, Host, HostId, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StorageDeviceId, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -62,11 +62,7 @@ object BaseReadDriverSuite {
     def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = Future.failed(new Exception("TODO"))
 
     def newTransaction(): Transaction = null
-
-    def getStoragePool(poolId: PoolId): Future[StoragePool] = null
-
-    def getStoragePool(poolName: String): Future[StoragePool] = null
-
+    
     override def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit] = ???
 
     override def newStoragePool(newPoolName: String,
@@ -76,9 +72,11 @@ object BaseReadDriverSuite {
 
     protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
 
-    def getHost(hostId: HostId): Future[Host] = null
-
-    def getHost(hostName: String): Future[Host] = null
+    def getStoragePoolId(poolName: String): Future[PoolId] = ???
+    def getHostId(hostName: String): Future[HostId] = ???
+    def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] = ???
+    def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] = ???
+    def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] = ???
 
     val retryStrategy: RetryStrategy = null
 

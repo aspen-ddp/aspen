@@ -97,19 +97,25 @@ object TestNetwork {
     def newTransaction(): Transaction = {
       new TransactionImpl(this, txManager, _ => 0, None)
     }
+    
+    def getStoragePoolId(poolName: String): Future[PoolId] = ???
 
-    def getStoragePool(poolName: String): Future[StoragePool] = ???
+    def getHostId(hostName: String): Future[HostId] = ???
 
-    def getStoragePool(poolId: PoolId): Future[StoragePool] = {
-      val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
-      val tkvl = new TieredKeyValueList(this, root)
-      for {
-        poolPtr <- tkvl.get(Key(poolId.uuid))
-        poolKvos <- read(KeyValueObjectPointer(poolPtr.get.value.bytes))
-      } yield {
-        SimpleStoragePool(this, poolKvos)
-      }
-    }
+    private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
+      val tkvl = new TieredKeyValueList(this, new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle))
+      tkvl.get(Key(poolId.uuid)).map: vs =>
+        KeyValueObjectPointer(vs.get.value.bytes)
+
+    private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] =
+      val tkvl = new TieredKeyValueList(this, new KVObjectRootManager(this, Radicle.HostsTreeKey, radicle))
+      tkvl.get(Key(hostId.uuid)).map: vs =>
+        KeyValueObjectPointer(vs.get.value.bytes)
+
+    private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
+      val tkvl = new TieredKeyValueList(this, new KVObjectRootManager(this, Radicle.StorageDeviceTreeKey, radicle))
+      tkvl.get(Key(storageDeviceId.uuid)).map: vs =>
+        KeyValueObjectPointer(vs.get.value.bytes)
 
     override def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit] = ???
 
@@ -120,9 +126,9 @@ object TestNetwork {
 
     protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
 
-    def getHost(hostId: HostId): Future[Host] = Future.successful(bootstrapHost)
+    //def getHost(hostId: HostId): Future[Host] = Future.successful(bootstrapHost)
 
-    def getHost(hostName: String): Future[Host] = getHost(HostId(new UUID(0,0)))
+    //def getHost(hostName: String): Future[Host] = getHost(HostId(new UUID(0,0)))
     
     override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 

@@ -25,6 +25,8 @@ object Host:
   private [aspen] val StateKey = Key(Array[Byte](0))
 
   def apply(buff: Array[Byte]): Host = Codec.decode(codec.Host.parseFrom(buff))
+  
+  def apply(kvos: KeyValueObjectState): Host = Host(kvos.contents(StateKey).value.bytes)
 
 
 case class Host(hostId: HostId,

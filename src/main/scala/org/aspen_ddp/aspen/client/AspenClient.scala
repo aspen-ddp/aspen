@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
+import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
@@ -16,13 +17,15 @@ import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
-trait AspenClient extends ObjectReader {
+trait AspenClient extends ObjectReader:
 
   val clientId: ClientId
 
   val txStatusCache: TransactionStatusCache
 
   val typeRegistry: TypeRegistry
+
+  def clientContext: ExecutionContext
 
   def client: AspenClient = this
 
@@ -34,9 +37,30 @@ trait AspenClient extends ObjectReader {
 
   def newTransaction(): Transaction
 
-  def getStoragePool(poolId: PoolId): Future[StoragePool]
-
-  def getStoragePool(poolName: String): Future[StoragePool]
+  def getStoragePool(poolId: PoolId): Future[StoragePool] =
+    given ExecutionContext = this.clientContext
+    getStoragePoolPointer(poolId).flatMap: pointer =>
+      read(pointer).map: kvos =>
+        SimpleStoragePool(this, kvos)
+  
+  def getHost(hostId: HostId): Future[Host] =
+    given ExecutionContext = this.clientContext
+    getHostPointer(hostId).flatMap: pointer =>
+      read(pointer).map: kvos =>
+        Host(kvos)
+  
+  def getStorageDevice(storageDeviceId: StorageDeviceId): Future[StorageDevice] =
+    given ExecutionContext = this.clientContext
+    getStorageDevicePointer(storageDeviceId).flatMap: pointer =>
+      read(pointer).map: kvos =>
+        StorageDevice(kvos)
+        
+  def getStoragePoolId(poolName: String): Future[PoolId]
+  def getHostId(hostName: String): Future[HostId]
+  
+  private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer]
+  private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]
+  private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer]
 
   private[aspen] def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit]
 
@@ -62,10 +86,6 @@ trait AspenClient extends ObjectReader {
 
   protected def createStoragePool(config: StoragePool.Config): Future[StoragePool]
 
-  def getHost(hostId: HostId): Future[Host]
-
-  def getHost(hostName: String): Future[Host]
-
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
 
@@ -82,19 +102,16 @@ trait AspenClient extends ObjectReader {
     fresult
 
   def transactUntilSuccessful[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
-    retryStrategy.retryUntilSuccessful {
+    retryStrategy.retryUntilSuccessful:
       transact(prepare)
-    }
+    
   def transactUntilSuccessfulWithRecovery[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
-    retryStrategy.retryUntilSuccessful(onCommitFailure) {
+    retryStrategy.retryUntilSuccessful(onCommitFailure):
       transact(prepare)
-    }
 
   def retryStrategy: RetryStrategy
 
   def backgroundTaskManager: BackgroundTaskManager
-
-  def clientContext: ExecutionContext
 
   private[client] def opportunisticRebuildManager: OpportunisticRebuildManager
 
@@ -109,4 +126,3 @@ trait AspenClient extends ObjectReader {
   private[aspen] def getSystemAttribute(key: String): Option[String]
   private[aspen] def setSystemAttribute(key: String, value: String): Unit
 
-}

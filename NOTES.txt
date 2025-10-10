@@ -1,9 +1,4 @@
 
-* add private[aspen] getHostPointer, storageDevice, and pool
-* implement getHost/Pool/SD in terms of the get Pointer
-* Rather than getTree, just create a val for each TKVL tree in the Radicle
-  simplifies code
-
 Modify StoragePool.Config to:
   1. drop numberOfStores (use stores.length)
   2. rename storeHosts to stores
@@ -21,26 +16,6 @@ For ZNetwork
       3. enqueue the original message to be sent
   - When get AddHostConnection message:
       1. add new host connection to map
-
-
-Add StorageDeviceTree to radicle
-Add BootstrapConfigKey and yaml value to radicle
-
-Bootstrap
-  - Pass in the bootstrap Host config object
-    * Should use generated Host ID and Storage Device
-  - Always create all the bootstrap stores within the bootstrap StorageDevice
-    * They have to be transferred out
-
-Create ConfigStateManager
-  - Encapsulates the PoolConfig, Host, StorageDevice implementation
-  - Takes client & bootstrapConfig args
-
-StoreManager
-  - Switch to managing drives that contain stores
-  - For now use host_config.yaml
-     - Lists network ports
-     - List path to each StorageDevice
 
 Create HostResolver
   - Takes AspenClient as argument
@@ -72,15 +47,6 @@ Update ZMQNetwork to use the NetworkResolver or maybe just client
 
 ServerMessenger
   - getCnCFrontend(hostId: HostId): Future[CnCFrontend]
-
-Add StorageDeviceState
-  - contains host uuid
-  - contains StoreIds and current state
-    - Initializing, TransferringIn, TransferringOut, or Active
-
-Add HostState
-  - Contains network endpoint config
-  - Contains list of StorageDevice UUIDs
 
 Host walks all StorageDevices
   1. Load all stores on all devices

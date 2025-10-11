@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{StorageDevice, StorageDeviceId, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{HostId, StorageDevice, StorageDeviceId, ObjectState as ClientObjectState}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -29,6 +29,7 @@ object StoreManager:
   private case class IOCompletion(op: Completion) extends Event
   private case class TransactionMessage(msg: TxMessage) extends Event
   private case class ClientReq(msg: ClientRequest) extends Event
+  private case class HostMsg(msg: HostMessage) extends Event
   private case class Repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]) extends Event
   private case class LoadStore(backend: Backend, completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
@@ -46,7 +47,8 @@ object StoreManager:
     var loadedStores: Set[StoreId] = Set()
 
 
-class StoreManager(val aspenSystemId: UUID,
+class StoreManager(val hostId: HostId,
+                   val aspenSystemId: UUID,
                    val rootDir: Path,
                    val ec: ExecutionContext,
                    val objectCacheFactory: () => ObjectCache,
@@ -93,24 +95,31 @@ class StoreManager(val aspenSystemId: UUID,
     val sdCfgPath = storageDevicePath.resolve(StorageDeviceConfig.configFilename)
 
     if Files.isDirectory(sdFile.toPath) && Files.exists(sdCfgPath) then
-      val sdCfg = StorageDeviceConfig.loadHostConfig(sdCfgPath.toFile)
-      if sdCfg.aspenSystemId != aspenSystemId then
-        logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
-      else
-        val sds = new StorageDeviceState(sdCfg.storageDeviceId, storageDevicePath)
-        storageDevices += sdCfg.storageDeviceId -> sds
-        sdFile.listFiles.foreach: potentialStoreFile =>
-          tryLoadStore(sds, potentialStoreFile)
+      try
+        val sdCfg = StorageDeviceConfig.loadHostConfig(sdCfgPath.toFile)
+        if sdCfg.aspenSystemId != aspenSystemId then
+          logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+        else
+          val sds = new StorageDeviceState(sdCfg.storageDeviceId, storageDevicePath)
+          storageDevices += sdCfg.storageDeviceId -> sds
+          logger.info(s"Loading store $sdFile. StorageDeviceId ${sds.storageDeviceId}")
+          sdFile.listFiles.foreach: potentialStoreFile =>
+            tryLoadStore(sds, potentialStoreFile)
+      catch
+        case t: Throwable => logger.warn(s"Failed to load storage device found at path $sdFile. Error: $t")
 
   private def tryLoadStore(sds: StorageDeviceState, potentialStoreFile: File): Unit =
     val storeCfgPath = potentialStoreFile.toPath.resolve(StoreConfig.configFilename)
     if Files.exists(storeCfgPath) then
-      val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath.toFile)
-      val backend = storeCfg.backend match
-        case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
-      sds.loadedStores += backend.storeId
-      logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
-      loadStore(backend)
+      try
+        val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath.toFile)
+        val backend = storeCfg.backend match
+          case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
+        sds.loadedStores += backend.storeId
+        logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
+        loadStore(backend)
+      catch
+        case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
   def start(): Unit =
     threadPool.submit(new Runnable {
@@ -124,6 +133,14 @@ class StoreManager(val aspenSystemId: UUID,
 
   def getDevicePath(storageDeviceId: StorageDeviceId): Option[Path] = synchronized {
     storageDevices.get(storageDeviceId).map(_.devicePath)
+  }
+
+  private def startStoreTransfer(m: StartStoreTransfer): Unit = synchronized {
+
+  }
+
+  private def transferDataReceived(m: StoreTransferData): Unit = synchronized {
+
   }
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
@@ -159,6 +176,9 @@ class StoreManager(val aspenSystemId: UUID,
   def receiveClientRequest(msg: ClientRequest): Unit = {
     events.put(ClientReq(msg))
   }
+  
+  def receiveHostMessage(msg: HostMessage): Unit =
+    events.put(HostMsg(msg))
 
   def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
     events.put(Repair(storeId, os, completion))
@@ -227,6 +247,11 @@ class StoreManager(val aspenSystemId: UUID,
             net.sendClientResponse(r)
         }
       }
+
+      case HostMsg(msg) => msg match
+        case m: StartStoreTransfer => startStoreTransfer(m)
+        case m: StoreTransferData => transferDataReceived(m)
+      
 
       case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
         store.repair(os, completion)

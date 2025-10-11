@@ -17,6 +17,8 @@ import scala.annotation.tailrec
   */
 final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal:
 
+  def isEmpty: Boolean = size == 0
+  
   /** Creates a new read-only copy of the wrapped byte buffer */
   def asReadOnlyBuffer(): ByteBuffer = buf.asReadOnlyBuffer()
 

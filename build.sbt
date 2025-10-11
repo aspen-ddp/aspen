@@ -28,6 +28,7 @@ lazy val root = (project in file(".")).
       "org.yaml"                         %  "snakeyaml"               % "1.25",
       "org.zeromq"                       %  "jeromq"                  % "0.6.0",
       "com.google.protobuf"              %  "protobuf-java"           % "3.13.0" % "protobuf",
+      "com.lihaoyi"                      %% "os-lib"                  % "0.11.5",
     )
   )
   

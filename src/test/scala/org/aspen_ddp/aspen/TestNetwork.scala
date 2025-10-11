@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver,
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientRequest, ClientResponse, Read, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
+import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientRequest, ClientResponse, HostMessage, Read, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -205,6 +205,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
   }
 
   val smgr = new StoreManager(
+    HostId(new UUID(0,0)),
     new UUID(0,0),
     Path.of("/"),
     executionContext,
@@ -249,6 +250,8 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     }
 
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
+
+    def sendHostMessage(msg: HostMessage): Unit = ()
   }
 
   val client = new TClient(executionContext, cliMessenger, radicle)

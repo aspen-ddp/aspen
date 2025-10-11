@@ -113,3 +113,20 @@ object ProtobufMessageEncoder:
     bb.put(encodedMsg)
 
     msg
+
+  def encodeMessage(message: HostMessage): Array[Byte] =
+    val builder = codec.Message.newBuilder()
+
+    message match
+      case m: StartStoreTransfer => builder.setStartStoreTransfer(Codec.encode(m))
+      case m: StoreTransferData => builder.setStoreTransferData(Codec.encode(m))
+
+    val encodedMsg = builder.build.toByteArray
+
+    val msg = new Array[Byte](4 + encodedMsg.length)
+    val bb = ByteBuffer.wrap(msg)
+    bb.order(ByteOrder.BIG_ENDIAN)
+    bb.putInt(encodedMsg.length)
+    bb.put(encodedMsg)
+
+    msg

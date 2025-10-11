@@ -4,10 +4,9 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.codec
-import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Codec, HostHeartbeat, HostMessage, TxMessage}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostHeartbeat, TxMessage}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
@@ -76,6 +75,7 @@ object ZMQNetwork {
   private case class SendClientTransactionMessage(msg: TxMessage) extends SendQueueMsg
   private case class SendClientResponse(msg: ClientResponse) extends SendQueueMsg
   private case class SendServerTransactionMessage(msg: TxMessage) extends SendQueueMsg
+  private case class SendHostMessage(msg: HostMessage) extends SendQueueMsg
   private case class NewHostConnected() extends SendQueueMsg
 
   private class CliMessenger(net: ZMQNetwork) extends ClientMessenger with Logging {
@@ -90,6 +90,10 @@ object ZMQNetwork {
     }
 
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
+
+    def sendHostMessage(msg: HostMessage): Unit = synchronized {
+      net.queueMessageForSend(SendHostMessage(msg))
+    }
   }
 
   private class SrvMessenger(net: ZMQNetwork) extends ServerMessenger with Logging {
@@ -117,7 +121,8 @@ class ZMQNetwork(val oclientId: Option[ClientId],
                  val heartbeatPeriod: Duration,
                  val onClientResponseReceived: ClientResponse => Unit,
                  val onClientRequestReceived: ClientRequest => Unit,
-                 val onTransactionMessageReceived: TxMessage => Unit) extends Logging {
+                 val onTransactionMessageReceived: TxMessage => Unit,
+                 val onHostMessageReceived: HostMessage => Unit) extends Logging {
 
   import ZMQNetwork._
 
@@ -235,21 +240,26 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     queueMessageForSend(NewHostConnected())
   }
   
-  private def sendStoreMessage(storeId: StoreId, msg: Array[Byte]): Unit = synchronized {
+  private def sendHostMessage(hostId: HostId, msg: Array[Byte]): Unit =
+    given ExecutionContext = client.clientContext
+    
+    hostStates.get(hostId) match
+      case Some(hostState) => hostState.dealer.send(msg)
+      case None => 
+        val phl = pendingHostLookup.get(hostId) match
+          case Some(p) => p
+          case None =>
+            val p = PendingHostLookup()
+            pendingHostLookup += hostId -> p
+            client.getHost(hostId).foreach(hostLookedUp)
+            p
+        phl.addMessage(msg)
+  
+  private def sendStoreMessage(storeId: StoreId, msg: Array[Byte]): Unit =
     given ExecutionContext = client.clientContext
     
     storeToHost.get(storeId) match
-      case Some(hostId) => hostStates.get(hostId) match
-        case Some(hostState) => hostState.dealer.send(msg)
-        case None =>
-          val phl = pendingHostLookup.get(hostId) match
-            case Some(p) => p
-            case None => 
-              val p = PendingHostLookup()
-              pendingHostLookup += hostId -> p
-              client.getHost(hostId).foreach(hostLookedUp)
-              p
-          phl.addMessage(msg)
+      case Some(hostId) => sendHostMessage(hostId, msg)
       case None => 
         val ppl = pendingPoolLookup.get(storeId.poolId) match 
           case Some(p) => p
@@ -259,7 +269,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
             client.getStoragePool(storeId.poolId).foreach(poolLookedUp)
             p
         ppl.addMessage(storeId, msg)
-  }
+  
   
   // Queue message in concurrent linked list and send an empty message to the queue socket
   // to wake the IO thread if it's sleeping in a call to poll()
@@ -378,6 +388,10 @@ class ZMQNetwork(val oclientId: Option[ClientId],
           case SendServerTransactionMessage(msg) =>
             logger.trace(s"Sending $msg")
             sendStoreMessage(msg.to, ProtobufMessageEncoder.encodeMessage(msg))
+
+          case SendHostMessage(msg) =>
+            logger.trace(s"Sending $msg")
+            sendHostMessage(msg.toHost, ProtobufMessageEncoder.encodeMessage(msg))
 
           case NewHostConnected() =>
             recreatePoller()
@@ -568,6 +582,16 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       logger.trace(s"Got $message")
       updateClientId(message.fromClient, from)
       onClientRequestReceived(message)
+
+    else if m.hasStoreTransferData then
+      val message = Codec.decode(m.getStoreTransferData)
+      logger.trace(s"Got $message")
+      onHostMessageReceived(message)
+
+    else if m.hasStartStoreTransfer then
+      val message = Codec.decode(m.getStartStoreTransfer)
+      logger.trace(s"Got $message")
+      onHostMessageReceived(message)
 
     else
       logger.error("Unknown Message!")

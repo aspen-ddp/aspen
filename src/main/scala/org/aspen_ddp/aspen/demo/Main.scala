@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.{ReedSolomon, Replication}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectPointer, ObjectRevisionGuard, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
@@ -117,6 +117,8 @@ object Main {
       onode.foreach(_.receiveClientRequest(msg))
     def onTransactionMessageReceived(msg: TxMessage): Unit =
       onode.foreach(_.receiveTransactionMessage(msg))
+    def onHostMessageReceived(msg: HostMessage): Unit =
+      onode.foreach(_.receiveHostMessage(msg))
   }
 
   def setLog4jConfigFile(f: File): Unit =
@@ -326,7 +328,8 @@ object Main {
     (b, new ZMQNetwork(oclientId, cfg, ohostNode, heartbeatPeriod,
       b.onClientResponseReceived,
       b.onClientRequestReceived,
-      b.onTransactionMessageReceived))
+      b.onTransactionMessageReceived,
+      b.onHostMessageReceived))
   }
 
   def createAmoebaClient(cfg: BootstrapConfig.Config,
@@ -661,6 +664,7 @@ object Main {
     val nodeNet = nnet.serverMessenger
 
     val storeManager = new StoreManager(
+      hostCfg.hostId,
       bootstrapCfg.aspenSystemId,
       hostDir,
       ec,

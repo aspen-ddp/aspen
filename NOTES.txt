@@ -1,44 +1,27 @@
 
-For ZNetwork
-  - If have store -> HostId mapping, send directly
-  - If not, Lookup via AspenClient
-    When Future resolves, enter synchronized block
-      1. if HostId not in pendingConnectionsSet, create new socket and update set
-      2. encuque AddHostConnection(zmqsocket and stuff)
-      3. enqueue the original message to be sent
-  - When get AddHostConnection message:
-      1. add new host connection to map
+Add HostRequest & HostResponse to network.Message
+  - Same signature as ClientRequest/ClientResponse
+      toHostId, fromClientId
+  - Add BeginStoreTransfer(storeId)
+    - On Rx, if not already transferring:
+       - Lookup poolConfig
+       - Lookup storageDeviceConfig
+       - If devConfig shows the store is TransferringOut,
+         lookup new device config
+         lookup host
+         start the transfer
 
-Create HostResolver
-  - Takes AspenClient as argument
-  - Takes BootstrapConfig as argument
-     - Allows bootstrap pool storeId and host lookups without consulting client
-  - Responsible for looking up HostId -> Host and StoreId -> Host
-  - Handles caching
-  - member variable of client?
-    - Would make it easy for cache invalidation messages to come in from external
-      sources
+On StoreManager
+  - Need awaitingTransferIn: Map[StoreId, HLCTimestamp]
+  - Need transferringIn: Map[storeId, TransferHandler]
+  - Need periodic task to poll awaitingTransferIn
+     if now - timestamp > 10 seconds
+        send BeginStoreTransfer
+  - If transfer fails:
+     remove from transferringIn and put back in awaitingTransferIn
+     send BeginStoreTransfer
 
-Update ZMQNetwork to use the NetworkResolver or maybe just client
-  - Set resolver after creation (must create network instance before client)
-  - Can probably just set the resolver to null in constructor
-    - Will be set before first use so should be fine
-
-Add RefreshBootstrapConfig CnC message
-  - Lookup bootsrap PoolConfig
-  - Lookup host info for each storeId
-     - Dump hosts to top of yaml file
-     - Dump storeId -> hostId mapping
-  - Store this in BootstrapConfigKey in Radicle
-
-After migrating bootstrap store, send RefreshBootstrapConfig CnC message to each
-host.
-  - Will need a way to propagate this across all clients.
-  - gossip protocol?
-  - clients periodically poll a host for latest BootstrapConfig hash?
-
-ServerMessenger
-  - getCnCFrontend(hostId: HostId): Future[CnCFrontend]
+Avoids CnC shenanigans which never really worked well
 
 Host walks all StorageDevices
   1. Load all stores on all devices
@@ -57,6 +40,9 @@ Host walks all StorageDevices
               - In Tx
                 update state to Active
                 update PoolConfig to reflect new host and device
+                update old storage device to remove store entry
+              - On Tx failure, just call storageDeviceCheckState() again
+                - simpler than txTillSuccessful?
             - Else, if not already transferring, start
 
 When transfer ends successfully
@@ -67,7 +53,7 @@ When transfer ends successfully
      (Process will see that the store is loaded and will update the state)
 
 To begin transfer:
-  * Verify source and host devices are different (would be a mess otherwise)
+  * Verify source and desgination devices are different (would be a mess otherwise)
   * In Tx
     update source drive state to set TransferringOut
     update target drive state to TransferringIn
@@ -86,6 +72,25 @@ To create new pool:
     * insert into TKVL
     * Update each StorageDeviceState to include new storeIds in Initializing state
   3. For each StorageDevice touched, use CnC to trigger a deviceStateCheck
+
+
+For notifying clients/hosts that a store has moved:
+  - On reception of a message for a store that isn't loaded:
+    - Check transferringOutStores. If not in this set/map:
+      - Send an UnknownStore(storeId) error in response to the Read/Write
+  - In Read & Write drivers, have them call an unknownStoreError(storeId) on
+    their client/server Messenger instance
+  - In network, just drop the storeId -> hostId mapping
+    - normal process of sending a message to an unknown store should fix
+      the problem
+  - CHECK if the storeId is in the Bootstrap pool
+    - If so, read the radicle for updated config and update local file
+
+Need a gossip protocol for spreading the word about cache invalidation for
+  1. Host changed it's address/port
+  2. StoreId has been migrated to a new host
+For now we can ignore this. Hosts don't change frequently and store moves
+can be found via error messages to read/write operations
 
 -----------------------------------------------------------
 

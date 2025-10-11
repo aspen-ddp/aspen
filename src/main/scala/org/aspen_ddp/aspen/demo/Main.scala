@@ -388,12 +388,7 @@ object Main {
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
-    val networkThread = new Thread {
-      override def run(): Unit = {
-        network.ioThread()
-      }
-    }
-    networkThread.start()
+    network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
 
@@ -441,12 +436,7 @@ object Main {
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
-    val networkThread = new Thread {
-      override def run(): Unit = {
-        network.ioThread()
-      }
-    }
-    networkThread.start()
+    network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
 
@@ -505,12 +495,7 @@ object Main {
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
-    val networkThread = new Thread {
-      override def run(): Unit = {
-        network.ioThread()
-      }
-    }
-    networkThread.start()
+    network.startIoThread(client)
 
     val f = initializeAmoeba(client, radicle)
 
@@ -690,12 +675,8 @@ object Main {
 
     networkBridge.onode = Some(storeManager)
 
-    val networkThread = new Thread {
-      override def run(): Unit = {
-        network.ioThread()
-      }
-    }
-    networkThread.start()
+    network.startIoThread(client)
+    
     storeManager.start()
 
     val cncBackend = new ZCnCBackend(
@@ -715,7 +696,7 @@ object Main {
     // Kickoff repair loop
     repair(client, storeManager)
 
-    networkThread.join()
+    network.joinIoThread()
   }
 
   def mkdirectory(p: Path): Unit = {
@@ -842,12 +823,7 @@ object Main {
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
-    val networkThread = new Thread {
-      override def run(): Unit = {
-        network.ioThread()
-      }
-    }
-    networkThread.start()
+    network.startIoThread(client)
     
     given ExecutionContext = client.clientContext
 
@@ -928,12 +904,7 @@ object Main {
 
     val (client, network, radicle) = createAmoebaClient(bootstrapConfig)
 
-    val networkThread = new Thread {
-      override def run(): Unit = {
-        network.ioThread()
-      }
-    }
-    networkThread.start()
+    network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
 
@@ -942,7 +913,7 @@ object Main {
       case "reed-solomon" => ReedSolomon(width, readThreshold, writeThreshold)
       case _ => throw new Exception(s"Invalid IDA type: $idaType")
 
-    def getHost(name: String): Future[Host] = 
+    def getHost(name: String): Future[Host] =
       client.getHostId(name).flatMap: hostId =>
         client.getHost(hostId)
 
@@ -965,12 +936,7 @@ object Main {
 
     val (client, network, radicle) = createAmoebaClient(bootstrapConfig)
 
-    val networkThread = new Thread {
-      override def run(): Unit = {
-        network.ioThread()
-      }
-    }
-    networkThread.start()
+    network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
 

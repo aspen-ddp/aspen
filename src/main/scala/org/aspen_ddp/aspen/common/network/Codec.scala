@@ -966,7 +966,44 @@ object Codec extends Logging:
 
   def decode(m: codec.HostHeartbeat): HostHeartbeat =
     HostHeartbeat(HostId(decodeUUID(m.getFromHostId)))
-    
+
+
+  def encode(o: StartStoreTransfer): codec.StartStoreTransfer =
+    codec.StartStoreTransfer.newBuilder()
+      .setToHost(encodeUUID(o.toHost.uuid))
+      .setFromClient(encodeUUID(o.fromClient.uuid))
+      .setFromDevice(encode(o.fromDevice))
+      .setStoreId(encode(o.storeId))
+      .setTimestamp(o.timestamp.asLong)
+      .setTransferUUID(encodeUUID(o.transferUUID))
+      .build
+
+  def decode(m: codec.StartStoreTransfer): StartStoreTransfer =
+    val toHost = HostId(decodeUUID(m.getToHost))
+    val fromClient = ClientId(decodeUUID(m.getFromClient))
+    val fromDevice = decode(m.getFromDevice)
+    val storeId = decode(m.getStoreId)
+    val timestamp = HLCTimestamp(m.getTimestamp)
+    val transferUUID = decodeUUID(m.getTransferUUID)
+    StartStoreTransfer(toHost, fromClient, fromDevice, storeId, timestamp, transferUUID)
+
+
+  def encode(o: StoreTransferData): codec.StoreTransferData =
+    codec.StoreTransferData.newBuilder()
+      .setToHost(encodeUUID(o.toHost.uuid))
+      .setFromClient(encodeUUID(o.fromClient.uuid))
+      .setTransferUUID(encodeUUID(o.transferUUID))
+      .setData(ByteString.copyFrom(o.data.asReadOnlyBuffer()))
+      .build
+
+  def decode(m: codec.StoreTransferData): StoreTransferData =
+    val toHost = HostId(decodeUUID(m.getToHost))
+    val fromClient = ClientId(decodeUUID(m.getFromClient))
+    val transferUUID = decodeUUID(m.getTransferUUID)
+    val data = DataBuffer(m.getData.toByteArray)
+    StoreTransferData(toHost, fromClient, transferUUID, data)
+
+
   // ----------------------- Non Network Messages -----------------------
 
   def encode(o: ObjectUpdate): codec.ObjectUpdate =

@@ -2,7 +2,7 @@
 Add HostRequest & HostResponse to network.Message
   - Same signature as ClientRequest/ClientResponse
       toHostId, fromClientId
-  - Add BeginStoreTransfer(storeId)
+  - Add BeginStoreTransfer(storeId, requestTimestamp, transferUUID)
     - On Rx, if not already transferring:
        - Lookup poolConfig
        - Lookup storageDeviceConfig

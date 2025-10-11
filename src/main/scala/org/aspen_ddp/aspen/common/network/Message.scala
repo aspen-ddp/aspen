@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.network
 
-import org.aspen_ddp.aspen.client.HostId
+import org.aspen_ddp.aspen.client.{HostId, StorageDeviceId}
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -22,6 +22,30 @@ sealed abstract class ClientResponse extends Message {
   val toClient: ClientId
   val fromStore: StoreId
 }
+
+sealed abstract class HostMessage extends Message:
+  val toHost: HostId
+  val fromClient: ClientId
+
+sealed abstract class HostResponse extends Message:
+  val toClient: ClientId
+  val fromHost: HostId
+
+final case class StartStoreTransfer(
+                                     toHost: HostId,
+                                     fromClient: ClientId,
+                                     fromDevice: StorageDeviceId,
+                                     storeId: StoreId,
+                                     timestamp: HLCTimestamp,
+                                     transferUUID: UUID
+                                   ) extends HostMessage
+
+final case class StoreTransferData(
+                                    toHost: HostId,
+                                    fromClient: ClientId,
+                                    transferUUID: UUID,
+                                    data: DataBuffer
+                                  ) extends HostMessage
 
 sealed abstract class TxMessage extends Message {
   val to: StoreId

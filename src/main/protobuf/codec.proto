@@ -403,6 +403,22 @@ message HostHeartbeat {
   UUID fromHostId = 1;
 }
 
+message StartStoreTransfer {
+  UUID toHost = 1;
+  UUID fromClient = 2;
+  StorageDeviceId fromDevice = 3;
+  StoreId storeId = 4;
+  uint64 timestamp = 5;
+  UUID transferUUID = 6;
+}
+
+message StoreTransferData {
+  UUID toHost = 1;
+  UUID fromClient = 2;
+  UUID transferUUID = 3;
+  bytes data = 4;
+}
+
 
 //---------------------------------------------------------------------------
 //- Root Message
@@ -429,6 +445,8 @@ message Message {
     HostHeartbeat host_heartbeat = 18;
     TxStatusRequest status_request = 19;
     TxStatusResponse status_response = 20;
+    StartStoreTransfer start_store_transfer = 21;
+    StoreTransferData store_transfer_data = 22;
   }
 }
 

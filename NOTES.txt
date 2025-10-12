@@ -1,23 +1,4 @@
 
-To begin transfer:
-  * Add AspenClient.transferStore(storeId, fromDevId, toDevId): Future[Unit]
-    - Verify source and desgination devices are different (would be a mess otherwise)
-    - Verify the source state for the store is Active
-      - fail otherwise
-  * In Tx
-    update source drive state to set TransferringOut
-    update target drive state to TransferringIn
-  * Send CheckStorageDevice message to target host
-
-To create new pool:
-  1. Identify all the newStoreId, StorageDevice pairings
-    - Collect into StorageDevice, List[newStoreIds]
-  2. in single Tx
-    * Create PoolConfig object
-    * insert into TKVL
-    * Update each StorageDeviceState to include new storeIds in Initializing state
-  3. For each StorageDevice touched, send CheckStorageDevice message to host
-
 For notifying clients/hosts that a store has moved:
   - On reception of a message for a store that isn't loaded:
     - Check offlineStores. If not in this set:

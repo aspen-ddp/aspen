@@ -62,13 +62,8 @@ object BaseReadDriverSuite {
     def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = Future.failed(new Exception("TODO"))
 
     def newTransaction(): Transaction = null
-
-    override def newStoragePool(newPoolName: String,
-                       hostCncFrontends: List[CnCFrontend],
-                       ida: IDA,
-                       backendType: BackendConfig): Future[StoragePool] = ???
-
-    protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
+    
+    protected def createStoragePool(config: StoragePool.Config): Future[PoolId] = ???
 
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
     def getHostId(hostName: String): Future[HostId] = ???

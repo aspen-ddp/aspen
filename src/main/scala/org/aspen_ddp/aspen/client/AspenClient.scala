@@ -5,20 +5,27 @@ import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, uuid2byte}
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
-trait AspenClient extends ObjectReader:
+object AspenClient:
+  class InvalidDestination extends Exception("Source and destination devices must be different")
+  class StoreNotActive(storeId: StoreId) extends Exception(s"Store $storeId is not in the Active state")
 
+trait AspenClient extends ObjectReader:
+  
+  import AspenClient.*
+  
   val clientId: ClientId
 
   val txStatusCache: TransactionStatusCache
@@ -62,12 +69,7 @@ trait AspenClient extends ObjectReader:
   private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]
   private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer]
 
-  def newStoragePool(newPoolName: String,
-                     hostCncFrontends: List[CnCFrontend],
-                     ida: IDA,
-                     backendType: BackendConfig): Future[StoragePool] = ???
-
-  protected def createStoragePool(config: StoragePool.Config): Future[StoragePool]
+  protected def createStoragePool(config: StoragePool.Config): Future[PoolId]
 
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
@@ -91,6 +93,95 @@ trait AspenClient extends ObjectReader:
   def transactUntilSuccessfulWithRecovery[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     retryStrategy.retryUntilSuccessful(onCommitFailure):
       transact(prepare)
+      
+  def createNewStoragePool(name: String,
+                           defaultIDA: IDA,
+                           maxObjectSize: Option[Int],
+                           storageDeviceIds: List[StorageDeviceId],
+                           backendConfig: BackendConfig): Future[PoolId] =
+    if storageDeviceIds.size < defaultIDA.width then
+      Future.failed(new IllegalArgumentException("storageDeviceIds list must be at least as long as defaultIDA.width"))
+    else
+      given ExecutionContext = this.clientContext
+      val poolId = PoolId(UUID.randomUUID())
+      for
+        devices <- Future.sequence(storageDeviceIds.map(sid => getStorageDevice(sid)))
+        stores = devices.map(dev => StoragePool.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
+        config = StoragePool.Config(
+          poolId,
+          name,
+          defaultIDA, 
+          maxObjectSize, 
+          stores, 
+          backendConfig
+        )
+        _ <- createStoragePool(config)
+      yield
+        poolId
+      
+  def transferStore(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = this.clientContext
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: InvalidDestination => throw StopRetrying(e)
+      case e: StoreNotActive => throw StopRetrying(e)
+      
+    transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+      
+      for
+        pool <- getStoragePool(storeId.poolId)
+        sourceId = pool.stores(storeId.poolIndex).storageDeviceId
+        srcPtr <- getStorageDevicePointer(sourceId)
+        srcKvos <- read(srcPtr)
+        srcState = StorageDevice(srcKvos)
+        dstPtr <- getStorageDevicePointer(destinationId)
+        dstKvos <- read(dstPtr)
+        dstState = StorageDevice(dstKvos)
+      yield
+        if sourceId == destinationId then
+          throw InvalidDestination()
+          
+        srcState.stores.get(storeId) match
+          case None => throw StoreNotActive(storeId)
+          case Some(entry) =>
+            if entry.status != StorageDevice.StoreStatus.Active then
+              throw StoreNotActive(storeId)
+            
+            // Update Source Device
+            val newSrcEntry = StorageDevice.StoreEntry(
+              StorageDevice.StoreStatus.TransferringOut,
+              Some(destinationId)
+            )
+            val newSrcStores = srcState.stores + (storeId -> newSrcEntry)
+            val newSrcState = srcState.copy(stores = newSrcStores)
+
+            val srcReqs = List(KeyRevision(StorageDevice.StateKey, srcKvos.contents(StorageDevice.StateKey).revision))
+            val srcOps = List(Insert(StorageDevice.StateKey, newSrcState.encode()))
+            
+            tx.update(srcPtr, None, None, srcReqs, srcOps)
+            
+            // Update Destination Device
+            val newDstEntry = StorageDevice.StoreEntry(
+              StorageDevice.StoreStatus.TransferringIn,
+              Some(sourceId)
+            )
+            val newDstStores = dstState.stores + (storeId -> newDstEntry)
+            val newDstState = dstState.copy(stores = newDstStores)
+
+            val dstReqs = List(KeyRevision(StorageDevice.StateKey, dstKvos.contents(StorageDevice.StateKey).revision))
+            val dstOps = List(Insert(StorageDevice.StateKey, newDstState.encode()))
+
+            tx.update(dstPtr, None, None, dstReqs, dstOps)
+            
+            tx.result.foreach: _ =>
+              val msg = CheckStorageDevice(
+                dstState.hostId,
+                clientId,
+                destinationId
+              )
+              sendHostMessage(msg)
 
   def retryStrategy: RetryStrategy
 

@@ -927,10 +927,10 @@ object Main {
     for
       hlist <- Future.sequence(hosts.map(getHost))
       frontends = hlist.map(host => new ZCnCFrontend(network, host))
-      sp <- client.newStoragePool(newPoolName, frontends, ida, RocksDBConfig())
+      //sp <- client.newStoragePool(newPoolName, frontends, ida, RocksDBConfig())
     yield
       println("******************************************")
-      println(f"* New Pool Created: ${sp.poolId}")
+      //println(f"* New Pool Created: ${sp.poolId}")
       println("******************************************")
   }
 

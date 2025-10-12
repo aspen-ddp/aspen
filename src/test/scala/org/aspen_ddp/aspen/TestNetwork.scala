@@ -117,12 +117,7 @@ object TestNetwork {
       tkvl.get(Key(storageDeviceId.uuid)).map: vs =>
         KeyValueObjectPointer(vs.get.value.bytes)
 
-    override def newStoragePool(newPoolName: String,
-                       hostCncFrontends: List[CnCFrontend],
-                       ida: IDA,
-                       backendType: BackendConfig): Future[StoragePool] = ???
-
-    protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] = ???
+    protected def createStoragePool(config: StoragePool.Config): Future[PoolId] = ???
 
     //def getHost(hostId: HostId): Future[Host] = Future.successful(bootstrapHost)
 

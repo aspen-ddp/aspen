@@ -84,11 +84,12 @@ final case class Allocate(
   override def toString: String = f"Allocate from $fromClient to $toStore type $objectType objectId $newObjectId allocationTx $allocationTransactionId"
 }
 
-final case class AllocateResponse( toClient: ClientId,
-                                   fromStore: StoreId,
-                                   allocationTransactionId: TransactionId,
-                                   newObjectId: ObjectId,
-                                   result: Option[StorePointer]) extends ClientResponse:
+final case class AllocateResponse(toClient: ClientId,
+                                  fromStore: StoreId,
+                                  allocationTransactionId: TransactionId,
+                                  newObjectId: ObjectId,
+                                  result: Option[StorePointer],
+                                  storeNotFound: Boolean) extends ClientResponse:
   override def toString: String = f"AllocateResponse from $fromStore to $toClient tx $allocationTransactionId objId $newObjectId"
 
 final case class Read(
@@ -172,8 +173,8 @@ final case class TransactionFinalized(
 /**
  * Sent in response to a transaction message if the recipient does not host the
  * store. Usually this will be due to the store having been transferred to a new
- * machine and the TransactionDriver is using the old, cached value. 
- * 
+ * machine and the TransactionDriver is using the old, cached value.
+ *
  * Note that the from: StoreId is the store not found
  */
 final case class TxUnknownStore(
@@ -181,9 +182,9 @@ final case class TxUnknownStore(
                                  from: StoreId,
                                  transactionId: TransactionId,
                                ) extends TxMessage:
-  
+
   override def toString: String = f"TxUnkonwnStore to $to from $from tx $transactionId"
-  
+
 final case class TxPrepare(
                             to: StoreId,
                             from: StoreId,

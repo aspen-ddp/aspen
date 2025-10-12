@@ -59,7 +59,7 @@ class Frontend(val storeId: StoreId,
 
     lalloc.foreach { ars =>
       val msg = AllocateResponse(ClientId.Null, storeId, ars.allocationTransactionId,
-        ars.newObjectId, Some(ars.storePointer))
+        ars.newObjectId, Some(ars.storePointer), false)
       var l = pendingAllocations.get(ars.allocationTransactionId) match {
         case None => Nil
         case Some(lst) => lst
@@ -334,14 +334,14 @@ class Frontend(val storeId: StoreId,
 
     either match {
       case Right(err) =>
-        val r = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId, None)
+        val r = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId, None, false)
         logger.debug(s"Failed to allocate object ${msg.newObjectId} for tx ${msg.allocationTransactionId}. Error: $err")
         net.sendClientResponse(r)
 
       case Left(storePointer) =>
         logger.trace(s"Backend allocated new object ${msg.newObjectId}. Saving in CRL. tx ${msg.allocationTransactionId}")
         val rmsg = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId,
-          Some(storePointer))
+          Some(storePointer), false)
 
         val arList = pendingAllocations.get(msg.allocationTransactionId) match
           case Some(lst) => rmsg :: lst

@@ -23,7 +23,7 @@ class AllocationManager(val client: AspenClient,
 
   def receive(m: AllocateResponse): Unit = {
     synchronized { outstandingAllocations.get(m.newObjectId) } foreach {
-      driver => driver.receiveAllocationResult(m.fromStore, m.result)
+      driver => driver.receiveAllocationResult(m.fromStore, m.result, m.storeNotFound)
     }
   }
 

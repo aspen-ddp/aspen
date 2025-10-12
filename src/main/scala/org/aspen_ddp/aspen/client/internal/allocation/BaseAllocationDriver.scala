@@ -51,34 +51,47 @@ class BaseAllocationDriver (
   }
 
   def receiveAllocationResult(fromStoreId: StoreId,
-                              result: Option[StorePointer]): Unit = synchronized {
+                              result: Option[StorePointer],
+                              storeNotFound: Boolean): Unit = synchronized {
     if (promise.isCompleted)
       return // Already done, nothing left to do
 
-    logger.trace(s"Got Allocation Result from store $fromStoreId: $result. Num Responses: ${responses.size}")
+    if storeNotFound then
+      // Store was probably transferred. Drop cache and re-send request
+      client.messenger.dropCacheForStore(fromStoreId)
 
-    if ( !responses.contains(fromStoreId.poolIndex) )
-      responses += (fromStoreId.poolIndex -> result)
+      val storeData = synchronized { objectData(fromStoreId.poolIndex) }
 
-    if (responses.size == objectData.size) {
-      var errors = Set[Byte]()
-      var pointers = List[StorePointer]()
+      val msg = Allocate(fromStoreId, client.clientId, newObjectId, objectType, objectSize, initialRefcount, storeData, timestamp,
+        allocationTransactionId, revisionGuard)
 
-      responses.foreach(t => t._2 match {
-        case Some(ptr) => pointers = ptr :: pointers
-        case None => errors += t._1
-      })
-      logger.trace(s"   Errors: $errors")
-      if (errors.isEmpty) {
-        val sortedPointersArray = pointers.sortBy(sp => sp.poolIndex).toArray
-        val op = objectType match {
-          case ObjectType.Data => new DataObjectPointer(newObjectId, poolId, objectSize, objectIDA, sortedPointersArray)
-          case ObjectType.KeyValue => new KeyValueObjectPointer(newObjectId, poolId, objectSize, objectIDA, sortedPointersArray)
-        }
-        promise.success(op)
-      } else
-        promise.failure(AllocationError(poolId))
-    }
+      client.messenger.sendClientRequest(msg)
+      
+    else
+      logger.trace(s"Got Allocation Result from store $fromStoreId: $result. Num Responses: ${responses.size}")
+  
+      if ( !responses.contains(fromStoreId.poolIndex) )
+        responses += (fromStoreId.poolIndex -> result)
+  
+      if (responses.size == objectData.size) {
+        var errors = Set[Byte]()
+        var pointers = List[StorePointer]()
+  
+        responses.foreach(t => t._2 match {
+          case Some(ptr) => pointers = ptr :: pointers
+          case None => errors += t._1
+        })
+        logger.trace(s"   Errors: $errors")
+        if (errors.isEmpty) {
+          val sortedPointersArray = pointers.sortBy(sp => sp.poolIndex).toArray
+          val op = objectType match {
+            case ObjectType.Data => new DataObjectPointer(newObjectId, poolId, objectSize, objectIDA, sortedPointersArray)
+            case ObjectType.KeyValue => new KeyValueObjectPointer(newObjectId, poolId, objectSize, objectIDA, sortedPointersArray)
+          }
+          promise.success(op)
+        } else
+          promise.failure(AllocationError(poolId))
+      }
   }
 }
 

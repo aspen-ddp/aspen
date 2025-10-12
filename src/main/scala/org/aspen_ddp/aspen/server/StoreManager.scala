@@ -572,6 +572,15 @@ class StoreManager(val client: AspenClient,
       case ClientReq(msg) => stores.get(msg.toStore) match
         case None => msg match
           case a: Allocate =>
+            if ! offlineStores.contains(a.toStore) then
+              val msg = AllocateResponse(
+                a.fromClient, 
+                a.toStore,
+                a.allocationTransactionId, 
+                a.newObjectId, 
+                None,
+                true)
+              net.sendClientResponse(msg)
           case r: Read => 
             if ! offlineStores.contains(r.toStore) then
               val msg = ReadResponse(

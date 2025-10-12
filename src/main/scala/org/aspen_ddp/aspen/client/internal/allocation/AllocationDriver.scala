@@ -22,7 +22,8 @@ trait AllocationDriver {
   def start(): Unit
 
   def receiveAllocationResult(fromStoreId: StoreId,
-                              result: Option[StorePointer]): Unit
+                              result: Option[StorePointer],
+                              storeNotFound: Boolean): Unit
 }
 
 object AllocationDriver {

@@ -954,6 +954,7 @@ object Codec extends Logging:
       .setFromStore(encode(o.fromStore))
       .setAllocationTransactionUuid(encodeUUID(o.allocationTransactionId.uuid))
       .setNewObjectUuid(encodeUUID(o.newObjectId.uuid))
+      .setStoreNotFound(o.storeNotFound)
 
     o.result.foreach: ptr =>
       builder.setAllocateStorePointer(encode(ptr))
@@ -966,8 +967,9 @@ object Codec extends Logging:
     val allocTxId = TransactionId(decodeUUID(m.getAllocationTransactionUuid))
     val newObjId = ObjectId(decodeUUID(m.getNewObjectUuid))
     val storePointer = if m.hasAllocateStorePointer then Some(decode(m.getAllocateStorePointer)) else None
+    val storeNotFound = m.getStoreNotFound
 
-    AllocateResponse(toClient, fromStore, allocTxId, newObjId, storePointer)
+    AllocateResponse(toClient, fromStore, allocTxId, newObjId, storePointer, storeNotFound)
 
 
   def encode(o: HostHeartbeat): codec.HostHeartbeat =

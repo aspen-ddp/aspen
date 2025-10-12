@@ -398,6 +398,7 @@ message AllocateResponse {
   UUID new_object_uuid = 4;
   StorePointer allocate_store_pointer = 5;
   AllocationError result_error = 6;
+  bool store_not_found = 7;
 }
 
 

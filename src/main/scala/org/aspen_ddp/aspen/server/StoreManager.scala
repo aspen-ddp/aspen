@@ -88,6 +88,7 @@ class StoreManager(val client: AspenClient,
   protected var storageDevices: Map[StorageDeviceId, StorageDeviceState] = Map()
   protected var stores: Map[StoreId, Store] = Map()
 
+  private var offlineStores: Set[StoreId] = Set()
   private var transferringOut: Map[StoreId, TransferringOut] = Map()
   private var transferringInUUIDs: Map[UUID, TransferringIn] = Map()
   private var transferringInStoreIds: Set[StoreId] = Set()
@@ -135,11 +136,15 @@ class StoreManager(val client: AspenClient,
     if Files.exists(storeCfgPath) then
       try
         val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath.toFile)
-        val backend = storeCfg.backend match
-          case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
-        sds.loadedStores += backend.storeId
-        logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
-        loadStore(backend)
+        if os.exists(os.Path(potentialStoreFile) / TransferringOut.MarkerFile) then
+          logger.info(s"Skipping load of offline store marked for transfer out. StoreId ${storeCfg.storeId}. $potentialStoreFile")
+          offlineStores += storeCfg.storeId
+        else
+          val backend = storeCfg.backend match
+            case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
+          sds.loadedStores += backend.storeId
+          logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
+          loadStore(backend)
       catch
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
@@ -468,6 +473,7 @@ class StoreManager(val client: AspenClient,
           case None => completion.success(())
           case Some(store) =>
             stores -= storeId
+            offlineStores += storeId
             crl.closeStore(storeId).foreach: (trs, ars) =>
               CrashRecoveryLog.saveStoreState(storeId, trs, ars, store.backend.crlSaveFile)
               store.close().foreach: _ =>

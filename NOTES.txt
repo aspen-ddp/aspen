@@ -1,9 +1,4 @@
 
-Add offlineStores: Set[StoreId]
-  - Update storeLoad logic to skip stores with transferring-out marker file
-    - add storeId to offlineStores
-  - When a store is taken offline, add to offlineStores
-  - When store directory is deleted in checkSeviceState, remove from offlineStores
 
 Host walks all StorageDevices
   1. Load all stores on all devices

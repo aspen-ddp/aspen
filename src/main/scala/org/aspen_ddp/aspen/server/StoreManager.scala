@@ -88,7 +88,21 @@ class StoreManager(val client: AspenClient,
   protected var storageDevices: Map[StorageDeviceId, StorageDeviceState] = Map()
   protected var stores: Map[StoreId, Store] = Map()
 
-  backgroundTasks.schedulePeriodic(heartbeatPeriod) {
+  private var transferringOut: Map[StoreId, TransferringOut] = Map()
+  private var transferringInUUIDs: Map[UUID, TransferringIn] = Map()
+  private var transferringInStoreIds: Set[StoreId] = Set()
+  private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
+
+  private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
+    synchronized {
+      val now = HLCTimestamp.now
+      pendingStartTransfers.valuesIterator.foreach: pt =>
+        if now - pt.lastSend > Duration(30, SECONDS) then
+          pt.lastSend = now
+          client.sendHostMessage(pt.msg)
+    }
+
+  private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
     events.put(HeartbeatEvent())
   }
 
@@ -143,23 +157,9 @@ class StoreManager(val client: AspenClient,
     storageDevices.get(storageDeviceId).map(_.devicePath)
   }
 
-  private var transferringOut: Map[StoreId, TransferringOut] = Map()
-  private var transferringInUUIDs: Map[UUID, TransferringIn] = Map()
-  private var transferringInStoreIds: Set[StoreId] = Set()
-  private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
-
-  private val pendingStartTask = client.backgroundTaskManager.schedulePeriodic(Duration(30, SECONDS)):
-    synchronized {
-      val now = HLCTimestamp.now
-      pendingStartTransfers.valuesIterator.foreach: pt =>
-        if now - pt.lastSend > Duration(30, SECONDS) then
-          pt.lastSend = now
-          client.sendHostMessage(pt.msg)
-    }
-
   private def updateStateForTransferredStore(storeId: StoreId,
                                              fromDeviceId: StorageDeviceId,
-                                             toDeviceid: StorageDeviceId): Unit =
+                                             toDeviceid: StorageDeviceId): Future[Unit] =
     client.transactUntilSuccessful: tx =>
       for
         poolPtr <- client.getStoragePoolPointer(storeId.poolId)
@@ -197,7 +197,7 @@ class StoreManager(val client: AspenClient,
           tx.update(toDevPtr, None, None, toDevReqs, toDevOps)
 
           // If state update transaction is successful, send a CheckStorageDevice
-          // message to the hosst of the old storage device so they can delete
+          // message to the host of the old storage device so they can delete
           // the store content
           tx.result.foreach: _ =>
             val msg = CheckStorageDevice(
@@ -211,6 +211,7 @@ class StoreManager(val client: AspenClient,
                                    fromHostId: HostId,
                                    fromDeviceId: StorageDeviceId,
                                    toDeviceid: StorageDeviceId): Unit = synchronized {
+    require(fromDeviceId != toDeviceid)
 
     if ! transferringInStoreIds.contains(storeId) then
       storageDevices.get(toDeviceid).foreach: toDevice =>
@@ -364,6 +365,7 @@ class StoreManager(val client: AspenClient,
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     events.put(Exit())
     pendingStartTask.cancel()
+    heartbeatTask.cancel()
     shutdownPromise.future
   }
   

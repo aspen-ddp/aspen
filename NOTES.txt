@@ -1,27 +1,9 @@
 
-Add HostRequest & HostResponse to network.Message
-  - Same signature as ClientRequest/ClientResponse
-      toHostId, fromClientId
-  - Add BeginStoreTransfer(storeId, requestTimestamp, transferUUID)
-    - On Rx, if not already transferring:
-       - Lookup poolConfig
-       - Lookup storageDeviceConfig
-       - If devConfig shows the store is TransferringOut,
-         lookup new device config
-         lookup host
-         start the transfer
-
-On StoreManager
-  - Need awaitingTransferIn: Map[StoreId, HLCTimestamp]
-  - Need transferringIn: Map[storeId, TransferHandler]
-  - Need periodic task to poll awaitingTransferIn
-     if now - timestamp > 10 seconds
-        send BeginStoreTransfer
-  - If transfer fails:
-     remove from transferringIn and put back in awaitingTransferIn
-     send BeginStoreTransfer
-
-Avoids CnC shenanigans which never really worked well
+Add offlineStores: Set[StoreId]
+  - Update storeLoad logic to skip stores with transferring-out marker file
+    - add storeId to offlineStores
+  - When a store is taken offline, add to offlineStores
+  - When store directory is deleted in checkSeviceState, remove from offlineStores
 
 Host walks all StorageDevices
   1. Load all stores on all devices
@@ -45,24 +27,15 @@ Host walks all StorageDevices
                 - simpler than txTillSuccessful?
             - Else, if not already transferring, start
 
-When transfer ends successfully
-  * Remove 'transferring-out' marker file
-  * os.rename from <device-root>/transferring-in/<storeId> to <device-root>/<storeId>
-  * Load store
-  * trigger storge device state check process mentioned above
-     (Process will see that the store is loaded and will update the state)
-
 To begin transfer:
-  * Verify source and desgination devices are different (would be a mess otherwise)
+  * Add AspenClient.transferStore(storeId, fromDevId, toDevId): Future[Unit]
+    - Verify source and desgination devices are different (would be a mess otherwise)
+    - Verify the source state for the store is Active
+      - fail otherwise
   * In Tx
     update source drive state to set TransferringOut
     update target drive state to TransferringIn
-  * Use CnC to ask destination host to trigger a deviceStateCheck
-
-On CnC transfer out request:
-  * If active, take store offline
-  * generate crl log
-  * create 'transferring-out' marker file
+  * Send CheckStorageDevice message to target host
 
 To create new pool:
   1. Identify all the newStoreId, StorageDevice pairings
@@ -71,12 +44,11 @@ To create new pool:
     * Create PoolConfig object
     * insert into TKVL
     * Update each StorageDeviceState to include new storeIds in Initializing state
-  3. For each StorageDevice touched, use CnC to trigger a deviceStateCheck
-
+  3. For each StorageDevice touched, send CheckStorageDevice message to host
 
 For notifying clients/hosts that a store has moved:
   - On reception of a message for a store that isn't loaded:
-    - Check transferringOutStores. If not in this set/map:
+    - Check offlineStores. If not in this set:
       - Send an UnknownStore(storeId) error in response to the Read/Write
   - In Read & Write drivers, have them call an unknownStoreError(storeId) on
     their client/server Messenger instance
@@ -85,6 +57,14 @@ For notifying clients/hosts that a store has moved:
       the problem
   - CHECK if the storeId is in the Bootstrap pool
     - If so, read the radicle for updated config and update local file
+
+Remove old CnC based StoreTransfer code
+
+----------------
+- Down the road
+
+May need to add an abortStoreTransfer method
+  - to get unstuck if destination drive is full
 
 Need a gossip protocol for spreading the word about cache invalidation for
   1. Host changed it's address/port

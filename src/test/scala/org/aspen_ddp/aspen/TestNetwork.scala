@@ -117,8 +117,6 @@ object TestNetwork {
       tkvl.get(Key(storageDeviceId.uuid)).map: vs =>
         KeyValueObjectPointer(vs.get.value.bytes)
 
-    override def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit] = ???
-
     override def newStoragePool(newPoolName: String,
                        hostCncFrontends: List[CnCFrontend],
                        ida: IDA,
@@ -150,6 +148,8 @@ object TestNetwork {
       case m: TransactionFinalized => txManager.receive(m)
       case m: AllocateResponse => allocationManager.receive(m)
     }
+
+    override def sendHostMessage(msg: HostMessage): Unit = messenger.sendHostMessage(msg)
 
     def getSystemAttribute(key: String): Option[String] = attributes.get(key)
     def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value
@@ -203,38 +203,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
       rfa.create(txd, messenger)
     }
   }
-
-  val smgr = new StoreManager(
-    HostId(new UUID(0,0)),
-    new UUID(0,0),
-    Path.of("/"),
-    executionContext,
-    objectCacheFactory,
-    this,
-    BackgroundTaskManager.NoBackgroundTaskManager,
-    TestCRL,
-    FinalizerFactory,
-    TransactionDriver.noErrorRecoveryFactory,
-    Duration(5, SECONDS))
   
-  smgr.loadStore(store0)
-  smgr.loadStore(store1)
-  smgr.loadStore(store2)
-
-  var otestThreadId: Option[Long] = None
-
-  def handleEvents(): Unit = {
-    otestThreadId match
-      case None => otestThreadId = Some(Thread.currentThread().threadId())
-      case Some(testThreadId) =>
-        if testThreadId != Thread.currentThread().threadId() then
-          println(s"*********** Current thread ${Thread.currentThread().threadId()} != testThreadId $testThreadId")
-          printStack()
-
-    synchronized:
-      smgr.testingOnlyHandleEvents()
-  }
-
   private val cliMessenger = new ClientMessenger {
 
     def sendClientRequest(msg: ClientRequest): Unit = {
@@ -254,8 +223,40 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     def sendHostMessage(msg: HostMessage): Unit = ()
   }
 
-  val client = new TClient(executionContext, cliMessenger, radicle)
+  val client: AspenClient = new TClient(executionContext, cliMessenger, radicle)
   FinalizerFactory.client = client
+
+  val smgr = new StoreManager(
+    client,
+    HostId(new UUID(0, 0)),
+    new UUID(0, 0),
+    Path.of("/"),
+    executionContext,
+    objectCacheFactory,
+    this,
+    BackgroundTaskManager.NoBackgroundTaskManager,
+    TestCRL,
+    FinalizerFactory,
+    TransactionDriver.noErrorRecoveryFactory,
+    Duration(5, SECONDS))
+
+  smgr.loadStore(store0)
+  smgr.loadStore(store1)
+  smgr.loadStore(store2)
+
+  var otestThreadId: Option[Long] = None
+
+  def handleEvents(): Unit = {
+    otestThreadId match
+      case None => otestThreadId = Some(Thread.currentThread().threadId())
+      case Some(testThreadId) =>
+        if testThreadId != Thread.currentThread().threadId() then
+          println(s"*********** Current thread ${Thread.currentThread().threadId()} != testThreadId $testThreadId")
+          printStack()
+
+    synchronized:
+      smgr.testingOnlyHandleEvents()
+  }
 
   // process load store events
   smgr.testingOnlyHandleEvents()

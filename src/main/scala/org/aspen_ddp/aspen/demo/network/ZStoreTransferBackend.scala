@@ -64,12 +64,12 @@ class ZStoreTransferBackend(val transferPort: Int,
 
           given ExecutionContext = client.clientContext
 
-          client.updateStorageHost(storeId, hostId).foreach: _ =>
-            logger.info(s"Successfully updated Storage Pool configuration for store: ${storeId.directoryName}")
+          //client.updateStorageHost(storeId, hostId).foreach: _ =>
+          //  logger.info(s"Successfully updated Storage Pool configuration for store: ${storeId.directoryName}")
 
         else
           ps.getOutputStream.write(data)
-          
- 
+
+
 
 

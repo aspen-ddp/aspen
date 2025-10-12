@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.client.internal.read.{ReadManager, SimpleReadDriver}
 import org.aspen_ddp.aspen.client.internal.transaction.{SimpleClientTransactionDriver, TransactionImpl, TransactionManager}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientResponse, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved}
+import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientResponse, HostMessage, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{KeyRequirement, KeyRevision}
@@ -81,26 +81,6 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     storageDeviceTree.get(Key(storageDeviceId.uuid)).map:
       case None => throw new NoSuchElementException(storageDeviceId.toString)
       case Some(vs) => KeyValueObjectPointer(vs.value.bytes)
-  
-  override def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit] =
-
-    given tx: Transaction = newTransaction()
-    
-    def updateConfig(config: StoragePool.Config): Unit = ()
-      //config.stores(storeId.poolIndex) = newHostId
-
-    for
-      poolPtr <- getStoragePoolPointer(storeId.poolId)
-      currentKvos <- read(poolPtr)
-      poolConfig = StoragePool.Config(currentKvos)
-      _=updateConfig(poolConfig)
-      _=tx.update(poolPtr, None, None,
-        KeyRevision(StoragePool.ConfigKey, 
-          currentKvos.contents(StoragePool.ConfigKey).revision) :: Nil,
-        Insert(StoragePool.ConfigKey, poolConfig.encode()) :: Nil)
-      _ <- tx.commit()
-    yield
-      ()
 
   override protected def createStoragePool(config: StoragePool.Config): Future[StoragePool] =
     val root = new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle)
@@ -165,6 +145,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     case m: TransactionResolved => txManager.receive(m)
     case m: TransactionFinalized => txManager.receive(m)
     case m: AllocateResponse => allocationManager.receive(m)
+
+  private[aspen] def sendHostMessage(msg: HostMessage): Unit =
+    messenger.sendHostMessage(msg)
 
   def getSystemAttribute(key: String): Option[String] = attributes.get(key)
   def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value

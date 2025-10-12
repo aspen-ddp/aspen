@@ -664,6 +664,7 @@ object Main {
     val nodeNet = nnet.serverMessenger
 
     val storeManager = new StoreManager(
+      client,
       hostCfg.hostId,
       bootstrapCfg.aspenSystemId,
       hostDir,

@@ -34,42 +34,42 @@ object ZMQNetwork {
     var isOnline: Boolean = false
     val dealer: ZMQ.Socket = context.createSocket(SocketType.DEALER)
     val pollItem: PollItem = new PollItem(dealer, ZMQ.Poller.POLLIN)
-    
+
     dealer.setIdentity(clientId.toBytes)
     dealer.connect(s"tcp://$address:$port")
-    
+
     oinitialHeartbeat.foreach: msg =>
       dealer.send(msg)
-    
+
     def heartbeatReceived(): Unit =
       lastHeartbeatTime = System.nanoTime()
       if (!isOnline)
         logger.info(s"Node $hostName is Online")
       isOnline = true
-    
-    def setOffline(): Unit = 
+
+    def setOffline(): Unit =
       if (isOnline)
         logger.info(s"Node $hostName is Offline")
       isOnline = false
 
   private class PendingPoolLookup:
     var storeMessages: Map[StoreId, List[Array[Byte]]] = Map()
-    
+
     def addMessage(storeId: StoreId, msg: Array[Byte]): Unit =
-      val lst = storeMessages.get(storeId) match 
+      val lst = storeMessages.get(storeId) match
         case None => msg :: Nil
         case Some(l) => msg :: l
       storeMessages += storeId -> lst
-      
+
   private class PendingHostLookup:
     var pendingMessages: List[Array[Byte]] = Nil
-    
-    def addMessage(msg: Array[Byte]): Unit = 
+
+    def addMessage(msg: Array[Byte]): Unit =
       pendingMessages = msg :: pendingMessages
-    
+
     def addMessages(lst: List[Array[Byte]]): Unit =
       pendingMessages = lst ++ pendingMessages
-  
+
   private sealed abstract class SendQueueMsg
   private case class SendClientRequest(msg: ClientRequest) extends SendQueueMsg
   private case class SendClientTransactionMessage(msg: TxMessage) extends SendQueueMsg
@@ -127,7 +127,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
   import ZMQNetwork._
 
   val clientId: ClientId = oclientId.getOrElse(ClientId(UUID.randomUUID()))
-  
+
   var client: AspenClient = null
 
   logger.debug(s"ZMQNetwork Client ID: ${clientId.uuid.toString}")
@@ -154,13 +154,13 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     val router = context.createSocket(SocketType.ROUTER)
     router.bind(s"tcp://*:$port")
     router
-  
+
   private val orouterPollItem = orouterSocket.map: router =>
     new PollItem(router, ZMQ.Poller.POLLIN)
 
   private val oheartbeatMessage = ohostNode.map: (hostId, _) =>
     ProtobufMessageEncoder.encodeMessage(HostHeartbeat(hostId))
-  
+
   private var storeToHost: Map[StoreId, HostId] =
     bootstrapConfig.hosts.flatMap { host =>
       host.stores.map(storeId => storeId -> host.hostId)
@@ -177,35 +177,35 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       clientId
     )
   }.toMap
-  
+
   private var pendingPoolLookup: Map[PoolId, PendingPoolLookup] = Map()
   private var pendingHostLookup: Map[HostId, PendingHostLookup] = Map()
-  
+
   private val networkThread = new Thread {
     override def run(): Unit = ioThread()
   }
-  
+
   def startIoThread(aspenClient: AspenClient): Unit =
     client = aspenClient
     networkThread.start()
-    
+
   def joinIoThread(): Unit = networkThread.join()
 
   def clientMessenger: ClientMessenger = new CliMessenger(this)
 
   def serverMessenger: ServerMessenger = new SrvMessenger(this)
-  
+
   private def poolLookedUp(pool: StoragePool): Unit = synchronized {
     pool.stores.zipWithIndex.foreach: (entry, index) =>
       val storeId = StoreId(pool.poolId, index.toByte)
       storeToHost += storeId -> entry.hostId
-      
+
     pendingPoolLookup.get(pool.poolId).foreach: ppl =>
       ppl.storeMessages.foreach: (storeId, msgList) =>
         val hostId = storeToHost(storeId)
-        hostStates.get(hostId) match 
+        hostStates.get(hostId) match
           case Some(hostState) => msgList.reverse.foreach(hostState.dealer.send)
-          case None => 
+          case None =>
             val phl = pendingHostLookup.get(hostId) match
               case Some(p) => p
               case None =>
@@ -213,8 +213,8 @@ class ZMQNetwork(val oclientId: Option[ClientId],
                 pendingHostLookup += hostId -> p
                 p
             phl.addMessages(msgList)
-          
-    pendingPoolLookup -= pool.poolId     
+
+    pendingPoolLookup -= pool.poolId
   }
 
   private def hostLookedUp(host: Host): Unit = synchronized {
@@ -227,25 +227,25 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       context,
       clientId
     )
-    
+
     hostStates += host.hostId -> hostState
-    
+
     pendingHostLookup.get(host.hostId).foreach: phl =>
       phl.pendingMessages.reverse.foreach(hostState.dealer.send)
-      
+
     pendingHostLookup -= host.hostId
 
     // Tell I/O thread about the new connection so it can rebuild it's Poller
     // instance
     queueMessageForSend(NewHostConnected())
   }
-  
+
   private def sendHostMessage(hostId: HostId, msg: Array[Byte]): Unit =
     given ExecutionContext = client.clientContext
-    
+
     hostStates.get(hostId) match
       case Some(hostState) => hostState.dealer.send(msg)
-      case None => 
+      case None =>
         val phl = pendingHostLookup.get(hostId) match
           case Some(p) => p
           case None =>
@@ -254,14 +254,14 @@ class ZMQNetwork(val oclientId: Option[ClientId],
             client.getHost(hostId).foreach(hostLookedUp)
             p
         phl.addMessage(msg)
-  
+
   private def sendStoreMessage(storeId: StoreId, msg: Array[Byte]): Unit =
     given ExecutionContext = client.clientContext
-    
+
     storeToHost.get(storeId) match
       case Some(hostId) => sendHostMessage(hostId, msg)
-      case None => 
-        val ppl = pendingPoolLookup.get(storeId.poolId) match 
+      case None =>
+        val ppl = pendingPoolLookup.get(storeId.poolId) match
           case Some(p) => p
           case None =>
             val p = PendingPoolLookup()
@@ -269,8 +269,8 @@ class ZMQNetwork(val oclientId: Option[ClientId],
             client.getStoragePool(storeId.poolId).foreach(poolLookedUp)
             p
         ppl.addMessage(storeId, msg)
-  
-  
+
+
   // Queue message in concurrent linked list and send an empty message to the queue socket
   // to wake the IO thread if it's sleeping in a call to poll()
   private def queueMessageForSend(msg: SendQueueMsg): Unit =
@@ -280,13 +280,13 @@ class ZMQNetwork(val oclientId: Option[ClientId],
   private def heartbeat(): Unit =
     synchronized:
       val offlineThreshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
-      
+
       hostStates.valuesIterator.foreach: host =>
         if host.lastHeartbeatTime <= offlineThreshold && host.isOnline then
           host.setOffline()
         oheartbeatMessage.foreach: msg =>
           host.dealer.send(msg)
-  
+
   private def ioThread(): Unit = {
 
     val routerPoll = orouterPollItem match
@@ -295,17 +295,17 @@ class ZMQNetwork(val oclientId: Option[ClientId],
 
     val heartBeatPeriodMillis = heartbeatPeriod.toMillis.toInt
     var nextHeartbeat = System.currentTimeMillis() + heartBeatPeriodMillis
-    
+
     var hostsArray: Array[HostState] = null
     var poller: ZMQ.Poller = null
-    
+
     def recreatePoller(): Unit = synchronized {
       // Unregister
       if hostsArray != null then
         hostsArray.foreach(host => poller.unregister(host.dealer))
         orouterSocket.foreach(poller.unregister)
         poller.unregister(sendQueueSocket)
-      
+
       // Recreate hostArray to pick up any new connections
       hostsArray = hostStates.valuesIterator.toArray
       // Poller size is size of hosts array plus one for sendQueue plus 0 or 1
@@ -318,7 +318,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     }
 
     recreatePoller()
-    
+
     while (!Thread.currentThread().isInterrupted) {
       val now = System.currentTimeMillis()
 
@@ -326,13 +326,13 @@ class ZMQNetwork(val oclientId: Option[ClientId],
         nextHeartbeat = now + heartBeatPeriodMillis
         heartbeat()
 
-      try 
+      try
         val timeToNextHB = nextHeartbeat - now
         if timeToNextHB > 0 then
           //logger.trace(s"*** SLEEPING. Time to next HB: $timeToNextHB")
           poller.poll(timeToNextHB)
           //logger.trace(s"*** Woke from poll. Time to next HB: ${nextHeartbeat - System.currentTimeMillis()}")
-      catch 
+      catch
         case e: Throwable =>
           logger.warn(s"Poll method threw an exception. Creating a new poller. Error: $e")
           recreatePoller()
@@ -353,7 +353,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
         var msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
         while msg != null do
           msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
-          
+
       // Process messages sent to our local host
       orouterSocket.foreach: router =>
         if poller.pollin(hostsArray.length + 1) then
@@ -373,18 +373,18 @@ class ZMQNetwork(val oclientId: Option[ClientId],
           case SendClientRequest(msg) =>
             logger.trace(s"Sending $msg")
             sendStoreMessage(msg.toStore, ProtobufMessageEncoder.encodeMessage(msg))
-            
+
           case SendClientTransactionMessage(msg) =>
             logger.trace(s"Sending $msg")
             sendStoreMessage(msg.to, ProtobufMessageEncoder.encodeMessage(msg))
-            
+
           case SendClientResponse(msg) =>
             logger.trace(s"Sending $msg")
             clients.get(msg.toClient).foreach: zmqIdentity =>
               orouterSocket.foreach: router =>
                 router.send(zmqIdentity, ZMQ.SNDMORE)
                 router.send(ProtobufMessageEncoder.encodeMessage(msg))
-                
+
           case SendServerTransactionMessage(msg) =>
             logger.trace(s"Sending $msg")
             sendStoreMessage(msg.to, ProtobufMessageEncoder.encodeMessage(msg))
@@ -395,7 +395,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
 
           case NewHostConnected() =>
             recreatePoller()
-            
+
         qmsg = sendQueue.poll()
     }
 
@@ -590,6 +590,11 @@ class ZMQNetwork(val oclientId: Option[ClientId],
 
     else if m.hasStartStoreTransfer then
       val message = Codec.decode(m.getStartStoreTransfer)
+      logger.trace(s"Got $message")
+      onHostMessageReceived(message)
+
+    else if m.hasCheckStorageDevice then
+      val message = Codec.decode(m.getCheckStorageDevice)
       logger.trace(s"Got $message")
       onHostMessageReceived(message)
 

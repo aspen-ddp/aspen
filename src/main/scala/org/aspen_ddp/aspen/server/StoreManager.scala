@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{HostId, StorageDevice, StorageDeviceId, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, HostId, StorageDevice, StorageDeviceId, StoragePool, Transaction, ObjectState as ClientObjectState}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -15,13 +15,18 @@ import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.objects.Insert
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend}
+import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
 
 import java.io.File
 import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.{Failure, Success}
 
 object StoreManager:
   private sealed abstract class Event
@@ -46,8 +51,11 @@ object StoreManager:
                            val devicePath: Path):
     var loadedStores: Set[StoreId] = Set()
 
+  class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
 
-class StoreManager(val hostId: HostId,
+
+class StoreManager(val client: AspenClient,
+                   val hostId: HostId,
                    val aspenSystemId: UUID,
                    val rootDir: Path,
                    val ec: ExecutionContext,
@@ -135,13 +143,183 @@ class StoreManager(val hostId: HostId,
     storageDevices.get(storageDeviceId).map(_.devicePath)
   }
 
-  private def startStoreTransfer(m: StartStoreTransfer): Unit = synchronized {
+  private var transferringOut: Map[StoreId, TransferringOut] = Map()
+  private var transferringInUUIDs: Map[UUID, TransferringIn] = Map()
+  private var transferringInStoreIds: Set[StoreId] = Set()
+  private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
 
+  private val pendingStartTask = client.backgroundTaskManager.schedulePeriodic(Duration(30, SECONDS)):
+    synchronized {
+      val now = HLCTimestamp.now
+      pendingStartTransfers.valuesIterator.foreach: pt =>
+        if now - pt.lastSend > Duration(30, SECONDS) then
+          pt.lastSend = now
+          client.sendHostMessage(pt.msg)
+    }
+
+  private def updateStateForTransferredStore(storeId: StoreId,
+                                             fromDeviceId: StorageDeviceId,
+                                             toDeviceid: StorageDeviceId): Unit =
+    client.transactUntilSuccessful: tx =>
+      for
+        poolPtr <- client.getStoragePoolPointer(storeId.poolId)
+        fromDevPtr <- client.getStorageDevicePointer(fromDeviceId)
+        toDevPtr <- client.getStorageDevicePointer(toDeviceid)
+        poolKvos <- client.read(poolPtr)
+        fromDevKvos <- client.read(fromDevPtr)
+        toDevKvos <- client.read(toDevPtr)
+      yield
+        given Transaction = tx
+
+        val poolCfg = StoragePool.Config(poolKvos)
+        val fromDev = StorageDevice(fromDevKvos)
+        val toDev = StorageDevice(toDevKvos)
+
+        // If the from device doesn't contain the storeId, we're already done.
+        // A concurrent call to this method must have succeeded
+        if fromDev.stores.contains(storeId) then
+          poolCfg.stores(storeId.poolIndex) = StoragePool.StoreEntry(hostId, toDeviceid)
+          val poolReqs = List(KeyRevision(StoragePool.ConfigKey, poolKvos.contents(StoragePool.ConfigKey).revision))
+          val poolOps = List(Insert(StoragePool.ConfigKey, poolCfg.encode()))
+          tx.update(poolPtr, None, None, poolReqs, poolOps)
+
+          val newFromStores = fromDev.stores - storeId
+          val newFromDev = fromDev.copy(stores = newFromStores)
+          val fromDevReqs = List(KeyRevision(StorageDevice.StateKey, fromDevKvos.contents(StorageDevice.StateKey).revision))
+          val fromDevOps = List(Insert(StorageDevice.StateKey, newFromDev.encode()))
+          tx.update(fromDevPtr, None, None, fromDevReqs, fromDevOps)
+
+          val newEntry = StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None)
+          val newToStores = toDev.stores + (storeId -> newEntry)
+          val newtoDev = toDev.copy(stores = newToStores)
+          val toDevReqs = List(KeyRevision(StorageDevice.StateKey, toDevKvos.contents(StorageDevice.StateKey).revision))
+          val toDevOps = List(Insert(StorageDevice.StateKey, newtoDev.encode()))
+          tx.update(toDevPtr, None, None, toDevReqs, toDevOps)
+
+          // If state update transaction is successful, send a CheckStorageDevice
+          // message to the hosst of the old storage device so they can delete
+          // the store content
+          tx.result.foreach: _ =>
+            val msg = CheckStorageDevice(
+              fromDev.hostId,
+              client.clientId,
+              fromDev.storageDeviceId
+            )
+            client.sendHostMessage(msg)
+
+  private def startStoreTransferIn(storeId: StoreId,
+                                   fromHostId: HostId,
+                                   fromDeviceId: StorageDeviceId,
+                                   toDeviceid: StorageDeviceId): Unit = synchronized {
+
+    if ! transferringInStoreIds.contains(storeId) then
+      storageDevices.get(toDeviceid).foreach: toDevice =>
+        val ti = new TransferringIn(
+          client,
+          storeId,
+          toDeviceid,
+          toDevice.devicePath
+        )
+        transferringInUUIDs += ti.transferUUID -> ti
+        transferringInStoreIds += storeId
+
+        def cleanup(): Unit = synchronized {
+          transferringInUUIDs -= ti.transferUUID
+          transferringInStoreIds -= storeId
+        }
+
+        ti.complete.onComplete:
+          case Success(_) =>
+            cleanup()
+            loadStoreById(toDeviceid, storeId)
+            updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid)
+          case Failure(_) =>
+            cleanup()
+            startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+
+        val msg = StartStoreTransfer(
+          fromHostId,
+          client.clientId,
+          fromDeviceId,
+          storeId,
+          HLCTimestamp.now,
+          ti.transferUUID
+        )
+
+        pendingStartTransfers += storeId -> new PendingTransfer(msg, HLCTimestamp.now)
+
+        client.sendHostMessage(msg)
+  }
+
+  private def startStoreTransferOut(m: StartStoreTransfer): Unit = synchronized {
+    def startTransfer(): Unit = {
+      def err(msg: String): Nothing =
+        logger.info(msg)
+        throw new Exception(msg)
+
+      for
+        pool <- client.getStoragePool(m.storeId.poolId)
+        poolEntry = pool.stores(m.storeId.poolIndex)
+        fromDevice <- client.getStorageDevice(poolEntry.storageDeviceId)
+        devEntry = fromDevice.stores.get(m.storeId) match
+          case None => err(s"Store ${m.storeId} missing from device. Transfer probably completed")
+          case Some(e) => e
+        toDeviceId = devEntry.transferDevice match
+          case None => err(s"Store ${m.storeId} not in transfer state. Transfer probably completed")
+          case Some(sid) => sid
+        toDevice <- client.getStorageDevice(toDeviceId)
+        sourceDs = storageDevices.get(fromDevice.storageDeviceId) match
+          case None => err(s"Source storage device for transfer ${fromDevice.storageDeviceId} not loaded. Disk removed?")
+          case Some(sds) => sds
+      yield
+        synchronized {
+          if devEntry.status == StorageDevice.StoreStatus.TransferringOut then
+            if ! transferringOut.contains(m.storeId) then
+              val fclosed = stores.get(m.storeId) match
+                case None => Future.unit
+                case Some(_) => closeStore(m.storeId)
+
+              fclosed.foreach: _ =>
+                synchronized {
+                  if ! transferringOut.contains(m.storeId) then
+                    val to = new TransferringOut(
+                      client,
+                      sourceDs.storageDeviceId,
+                      sourceDs.devicePath,
+                      m.storeId,
+                      toDevice.hostId,
+                      toDevice.storageDeviceId,
+                      m.timestamp,
+                      m.transferUUID
+                    )
+                    transferringOut += m.storeId -> to
+
+                    to.complete.foreach: _ =>
+                      synchronized {
+                        transferringOut -= m.storeId
+                      }
+                }
+        }
+    }
+
+    transferringOut.get(m.storeId) match
+      case None => startTransfer()
+      case Some(to) =>
+        if to.transferUUID != m.transferUUID && to.timestamp < m.timestamp then
+          to.abort()
+          transferringOut -= m.storeId
+          startTransfer()
   }
 
   private def transferDataReceived(m: StoreTransferData): Unit = synchronized {
-
+    transferringInUUIDs.get(m.transferUUID).foreach: ti =>
+      if pendingStartTransfers.contains(ti.storeId) then
+        pendingStartTransfers -= ti.storeId
+      ti.dataReceived(m.data)
   }
+
+  private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
+    ()
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
@@ -176,7 +354,7 @@ class StoreManager(val hostId: HostId,
   def receiveClientRequest(msg: ClientRequest): Unit = {
     events.put(ClientReq(msg))
   }
-  
+
   def receiveHostMessage(msg: HostMessage): Unit =
     events.put(HostMsg(msg))
 
@@ -185,10 +363,11 @@ class StoreManager(val hostId: HostId,
 
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     events.put(Exit())
+    pendingStartTask.cancel()
     shutdownPromise.future
   }
   
-  def closeStore(storeId: StoreId): Future[Unit] = {
+  private def closeStore(storeId: StoreId): Future[Unit] = {
     val p = Promise[Unit]()
     events.put(ShutdownStore(storeId, p))
     p.future
@@ -249,9 +428,10 @@ class StoreManager(val hostId: HostId,
       }
 
       case HostMsg(msg) => msg match
-        case m: StartStoreTransfer => startStoreTransfer(m)
+        case m: StartStoreTransfer => startStoreTransferOut(m)
         case m: StoreTransferData => transferDataReceived(m)
-      
+        case m: CheckStorageDevice => checkStorageDevice(m.deviceId)
+
 
       case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
         store.repair(os, completion)

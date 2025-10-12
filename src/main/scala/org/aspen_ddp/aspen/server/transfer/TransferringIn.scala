@@ -32,11 +32,14 @@ class TransferringIn( val client: AspenClient,
   if os.exists(finalPath) then
     throw new Exception(s"Store path already exists! $finalPath")
 
-  if os.exists(transferInPath) then
+  private def deleteTransferPath(): Unit =
     try
       os.remove.all(transferInPath)
     catch
       case t: Throwable => logger.error(f"Failed to remove transfer-in directory $transferInPath. Error: $t")
+      
+  if os.exists(transferInPath) then
+    deleteTransferPath()
 
   os.makeDir.all(transferInPath)
 
@@ -54,6 +57,7 @@ class TransferringIn( val client: AspenClient,
     bgTask.cancel()
     if extractionProcess.isAlive() then
       extractionProcess.destroy()
+    deleteTransferPath()
     val msg = f"Transfer ailed for store $storeId: $errorMessage"
     logger.info(msg)
     completionPromise.failure(new Exception(msg))

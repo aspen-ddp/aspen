@@ -120,6 +120,7 @@ object ProtobufMessageEncoder:
     message match
       case m: StartStoreTransfer => builder.setStartStoreTransfer(Codec.encode(m))
       case m: StoreTransferData => builder.setStoreTransferData(Codec.encode(m))
+      case m: CheckStorageDevice => builder.setCheckStorageDevice(Codec.encode(m))
 
     val encodedMsg = builder.build.toByteArray
 

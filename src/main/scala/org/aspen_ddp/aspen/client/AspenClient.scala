@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -62,8 +62,6 @@ trait AspenClient extends ObjectReader:
   private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]
   private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer]
 
-  private[aspen] def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit]
-
   def newStoragePool(newPoolName: String,
                      hostCncFrontends: List[CnCFrontend],
                      ida: IDA,
@@ -107,6 +105,7 @@ trait AspenClient extends ObjectReader:
   private[client] val objectCache: ObjectCache
 
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
+  private[aspen] def sendHostMessage(msg: HostMessage): Unit
 
   private[aspen] def getSystemAttribute(key: String): Option[String]
   private[aspen] def setSystemAttribute(key: String, value: String): Unit

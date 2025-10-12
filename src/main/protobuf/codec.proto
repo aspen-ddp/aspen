@@ -419,6 +419,12 @@ message StoreTransferData {
   bytes data = 4;
 }
 
+message CheckStorageDevice {
+  UUID toHost = 1;
+  UUID fromClient = 2;
+  StorageDeviceId deviceId = 3;
+}
+
 
 //---------------------------------------------------------------------------
 //- Root Message
@@ -447,6 +453,7 @@ message Message {
     TxStatusResponse status_response = 20;
     StartStoreTransfer start_store_transfer = 21;
     StoreTransferData store_transfer_data = 22;
+    CheckStorageDevice check_storage_device = 23;
   }
 }
 

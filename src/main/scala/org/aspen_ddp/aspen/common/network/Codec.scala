@@ -1004,6 +1004,20 @@ object Codec extends Logging:
     StoreTransferData(toHost, fromClient, transferUUID, data)
 
 
+  def encode(o: CheckStorageDevice): codec.CheckStorageDevice =
+    codec.CheckStorageDevice.newBuilder()
+      .setToHost(encodeUUID(o.toHost.uuid))
+      .setFromClient(encodeUUID(o.fromClient.uuid))
+      .setDeviceId(encode(o.deviceId))
+      .build
+
+  def decode(m: codec.CheckStorageDevice): CheckStorageDevice =
+    val toHost = HostId(decodeUUID(m.getToHost))
+    val fromClient = ClientId(decodeUUID(m.getFromClient))
+    val deviceId = decode(m.getDeviceId)
+    CheckStorageDevice(toHost, fromClient, deviceId)
+
+
   // ----------------------- Non Network Messages -----------------------
 
   def encode(o: ObjectUpdate): codec.ObjectUpdate =

@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, Host, HostId, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StorageDeviceId, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
@@ -62,8 +62,6 @@ object BaseReadDriverSuite {
     def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = Future.failed(new Exception("TODO"))
 
     def newTransaction(): Transaction = null
-    
-    override def updateStorageHost(storeId: StoreId, newHostId: HostId): Future[Unit] = ???
 
     override def newStoragePool(newPoolName: String,
                        hostCncFrontends: List[CnCFrontend],
@@ -93,6 +91,8 @@ object BaseReadDriverSuite {
     private[client] val objectCache: ObjectCache = ObjectCache.NoCache
 
     private[aspen] def receiveClientResponse(msg: ClientResponse): Unit = ()
+
+    override def sendHostMessage(msg: HostMessage): Unit = ()
 
     private[aspen] def getSystemAttribute(key: String): Option[String] = None
     private[aspen] def setSystemAttribute(key: String, value: String): Unit = ()

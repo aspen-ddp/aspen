@@ -47,6 +47,12 @@ final case class StoreTransferData(
                                     data: DataBuffer
                                   ) extends HostMessage
 
+final case class CheckStorageDevice(
+                                     toHost: HostId,
+                                     fromClient: ClientId,
+                                     deviceId: StorageDeviceId
+                                   ) extends HostMessage
+
 sealed abstract class TxMessage extends Message {
   val to: StoreId
   val from: StoreId

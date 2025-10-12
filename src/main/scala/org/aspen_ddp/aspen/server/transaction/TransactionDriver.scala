@@ -179,6 +179,16 @@ abstract class TransactionDriver(
     cliResolved.foreach(messenger.sendClientResponse)
   }
 
+  def receiveTxUnknownStore(msg: TxUnknownStore): Unit = {
+    // Don't worry about re-sending lost messages. Odds are the store was
+    // transferred to a new host and has been offline for a relatively long
+    // time. If the Tx is stalled waiting for this store to come online,
+    // Dropping the cache will ensure that the next retransmit will use the
+    // new host. Otherwise we can just complete without this store and let
+    // the repair process take care of the missed Tx
+    messenger.dropCacheForStore(msg.from)
+  }
+
   def receiveTxPrepare(msg: TxPrepare): Unit = synchronized {
     proposer.updateHighestProposalId(msg.proposalId)
   }

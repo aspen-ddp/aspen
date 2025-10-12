@@ -218,6 +218,8 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
 
     def sendHostMessage(msg: HostMessage): Unit = ()
+
+    def dropCacheForStore(storeId: StoreId): Unit = ()
   }
 
   val client: AspenClient = new TClient(executionContext, cliMessenger, radicle)
@@ -276,6 +278,8 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     msg.foreach(smgr.receiveTransactionMessage)
     handleEvents()
   }
+  
+  override def dropCacheForStore(storeId: StoreId): Unit = ()
 
   def hasTransactions: Boolean = smgr.hasTransactions
 

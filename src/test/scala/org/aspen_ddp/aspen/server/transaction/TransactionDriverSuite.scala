@@ -47,6 +47,8 @@ object TransactionDriverSuite {
 
     def sendTransactionMessages(msg: List[TxMessage]): Unit = messages = msg ++ messages
 
+    def dropCacheForStore(storeId: StoreId): Unit = ()
+
     def clear(): Unit = messages = List()
   }
 

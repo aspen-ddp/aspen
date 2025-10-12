@@ -572,6 +572,17 @@ object Codec extends Logging:
       m.getCommitted)
 
 
+  def encode(o: TxUnknownStore): codec.TxUnknownStore =
+    codec.TxUnknownStore.newBuilder()
+      .setTo(encode(o.to))
+      .setFrom(encode(o.from))
+      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
+      .build
+
+  def decode(m: codec.TxUnknownStore): TxUnknownStore =
+    TxUnknownStore(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)))
+
+
   def encode(o: TxCommitted): codec.TxCommitted =
     val builder = codec.TxCommitted.newBuilder()
       .setTo(encode(o.to))

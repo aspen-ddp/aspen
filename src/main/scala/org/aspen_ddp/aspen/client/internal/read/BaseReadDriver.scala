@@ -1,17 +1,14 @@
 package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
-
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadError}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadType}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, SECONDS}
-import scala.util.{Failure, Success}
 
 abstract class BaseReadDriver(
                                val client: AspenClient,
@@ -20,8 +17,6 @@ abstract class BaseReadDriver(
                                val comment: String,
                                val disableOpportunisticRebuild: Boolean = false
                     ) extends ReadDriver with Logging {
-
-  given ec: ExecutionContext
 
   logger.info(s"Read UUID $readUUID: Beginning read of ${objectPointer.objectType} object ${objectPointer.id}. Comment: $comment")
 
@@ -101,7 +96,16 @@ abstract class BaseReadDriver(
       }
     }
 
-    if (hasLocksForKnownCommittedTransactions) {
+    val isUnknownStoreResponse = response.result match
+      case Left(err) =>
+        if err == ReadError.StoreNotFound then
+          client.messenger.dropCacheForStore(response.fromStore)
+          true
+        else
+          false
+      case Right(_) => false
+
+    if (isUnknownStoreResponse || hasLocksForKnownCommittedTransactions) {
       // We know for certain that the response from this store has out-of-date information. Transactions _should_
       // resolve quickly so we'll immediately reread from the store
       sendReadRequest(response.fromStore)

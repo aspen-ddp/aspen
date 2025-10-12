@@ -94,6 +94,8 @@ object ZMQNetwork {
     def sendHostMessage(msg: HostMessage): Unit = synchronized {
       net.queueMessageForSend(SendHostMessage(msg))
     }
+    
+    def dropCacheForStore(storeId: StoreId): Unit = net.dropCacheForStore(storeId)
   }
 
   private class SrvMessenger(net: ZMQNetwork) extends ServerMessenger with Logging {
@@ -112,6 +114,8 @@ object ZMQNetwork {
     }
 
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
+
+    def dropCacheForStore(storeId: StoreId): Unit = net.dropCacheForStore(storeId)
   }
 }
 
@@ -194,6 +198,10 @@ class ZMQNetwork(val oclientId: Option[ClientId],
   def clientMessenger: ClientMessenger = new CliMessenger(this)
 
   def serverMessenger: ServerMessenger = new SrvMessenger(this)
+  
+  def dropCacheForStore(storeId: StoreId): Unit = synchronized {
+    storeToHost -= storeId
+  }
 
   private def poolLookedUp(pool: StoragePool): Unit = synchronized {
     pool.stores.zipWithIndex.foreach: (entry, index) =>
@@ -597,6 +605,11 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       val message = Codec.decode(m.getCheckStorageDevice)
       logger.trace(s"Got $message")
       onHostMessageReceived(message)
+
+    else if m.hasUnknownStore then
+      val message = Codec.decode(m.getUnknownStore)
+      logger.trace(s"Got $message")
+      onTransactionMessageReceived(message)
 
     else
       logger.error("Unknown Message!")

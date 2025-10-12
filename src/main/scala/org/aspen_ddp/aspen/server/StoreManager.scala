@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
 
@@ -560,13 +560,33 @@ class StoreManager(val client: AspenClient,
         store.frontend.backendOperationComplete(op)
       }
 
-      case TransactionMessage(msg) =>
-        stores.get(msg.to).foreach { store =>
-          store.receiveTransactionMessage(msg)
-        }
+      case TransactionMessage(msg) => stores.get(msg.to) match
+        case None => 
+          if ! offlineStores.contains(msg.to) then
+            val reply = TxUnknownStore(msg.from, msg.to, msg.transactionId)
+            net.sendTransactionMessage(reply)
+            
+        case Some(store) => store.receiveTransactionMessage(msg)
+        
 
-      case ClientReq(msg) => stores.get(msg.toStore).foreach { store =>
-        msg match {
+      case ClientReq(msg) => stores.get(msg.toStore) match
+        case None => msg match
+          case a: Allocate =>
+          case r: Read => 
+            if ! offlineStores.contains(r.toStore) then
+              val msg = ReadResponse(
+                r.fromClient,
+                r.toStore,
+                r.readUUID,
+                HLCTimestamp.now,
+                Left(ReadError.StoreNotFound)
+              )
+              net.sendClientResponse(msg)
+              
+          case op: OpportunisticRebuild =>
+          case s: TransactionCompletionQuery =>
+          
+        case Some(store) => msg match
           case a: Allocate => store.frontend.allocateObject(a)
 
           case r: Read =>
@@ -586,8 +606,6 @@ class StoreManager(val client: AspenClient,
             }
             val r = TransactionCompletionResponse(s.fromClient, s.toStore, s.queryUUID, isComplete)
             net.sendClientResponse(r)
-        }
-      }
 
       case HostMsg(msg) => msg match
         case m: StartStoreTransfer => startStoreTransferOut(m)

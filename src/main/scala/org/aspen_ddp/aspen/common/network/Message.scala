@@ -169,7 +169,21 @@ final case class TransactionFinalized(
                                        committed: Boolean) extends ClientResponse:
   override def toString: String = f"TransactionFinalized to $toClient from $fromStore tx $transactionId committed $committed"
 
-
+/**
+ * Sent in response to a transaction message if the recipient does not host the
+ * store. Usually this will be due to the store having been transferred to a new
+ * machine and the TransactionDriver is using the old, cached value. 
+ * 
+ * Note that the from: StoreId is the store not found
+ */
+final case class TxUnknownStore(
+                                 to: StoreId,
+                                 from: StoreId,
+                                 transactionId: TransactionId,
+                               ) extends TxMessage:
+  
+  override def toString: String = f"TxUnkonwnStore to $to from $from tx $transactionId"
+  
 final case class TxPrepare(
                             to: StoreId,
                             from: StoreId,

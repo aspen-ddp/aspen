@@ -131,6 +131,10 @@ class Store(val storageDeviceId: StorageDeviceId,
         transactionDrivers -= m.transactionId
       }
 
+      case m: TxUnknownStore => transactionDrivers.get(m.transactionId).foreach { driver =>
+        driver.receiveTxUnknownStore(m)
+      }
+
       case _ =>
     }
 

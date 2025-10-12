@@ -275,6 +275,12 @@ message TxStatusResponse {
   bool is_finalized = 7;
 }
 
+message TxUnknownStore {
+  StoreId to = 1;
+  StoreId from = 2;
+  UUID transaction_uuid = 3;
+}
+
 //---------------------------------------------------------------------------
 //- Read Messages
 //---------------------------------------------------------------------------
@@ -454,6 +460,7 @@ message Message {
     StartStoreTransfer start_store_transfer = 21;
     StoreTransferData store_transfer_data = 22;
     CheckStorageDevice check_storage_device = 23;
+    TxUnknownStore unknown_store = 24;
   }
 }
 

@@ -43,6 +43,8 @@ object FrontendSuite {
     override def sendTransactionMessage(msg: TxMessage): Unit = tx = Some(msg)
 
     override def sendTransactionMessages(msg: List[TxMessage]): Unit = Some(msg.head)
+    
+    override def dropCacheForStore(storeId: StoreId): Unit = ()
 
     def clientMessage(): Option[ClientResponse] = {
       val t = cr

@@ -38,6 +38,7 @@ object ProtobufMessageEncoder:
       case m: TxHeartbeat => builder.setHeartbeat(Codec.encode(m))
       case m: TxStatusRequest => builder.setStatusRequest(Codec.encode(m))
       case m: TxStatusResponse => builder.setStatusResponse(Codec.encode(m))
+      case m: TxUnknownStore => builder.setUnknownStore(Codec.encode(m))
 
     val encodedMsg = builder.build.toByteArray
 

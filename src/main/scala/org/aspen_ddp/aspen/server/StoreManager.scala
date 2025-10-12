@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{AspenClient, HostId, StorageDevice, StorageDeviceId, StoragePool, Transaction, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, HostId, KeyValueObjectState, StorageDevice, StorageDeviceId, StoragePool, Transaction, ObjectState as ClientObjectState}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -10,15 +10,14 @@ import org.aspen_ddp.aspen.common.transaction.TransactionStatus
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler, RocksDBBackend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.Insert
+import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend}
 import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
 
 import java.io.File
@@ -36,11 +35,12 @@ object StoreManager:
   private case class ClientReq(msg: ClientRequest) extends Event
   private case class HostMsg(msg: HostMessage) extends Event
   private case class Repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]) extends Event
-  private case class LoadStore(backend: Backend, completion: Promise[Unit]) extends Event
+  private case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend, completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   private case class Exit() extends Event
   private case class RecoveryEvent() extends Event
   private case class HeartbeatEvent() extends Event
+  private case class CheckAllDevices() extends Event
   private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
 
   class IOHandler(mgr: StoreManager) extends CompletionHandler:
@@ -50,6 +50,7 @@ object StoreManager:
   class StorageDeviceState(val storageDeviceId: StorageDeviceId,
                            val devicePath: Path):
     var loadedStores: Set[StoreId] = Set()
+    var offlineStores: Set[StoreId] = Set()
 
   class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
 
@@ -65,7 +66,8 @@ class StoreManager(val client: AspenClient,
                    crlFactory: CrashRecoveryLogFactory,
                    val finalizerFactory: TransactionFinalizer.Factory,
                    val txDriverFactory: TransactionDriver.Factory,
-                   val heartbeatPeriod: Duration) extends Logging {
+                   val heartbeatPeriod: Duration,
+                   val checkStorageDevicePeriod: Duration) extends Logging {
   import StoreManager._
   
   given ExecutionContext = ec
@@ -89,6 +91,7 @@ class StoreManager(val client: AspenClient,
   protected var stores: Map[StoreId, Store] = Map()
 
   private var offlineStores: Set[StoreId] = Set()
+  private var creatingStores: Set[StoreId] = Set()
   private var transferringOut: Map[StoreId, TransferringOut] = Map()
   private var transferringInUUIDs: Map[UUID, TransferringIn] = Map()
   private var transferringInStoreIds: Set[StoreId] = Set()
@@ -106,12 +109,21 @@ class StoreManager(val client: AspenClient,
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
     events.put(HeartbeatEvent())
   }
-
+  
+  private val checkStorageDeviceTask = backgroundTasks.schedulePeriodic(checkStorageDevicePeriod) {
+    events.put(CheckAllDevices())
+  }
+  
   if ! Files.isDirectory(storageDevicesDir) then
     logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
   else
     storageDevicesDir.toFile.listFiles().foreach: sdFile =>
       tryLoadDevice(sdFile)
+      
+  // After we've loaded all the stores, initiate an initial check of all our
+  // devices in case operations were preformed while we were down and missed
+  // the CheckDeviceState messages
+  events.put(CheckAllDevices())
 
   private def tryLoadDevice(sdFile: File): Unit =
     val storageDevicePath = sdFile.toPath
@@ -139,12 +151,13 @@ class StoreManager(val client: AspenClient,
         if os.exists(os.Path(potentialStoreFile) / TransferringOut.MarkerFile) then
           logger.info(s"Skipping load of offline store marked for transfer out. StoreId ${storeCfg.storeId}. $potentialStoreFile")
           offlineStores += storeCfg.storeId
+          sds.offlineStores += storeCfg.storeId
         else
           val backend = storeCfg.backend match
             case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
           sds.loadedStores += backend.storeId
           logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
-          loadStore(backend)
+          loadStore(sds.storageDeviceId, backend)
       catch
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
@@ -324,8 +337,149 @@ class StoreManager(val client: AspenClient,
       ti.dataReceived(m.data)
   }
 
+  private def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
+    client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+
+      case class PoolState(poolId: PoolId,
+                           pointer: KeyValueObjectPointer,
+                           kvos: KeyValueObjectState,
+                           stores: List[StoreId],
+                           config: StoragePool.Config)
+
+      def collectPools(stores: List[StoreId]): List[Future[PoolState]] =
+        val poolMap = stores.foldLeft(Map[PoolId, List[StoreId]]()): (m, storeId) =>
+          val l = m.get(storeId.poolId) match
+            case None => storeId :: Nil
+            case Some(lst) => storeId :: lst
+          m + (storeId.poolId -> l)
+
+        poolMap.map { (poolId, stores) =>
+          for
+            poolPtr <- client.getStoragePoolPointer(poolId)
+            poolKvos <- client.read(poolPtr)
+          yield
+            PoolState(poolId, poolPtr, poolKvos, stores, StoragePool.Config(poolKvos))
+        }.toList
+
+      def updatePool(ps: PoolState): Unit =
+        ps.stores.foreach: storeId =>
+          val newEntry = ps.config.stores(storeId.poolIndex).copy(hostId = hostId)
+          ps.config.stores(storeId.poolIndex) = newEntry
+
+        val reqs = List(KeyRevision(StoragePool.ConfigKey, ps.kvos.contents(StoragePool.ConfigKey).revision))
+        val ops = List(Insert(StoragePool.ConfigKey, ps.config.encode()))
+
+        tx.update(ps.pointer, None, None, reqs, ops)
+
+      for
+        devPtr <- client.getStorageDevicePointer(storageDeviceId)
+        devKvos <- client.read(devPtr)
+        state = StorageDevice(devKvos)
+        pools <- Future.sequence(collectPools(state.stores.keysIterator.toList))
+      yield
+        // Check to ensure another concurrent call to this method didn't already
+        // succeed
+        if state.hostId != hostId then
+          logger.info(s"Updating host for storage device ${storageDeviceId}")
+
+          pools.foreach: ps =>
+            updatePool(ps)
+
+          val newDevState = state.copy(hostId = hostId)
+          val reqs = List(KeyRevision(StorageDevice.StateKey, devKvos.contents(StorageDevice.StateKey).revision))
+          val ops = List(Insert(StorageDevice.StateKey, newDevState.encode()))
+
+          tx.update(devPtr, None, None, reqs, ops)
+
+          tx.result.foreach: _ =>
+            logger.info(s"Successfully updated host for storage device ${storageDeviceId}")
+
+  private def createNewStore(local: StorageDeviceState, storeId: StoreId): Unit = synchronized {
+    val storePath = os.Path(local.devicePath) / storeId.directoryName
+
+    if ! creatingStores.contains(storeId) then
+      creatingStores += storeId
+
+      val fcreate = if os.exists(storePath) then
+        Future.unit
+      else
+        client.getStoragePool(storeId.poolId).flatMap: pool =>
+          val backend = pool.backendConfig match
+            case cfg: RocksDBConfig => new RocksDBBackend(storePath.toNIO, storeId, ec)
+
+          loadStore(local.storageDeviceId, backend)
+
+      client.transactUntilSuccessful: tx =>
+        for
+          _ <- fcreate
+          ptr <- client.getStorageDevicePointer(local.storageDeviceId)
+          kvos <- client.read(ptr)
+          state = StorageDevice(kvos)
+        yield
+          state.stores.get(storeId).foreach: entry =>
+            if entry.status == StorageDevice.StoreStatus.Initializing then
+              val newStores = state.stores + (storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None))
+              val newState = state.copy(stores = newStores)
+
+              val reqs = List(KeyRevision(StorageDevice.StateKey, kvos.contents(StorageDevice.StateKey).revision))
+              val ops = List(Insert(StorageDevice.StateKey, newState.encode()))
+
+              logger.info(s"Updating device state to mark store $storeId as Active")
+              tx.update(ptr, None, None, reqs, ops)
+
+              tx.result.foreach: _ =>
+                logger.info(s"Successfully updated device state to mark store $storeId as Active")
+                synchronized:
+                  creatingStores -= storeId
+  }
+
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
-    ()
+    def check(local: StorageDeviceState, remote: StorageDevice): Unit = synchronized {
+      if remote.hostId != hostId then
+        updateHostId(storageDeviceId).foreach: _ =>
+          checkStorageDevice(storageDeviceId)
+      else
+        //----------------------
+        // Deleted Stores
+        //
+        local.offlineStores.filter(storeId =>
+          !remote.stores.contains(storeId)
+        ).foreach: storeId =>
+          val storePath = os.Path(local.devicePath) / storeId.directoryName
+          if os.exists(storePath) then
+            logger.info(s"Deleting successfully transferred store $storePath")
+            try
+              os.remove.all(storePath)
+            catch
+              case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
+
+        //----------------------
+        // New Stores
+        //
+        remote.stores.filter((storeId, entry) =>
+          entry.status == StorageDevice.StoreStatus.Initializing
+        ).map( (storeId, _) =>
+          storeId
+        ).foreach: storeId =>
+          createNewStore(local, storeId)
+
+        //----------------------
+        // Transferring In Stores
+        //
+        remote.stores.filter { (storeId, entry) =>
+          entry.status == StorageDevice.StoreStatus.TransferringIn
+        }.map { (storeId, status) =>
+          (storeId, status.transferDevice)
+        }.toList.foreach: (storeId, ofromDeviceId) =>
+          ofromDeviceId.foreach: fromDeviceId =>
+            client.getStorageDevice(fromDeviceId).foreach: fromDevice =>
+              startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+    }
+
+    synchronized { storageDevices.get(storageDeviceId) }.foreach: local =>
+      client.getStorageDevice(storageDeviceId).foreach: remote =>
+        check(local, remote)
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
@@ -344,9 +498,9 @@ class StoreManager(val client: AspenClient,
     stores.values.foreach(_.logTransactionStatus(log))
   }
 
-  def loadStore(backend: Backend): Future[Unit] = {
+  def loadStore(storageDeviceId: StorageDeviceId, backend: Backend): Future[Unit] = {
     val p = Promise[Unit]()
-    events.put(LoadStore(backend, p))
+    events.put(LoadStore(storageDeviceId, backend, p))
     p.future
   }
 
@@ -371,6 +525,7 @@ class StoreManager(val client: AspenClient,
     events.put(Exit())
     pendingStartTask.cancel()
     heartbeatTask.cancel()
+    checkStorageDeviceTask.cancel()
     shutdownPromise.future
   }
   
@@ -438,16 +593,15 @@ class StoreManager(val client: AspenClient,
         case m: StartStoreTransfer => startStoreTransferOut(m)
         case m: StoreTransferData => transferDataReceived(m)
         case m: CheckStorageDevice => checkStorageDevice(m.deviceId)
-
-
+      
       case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
         store.repair(os, completion)
 
       case RecoveryEvent() =>
         handleRecoveryEvent()
 
-      case LoadStore(backend, p) =>
-        val store = new Store(ec, backend, objectCacheFactory(), net, backgroundTasks, crl,
+      case LoadStore(storageDeviceId, backend, p) =>
+        val store = new Store(storageDeviceId, ec, backend, objectCacheFactory(), net, backgroundTasks, crl,
           txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8)
         backend.setCompletionHandler(ioHandler)
         stores += (backend.storeId -> store)
@@ -467,6 +621,10 @@ class StoreManager(val client: AspenClient,
       case HeartbeatEvent() =>
         //logger.trace("Main loop got heartbeat event")
         stores.valuesIterator.foreach(_.heartbeat())
+
+      case CheckAllDevices() =>
+        storageDevices.valuesIterator.foreach: sds =>
+          checkStorageDevice(sds.storageDeviceId)
         
       case ShutdownStore(storeId, completion) =>
         stores.get(storeId) match
@@ -474,6 +632,8 @@ class StoreManager(val client: AspenClient,
           case Some(store) =>
             stores -= storeId
             offlineStores += storeId
+            storageDevices.get(store.storageDeviceId).foreach: sds =>
+              sds.offlineStores += storeId
             crl.closeStore(storeId).foreach: (trs, ars) =>
               CrashRecoveryLog.saveStoreState(storeId, trs, ars, store.backend.crlSaveFile)
               store.close().foreach: _ =>

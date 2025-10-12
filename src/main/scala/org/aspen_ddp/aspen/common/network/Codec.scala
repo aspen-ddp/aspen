@@ -1128,6 +1128,14 @@ object Codec extends Logging:
     StoragePool.StoreEntry(hostId, storageDeviceId)
 
 
+  def encodeBackendConfig(o: BackendConfig): codec.BackendConfig = o match
+    case RocksDBConfig() => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
+
+  def decodeBackendConfig(m: codec.BackendConfig): BackendConfig = m match
+    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig()
+    case f => throw new EncodingError(f"Invalid Backend Config: $f")
+    
+    
   def encode(o: StoragePool.Config): codec.PoolConfig =
     val builder = codec.PoolConfig.newBuilder()
 
@@ -1135,6 +1143,7 @@ object Codec extends Logging:
     builder.setName(o.name)
     builder.setDefaultIDA(encode(o.defaultIDA))
     builder.setMaxObjectSize(o.maxObjectSize.getOrElse(0))
+    builder.setBackendConfig(encodeBackendConfig(o.backendConfig))
 
     o.stores.foreach: storeEntry =>
       builder.addStores(encode(storeEntry))
@@ -1147,8 +1156,9 @@ object Codec extends Logging:
     val defaultIDA = decode(m.getDefaultIDA)
     val maxObjectSize = if m.getMaxObjectSize == 0 then None else Some(m.getMaxObjectSize)
     val stores = m.getStoresList.asScala.map(decode).toArray
+    val backendConfig = decodeBackendConfig(m.getBackendConfig)
 
-    StoragePool.Config(poolId, name, defaultIDA, maxObjectSize, stores)
+    StoragePool.Config(poolId, name, defaultIDA, maxObjectSize, stores, backendConfig)
 
 
   def encode(o: Host): codec.Host =
@@ -1179,15 +1189,7 @@ object Codec extends Logging:
     Host(hostId, name, address, dataPort, cncPort, storeTransferPort, storageDevices)
 
   // CnC Messages -----------------------------------------------------------------
-
-  def encodeBackendConfig(o: BackendConfig): codec.BackendConfig = o match
-    case RocksDBConfig() => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
-
-  def decodeBackendConfig(m: codec.BackendConfig): BackendConfig = m match
-    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig()
-    case f => throw new EncodingError(f"Invalid Backend Config: $f")
-
-
+  
   def encode(o: NewStore): codec.NewStore =
     val builder = codec.NewStore.newBuilder()
 

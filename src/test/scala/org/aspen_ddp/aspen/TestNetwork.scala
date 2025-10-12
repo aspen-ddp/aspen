@@ -171,11 +171,13 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
   val store2 = new MapBackend(storeId2)
 
   val ida = Replication(3, 2)
+  
+  val storageDeviceId = StorageDeviceId(new UUID(0, 0))
 
   var handleDepth = 0
 
   val bootstrapSD = StorageDevice(
-    StorageDeviceId(new UUID(0, 0)),
+    storageDeviceId,
     bootstrapHost.hostId,
     Map(
       store0.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None),
@@ -238,11 +240,12 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     TestCRL,
     FinalizerFactory,
     TransactionDriver.noErrorRecoveryFactory,
-    Duration(5, SECONDS))
+    Duration(5, SECONDS),
+    Duration(60, SECONDS))
 
-  smgr.loadStore(store0)
-  smgr.loadStore(store1)
-  smgr.loadStore(store2)
+  smgr.loadStore(storageDeviceId, store0)
+  smgr.loadStore(storageDeviceId, store1)
+  smgr.loadStore(storageDeviceId, store2)
 
   var otestThreadId: Option[Long] = None
 

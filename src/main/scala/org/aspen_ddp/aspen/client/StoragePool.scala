@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.Key
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.codec
+import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
 object StoragePool:
   private [aspen] val ConfigKey = Key(Array[Byte](0))
@@ -20,7 +21,8 @@ object StoragePool:
                            name: String,
                            defaultIDA: IDA,
                            maxObjectSize: Option[Int],
-                           stores: Array[StoreEntry]
+                           stores: Array[StoreEntry],
+                           backendConfig: BackendConfig
                          ):
     def numberOfStores: Int = stores.length
 
@@ -45,6 +47,8 @@ trait StoragePool {
   val defaultIDA: IDA
 
   val stores: Array[StoragePool.StoreEntry]
+  
+  val backendConfig: BackendConfig
 
   def supportsIDA(ida: IDA): Boolean
 

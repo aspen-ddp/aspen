@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.client.{AspenClient, HostId, KeyValueObjectState, ObjectAllocator, StoragePool}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
 object SimpleStoragePool:
   
@@ -20,7 +21,8 @@ object SimpleStoragePool:
     val errorTree = new TieredKeyValueList(client,
       new KVObjectRootManager(client, StoragePool.ErrorTreeKey, kvos.pointer))
 
-    new SimpleStoragePool(client, cfg.poolId, cfg.name, cfg.numberOfStores, cfg.defaultIDA, cfg.stores, cfg.maxObjectSize,
+    new SimpleStoragePool(client, cfg.poolId, cfg.name, cfg.numberOfStores, cfg.defaultIDA, cfg.stores,
+      cfg.backendConfig, cfg.maxObjectSize,
       allocTree, errorTree)
 
 
@@ -30,6 +32,7 @@ class SimpleStoragePool(val client: AspenClient,
                         val numberOfStores: Int,
                         val defaultIDA: IDA,
                         val stores: Array[StoragePool.StoreEntry],
+                        val backendConfig: BackendConfig,
                         val maxObjectSize: Option[Int],
                         val allocationTree: TieredKeyValueList,
                         val errorTree: TieredKeyValueList) extends StoragePool:

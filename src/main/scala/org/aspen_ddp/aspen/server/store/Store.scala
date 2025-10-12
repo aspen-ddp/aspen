@@ -11,12 +11,13 @@ import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.apache.logging.log4j.scala.Logging
-import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
+import org.aspen_ddp.aspen.client.{StorageDeviceId, ObjectState as ClientObjectState}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.*
 
-class Store(val executionContext: ExecutionContext,
+class Store(val storageDeviceId: StorageDeviceId,
+            val executionContext: ExecutionContext,
             val backend: Backend,
             val objectCache: ObjectCache,
             val net: Messenger,

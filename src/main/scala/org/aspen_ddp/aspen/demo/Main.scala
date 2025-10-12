@@ -43,7 +43,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
+import scala.concurrent.duration.{Duration, HOURS, MILLISECONDS, SECONDS}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.language.implicitConversions
 
@@ -657,6 +657,7 @@ object Main {
     val txHeartbeatPeriod = Duration(5, SECONDS)
     val txRetryDelay = Duration(100, MILLISECONDS) //
     val txRetryCap = Duration(3, SECONDS)
+    val checkStorageDevicesPeriod = Duration(1, HOURS)
     //val allocHeartbeatPeriod   = Duration(3, SECONDS)
     //val allocTimeout           = Duration(4, SECONDS)
     //val allocStatusQueryPeriod = Duration(1, SECONDS)
@@ -676,6 +677,7 @@ object Main {
       txFinalizerFactory,
       SimpleTransactionDriver.factory(txRetryDelay, txRetryCap),
       txHeartbeatPeriod,
+      checkStorageDevicesPeriod
     ) with SimpleDriverRecoveryMixin
 
     networkBridge.onode = Some(storeManager)

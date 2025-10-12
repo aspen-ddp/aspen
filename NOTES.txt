@@ -1,27 +1,4 @@
 
-
-Host walks all StorageDevices
-  1. Load all stores on all devices
-    * Ignore stores that have the 'transferring-out' marker file
-  2. For each storage device
-    storageDeviceStateCheck():
-    * Lookup storage device state
-      * If state.host-id != current host-id
-         In single Tx:
-            Update StorageState object to point to new host
-            Update the PoolConfig for each store to point to new host
-      * For each store
-         - If Initializing, crete store and update storage device state to Active
-         - If TransferringIn,
-            - Check to see if store is already loaded.
-              - In Tx
-                update state to Active
-                update PoolConfig to reflect new host and device
-                update old storage device to remove store entry
-              - On Tx failure, just call storageDeviceCheckState() again
-                - simpler than txTillSuccessful?
-            - Else, if not already transferring, start
-
 To begin transfer:
   * Add AspenClient.transferStore(storeId, fromDevId, toDevId): Future[Unit]
     - Verify source and desgination devices are different (would be a mess otherwise)

@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.store.backend.Backend
+import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.common.util.uuid2byte
 import org.aspen_ddp.aspen.demo.BootstrapConfig
 
@@ -83,7 +83,13 @@ object Bootstrap:
       StoragePool.StoreEntry(bootstrapHost.hostId, bootstrapStorageDevice.storageDeviceId)
     }.toArray
     
-    val poolConfig = StoragePool.Config(PoolId.BootstrapPoolId, PoolId.BootstrapPoolName, ida, None, storeEntrys).encode()
+    val poolConfig = StoragePool.Config(
+      PoolId.BootstrapPoolId, 
+      PoolId.BootstrapPoolName, 
+      ida, 
+      None, 
+      storeEntrys,
+      RocksDBConfig()).encode()
     val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), BootstrapPoolNodeAllocator).encode()
     val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), BootstrapPoolNodeAllocator).encode()
 

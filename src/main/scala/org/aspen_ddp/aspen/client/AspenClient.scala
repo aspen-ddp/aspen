@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
+import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
@@ -15,6 +16,7 @@ import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, uuid2byte}
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -183,6 +185,12 @@ trait AspenClient extends ObjectReader:
               )
               sendHostMessage(msg)
 
+  def getBootstrapConfig(): Future[String] =
+    given ExecutionContext = this.clientContext
+    
+    client.read(radicle).map: radicleKvos =>
+      new String(radicleKvos.contents(Radicle.BootstrapConfigKey).value.bytes, StandardCharsets.UTF_8)
+      
   def retryStrategy: RetryStrategy
 
   def backgroundTaskManager: BackgroundTaskManager
@@ -194,6 +202,8 @@ trait AspenClient extends ObjectReader:
   private[client] val allocationManager: AllocationManager
 
   private[client] val objectCache: ObjectCache
+  
+  private[aspen] val radicle: KeyValueObjectPointer
 
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
   private[aspen] def sendHostMessage(msg: HostMessage): Unit

@@ -1,10 +1,67 @@
 
-Update bootstrapConfig in radicle if Transferred store was Bootstrap pool
+Rename StoreManager to StorageHost?
+
+Create ObjectRegistry(client, mgrPointer: KeyValueObjectPointer, allocater)
+  - Add general-purpose, system-level ObjectRegistry to radicle
+    - ObjectRegistryRootKey -> kvptr
+  - Add to AspenClient
+    - client.getSystemObjectRegistry: Future[ObjectRegistry]
+  - Use ObjectRegistry.GuardKey plus Key(1) and empty byte array value
+     - use KeyRevisonGaurd on this for allocations
+     - cheap and fast to read root pointer for each allocation
+  - loadObjectRegistry(mgrPointer)
+    - Reads mgrPointer
+    - If not initialized, initialize it
+      - transactUntilSuccessful
+  - Allocations should probably take a given transaction rather than succeed
+    unconditionally. Allows all-or-nothing initialization
+  - allocateObject(RegisteredKeyValueObjectId, initialContent: List[Key, Array[Byte]]): Future[KeyValueObjectPointer]
+  - allocateObject(RegisteredDataObjectId, initialContent: Array[Byte]): Future[DataObjectPointer]
+  - getObjectPointer(RegisteredKeyValueObjectId): Future[KeyValueObjectPointer]
+  - getObjectPointer(RegisteredDataObjectId): Future[DataObjectPointer]
+
+  ** Can create unit tests for this
+
+Switch AmoebaFS to use a registered object for the root
+
+** Testing of all the stuff that's been coded
+
+Add add-host command
+  - takes address & ports
+  - generates a host config file in current directory
+
+Add add-storage-device command
+  - takes host dir and target link/dirname
+  - auto-prefix target with <hostDir>/storage-devices/<target>
+
+update transfer-store to take target device
+
+Need some wey to list hosts & devices
+  - UUIDs will be pretty meaningless
+  - Add storage-devices/<link/dirname> to localDeviceName in Host state?
+    - need to modify host state every time a device is added anyway
+  - convert from Set[stoargeDeviceId] to Map[storageDeviceId, String]
+
+Move ZMQNetwork to aspen-ddp.common.network.zmqnet
+
+Move Main to aspen-ddp.cmdline ?
+
+Need a plan for getting the storageDevices needed for pool creation
+
+Need a plan for managing more complex Allocaters
+  - can add an Allocaters TKVL tree where each allocater is stored in a DataObject
+  - can use Protobuf for flexible serial/deserial
+  - NodeAllocater going into Root can store 2 UUIDs for easy/cheap serial/storage
+    - UUID of allocater
+    - UUID of registered factory that knows how to deserial the allocater
+       - Prevents huge union type in Protobuf
 
 Handle transfer of a bootstrap store
   - Need some way to update config file
 
 Remove old CnC based StoreTransfer code
+
+Implement AllocationRecovery
 
 ----------------
 - Down the road

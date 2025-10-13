@@ -85,6 +85,8 @@ object BaseReadDriverSuite {
 
     private[client] val objectCache: ObjectCache = ObjectCache.NoCache
 
+    val radicle: KeyValueObjectPointer = null
+
     private[aspen] def receiveClientResponse(msg: ClientResponse): Unit = ()
 
     override def sendHostMessage(msg: HostMessage): Unit = ()

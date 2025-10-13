@@ -97,7 +97,7 @@ object TestNetwork {
     def newTransaction(): Transaction = {
       new TransactionImpl(this, txManager, _ => 0, None)
     }
-    
+
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
 
     def getHostId(hostName: String): Future[HostId] = ???
@@ -166,7 +166,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
   val store2 = new MapBackend(storeId2)
 
   val ida = Replication(3, 2)
-  
+
   val storageDeviceId = StorageDeviceId(new UUID(0, 0))
 
   var handleDepth = 0
@@ -200,7 +200,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
       rfa.create(txd, messenger)
     }
   }
-  
+
   private val cliMessenger = new ClientMessenger {
 
     def sendClientRequest(msg: ClientRequest): Unit = {
@@ -278,7 +278,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     msg.foreach(smgr.receiveTransactionMessage)
     handleEvents()
   }
-  
+
   override def dropCacheForStore(storeId: StoreId): Unit = ()
 
   def hasTransactions: Boolean = smgr.hasTransactions

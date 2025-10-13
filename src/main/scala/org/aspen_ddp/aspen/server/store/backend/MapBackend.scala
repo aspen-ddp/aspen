@@ -16,6 +16,8 @@ class MapBackend(val storeId: StoreId) extends Backend {
 
   override def close(): Future[Unit] = Future.successful(())
   
+  override def estimateSize(): Long = 0
+  
   override def path: Path = Path.of("/")
 
   override def setCompletionHandler(handler: CompletionHandler): Unit = {

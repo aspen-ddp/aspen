@@ -17,7 +17,9 @@ trait Backend extends Logging {
 
   def crlSaveFile: Path = path.resolve("crl_save.log")
   
-  def close(): Future[Unit] 
+  def close(): Future[Unit]
+
+  def estimateSize(): Long
 
   def setCompletionHandler(handler: CompletionHandler): Unit
 

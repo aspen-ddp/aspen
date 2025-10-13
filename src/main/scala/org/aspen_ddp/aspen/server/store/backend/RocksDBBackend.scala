@@ -66,6 +66,8 @@ class RocksDBBackend(dbPath:Path,
 
   override def close(): Future[Unit] = db.close()
   
+  override def estimateSize(): Long = db.estimateSize()
+  
   override def path: Path = dbPath
 
   override def setCompletionHandler(handler: CompletionHandler): Unit = {

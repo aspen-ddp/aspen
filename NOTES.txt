@@ -1,7 +1,11 @@
 
+os.Path note:
+  - can convert to java Path via os.Path.toNIO
+  - then to File via java Path.toFile()
+
 Rename StoreManager to StorageHost?
 
-Create ObjectRegistry(client, mgrPointer: KeyValueObjectPointer, allocater)
+Create ObjectRegistry(client, mgrPointer: KeyValueObjectPointer, allocator)
   - Add general-purpose, system-level ObjectRegistry to radicle
     - ObjectRegistryRootKey -> kvptr
   - Add to AspenClient
@@ -26,13 +30,56 @@ Switch AmoebaFS to use a registered object for the root
 
 ** Testing of all the stuff that's been coded
 
+Need to think about how to handle allocation.
+  - How to choose which pool to use
+     - Balance across pools created at different times with different utilizations
+  - Can create AllocationGroups
+     - collects pools into logical groups for allocation
+     - Named as this helps bridge app design with deployment policy?
+     - Stored in DataObject
+       - timestamp of object indicates time of last pool size refresh
+       - stores list (poolId, approximateCurrentSize, maxSize)
+  - Store Allocator config in DataObject
+     - could use system ObjectRegistry
+       - random UUID would guarantee no collisions
+       - Allows
+
+Allocator ideas
+  - can add an Allocators TKVL tree where each allocator is stored in a DataObject
+    - Or just use system ObjectRegistry
+    - Randomized UUID works just as well as hard-coded. No collisions
+  - can use Protobuf for flexible serial/deserial
+  - NodeAllocator going into Root can store 2 UUIDs for easy/cheap serial/storage
+    - UUID of allocator
+    - UUID of registered factory that knows how to deserial the allocator
+       - Prevents huge union type in Protobuf
+
+Need a way to connect AllocationGroups to App-defined Allocators
+  - 
+
+How to know space usage
+  - Added Backend.estimateSize(): Long
+    - Not perfect but should give us a basis for starting out
+  - File.getTotalSpace() and getUsableSpace can be used to get drive/partition sizes
+    - Can call this on the storage device config file
+    - Should work the same across platforms
+  - Can poll disks at set interval and update StorageDevice state when changes by
+    some configurable factor. Say 0.5% to start
+  - Similarly, can poll loaded stores
+    - update PoolState when store size changes by certain percentage
+       - May need to be careful for small stores to avoid update floods
+    - Can use Key(s"sz${storeId.poolIndex}") as key and Long as value. Cache
+      the last-successfully-updated Tx and we should be able to do quick updates
+      with minimal risk of Tx failure. If it happens, just read the PoolObj and
+      try again
+
 Add add-host command
   - takes address & ports
   - generates a host config file in current directory
 
 Add add-storage-device command
-  - takes host dir and target link/dirname
-  - auto-prefix target with <hostDir>/storage-devices/<target>
+  - takes link/dirname
+    - Can find host config at os.Path(devDir) / os.up / os.up / "aspen-host-conf.."
 
 update transfer-store to take target device
 
@@ -47,14 +94,6 @@ Move ZMQNetwork to aspen-ddp.common.network.zmqnet
 Move Main to aspen-ddp.cmdline ?
 
 Need a plan for getting the storageDevices needed for pool creation
-
-Need a plan for managing more complex Allocaters
-  - can add an Allocaters TKVL tree where each allocater is stored in a DataObject
-  - can use Protobuf for flexible serial/deserial
-  - NodeAllocater going into Root can store 2 UUIDs for easy/cheap serial/storage
-    - UUID of allocater
-    - UUID of registered factory that knows how to deserial the allocater
-       - Prevents huge union type in Protobuf
 
 Handle transfer of a bootstrap store
   - Need some way to update config file
@@ -166,7 +205,7 @@ exec java -cp $CLASSPATH com.ibm.aspen.demo.Main "$@"
 - TODO
 -
 
-AllocateResponse
+Allocatoresponse
     - Add error string to message on failure
     - Handle allocation failure
     

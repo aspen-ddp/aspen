@@ -38,6 +38,8 @@ class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) {
   private var commitInProgress = false
   private var closing: Option[Promise[Unit]] = None
   private var outsandingOpCount = 0
+  
+  def estimateSize(): Long = db.getLongProperty("rocksdb.total-sst-files-size")
 
   private def doNextCommit(): Future[Unit] = {
     val nbatch = nextBatch

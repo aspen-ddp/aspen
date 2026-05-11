@@ -42,6 +42,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Can be used for arbitrary "fast" operations such as logging which DataStores failed to properly process a
     transaction or insering a newly allocated node into the next tier up in a distributed B-tree
   - Not suitable for long-lived operations as they "clog up" resources on the Servers
+  - Provides At-Least-Once guarantees
 - **Durable Tasks**:
   - Provides support for long-lived and/or "crash-proof", multi-step tasks.
     - The key is that each step in the task uses a multi-object transaction to both preform the task's logical
@@ -51,6 +52,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     - Example use: allocating an inode and inserting it into a directory in a distributed file system. Both 
       operations must complete successfully to avoid a corrupted file system but cannot be done in a single
       transaction. Using a DurableTask ensures that the operations proceed successfully and in the correct order.
+  - Provides Exactly-Once guarantees
   
 ## Key Design Aspects
 - Building and using Distributed Data Structures is the primary use case for Aspen-based systems

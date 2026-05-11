@@ -42,6 +42,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Can be used for arbitrary "fast" operations such as logging which DataStores failed to properly process a
     transaction or insering a newly allocated node into the next tier up in a distributed B-tree
   - Not suitable for long-lived operations as they "clog up" resources on the Servers
+  - Should be idempotent operations as they may be executed multiple times
   - Provides At-Least-Once guarantees
 - **Durable Tasks**:
   - Provides support for long-lived and/or "crash-proof", multi-step tasks.

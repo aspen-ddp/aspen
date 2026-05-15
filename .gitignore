@@ -32,6 +32,9 @@ project/plugins/project/
 .project
 .settings/
 
+# Claude/AI
+Prompt.txt
+
 # Demo generated files
 t
 demo/bootstrap

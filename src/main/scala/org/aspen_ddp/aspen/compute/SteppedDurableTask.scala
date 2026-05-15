@@ -10,7 +10,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
 object SteppedDurableTask:
-  val StepStateKey: Key = Key(1)
+  val StepStateKey: Key = Key(0xFE)
 
   def getInitialContent(initialState: Map[String, Array[Byte]]): (Key, Value) =
     val encoded = Codec.encodeSteppedDurableTaskState(0, initialState)

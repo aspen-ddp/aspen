@@ -46,7 +46,7 @@ class TestSteppedTask(
   override def resultFromState(state: Map[String, Array[Byte]]): Option[AnyRef] =
     Some(new String(state("result"), StandardCharsets.UTF_8))
 
-  def step0(tx: Transaction, state: Map[String, Array[Byte]]): Future[Map[String, Array[Byte]]] =
+  def step0(tx: Transaction, state: Map[String, Array[Byte]], stepRevision: ObjectRevision): Future[Map[String, Array[Byte]]] =
     client.read(dataPointer).map: dos =>
       val content = new String(dos.data.getByteArray, StandardCharsets.UTF_8)
       assert(content == "initial", s"Step 0: expected 'initial' but got '$content'")
@@ -55,7 +55,7 @@ class TestSteppedTask(
         .updated("step0_seen", content.getBytes(StandardCharsets.UTF_8))
         .updated("result", "step0_done".getBytes(StandardCharsets.UTF_8))
 
-  def step1(tx: Transaction, state: Map[String, Array[Byte]]): Future[Map[String, Array[Byte]]] =
+  def step1(tx: Transaction, state: Map[String, Array[Byte]], stepRevision: ObjectRevision): Future[Map[String, Array[Byte]]] =
     client.read(dataPointer).map: dos =>
       val content = new String(dos.data.getByteArray, StandardCharsets.UTF_8)
       assert(content == "step1", s"Step 1: expected 'step1' but got '$content'")
@@ -64,7 +64,7 @@ class TestSteppedTask(
       tx.overwrite(dataPointer, dos.revision, DataBuffer("step2".getBytes(StandardCharsets.UTF_8)))
       state.updated("result", "step1_done".getBytes(StandardCharsets.UTF_8))
 
-  val steps: Array[(Transaction, Map[String, Array[Byte]]) => Future[Map[String, Array[Byte]]]] =
+  val steps: Array[(Transaction, Map[String, Array[Byte]], ObjectRevision) => Future[Map[String, Array[Byte]]]] =
     Array(step0, step1)
 
 class SteppedDurableTaskSuite extends IntegrationTestSuite:

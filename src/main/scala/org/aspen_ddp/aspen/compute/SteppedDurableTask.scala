@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.compute
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.network.Codec
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -25,7 +25,7 @@ abstract class SteppedDurableTask(
 
   given ExecutionContext = client.clientContext
 
-  val steps: Array[(Transaction, Map[String, Array[Byte]]) => Future[Map[String, Array[Byte]]]]
+  val steps: Array[(Transaction, Map[String, Array[Byte]], ObjectRevision) => Future[Map[String, Array[Byte]]]]
 
   def resultFromState(state: Map[String, Array[Byte]]): Option[AnyRef] = None
 
@@ -49,7 +49,7 @@ abstract class SteppedDurableTask(
       else
         val tx = client.newTransaction()
 
-        steps(step)(tx, stateMap).onComplete:
+        steps(step)(tx, stateMap, vs.revision).onComplete:
           case Failure(err) => err match
             case e: StopRetrying =>
               synchronized:

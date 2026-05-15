@@ -607,3 +607,16 @@ message StorageDevice {
   UUID host_id = 2; // Optional field
   repeated StorageDeviceStoreKeyValue stores = 3;
 }
+
+//---------------------------------------------------------------------------
+//- Stepped Durable Task State
+//---------------------------------------------------------------------------
+message SteppedDurableTaskEntry {
+  string key = 1;
+  bytes value = 2;
+}
+
+message SteppedDurableTaskState {
+  uint32 step = 1;
+  repeated SteppedDurableTaskEntry entries = 2;
+}

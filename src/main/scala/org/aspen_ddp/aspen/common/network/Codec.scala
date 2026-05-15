@@ -1328,4 +1328,24 @@ object Codec extends Logging:
 
     new StorageDevice(storageDeviceId, hostId, stores)
 
+  def encodeSteppedDurableTaskState(step: Int, state: Map[String, Array[Byte]]): Array[Byte] =
+    val builder = codec.SteppedDurableTaskState.newBuilder()
+    builder.setStep(step)
+    state.foreach: (key, value) =>
+      builder.addEntries(
+        codec.SteppedDurableTaskEntry.newBuilder()
+          .setKey(key)
+          .setValue(ByteString.copyFrom(value))
+          .build
+      )
+    builder.build.toByteArray
+
+  def decodeSteppedDurableTaskState(data: Array[Byte]): (Int, Map[String, Array[Byte]]) =
+    val m = codec.SteppedDurableTaskState.parseFrom(data)
+    val step = m.getStep
+    val state = m.getEntriesList.asScala.map: entry =>
+      entry.getKey -> entry.getValue.toByteArray
+    .toMap
+    (step, state)
+
 

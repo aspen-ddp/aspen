@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-
-import org.aspen_ddp.aspen.client.StorageDeviceId
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.constructor.SafeConstructor

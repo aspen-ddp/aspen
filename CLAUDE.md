@@ -60,9 +60,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Linked lists, Tiered Key Value Lists (similar to B-Trees), and other data structures can be used to
     efficiently store and retrieve data in Aspen
 - Aspen is designed and implemented largely as a logical system
-  - Messages are addressed to logical entities like DataStores rather than physical hosts
+  - Messages are addressed to logical entities like DataStores rather than physical hostStates
   - The last step prior to sending a message is to look up the address of the network endpoint currently
-    hosting the logical entity. The message is then sent to that physical host which will in turn deliver
+    hosting the logical entity. The message is then sent to that physical hostState which will in turn deliver
     the message to the logical entity
 - Unlike most scalable distributed storage systems, Aspen acheives scale not through consistent hashing
   or sharding, but rather through binary ObjectPointers that encode the location of the object within the
@@ -81,7 +81,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     - From this, the "Radicle Object" with a zeroed UUID is loaded
       - This object serves as the ultimate root for locating all data stored within an Aspen system
       - It contains embedded ObjectPointers to the roots of all critical distributed data structures used
-        to store system metadata such as physical storage hosts, netowrk configurations, storage pool
+        to store system metadata such as physical storage hostStates, netowrk configurations, storage pool
         configurations, etc
 - Aspen uses a Crash-Only architecture. By intentional design, there is no clean shutdown process.
 - The Network Layer is designed to be pluggable. Currently only a simple but inefficient ZeroMQ based network
@@ -152,15 +152,15 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 
 ### Command and Control (CnC)
 - Mechanism to instruct a store to do something immediately
-- Generally avoided as messages can be lost and/or hosts may be unavailable when the command is issued
+- Generally avoided as messages can be lost and/or hostStates may be unavailable when the command is issued
 - Prefer updating state in the system for a later polling by the target entity
 - Largely deprecated and may be removed entirely
 
 ### Host and StorageDevice Management
-- Most administration is done by reading and writing host and device objects containing the desired state
+- Most administration is done by reading and writing hostState and device objects containing the desired state
 - Hosts will poll these instances and act on changes
   - This approach is preferred over direct Command and Control messaging since those messages could be lost
-  - An example is seeing that a DataStore is marked for transfer in or out. When seen, the host will start the process
+  - An example is seeing that a DataStore is marked for transfer in or out. When seen, the hostState will start the process
 
 ### Hybrid Logical Clock (HLC) Timestamps
 - Provides timestamps that are guaranteed to be later than some previously observed event(s)

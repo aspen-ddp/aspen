@@ -1,10 +1,9 @@
 package org.aspen_ddp.aspen.demo
 
-import org.aspen_ddp.aspen.client.{Host, HostId}
-
 import java.io.{File, FileInputStream}
 import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.yaml.snakeyaml.Yaml
@@ -17,10 +16,10 @@ bootstrap-ida:
   read-threshold: 2
   write-threshold: 2
   width: 3
-bootstrap-hosts:
-  - host-id: AA1049AD-D2A8-4D17-8080-E01A4678C8B3
+bootstrap-hostStates:
+  - hostState-id: AA1049AD-D2A8-4D17-8080-E01A4678C8B3
     name: node_a
-    host: 127.0.0.1
+    hostState: 127.0.0.1
     data-port: 5000
     cnc-port: 5001
     store-transfer-port: 5002
@@ -74,7 +73,7 @@ object BootstrapConfig:
                            stores: List[StoreId])
 
   object BootstrapHost extends YObject[BootstrapHost]:
-    val hostId: Required[HostId]         = Required("host-id", HostId.YHostId)
+    val hostId: Required[HostId]         = Required("hostState-id", HostId.YHostId)
     val name: Required[String]           = Required("name", YString)
     val address: Required[String]        = Required("address", YString)
     val dataPort: Required[Int]          = Required("data-port", YInt)
@@ -97,12 +96,12 @@ object BootstrapConfig:
   case class Config(aspenSystemId: UUID, bootstrapIDA: IDA, hosts: List[BootstrapHost]):
     // Validate config
     if hosts.length != bootstrapIDA.width then
-      throw new FormatError("Number of hosts must exactly match the Bootstrap IDA width")
+      throw new FormatError("Number of hostStates must exactly match the Bootstrap IDA width")
 
   object Config extends YObject[Config]:
     val aspenSystemId: Required[UUID]        = Required("aspen-system-id", YUUID)
     val bootstrapIDA: Required[IDA]          = Required("bootstrap-ida",   Choice("type", Map("replication" -> ReplicationFormat)))
-    val hosts: Required[List[BootstrapHost]] = Required("bootstrap-hosts", YList(BootstrapHost))
+    val hosts: Required[List[BootstrapHost]] = Required("bootstrap-hostStates", YList(BootstrapHost))
 
     val attrs: List[Attr] = aspenSystemId :: bootstrapIDA :: hosts :: Nil
 
@@ -117,9 +116,9 @@ object BootstrapConfig:
 
   def generateBootstrapConfig(aspenSystemId: UUID,
                               ida: IDA,
-                              hosts: List[Host],
+                              hostStates: List[HostState],
                               storeMap: List[(StoreId, HostId)]): String =
-    val hostIdSet = hosts.map(_.hostId).toSet
+    val hostIdSet = hostStates.map(_.hostId).toSet
 
     storeMap.foreach: (_, hostId) =>
       require(hostIdSet.contains(hostId))
@@ -135,13 +134,13 @@ object BootstrapConfig:
         sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
     sb.append(s"  write-threshold: ${ida.writeThreshold}\n")
     sb.append(s"  width: ${ida.width}\n")
-    sb.append("bootstrap-hosts:")
-    hosts.foreach: host =>
+    sb.append("bootstrap-hostStates:")
+    hostStates.foreach: host =>
       val storesOnHost = storeMap.filter(t => t._2 == host.hostId).map(t => t._1)
 
       require(storesOnHost.nonEmpty)
 
-      sb.append(f"  - host-id: ${host.hostId.uuid}\n")
+      sb.append(f"  - hostState-id: ${host.hostId.uuid}\n")
       sb.append(f"    name: ${host.name}\n")
       sb.append(f"    address: ${host.address}\n")
       sb.append(f"    data-port: ${host.dataPort}\n")

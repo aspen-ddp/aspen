@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, Host, HostId, KeyValueObjectState, ObjectAllocator, ObjectCache, RetryStrategy, StorageDevice, StorageDeviceId, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.allocation.{AllocationManager, SuperSimpleAllocationDriver}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectRevisionGuard, Value}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.client.internal.read.{ReadManager, SimpleReadDriver}
 import org.aspen_ddp.aspen.client.internal.transaction.{SimpleClientTransactionDriver, TransactionImpl, TransactionManager}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{AllocateResponse, CheckStorageDevice, ClientId, ClientResponse, HostMessage, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -82,7 +83,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       case None => throw new NoSuchElementException(storageDeviceId.toString)
       case Some(vs) => KeyValueObjectPointer(vs.value.bytes)
 
-  override protected def createStoragePool(config: StoragePool.Config): Future[PoolId] =
+  override protected def createStoragePool(config: StoragePoolState): Future[PoolId] =
     transactUntilSuccessful: tx =>
       given Transaction = tx
   
@@ -102,9 +103,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
           allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), nodeAllocator).encode()
           
           poolPtr <- alloc.allocateKeyValueObject(revisionGuard, Map(
-            StoragePool.ConfigKey -> Value(poolConfig),
-            StoragePool.ErrorTreeKey -> Value(errorTree),
-            StoragePool.AllocationTreeKey -> Value(allocTree)
+            StoragePoolState.ConfigKey -> Value(poolConfig),
+            StoragePoolState.ErrorTreeKey -> Value(errorTree),
+            StoragePoolState.AllocationTreeKey -> Value(allocTree)
           ))
         yield 
           poolPtr
@@ -113,9 +114,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
                               pointer: KeyValueObjectPointer,
                               kvos: KeyValueObjectState,
                               stores: List[StoreId],
-                              state: StorageDevice)
+                              state: StorageDeviceState)
 
-      def collectDevices(stores: Array[StoragePool.StoreEntry]): List[Future[DeviceUpdate]] =
+      def collectDevices(stores: Array[StoragePoolState.StoreEntry]): List[Future[DeviceUpdate]] =
         val devMap = stores.zipWithIndex.foldLeft(Map[StorageDeviceId, List[StoreId]]()): (m, tpl) =>
           val (entry, poolIndex) = tpl
           val storeId = StoreId(config.poolId, poolIndex.toByte)
@@ -129,21 +130,21 @@ class SimpleAspenClient(val msngr: ClientMessenger,
             devPtr <- client.getStorageDevicePointer(storageDeviceId)
             devKvos <- client.read(devPtr)
           yield
-            DeviceUpdate(storageDeviceId, devPtr, devKvos, stores, StorageDevice(devKvos))
+            DeviceUpdate(storageDeviceId, devPtr, devKvos, stores, StorageDeviceState(devKvos))
         }.toList
 
       def updateDevice(du: DeviceUpdate): Unit =
         val updates = du.stores.map { storeId =>
-          storeId -> StorageDevice.StoreEntry(
-            StorageDevice.StoreStatus.Initializing,
+          storeId -> StorageDeviceState.StoreEntry(
+            StorageDeviceState.StoreStatus.Initializing,
             None
           )
         }.toMap
         
         val newState = du.state.copy(stores = du.state.stores ++ updates)
         
-        val reqs = List(KeyRevision(StorageDevice.StateKey, du.kvos.contents(StorageDevice.StateKey).revision))
-        val ops = List(Insert(StorageDevice.StateKey, newState.encode()))
+        val reqs = List(KeyRevision(StorageDeviceState.StateKey, du.kvos.contents(StorageDeviceState.StateKey).revision))
+        val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
 
         tx.update(du.pointer, None, None, reqs, ops)
         

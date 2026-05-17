@@ -4,8 +4,9 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
-import org.aspen_ddp.aspen.client.{AspenClient, HostId, KeyValueObjectState, ObjectAllocator, StoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, StoragePool}
 import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.metadata.{HostId, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
@@ -13,13 +14,13 @@ object SimpleStoragePool:
   
   def apply(client: AspenClient, kvos: KeyValueObjectState): SimpleStoragePool =
 
-    val cfg = StoragePool.Config(kvos)
+    val cfg = StoragePoolState(kvos)
 
     val allocTree = new TieredKeyValueList(client,
-      new KVObjectRootManager(client, StoragePool.AllocationTreeKey, kvos.pointer))
+      new KVObjectRootManager(client, StoragePoolState.AllocationTreeKey, kvos.pointer))
 
     val errorTree = new TieredKeyValueList(client,
-      new KVObjectRootManager(client, StoragePool.ErrorTreeKey, kvos.pointer))
+      new KVObjectRootManager(client, StoragePoolState.ErrorTreeKey, kvos.pointer))
 
     new SimpleStoragePool(client, cfg.poolId, cfg.name, cfg.numberOfStores, cfg.defaultIDA, cfg.stores,
       cfg.backendConfig, cfg.maxObjectSize,
@@ -31,7 +32,7 @@ class SimpleStoragePool(val client: AspenClient,
                         val name: String,
                         val numberOfStores: Int,
                         val defaultIDA: IDA,
-                        val stores: Array[StoragePool.StoreEntry],
+                        val stores: Array[StoragePoolState.StoreEntry],
                         val backendConfig: BackendConfig,
                         val maxObjectSize: Option[Int],
                         val allocationTree: TieredKeyValueList,

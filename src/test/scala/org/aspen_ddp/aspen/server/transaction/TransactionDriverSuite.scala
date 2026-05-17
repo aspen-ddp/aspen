@@ -149,7 +149,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
     driver.receiveTxPrepareResponse(TxPrepareResponse(
       ds0,
-      ds3, // invalid, poolIndex doesn't host a slice
+      ds3, // invalid, poolIndex doesn't hostState a slice
       txd.transactionId,
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),

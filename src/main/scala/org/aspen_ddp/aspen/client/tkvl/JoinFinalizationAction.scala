@@ -28,7 +28,7 @@ class JoinFinalizationAction(val client: AspenClient,
       def setNewRoot(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
         given tx: Transaction = client.newTransaction()
 
-        // Root host always has a pointer to the AbsoluteMinimum host
+        // Root hostState always has a pointer to the AbsoluteMinimum hostState
         val newRoot = KeyValueObjectPointer(rootNode.contents(Key.AbsoluteMinimum).value.bytes)
 
         tx.setRefcount(rootNode.pointer, rootNode.refcount, rootNode.refcount.decrement())

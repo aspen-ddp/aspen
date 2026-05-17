@@ -113,8 +113,8 @@ class SimpleFileRootManager(client: AspenClient,
       
       onode.foreach: _ =>
         // Check for a race condition where multiple concurrent attempts to
-        // create the initial host might clash with each other
-        tx.invalidateTransaction(new Exception("Initial TKVL host already exists."))
+        // create the initial hostState might clash with each other
+        tx.invalidateTransaction(new Exception("Initial TKVL hostState already exists."))
       
       ObjectRevisionGuard(inodePointer, dos.revision)
       

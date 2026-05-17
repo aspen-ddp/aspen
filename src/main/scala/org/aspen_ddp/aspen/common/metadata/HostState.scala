@@ -1,5 +1,6 @@
-package org.aspen_ddp.aspen.client
+package org.aspen_ddp.aspen.common.metadata
 
+import org.aspen_ddp.aspen.client.KeyValueObjectState
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.Key
@@ -21,26 +22,26 @@ object HostId:
       case _ => throw new FormatError(s"String Required")
 
 
-object Host:
+object HostState:
   private [aspen] val StateKey = Key(Array[Byte](0))
 
-  def apply(buff: Array[Byte]): Host = Codec.decode(codec.Host.parseFrom(buff))
+  def apply(buff: Array[Byte]): HostState = Codec.decode(codec.Host.parseFrom(buff))
   
-  def apply(kvos: KeyValueObjectState): Host = Host(kvos.contents(StateKey).value.bytes)
+  def apply(kvos: KeyValueObjectState): HostState = HostState(kvos.contents(StateKey).value.bytes)
 
 
-case class Host(hostId: HostId,
-                name: String,
-                address: String,
-                dataPort: Int,
-                cncPort: Int,
-                storeTransferPort: Int,
-                storageDevices: Set[StorageDeviceId]):
+case class HostState(hostId: HostId,
+                     name: String,
+                     address: String,
+                     dataPort: Int,
+                     cncPort: Int,
+                     storeTransferPort: Int,
+                     storageDevices: Set[StorageDeviceId]):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
   
-  def addStorageDevice(deviceId: StorageDeviceId): Host =
+  def addStorageDevice(deviceId: StorageDeviceId): HostState =
     this.copy(storageDevices = storageDevices + deviceId)
 
-  def removeStorageDevice(deviceId: StorageDeviceId): Host =
+  def removeStorageDevice(deviceId: StorageDeviceId): HostState =
     this.copy(storageDevices = storageDevices + deviceId)

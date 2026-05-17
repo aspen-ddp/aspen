@@ -35,7 +35,7 @@ Create ObjectRegistry(client,
 
   - Create unit tests for this
 
-Switch to system object registry for pool, hosts, and storageDevice
+Switch to system object registry for pool, hostStates, and storageDevice
 pointers. Replaces the separate TKVLs in radicle
 
 Create NamespacedIdRegistry(tkvl)
@@ -138,20 +138,20 @@ Allocator ideas
 Need a way to connect AllocationGroups to App-defined Allocators
   -
 
-Add add-host command
+Add add-hostState command
   - takes address & ports
-  - generates a host config file in current directory
+  - generates a hostState config file in current directory
 
 Add add-storage-device command
   - takes link/dirname
-    - Can find host config at os.Path(devDir) / os.up / os.up / "aspen-host-conf.."
+    - Can find hostState config at os.Path(devDir) / os.up / os.up / "aspen-hostState-conf.."
 
 update transfer-store to take target device
 
-Need some wey to list hosts & devices
+Need some wey to list hostStates & devices
   - UUIDs will be pretty meaningless
   - Add storage-devices/<link/dirname> to localDeviceName in Host state?
-    - need to modify host state every time a device is added anyway
+    - need to modify hostState state every time a device is added anyway
   - convert from Set[stoargeDeviceId] to Map[storageDeviceId, String]
 
 Move ZMQNetwork to aspen-ddp.common.network.zmqnet
@@ -175,7 +175,7 @@ May need to add an abortStoreTransfer method
 
 Need a gossip protocol for spreading the word about cache invalidation for
   1. Host changed it's address/port
-  2. StoreId has been migrated to a new host
+  2. StoreId has been migrated to a new hostState
 For now we can ignore this. Hosts don't change frequently and store moves
 can be found via error messages to read/write operations
 

@@ -11,7 +11,8 @@ import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.apache.logging.log4j.scala.Logging
-import org.aspen_ddp.aspen.client.{StorageDeviceId, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.*

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{AspenClient, Host, HostId, KeyValueObjectState, StorageDevice, StorageDeviceId, StoragePool, Transaction, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StoragePool, Transaction, ObjectState as ClientObjectState}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -15,6 +15,7 @@ import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -182,7 +183,7 @@ class StoreManager(val client: AspenClient,
                                              toDeviceid: StorageDeviceId): Future[Unit] =
     client.transactUntilSuccessful: tx =>
       
-      def prepUpdateBootstrapConfig(poolCfg: StoragePool.Config, toDevice: StorageDevice): Future[Unit] =
+      def prepUpdateBootstrapConfig(poolCfg: StoragePoolState, toDevice: StorageDeviceState): Future[Unit] =
         if storeId.poolId != PoolId.BootstrapPoolId then
           Future.unit
         else 
@@ -217,35 +218,35 @@ class StoreManager(val client: AspenClient,
         poolKvos <- client.read(poolPtr)
         fromDevKvos <- client.read(fromDevPtr)
         toDevKvos <- client.read(toDevPtr)
-        poolCfg = StoragePool.Config(poolKvos)
-        toDev = StorageDevice(toDevKvos)
+        poolCfg = StoragePoolState(poolKvos)
+        toDev = StorageDeviceState(toDevKvos)
         _ <- prepUpdateBootstrapConfig(poolCfg, toDev)
       yield
-        val fromDev = StorageDevice(fromDevKvos)
+        val fromDev = StorageDeviceState(fromDevKvos)
 
         // If the from device doesn't contain the storeId, we're already done.
         // A concurrent call to this method must have succeeded
         if fromDev.stores.contains(storeId) then
-          poolCfg.stores(storeId.poolIndex) = StoragePool.StoreEntry(hostId, toDeviceid)
-          val poolReqs = List(KeyRevision(StoragePool.ConfigKey, poolKvos.contents(StoragePool.ConfigKey).revision))
-          val poolOps = List(Insert(StoragePool.ConfigKey, poolCfg.encode()))
+          poolCfg.stores(storeId.poolIndex) = StoragePoolState.StoreEntry(hostId, toDeviceid)
+          val poolReqs = List(KeyRevision(StoragePoolState.ConfigKey, poolKvos.contents(StoragePoolState.ConfigKey).revision))
+          val poolOps = List(Insert(StoragePoolState.ConfigKey, poolCfg.encode()))
           tx.update(poolPtr, None, None, poolReqs, poolOps)
 
           val newFromStores = fromDev.stores - storeId
           val newFromDev = fromDev.copy(stores = newFromStores)
-          val fromDevReqs = List(KeyRevision(StorageDevice.StateKey, fromDevKvos.contents(StorageDevice.StateKey).revision))
-          val fromDevOps = List(Insert(StorageDevice.StateKey, newFromDev.encode()))
+          val fromDevReqs = List(KeyRevision(StorageDeviceState.StateKey, fromDevKvos.contents(StorageDeviceState.StateKey).revision))
+          val fromDevOps = List(Insert(StorageDeviceState.StateKey, newFromDev.encode()))
           tx.update(fromDevPtr, None, None, fromDevReqs, fromDevOps)
 
-          val newEntry = StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None)
+          val newEntry = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
           val newToStores = toDev.stores + (storeId -> newEntry)
           val newtoDev = toDev.copy(stores = newToStores)
-          val toDevReqs = List(KeyRevision(StorageDevice.StateKey, toDevKvos.contents(StorageDevice.StateKey).revision))
-          val toDevOps = List(Insert(StorageDevice.StateKey, newtoDev.encode()))
+          val toDevReqs = List(KeyRevision(StorageDeviceState.StateKey, toDevKvos.contents(StorageDeviceState.StateKey).revision))
+          val toDevOps = List(Insert(StorageDeviceState.StateKey, newtoDev.encode()))
           tx.update(toDevPtr, None, None, toDevReqs, toDevOps)
 
           // If state update transaction is successful, send a CheckStorageDevice
-          // message to the host of the old storage device so they can delete
+          // message to the hostState of the old storage device so they can delete
           // the store content
           tx.result.foreach: _ =>
             val msg = CheckStorageDevice(
@@ -322,7 +323,7 @@ class StoreManager(val client: AspenClient,
           case Some(sds) => sds
       yield
         synchronized {
-          if devEntry.status == StorageDevice.StoreStatus.TransferringOut then
+          if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
             if ! transferringOut.contains(m.storeId) then
               val fclosed = stores.get(m.storeId) match
                 case None => Future.unit
@@ -375,7 +376,7 @@ class StoreManager(val client: AspenClient,
                            pointer: KeyValueObjectPointer,
                            kvos: KeyValueObjectState,
                            stores: List[StoreId],
-                           config: StoragePool.Config)
+                           config: StoragePoolState)
 
       def collectPools(stores: List[StoreId]): List[Future[PoolState]] =
         val poolMap = stores.foldLeft(Map[PoolId, List[StoreId]]()): (m, storeId) =>
@@ -389,7 +390,7 @@ class StoreManager(val client: AspenClient,
             poolPtr <- client.getStoragePoolPointer(poolId)
             poolKvos <- client.read(poolPtr)
           yield
-            PoolState(poolId, poolPtr, poolKvos, stores, StoragePool.Config(poolKvos))
+            PoolState(poolId, poolPtr, poolKvos, stores, StoragePoolState(poolKvos))
         }.toList
 
       def updatePool(ps: PoolState): Unit =
@@ -397,15 +398,15 @@ class StoreManager(val client: AspenClient,
           val newEntry = ps.config.stores(storeId.poolIndex).copy(hostId = hostId)
           ps.config.stores(storeId.poolIndex) = newEntry
 
-        val reqs = List(KeyRevision(StoragePool.ConfigKey, ps.kvos.contents(StoragePool.ConfigKey).revision))
-        val ops = List(Insert(StoragePool.ConfigKey, ps.config.encode()))
+        val reqs = List(KeyRevision(StoragePoolState.ConfigKey, ps.kvos.contents(StoragePoolState.ConfigKey).revision))
+        val ops = List(Insert(StoragePoolState.ConfigKey, ps.config.encode()))
 
         tx.update(ps.pointer, None, None, reqs, ops)
 
       for
         devPtr <- client.getStorageDevicePointer(storageDeviceId)
         devKvos <- client.read(devPtr)
-        state = StorageDevice(devKvos)
+        state = StorageDeviceState(devKvos)
         pools <- Future.sequence(collectPools(state.stores.keysIterator.toList))
         newHostPtr <- client.getHostPointer(hostId)
         newHostKvos <- client.read(newHostPtr)
@@ -415,7 +416,7 @@ class StoreManager(val client: AspenClient,
         // Check to ensure another concurrent call to this method didn't already
         // succeed
         if state.hostId != hostId then
-          logger.info(s"Updating host for storage device ${storageDeviceId}")
+          logger.info(s"Updating hostState for storage device ${storageDeviceId}")
 
           pools.foreach: ps =>
             updatePool(ps)
@@ -424,33 +425,33 @@ class StoreManager(val client: AspenClient,
           // Update Device State
           //
           val newDevState = state.copy(hostId = hostId)
-          val reqs = List(KeyRevision(StorageDevice.StateKey, devKvos.contents(StorageDevice.StateKey).revision))
-          val ops = List(Insert(StorageDevice.StateKey, newDevState.encode()))
+          val reqs = List(KeyRevision(StorageDeviceState.StateKey, devKvos.contents(StorageDeviceState.StateKey).revision))
+          val ops = List(Insert(StorageDeviceState.StateKey, newDevState.encode()))
 
           tx.update(devPtr, None, None, reqs, ops)
 
           //----------------------
-          // Update Old Host State
+          // Update Old HostState State
           //
-          val oldHostState = Host(oldHostKvos)
+          val oldHostState = HostState(oldHostKvos)
           val updatedOldHostState = oldHostState.copy(storageDevices = oldHostState.storageDevices - storageDeviceId)
 
           tx.update(oldHostPtr, None, None,
-            List(KeyRevision(Host.StateKey, oldHostKvos.contents(Host.StateKey).revision)),
-            List(Insert(Host.StateKey, updatedOldHostState.encode())))
+            List(KeyRevision(HostState.StateKey, oldHostKvos.contents(HostState.StateKey).revision)),
+            List(Insert(HostState.StateKey, updatedOldHostState.encode())))
 
           //----------------------
-          // Update New Host State
+          // Update New HostState State
           //
-          val newHostState = Host(newHostKvos)
+          val newHostState = HostState(newHostKvos)
           val updatedNewHostState = newHostState.copy(storageDevices = newHostState.storageDevices + storageDeviceId)
 
           tx.update(newHostPtr, None, None,
-            List(KeyRevision(Host.StateKey, newHostKvos.contents(Host.StateKey).revision)),
-            List(Insert(Host.StateKey, updatedNewHostState.encode())))
+            List(KeyRevision(HostState.StateKey, newHostKvos.contents(HostState.StateKey).revision)),
+            List(Insert(HostState.StateKey, updatedNewHostState.encode())))
 
           tx.result.foreach: _ =>
-            logger.info(s"Successfully updated host for storage device ${storageDeviceId}")
+            logger.info(s"Successfully updated hostState for storage device ${storageDeviceId}")
 
   private def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
     val storePath = os.Path(local.devicePath) / storeId.directoryName
@@ -472,15 +473,15 @@ class StoreManager(val client: AspenClient,
           _ <- fcreate
           ptr <- client.getStorageDevicePointer(local.storageDeviceId)
           kvos <- client.read(ptr)
-          state = StorageDevice(kvos)
+          state = StorageDeviceState(kvos)
         yield
           state.stores.get(storeId).foreach: entry =>
-            if entry.status == StorageDevice.StoreStatus.Initializing then
-              val newStores = state.stores + (storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None))
+            if entry.status == StorageDeviceState.StoreStatus.Initializing then
+              val newStores = state.stores + (storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
               val newState = state.copy(stores = newStores)
 
-              val reqs = List(KeyRevision(StorageDevice.StateKey, kvos.contents(StorageDevice.StateKey).revision))
-              val ops = List(Insert(StorageDevice.StateKey, newState.encode()))
+              val reqs = List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision))
+              val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
 
               logger.info(s"Updating device state to mark store $storeId as Active")
               tx.update(ptr, None, None, reqs, ops)
@@ -492,7 +493,7 @@ class StoreManager(val client: AspenClient,
   }
 
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
-    def check(local: LocalStorageDeviceState, remote: StorageDevice): Unit = synchronized {
+    def check(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit = synchronized {
       if remote.hostId != hostId then
         updateHostId(storageDeviceId).foreach: _ =>
           checkStorageDevice(storageDeviceId)
@@ -515,7 +516,7 @@ class StoreManager(val client: AspenClient,
         // New Stores
         //
         remote.stores.filter((storeId, entry) =>
-          entry.status == StorageDevice.StoreStatus.Initializing
+          entry.status == StorageDeviceState.StoreStatus.Initializing
         ).map( (storeId, _) =>
           storeId
         ).foreach: storeId =>
@@ -525,7 +526,7 @@ class StoreManager(val client: AspenClient,
         // Transferring In Stores
         //
         remote.stores.filter { (storeId, entry) =>
-          entry.status == StorageDevice.StoreStatus.TransferringIn
+          entry.status == StorageDeviceState.StoreStatus.TransferringIn
         }.map { (storeId, status) =>
           (storeId, status.transferDevice)
         }.toList.foreach: (storeId, ofromDeviceId) =>

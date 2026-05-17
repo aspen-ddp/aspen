@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.internal.{OpportunisticRebuildManager, StaticTypeRegistry}
 import org.aspen_ddp.aspen.client.internal.allocation.{AllocationManager, BaseAllocationDriver}
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, Host, HostId, KeyValueObjectState, ObjectCache, RetryStrategy, StorageDevice, StorageDeviceId, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{BaseReadDriver, ReadManager}
@@ -27,6 +27,7 @@ import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 
 import java.nio.file.Path
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
@@ -36,7 +37,7 @@ import scala.language.implicitConversions
 
 object TestNetwork {
 
-  val bootstrapHost = Host(HostId(new UUID(0,0)), "testhost", "localhost", 1234, 1235, 1236, Set())
+  val bootstrapHost = HostState(HostId(new UUID(0,0)), "testhost", "localhost", 1234, 1235, 1236, Set())
 
   class TestCRL extends CrashRecoveryLog {
     override def getFullRecoveryState(storeId: StoreId): (List[TransactionRecoveryState], List[AllocationRecoveryState]) = (Nil, Nil)
@@ -117,11 +118,11 @@ object TestNetwork {
       tkvl.get(Key(storageDeviceId.uuid)).map: vs =>
         KeyValueObjectPointer(vs.get.value.bytes)
 
-    protected def createStoragePool(config: StoragePool.Config): Future[PoolId] = ???
+    protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 
-    //def getHost(hostId: HostId): Future[Host] = Future.successful(bootstrapHost)
+    //def getHost(hostId: HostId): Future[HostState] = Future.successful(bootstrapHostState)
 
-    //def getHost(hostName: String): Future[Host] = getHost(HostId(new UUID(0,0)))
+    //def getHost(hostName: String): Future[HostState] = getHost(HostId(new UUID(0,0)))
     
     override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 
@@ -171,13 +172,13 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
 
   var handleDepth = 0
 
-  val bootstrapSD = StorageDevice(
+  val bootstrapSD = StorageDeviceState(
     storageDeviceId,
     bootstrapHost.hostId,
     Map(
-      store0.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None),
-      store1.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None),
-      store2.storeId -> StorageDevice.StoreEntry(StorageDevice.StoreStatus.Active, None)
+      store0.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
+      store1.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
+      store2.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
     )
   )
 

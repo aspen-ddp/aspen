@@ -1,6 +1,8 @@
-package org.aspen_ddp.aspen.client
+package org.aspen_ddp.aspen.common.metadata
 
+import org.aspen_ddp.aspen.client.KeyValueObjectState
 import org.aspen_ddp.aspen.codec
+import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.Key
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -21,14 +23,14 @@ object StorageDeviceId:
       case _ => throw new FormatError(s"String Required")
 
 
-object StorageDevice:
+object StorageDeviceState:
 
   private [aspen] val StateKey = Key(Array[Byte](0))
 
-  def apply(buff: Array[Byte]): StorageDevice = Codec.decode(codec.StorageDevice.parseFrom(buff))
+  def apply(buff: Array[Byte]): StorageDeviceState = Codec.decode(codec.StorageDevice.parseFrom(buff))
   
-  def apply(kvos: KeyValueObjectState): StorageDevice = 
-    StorageDevice(kvos.contents(StateKey).value.bytes)
+  def apply(kvos: KeyValueObjectState): StorageDeviceState = 
+    StorageDeviceState(kvos.contents(StateKey).value.bytes)
   
   enum StoreStatus:
     case Initializing, Active, TransferringIn, TransferringOut, Rebuilding
@@ -37,19 +39,19 @@ object StorageDevice:
                         transferDevice: Option[StorageDeviceId])
 
 
-case class StorageDevice(storageDeviceId: StorageDeviceId,
-                         hostId: HostId,
-                         stores: Map[StoreId, StorageDevice.StoreEntry]):
+case class StorageDeviceState(storageDeviceId: StorageDeviceId,
+                              hostId: HostId,
+                              stores: Map[StoreId, StorageDeviceState.StoreEntry]):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
   
-  def setHost(hostId: HostId): StorageDevice =
+  def setHost(hostId: HostId): StorageDeviceState =
     this.copy(hostId=hostId)
 
-  def setStoreEntry(storeId: StoreId, 
-                    status: StorageDevice.StoreStatus,
-                    transferDevice: Option[StorageDeviceId]): StorageDevice =
-    this.copy(stores=stores + (storeId -> StorageDevice.StoreEntry(status, transferDevice)))
+  def setStoreEntry(storeId: StoreId,
+                    status: StorageDeviceState.StoreStatus,
+                    transferDevice: Option[StorageDeviceId]): StorageDeviceState =
+    this.copy(stores=stores + (storeId -> StorageDeviceState.StoreEntry(status, transferDevice)))
 
-  def removeStore(storeId: StoreId): StorageDevice =
+  def removeStore(storeId: StoreId): StorageDeviceState =
     this.copy(stores=stores - storeId)

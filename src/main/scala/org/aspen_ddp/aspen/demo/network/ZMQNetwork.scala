@@ -11,7 +11,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
 import org.apache.logging.log4j.scala.Logging
-import org.aspen_ddp.aspen.client.{AspenClient, Host, HostId, StoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.demo.BootstrapConfig
 import org.zeromq.ZMQ.{DONTWAIT, PollItem}
@@ -225,23 +226,23 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     pendingPoolLookup -= pool.poolId
   }
 
-  private def hostLookedUp(host: Host): Unit = synchronized {
-    val hostState = ZHostState(
-      host.hostId,
-      host.name,
-      host.address,
-      host.dataPort,
+  private def hostLookedUp(hostState: HostState): Unit = synchronized {
+    val zhostState = ZHostState(
+      hostState.hostId,
+      hostState.name,
+      hostState.address,
+      hostState.dataPort,
       oheartbeatMessage,
       context,
       clientId
     )
 
-    hostStates += host.hostId -> hostState
+    hostStates += zhostState.hostId -> zhostState
 
-    pendingHostLookup.get(host.hostId).foreach: phl =>
-      phl.pendingMessages.reverse.foreach(hostState.dealer.send)
+    pendingHostLookup.get(hostState.hostId).foreach: phl =>
+      phl.pendingMessages.reverse.foreach(zhostState.dealer.send)
 
-    pendingHostLookup -= host.hostId
+    pendingHostLookup -= hostState.hostId
 
     // Tell I/O thread about the new connection so it can rebuild it's Poller
     // instance
@@ -316,7 +317,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
 
       // Recreate hostArray to pick up any new connections
       hostsArray = hostStates.valuesIterator.toArray
-      // Poller size is size of hosts array plus one for sendQueue plus 0 or 1
+      // Poller size is size of hostStates array plus one for sendQueue plus 0 or 1
       // depending on if we have a router socket or not
       poller = context.createPoller(hostsArray.length + 1 + routerPoll)
 
@@ -345,7 +346,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
           logger.warn(s"Poll method threw an exception. Creating a new poller. Error: $e")
           recreatePoller()
 
-      // Process messages coming from hosts
+      // Process messages coming from hostStates
       for i <- hostsArray.indices do
         if poller.pollin(i) then
           var msg = hostsArray(i).dealer.recv(ZMQ.DONTWAIT)
@@ -362,7 +363,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
         while msg != null do
           msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
 
-      // Process messages sent to our local host
+      // Process messages sent to our local hostState
       orouterSocket.foreach: router =>
         if poller.pollin(hostsArray.length + 1) then
           var from = router.recv(ZMQ.DONTWAIT)

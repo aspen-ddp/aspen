@@ -1,11 +1,12 @@
 package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{Host, HostId, StorageDevice, StoragePool}
+import org.aspen_ddp.aspen.client.StoragePool
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.tkvl.{BootstrapPoolNodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -19,8 +20,8 @@ object Bootstrap:
 
   def initialize(aspenSystemId: UUID,
                  ida: IDA,
-                 bootstrapHost: Host,
-                 bootstrapStorageDevice: StorageDevice,
+                 bootstrapHostState: HostState,
+                 bootstrapStorageDeviceState: StorageDeviceState,
                  stores: List[Backend]): KeyValueObjectPointer = {
 
     require( ida.width == stores.length )
@@ -28,8 +29,8 @@ object Bootstrap:
     val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
       aspenSystemId = aspenSystemId,
       ida = ida,
-      hosts = List(bootstrapHost),
-      storeMap = stores.map(backend => backend.storeId -> bootstrapHost.hostId)
+      hostStates = List(bootstrapHostState),
+      storeMap = stores.map(backend => backend.storeId -> bootstrapHostState.hostId)
     )
 
     val bootstrapMetadata = Metadata(
@@ -80,10 +81,10 @@ object Bootstrap:
     val allocTreeRoot = allocate()
 
     val storeEntrys = (0 until ida.width).map{ _ => 
-      StoragePool.StoreEntry(bootstrapHost.hostId, bootstrapStorageDevice.storageDeviceId)
+      StoragePoolState.StoreEntry(bootstrapHostState.hostId, bootstrapStorageDeviceState.storageDeviceId)
     }.toArray
     
-    val poolConfig = StoragePool.Config(
+    val poolState = StoragePoolState(
       PoolId.BootstrapPoolId, 
       PoolId.BootstrapPoolName, 
       ida, 
@@ -94,9 +95,9 @@ object Bootstrap:
     val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), BootstrapPoolNodeAllocator).encode()
 
     val poolPointer = allocate(List(
-      StoragePool.ConfigKey -> poolConfig,
-      StoragePool.ErrorTreeKey -> errorTree,
-      StoragePool.AllocationTreeKey -> allocTree
+      StoragePoolState.ConfigKey -> poolState,
+      StoragePoolState.ErrorTreeKey -> errorTree,
+      StoragePoolState.AllocationTreeKey -> allocTree
     ))
     val poolTreeRoot = allocate(List(
       Key(Radicle.poolId.uuid) -> poolPointer.toArray
@@ -115,10 +116,10 @@ object Bootstrap:
       BootstrapPoolNodeAllocator)
 
     val storageDevicePtr = allocate(List(
-      StorageDevice.StateKey ->  bootstrapStorageDevice.encode()
+      StorageDeviceState.StateKey ->  bootstrapStorageDeviceState.encode()
     ))
     val storageDeviceTreeRootObj = allocate(List(
-      Key(bootstrapStorageDevice.storageDeviceId.uuid) -> storageDevicePtr.toArray
+      Key(bootstrapStorageDeviceState.storageDeviceId.uuid) -> storageDevicePtr.toArray
     ))
     val storageDeviceTree = Root(0,
       ByteArrayKeyOrdering,
@@ -126,10 +127,10 @@ object Bootstrap:
       BootstrapPoolNodeAllocator)
 
     val hostPtr = allocate(List(
-      Host.StateKey -> bootstrapHost.encode()
+      HostState.StateKey -> bootstrapHostState.encode()
     ))
     val hostsTreeRootObj = allocate(List(
-      Key(bootstrapHost.hostId.uuid) -> hostPtr.toArray
+      Key(bootstrapHostState.hostId.uuid) -> hostPtr.toArray
     ))
     val hostsTree = Root(0,
       ByteArrayKeyOrdering,
@@ -137,7 +138,7 @@ object Bootstrap:
       BootstrapPoolNodeAllocator)
 
     val hostsNameTreeRootObj = allocate(List(
-      Key(bootstrapHost.name) -> uuid2byte(bootstrapHost.hostId.uuid)
+      Key(bootstrapHostState.name) -> uuid2byte(bootstrapHostState.hostId.uuid)
     ))
     val hostsNameTree = Root(0,
       LexicalKeyOrdering,

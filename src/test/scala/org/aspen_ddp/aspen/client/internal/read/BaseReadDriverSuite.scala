@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
-import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, Host, HostId, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StorageDeviceId, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -18,6 +18,7 @@ import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StoragePoolState}
 
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.*
@@ -63,7 +64,7 @@ object BaseReadDriverSuite {
 
     def newTransaction(): Transaction = null
     
-    protected def createStoragePool(config: StoragePool.Config): Future[PoolId] = ???
+    protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
     def getHostId(hostName: String): Future[HostId] = ???

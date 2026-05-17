@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -52,17 +53,17 @@ trait AspenClient extends ObjectReader:
       read(pointer).map: kvos =>
         SimpleStoragePool(this, kvos)
   
-  def getHost(hostId: HostId): Future[Host] =
+  def getHost(hostId: HostId): Future[HostState] =
     given ExecutionContext = this.clientContext
     getHostPointer(hostId).flatMap: pointer =>
       read(pointer).map: kvos =>
-        Host(kvos)
+        HostState(kvos)
   
-  def getStorageDevice(storageDeviceId: StorageDeviceId): Future[StorageDevice] =
+  def getStorageDevice(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     given ExecutionContext = this.clientContext
     getStorageDevicePointer(storageDeviceId).flatMap: pointer =>
       read(pointer).map: kvos =>
-        StorageDevice(kvos)
+        StorageDeviceState(kvos)
         
   def getStoragePoolId(poolName: String): Future[PoolId]
   def getHostId(hostName: String): Future[HostId]
@@ -71,7 +72,7 @@ trait AspenClient extends ObjectReader:
   private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]
   private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer]
 
-  protected def createStoragePool(config: StoragePool.Config): Future[PoolId]
+  protected def createStoragePool(config: StoragePoolState): Future[PoolId]
 
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
@@ -108,8 +109,8 @@ trait AspenClient extends ObjectReader:
       val poolId = PoolId(UUID.randomUUID())
       for
         devices <- Future.sequence(storageDeviceIds.map(sid => getStorageDevice(sid)))
-        stores = devices.map(dev => StoragePool.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
-        config = StoragePool.Config(
+        stores = devices.map(dev => StoragePoolState.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
+        config = StoragePoolState(
           poolId,
           name,
           defaultIDA, 
@@ -137,10 +138,10 @@ trait AspenClient extends ObjectReader:
         sourceId = pool.stores(storeId.poolIndex).storageDeviceId
         srcPtr <- getStorageDevicePointer(sourceId)
         srcKvos <- read(srcPtr)
-        srcState = StorageDevice(srcKvos)
+        srcState = StorageDeviceState(srcKvos)
         dstPtr <- getStorageDevicePointer(destinationId)
         dstKvos <- read(dstPtr)
-        dstState = StorageDevice(dstKvos)
+        dstState = StorageDeviceState(dstKvos)
       yield
         if sourceId == destinationId then
           throw InvalidDestination()
@@ -148,32 +149,32 @@ trait AspenClient extends ObjectReader:
         srcState.stores.get(storeId) match
           case None => throw StoreNotActive(storeId)
           case Some(entry) =>
-            if entry.status != StorageDevice.StoreStatus.Active then
+            if entry.status != StorageDeviceState.StoreStatus.Active then
               throw StoreNotActive(storeId)
             
             // Update Source Device
-            val newSrcEntry = StorageDevice.StoreEntry(
-              StorageDevice.StoreStatus.TransferringOut,
+            val newSrcEntry = StorageDeviceState.StoreEntry(
+              StorageDeviceState.StoreStatus.TransferringOut,
               Some(destinationId)
             )
             val newSrcStores = srcState.stores + (storeId -> newSrcEntry)
             val newSrcState = srcState.copy(stores = newSrcStores)
 
-            val srcReqs = List(KeyRevision(StorageDevice.StateKey, srcKvos.contents(StorageDevice.StateKey).revision))
-            val srcOps = List(Insert(StorageDevice.StateKey, newSrcState.encode()))
+            val srcReqs = List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision))
+            val srcOps = List(Insert(StorageDeviceState.StateKey, newSrcState.encode()))
             
             tx.update(srcPtr, None, None, srcReqs, srcOps)
             
             // Update Destination Device
-            val newDstEntry = StorageDevice.StoreEntry(
-              StorageDevice.StoreStatus.TransferringIn,
+            val newDstEntry = StorageDeviceState.StoreEntry(
+              StorageDeviceState.StoreStatus.TransferringIn,
               Some(sourceId)
             )
             val newDstStores = dstState.stores + (storeId -> newDstEntry)
             val newDstState = dstState.copy(stores = newDstStores)
 
-            val dstReqs = List(KeyRevision(StorageDevice.StateKey, dstKvos.contents(StorageDevice.StateKey).revision))
-            val dstOps = List(Insert(StorageDevice.StateKey, newDstState.encode()))
+            val dstReqs = List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision))
+            val dstOps = List(Insert(StorageDeviceState.StateKey, newDstState.encode()))
 
             tx.update(dstPtr, None, None, dstReqs, dstOps)
             

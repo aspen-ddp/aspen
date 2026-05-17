@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.cnc
 
-import org.aspen_ddp.aspen.client.HostId
+import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 

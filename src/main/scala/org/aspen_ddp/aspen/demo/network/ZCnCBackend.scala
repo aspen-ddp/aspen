@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.demo.network
 
-import org.aspen_ddp.aspen.client.{AspenClient, Host, HostId, StoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.server.StoreManager
 import org.aspen_ddp.aspen.server.cnc.*
 import org.aspen_ddp.aspen.server.store.backend.{RocksDBBackend, RocksDBConfig}
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.zeromq.SocketType
 
 import java.nio.file.{Files, Path}
@@ -113,10 +114,10 @@ class ZCnCBackend(val network: ZMQNetwork,
         Future.failed(new Exception(f"Store ${msg.storeId} not found"))
       case Some(storeManager) =>
         for
-          host <- someOrThrow(client.getHost(msg.toHost), new Exception(f"Host name not found: ${msg.toHost}"))
+          hostState <- someOrThrow(client.getHost(msg.toHost), new Exception(f"HostState name not found: ${msg.toHost}"))
         yield
           val stf = new ZStoreTransferFrontend(storeManager.storesDir, network)
-          stf.send(msg.storeId, host.address, host.storeTransferPort)
+          stf.send(msg.storeId, hostState.address, hostState.storeTransferPort)
 
 
  */

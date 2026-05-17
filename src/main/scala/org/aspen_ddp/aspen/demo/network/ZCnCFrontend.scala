@@ -1,10 +1,10 @@
 package org.aspen_ddp.aspen.demo.network
 
-import org.aspen_ddp.aspen.client.Host
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, CnCRequest, NewStore, ShutdownStore, TransferStore}
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.common.metadata.HostState
 import org.zeromq.SocketType
 
 import java.nio.{ByteBuffer, ByteOrder}
@@ -21,7 +21,7 @@ object ZCnCFrontend:
   final case class Shutdown(promise: Promise[Unit]) extends QMsg
 
 class ZCnCFrontend(val network: ZMQNetwork, 
-                   val host: Host) extends CnCFrontend with Logging:
+                   val host: HostState) extends CnCFrontend with Logging:
 
   import ZCnCFrontend._
 

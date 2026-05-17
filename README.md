@@ -62,7 +62,7 @@ crashes, e.g, deleting a tree structure comprised of millions of individual obje
 on storage media to optimize their intended use case. For example, the upper tiers of a
 B-tree could be backed by NVME media for fast lookups while the bottom tier could be backed
 by spinning disks to store bulk data.
-- **Data stores and, consequently, their stored objects may be freely migrated between hosts
+- **Data stores and, consequently, their stored objects may be freely migrated between hostStates
 and backing media on-the-fly** - Data stores are logical entities that may be freely moved
 about to satisfy changing needs of the operational environment.
 

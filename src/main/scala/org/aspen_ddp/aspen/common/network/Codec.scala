@@ -1,12 +1,13 @@
 package org.aspen_ddp.aspen.common.network
 
 import com.google.protobuf.ByteString
-import org.aspen_ddp.aspen.client.{Host, HostId, StorageDevice, StorageDeviceId, StoragePool}
+import org.aspen_ddp.aspen.client.StoragePool
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.codec.ObjectReadError
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyRevisionGuard, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectRevisionGuard, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -1129,16 +1130,16 @@ object Codec extends Logging:
       initialRefcount, timestamp, transactionId, serializedRevisionGuard)
 
 
-  def encode(o: StoragePool.StoreEntry): codec.PoolStoreEntry =
+  def encode(o: StoragePoolState.StoreEntry): codec.PoolStoreEntry =
     codec.PoolStoreEntry.newBuilder()
       .setHostId(encodeUUID(o.hostId.uuid))
       .setStorageDeviceId(encode(o.storageDeviceId))
       .build
 
-  def decode(m: codec.PoolStoreEntry): StoragePool.StoreEntry =
+  def decode(m: codec.PoolStoreEntry): StoragePoolState.StoreEntry =
     val hostId = HostId(decodeUUID(m.getHostId))
     val storageDeviceId = decode(m.getStorageDeviceId)
-    StoragePool.StoreEntry(hostId, storageDeviceId)
+    StoragePoolState.StoreEntry(hostId, storageDeviceId)
 
 
   def encodeBackendConfig(o: BackendConfig): codec.BackendConfig = o match
@@ -1149,7 +1150,7 @@ object Codec extends Logging:
     case f => throw new EncodingError(f"Invalid Backend Config: $f")
     
     
-  def encode(o: StoragePool.Config): codec.PoolConfig =
+  def encode(o: StoragePoolState): codec.PoolConfig =
     val builder = codec.PoolConfig.newBuilder()
 
     builder.setPoolId(encodeUUID(o.poolId.uuid))
@@ -1163,7 +1164,7 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.PoolConfig): StoragePool.Config =
+  def decode(m: codec.PoolConfig): StoragePoolState =
     val poolId = PoolId(decodeUUID(m.getPoolId))
     val name = m.getName
     val defaultIDA = decode(m.getDefaultIDA)
@@ -1171,10 +1172,10 @@ object Codec extends Logging:
     val stores = m.getStoresList.asScala.map(decode).toArray
     val backendConfig = decodeBackendConfig(m.getBackendConfig)
 
-    StoragePool.Config(poolId, name, defaultIDA, maxObjectSize, stores, backendConfig)
+    StoragePoolState(poolId, name, defaultIDA, maxObjectSize, stores, backendConfig)
 
 
-  def encode(o: Host): codec.Host =
+  def encode(o: HostState): codec.Host =
     val builder = codec.Host.newBuilder()
 
     builder.setHostId(encodeUUID(o.hostId.uuid))
@@ -1190,7 +1191,7 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.Host): Host =
+  def decode(m: codec.Host): HostState =
     val hostId = HostId(decodeUUID(m.getHostId))
     val name = m.getName
     val address = m.getAddress
@@ -1199,7 +1200,7 @@ object Codec extends Logging:
     val storeTransferPort = m.getStoreTransferPort
     val storageDevices = m.getStorageDevicesList.asScala.map(decode).toSet
 
-    Host(hostId, name, address, dataPort, cncPort, storeTransferPort, storageDevices)
+    HostState(hostId, name, address, dataPort, cncPort, storeTransferPort, storageDevices)
 
   // CnC Messages -----------------------------------------------------------------
   
@@ -1267,23 +1268,23 @@ object Codec extends Logging:
     StorageDeviceId(decodeUUID(m.getDeviceUuid))
 
 
-  def encodeStorageDeviceStoreStatus(o: StorageDevice.StoreStatus): codec.StorageDeviceStoreStatus = o match
-    case StorageDevice.StoreStatus.Initializing => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING
-    case StorageDevice.StoreStatus.Active => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE
-    case StorageDevice.StoreStatus.TransferringIn => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN
-    case StorageDevice.StoreStatus.TransferringOut => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT
-    case StorageDevice.StoreStatus.Rebuilding => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING
+  def encodeStorageDeviceStoreStatus(o: StorageDeviceState.StoreStatus): codec.StorageDeviceStoreStatus = o match
+    case StorageDeviceState.StoreStatus.Initializing => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING
+    case StorageDeviceState.StoreStatus.Active => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE
+    case StorageDeviceState.StoreStatus.TransferringIn => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN
+    case StorageDeviceState.StoreStatus.TransferringOut => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT
+    case StorageDeviceState.StoreStatus.Rebuilding => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING
 
-  def decodeStorageDeviceStoreStatus(m: codec.StorageDeviceStoreStatus): StorageDevice.StoreStatus = m match
-    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING => StorageDevice.StoreStatus.Initializing
-    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE => StorageDevice.StoreStatus.Active
-    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN => StorageDevice.StoreStatus.TransferringIn
-    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT => StorageDevice.StoreStatus.TransferringOut
-    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING => StorageDevice.StoreStatus.Rebuilding
+  def decodeStorageDeviceStoreStatus(m: codec.StorageDeviceStoreStatus): StorageDeviceState.StoreStatus = m match
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING => StorageDeviceState.StoreStatus.Initializing
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE => StorageDeviceState.StoreStatus.Active
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN => StorageDeviceState.StoreStatus.TransferringIn
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT => StorageDeviceState.StoreStatus.TransferringOut
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING => StorageDeviceState.StoreStatus.Rebuilding
     case f => throw new EncodingError(f"Invalid StorageDeviceStoreStatus: $f")
 
 
-  def encode(o: StorageDevice.StoreEntry): codec.StorageDeviceStoreEntry =
+  def encode(o: StorageDeviceState.StoreEntry): codec.StorageDeviceStoreEntry =
     val builder = codec.StorageDeviceStoreEntry.newBuilder()
       .setStatus(encodeStorageDeviceStoreStatus(o.status))
 
@@ -1292,17 +1293,17 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.StorageDeviceStoreEntry): StorageDevice.StoreEntry =
+  def decode(m: codec.StorageDeviceStoreEntry): StorageDeviceState.StoreEntry =
     val status = decodeStorageDeviceStoreStatus(m.getStatus)
     val transferDevice = if m.hasTransferDevice then
       Some(decode(m.getTransferDevice))
     else
       None
 
-    StorageDevice.StoreEntry(status, transferDevice)
+    StorageDeviceState.StoreEntry(status, transferDevice)
 
 
-  def encode(o: StorageDevice): codec.StorageDevice =
+  def encode(o: StorageDeviceState): codec.StorageDevice =
     val builder = codec.StorageDevice.newBuilder()
       .setStorageDeviceId(encode(o.storageDeviceId))
     
@@ -1317,7 +1318,7 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.StorageDevice): StorageDevice =
+  def decode(m: codec.StorageDevice): StorageDeviceState =
     val storageDeviceId = decode(m.getStorageDeviceId)
     val hostId = HostId(decodeUUID(m.getHostId))
     val stores = m.getStoresList.asScala.map: keyValue =>
@@ -1326,7 +1327,7 @@ object Codec extends Logging:
       storeId -> entry
     .toMap
 
-    new StorageDevice(storageDeviceId, hostId, stores)
+    new StorageDeviceState(storageDeviceId, hostId, stores)
 
   def encodeSteppedDurableTaskState(step: Int, state: Map[String, Array[Byte]]): Array[Byte] =
     val builder = codec.SteppedDurableTaskState.newBuilder()

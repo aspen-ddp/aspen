@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.HostId
+import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.aspen_ddp.aspen.server.HostConfig
 import org.yaml.snakeyaml.Yaml
@@ -10,8 +10,8 @@ import java.io.{File, FileInputStream}
 import java.util.UUID
 
 /*
-host-id: 00000000-0000-0000-0000-000000000000
-name: bootstrap-host
+hostState-id: 00000000-0000-0000-0000-000000000000
+name: bootstrap-hostState
 aspen-system-id: 00000000-0000-0000-0000-000000000000
 data-port: 4750
 cnc-port: 4751
@@ -27,7 +27,7 @@ case class HostConfig(hostId: HostId,
                       log4jConfigFile: File,
                       crl: HostConfig.CRLBackend):
   def yamlConfig: String =
-    val base = s"""host-id: $hostId
+    val base = s"""hostState-id: $hostId
        |aspen-system-id: $aspenSystemId
        |name: $name
        |address: $address
@@ -50,7 +50,7 @@ case class HostConfig(hostId: HostId,
 
 object HostConfig extends YObject[HostConfig]:
 
-  val configFilename = "aspen-host-config.yaml"
+  val configFilename = "aspen-hostState-config.yaml"
 
   sealed abstract class CRLBackend
 
@@ -66,7 +66,7 @@ object HostConfig extends YObject[HostConfig]:
       numStreams.get(o).getOrElse(3),
       fileSize.get(o).getOrElse(300))
 
-  val hostId: Required[HostId]         = Required("host-id", HostId.YHostId)
+  val hostId: Required[HostId]         = Required("hostState-id", HostId.YHostId)
   val aspenSystemId: Required[UUID]    = Required("aspen-system-id", YUUID)
   val name: Required[String]           = Required("name", YString)
   val address: Required[String]        = Required("address", YString)

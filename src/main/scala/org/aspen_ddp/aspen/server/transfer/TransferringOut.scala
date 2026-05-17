@@ -1,7 +1,8 @@
 package org.aspen_ddp.aspen.server.transfer
 
 import org.apache.logging.log4j.scala.Logging
-import org.aspen_ddp.aspen.client.{AspenClient, HostId, StorageDeviceId}
+import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.StoreTransferData
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -32,7 +33,7 @@ class TransferringOut( val client: AspenClient,
   // Create marker file so the server knows not to load this store
   os.write.over(storePath / MarkerFile, "")
 
-  logger.info(s"Beginning transfer of store $storeId on storage device $fromDevice to storage device $toDevice on host $toHost")
+  logger.info(s"Beginning transfer of store $storeId on storage device $fromDevice to storage device $toDevice on hostState $toHost")
 
   private val creationProcess = os.spawn(
     cmd = ("jar", "--create"),

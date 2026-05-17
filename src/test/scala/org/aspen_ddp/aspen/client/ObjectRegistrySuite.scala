@@ -74,3 +74,17 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
       result <- registry.prepareRegisterObject(objectId, ptr2)(using tx2).failed
     yield
       result shouldBe a [KeyAlreadyExists]
+
+  atest("registerObject and retrieve"):
+    val objectId = UUID.randomUUID()
+    for
+      registry <- createRegistry()
+
+      // Use the radicle object (which already exists) for testing
+      ptr = radicle
+
+      _ <- registry.registerObject(objectId, ptr)
+
+      retrieved <- registry.getRegisteredObject(objectId)
+    yield
+      retrieved should be (ptr)

@@ -35,3 +35,17 @@ class ObjectRegistry(val client: AspenClient,
       tx.result.value match
         case Some(Failure(_: KeyAlreadyExists)) => throw KeyAlreadyExists(Key(objectId))
         case _ => ()
+
+  def registerObject(objectId: UUID, pointer: ObjectPointer): Future[Unit] =
+    val key = Key(objectId)
+    client.retryStrategy.retryUntilSuccessful:
+      tkvl.get(key).flatMap:
+        case Some(vs) =>
+          if ObjectPointer(vs.value.bytes) == pointer then
+            Future.unit
+          else
+            throw StopRetrying(ObjectRegistry.DuplicateRegistration(objectId, ObjectPointer(vs.value.bytes)))
+        case None =>
+          client.transact: tx =>
+            given Transaction = tx
+            prepareRegisterObject(objectId, pointer)

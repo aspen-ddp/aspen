@@ -29,3 +29,9 @@ class ObjectRegistry(val client: AspenClient,
 
   def getRegisteredDataObject(objectId: UUID): Future[DataObjectPointer] =
     getRegisteredObject(objectId).map(_.asInstanceOf[DataObjectPointer])
+
+  def prepareRegisterObject(objectId: UUID, pointer: ObjectPointer)(using tx: Transaction): Future[Unit] =
+    tkvl.set(Key(objectId), Value(pointer.toArray), requirement = Some(Left(true))).map: _ =>
+      tx.result.value match
+        case Some(Failure(_: KeyAlreadyExists)) => throw KeyAlreadyExists(Key(objectId))
+        case _ => ()

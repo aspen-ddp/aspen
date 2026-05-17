@@ -33,3 +33,44 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
       result <- registry.getRegisteredObject(UUID.randomUUID()).failed
     yield
       result shouldBe a [NoSuchElementException]
+
+  atest("prepareRegisterObject and retrieve"):
+    for
+      registry <- createRegistry()
+      objectId = UUID.randomUUID()
+
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.createAllocator(Replication(3, 2))
+
+      tx = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx)
+      _ <- registry.prepareRegisterObject(objectId, ptr)(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+
+      retrieved <- registry.getRegisteredObject(objectId)
+    yield
+      retrieved should be (ptr)
+
+  atest("prepareRegisterObject detects duplicate key"):
+    for
+      registry <- createRegistry()
+      objectId = UUID.randomUUID()
+
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.createAllocator(Replication(3, 2))
+
+      tx1 = client.newTransaction()
+      ptr1 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx1)
+      _ <- registry.prepareRegisterObject(objectId, ptr1)(using tx1)
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+
+      ikvos2 <- client.read(radicle)
+      tx2 = client.newTransaction()
+      ptr2 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos2.revision), Map())(using tx2)
+      result <- registry.prepareRegisterObject(objectId, ptr2)(using tx2).failed
+    yield
+      result shouldBe a [KeyAlreadyExists]

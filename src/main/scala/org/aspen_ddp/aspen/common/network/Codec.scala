@@ -401,6 +401,13 @@ object Codec extends Logging:
       builder.addNotifyOnResolution(encode(storeId))
     o.notes.foreach: s =>
       builder.addNotes(s)
+    o.poolIDAMap.foreach: (poolId, ida) =>
+      builder.addPoolIdas(
+        codec.PoolIDA.newBuilder()
+          .setPoolId(encodeUUID(poolId.uuid))
+          .setIda(encode(ida))
+          .build
+      )
 
     builder.build
   def decode(m: codec.TransactionDescription): TransactionDescription =
@@ -413,9 +420,13 @@ object Codec extends Logging:
     val origClient = if m.hasOriginatingClient then Some(ClientId(decodeUUID(m.getOriginatingClient))) else None
     val notifyOnRes = m.getNotifyOnResolutionList.asScala.map(decode).toList
     val notes = m.getNotesList.asScala.toList
+    val poolIDAMap = m.getPoolIdasList.asScala.map: pida =>
+      PoolId(decodeUUID(pida.getPoolId)) -> decode(pida.getIda)
+    .toMap
+    val primaryObjectIDA = poolIDAMap(primaryObj.poolId)
 
     TransactionDescription(txuuid, startTs, primaryObj, designatedLeader, requirements,
-      serializedFas, origClient, notifyOnRes, notes)
+      serializedFas, origClient, notifyOnRes, notes, primaryObjectIDA, poolIDAMap)
 
 
   def encode(o: ProposalId): codec.ProposalId =

@@ -1,18 +1,4 @@
 
-Move StorageDevice, StoragePool, and Host to common.metadata package
-  - Suffix each with State for clear deliniation between metadata state and
-    functional classes in client/store
-  - Will add AllocatorState later
-
-metadata.fixed_ids
-  - Needed for shared trees
-  - Will need to update TestNetwork to use these ids
-  - top-level definitions in package-scope
-    val RadicleId = ObjectId(new UUID(0, 0))
-    val BootstrapPoolId = PoolId(new UUID(0, 1))
-    val BootstrapHostId = HostId(new UUID(0, 2))
-    ...
-
 Create ObjectRegistry(client,
                       mgrPointer: KeyValueObjectPointer,
                       treeRootKey: Key,

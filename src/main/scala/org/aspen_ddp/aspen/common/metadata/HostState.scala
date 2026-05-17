@@ -12,6 +12,8 @@ final case class HostId(uuid: UUID) extends AnyVal
 
 object HostId:
 
+  val BootstrapHostId: HostId = fixed_ids.BootstrapHostId
+
   object YHostId extends Format[HostId]:
     override def format(o: Object): HostId = o match
       case v: java.lang.String =>

@@ -13,6 +13,8 @@ import java.util.UUID
 final case class StorageDeviceId(uuid: UUID) extends AnyVal
 
 object StorageDeviceId:
+  val BootstrapStorageDeviceId: StorageDeviceId = fixed_ids.BootstrapStorageDeviceId
+
   object YStorageDeviceId extends Format[StorageDeviceId]:
     override def format(o: Object): StorageDeviceId = o match
       case v: java.lang.String =>

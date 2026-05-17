@@ -320,10 +320,6 @@ object Main {
                     ohostNode: Option[(HostId, Int)],
                     oclientId: Option[ClientId]): (NetworkBridge, ZMQNetwork) = {
     val b = new NetworkBridge
-    //val nodes = cfg.hostStates.map(ds => ds.name -> (ds.hostState, ds.dataPort)).toMap
-    //val stores = cfg.hostStates.zipWithIndex.map { (hostState, index) =>
-    //  StoreId(PoolId(new UUID(0,0)), index.toByte) -> hostState.name
-    //}.toMap
 
     val heartbeatPeriod = Duration(10, SECONDS)
     (b, new ZMQNetwork(oclientId, cfg, ohostNode, heartbeatPeriod,

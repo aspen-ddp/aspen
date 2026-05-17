@@ -4,9 +4,10 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.metadata.fixed_ids
 
-object Radicle {
-  val objectId: ObjectId = ObjectId(new UUID(0, 0))
+object Radicle:
+  val objectId: ObjectId = fixed_ids.RadicleObjectId
 
   val objectType: ObjectType.Value = ObjectType.KeyValue
 
@@ -19,4 +20,4 @@ object Radicle {
   private[aspen] val HostsNameTreeKey = Key(Array[Byte](4))
   private[aspen] val BootstrapConfigKey = Key(Array[Byte](5))
   private[aspen] val SystemIdKey = Key(Array[Byte](6))
-}
+

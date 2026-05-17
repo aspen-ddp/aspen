@@ -37,7 +37,7 @@ import scala.language.implicitConversions
 
 object TestNetwork {
 
-  val bootstrapHost = HostState(HostId(new UUID(0,0)), "testhost", "localhost", 1234, 1235, 1236, Set())
+  val bootstrapHost = HostState(HostId.BootstrapHostId, "testhost", "localhost", 1234, 1235, 1236, Set())
 
   class TestCRL extends CrashRecoveryLog {
     override def getFullRecoveryState(storeId: StoreId): (List[TransactionRecoveryState], List[AllocationRecoveryState]) = (Nil, Nil)
@@ -120,13 +120,9 @@ object TestNetwork {
 
     protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 
-    //def getHost(hostId: HostId): Future[HostState] = Future.successful(bootstrapHostState)
-
-    //def getHost(hostName: String): Future[HostState] = getHost(HostId(new UUID(0,0)))
-    
     override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 
-    def clientContext: ExecutionContext = executionContext//scala.concurrent.ExecutionContext.Implicits.global
+    def clientContext: ExecutionContext = executionContext
 
     def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
 
@@ -168,7 +164,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
 
   val ida = Replication(3, 2)
 
-  val storageDeviceId = StorageDeviceId(new UUID(0, 0))
+  val storageDeviceId = StorageDeviceId.BootstrapStorageDeviceId
 
   var handleDepth = 0
 
@@ -228,7 +224,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
 
   val smgr = new StoreManager(
     client,
-    HostId(new UUID(0, 0)),
+    HostId.BootstrapHostId,
     new UUID(0, 0),
     Path.of("/"),
     executionContext,

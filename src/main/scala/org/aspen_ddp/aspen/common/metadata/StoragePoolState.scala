@@ -13,6 +13,8 @@ object StoragePoolState:
   private [aspen] val ErrorTreeKey = Key(Array[Byte](1))
   private [aspen] val AllocationTreeKey = Key(Array[Byte](2))
 
+  val BootstrapPoolId: PoolId = fixed_ids.BootstrapPoolId
+
   case class StoreEntry(hostId: HostId, storageDeviceId: StorageDeviceId)
 
   def apply(cfg: Array[Byte]): StoragePoolState = Codec.decode(codec.StoragePoolState.parseFrom(cfg))

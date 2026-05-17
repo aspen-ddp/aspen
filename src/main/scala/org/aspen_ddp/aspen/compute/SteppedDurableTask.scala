@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.compute
 
 import org.apache.logging.log4j.scala.Logging
-import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -68,7 +68,11 @@ abstract class SteppedDurableTask(
 
             tx.commit().onComplete:
               case Failure(err) =>
-                logger.error(s"Commit failed at step $step for task ${taskPointer.kvPointer}, retrying", err)
+                err match
+                  case _: TransactionAborted =>
+                    logger.warn(s"Commit aborted at step $step for task ${taskPointer.kvPointer}, retrying")
+                  case _ =>
+                    logger.error(s"Commit failed at step $step for task ${taskPointer.kvPointer}, retrying", err)
                 doNextStep()
               case Success(_) =>
                 if step + 1 >= steps.length then

@@ -66,4 +66,4 @@ class UUIDObjectRegistrySuite extends IntegrationTestSuite:
 
       result <- registry.registerObject(objectId, ptr2).failed
     yield
-      result shouldBe a [ObjectRegistry.DuplicateRegistration]
+      result shouldBe a [Registry.DuplicateRegistration]

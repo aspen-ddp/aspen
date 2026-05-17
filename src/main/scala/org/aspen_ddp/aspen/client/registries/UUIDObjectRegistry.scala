@@ -1,28 +1,34 @@
 package org.aspen_ddp.aspen.client.registries
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectPointer, Value}
 
 import java.util.UUID
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 
 class UUIDObjectRegistry(val client: AspenClient,
                          containingObjectPtr: KeyValueObjectPointer,
                          treeRootKey: Key):
 
-  private val registry = ObjectRegistry(client, containingObjectPtr, treeRootKey)
+  given ExecutionContext = client.clientContext
+
+  private val registry = Registry(client, containingObjectPtr, treeRootKey)
+
+  private def encodePointer(pointer: ObjectPointer): Value = Value(pointer.toArray)
+
+  private def decodePointer(value: Value): ObjectPointer = ObjectPointer(value.bytes)
 
   def getRegisteredObject(objectId: UUID): Future[ObjectPointer] =
-    registry.getRegisteredObject(Key(objectId))
+    registry.get(Key(objectId)).map(decodePointer)
 
   def getRegisteredKeyValueObject(objectId: UUID): Future[KeyValueObjectPointer] =
-    registry.getRegisteredKeyValueObject(Key(objectId))
+    getRegisteredObject(objectId).map(_.asInstanceOf[KeyValueObjectPointer])
 
   def getRegisteredDataObject(objectId: UUID): Future[DataObjectPointer] =
-    registry.getRegisteredDataObject(Key(objectId))
+    getRegisteredObject(objectId).map(_.asInstanceOf[DataObjectPointer])
 
   def prepareRegisterObject(objectId: UUID, pointer: ObjectPointer)(using tx: Transaction): Future[Unit] =
-    registry.prepareRegisterObject(Key(objectId), pointer)
+    registry.prepareRegister(Key(objectId), encodePointer(pointer))
 
   def registerObject(objectId: UUID, pointer: ObjectPointer): Future[Unit] =
-    registry.registerObject(Key(objectId), pointer)
+    registry.register(Key(objectId), encodePointer(pointer))

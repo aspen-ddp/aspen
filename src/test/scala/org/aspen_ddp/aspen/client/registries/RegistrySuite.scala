@@ -10,11 +10,11 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, SinglePoolNodeAlloc
 
 import scala.concurrent.Future
 
-class ObjectRegistrySuite extends IntegrationTestSuite:
+class RegistrySuite extends IntegrationTestSuite:
 
   val registryTreeKey = Key(Array[Byte](100))
 
-  def createRegistry(): Future[ObjectRegistry] =
+  def createRegistry(): Future[Registry] =
     given tx: Transaction = client.newTransaction()
     for
       ikvos <- client.read(radicle)
@@ -26,19 +26,19 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
     yield
-      ObjectRegistry(client, ptr, registryTreeKey)
+      Registry(client, ptr, registryTreeKey)
 
-  atest("Get non-existent object fails with NoSuchElementException"):
+  atest("Get non-existent value fails with NoSuchElementException"):
     for
       registry <- createRegistry()
-      result <- registry.getRegisteredObject(Key("nonexistent")).failed
+      result <- registry.get(Key("nonexistent")).failed
     yield
       result shouldBe a [NoSuchElementException]
 
-  atest("prepareRegisterObject and retrieve"):
+  atest("prepareRegister and retrieve"):
     for
       registry <- createRegistry()
-      key = Key("test-object-1")
+      key = Key("test-value-1")
 
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
@@ -46,18 +46,19 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
 
       tx = client.newTransaction()
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx)
-      _ <- registry.prepareRegisterObject(key, ptr)(using tx)
+      value = Value(ptr.toArray)
+      _ <- registry.prepareRegister(key, value)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
 
-      retrieved <- registry.getRegisteredObject(key)
+      retrieved <- registry.get(key)
     yield
-      retrieved should be (ptr)
+      java.util.Arrays.equals(retrieved.bytes, value.bytes) should be (true)
 
-  atest("prepareRegisterObject detects duplicate key"):
+  atest("prepareRegister detects duplicate key"):
     for
       registry <- createRegistry()
-      key = Key("test-object-2")
+      key = Key("test-value-2")
 
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
@@ -65,32 +66,34 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
 
       tx1 = client.newTransaction()
       ptr1 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx1)
-      _ <- registry.prepareRegisterObject(key, ptr1)(using tx1)
+      value1 = Value(ptr1.toArray)
+      _ <- registry.prepareRegister(key, value1)(using tx1)
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
 
       ikvos2 <- client.read(radicle)
       tx2 = client.newTransaction()
       ptr2 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos2.revision), Map())(using tx2)
-      result <- registry.prepareRegisterObject(key, ptr2)(using tx2).failed
+      value2 = Value(ptr2.toArray)
+      result <- registry.prepareRegister(key, value2)(using tx2).failed
     yield
       result shouldBe a [KeyAlreadyExists]
 
-  atest("registerObject and retrieve"):
+  atest("register and retrieve"):
     for
       registry <- createRegistry()
-      key = Key("test-object-3")
-      ptr = radicle
+      key = Key("test-value-3")
+      value = Value(radicle.toArray)
 
-      _ <- registry.registerObject(key, ptr)
-      retrieved <- registry.getRegisteredObject(key)
+      _ <- registry.register(key, value)
+      retrieved <- registry.get(key)
     yield
-      retrieved should be (ptr)
+      java.util.Arrays.equals(retrieved.bytes, value.bytes) should be (true)
 
-  atest("registerObject is idempotent for same pointer"):
+  atest("register is idempotent for same value"):
     for
       registry <- createRegistry()
-      key = Key("test-object-4")
+      key = Key("test-value-4")
 
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
@@ -102,17 +105,18 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
 
-      _ <- registry.registerObject(key, ptr)
-      _ <- registry.registerObject(key, ptr)
+      value = Value(ptr.toArray)
+      _ <- registry.register(key, value)
+      _ <- registry.register(key, value)
 
-      retrieved <- registry.getRegisteredObject(key)
+      retrieved <- registry.get(key)
     yield
-      retrieved should be (ptr)
+      java.util.Arrays.equals(retrieved.bytes, value.bytes) should be (true)
 
-  atest("registerObject fails with DuplicateRegistration for different pointer"):
+  atest("register fails with DuplicateRegistration for different value"):
     for
       registry <- createRegistry()
-      key = Key("test-object-5")
+      key = Key("test-value-5")
 
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
@@ -124,7 +128,8 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
 
-      _ <- registry.registerObject(key, ptr1)
+      value1 = Value(ptr1.toArray)
+      _ <- registry.register(key, value1)
 
       ikvos2 <- client.read(radicle)
       tx2 = client.newTransaction()
@@ -133,46 +138,7 @@ class ObjectRegistrySuite extends IntegrationTestSuite:
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()
 
-      result <- registry.registerObject(key, ptr2).failed
+      value2 = Value(ptr2.toArray)
+      result <- registry.register(key, value2).failed
     yield
-      result shouldBe a [ObjectRegistry.DuplicateRegistration]
-
-  atest("getRegisteredKeyValueObject returns typed pointer"):
-    for
-      registry <- createRegistry()
-      key = Key("test-object-6")
-
-      ikvos <- client.read(radicle)
-      pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator(Replication(3, 2))
-
-      tx = client.newTransaction()
-      kvPtr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx)
-      _ = tx.update(radicle, Some(ikvos.revision), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](96)))), List(Insert(Key(Array[Byte](96)), Array[Byte](1))))
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-
-      _ <- registry.registerObject(key, kvPtr)
-      retrieved <- registry.getRegisteredKeyValueObject(key)
-    yield
-      retrieved should be (kvPtr)
-
-  atest("getRegisteredDataObject returns typed pointer"):
-    for
-      registry <- createRegistry()
-      key = Key("test-object-7")
-
-      ikvos <- client.read(radicle)
-      pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator(Replication(3, 2))
-
-      tx = client.newTransaction()
-      dataPtr <- alloc.allocateDataObject(ObjectRevisionGuard(radicle, ikvos.revision), DataBuffer(Array[Byte](1, 2, 3)))(using tx)
-      _ = tx.update(radicle, Some(ikvos.revision), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](95)))), List(Insert(Key(Array[Byte](95)), Array[Byte](1))))
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-
-      _ <- registry.registerObject(key, dataPtr)
-      retrieved <- registry.getRegisteredDataObject(key)
-    yield
-      retrieved should be (dataPtr)
+      result shouldBe a [Registry.DuplicateRegistration]

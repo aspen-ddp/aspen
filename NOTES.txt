@@ -1,28 +1,8 @@
 
-Create ObjectRegistry(client,
-                      mgrPointer: KeyValueObjectPointer,
-                      treeRootKey: Key,
-                      allocator)
-  - Add general-purpose, system-level ObjectRegistry to radicle
-  - Very thin wrapper around a TKVL
-    - prepareRegisterObject(UUID, pointer)(tx): Future[Unit]
-      - After tkvl.set() future returns, check it for the tx.result already
-        being completed with KeyAlreadyExists error. Throw if so
-    - registerObject(UUID, ObjectPointer): Future[Unit]
-      - On Tx Failure: If already exists:
-        - If Pointers are equal, succeed
-        - Otherwise fail with DuplicateRegistration
-      - transactUntilSuccessful
-        - RequireKeyNotExist
-        - Recovery function checks the above conditions
-    - getRegisteredObject(RegisteredObjectId): Future[ObjectPointer]
-      - fail with NoSuchElement if not found
-    - getRegisteredKeyValueObject() - Helper for typecast
-
-  - Create unit tests for this
-
 Switch to system object registry for pool, hostStates, and storageDevice
-pointers. Replaces the separate TKVLs in radicle
+pointers. Replaces the separate TKVLs in radicle.
+
+Replace the named tkvl registries with single Namespaced registry
 
 Create NamespacedIdRegistry(tkvl)
   - Replace dedicated "name" tkvls with this one tree

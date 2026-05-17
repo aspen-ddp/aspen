@@ -25,7 +25,7 @@ object HostId:
 object HostState:
   private [aspen] val StateKey = Key(Array[Byte](0))
 
-  def apply(buff: Array[Byte]): HostState = Codec.decode(codec.Host.parseFrom(buff))
+  def apply(buff: Array[Byte]): HostState = Codec.decode(codec.HostState.parseFrom(buff))
   
   def apply(kvos: KeyValueObjectState): HostState = HostState(kvos.contents(StateKey).value.bytes)
 

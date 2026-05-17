@@ -517,7 +517,7 @@ enum BackendConfig {
   BACKEND_CONFIG_ROCKS_DB = 0;
 }
 
-message PoolState {
+message StoragePoolState {
   UUID poolId = 1;
   string name = 2;
   IDA defaultIDA = 3;
@@ -526,7 +526,7 @@ message PoolState {
   BackendConfig backendConfig = 6;
 }
 
-message Host {
+message HostState {
   UUID hostId = 1;
   string name = 2;
   string address = 3;
@@ -602,7 +602,7 @@ message StorageDeviceStoreKeyValue {
   StorageDeviceStoreEntry entry = 2;
 }
 
-message StorageDevice {
+message StorageDeviceState {
   StorageDeviceId storage_device_id = 1;
   UUID host_id = 2; // Optional field
   repeated StorageDeviceStoreKeyValue stores = 3;

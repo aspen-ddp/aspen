@@ -27,7 +27,7 @@ object StorageDeviceState:
 
   private [aspen] val StateKey = Key(Array[Byte](0))
 
-  def apply(buff: Array[Byte]): StorageDeviceState = Codec.decode(codec.StorageDevice.parseFrom(buff))
+  def apply(buff: Array[Byte]): StorageDeviceState = Codec.decode(codec.StorageDeviceState.parseFrom(buff))
   
   def apply(kvos: KeyValueObjectState): StorageDeviceState = 
     StorageDeviceState(kvos.contents(StateKey).value.bytes)

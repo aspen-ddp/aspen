@@ -1150,8 +1150,8 @@ object Codec extends Logging:
     case f => throw new EncodingError(f"Invalid Backend Config: $f")
     
     
-  def encode(o: StoragePoolState): codec.PoolState =
-    val builder = codec.PoolState.newBuilder()
+  def encode(o: StoragePoolState): codec.StoragePoolState =
+    val builder = codec.StoragePoolState.newBuilder()
 
     builder.setPoolId(encodeUUID(o.poolId.uuid))
     builder.setName(o.name)
@@ -1164,7 +1164,7 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.PoolState): StoragePoolState =
+  def decode(m: codec.StoragePoolState): StoragePoolState =
     val poolId = PoolId(decodeUUID(m.getPoolId))
     val name = m.getName
     val defaultIDA = decode(m.getDefaultIDA)
@@ -1175,8 +1175,8 @@ object Codec extends Logging:
     StoragePoolState(poolId, name, defaultIDA, maxObjectSize, stores, backendConfig)
 
 
-  def encode(o: HostState): codec.Host =
-    val builder = codec.Host.newBuilder()
+  def encode(o: HostState): codec.HostState =
+    val builder = codec.HostState.newBuilder()
 
     builder.setHostId(encodeUUID(o.hostId.uuid))
     builder.setName(o.name)
@@ -1191,7 +1191,7 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.Host): HostState =
+  def decode(m: codec.HostState): HostState =
     val hostId = HostId(decodeUUID(m.getHostId))
     val name = m.getName
     val address = m.getAddress
@@ -1303,8 +1303,8 @@ object Codec extends Logging:
     StorageDeviceState.StoreEntry(status, transferDevice)
 
 
-  def encode(o: StorageDeviceState): codec.StorageDevice =
-    val builder = codec.StorageDevice.newBuilder()
+  def encode(o: StorageDeviceState): codec.StorageDeviceState =
+    val builder = codec.StorageDeviceState.newBuilder()
       .setStorageDeviceId(encode(o.storageDeviceId))
     
     builder.setHostId(encodeUUID(o.hostId.uuid))
@@ -1318,7 +1318,7 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.StorageDevice): StorageDeviceState =
+  def decode(m: codec.StorageDeviceState): StorageDeviceState =
     val storageDeviceId = decode(m.getStorageDeviceId)
     val hostId = HostId(decodeUUID(m.getHostId))
     val stores = m.getStoresList.asScala.map: keyValue =>

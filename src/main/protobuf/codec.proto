@@ -517,7 +517,7 @@ enum BackendConfig {
   BACKEND_CONFIG_ROCKS_DB = 0;
 }
 
-message PoolConfig {
+message PoolState {
   UUID poolId = 1;
   string name = 2;
   IDA defaultIDA = 3;

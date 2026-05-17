@@ -1150,8 +1150,8 @@ object Codec extends Logging:
     case f => throw new EncodingError(f"Invalid Backend Config: $f")
     
     
-  def encode(o: StoragePoolState): codec.PoolConfig =
-    val builder = codec.PoolConfig.newBuilder()
+  def encode(o: StoragePoolState): codec.PoolState =
+    val builder = codec.PoolState.newBuilder()
 
     builder.setPoolId(encodeUUID(o.poolId.uuid))
     builder.setName(o.name)
@@ -1164,7 +1164,7 @@ object Codec extends Logging:
 
     builder.build
 
-  def decode(m: codec.PoolConfig): StoragePoolState =
+  def decode(m: codec.PoolState): StoragePoolState =
     val poolId = PoolId(decodeUUID(m.getPoolId))
     val name = m.getName
     val defaultIDA = decode(m.getDefaultIDA)

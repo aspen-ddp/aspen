@@ -15,7 +15,7 @@ object StoragePoolState:
 
   case class StoreEntry(hostId: HostId, storageDeviceId: StorageDeviceId)
 
-  def apply(cfg: Array[Byte]): StoragePoolState = Codec.decode(codec.PoolConfig.parseFrom(cfg))
+  def apply(cfg: Array[Byte]): StoragePoolState = Codec.decode(codec.PoolState.parseFrom(cfg))
 
   def apply(kvos: KeyValueObjectState): StoragePoolState = StoragePoolState(kvos.contents(ConfigKey).value.bytes)
 

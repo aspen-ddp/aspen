@@ -1,8 +1,9 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
+
 import java.util.UUID
-import org.aspen_ddp.aspen.client.StoragePool
-import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
+import java.nio.charset.StandardCharsets
 import org.aspen_ddp.aspen.client.tkvl.{BootstrapPoolNodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
@@ -13,8 +14,6 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.common.util.uuid2byte
 import org.aspen_ddp.aspen.demo.BootstrapConfig
-
-import java.nio.charset.StandardCharsets
 
 object Bootstrap:
 
@@ -77,9 +76,6 @@ object Bootstrap:
       }
     }
 
-    val errTreeRoot = allocate()
-    val allocTreeRoot = allocate()
-
     val storeEntrys = (0 until ida.width).map{ _ => 
       StoragePoolState.StoreEntry(bootstrapHostState.hostId, bootstrapStorageDeviceState.storageDeviceId)
     }.toArray
@@ -91,6 +87,9 @@ object Bootstrap:
       None, 
       storeEntrys,
       RocksDBConfig()).encode()
+
+    val errTreeRoot = allocate()
+    val allocTreeRoot = allocate()
     val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), BootstrapPoolNodeAllocator).encode()
     val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), BootstrapPoolNodeAllocator).encode()
 
@@ -99,72 +98,45 @@ object Bootstrap:
       StoragePoolState.ErrorTreeKey -> errorTree,
       StoragePoolState.AllocationTreeKey -> allocTree
     ))
-    val poolTreeRoot = allocate(List(
-      Key(Radicle.poolId.uuid) -> poolPointer.toArray
-    ))
-    val poolTree = Root(0,
-      ByteArrayKeyOrdering,
-      Some(poolTreeRoot),
-      BootstrapPoolNodeAllocator)
-
-    val poolNameTreeRootObj = allocate(List(
-      Key(PoolId.BootstrapPoolName) -> uuid2byte(Radicle.poolId.uuid)
-    ))
-    val poolNameTree = Root(0,
-      LexicalKeyOrdering,
-      Some(poolNameTreeRootObj),
-      BootstrapPoolNodeAllocator)
-
+    
     val storageDevicePtr = allocate(List(
       StorageDeviceState.StateKey ->  bootstrapStorageDeviceState.encode()
     ))
-    val storageDeviceTreeRootObj = allocate(List(
-      Key(bootstrapStorageDeviceState.storageDeviceId.uuid) -> storageDevicePtr.toArray
-    ))
-    val storageDeviceTree = Root(0,
-      ByteArrayKeyOrdering,
-      Some(storageDeviceTreeRootObj),
-      BootstrapPoolNodeAllocator)
 
     val hostPtr = allocate(List(
       HostState.StateKey -> bootstrapHostState.encode()
     ))
-    val hostsTreeRootObj = allocate(List(
+    
+    // Create registry trees 
+    val objectRegistryRoot = allocate(List(
+      Key(Radicle.poolId.uuid) -> poolPointer.toArray,
+      Key(bootstrapStorageDeviceState.storageDeviceId.uuid) -> storageDevicePtr.toArray,
       Key(bootstrapHostState.hostId.uuid) -> hostPtr.toArray
     ))
-    val hostsTree = Root(0,
+    val objectRegistryTree = Root(0,
       ByteArrayKeyOrdering,
-      Some(hostsTreeRootObj),
+      Some(objectRegistryRoot),
       BootstrapPoolNodeAllocator)
 
-    val hostsNameTreeRootObj = allocate(List(
-      Key(bootstrapHostState.name) -> uuid2byte(bootstrapHostState.hostId.uuid)
+    val namespacedRegistryRoot = allocate(List(
+      NamespacedUUIDRegistry.makeKey("pool", PoolId.BootstrapPoolName) -> uuid2byte(Radicle.poolId.uuid),
+      NamespacedUUIDRegistry.makeKey("host", bootstrapHostState.name) -> uuid2byte(bootstrapHostState.hostId.uuid)
     ))
-    val hostsNameTree = Root(0,
+    val namespacedRegistryTree = Root(0,
       LexicalKeyOrdering,
-      Some(hostsNameTreeRootObj),
+      Some(namespacedRegistryRoot),
       BootstrapPoolNodeAllocator)
 
     val radicleContent: List[(Key, Array[Byte])] = List(
-      Radicle.PoolTreeKey -> poolTree.encode(),
-      Radicle.PoolNameTreeKey -> poolNameTree.encode(),
-      Radicle.StorageDeviceTreeKey -> storageDeviceTree.encode(),
-      Radicle.HostsTreeKey -> hostsTree.encode(),
-      Radicle.HostsNameTreeKey -> hostsNameTree.encode(),
       Radicle.BootstrapConfigKey -> bootstrapConfig.getBytes(StandardCharsets.UTF_8),
-      Radicle.SystemIdKey -> uuid2byte(aspenSystemId)
+      Radicle.SystemIdKey -> uuid2byte(aspenSystemId),
+      Radicle.ObjectRegistryKey -> objectRegistryTree.encode(),
+      Radicle.NamespacedRegistryKey -> namespacedRegistryTree.encode()
     )
 
     val radicle = allocate(radicleContent, Some(Radicle.objectId))
 
     overwrite(allocTreeRoot, allocTreeContent)
-
-    if false then
-      println(s"ErrorTreeRoot: ${errTreeRoot.id.uuid}")
-      println(s"AllocTreeRoot: ${allocTreeRoot.id.uuid}")
-      println(s"Radicle Pool : ${poolPointer.id.uuid}")
-      println(s"PoolTreeRoot : ${poolTreeRoot.id.uuid}")
-      println(s"Radicle      : ${radicle.id.uuid}")
 
     radicle
   }

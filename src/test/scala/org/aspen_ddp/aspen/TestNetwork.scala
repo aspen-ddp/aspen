@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{BaseReadDriver, ReadManager}
 import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, MissedUpdateFinalizationAction, TransactionImpl, TransactionManager}
+import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -102,22 +103,19 @@ object TestNetwork {
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
 
     def getHostId(hostName: String): Future[HostId] = ???
+    
+    val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
+    val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
 
     private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
-      val tkvl = new TieredKeyValueList(this, new KVObjectRootManager(this, Radicle.PoolTreeKey, radicle))
-      tkvl.get(Key(poolId.uuid)).map: vs =>
-        KeyValueObjectPointer(vs.get.value.bytes)
+      objectRegistry.getRegisteredKeyValueObject(poolId.uuid)
 
     private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] =
-      val tkvl = new TieredKeyValueList(this, new KVObjectRootManager(this, Radicle.HostsTreeKey, radicle))
-      tkvl.get(Key(hostId.uuid)).map: vs =>
-        KeyValueObjectPointer(vs.get.value.bytes)
+      objectRegistry.getRegisteredKeyValueObject(hostId.uuid)
 
     private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
-      val tkvl = new TieredKeyValueList(this, new KVObjectRootManager(this, Radicle.StorageDeviceTreeKey, radicle))
-      tkvl.get(Key(storageDeviceId.uuid)).map: vs =>
-        KeyValueObjectPointer(vs.get.value.bytes)
-
+      objectRegistry.getRegisteredKeyValueObject(storageDeviceId.uuid)
+      
     protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 
     override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))

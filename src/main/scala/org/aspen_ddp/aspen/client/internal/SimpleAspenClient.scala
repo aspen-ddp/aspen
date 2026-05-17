@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{ReadManager, SimpleReadDriver}
 import org.aspen_ddp.aspen.client.internal.transaction.{SimpleClientTransactionDriver, TransactionImpl, TransactionManager}
+import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
@@ -40,12 +41,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   private val rmgr = new ReadManager(this,
     new SimpleReadDriver.Factory(initialReadDelay, maxReadDelay).apply)
-  
-  private val storagePoolTree     = new TieredKeyValueList(this, KVObjectRootManager(this, Radicle.PoolTreeKey, radicle))
-  private val storagePoolNameTree = new TieredKeyValueList(this, KVObjectRootManager(this, Radicle.PoolNameTreeKey, radicle))
-  private val hostTree            = new TieredKeyValueList(this, KVObjectRootManager(this, Radicle.HostsTreeKey, radicle))
-  private val hostNameTree        = new TieredKeyValueList(this, KVObjectRootManager(this, Radicle.HostsNameTreeKey, radicle))
-  private val storageDeviceTree   = new TieredKeyValueList(this, KVObjectRootManager(this, Radicle.StorageDeviceTreeKey, radicle))
+
+  private val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
+  private val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
 
   override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
     rmgr.read(pointer, comment).map(_.asInstanceOf[DataObjectState])
@@ -59,29 +57,19 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     TransactionImpl(this, txManager, _ => 0, None)
   
   override def getStoragePoolId(poolName: String): Future[PoolId] =
-    storagePoolNameTree.get(Key(poolName)).map:
-      case None => throw new NoSuchElementException(poolName)
-      case Some(vs) => PoolId(byte2uuid(vs.value.bytes))
+    namespacedRegistry.getRegisteredObject("pool", poolName).map(PoolId(_))
 
   override def getHostId(hostName: String): Future[HostId] =
-    hostNameTree.get(Key(hostName)).map:
-      case None => throw new NoSuchElementException(hostName)
-      case Some(vs) => HostId(byte2uuid(vs.value.bytes))
+    namespacedRegistry.getRegisteredObject("host", hostName).map(HostId(_))
 
   override def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
-    storagePoolTree.get(Key(poolId.uuid)).map:
-      case None => throw new NoSuchElementException(poolId.toString)
-      case Some(vs) => KeyValueObjectPointer(vs.value.bytes)
+    objectRegistry.getRegisteredKeyValueObject(poolId.uuid)
 
   override def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] =
-    hostTree.get(Key(hostId.uuid)).map:
-      case None => throw new NoSuchElementException(hostId.toString)
-      case Some(vs) => KeyValueObjectPointer(vs.value.bytes)
+    objectRegistry.getRegisteredKeyValueObject(hostId.uuid)
 
   override def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
-    storageDeviceTree.get(Key(storageDeviceId.uuid)).map:
-      case None => throw new NoSuchElementException(storageDeviceId.toString)
-      case Some(vs) => KeyValueObjectPointer(vs.value.bytes)
+    objectRegistry.getRegisteredKeyValueObject(storageDeviceId.uuid)
 
   override protected def createStoragePool(config: StoragePoolState): Future[PoolId] =
     transactUntilSuccessful: tx =>
@@ -159,8 +147,8 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         poolPtr <- createPoolObj(bsPool.defaultAllocator)
-        _ <- storagePoolTree.set(Key(config.poolId.uuid), Value(poolPtr.toArray))
-        _ <- storagePoolNameTree.set(Key(config.name), Value(uuid2byte(config.poolId.uuid)))
+        _ <- objectRegistry.prepareRegisterObject(config.poolId.uuid, poolPtr)
+        _ <- namespacedRegistry.prepareRegisterObject("pool", config.name, config.poolId.uuid)
         devUpdates <- Future.sequence(collectDevices(config.stores))
       yield 
         devUpdates.foreach(updateDevice)

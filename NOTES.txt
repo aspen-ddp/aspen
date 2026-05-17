@@ -1,15 +1,4 @@
 
-Switch to system object registry for pool, hostStates, and storageDevice
-pointers. Replaces the separate TKVLs in radicle.
-
-Replace the named tkvl registries with single Namespaced registry
-
-Create NamespacedIdRegistry(tkvl)
-  - Replace dedicated "name" tkvls with this one tree
-  - prepareRegistration(namespace:String, name:String, UUID)(tx)
-  - getId(namespace, name): Future[UUID]
-  - actual key is s"$namespace.$name"
-
 How to know space usage
   - Added Backend.estimateSize(): Long
     - Not perfect but should give us a basis for starting out

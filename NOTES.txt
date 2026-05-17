@@ -1,4 +1,35 @@
 
+Refactor StoragePools, ObjectPointers, and Allocation design
+  - StoragePools use a fixed IDA
+  - IDA removed from ObjectPointer
+
+  - IndexMap removed from ObjectPointer
+  - storeLocators list replaced with singular, optional StoreLocator
+    - Idea being a fixed value assigned at allocation time for all stores
+
+  - Allocations
+    - Allocations only need writeThreshold responses
+    - Remove Allocate/AllocateResponse messages
+    - Just 1RTT just like any other transaction
+      - Allocates write to store just like an update (no special
+        "allocation" notification)
+    - Eliminates the need for AllocationRecovery!!!
+      - Failed "allocations" are cleaned up just like normal out-of-date objects
+
+  - StoragePools get a maxStoreSize - Stored in State
+    - Required for pool creation
+      - Idea is to prevent exeeding storageDevice limits and keep fast-media stores
+        small
+    - Mutable
+      - Can increase but not decrease
+
+  - Need a mechanism to handle "out of space" errors
+    - Will present when we attempt to commit an object update to the store
+      - Read-Only or out of space underlying media will cause it to fail
+    - Will clog up the CRL if left untreated
+    - Might start with just relying on TransferStore to a device with space
+      - Might be able to automate this eventually
+
 How to know space usage
   - Added Backend.estimateSize(): Long
     - Not perfect but should give us a basis for starting out

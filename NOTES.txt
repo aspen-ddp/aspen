@@ -1,61 +1,48 @@
 
-os.Path note:
-  - can convert to java Path via os.Path.toNIO
-  - then to File via java Path.toFile()
+Move StorageDevice, StoragePool, and Host to common.metadata package
+  - Suffix each with State for clear deliniation between metadata state and
+    functional classes in client/store
+  - Will add AllocatorState later
 
-Rename StoreManager to StorageHost?
+metadata.fixed_ids
+  - Needed for shared trees
+  - Will need to update TestNetwork to use these ids
+  - top-level definitions in package-scope
+    val RadicleId = ObjectId(new UUID(0, 0))
+    val BootstrapPoolId = PoolId(new UUID(0, 1))
+    val BootstrapHostId = HostId(new UUID(0, 2))
+    ...
 
-Create ObjectRegistry(client, mgrPointer: KeyValueObjectPointer, allocator)
+Create ObjectRegistry(client,
+                      mgrPointer: KeyValueObjectPointer,
+                      treeRootKey: Key,
+                      allocator)
   - Add general-purpose, system-level ObjectRegistry to radicle
-    - ObjectRegistryRootKey -> kvptr
-  - Add to AspenClient
-    - client.getSystemObjectRegistry: Future[ObjectRegistry]
-  - Use ObjectRegistry.GuardKey plus Key(1) and empty byte array value
-     - use KeyRevisonGaurd on this for allocations
-     - cheap and fast to read root pointer for each allocation
-  - loadObjectRegistry(mgrPointer)
-    - Reads mgrPointer
-    - If not initialized, initialize it
+  - Very thin wrapper around a TKVL
+    - prepareRegisterObject(UUID, pointer)(tx): Future[Unit]
+      - After tkvl.set() future returns, check it for the tx.result already
+        being completed with KeyAlreadyExists error. Throw if so
+    - registerObject(UUID, ObjectPointer): Future[Unit]
+      - On Tx Failure: If already exists:
+        - If Pointers are equal, succeed
+        - Otherwise fail with DuplicateRegistration
       - transactUntilSuccessful
-  - Allocations should probably take a given transaction rather than succeed
-    unconditionally. Allows all-or-nothing initialization
-  - allocateObject(RegisteredKeyValueObjectId, initialContent: List[Key, Array[Byte]]): Future[KeyValueObjectPointer]
-  - allocateObject(RegisteredDataObjectId, initialContent: Array[Byte]): Future[DataObjectPointer]
-  - getObjectPointer(RegisteredKeyValueObjectId): Future[KeyValueObjectPointer]
-  - getObjectPointer(RegisteredDataObjectId): Future[DataObjectPointer]
+        - RequireKeyNotExist
+        - Recovery function checks the above conditions
+    - getRegisteredObject(RegisteredObjectId): Future[ObjectPointer]
+      - fail with NoSuchElement if not found
+    - getRegisteredKeyValueObject() - Helper for typecast
 
-  ** Can create unit tests for this
+  - Create unit tests for this
 
-Switch AmoebaFS to use a registered object for the root
+Switch to system object registry for pool, hosts, and storageDevice
+pointers. Replaces the separate TKVLs in radicle
 
-** Testing of all the stuff that's been coded
-
-Need to think about how to handle allocation.
-  - How to choose which pool to use
-     - Balance across pools created at different times with different utilizations
-  - Can create AllocationGroups
-     - collects pools into logical groups for allocation
-     - Named as this helps bridge app design with deployment policy?
-     - Stored in DataObject
-       - timestamp of object indicates time of last pool size refresh
-       - stores list (poolId, approximateCurrentSize, maxSize)
-  - Store Allocator config in DataObject
-     - could use system ObjectRegistry
-       - random UUID would guarantee no collisions
-       - Allows
-
-Allocator ideas
-  - can add an Allocators TKVL tree where each allocator is stored in a DataObject
-    - Or just use system ObjectRegistry
-    - Randomized UUID works just as well as hard-coded. No collisions
-  - can use Protobuf for flexible serial/deserial
-  - NodeAllocator going into Root can store 2 UUIDs for easy/cheap serial/storage
-    - UUID of allocator
-    - UUID of registered factory that knows how to deserial the allocator
-       - Prevents huge union type in Protobuf
-
-Need a way to connect AllocationGroups to App-defined Allocators
-  - 
+Create NamespacedIdRegistry(tkvl)
+  - Replace dedicated "name" tkvls with this one tree
+  - prepareRegistration(namespace:String, name:String, UUID)(tx)
+  - getId(namespace, name): Future[UUID]
+  - actual key is s"$namespace.$name"
 
 How to know space usage
   - Added Backend.estimateSize(): Long
@@ -72,6 +59,84 @@ How to know space usage
       the last-successfully-updated Tx and we should be able to do quick updates
       with minimal risk of Tx failure. If it happens, just read the PoolObj and
       try again
+
+aspen.store.usage
+  - BaseUsageManager
+    - Provides tracking of in-flight updates so backups don't pile up
+  - AllocatorUsageManager
+    - update(allocatorId, poolId)
+  - StorageDeviceUsageManager
+    - update(storageDeviceId, totalSize, currentUsage)
+  - StoragePoolUsageManager
+    - takes an AllocatorUsageManager as constructor arg
+    - Pools could be used by multiple allocators
+      - probably need a list of AllocatorIds (up pointers)
+    - update(poolId, index, currentUsage)
+
+os.Path note:
+  - can convert to java Path via os.Path.toNIO
+  - then to File via java Path.toFile()
+
+Rename StoreManager to Host?
+
+Switch AmoebaFS to use a registered object for the root
+
+Switch to ScalaPB
+
+Consider removing usage of invalidateTransaction in favor of just throwing
+exceptions.
+  - May be needed in some contexts but probably ought to be avoided when
+    possible
+  - Makes it difficult to detect problems and recover from them
+  - Hides the source of the error
+  - Limited to just a single error per tx setup
+
+** Testing of all the stuff that's been coded
+
+Need to think about how to handle allocation.
+  - How to choose which pool to use
+     - Balance across pools created at different times with different utilizations
+  - Can create AllocationGroups
+     - collects pools into logical groups for allocation
+     - Named as this helps bridge app design with deployment policy?
+     - Stored in DataObject
+       - timestamp of object indicates time of last pool size refresh
+       - stores list (poolId, approximateCurrentSize, maxSize)
+  - Store Allocator config in DataObject
+     - could use system ObjectRegistry
+       - random UUID would guarantee no collisions
+  - Allocation groups could be of two types: PoolGroup or GroupGroup
+    - Contains a list of sub entities to allocate from
+      - each entity has a currentUsage that is periodically refreshed
+        - Optional max capacity?
+        - Probalby a combination of polling + event triggers (like
+          a pool detecting a 0.5% change)
+      - Configurable allocation policies?
+        - Round Robin
+        - Least utilization first
+        - Weighted
+        - Sequential (fill to full then next)
+
+Allocator could just be a client-side class that takes an AllocationGroup
+no actual state representation themselves.
+
+NodeAllocator for TKVLs could be a list of AllocationGroups UUIDs. Last
+entry is for tier-0, each entry going up the list is for the next tier up.
+Top entry is used for all tiers above that. Makes it easy for there to be
+just a single entry (same allocator for all tiers).
+
+Allocator ideas
+  - can add an Allocators TKVL tree where each allocator is stored in a DataObject
+    - Or just use system ObjectRegistry
+    - Randomized UUID works just as well as hard-coded. No collisions
+  - can use Protobuf for flexible serial/deserial
+  - NodeAllocator going into Root can store 2 UUIDs for easy/cheap serial/storage
+    - UUID of allocator
+    - UUID of registered factory that knows how to deserial the allocator
+       - Prevents huge union type in Protobuf
+
+Need a way to connect AllocationGroups to App-defined Allocators
+  -
 
 Add add-host command
   - takes address & ports

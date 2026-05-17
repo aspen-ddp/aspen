@@ -1,17 +1,24 @@
-# ObjectRegistry Design
+# Generalized ObjectRegistry Design
 
 ## Overview
 
-Add an `ObjectRegistry` class to `org.aspen_ddp.aspen.client` that provides a thin wrapper around a TKVL mapping UUID keys to ObjectPointers. It supports both transactional (prepare-style) and standalone (retry-until-successful) registration, with idempotency handling and duplicate detection.
+Generalize the existing `ObjectRegistry` from a UUID-keyed registry to a generic `Key`-based registry, then provide two typed wrappers: `UUIDObjectRegistry` (keyed by UUID) and `NamespacedObjectRegistry` (keyed by namespace + name strings).
 
 ## Motivation
 
-Several parts of the system maintain TKVLs that map UUIDs to ObjectPointers (storage pools, hosts, storage devices in `SimpleAspenClient`). `ObjectRegistry` extracts this into a reusable abstraction. Future work will consolidate the separate radicle TKVLs into a single system ObjectRegistry, but that migration is out of scope here.
+The current `ObjectRegistry` hardcodes UUID keys, but the underlying TKVL operates on `Key` instances. Generalizing to `Key` makes the registry reusable for any key type. Typed wrappers provide ergonomic APIs for common key patterns without duplicating logic.
 
-## Class Definition
+## Package Structure
 
-**Package:** `org.aspen_ddp.aspen.client`
-**File:** `ObjectRegistry.scala`
+All classes move to `org.aspen_ddp.aspen.client.registries`:
+
+- `ObjectRegistry.scala` — generic Key-based registry
+- `UUIDObjectRegistry.scala` — UUID wrapper
+- `NamespacedObjectRegistry.scala` — namespace+name wrapper
+
+## ObjectRegistry (Generic)
+
+**File:** `src/main/scala/org/aspen_ddp/aspen/client/registries/ObjectRegistry.scala`
 
 ### Constructor
 
@@ -23,72 +30,116 @@ class ObjectRegistry(
 )
 ```
 
-Internally creates a `KVObjectRootManager(client, treeRootKey, containingObjectPtr)` and wraps it in a `TieredKeyValueList`. Uses `client.clientContext` as the implicit `ExecutionContext`.
+Same as today. Internally creates a TKVL via `KVObjectRootManager`.
 
-### Exception
+### Companion Object
 
 ```scala
-class DuplicateRegistration(val objectId: UUID, val existing: ObjectPointer)
-    extends Exception
+object ObjectRegistry:
+  class DuplicateRegistration(val key: Key, val existing: ObjectPointer)
+    extends Exception(s"Duplicate registration for key $key")
 ```
 
-Defined within the `ObjectRegistry` companion object. Thrown when `registerObject` finds an existing entry with a different pointer than the one being registered.
+`DuplicateRegistration` takes a `Key` instead of `UUID`.
 
 ### Methods
 
-#### `prepareRegisterObject(objectId: UUID, pointer: ObjectPointer)(using tx: Transaction): Future[Unit]`
+All methods take `Key` instead of `UUID`. The internal implementation drops the `Key(objectId)` conversions since the input is already a `Key`:
 
-For use within an externally-managed transaction. Inserts the UUID-to-pointer mapping with a key-must-not-exist requirement.
+- `getRegisteredObject(key: Key): Future[ObjectPointer]`
+- `getRegisteredKeyValueObject(key: Key): Future[KeyValueObjectPointer]`
+- `getRegisteredDataObject(key: Key): Future[DataObjectPointer]`
+- `prepareRegisterObject(key: Key, pointer: ObjectPointer)(using tx: Transaction): Future[Unit]`
+- `registerObject(key: Key, pointer: ObjectPointer): Future[Unit]`
 
-1. Call `tkvl.set(Key(objectId), Value(pointer.toArray), requirement = Some(Left(true)))`.
-2. After the set future completes, check `tx.result.value` for `Some(Failure(_: KeyAlreadyExists))`. If found, throw the `KeyAlreadyExists` to give the caller an immediate signal before `tx.commit()`.
-3. If `tx.result` is not yet failed, return successfully. The transaction may still abort at commit time due to contention, but that is handled by the caller.
+Logic is identical to the current implementation — just replacing `objectId: UUID` parameters with `key: Key` and removing the `Key(objectId)` wrapping.
 
-#### `registerObject(objectId: UUID, pointer: ObjectPointer): Future[Unit]`
+## UUIDObjectRegistry
 
-Standalone operation that retries until successful. Handles idempotency: if a retry discovers the key already exists with an identical pointer, it treats the operation as successful (the previous attempt committed but the client didn't know).
+**File:** `src/main/scala/org/aspen_ddp/aspen/client/registries/UUIDObjectRegistry.scala`
 
-Uses `client.retryStrategy.retryUntilSuccessful` directly (not `transactUntilSuccessful`) because the recovery-function variant of the retry strategy cannot signal success — it can only allow retry or stop with an error. Instead, each attempt begins with a pre-check read:
+Wraps an `ObjectRegistry` instance. All methods take `UUID`, convert via `Key(uuid)`, and forward:
 
-**Each attempt:**
-1. Read the key via `tkvl.get(Key(objectId))`.
-2. If the key exists and the stored pointer equals the one being registered, return `Future.unit` — the previous attempt committed (idempotent success).
-3. If the key exists but the pointer differs, throw `StopRetrying(DuplicateRegistration(objectId, existingPointer))`.
-4. If the key does not exist, execute `client.transact` calling `prepareRegisterObject` within the transaction. If the transaction fails due to contention, the retry loop retries from step 1.
+```scala
+class UUIDObjectRegistry(val client: AspenClient,
+                         containingObjectPtr: KeyValueObjectPointer,
+                         treeRootKey: Key):
 
-#### `getRegisteredObject(objectId: UUID): Future[ObjectPointer]`
+  private val registry = ObjectRegistry(client, containingObjectPtr, treeRootKey)
 
-Reads the TKVL and decodes the value.
+  def getRegisteredObject(objectId: UUID): Future[ObjectPointer] =
+    registry.getRegisteredObject(Key(objectId))
 
-1. Call `tkvl.get(Key(objectId))`.
-2. If `None`, fail with `NoSuchElementException`.
-3. If `Some(vs)`, return `ObjectPointer(vs.value.bytes)`.
+  def getRegisteredKeyValueObject(objectId: UUID): Future[KeyValueObjectPointer] =
+    registry.getRegisteredKeyValueObject(Key(objectId))
 
-#### `getRegisteredKeyValueObject(objectId: UUID): Future[KeyValueObjectPointer]`
+  def getRegisteredDataObject(objectId: UUID): Future[DataObjectPointer] =
+    registry.getRegisteredDataObject(Key(objectId))
 
-Calls `getRegisteredObject` and casts the result to `KeyValueObjectPointer`.
+  def prepareRegisterObject(objectId: UUID, pointer: ObjectPointer)(using tx: Transaction): Future[Unit] =
+    registry.prepareRegisterObject(Key(objectId), pointer)
 
-#### `getRegisteredDataObject(objectId: UUID): Future[DataObjectPointer]`
+  def registerObject(objectId: UUID, pointer: ObjectPointer): Future[Unit] =
+    registry.registerObject(Key(objectId), pointer)
+```
 
-Calls `getRegisteredObject` and casts the result to `DataObjectPointer`.
+## NamespacedObjectRegistry
 
-## Pointer Equality
+**File:** `src/main/scala/org/aspen_ddp/aspen/client/registries/NamespacedObjectRegistry.scala`
 
-`ObjectPointer` has a structural `equals` implementation that compares `id`, `poolId`, `size`, `ida`, and `storePointers`. The idempotency check in `registerObject` uses this directly: `ObjectPointer(vs.value.bytes) == pointer`.
+Same wrapping pattern. Key formation uses `namespace.name` string format:
+
+```scala
+object NamespacedObjectRegistry:
+  def makeKey(namespace: String, name: String): Key = Key(s"$namespace.$name")
+
+class NamespacedObjectRegistry(val client: AspenClient,
+                               containingObjectPtr: KeyValueObjectPointer,
+                               treeRootKey: Key):
+
+  import NamespacedObjectRegistry.makeKey
+
+  private val registry = ObjectRegistry(client, containingObjectPtr, treeRootKey)
+
+  def getRegisteredObject(namespace: String, name: String): Future[ObjectPointer] =
+    registry.getRegisteredObject(makeKey(namespace, name))
+
+  def getRegisteredKeyValueObject(namespace: String, name: String): Future[KeyValueObjectPointer] =
+    registry.getRegisteredKeyValueObject(makeKey(namespace, name))
+
+  def getRegisteredDataObject(namespace: String, name: String): Future[DataObjectPointer] =
+    registry.getRegisteredDataObject(makeKey(namespace, name))
+
+  def prepareRegisterObject(namespace: String, name: String, pointer: ObjectPointer)(using tx: Transaction): Future[Unit] =
+    registry.prepareRegisterObject(makeKey(namespace, name), pointer)
+
+  def registerObject(namespace: String, name: String, pointer: ObjectPointer): Future[Unit] =
+    registry.registerObject(makeKey(namespace, name), pointer)
+```
 
 ## Tests
 
-**File:** `src/test/scala/org/aspen_ddp/aspen/client/ObjectRegistrySuite.scala`
-**Base class:** `IntegrationTestSuite`
+### ObjectRegistrySuite
 
-Tests use the existing integration test infrastructure which provides a `TestNetwork`, `AspenClient`, and radicle `KeyValueObjectPointer`. A new TKVL tree is created in the radicle object during test setup.
+**File:** `src/test/scala/org/aspen_ddp/aspen/client/registries/ObjectRegistrySuite.scala`
 
-### Test Cases
+The existing test suite adapted to use `Key` directly instead of `UUID`. All seven existing test cases remain, with `UUID.randomUUID()` replaced by arbitrary `Key` values (e.g. `Key("test-object-1")`). This is the comprehensive test suite since it exercises the real logic.
 
-1. **Register and retrieve** — register a pointer, retrieve it with `getRegisteredObject`, verify equality.
-2. **Retrieve typed pointers** — register a `KeyValueObjectPointer`, retrieve via `getRegisteredKeyValueObject`; same for `DataObjectPointer` via `getRegisteredDataObject`.
-3. **Get non-existent** — `getRegisteredObject` for an unregistered UUID fails with `NoSuchElementException`.
-4. **Idempotent re-registration** — `registerObject` with the same UUID and same pointer succeeds (no error).
-5. **Duplicate with different pointer** — `registerObject` with the same UUID but a different pointer fails with `DuplicateRegistration`.
-6. **prepareRegisterObject within transaction** — use `prepareRegisterObject` inside a manually-managed transaction, commit, then verify the object is retrievable.
-7. **prepareRegisterObject duplicate detection** — call `prepareRegisterObject` for an already-registered UUID and verify it throws `KeyAlreadyExists`.
+### UUIDObjectRegistrySuite
+
+**File:** `src/test/scala/org/aspen_ddp/aspen/client/registries/UUIDObjectRegistrySuite.scala`
+
+Basic tests since the wrapper just converts and forwards:
+
+1. **Register and retrieve** — register with UUID, retrieve, verify equality.
+2. **Duplicate detection** — register same UUID with different pointer, verify `DuplicateRegistration`.
+
+### NamespacedObjectRegistrySuite
+
+**File:** `src/test/scala/org/aspen_ddp/aspen/client/registries/NamespacedObjectRegistrySuite.scala`
+
+Basic tests:
+
+1. **Register and retrieve** — register with namespace+name, retrieve, verify equality.
+2. **Duplicate detection** — register same namespace+name with different pointer, verify `DuplicateRegistration`.
+3. **makeKey format** — verify `NamespacedObjectRegistry.makeKey("ns", "obj")` produces `Key("ns.obj")`.

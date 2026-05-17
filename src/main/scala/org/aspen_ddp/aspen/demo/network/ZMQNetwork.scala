@@ -22,13 +22,13 @@ import scala.concurrent.duration.Duration
 
 object ZMQNetwork {
 
-  private class HostState(val hostId: HostId,
-                          val hostName: String,
-                          val address: String,
-                          val port: Int,
-                          val oinitialHeartbeat: Option[Array[Byte]],
-                          context: ZContext,
-                          clientId: ClientId) extends Logging:
+  private class ZHostState(val hostId: HostId,
+                           val hostName: String,
+                           val address: String,
+                           val port: Int,
+                           val oinitialHeartbeat: Option[Array[Byte]],
+                           context: ZContext,
+                           clientId: ClientId) extends Logging:
 
     var lastHeartbeatTime: Long = 0
     var isOnline: Boolean = false
@@ -170,8 +170,8 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       host.stores.map(storeId => storeId -> host.hostId)
     }.toMap
 
-  private var hostStates: Map[HostId, HostState] = bootstrapConfig.hosts.map { host =>
-    host.hostId -> HostState(
+  private var hostStates: Map[HostId, ZHostState] = bootstrapConfig.hosts.map { host =>
+    host.hostId -> ZHostState(
       host.hostId,
       host.name,
       host.address,
@@ -226,7 +226,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
   }
 
   private def hostLookedUp(host: Host): Unit = synchronized {
-    val hostState = HostState(
+    val hostState = ZHostState(
       host.hostId,
       host.name,
       host.address,
@@ -304,7 +304,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     val heartBeatPeriodMillis = heartbeatPeriod.toMillis.toInt
     var nextHeartbeat = System.currentTimeMillis() + heartBeatPeriodMillis
 
-    var hostsArray: Array[HostState] = null
+    var hostsArray: Array[ZHostState] = null
     var poller: ZMQ.Poller = null
 
     def recreatePoller(): Unit = synchronized {
@@ -471,7 +471,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       logger.trace(s"Got $msg")
       hostStates.get(msg.hostId) match
         case None =>
-          //val ns = new HostState(msg.nodeName,0, false)
+          //val ns = new ZHostState(msg.nodeName,0, false)
           //ns.heartbeatReceived()
           //nodeStates += msg.nodeName -> ns
         case Some(ns) => ns.heartbeatReceived()

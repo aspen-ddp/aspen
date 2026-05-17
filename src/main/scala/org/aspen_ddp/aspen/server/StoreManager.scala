@@ -49,8 +49,8 @@ object StoreManager:
     override def complete(op: Completion): Unit =
       mgr.events.add(IOCompletion(op))
 
-  class StorageDeviceState(val storageDeviceId: StorageDeviceId,
-                           val devicePath: Path):
+  class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
+                                val devicePath: Path):
     var loadedStores: Set[StoreId] = Set()
     var offlineStores: Set[StoreId] = Set()
 
@@ -89,7 +89,7 @@ class StoreManager(val client: AspenClient,
 
   val storageDevicesDir: Path = rootDir.resolve("storage-devices")
 
-  protected var storageDevices: Map[StorageDeviceId, StorageDeviceState] = Map()
+  protected var storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
   protected var stores: Map[StoreId, Store] = Map()
 
   private var offlineStores: Set[StoreId] = Set()
@@ -137,7 +137,7 @@ class StoreManager(val client: AspenClient,
         if sdCfg.aspenSystemId != aspenSystemId then
           logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
         else
-          val sds = new StorageDeviceState(sdCfg.storageDeviceId, storageDevicePath)
+          val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath)
           storageDevices += sdCfg.storageDeviceId -> sds
           logger.info(s"Loading store $sdFile. StorageDeviceId ${sds.storageDeviceId}")
           sdFile.listFiles.foreach: potentialStoreFile =>
@@ -145,7 +145,7 @@ class StoreManager(val client: AspenClient,
       catch
         case t: Throwable => logger.warn(s"Failed to load storage device found at path $sdFile. Error: $t")
 
-  private def tryLoadStore(sds: StorageDeviceState, potentialStoreFile: File): Unit =
+  private def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: File): Unit =
     val storeCfgPath = potentialStoreFile.toPath.resolve(StoreConfig.configFilename)
     if Files.exists(storeCfgPath) then
       try
@@ -452,7 +452,7 @@ class StoreManager(val client: AspenClient,
           tx.result.foreach: _ =>
             logger.info(s"Successfully updated host for storage device ${storageDeviceId}")
 
-  private def createNewStore(local: StorageDeviceState, storeId: StoreId): Unit = synchronized {
+  private def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
     val storePath = os.Path(local.devicePath) / storeId.directoryName
 
     if ! creatingStores.contains(storeId) then
@@ -492,7 +492,7 @@ class StoreManager(val client: AspenClient,
   }
 
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
-    def check(local: StorageDeviceState, remote: StorageDevice): Unit = synchronized {
+    def check(local: LocalStorageDeviceState, remote: StorageDevice): Unit = synchronized {
       if remote.hostId != hostId then
         updateHostId(storageDeviceId).foreach: _ =>
           checkStorageDevice(storageDeviceId)

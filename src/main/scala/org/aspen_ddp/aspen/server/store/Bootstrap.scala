@@ -49,13 +49,13 @@ object Bootstrap:
         t._1 -> new ValueState(Value(t._2), bootstrapMetadata.revision, bootstrapMetadata.timestamp, None)
       }.toMap
 
-      val storePointers = KVObjectState.encodeIDA(ida, None, None, None, None, contents).zip(stores).map { t =>
+      KVObjectState.encodeIDA(ida, None, None, None, None, contents).zip(stores).foreach { t =>
         val (storeData, store) = t
 
         store.bootstrapAllocate(oid, ObjectType.KeyValue, bootstrapMetadata, storeData)
       }
 
-      val p = KeyValueObjectPointer(oid, Radicle.poolId, None, ida, storePointers)
+      val p = KeyValueObjectPointer(oid, Radicle.poolId)
 
       allocTreeContent = (Key(p.id.uuid) -> p.toArray) :: allocTreeContent
 
@@ -71,8 +71,7 @@ object Bootstrap:
 
       KVObjectState.encodeIDA(ida, None, None, None, None, contents).zip(stores).foreach { t =>
         val (storeData, store) = t
-        val sp = pointer.getStorePointer(store.storeId).get
-        store.bootstrapOverwrite(pointer.id, sp, storeData)
+        store.bootstrapOverwrite(pointer.id, storeData)
       }
     }
 

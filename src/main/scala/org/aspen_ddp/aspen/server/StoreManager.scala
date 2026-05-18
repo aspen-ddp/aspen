@@ -632,11 +632,11 @@ class StoreManager(val client: AspenClient,
           case a: Allocate =>
             if ! offlineStores.contains(a.toStore) then
               val msg = AllocateResponse(
-                a.fromClient, 
+                a.fromClient,
                 a.toStore,
-                a.allocationTransactionId, 
-                a.newObjectId, 
-                None,
+                a.allocationTransactionId,
+                a.newObjectId,
+                false,
                 true)
               net.sendClientResponse(msg)
           case r: Read => 
@@ -657,9 +657,8 @@ class StoreManager(val client: AspenClient,
           case a: Allocate => store.frontend.allocateObject(a)
 
           case r: Read =>
-            r.objectPointer.getStoreLocater(store.storeId).foreach { locater =>
-              store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, locater)
-            }
+            if r.objectPointer.poolId == store.storeId.poolId then
+              store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer.id)
 
           case op: OpportunisticRebuild => store.frontend.readObjectForOpportunisticRebuild(op)
 

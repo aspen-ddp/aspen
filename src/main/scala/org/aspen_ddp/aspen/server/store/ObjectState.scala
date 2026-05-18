@@ -2,15 +2,12 @@ package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectType}
-import org.aspen_ddp.aspen.common.store.StorePointer
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 
 class ObjectState(val objectId: ObjectId,
-                  val storePointer: StorePointer,
                   var metadata: Metadata,
                   val objectType: ObjectType.Value,
-                  var data: DataBuffer,
-                  val maxSize: Option[Int]) {
+                  var data: DataBuffer) {
 
   /** Used to track the number of references currently working on this object.
     * The object is not allowed to exit the cache until this number drops to

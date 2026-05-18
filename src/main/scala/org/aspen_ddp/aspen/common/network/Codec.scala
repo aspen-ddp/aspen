@@ -937,7 +937,7 @@ object Codec extends Logging:
         case _ => throw new EncodingError("Only KeyObjectRevisions are allowed")
       KeyRevisionGuard(allocObj.asInstanceOf[KeyValueObjectPointer], kvreq.key, rev)
 
-    Allocate(toStore, fromClient, newObjectId, objectType, None, initialRefcount,
+    Allocate(toStore, fromClient, newObjectId, objectType, initialRefcount,
       objectData, timestamp, allocTxId, revisionGuard)
 
 
@@ -947,7 +947,7 @@ object Codec extends Logging:
       .setFromStore(encode(o.fromStore))
       .setAllocationTransactionUuid(encodeUUID(o.allocationTransactionId.uuid))
       .setNewObjectUuid(encodeUUID(o.newObjectId.uuid))
-      .setSuccess(o.result.isDefined)
+      .setSuccess(o.success)
       .setStoreNotFound(o.storeNotFound)
       .build
 

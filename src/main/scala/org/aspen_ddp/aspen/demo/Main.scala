@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.ida.{ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectPointer, ObjectRevisionGuard, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRequirement}
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat, someOrThrow}
@@ -343,8 +343,7 @@ object Main {
     val sched = Executors.newScheduledThreadPool(3)
     val ec: ExecutionContext = ExecutionContext.fromExecutorService(sched)
 
-    val radicle = KeyValueObjectPointer(Radicle.objectId, Radicle.poolId, None,
-      cfg.bootstrapIDA, (0 until cfg.bootstrapIDA.width).map(idx => StorePointer(idx.toByte, Array())).toArray)
+    val radicle = KeyValueObjectPointer(Radicle.objectId, Radicle.poolId)
 
     val ret = (new SimpleAspenClient(nnet.clientMessenger, nnet.clientId, ec, radicle,
       txStatusCacheDuration,
@@ -374,7 +373,7 @@ object Main {
         println("Creating Amoeba")
         val guard = ObjectRevisionGuard(kvos.pointer, kvos.revision)
         client.getStoragePool(kvos.pointer.poolId).flatMap { pool =>
-          val allocator = new SinglePoolObjectAllocator(client, pool, kvos.pointer.ida, None)
+          val allocator = new SinglePoolObjectAllocator(client, pool, pool.defaultIDA, None)
           SimpleFileSystem.bootstrap(client, guard, allocator, kvos.pointer, AmoebafsKey)
         }
     }
@@ -798,26 +797,10 @@ object Main {
       bootstrapStores.toList)
 
     // Print yaml representation of Radicle Pointer
-    println("# NHucleus Pointer Definition")
+    println("# Aspen Radicle Pointer Definition")
     println("radicle:")
     println(s"    uuid:      ${radicle.id}")
     println(s"    pool-uuid: ${radicle.poolId}")
-    radicle.size.foreach(size => println(s"    size:      $size"))
-    println("    ida:")
-    radicle.ida match {
-      case ida: Replication =>
-        println(s"        type:            replication")
-        println(s"        width:           ${ida.width}")
-        println(s"        write-threshold: ${ida.writeThreshold}")
-
-      case _: ReedSolomon => throw new NotImplementedError
-    }
-    println("    store-pointers:")
-    radicle.storePointers.foreach { sp =>
-      println(s"        - pool-index: ${sp.poolIndex}")
-      if (sp.data.length > 0)
-        println(s"          data: ${java.util.Base64.getEncoder.encodeToString(sp.data)}")
-    }
     sched.shutdownNow()
   }
 
@@ -865,9 +848,8 @@ object Main {
 
       println(f"Rebuilding object: $objectId")
 
-      val storePointer = ptr.getStorePointer(storeId) match
-        case None => return Future.successful(()) // This store doesn't hold data for this object.
-        case Some(sp) => sp
+      if ptr.poolId != storeId.poolId then
+        return Future.successful(())
 
       val fos = ptr match
         case p: KeyValueObjectPointer => client.read(p)
@@ -877,7 +859,7 @@ object Main {
         os <- fos
         (objectType, metadata) = getMetadata(os)
         localData = os.getRebuildDataForStore(storeId)
-        _ = store.rebuildWrite(os.id, objectType, metadata, storePointer, localData.getOrElse(DataBuffer()))
+        _ = store.rebuildWrite(os.id, objectType, metadata, localData.getOrElse(DataBuffer()))
       yield
         println(f"Rebuilt object ${os.id}")
 

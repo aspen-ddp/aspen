@@ -26,10 +26,10 @@ object RequirementsCheckerSuite {
   val tx1 = TransactionId(new UUID(0, 5))
   val tx2 = TransactionId(new UUID(0, 6))
 
-  val p1 = new DataObjectPointer(oid1, PoolId(new UUID(0,0)))
-  val p2 = new DataObjectPointer(oid2, PoolId(new UUID(0,0)))
+  val p1 = DataObjectPointer(oid1, PoolId(new UUID(0,0)), Array[Byte]())
+  val p2 = DataObjectPointer(oid2, PoolId(new UUID(0,0)), Array[Byte]())
 
-  val kp1 = new KeyValueObjectPointer(oid1, PoolId(new UUID(0,0)))
+  val kp1 = KeyValueObjectPointer(oid1, PoolId(new UUID(0,0)), Array[Byte]())
 }
 
 class RequirementsCheckerSuite extends AnyFunSuite with Matchers {

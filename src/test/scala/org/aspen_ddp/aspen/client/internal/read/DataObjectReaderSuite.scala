@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.internal.read
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{CorruptedObject, DataObjectState, InvalidObject, ObjectState}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -14,8 +14,8 @@ import org.scalatest.matchers.should.Matchers
 
 object DataObjectReaderSuite {
   
-  class TestReader(pointer: DataObjectPointer)
-    extends BaseObjectReader[DataObjectPointer, DataObjectStoreState](false, pointer, new UUID(0,0)) {
+  class TestReader(pointer: DataObjectPointer, ida: IDA)
+    extends BaseObjectReader[DataObjectPointer, DataObjectStoreState](false, pointer, ida, new UUID(0,0)) {
 
     var rstates: Option[List[StoreState]] = None
 
@@ -28,7 +28,7 @@ object DataObjectReaderSuite {
                                          allStoreStates: List[DataObjectStoreState], debug: Boolean): ObjectState = {
       rstates = Some(matchingStoreStates)
       val s = matchingStoreStates.head
-      DataObjectState(pointer, revision, refcount, timestamp, readTime, 0, DataBuffer.Empty)
+      DataObjectState(pointer, revision, refcount, timestamp, readTime, ida, 0, DataBuffer.Empty)
     }
   }
 
@@ -37,7 +37,7 @@ object DataObjectReaderSuite {
 
       val ida = Replication(width, threshold)
 
-      new TestReader(DataObjectPointer(ObjectId(objUUID), pool))
+      new TestReader(DataObjectPointer(ObjectId(objUUID), pool, Array[Byte]()), ida)
     }
   }
 

@@ -69,7 +69,8 @@ object TestNetwork {
 
   class TClient(executionContext: ExecutionContext,
                 msngr: ClientMessenger,
-                val radicle: KeyValueObjectPointer) extends AspenClient {
+                val radicle: KeyValueObjectPointer,
+                ida: IDA) extends AspenClient {
 
     given ExecutionContext = executionContext
 
@@ -87,11 +88,11 @@ object TestNetwork {
     val rmgr = new ReadManager(this, BaseReadDriver.noErrorRecoveryReadDriver)
 
     def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] = {
-      rmgr.read(pointer, comment).map(_.asInstanceOf[DataObjectState])
+      rmgr.read(pointer, ida, comment).map(_.asInstanceOf[DataObjectState])
     }
 
     def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = {
-      rmgr.read(pointer, comment).map(_.asInstanceOf[KeyValueObjectState])
+      rmgr.read(pointer, ida, comment).map(_.asInstanceOf[KeyValueObjectState])
     }
 
     val txManager = new TransactionManager(this, ClientTransactionDriver.noErrorRecoveryFactory)
@@ -217,7 +218,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     def dropCacheForStore(storeId: StoreId): Unit = ()
   }
 
-  val client: AspenClient = new TClient(executionContext, cliMessenger, radicle)
+  val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida)
   FinalizerFactory.client = client
 
   val smgr = new StoreManager(

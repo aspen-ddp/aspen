@@ -105,7 +105,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
                readUUID:UUID = readUUID,
                comment: String = "",
                disableOpportunisticRebuild: Boolean = false) = {
-    new BaseReadDriver(client, objectPointer, readUUID, comment, disableOpportunisticRebuild) {
+    new BaseReadDriver(client, objectPointer, ida, readUUID, comment, disableOpportunisticRebuild) {
       given ec: ExecutionContext = this.client.clientContext
     }
   }
@@ -220,7 +220,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     r.readResult.isCompleted should be (true)
     val o = Await.result(r.readResult, awaitDuration)
 
-    o should be (DataObjectState(ptr, nrev2, ref, ts, minTs, 5, odata))
+    o should be (DataObjectState(ptr, nrev2, ref, ts, minTs, ida, 5, odata))
   }
 
 
@@ -235,7 +235,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     r.readResult.isCompleted should be (true)
     val o = Await.result(r.readResult, awaitDuration)
 
-    o should be (DataObjectState(ptr, rev, ref, ts, ts, 5, odata))
+    o should be (DataObjectState(ptr, rev, ref, ts, ts, ida, 5, odata))
   }
 
 }

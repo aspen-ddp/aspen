@@ -30,6 +30,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
         tail.map(p => Value(p.toArray)))
     } yield new KeyValueListNode(
       client,
+      pool.defaultIDA,
       lptr,
       ByteArrayKeyOrdering,
       minimum,

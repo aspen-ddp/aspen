@@ -27,10 +27,11 @@ object TransactionDriverSuite {
 
   val rev: ObjectRevision = ObjectRevision.Null
   val oid = ObjectId(java.util.UUID.randomUUID())
-  val simpleObj = DataObjectPointer(oid, poolId)
+  val ida = Replication(3, 2)
+  val simpleObj = DataObjectPointer(oid, poolId, Array[Byte]())
 
   def mktxd(optr: ObjectPointer, du: List[DataUpdate] = Nil, ru: List[RefcountUpdate] = Nil) = TransactionDescription(
-    TransactionId(java.util.UUID.randomUUID()), HLCTimestamp(100), optr, 0, du ++ ru, Nil)
+    TransactionId(java.util.UUID.randomUUID()), HLCTimestamp(100), optr, 0, du ++ ru, Nil, None, Nil, Nil, ida, Map())
 
   def mkprep(paxosRound: Int, toPeer: Byte, fromPeer: Byte, txd: TransactionDescription) = TxPrepare(StoreId(poolId,toPeer), StoreId(poolId,fromPeer), txd, ProposalId(paxosRound,fromPeer), Nil, Nil)
 

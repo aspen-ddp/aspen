@@ -75,7 +75,7 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
     for
       kvos <- client.read(radicle)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
-      allocator = new SinglePoolObjectAllocator(client, rootPool, radicle.ida, None)
+      allocator = new SinglePoolObjectAllocator(client, rootPool, rootPool.defaultIDA, None)
 
       // Allocate executor root and data object in one transaction
       tx0 = client.newTransaction()

@@ -30,7 +30,8 @@ object FrontendSuite {
   val txid1 = TransactionId(new UUID(0,5))
   val txid2 = TransactionId(new UUID(0,6))
   val rev0 = new ObjectRevision(new UUID(0, 7))
-  val op1 = new DataObjectPointer(oid1, poolId)
+  val ida = Replication(3, 2)
+  val op1 = DataObjectPointer(oid1, poolId, Array[Byte]())
 
   class TestNet extends Messenger {
 
@@ -179,7 +180,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     val txd = TransactionDescription(txid1, its, op1, 1.toByte,
       List(DataUpdate(op1, ObjectRevision(txid1), DataUpdateOperation.Overwrite)),
-      List(), None, List(), List())
+      List(), None, List(), List(), ida, Map())
 
     val db = DataBuffer(Array[Byte](0, 1, 2, 3))
     val ou = ObjectUpdate(oid1, db)

@@ -65,10 +65,11 @@ object SimpleCRLSuite:
   val stream2 = StreamId(2)
 
   val oid1 = ObjectId(new UUID(0, 2))
-  val op1 = new DataObjectPointer(oid1, poolId)
+  val ida = Replication(3, 2)
+  val op1 = DataObjectPointer(oid1, poolId, Array[Byte]())
   val txd = TransactionDescription(transactionId, timestamp, op1, 1.toByte,
     List(DataUpdate(op1, ObjectRevision(transactionId), DataUpdateOperation.Overwrite)),
-    List(), None, List(), List())
+    List(), None, List(), List(), ida, Map())
   val trsValidTxd = TransactionRecoveryState(storeId, txd.serialize(), List(ou1, ou2), disp, status, pax)
   val trsValidTxd2 = TransactionRecoveryState(storeId2, txd.serialize(), List(ou1, ou2), disp, status, pax)
 

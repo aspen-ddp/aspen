@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, KeyValueObjectState, ObjectAllocator, ObjectReader, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RevisionLock}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, FullContentLock, KeyObjectRevision, KeyRequirement, KeyRevision, WithinRange}
@@ -13,6 +14,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
 class KeyValueListNode(val reader: ObjectReader,
+                       val ida: IDA,
                        val pointer: KeyValueObjectPointer,
                        val ordering: KeyOrdering,
                        val minimum: Key,
@@ -26,7 +28,7 @@ class KeyValueListNode(val reader: ObjectReader,
   def maximum: Option[Key] = tail.map(rp => rp.minimum)
 
   def refresh(): Future[KeyValueListNode] = reader.read(pointer, s"Refresh KVListNode hostState ${pointer.id}. Minimum: $minimum").map { kvos =>
-    new KeyValueListNode(reader, pointer, ordering, minimum,
+    new KeyValueListNode(reader, kvos.ida, pointer, ordering, minimum,
       kvos.revision, kvos.refcount, kvos.contents, kvos.right.map(v => KeyValueListPointer(v.bytes)))
   }
 
@@ -48,7 +50,7 @@ class KeyValueListNode(val reader: ObjectReader,
       case Failure(err) => p.failure(err)
 
       case Success(kvos) =>
-        val node = new KeyValueListNode(reader, right.pointer, ordering, right.minimum,
+        val node = new KeyValueListNode(reader, kvos.ida, right.pointer, ordering, right.minimum,
           kvos.revision, kvos.refcount, kvos.contents, kvos.right.map(v => KeyValueListPointer(v.bytes)))
 
         node.tail match {
@@ -135,7 +137,7 @@ class KeyValueListNode(val reader: ObjectReader,
           case Failure(err) => p.failure(err)
 
           case Success(kvos) =>
-            val nextNode = new KeyValueListNode(reader, kvos.pointer, ordering, nodeTail.minimum,
+            val nextNode = new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
               kvos.revision, kvos.refcount, kvos.contents,
               kvos.right.map(v => KeyValueListPointer(v.bytes)))
 
@@ -174,7 +176,7 @@ class KeyValueListNode(val reader: ObjectReader,
                   p.failure(err)
 
                 case Success(kvos) =>
-                  val nextNode = new KeyValueListNode(reader, kvos.pointer, ordering, nodeTail.minimum,
+                  val nextNode = new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
                     kvos.revision, kvos.refcount, kvos.contents,
                     kvos.right.map(v => KeyValueListPointer(v.bytes)))
 
@@ -220,7 +222,7 @@ class KeyValueListNode(val reader: ObjectReader,
                     p.failure(err)
 
                   case Success(kvos) =>
-                    val nextNode = new KeyValueListNode(reader, kvos.pointer, ordering, nodeTail.minimum,
+                    val nextNode = new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
                       kvos.revision, kvos.refcount, kvos.contents,
                       kvos.right.map(v => KeyValueListPointer(v.bytes)))
 
@@ -245,7 +247,7 @@ object KeyValueListNode {
             pointer: KeyValueListPointer,
             ordering: KeyOrdering,
             kvos: KeyValueObjectState): KeyValueListNode = {
-    new KeyValueListNode(reader, pointer.pointer, ordering, pointer.minimum, kvos.revision,
+    new KeyValueListNode(reader, kvos.ida, pointer.pointer, ordering, pointer.minimum, kvos.revision,
       kvos.refcount, kvos.contents, kvos.right.map(v => KeyValueListPointer(v.bytes)))
   }
 
@@ -261,10 +263,10 @@ object KeyValueListNode {
                     )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
 
     val currentSize = node.contents.foldLeft(0) { (sz, t) =>
-      sz + KVObjectState.idaEncodedPairSize(node.pointer.ida, t._1, t._2.value)
+      sz + KVObjectState.idaEncodedPairSize(node.ida, t._1, t._2.value)
     }
 
-    val newPairSize = KVObjectState.idaEncodedPairSize(node.pointer.ida, key, value)
+    val newPairSize = KVObjectState.idaEncodedPairSize(node.ida, key, value)
 
     val maxSize = maxNodeSize - 4 - 4 - node.minimum.bytes.length - node.maximum.map(_.bytes.length).getOrElse(0) - node.tail.map{ p =>
       p.encodedSize
@@ -300,7 +302,7 @@ object KeyValueListNode {
 
       val sizes = keys.iterator.map { k =>
         val vs = fullContent(k)
-        (k, KVObjectState.idaEncodedPairSize(node.pointer.ida, k, vs.value))
+        (k, KVObjectState.idaEncodedPairSize(node.ida, k, vs.value))
       }.toList
 
       val fullSize = sizes.foldLeft(0)((sz, t) => sz + t._2)
@@ -356,14 +358,14 @@ object KeyValueListNode {
     assert(node.contents.contains(oldKey))
 
     val currentSize = node.contents.foldLeft(0) { (sz, t) =>
-      sz + KVObjectState.idaEncodedPairSize(node.pointer.ida, t._1, t._2.value)
+      sz + KVObjectState.idaEncodedPairSize(node.ida, t._1, t._2.value)
     }
 
     val value = node.contents(oldKey).value
     val klenDelta = newKey.bytes.length - oldKey.bytes.length
 
-    val oldPairSize = KVObjectState.idaEncodedPairSize(node.pointer.ida, oldKey, value)
-    val newPairSize = KVObjectState.idaEncodedPairSize(node.pointer.ida, newKey, value)
+    val oldPairSize = KVObjectState.idaEncodedPairSize(node.ida, oldKey, value)
+    val newPairSize = KVObjectState.idaEncodedPairSize(node.ida, newKey, value)
 
     val newSize = newPairSize - oldPairSize
 
@@ -390,7 +392,7 @@ object KeyValueListNode {
 
       val sizes = keys.iterator.map { k =>
         val vs = fullContent(k)
-        (k, KVObjectState.idaEncodedPairSize(node.pointer.ida, k, vs.value))
+        (k, KVObjectState.idaEncodedPairSize(node.ida, k, vs.value))
       }.toList
 
       val fullSize = sizes.foldLeft(0)((sz, t) => sz + t._2)

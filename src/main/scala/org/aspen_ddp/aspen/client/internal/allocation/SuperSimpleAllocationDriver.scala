@@ -18,7 +18,6 @@ object SuperSimpleAllocationDriver {
       def create(client: AspenClient,
                  poolId: PoolId,
                  newObjectId: ObjectId,
-                 objectSize: Option[Int],
                  objectIDA: IDA,
                  objectData: Map[Byte, DataBuffer], // Map DataStore pool index -> store-specific ObjectData
                  objectType: ObjectType.Value,
@@ -26,7 +25,7 @@ object SuperSimpleAllocationDriver {
                  initialRefcount: ObjectRefcount,
                  allocationTransactionId: TransactionId,
                  revisionGuard: AllocationRevisionGuard): BaseAllocationDriver = {
-        new SuperSimpleAllocationDriver(retransmitDelay, client, poolId, newObjectId, objectSize, objectIDA, objectData,
+        new SuperSimpleAllocationDriver(retransmitDelay, client, poolId, newObjectId, objectIDA, objectData,
           objectType, timestamp, initialRefcount, allocationTransactionId, revisionGuard)
       }
     }
@@ -38,7 +37,6 @@ class SuperSimpleAllocationDriver(retransmitDelay: Duration,
                                   client: AspenClient,
                                   poolId: PoolId,
                                   newObjectId: ObjectId,
-                                  objectSize: Option[Int],
                                   objectIDA: IDA,
                                   objectData: Map[Byte, DataBuffer], // Map DataStore pool index -> store-specific ObjectData
                                   objectType: ObjectType.Value,
@@ -46,7 +44,7 @@ class SuperSimpleAllocationDriver(retransmitDelay: Duration,
                                   initialRefcount: ObjectRefcount,
                                   allocationTransactionId: TransactionId,
                                   revisionGuard: AllocationRevisionGuard) extends BaseAllocationDriver(client, poolId,
-  newObjectId, objectSize, objectIDA, objectData, objectType, timestamp, initialRefcount, allocationTransactionId,
+  newObjectId, objectIDA, objectData, objectType, timestamp, initialRefcount, allocationTransactionId,
   revisionGuard) with Logging {
 
   given ExecutionContext = client.clientContext

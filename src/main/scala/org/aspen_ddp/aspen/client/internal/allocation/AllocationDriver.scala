@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, ObjectId, ObjectPointer, ObjectRefcount, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 
@@ -22,7 +22,7 @@ trait AllocationDriver {
   def start(): Unit
 
   def receiveAllocationResult(fromStoreId: StoreId,
-                              result: Option[StorePointer],
+                              success: Boolean,
                               storeNotFound: Boolean): Unit
 }
 
@@ -31,7 +31,6 @@ object AllocationDriver {
     def create(client: AspenClient,
                poolId: PoolId,
                newObjectId: ObjectId,
-               objectSize: Option[Int],
                objectIDA: IDA,
                objectData: Map[Byte,DataBuffer], // Map DataStore pool index -> store-specific ObjectData
                objectType: ObjectType.Value,

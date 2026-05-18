@@ -69,7 +69,7 @@ object SimpleCRLSuite:
   val op1 = DataObjectPointer(oid1, poolId, Array[Byte]())
   val txd = TransactionDescription(transactionId, timestamp, op1, 1.toByte,
     List(DataUpdate(op1, ObjectRevision(transactionId), DataUpdateOperation.Overwrite)),
-    List(), None, List(), List(), ida, Map())
+    List(), None, List(), List(), ida, Map(poolId -> ida))
   val trsValidTxd = TransactionRecoveryState(storeId, txd.serialize(), List(ou1, ou2), disp, status, pax)
   val trsValidTxd2 = TransactionRecoveryState(storeId2, txd.serialize(), List(ou1, ou2), disp, status, pax)
 

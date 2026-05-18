@@ -180,7 +180,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
     val txd = TransactionDescription(txid1, its, op1, 1.toByte,
       List(DataUpdate(op1, ObjectRevision(txid1), DataUpdateOperation.Overwrite)),
-      List(), None, List(), List(), ida, Map())
+      List(), None, List(), List(), ida, Map(poolId -> ida))
 
     val db = DataBuffer(Array[Byte](0, 1, 2, 3))
     val ou = ObjectUpdate(oid1, db)

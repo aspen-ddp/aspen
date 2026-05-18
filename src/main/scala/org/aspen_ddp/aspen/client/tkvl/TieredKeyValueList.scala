@@ -410,7 +410,7 @@ object TieredKeyValueList {
 
           val tail = kvos.right.map(right => KeyValueListPointer(right.bytes))
 
-          val node = new KeyValueListNode(client, pointer, ordering, minimum,
+          val node = new KeyValueListNode(client, kvos.ida, pointer, ordering, minimum,
             kvos.revision, kvos.refcount, kvos.contents, tail)
           p.success(Right(node))
       }

@@ -6,7 +6,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 
 sealed abstract class Message
@@ -64,7 +64,6 @@ final case class Allocate(
                            fromClient: ClientId,
                            newObjectId: ObjectId,
                            objectType: ObjectType.Value,
-                           objectSize: Option[Int],
                            initialRefcount: ObjectRefcount,
                            objectData: DataBuffer,
                            timestamp: HLCTimestamp,
@@ -74,7 +73,7 @@ final case class Allocate(
 
   override def equals(other: Any): Boolean = other match {
     case rhs: Allocate => toStore == rhs.toStore && fromClient == rhs.fromClient &&
-      objectSize == rhs.objectSize && objectData.compareTo(rhs.objectData) == 0 &&
+      objectData.compareTo(rhs.objectData) == 0 &&
       initialRefcount == rhs.initialRefcount && timestamp.compareTo(rhs.timestamp) == 0 &&
       allocationTransactionId == rhs.allocationTransactionId &&
       revisionGuard == rhs.revisionGuard
@@ -88,7 +87,7 @@ final case class AllocateResponse(toClient: ClientId,
                                   fromStore: StoreId,
                                   allocationTransactionId: TransactionId,
                                   newObjectId: ObjectId,
-                                  result: Option[StorePointer],
+                                  success: Boolean,
                                   storeNotFound: Boolean) extends ClientResponse:
   override def toString: String = f"AllocateResponse from $fromStore to $toClient tx $allocationTransactionId objId $newObjectId"
 

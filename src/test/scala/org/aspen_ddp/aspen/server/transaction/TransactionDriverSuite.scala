@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.{ClientResponse, TxAccept, TxAcceptRes
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.NoBackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -26,15 +26,15 @@ object TransactionDriverSuite {
   val ds3 = StoreId(poolId, 3)
 
   val rev: ObjectRevision = ObjectRevision.Null
-  val arr = new Array[Byte](0)
   val oid = ObjectId(java.util.UUID.randomUUID())
-  val simpleObj = DataObjectPointer(oid, poolId, None, Replication(3,2),
-    Array(StorePointer(0,arr), StorePointer(1,arr), StorePointer(2,arr)))
+  val ida = Replication(3, 2)
+  val simpleObj = DataObjectPointer(oid, poolId, Array[Byte]())
 
-  //def mkobj = ObjectPointer(java.util.UUID.randomUUID(), poolUUID, None, Replication(3,2), new Array[StorePointer](0))
-
-  def mktxd(optr: ObjectPointer, du: List[DataUpdate] = Nil, ru: List[RefcountUpdate] = Nil) = TransactionDescription(
-    TransactionId(java.util.UUID.randomUUID()), HLCTimestamp(100), optr, 0, du ++ ru, Nil)
+  def mktxd(optr: ObjectPointer, du: List[DataUpdate] = Nil, ru: List[RefcountUpdate] = Nil) =
+    val allPools = (optr :: du.map(_.objectPointer) ++ ru.map(_.objectPointer)).map(_.poolId).toSet
+    val poolMap = allPools.map(p => p -> ida).toMap
+    TransactionDescription(
+      TransactionId(java.util.UUID.randomUUID()), HLCTimestamp(100), optr, 0, du ++ ru, Nil, None, Nil, Nil, ida, poolMap)
 
   def mkprep(paxosRound: Int, toPeer: Byte, fromPeer: Byte, txd: TransactionDescription) = TxPrepare(StoreId(poolId,toPeer), StoreId(poolId,fromPeer), txd, ProposalId(paxosRound,fromPeer), Nil, Nil)
 
@@ -186,8 +186,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
   test("Multi-object PrepareResponse Handling") {
     val otherPool = PoolId(java.util.UUID.randomUUID())
-    val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool, None, Replication(3,2),
-      Array(StorePointer(0,arr), StorePointer(1,arr), StorePointer(2,arr)))
+    val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool)
 
     val ods0 = StoreId(otherPool, 0)
     val ods1 = StoreId(otherPool, 1)
@@ -250,8 +249,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
   test("Multi-object PrepareResponse Handling - Abort") {
     val otherPool = PoolId(java.util.UUID.randomUUID())
-    val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool, None, Replication(3,2),
-      Array(StorePointer(0,arr), StorePointer(1,arr), StorePointer(2,arr)))
+    val otherObj = DataObjectPointer(ObjectId(java.util.UUID.randomUUID()), otherPool)
 
     val ods0 = StoreId(otherPool, 0)
     val ods1 = StoreId(otherPool, 1)

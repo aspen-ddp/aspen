@@ -18,12 +18,12 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.language.implicitConversions
 import scala.concurrent.duration.*
 
-class SimpleFileContent(file: SimpleFile, 
+class SimpleFileContent(file: SimpleFile,
                         osegmentSize: Option[Int]=None) extends Logging:
-  
+
   import SimpleFileContent.*
 
-  private val fs = file.fs
+  private val fs = file.fs.asInstanceOf[SimpleFileSystem]
 
   private val dosCache: Cache[Long, DataObjectState] = Scaffeine().
     maximumSize(5).
@@ -197,7 +197,8 @@ class SimpleFileContent(file: SimpleFile,
         ObjectRefcount(0, 1),
         HLCTimestamp.now,
         HLCTimestamp.now,
-        dos.pointer.ida.calculateEncodedSegmentLength(db.size),
+        dos.ida,
+        dos.ida.calculateEncodedSegmentLength(db.size),
         db)
 
       tx.overwrite(dos.pointer, dos.revision, db)
@@ -227,7 +228,8 @@ class SimpleFileContent(file: SimpleFile,
           ObjectRefcount(0, 1),
           HLCTimestamp.now,
           HLCTimestamp.now,
-          ptr.ida.calculateEncodedSegmentLength(db.size),
+          fs.defaultIDA,
+          fs.defaultIDA.calculateEncodedSegmentLength(db.size),
           db)
 
         (dos, remaining)

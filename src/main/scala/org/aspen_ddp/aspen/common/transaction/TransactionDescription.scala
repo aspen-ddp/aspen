@@ -5,6 +5,8 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, Codec}
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.server.store.Locater
 import scala.language.implicitConversions
 
@@ -59,7 +61,13 @@ final case class TransactionDescription (
   /** Optional set of notes that may be used for debugging transactions.
     *
     */
-  notes: List[String] = Nil) {
+  notes: List[String] = Nil,
+
+  /** IDA of the pool containing the primary object */
+  primaryObjectIDA: IDA,
+
+  /** Maps each pool referenced by the transaction to its IDA */
+  poolIDAMap: Map[PoolId, IDA]) {
 
   def objectRequirements: List[TransactionObjectRequirement] = requirements.flatMap {
     case tor: TransactionObjectRequirement => Some(tor)
@@ -68,29 +76,27 @@ final case class TransactionDescription (
 
   def allReferencedObjectsSet: Set[ObjectPointer] = objectRequirements.map(_.objectPointer).toSet
 
-  def primaryObjectDataStores: Set[StoreId] = primaryObject.storePointers.foldLeft(Set[StoreId]())((s, sp) => s + StoreId(primaryObject.poolId, sp.poolIndex))
+  def primaryObjectDataStores: Set[StoreId] =
+    (0 until primaryObjectIDA.width).map(i => StoreId(primaryObject.poolId, i.toByte)).toSet
 
-  def allDataStores: Set[StoreId] = allReferencedObjectsSet.flatMap(ptr => ptr.storePointers.map(sp => StoreId(ptr.poolId, sp.poolIndex)))
+  def allDataStores: Set[StoreId] =
+    allReferencedObjectsSet.flatMap: ptr =>
+      val ida = poolIDAMap(ptr.poolId)
+      (0 until ida.width).map(i => StoreId(ptr.poolId, i.toByte))
 
-  def allHostedObjects(storeId: StoreId): List[ObjectPointer] = allReferencedObjectsSet.foldLeft(List[ObjectPointer]())((l, op) => {
-    if (op.poolId == storeId.poolId) {
-      op.storePointers.find(_.poolIndex == storeId.poolIndex) match {
-        case Some(sp) => op :: l
-        case None => l
-      }
-    } else
-      l
-  })
+  def allHostedObjects(storeId: StoreId): List[ObjectPointer] =
+    allReferencedObjectsSet.foldLeft(List[ObjectPointer]()): (l, op) =>
+      if op.poolId == storeId.poolId && storeId.poolIndex < poolIDAMap(storeId.poolId).width then
+        op :: l
+      else
+        l
 
-  def hostedObjectLocaters(storeId: StoreId): List[Locater] = allReferencedObjectsSet.foldLeft(List[Locater]())((l, op) => {
-    if (op.poolId == storeId.poolId) {
-      op.storePointers.find(_.poolIndex == storeId.poolIndex) match {
-        case Some(sp) => Locater(op.id, sp) :: l
-        case None => l
-      }
-    } else
-      l
-  })
+  def hostedObjectLocaters(storeId: StoreId): List[Locater] =
+    allReferencedObjectsSet.foldLeft(List[Locater]()): (l, op) =>
+      if op.poolId == storeId.poolId && storeId.poolIndex < poolIDAMap(storeId.poolId).width then
+        op.id :: l
+      else
+        l
 
   def shortString: String = {
     val sb = new StringBuilder

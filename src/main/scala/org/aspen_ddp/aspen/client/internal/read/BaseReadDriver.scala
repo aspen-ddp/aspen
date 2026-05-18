@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client.internal.read
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadError}
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -13,6 +14,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 abstract class BaseReadDriver(
                                val client: AspenClient,
                                val objectPointer: ObjectPointer,
+                               val ida: IDA,
                                val readUUID:UUID,
                                val comment: String,
                                val disableOpportunisticRebuild: Boolean = false
@@ -25,11 +27,11 @@ abstract class BaseReadDriver(
 
   // Detect invalid combinations
   val objectReader: ObjectReader = (objectPointer, readType) match {
-    case (p: KeyValueObjectPointer, _:MetadataOnly) => new KeyValueObjectReader(true, p, readUUID)
-    case (p: KeyValueObjectPointer, _) => new KeyValueObjectReader(false, p, readUUID)
+    case (p: KeyValueObjectPointer, _:MetadataOnly) => new KeyValueObjectReader(true, p, ida, readUUID)
+    case (p: KeyValueObjectPointer, _) => new KeyValueObjectReader(false, p, ida, readUUID)
 
-    case (p: DataObjectPointer,     _:MetadataOnly) => new DataObjectReader(true, p, readUUID)
-    case (p: DataObjectPointer,     _:FullObject) => new DataObjectReader(false, p, readUUID)
+    case (p: DataObjectPointer,     _:MetadataOnly) => new DataObjectReader(true, p, ida, readUUID)
+    case (p: DataObjectPointer,     _:FullObject) => new DataObjectReader(false, p, ida, readUUID)
 
     case _ => throw new AssertionError("Invalid read combination")
   }
@@ -61,7 +63,7 @@ abstract class BaseReadDriver(
 
   /** Sends a Read request to all stores that have not already responded. May be called outside a synchronized block */
   protected def sendReadRequests(): Unit = {
-    logger.trace(s"Read UUID $readUUID: sending read requests to all stores for object ${objectPointer.id}. ${objectPointer.storePointers.map(sp => StoreId(objectPointer.poolId, sp.poolIndex)).toList}")
+    logger.trace(s"Read UUID $readUUID: sending read requests to all stores for object ${objectPointer.id}. ${(0 until ida.width).map(i => StoreId(objectPointer.poolId, i.toByte)).toList}")
     synchronized {
       retryCount += 1
       if (retryCount > 3) {
@@ -70,8 +72,7 @@ abstract class BaseReadDriver(
           s => logger.trace(s))
       }
     }
-    //objectPointer.storePointers.foreach(sp => sendReadRequestNoLogMessage(StoreId(objectPointer.poolId, sp.poolIndex)))
-    objectPointer.storePointers.foreach(sp => sendReadRequest(StoreId(objectPointer.poolId, sp.poolIndex)))
+    (0 until ida.width).foreach(i => sendReadRequest(StoreId(objectPointer.poolId, i.toByte)))
   }
 
   protected def sendOpportunisticRebuild(storeId: StoreId, os: ObjectState): Unit = {
@@ -180,11 +181,12 @@ object BaseReadDriver:
   def noErrorRecoveryReadDriver(
                                  client: AspenClient,
                                  objectPointer: ObjectPointer,
+                                 ida: IDA,
                                  readUUID:UUID,
                                  comment: String,
                                  disableOpportunisticRebuild: Boolean): ReadDriver =
 
-    new BaseReadDriver(client, objectPointer, readUUID, comment):
+    new BaseReadDriver(client, objectPointer, ida, readUUID, comment):
 
       given ec: ExecutionContext = this.client.clientContext
 

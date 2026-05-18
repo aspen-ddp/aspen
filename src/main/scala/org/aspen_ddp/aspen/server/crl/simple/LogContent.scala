@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRefcount, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, TransactionRecoveryState}
 
@@ -227,28 +227,20 @@ class Tx(val id: TxId,
 object Alloc:
   case class LoadingAlloc( txid: TxId,
                            dataLocation: StreamLocation,
-                           storePointer: StorePointer,
                            newObjectId: ObjectId,
                            objectType: ObjectType.Value,
-                           objectSize: Option[Int],
                            initialRefcount: ObjectRefcount,
                            timestamp: HLCTimestamp,
                            serializedRevisionGuard: DataBuffer )
 
   def loadAlloc(bb: ByteBuffer): LoadingAlloc =
     val txid = LogContent.getTxId(bb)
-    val spLen = bb.getInt()
-    val sparr = new Array[Byte](spLen)
-    bb.get(sparr)
-    val storePointer = StorePointer(txid.storeId.poolIndex, sparr)
     val newObjectId = ObjectId(LogContent.getUUID(bb))
     val objectType = bb.get() match {
       case 0 => ObjectType.Data
       case 1 => ObjectType.KeyValue
       case _ => throw new CorruptedEntry("Invalid Object Type")
     }
-    val sz = bb.getInt()
-    val objectSize = if (sz != 0) Some(sz) else None
     val dataLocation = LogContent.getStreamLocation(bb)
     val rserial = bb.getInt()
     val rcount = bb.getInt()
@@ -258,7 +250,7 @@ object Alloc:
     bb.get(guard)
     val serializedRevisionGuard = DataBuffer(guard)
 
-    LoadingAlloc(txid, dataLocation, storePointer, newObjectId, objectType, objectSize, refcount,
+    LoadingAlloc(txid, dataLocation, newObjectId, objectType, refcount,
       timestamp, serializedRevisionGuard)
 
 
@@ -279,31 +271,25 @@ class Alloc(var dataLocation: Option[StreamLocation],
   override def staticDataSize: Long =
     // Allocation Entry
     //     txid: StoreId 17 + allocation_transaction_id 16
-    //     store_pointer: StorePointer, 4 + nbytes
     //     id: ObjectId, 16
     //     objectType: ObjectType, 1
-    //     size: Option[Int], 4 - 0 means None
     //     data: StreamLocation, 14
     //     refcount: Refcount, 8 (4-byte serial, 4-byte count)
     //     timestamp: HLCTimestamp, 8
     //     serialized_revision_guard: DataBuffer <== 4 + nbytes
     //
-    17 + 16 + 4 + state.storePointer.data.length
-      + 16 + 1 + 4 + StreamLocation.StaticSize + 8 + 8 + 4 + state.serializedRevisionGuard.size
+    17 + 16 + 16 + 1 + StreamLocation.StaticSize + 8 + 8 + 4 + state.serializedRevisionGuard.size
 
   override def writeStaticEntry(bb: ByteBuffer): Unit =
     require(dataLocation.nonEmpty)
 
     LogContent.putTxId(bb, TxId(state.storeId, state.allocationTransactionId))
-    bb.putInt(state.storePointer.data.length)
-    bb.put(state.storePointer.data)
     LogContent.putUUID(bb, state.newObjectId.uuid)
     val kind = state.objectType match {
       case ObjectType.Data => 0
       case ObjectType.KeyValue => 1
     }
     bb.put(kind.toByte)
-    bb.putInt(state.objectSize.getOrElse(0))
     dataLocation.foreach: loc =>
       LogContent.putStreamLocation(bb, loc)
     bb.putInt(state.initialRefcount.updateSerial)

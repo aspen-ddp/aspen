@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, 
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyRevisionGuard, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectRevisionGuard, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, PreTransactionOpportunisticRebuild, RefcountUpdate, RevisionLock, SerializedFinalizationAction, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
 import org.aspen_ddp.aspen.server.cnc
@@ -105,14 +105,6 @@ object Codec extends Logging:
     ObjectRefcount(m.getUpdateSerial.toInt, m.getRefcount)
 
 
-  def encode(o: StorePointer): codec.StorePointer =
-    codec.StorePointer.newBuilder()
-      .setStoreIndex(o.poolIndex)
-      .setData(ByteString.copyFrom(o.data))
-      .build
-
-  def decode(m: codec.StorePointer): StorePointer =
-    StorePointer(m.getStoreIndex.toByte, m.getData.toByteArray)
 
 
   def encodeObjectType(o: ObjectType.Value): codec.ObjectType = o match
@@ -126,31 +118,22 @@ object Codec extends Logging:
 
 
   def encode(o: ObjectPointer): codec.ObjectPointer =
-    val builder = codec.ObjectPointer.newBuilder()
+    codec.ObjectPointer.newBuilder()
       .setUuid(encodeUUID(o.id.uuid))
       .setPoolUuid(encodeUUID(o.poolId.uuid))
-      .setIda(encode(o.ida))
       .setObjectType(encodeObjectType(o.objectType))
-
-    o.size.foreach: size =>
-      builder.setSize(size)
-
-    o.storePointers.foreach: ptr =>
-      builder.addStorePointers(encode(ptr))
-
-    builder.build
+      .setStorePointer(ByteString.copyFrom(o.storePointer))
+      .build
 
   def decode(m: codec.ObjectPointer): ObjectPointer =
     val uuid = decodeUUID(m.getUuid)
     val poolUuid = decodeUUID(m.getPoolUuid)
-    val ida = decode(m.getIda)
     val objectType = decodeObjectType(m.getObjectType)
-    val osize = if m.getSize == 0 then None else Some(m.getSize)
-    val storePointers = m.getStorePointersList.asScala.map(sp => decode(sp)).toArray
+    val storePointer = m.getStorePointer.toByteArray
 
     objectType match
-      case ObjectType.Data => new DataObjectPointer(ObjectId(uuid), PoolId(poolUuid), osize, ida, storePointers)
-      case ObjectType.KeyValue => new KeyValueObjectPointer(ObjectId(uuid), PoolId(poolUuid), osize, ida, storePointers)
+      case ObjectType.Data => DataObjectPointer(ObjectId(uuid), PoolId(poolUuid), storePointer)
+      case ObjectType.KeyValue => KeyValueObjectPointer(ObjectId(uuid), PoolId(poolUuid), storePointer)
 
 
   def encodeTransactionStatus(o: TransactionStatus.Value): codec.TransactionStatus = o match
@@ -418,6 +401,13 @@ object Codec extends Logging:
       builder.addNotifyOnResolution(encode(storeId))
     o.notes.foreach: s =>
       builder.addNotes(s)
+    o.poolIDAMap.foreach: (poolId, ida) =>
+      builder.addPoolIdas(
+        codec.PoolIDA.newBuilder()
+          .setPoolId(encodeUUID(poolId.uuid))
+          .setIda(encode(ida))
+          .build
+      )
 
     builder.build
   def decode(m: codec.TransactionDescription): TransactionDescription =
@@ -430,9 +420,13 @@ object Codec extends Logging:
     val origClient = if m.hasOriginatingClient then Some(ClientId(decodeUUID(m.getOriginatingClient))) else None
     val notifyOnRes = m.getNotifyOnResolutionList.asScala.map(decode).toList
     val notes = m.getNotesList.asScala.toList
+    val poolIDAMap = m.getPoolIdasList.asScala.map: pida =>
+      PoolId(decodeUUID(pida.getPoolId)) -> decode(pida.getIda)
+    .toMap
+    val primaryObjectIDA = poolIDAMap(primaryObj.poolId)
 
     TransactionDescription(txuuid, startTs, primaryObj, designatedLeader, requirements,
-      serializedFas, origClient, notifyOnRes, notes)
+      serializedFas, origClient, notifyOnRes, notes, primaryObjectIDA, poolIDAMap)
 
 
   def encode(o: ProposalId): codec.ProposalId =
@@ -910,7 +904,6 @@ object Codec extends Logging:
       .setFromClient(encodeUUID(o.fromClient.uuid))
       .setNewObjectUuid(encodeUUID(o.newObjectId.uuid))
       .setObjectType(encodeObjectType(o.objectType))
-      .setObjectSize(o.objectSize.getOrElse(0))
       .setInitialRefcount(encode(o.initialRefcount))
       .setObjectData(ByteString.copyFrom(o.objectData.asReadOnlyBuffer()))
       .setTimestamp(o.timestamp.asLong)
@@ -930,7 +923,6 @@ object Codec extends Logging:
     val fromClient = ClientId(decodeUUID(m.getFromClient))
     val newObjectId = ObjectId(decodeUUID(m.getNewObjectUuid))
     val objectType = decodeObjectType(m.getObjectType)
-    val objectSize = if m.getObjectSize == 0 then None else Some(m.getObjectSize)
     val initialRefcount = decode(m.getInitialRefcount)
     val objectData = DataBuffer(m.getObjectData.toByteArray)
     val timestamp = HLCTimestamp(m.getTimestamp)
@@ -945,32 +937,29 @@ object Codec extends Logging:
         case _ => throw new EncodingError("Only KeyObjectRevisions are allowed")
       KeyRevisionGuard(allocObj.asInstanceOf[KeyValueObjectPointer], kvreq.key, rev)
 
-    Allocate(toStore, fromClient, newObjectId, objectType, objectSize, initialRefcount,
+    Allocate(toStore, fromClient, newObjectId, objectType, initialRefcount,
       objectData, timestamp, allocTxId, revisionGuard)
 
 
   def encode(o: AllocateResponse): codec.AllocateResponse =
-    val builder = codec.AllocateResponse.newBuilder()
+    codec.AllocateResponse.newBuilder()
       .setToClient(encodeUUID(o.toClient.uuid))
       .setFromStore(encode(o.fromStore))
       .setAllocationTransactionUuid(encodeUUID(o.allocationTransactionId.uuid))
       .setNewObjectUuid(encodeUUID(o.newObjectId.uuid))
+      .setSuccess(o.success)
       .setStoreNotFound(o.storeNotFound)
-
-    o.result.foreach: ptr =>
-      builder.setAllocateStorePointer(encode(ptr))
-
-    builder.build
+      .build
 
   def decode(m: codec.AllocateResponse): AllocateResponse =
     val toClient = ClientId(decodeUUID(m.getToClient))
     val fromStore = decode(m.getFromStore)
     val allocTxId = TransactionId(decodeUUID(m.getAllocationTransactionUuid))
     val newObjId = ObjectId(decodeUUID(m.getNewObjectUuid))
-    val storePointer = if m.hasAllocateStorePointer then Some(decode(m.getAllocateStorePointer)) else None
+    val success = m.getSuccess
     val storeNotFound = m.getStoreNotFound
 
-    AllocateResponse(toClient, fromStore, allocTxId, newObjId, storePointer, storeNotFound)
+    AllocateResponse(toClient, fromStore, allocTxId, newObjId, success, storeNotFound)
 
 
   def encode(o: HostHeartbeat): codec.HostHeartbeat =
@@ -1101,32 +1090,27 @@ object Codec extends Logging:
     val builder = codec.AllocationRecoveryState.newBuilder()
 
     builder.setStoreId(encode(o.storeId))
-    builder.setStorePointer(encode(o.storePointer))
     builder.setNewObjectId(encodeUUID(o.newObjectId.uuid))
     builder.setObjectType(encodeObjectType(o.objectType))
-    o.objectSize.foreach: sz =>
-      builder.setObjectSize(sz)
     builder.setObjectData(ByteString.copyFrom(o.objectData.asReadOnlyBuffer()))
     builder.setInitialRefcount(encode(o.initialRefcount))
     builder.setTimestamp(o.timestamp.asLong)
     builder.setTransactionUuid(encodeUUID(o.allocationTransactionId.uuid))
     builder.setSerializedRevisionGuard(ByteString.copyFrom(o.serializedRevisionGuard.asReadOnlyBuffer()))
-    
+
     builder.build
 
   def decode(m: codec.AllocationRecoveryState): AllocationRecoveryState =
     val storeId = decode(m.getStoreId)
-    val storePointer = decode(m.getStorePointer)
     val newObjectId = ObjectId(decodeUUID(m.getNewObjectId))
     val objectType = decodeObjectType(m.getObjectType)
-    val objectSize = if m.getObjectSize == 0 then None else Some(m.getObjectSize)
     val objectData = DataBuffer(m.getObjectData.toByteArray)
     val initialRefcount = decode(m.getInitialRefcount)
     val timestamp = HLCTimestamp(m.getTimestamp)
     val transactionId = TransactionId(decodeUUID(m.getTransactionUuid))
     val serializedRevisionGuard = DataBuffer(m.getSerializedRevisionGuard.toByteArray)
 
-    AllocationRecoveryState(storeId, storePointer, newObjectId, objectType, objectSize, objectData,
+    AllocationRecoveryState(storeId, newObjectId, objectType, objectData,
       initialRefcount, timestamp, transactionId, serializedRevisionGuard)
 
 

@@ -45,10 +45,6 @@ message ObjectRefcount {
   uint32 refcount = 2;
 }
 
-message StorePointer {
-  uint32 store_index = 1;
-  bytes data = 2;
-}
 
 enum ObjectType {
   OBJECT_TYPE_DATA = 0;
@@ -58,10 +54,8 @@ enum ObjectType {
 message ObjectPointer {
   UUID uuid = 1;
   UUID pool_uuid = 2;
-  uint32 size = 3;
-  repeated StorePointer store_pointers = 4;
-  IDA ida = 5;
-  ObjectType object_type = 6;
+  ObjectType object_type = 3;
+  bytes store_pointer = 4;
 }
 
 //---------------------------------------------------------------------------
@@ -163,6 +157,11 @@ message SerializedFinalizationAction {
   bytes data = 2;
 }
 
+message PoolIDA {
+  UUID pool_id = 1;
+  IDA ida = 2;
+}
+
 message TransactionDescription {
   UUID transaction_uuid = 1;
   uint64 start_timestamp = 2;
@@ -173,6 +172,7 @@ message TransactionDescription {
   UUID originating_client = 7;
   repeated StoreId notify_on_resolution = 8;
   repeated string notes = 9;
+  repeated PoolIDA pool_idas = 10;
 }
 
 //---------------------------------------------------------------------------
@@ -377,7 +377,7 @@ message Allocate {
   UUID from_client = 2;
   UUID new_object_uuid = 3;
   ObjectType object_type = 4;
-  uint32 object_size = 5;
+  // field 5 removed (was object_size)
   ObjectRefcount initial_refcount = 6;
   bytes object_data = 7;
   uint64 timestamp = 8;
@@ -396,7 +396,7 @@ message AllocateResponse {
   StoreId from_store = 2;
   UUID allocation_transaction_uuid = 3;
   UUID new_object_uuid = 4;
-  StorePointer allocate_store_pointer = 5;
+  bool success = 5;
   AllocationError result_error = 6;
   bool store_not_found = 7;
 }
@@ -490,10 +490,10 @@ message TransactionRecoveryState {
 
 message AllocationRecoveryState {
   StoreId store_id = 1;
-  StorePointer store_pointer = 2;
+  // field 2 removed (was store_pointer)
   UUID new_object_id = 3;
   ObjectType object_type = 4;
-  uint32 object_size = 5;
+  // field 5 removed (was object_size)
   bytes object_data = 6;
   ObjectRefcount initial_refcount = 7;
   uint64 timestamp = 8;

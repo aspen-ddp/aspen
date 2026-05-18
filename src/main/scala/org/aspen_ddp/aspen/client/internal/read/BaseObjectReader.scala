@@ -4,6 +4,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.client.{CorruptedObject, InvalidObject, MetadataObjectState, ObjectState, ReadError => ClientReadError}
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.ReadResponse
 import org.aspen_ddp.aspen.common.objects.{ObjectPointer, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -17,12 +18,13 @@ object BaseObjectReader {
 abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: StoreState](
                                  val metadataOnly: Boolean,
                                  val pointer: PointerType,
+                                 val ida: IDA,
                                  val readUUID: UUID) extends ObjectReader with Logging {
 
   import BaseObjectReader._
 
-  def width: Int = pointer.ida.width
-  def threshold: Int = pointer.ida.consistentRestoreThreshold
+  def width: Int = ida.width
+  def threshold: Int = ida.consistentRestoreThreshold
 
   protected var responses: Map[StoreId, Either[CommonReadError.Value, StoreStateType]] = Map()
   protected var endResult: Option[Either[ClientReadError, ObjectState]] = None

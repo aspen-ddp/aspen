@@ -4,7 +4,6 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
-import org.aspen_ddp.aspen.common.store.StorePointer
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.scalatest.funsuite.AnyFunSuite
@@ -18,46 +17,38 @@ object SimpleLRUObjectCacheSuite {
 
     val o1 = new ObjectState(
       ObjectId(new UUID(0,1)),
-      StorePointer(1, new Array[Byte](0)),
       Metadata(ObjectRevision(TransactionId(new UUID(0, 2))),
         ObjectRefcount(1,1),
         HLCTimestamp(1)),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     val o2 = new ObjectState(
       ObjectId(new UUID(0,2)),
-      StorePointer(1, new Array[Byte](0)),
       Metadata(ObjectRevision(TransactionId(new UUID(0, 2))),
         ObjectRefcount(1,1),
         HLCTimestamp(1)),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     val o3 = new ObjectState(
       ObjectId(new UUID(0,3)),
-      StorePointer(1, new Array[Byte](0)),
       Metadata(ObjectRevision(TransactionId(new UUID(0, 2))),
         ObjectRefcount(1,1),
         HLCTimestamp(1)),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     val o4 = new ObjectState(
       ObjectId(new UUID(0,4)),
-      StorePointer(1, new Array[Byte](0)),
       Metadata(ObjectRevision(TransactionId(new UUID(0, 2))),
         ObjectRefcount(1,1),
         HLCTimestamp(1)),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     (o1, o2, o3, o4)

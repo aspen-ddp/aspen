@@ -93,8 +93,8 @@ object KeyValueObjectReaderSuite {
   val right1 = SetRight(bar.bytes, Some(t1), Some(r1))
   val right2 = SetRight(baz.bytes, Some(t2), Some(r2))
 
-  class TestReader(val ida: IDA) extends KeyValueObjectReader(
-    false, KeyValueObjectPointer(ObjectId(objUUID), pool, None, ida, Array()), new UUID(0,0)) {
+  class TestReader(override val ida: IDA) extends KeyValueObjectReader(
+    false, KeyValueObjectPointer(ObjectId(objUUID), pool, Array[Byte]()), ida, new UUID(0,0)) {
 
     def err(store: Int, e: ReadError.Value): Unit = {
       receiveReadResponse(ReadResponse(client, StoreId(pool, store.toByte), this.readUUID, HLCTimestamp.Zero, Left(e)))

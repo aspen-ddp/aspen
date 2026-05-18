@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.Allocate
 import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.apache.logging.log4j.scala.Logging
 
@@ -16,7 +16,6 @@ class BaseAllocationDriver (
                              val client: AspenClient,
                              val poolId: PoolId,
                              val newObjectId: ObjectId,
-                             val objectSize: Option[Int],
                              val objectIDA: IDA,
                              val objectData: Map[Byte,DataBuffer], // Map DataStore pool index -> store-specific ObjectData
                              val objectType: ObjectType.Value,
@@ -30,7 +29,7 @@ class BaseAllocationDriver (
 
   def futureResult: Future[ObjectPointer] = promise.future
 
-  private var responses =  Map[Byte, Option[StorePointer]]()
+  private var responses =  Map[Byte, Boolean]()
 
   def shutdown(): Unit = {}
 
@@ -43,7 +42,7 @@ class BaseAllocationDriver (
     for ( (storeIndex, objectData) <- toSend ) {
       val storeId = StoreId(poolId, storeIndex)
 
-      val msg = Allocate(storeId, client.clientId, newObjectId, objectType, objectSize, initialRefcount, objectData, timestamp,
+      val msg = Allocate(storeId, client.clientId, newObjectId, objectType, initialRefcount, objectData, timestamp,
         allocationTransactionId, revisionGuard)
 
       client.messenger.sendClientRequest(msg)
@@ -51,7 +50,7 @@ class BaseAllocationDriver (
   }
 
   def receiveAllocationResult(fromStoreId: StoreId,
-                              result: Option[StorePointer],
+                              success: Boolean,
                               storeNotFound: Boolean): Unit = synchronized {
     if (promise.isCompleted)
       return // Already done, nothing left to do
@@ -62,34 +61,25 @@ class BaseAllocationDriver (
 
       val storeData = synchronized { objectData(fromStoreId.poolIndex) }
 
-      val msg = Allocate(fromStoreId, client.clientId, newObjectId, objectType, objectSize, initialRefcount, storeData, timestamp,
+      val msg = Allocate(fromStoreId, client.clientId, newObjectId, objectType, initialRefcount, storeData, timestamp,
         allocationTransactionId, revisionGuard)
 
       client.messenger.sendClientRequest(msg)
-      
+
     else
-      logger.trace(s"Got Allocation Result from store $fromStoreId: $result. Num Responses: ${responses.size}")
-  
+      logger.trace(s"Got Allocation Result from store $fromStoreId: $success. Num Responses: ${responses.size}")
+
       if ( !responses.contains(fromStoreId.poolIndex) )
-        responses += (fromStoreId.poolIndex -> result)
-  
+        responses += (fromStoreId.poolIndex -> success)
+
       if (responses.size == objectData.size) {
-        var errors = Set[Byte]()
-        var pointers = List[StorePointer]()
-  
-        responses.foreach(t => t._2 match {
-          case Some(ptr) => pointers = ptr :: pointers
-          case None => errors += t._1
-        })
-        logger.trace(s"   Errors: $errors")
-        if (errors.isEmpty) {
-          val sortedPointersArray = pointers.sortBy(sp => sp.poolIndex).toArray
-          val op = objectType match {
-            case ObjectType.Data => new DataObjectPointer(newObjectId, poolId, objectSize, objectIDA, sortedPointersArray)
-            case ObjectType.KeyValue => new KeyValueObjectPointer(newObjectId, poolId, objectSize, objectIDA, sortedPointersArray)
-          }
+        val allSucceeded = responses.values.forall(identity)
+        if allSucceeded then
+          val op = objectType match
+            case ObjectType.Data => DataObjectPointer(newObjectId, poolId)
+            case ObjectType.KeyValue => KeyValueObjectPointer(newObjectId, poolId)
           promise.success(op)
-        } else
+        else
           promise.failure(AllocationError(poolId))
       }
   }
@@ -101,7 +91,6 @@ object BaseAllocationDriver {
     def create(client: AspenClient,
                poolId: PoolId,
                newObjectId: ObjectId,
-               objectSize: Option[Int],
                objectIDA: IDA,
                objectData: Map[Byte,DataBuffer], // Map DataStore pool index -> store-specific ObjectData
                objectType: ObjectType.Value,
@@ -109,7 +98,7 @@ object BaseAllocationDriver {
                initialRefcount: ObjectRefcount,
                allocationTransactionId: TransactionId,
                revisionGuard: AllocationRevisionGuard): BaseAllocationDriver = {
-      new BaseAllocationDriver(client, poolId, newObjectId, objectSize, objectIDA, objectData, objectType, timestamp,
+      new BaseAllocationDriver(client, poolId, newObjectId, objectIDA, objectData, objectType, timestamp,
         initialRefcount, allocationTransactionId, revisionGuard)
     }
   }

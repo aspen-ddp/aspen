@@ -6,7 +6,6 @@ import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.StorePointer
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
 import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
@@ -27,10 +26,10 @@ object RequirementsCheckerSuite {
   val tx1 = TransactionId(new UUID(0, 5))
   val tx2 = TransactionId(new UUID(0, 6))
 
-  val p1 = new DataObjectPointer(oid1, PoolId(new UUID(0,0)), None, Replication(1,1), Array())
-  val p2 = new DataObjectPointer(oid2, PoolId(new UUID(0,0)), None, Replication(1,1), Array())
+  val p1 = DataObjectPointer(oid1, PoolId(new UUID(0,0)), Array[Byte]())
+  val p2 = DataObjectPointer(oid2, PoolId(new UUID(0,0)), Array[Byte]())
 
-  val kp1 = new KeyValueObjectPointer(oid1, PoolId(new UUID(0,0)), None, Replication(1,1), Array())
+  val kp1 = KeyValueObjectPointer(oid1, PoolId(new UUID(0,0)), Array[Byte]())
 }
 
 class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
@@ -41,20 +40,16 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
     val o1 = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     val o2 = new ObjectState(
       oid2,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev2, ref2, ts2),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     (o1, o2)
@@ -69,11 +64,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("DataUpdate okay") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -95,11 +88,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("VersionBump okay") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -121,11 +112,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("RevisionLock okay") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -147,11 +136,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("VersionBump failure on tx collision") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx2)
@@ -175,11 +162,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("RevisionLock failure on tx collision") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx2)
@@ -203,11 +188,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("RevisionLock failure on revision mismatch") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     val req = RevisionLock(p1, rev2)
@@ -229,11 +212,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("VersionBump failure on revision mismatch") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     val req = VersionBump(p1, rev2)
@@ -255,11 +236,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("Refcount okay") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -281,11 +260,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("DataUpdate no collision when already locked to same transaction") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -309,11 +286,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("Missing object update data") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -336,11 +311,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("Transaction collision") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -366,11 +339,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("Revision mismatch") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -394,11 +365,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("Refcount mismatch") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -422,11 +391,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("Localtime okay") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -445,11 +412,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("Localtime error") {
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.lockedToTransaction = Some(tx1)
@@ -482,11 +447,9 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
     val o = new ObjectState(
       oid1,
-      StorePointer(1, new Array[Byte](0)),
       Metadata(rev1, ref1, ts1),
       ObjectType.Data,
-      DataBuffer(new Array[Byte](0)),
-      None
+      DataBuffer(new Array[Byte](0))
     )
 
     o.kvState = Some(kvos)

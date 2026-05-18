@@ -4,6 +4,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.client.{KeyValueObjectState, ObjectState}
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.ReadResponse
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -17,8 +18,8 @@ object KeyValueObjectReader {
   private case class Restorable(revision: ObjectRevision, timestamp: HLCTimestamp, slices: List[(Byte, Value)])
 }
 
-class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer, readUUID: UUID)
-  extends BaseObjectReader[KeyValueObjectPointer, KeyValueObjectStoreState](metadataOnly, pointer, readUUID) {
+class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer, ida: IDA, readUUID: UUID)
+  extends BaseObjectReader[KeyValueObjectPointer, KeyValueObjectStoreState](metadataOnly, pointer, ida, readUUID) {
 
   import KeyValueObjectReader._
 
@@ -51,7 +52,7 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
       if (lleft.size < threshold)
         throw BaseObjectReader.NotRestorable(s"KVObject left object attribute is below threshold")
       else
-        Some(Value(pointer.ida.restoreArray(lleft)))
+        Some(Value(ida.restoreArray(lleft)))
     } else {
       None
     }
@@ -65,7 +66,7 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
       if (lright.size < threshold)
         throw BaseObjectReader.NotRestorable(s"KVObject right object attribute is below threshold")
       else {
-        Some(Value(pointer.ida.restoreArray(lright)))
+        Some(Value(ida.restoreArray(lright)))
       }
     } else {
       None
@@ -89,14 +90,14 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
       case Some(r) =>
         if (debug)
           println(s"Creating value state for key ${t._1}.")
-        val v = Value(pointer.ida.restoreArray(r.slices.map(t => t._1 -> t._2.bytes)))
+        val v = Value(ida.restoreArray(r.slices.map(t => t._1 -> t._2.bytes)))
         m + (t._1 -> KeyValueObjectState.ValueState(v, r.revision, r.timestamp))
     }}
 
     if (debug)
       println(s"Restored Contents: $contents")
 
-    new KeyValueObjectState(pointer, revision, refcount, timestamp, readTime, min, max, left, right, contents)
+    new KeyValueObjectState(pointer, revision, refcount, timestamp, readTime, ida, min, max, left, right, contents)
   }
 
 

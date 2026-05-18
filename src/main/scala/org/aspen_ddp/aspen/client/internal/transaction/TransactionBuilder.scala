@@ -10,6 +10,8 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction.*
 import org.aspen_ddp.aspen.common.util.printStack
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.pool.PoolId
 
 object TransactionBuilder {
   case class KVUpdate(
@@ -45,7 +47,7 @@ class TransactionBuilder(
   private  var missedCommitDelayInMs = 1000
   private  val minimumTimestamp = HLCTimestamp.now
 
-  def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager): (TransactionDescription,
+  def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager, poolIDAMap: Map[PoolId, IDA]): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {
 
     HLCTimestamp.update(minimumTimestamp)
@@ -62,7 +64,7 @@ class TransactionBuilder(
     val primaryObject = requirements.flatMap {
       case tor: TransactionObjectRequirement => Some(tor)
       case _ => None
-    }.map(_.objectPointer).maxBy(ptr => ptr.ida)
+    }.map(_.objectPointer).maxBy(ptr => poolIDAMap(ptr.poolId))
 
     val designatedLeaderUID = chooseDesignatedLeader(primaryObject)
     val originatingClient = Some(clientId)
@@ -70,21 +72,23 @@ class TransactionBuilder(
     if (addMissedUpdateTrackingFA)
       finalizationActions = MissedUpdateFinalizationAction.createSerializedFA(missedCommitDelayInMs) :: finalizationActions
 
+    val primaryObjectIDA = poolIDAMap(primaryObject.poolId)
+
     val txd = TransactionDescription(transactionId, startTimestamp, primaryObject, designatedLeaderUID,
       requirements, finalizationActions, originatingClient, notifyOnResolution.toList,
-      notes)
+      notes, primaryObjectIDA, poolIDAMap)
 
     var updates = Map[StoreId, TransactionData]()
 
     def addUpdate(pointer: ObjectPointer, encoded: Array[DataBuffer]): Unit = {
       val mpr = opportunisticRebuildManager.getPreTransactionOpportunisticRebuild(pointer)
+      val objIDA = poolIDAMap(pointer.poolId)
 
-      pointer.storePointers zip encoded foreach { x =>
-        val (sp, bb) = x
-        val storeId = StoreId(pointer.poolId, sp.poolIndex)
-        val lu = ObjectUpdate(pointer.id, bb)
+      (0 until objIDA.width).foreach { poolIndex =>
+        val storeId = StoreId(pointer.poolId, poolIndex.toByte)
+        val lu = ObjectUpdate(pointer.id, encoded(poolIndex))
 
-        val opr = mpr.get(sp.poolIndex)
+        val opr = mpr.get(poolIndex.toByte)
 
         updates.get(storeId) match {
           case None =>
@@ -108,14 +112,22 @@ class TransactionBuilder(
     dataObjectUpdates foreach { t =>
       val (objectPointer, buf) = t
 
-      addUpdate(objectPointer, objectPointer.ida.encode(buf))
+      addUpdate(objectPointer, poolIDAMap(objectPointer.poolId).encode(buf))
     }
 
     keyValueUpdates.valuesIterator.foreach { kvu =>
-      addUpdate(kvu.pointer, KeyValueOperation.encode(kvu.operations, kvu.pointer.ida))
+      addUpdate(kvu.pointer, KeyValueOperation.encode(kvu.operations, poolIDAMap(kvu.pointer.poolId)))
     }
 
     (txd, updates, startTimestamp)
+  }
+
+  def allReferencedPoolIds: Set[PoolId] = synchronized {
+    val objectPointers = requirements.flatMap {
+      case tor: TransactionObjectRequirement => Some(tor.objectPointer)
+      case _ => None
+    } ++ keyValueUpdates.values.map(_.pointer)
+    objectPointers.map(_.poolId).toSet
   }
 
   def disableMissedUpdateTracking(): Unit = synchronized {

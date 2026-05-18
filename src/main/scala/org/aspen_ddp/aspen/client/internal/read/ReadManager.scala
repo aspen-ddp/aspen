@@ -3,8 +3,10 @@ package org.aspen_ddp.aspen.client.internal.read
 import java.util.UUID
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectState}
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{ReadResponse, TransactionCompletionQuery, TransactionCompletionResponse}
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
@@ -21,14 +23,14 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
   private var completionTimes = Map[UUID, (Long, ReadDriver)]()
   private var completionQueries = Map[UUID, CompletionQuery]()
 
-  private class CompletionQuery(val pointer: ObjectPointer, val transactionUUID: UUID) {
+  private class CompletionQuery(val pointer: ObjectPointer, val ida: IDA, val transactionUUID: UUID) {
     val queryUUID: UUID = UUID.randomUUID()
     val promise: Promise[Unit] = Promise()
     var responses: Map[StoreId, Boolean] = Map()
 
     private val retransmitTask = client.backgroundTaskManager.retryWithExponentialBackoff(tryNow = true, Duration(10, SECONDS), Duration(3, MINUTES)) {
-      pointer.hostingStores.foreach { storeId =>
-        client.messenger.sendClientRequest(TransactionCompletionQuery(storeId, client.clientId, queryUUID, TransactionId(transactionUUID)))
+      (0 until ida.width).foreach { i =>
+        client.messenger.sendClientRequest(TransactionCompletionQuery(StoreId(pointer.poolId, i.toByte), client.clientId, queryUUID, TransactionId(transactionUUID)))
       }
       false
     }
@@ -37,7 +39,7 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
 
     def update(storeId: StoreId, complete: Boolean): Unit = {
       responses += storeId -> complete
-      if (responses.valuesIterator.count(b => b) >= pointer.ida.consistentRestoreThreshold) {
+      if (responses.valuesIterator.count(b => b) >= ida.consistentRestoreThreshold) {
         completionQueries -= queryUUID
         retransmitTask.cancel()
         promise.success(())
@@ -98,13 +100,14 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
     */
   def read(
             objectPointer: ObjectPointer,
+            ida: IDA,
             comment: String,
             disableOpportunisticRebuild:Boolean=false,
             ): Future[ObjectState] = {
 
     val readUUID = UUID.randomUUID()
 
-    val driver = driverFactory(client, objectPointer, readUUID, comment, disableOpportunisticRebuild)
+    val driver = driverFactory(client, objectPointer, ida, readUUID, comment, disableOpportunisticRebuild)
 
     synchronized { outstandingReads += (readUUID -> driver) }
 
@@ -113,8 +116,8 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
     driver.readResult
   }
 
-  def getTransactionFinalized(pointer: ObjectPointer, transactionUUID: UUID): Future[Unit] = {
-    val q = new CompletionQuery(pointer, transactionUUID)
+  def getTransactionFinalized(pointer: ObjectPointer, ida: IDA, transactionUUID: UUID): Future[Unit] = {
+    val q = new CompletionQuery(pointer, ida, transactionUUID)
     q.promise.future
   }
 }

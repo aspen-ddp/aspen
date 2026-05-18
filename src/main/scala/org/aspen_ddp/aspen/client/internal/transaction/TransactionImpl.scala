@@ -8,6 +8,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, KeyValueUpdate, TransactionId}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -133,39 +135,53 @@ class TransactionImpl(val client: AspenClient,
     if (!promise.isCompleted) {
 
       state.foreach { bldr =>
-        val (txd, transactionData, timestamp) = bldr.buildTranaction(client.opportunisticRebuildManager)
+        val poolIds = bldr.allReferencedPoolIds
 
-        //---- Tx Debugging ----
-        result.onComplete {
-          case Success(_) =>
-            logger.info(s"TX SUCCESS: ${txd.shortString}\n${txd.shortString}")
-          case Failure(e) =>
-            logger.info(s"TX FAILURE: ${txd.shortString}: $e\n$stack")
+        val poolIDAMapFuture = Future.sequence(
+          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.defaultIDA))
+        ).map(_.toMap)
+
+        poolIDAMapFuture.failed.foreach { cause =>
+          promise.tryFailure(cause)
         }
-        //---------------------
 
-        state = Left(timestamp)
-        if (txd.requirements.isEmpty)
-          promise.success(txd.startTimestamp)
-        else {
+        poolIDAMapFuture.foreach { poolIDAMap =>
+          try
+            val (txd, transactionData, timestamp) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap)
 
-          txManager.runTransaction(txd, transactionData, transactionDriverStrategy) onComplete {
-            case Failure(cause) =>
-              // TODO Catch transaction timeout from lower layer and convert to TransactionError.TransactionTimedOut
-              client.txStatusCache.transactionAborted(txd.transactionId)
-              promise.failure(cause)
-            case Success(committed) =>
+            //---- Tx Debugging ----
+            result.onComplete {
+              case Success(_) =>
+                logger.info(s"TX SUCCESS: ${txd.shortString}\n${txd.shortString}")
+              case Failure(e) =>
+                logger.info(s"TX FAILURE: ${txd.shortString}: $e\n$stack")
+            }
+            //---------------------
 
-              if (committed) {
-                val ts = txd.startTimestamp
-                HLCTimestamp.update(ts)
-                client.txStatusCache.transactionCommitted(txd.transactionId)
-                promise.success(ts)
-              } else {
-                client.txStatusCache.transactionAborted(txd.transactionId)
-                promise.failure(TransactionAborted(txd))
+            state = Left(timestamp)
+            if (txd.requirements.isEmpty)
+              promise.success(txd.startTimestamp)
+            else
+
+              txManager.runTransaction(txd, transactionData, transactionDriverStrategy) onComplete {
+                case Failure(cause) =>
+                  // TODO Catch transaction timeout from lower layer and convert to TransactionError.TransactionTimedOut
+                  client.txStatusCache.transactionAborted(txd.transactionId)
+                  promise.failure(cause)
+                case Success(committed) =>
+
+                  if (committed) {
+                    val ts = txd.startTimestamp
+                    HLCTimestamp.update(ts)
+                    client.txStatusCache.transactionCommitted(txd.transactionId)
+                    promise.success(ts)
+                  } else {
+                    client.txStatusCache.transactionAborted(txd.transactionId)
+                    promise.failure(TransactionAborted(txd))
+                  }
               }
-          }
+          catch
+            case e: Throwable => promise.tryFailure(e)
         }
       }
     }

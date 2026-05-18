@@ -90,10 +90,8 @@ object Recovery extends Logging:
     val arsLst = rs.allocations.valuesIterator.map( a =>
       AllocationRecoveryState(
         a.txid.storeId,
-        a.storePointer,
         a.newObjectId,
         a.objectType,
-        a.objectSize,
         readStreamLocation(a.dataLocation),
         a.initialRefcount,
         a.timestamp,

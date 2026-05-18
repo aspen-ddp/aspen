@@ -5,6 +5,7 @@ import java.util.concurrent.{Executors, TimeUnit}
 import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.client.{AspenClient, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, Transaction}
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, Insert, IntegerKeyOrdering, Key, KeyValueObjectPointer, KeyValueOperation, LexicalKeyOrdering, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
@@ -66,16 +67,17 @@ object SimpleFileSystem {
     for
       kvos <- client.read(fsRoot)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
-      defaultAllocator = new SinglePoolObjectAllocator(client, rootPool, fsRoot.ida, None)
+      defaultAllocator = new SinglePoolObjectAllocator(client, rootPool, rootPool.defaultIDA, None)
       executorRoot = KeyValueObjectPointer(kvos.contents(TaskExecutorRootKey).value.bytes)
       executor <- SimpleTaskExecutor(client, defaultAllocator, executorRoot)
     yield
-      new SimpleFileSystem(client, kvos, defaultAllocator, executor, numContextThreads)
+      new SimpleFileSystem(client, kvos, rootPool.defaultIDA, defaultAllocator, executor, numContextThreads)
 
   }
 }
 class SimpleFileSystem(aclient: AspenClient,
                        fsRoot: KeyValueObjectState,
+                       val defaultIDA: IDA,
                        defaultAllocator: ObjectAllocator,
                        executor: TaskExecutor,
                        val numContextThreads: Int = 4,

@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{Allocate, AllocateResponse, ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectRevision, ObjectType, ReadError}
-import org.aspen_ddp.aspen.common.store.{ReadState, StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -59,7 +59,7 @@ class Frontend(val storeId: StoreId,
 
     lalloc.foreach { ars =>
       val msg = AllocateResponse(ClientId.Null, storeId, ars.allocationTransactionId,
-        ars.newObjectId, Some(ars.storePointer), false)
+        ars.newObjectId, true, false)
       var l = pendingAllocations.get(ars.allocationTransactionId) match {
         case None => Nil
         case Some(lst) => lst
@@ -122,7 +122,7 @@ class Frontend(val storeId: StoreId,
         os.transactionReferences -= 1
 
         if (m.committed) {
-          val cs = CommitState(os.objectId, os.storePointer, os.metadata, os.objectType, os.data, os.maxSize)
+          val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
           allocationCommits += m.transactionId
           backend.commit(cs, m.transactionId)
         } else {
@@ -137,7 +137,7 @@ class Frontend(val storeId: StoreId,
   }
 
   def backendOperationComplete(completion: Completion): Unit = completion match {
-    case r: Read => backendReadComplete(r.objectId, r.storePointer, r.result)
+    case r: Read => backendReadComplete(r.objectId, r.result)
     case c: Commit =>
       transactions.get(c.transactionId).foreach { tx =>
         tx.commitComplete(c.objectId, c.result)
@@ -150,9 +150,8 @@ class Frontend(val storeId: StoreId,
   }
 
   def readObjectForNetwork(clientId: ClientId, readUUID: UUID, locater: Locater): Unit = {
-    objectCache.get(locater.objectId) match {
+    objectCache.get(locater) match {
       case Some(os) =>
-        //println(s"Reading Store Cached Object ${locater.objectId} ${os.metadata.refcount}")
         logger.trace(s"Reading Cached object for read $readUUID. Revision ${os.metadata.revision}")
         val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
           os.data.size, Some(os.data), os.lockedWriteTransactions )
@@ -165,12 +164,12 @@ class Frontend(val storeId: StoreId,
         logger.trace(s"Reading uncached object from backing store for read $readUUID")
         val nr = NetworkRead(clientId, readUUID)
 
-        pendingReads.get(locater.objectId) match {
+        pendingReads.get(locater) match {
           case Some(lst) =>
-            pendingReads += (locater.objectId -> (nr :: lst))
+            pendingReads += (locater -> (nr :: lst))
 
           case None =>
-            pendingReads += (locater.objectId -> (nr :: Nil))
+            pendingReads += (locater -> (nr :: Nil))
             backend.read(locater)
         }
     }
@@ -180,16 +179,16 @@ class Frontend(val storeId: StoreId,
     objectCache.get(op.pointer.id) match {
       case Some(os) => opportunisticRebuild(op, os)
       case None =>
-        op.pointer.getStoreLocater(storeId).foreach {locater =>
-          pendingReads.get(locater.objectId) match {
+        if op.pointer.poolId == storeId.poolId then
+          val locater: Locater = op.pointer.id
+          pendingReads.get(locater) match {
             case Some(lst) =>
-              pendingReads += (locater.objectId -> (OpportuneRebuild(op) :: lst))
+              pendingReads += (locater -> (OpportuneRebuild(op) :: lst))
 
             case None =>
-              pendingReads += (locater.objectId -> (OpportuneRebuild(op) :: Nil))
+              pendingReads += (locater -> (OpportuneRebuild(op) :: Nil))
               backend.read(locater)
           }
-        }
     }
   }
 
@@ -197,35 +196,35 @@ class Frontend(val storeId: StoreId,
     objectCache.get(current.pointer.id) match {
       case Some(os) => repair(current, completion, os)
       case None =>
-        current.pointer.getStoreLocater(storeId).foreach { locater =>
-          pendingReads.get(locater.objectId) match {
+        if current.pointer.poolId == storeId.poolId then
+          val locater: Locater = current.pointer.id
+          pendingReads.get(locater) match {
             case Some(lst) =>
-              pendingReads += (locater.objectId -> (RepairRead(current, completion) :: lst))
+              pendingReads += (locater -> (RepairRead(current, completion) :: lst))
 
             case None =>
-              pendingReads += (locater.objectId -> (RepairRead(current, completion) :: Nil))
+              pendingReads += (locater -> (RepairRead(current, completion) :: Nil))
               backend.read(locater)
           }
-        }
     }
   }
 
   private def readObjectForTransaction(transaction: Tx, locater: Locater): Unit = {
-    logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: ${locater.objectId}")
-    objectCache.get(locater.objectId) match {
+    logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: $locater")
+    objectCache.get(locater) match {
       case Some(os) =>
-        logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: ${locater.objectId}")
+        logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $locater")
         transaction.objectLoaded(os)
       case None =>
         val tr = TransactionRead(transaction.transactionId)
 
-        pendingReads.get(locater.objectId) match {
+        pendingReads.get(locater) match {
           case Some(lst) =>
-            pendingReads += (locater.objectId -> (tr :: lst))
+            pendingReads += (locater -> (tr :: lst))
 
           case None =>
-            pendingReads += (locater.objectId -> (tr :: Nil))
-            logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: ${locater.objectId}")
+            pendingReads += (locater -> (tr :: Nil))
+            logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $locater")
             backend.read(locater)
         }
     }
@@ -240,7 +239,7 @@ class Frontend(val storeId: StoreId,
 
       os.metadata = Metadata(op.revision, rc, op.timestamp)
       os.data = op.data
-      val cs = CommitState(os.objectId, os.storePointer, os.metadata, os.objectType, os.data, os.maxSize)
+      val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
       val txid = TransactionId(op.revision.lastUpdateTxUUID)
       // No need to wait for this to complete
       commit(os, cs, txid)
@@ -256,18 +255,17 @@ class Frontend(val storeId: StoreId,
         case Some(storeData) =>
           os.metadata = Metadata(current.revision, current.refcount, current.timestamp)
           os.data = storeData
-          val cs = CommitState(os.objectId, os.storePointer, os.metadata,
-            current.pointer.objectType, os.data, current.pointer.size)
+          val cs = CommitState(os.objectId, os.metadata,
+            current.pointer.objectType, os.data)
           val txid = TransactionId(current.revision.lastUpdateTxUUID)
           backend.repair(cs, completion)
 
 
   def backendReadComplete(objectId: ObjectId,
-                          storePointer: StorePointer,
                           result: Either[ReadState, ReadError.Value]): Unit = {
     result match {
       case Left(rs) =>
-        val os = new ObjectState(objectId, storePointer, rs.metadata, rs.objectType, rs.data, None)
+        val os = new ObjectState(objectId, rs.metadata, rs.objectType, rs.data)
         objectCache.insert(os)
 
         pendingReads.get(objectId).foreach { lpr =>
@@ -308,8 +306,8 @@ class Frontend(val storeId: StoreId,
 
             case RepairRead(cos, completion) =>
               // Failure to read probably means a repair is required
-              val os = new ObjectState(objectId, storePointer, Metadata.Zeroed,
-                ObjectType.Data, DataBuffer.Empty, None)
+              val os = new ObjectState(objectId, Metadata.Zeroed,
+                ObjectType.Data, DataBuffer.Empty)
               repair(cos, completion, os)
           }
         }
@@ -330,18 +328,18 @@ class Frontend(val storeId: StoreId,
     val metadata = Metadata(ObjectRevision(msg.allocationTransactionId),
       msg.initialRefcount, msg.timestamp)
 
-    val either = backend.allocate(msg.newObjectId, msg.objectType, metadata, msg.objectData, msg.objectSize)
+    val either = backend.allocate(msg.newObjectId, msg.objectType, metadata, msg.objectData)
 
     either match {
       case Right(err) =>
-        val r = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId, None, false)
+        val r = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId, false, false)
         logger.debug(s"Failed to allocate object ${msg.newObjectId} for tx ${msg.allocationTransactionId}. Error: $err")
         net.sendClientResponse(r)
 
-      case Left(storePointer) =>
+      case Left(()) =>
         logger.trace(s"Backend allocated new object ${msg.newObjectId}. Saving in CRL. tx ${msg.allocationTransactionId}")
         val rmsg = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId,
-          Some(storePointer), false)
+          true, false)
 
         val arList = pendingAllocations.get(msg.allocationTransactionId) match
           case Some(lst) => rmsg :: lst
@@ -349,8 +347,7 @@ class Frontend(val storeId: StoreId,
 
         pendingAllocations += (msg.allocationTransactionId -> arList)
 
-        val os = new ObjectState(msg.newObjectId, storePointer, metadata, msg.objectType, msg.objectData,
-          msg.objectSize)
+        val os = new ObjectState(msg.newObjectId, metadata, msg.objectType, msg.objectData)
 
         // Ensure this object stays in the cache
         os.transactionReferences += 1
@@ -359,17 +356,15 @@ class Frontend(val storeId: StoreId,
 
         val ars = AllocationRecoveryState(
           storeId,
-          storePointer,
           msg.newObjectId,
           msg.objectType,
-          msg.objectSize,
           msg.objectData,
           msg.initialRefcount,
           msg.timestamp,
           msg.allocationTransactionId,
           msg.revisionGuard.serialize()
         )
-        
+
         crl.save(ars, () =>
           logger.trace(s"CRL Save Completed for Allocation of object ${msg.newObjectId} tx ${msg.allocationTransactionId}")
           net.sendClientResponse(rmsg)

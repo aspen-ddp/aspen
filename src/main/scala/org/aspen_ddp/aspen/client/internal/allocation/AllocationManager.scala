@@ -23,7 +23,7 @@ class AllocationManager(val client: AspenClient,
 
   def receive(m: AllocateResponse): Unit = {
     synchronized { outstandingAllocations.get(m.newObjectId) } foreach {
-      driver => driver.receiveAllocationResult(m.fromStore, m.result, m.storeNotFound)
+      driver => driver.receiveAllocationResult(m.fromStore, m.success, m.storeNotFound)
     }
   }
 
@@ -31,7 +31,6 @@ class AllocationManager(val client: AspenClient,
                                                       client: AspenClient,
                                                       transaction: Transaction,
                                                       pool: StoragePool,
-                                                      objectSize: Option[Int],
                                                       objectIDA: IDA,
                                                       encodedContent: Array[DataBuffer],
                                                       objectType: ObjectType.Value,
@@ -45,7 +44,7 @@ class AllocationManager(val client: AspenClient,
 
     val timestamp = HLCTimestamp.now
 
-    val driver = driverFactory.create(client, pool.poolId, newObjectId, objectSize, objectIDA, objectData, objectType,
+    val driver = driverFactory.create(client, pool.poolId, newObjectId, objectIDA, objectData, objectType,
       timestamp, initialRefcount, transaction.id, revisionGuard)
 
     synchronized { outstandingAllocations += (newObjectId -> driver) }
@@ -68,7 +67,6 @@ class AllocationManager(val client: AspenClient,
                           client: AspenClient,
                           transaction: Transaction,
                           pool: StoragePool,
-                          objectSize: Option[Int],
                           objectIDA: IDA,
                           initialRefcount: ObjectRefcount,
                           revisionGuard: AllocationRevisionGuard,
@@ -76,10 +74,7 @@ class AllocationManager(val client: AspenClient,
 
     val encodedContent = objectIDA.encode(initialContent)
 
-    if (objectSize.exists(encodedContent(0).size > _))
-      Future.failed(AllocationError(pool.poolId))
-
-    allocate(client, transaction, pool, objectSize, objectIDA, encodedContent, ObjectType.Data,
+    allocate(client, transaction, pool, objectIDA, encodedContent, ObjectType.Data,
       initialRefcount, revisionGuard)
   }
 
@@ -87,7 +82,6 @@ class AllocationManager(val client: AspenClient,
                               client: AspenClient,
                               transaction: Transaction,
                               pool: StoragePool,
-                              objectSize: Option[Int],
                               objectIDA: IDA,
                               initialRefcount: ObjectRefcount,
                               revisionGuard: AllocationRevisionGuard,
@@ -103,10 +97,7 @@ class AllocationManager(val client: AspenClient,
 
     val encodedContent = KVObjectState.encodeIDA(objectIDA, minimum, maximum, left, right, contents)
 
-    if (objectSize.exists(encodedContent(0).size > _))
-      return Future.failed(AllocationError(pool.poolId))
-
-    allocate(client, transaction, pool, objectSize, objectIDA, encodedContent, ObjectType.KeyValue,
+    allocate(client, transaction, pool, objectIDA, encodedContent, ObjectType.KeyValue,
       initialRefcount, revisionGuard)
   }
 }

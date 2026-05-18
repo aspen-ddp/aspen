@@ -83,11 +83,11 @@ abstract class TransactionDriver(
                                   val backgroundTasks: BackgroundTaskManager,
                                   val txd: TransactionDescription,
                                   private val finalizerFactory: TransactionFinalizer.Factory)(using ec: ExecutionContext) extends Logging {
-  def ida: IDA = txd.primaryObject.ida
+  def ida: IDA = txd.primaryObjectIDA
 
   protected val proposer: Proposer = new Proposer(storeId.poolIndex, ida.width, ida.writeThreshold)
   protected val learner: Learner = new Learner(ida.width, ida.writeThreshold)
-  protected val validAcceptorSet: Set[Byte] = txd.primaryObject.storePointers.iterator.map(sp => sp.poolIndex).toSet
+  protected val validAcceptorSet: Set[Byte] = (0 until ida.width).map(_.toByte).toSet
   protected val allObjects: Set[ObjectPointer] = txd.allReferencedObjectsSet
   protected val primaryObjectDataStores: Set[StoreId] = txd.primaryObjectDataStores
   protected val allDataStores: List[StoreId] = txd.allDataStores.toList
@@ -242,28 +242,31 @@ abstract class TransactionDriver(
                 var nAbortVotes = 0
                 var nCommitVotes = 0
                 var canCommitObject = true
+                val objIDA = txd.poolIDAMap(ptr.poolId)
 
-                ptr.storePointers.foreach(sp => peerDispositions.get(StoreId(ptr.poolId, sp.poolIndex)).foreach(disposition => {
-                  nReplies += 1
-                  disposition match {
-                    case TransactionDisposition.VoteCommit => nCommitVotes += 1
-                    case _ =>
-                      // TODO: We can be quite a bit smarter about choosing when we must abort
-                      nAbortVotes += 1
+                (0 until objIDA.width).foreach { poolIndex =>
+                  peerDispositions.get(StoreId(ptr.poolId, poolIndex.toByte)).foreach { disposition =>
+                    nReplies += 1
+                    disposition match {
+                      case TransactionDisposition.VoteCommit => nCommitVotes += 1
+                      case _ =>
+                        // TODO: We can be quite a bit smarter about choosing when we must abort
+                        nAbortVotes += 1
+                    }
                   }
-                }))
+                }
 
-                if (nReplies < ptr.ida.writeThreshold) {
+                if (nReplies < objIDA.writeThreshold) {
                   cantAttempt = true
                   break()
                 }
 
-                if (nReplies != ptr.ida.width && nCommitVotes < ptr.ida.writeThreshold && ptr.ida.width - nAbortVotes >= ptr.ida.writeThreshold) {
+                if (nReplies != objIDA.width && nCommitVotes < objIDA.writeThreshold && objIDA.width - nAbortVotes >= objIDA.writeThreshold) {
                   cantAttempt = true
                   break()
                 }
 
-                if (ptr.ida.width - nAbortVotes < ptr.ida.writeThreshold)
+                if (objIDA.width - nAbortVotes < objIDA.writeThreshold)
                   canCommitObject = false
 
                 // Once canCommitTransaction flips to false, it stays there

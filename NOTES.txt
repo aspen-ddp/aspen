@@ -1,6 +1,5 @@
 
 Refactor StoragePools and Allocation design
-  - Update StoragePool to have fixed IDA
 
   - Allocations
     - Allocations only need writeThreshold responses
@@ -24,6 +23,9 @@ Refactor StoragePools and Allocation design
     - Will clog up the CRL if left untreated
     - Might start with just relying on TransferStore to a device with space
       - Might be able to automate this eventually
+    - Could set up "spillover stores"
+      - Dedicated to hosting data for full stores
+      - Lots of implications though, will require some thought
 
 getStoragePool()
   - Needs use a cache

@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client.internal.read
 import java.util.UUID
 
 import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 
@@ -16,11 +17,12 @@ object SimpleReadDriver {
     def apply(
                client: AspenClient,
                objectPointer: ObjectPointer,
+               ida: IDA,
                readUUID:UUID,
                comment: String,
                disableOpportunisticRebuild: Boolean): ReadDriver = {
       new SimpleReadDriver(initialDelay, maxDelay, client,
-        objectPointer, readUUID, comment, disableOpportunisticRebuild)
+        objectPointer, ida, readUUID, comment, disableOpportunisticRebuild)
     }
   }
 }
@@ -34,10 +36,11 @@ class SimpleReadDriver(
                         val maxDelay: Duration,
                         client: AspenClient,
                         objectPointer: ObjectPointer,
+                        ida: IDA,
                         readUUID:UUID,
                         comment: String,
                         disableOpportunisticRebuild: Boolean) extends BaseReadDriver( client,
-  objectPointer, readUUID, comment, disableOpportunisticRebuild) {
+  objectPointer, ida, readUUID, comment, disableOpportunisticRebuild) {
 
   given ec: ExecutionContext = client.clientContext
 

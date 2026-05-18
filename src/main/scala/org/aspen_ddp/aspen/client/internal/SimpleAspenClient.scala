@@ -46,10 +46,14 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   private val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
 
   override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
-    rmgr.read(pointer, comment).map(_.asInstanceOf[DataObjectState])
+    getStoragePool(pointer.poolId).flatMap { pool =>
+      rmgr.read(pointer, pool.defaultIDA, comment).map(_.asInstanceOf[DataObjectState])
+    }
 
   override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
-    rmgr.read(pointer, comment).map(_.asInstanceOf[KeyValueObjectState])
+    getStoragePool(pointer.poolId).flatMap { pool =>
+      rmgr.read(pointer, pool.defaultIDA, comment).map(_.asInstanceOf[KeyValueObjectState])
+    }
 
   private val txManager = new TransactionManager(this, SimpleClientTransactionDriver.factory(txRetransmitDelay))
   

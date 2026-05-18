@@ -1,14 +1,14 @@
 package org.aspen_ddp.aspen.server.transaction
 
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ReadError}
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState}
-import org.aspen_ddp.aspen.server.store.{Frontend, Locater, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
+import org.aspen_ddp.aspen.server.store.{Frontend, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
 import org.apache.logging.log4j.scala.Logging
 
 import scala.concurrent.duration._
@@ -21,7 +21,7 @@ class Tx( trs: TransactionRecoveryState,
           private val crl: CrashRecoveryLog,
           private val statusCache: TransactionStatusCache,
           private val preTxRebuilds: List[PreTransactionOpportunisticRebuild],
-          private val objectLocaters: List[Locater]) extends Logging {
+          private val objectPointers: List[ObjectPointer]) extends Logging {
 
   val transactionId: TransactionId = txd.transactionId
 
@@ -34,7 +34,7 @@ class Tx( trs: TransactionRecoveryState,
   private var oresolution: Option[Boolean] = None
   private var ofinalized: Option[Boolean] = None
   private var objects: Map[ObjectId, ObjectState] = Map()
-  private var pendingObjectLoads: Int = objectLocaters.size
+  private var pendingObjectLoads: Int = objectPointers.size
   private var pendingObjectCommits: Int = 0
   private var delayedPrepare: Option[TxPrepareResponse] = None
 

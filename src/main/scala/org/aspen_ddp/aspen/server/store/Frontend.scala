@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{Allocate, AllocateResponse, ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectRevision, ObjectType, ReadError}
+import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRevision, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
@@ -51,10 +51,10 @@ class Frontend(val storeId: StoreId,
 
     ltrs.foreach { trs =>
       val txd = TransactionDescription.deserialize(trs.serializedTxd)
-      val locaters = txd.hostedObjectLocaters(storeId)
-      val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, locaters)
+      val pointers = txd.allHostedObjects(storeId)
+      val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers)
       transactions += (txd.transactionId -> tx)
-      locaters.foreach(locater => readObjectForTransaction(tx, locater))
+      pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
     }
 
     lalloc.foreach { ars =>
@@ -104,11 +104,11 @@ class Frontend(val storeId: StoreId,
     case None =>
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates)
-      val locaters = m.txd.hostedObjectLocaters(m.to)
-      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, locaters)
+      val pointers = m.txd.allHostedObjects(m.to)
+      val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers)
       transactions += (m.txd.transactionId -> tx)
       tx.receivePrepare(m)
-      locaters.foreach(locater => readObjectForTransaction(tx, locater))
+      pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }
 
   /** TxResolved messages are the one and only mechanism for resolving pending allocations */
@@ -149,8 +149,9 @@ class Frontend(val storeId: StoreId,
       }
   }
 
-  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, locater: Locater): Unit = {
-    objectCache.get(locater) match {
+  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer): Unit = {
+    val objectId = pointer.id
+    objectCache.get(objectId) match {
       case Some(os) =>
         logger.trace(s"Reading Cached object for read $readUUID. Revision ${os.metadata.revision}")
         val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
@@ -164,68 +165,69 @@ class Frontend(val storeId: StoreId,
         logger.trace(s"Reading uncached object from backing store for read $readUUID")
         val nr = NetworkRead(clientId, readUUID)
 
-        pendingReads.get(locater) match {
+        pendingReads.get(objectId) match {
           case Some(lst) =>
-            pendingReads += (locater -> (nr :: lst))
+            pendingReads += (objectId -> (nr :: lst))
 
           case None =>
-            pendingReads += (locater -> (nr :: Nil))
-            backend.read(locater)
+            pendingReads += (objectId -> (nr :: Nil))
+            backend.read(pointer)
         }
     }
   }
 
   def readObjectForOpportunisticRebuild(op: OpportunisticRebuild): Unit = {
-    objectCache.get(op.pointer.id) match {
+    val objectId = op.pointer.id
+    objectCache.get(objectId) match {
       case Some(os) => opportunisticRebuild(op, os)
       case None =>
         if op.pointer.poolId == storeId.poolId then
-          val locater: Locater = op.pointer.id
-          pendingReads.get(locater) match {
+          pendingReads.get(objectId) match {
             case Some(lst) =>
-              pendingReads += (locater -> (OpportuneRebuild(op) :: lst))
+              pendingReads += (objectId -> (OpportuneRebuild(op) :: lst))
 
             case None =>
-              pendingReads += (locater -> (OpportuneRebuild(op) :: Nil))
-              backend.read(locater)
+              pendingReads += (objectId -> (OpportuneRebuild(op) :: Nil))
+              backend.read(op.pointer)
           }
     }
   }
 
   def readObjectForRepair(current: ClientObjectState, completion: Promise[Unit]): Unit = {
-    objectCache.get(current.pointer.id) match {
+    val objectId = current.pointer.id
+    objectCache.get(objectId) match {
       case Some(os) => repair(current, completion, os)
       case None =>
         if current.pointer.poolId == storeId.poolId then
-          val locater: Locater = current.pointer.id
-          pendingReads.get(locater) match {
+          pendingReads.get(objectId) match {
             case Some(lst) =>
-              pendingReads += (locater -> (RepairRead(current, completion) :: lst))
+              pendingReads += (objectId -> (RepairRead(current, completion) :: lst))
 
             case None =>
-              pendingReads += (locater -> (RepairRead(current, completion) :: Nil))
-              backend.read(locater)
+              pendingReads += (objectId -> (RepairRead(current, completion) :: Nil))
+              backend.read(current.pointer)
           }
     }
   }
 
-  private def readObjectForTransaction(transaction: Tx, locater: Locater): Unit = {
-    logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: $locater")
-    objectCache.get(locater) match {
+  private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit = {
+    val objectId = pointer.id
+    logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: $objectId")
+    objectCache.get(objectId) match {
       case Some(os) =>
-        logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $locater")
+        logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
         transaction.objectLoaded(os)
       case None =>
         val tr = TransactionRead(transaction.transactionId)
 
-        pendingReads.get(locater) match {
+        pendingReads.get(objectId) match {
           case Some(lst) =>
-            pendingReads += (locater -> (tr :: lst))
+            pendingReads += (objectId -> (tr :: lst))
 
           case None =>
-            pendingReads += (locater -> (tr :: Nil))
-            logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $locater")
-            backend.read(locater)
+            pendingReads += (objectId -> (tr :: Nil))
+            logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $objectId")
+            backend.read(pointer)
         }
     }
   }

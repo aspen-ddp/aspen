@@ -7,7 +7,6 @@ import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.server.store.Locater
 import scala.language.implicitConversions
 
 object TransactionDescription {
@@ -88,13 +87,6 @@ final case class TransactionDescription (
     allReferencedObjectsSet.foldLeft(List[ObjectPointer]()): (l, op) =>
       if op.poolId == storeId.poolId && storeId.poolIndex < poolIDAMap(storeId.poolId).width then
         op :: l
-      else
-        l
-
-  def hostedObjectLocaters(storeId: StoreId): List[Locater] =
-    allReferencedObjectsSet.foldLeft(List[Locater]()): (l, op) =>
-      if op.poolId == storeId.poolId && storeId.poolIndex < poolIDAMap(storeId.poolId).width then
-        op.id :: l
       else
         l
 

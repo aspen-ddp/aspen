@@ -37,7 +37,7 @@ object DataObjectReaderSuite {
 
       val ida = Replication(width, threshold)
 
-      new TestReader(DataObjectPointer(ObjectId(objUUID), pool, None, ida, Array()))
+      new TestReader(DataObjectPointer(ObjectId(objUUID), pool))
     }
   }
 

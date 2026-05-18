@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.simple.{Alloc, Recovery, StreamId, StreamLocation, Tx}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
@@ -40,12 +40,8 @@ object SimpleCRLSuite:
   val accept = ProposalId(2, 2)
   val pax = PersistentState(Some(promise), Some((accept, true)))
 
-  val storePointerEmpty = StorePointer(storeId.poolIndex, Array[Byte]())
-  val storePointerEmpty2 = StorePointer(storeId2.poolIndex, Array[Byte]())
-  val storePointerData = StorePointer(storeId.poolIndex, Array[Byte](1,2,3))
   val objectId = ObjectId(new UUID(0,5))
   val objectData = DataBuffer(Array[Byte](0,1))
-  val objectSize = 5
   val refcount = ObjectRefcount(1,1)
   val timestamp = HLCTimestamp(2)
   val allocTxId = TransactionId(new UUID(0,6))
@@ -55,10 +51,8 @@ object SimpleCRLSuite:
   val trs = TransactionRecoveryState(storeId, txdata, List(ou1, ou2), disp, status, pax)
   val trs2 = TransactionRecoveryState(storeId2, txdata, Nil, disp, status, pax)
 
-  val ars = AllocationRecoveryState(storeId, storePointerData, objectId, ObjectType.Data,
-    Some(objectSize), objectData, refcount, timestamp , transactionId, serializedRevisionGuard)
-  val ars2 = AllocationRecoveryState(storeId2, storePointerEmpty2, objectId, ObjectType.Data,
-    None, objectData, refcount, timestamp, transactionId2, serializedRevisionGuard)
+  val ars = AllocationRecoveryState(storeId, objectId, ObjectType.Data, objectData, refcount, timestamp , transactionId, serializedRevisionGuard)
+  val ars2 = AllocationRecoveryState(storeId2, objectId, ObjectType.Data, objectData, refcount, timestamp, transactionId2, serializedRevisionGuard)
 
   val txdLoc = StreamLocation(StreamId(0), 16, 4)
   val ou1Loc = StreamLocation(StreamId(0), 25, 2)
@@ -71,7 +65,7 @@ object SimpleCRLSuite:
   val stream2 = StreamId(2)
 
   val oid1 = ObjectId(new UUID(0, 2))
-  val op1 = new DataObjectPointer(oid1, poolId, None, Replication(3, 2), Array(storePointerEmpty))
+  val op1 = new DataObjectPointer(oid1, poolId)
   val txd = TransactionDescription(transactionId, timestamp, op1, 1.toByte,
     List(DataUpdate(op1, ObjectRevision(transactionId), DataUpdateOperation.Overwrite)),
     List(), None, List(), List())
@@ -480,9 +474,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val x = r.arsList.head
     assert(x.storeId == ars2.storeId)
-    assert(x.storePointer == ars2.storePointer)
     assert(x.newObjectId == ars2.newObjectId)
-    assert(x.objectSize == ars2.objectSize)
     assert(x.objectData == ars2.objectData)
     assert(x.initialRefcount == ars2.initialRefcount)
     assert(x.timestamp == ars2.timestamp)
@@ -536,9 +528,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val x = r.arsList.head
     assert(x.storeId == ars.storeId)
-    assert(x.storePointer == ars.storePointer)
     assert(x.newObjectId == ars.newObjectId)
-    assert(x.objectSize == ars.objectSize)
     assert(x.objectData == ars.objectData)
     assert(x.initialRefcount == ars.initialRefcount)
     assert(x.timestamp == ars.timestamp)
@@ -547,9 +537,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val x2 = r.arsList.tail.head
     assert(x2.storeId == ars2.storeId)
-    assert(x2.storePointer == ars2.storePointer)
     assert(x2.newObjectId == ars2.newObjectId)
-    assert(x2.objectSize == ars2.objectSize)
     assert(x2.objectData == ars2.objectData)
     assert(x2.initialRefcount == ars2.initialRefcount)
     assert(x2.timestamp == ars2.timestamp)
@@ -587,9 +575,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val x = r.arsList.head
     assert(x.storeId == ars.storeId)
-    assert(x.storePointer == ars.storePointer)
     assert(x.newObjectId == ars.newObjectId)
-    assert(x.objectSize == ars.objectSize)
     assert(x.objectData == ars.objectData)
     assert(x.initialRefcount == ars.initialRefcount)
     assert(x.timestamp == ars.timestamp)
@@ -639,9 +625,8 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(r.activeStreamId == stream0)
   }
 
-  test("Alloc Static Save & Load With Empty StorePointer & Data") {
-    val ars = AllocationRecoveryState( storeId, storePointerEmpty, objectId, ObjectType.KeyValue,
-      None, objectData, refcount, timestamp, allocTxId, serializedRevisionGuard)
+  test("Alloc Static Save & Load With Empty Data") {
+    val ars = AllocationRecoveryState( storeId, objectId, ObjectType.KeyValue, objectData, refcount, timestamp, allocTxId, serializedRevisionGuard)
 
     val a = Alloc(Some(allocDataLocation), ars)
 
@@ -655,19 +640,16 @@ class SimpleCRLSuite extends FileBasedTests {
 
     assert(la.txid.storeId == ars.storeId)
     assert(la.txid.transactionId == ars.allocationTransactionId)
-    assert(la.storePointer == ars.storePointer)
     assert(la.newObjectId == ars.newObjectId)
     assert(la.objectType == ars.objectType)
-    assert(la.objectSize == ars.objectSize)
     assert(la.initialRefcount == ars.initialRefcount)
     assert(la.timestamp == ars.timestamp)
     assert(la.serializedRevisionGuard == ars.serializedRevisionGuard)
   }
 
-  test("Alloc Static Save & Load With NonEmpty StorePointer & No Data") {
+  test("Alloc Static Save & Load With No Data") {
     val noObjectData = DataBuffer(Array[Byte]())
-    val ars = AllocationRecoveryState(storeId, storePointerData, objectId, ObjectType.Data,
-      None, noObjectData, refcount, timestamp, allocTxId, serializedRevisionGuard)
+    val ars = AllocationRecoveryState(storeId, objectId, ObjectType.Data, noObjectData, refcount, timestamp, allocTxId, serializedRevisionGuard)
 
     val a = Alloc(Some(allocDataLocation), ars)
 
@@ -681,10 +663,8 @@ class SimpleCRLSuite extends FileBasedTests {
 
     assert(la.txid.storeId == ars.storeId)
     assert(la.txid.transactionId == ars.allocationTransactionId)
-    assert(la.storePointer == ars.storePointer)
     assert(la.newObjectId == ars.newObjectId)
     assert(la.objectType == ars.objectType)
-    assert(la.objectSize == ars.objectSize)
     assert(la.initialRefcount == ars.initialRefcount)
     assert(la.timestamp == ars.timestamp)
     assert(la.serializedRevisionGuard == ars.serializedRevisionGuard)

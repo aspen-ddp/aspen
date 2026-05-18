@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
@@ -38,12 +38,8 @@ object BaseReadDriverSuite {
   val ds1 = StoreId(poolId, 1)
   val ds2 = StoreId(poolId, 2)
 
-  val sp0 = StorePointer(0, List[Byte](0).toArray)
-  val sp1 = StorePointer(1, List[Byte](1).toArray)
-  val sp2 = StorePointer(2, List[Byte](2).toArray)
-
-  val ptr = DataObjectPointer(objId, poolId, None, ida, (sp0 :: sp1 :: sp2 :: Nil).toArray)
-  val kvptr = KeyValueObjectPointer(objId, poolId, None, ida, (sp0 :: sp1 :: sp2 :: Nil).toArray)
+  val ptr = DataObjectPointer(objId, poolId)
+  val kvptr = KeyValueObjectPointer(objId, poolId)
   val rev = ObjectRevision.Null
   val ref = ObjectRefcount(1,1)
 
@@ -182,7 +178,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     //        println(s"ptr(${ptr}), rev(${nrev2}), ref(${ref}), ts(${ts}), data(${com.ibm.aspen.util.db2string(odata)})")
     //    }
 
-    o should be (DataObjectState(ptr, nrev2, ref, ts, readTime, 5, odata))
+    o should be (DataObjectState(ptr, nrev2, ref, ts, readTime, ida, 5, odata))
   }
 
   test("Ignore old revisions") {
@@ -202,7 +198,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     r.readResult.isCompleted should be (true)
     val o = Await.result(r.readResult, awaitDuration)
 
-    o should be (DataObjectState(ptr, nrev2, ref, ts, ts, 5, odata))
+    o should be (DataObjectState(ptr, nrev2, ref, ts, ts, ida, 5, odata))
   }
 
   test("Use minimum readTime") {

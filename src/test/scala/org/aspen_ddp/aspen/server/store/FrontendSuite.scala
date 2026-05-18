@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.{Allocate, AllocateResponse, ClientId,
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ObjectRevisionGuard, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.store.{StoreId, StorePointer}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
@@ -30,8 +30,7 @@ object FrontendSuite {
   val txid1 = TransactionId(new UUID(0,5))
   val txid2 = TransactionId(new UUID(0,6))
   val rev0 = new ObjectRevision(new UUID(0, 7))
-  val sp1 = StorePointer(0, Array[Byte]())
-  val op1 = new DataObjectPointer(oid1, poolId, None, Replication(3,2), Array(sp1))
+  val op1 = new DataObjectPointer(oid1, poolId)
 
   class TestNet extends Messenger {
 
@@ -110,7 +109,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       fromClient = clientId,
       newObjectId = oid1,
       objectType = ObjectType.Data,
-      objectSize = None,
       initialRefcount = iref,
       objectData = idata,
       timestamp = its,
@@ -137,7 +135,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     assert(ar.fromStore == storeId)
     assert(ar.allocationTransactionId == txid1)
     assert(ar.newObjectId == oid1)
-    assert(ar.result.contains(sp1))
+    assert(ar.success)
 
     assert(cache.get(oid1).nonEmpty)
     assert(backend.get(oid1).isEmpty)
@@ -164,7 +162,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       fromClient = clientId,
       newObjectId = oid1,
       objectType = ObjectType.Data,
-      objectSize = None,
       initialRefcount = iref,
       objectData = idata,
       timestamp = its,

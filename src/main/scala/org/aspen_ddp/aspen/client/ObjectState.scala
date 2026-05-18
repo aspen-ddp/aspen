@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client
 import java.util.UUID
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -62,12 +63,13 @@ class DataObjectState(
                        refcount: ObjectRefcount,
                        timestamp: HLCTimestamp,
                        readTimestamp: HLCTimestamp,
+                       val ida: IDA,
                        val sizeOnStore: Int,
                        val data: DataBuffer) extends ObjectState(pointer, revision, refcount, timestamp, readTimestamp) {
 
   def lastUpdateTimestamp: HLCTimestamp = timestamp
 
-  def size: Int = pointer.ida.calculateRestoredObjectSize(sizeOnStore)
+  def size: Int = ida.calculateRestoredObjectSize(sizeOnStore)
 
   def canEqual(other: Any): Boolean = other.isInstanceOf[DataObjectState]
 
@@ -80,9 +82,11 @@ class DataObjectState(
     val hashCodes = List(pointer.hashCode, revision.hashCode, refcount.hashCode, timestamp.hashCode, data.hashCode)
     hashCodes.reduce( (a,b) => a ^ b )
 
-  def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] = pointer.getEncodedDataIndexForStore(storeId).map { idx =>
-    pointer.ida.encode(data)(idx)
-  }
+  def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] =
+    if storeId.poolId == pointer.poolId && storeId.poolIndex < ida.width then
+      Some(ida.encode(data)(storeId.poolIndex))
+    else
+      None
 }
 
 object DataObjectState {
@@ -92,8 +96,9 @@ object DataObjectState {
              refcount:ObjectRefcount,
              timestamp: HLCTimestamp,
              readTimestamp: HLCTimestamp,
+             ida: IDA,
              sizeOnStore: Int,
-             data: DataBuffer): DataObjectState = new DataObjectState(pointer, revision, refcount, timestamp, readTimestamp, sizeOnStore, data)
+             data: DataBuffer): DataObjectState = new DataObjectState(pointer, revision, refcount, timestamp, readTimestamp, ida, sizeOnStore, data)
 }
 
 class KeyValueObjectState(
@@ -102,6 +107,7 @@ class KeyValueObjectState(
                            refcount:ObjectRefcount,
                            timestamp: HLCTimestamp,
                            readTimestamp: HLCTimestamp,
+                           val ida: IDA,
                            val minimum: Option[Key],
                            val maximum: Option[Key],
                            val left: Option[Value],
@@ -111,7 +117,7 @@ class KeyValueObjectState(
 
   def sizeOnStore: Int =
     def encodedValueSize(v: Value): Int =
-      val sz = pointer.ida.calculateEncodedSegmentLength(v.bytes.length)
+      val sz = ida.calculateEncodedSegmentLength(v.bytes.length)
       Varint.getUnsignedIntEncodingLength(sz) + sz
     var size = 1 // mask byte
     minimum.foreach(key => size += Varint.getUnsignedIntEncodingLength(key.bytes.length) + key.bytes.length)
@@ -131,7 +137,7 @@ class KeyValueObjectState(
     def encodedKeySize(k: Key): Int = Varint.getUnsignedIntEncodingLength(k.bytes.length) + k.bytes.length
 
     def encodedValueSize(v: Value): Int =
-      val sz = pointer.ida.calculateEncodedSegmentLength(v.bytes.length)
+      val sz = ida.calculateEncodedSegmentLength(v.bytes.length)
       Varint.getUnsignedIntEncodingLength(sz) + sz
 
     val adds = inserts.foldLeft(0){ (sz, t) =>
@@ -228,23 +234,21 @@ class KeyValueObjectState(
 
     s"KVObjectState(object: ${pointer.id}, revision: $revision, refcount: $refcount, min: $min, max: $max, left: $l, right: $r, contents: $contents"
 
-  def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] = pointer.getEncodedDataIndexForStore(storeId).map { idaIndex =>
-
-    import org.aspen_ddp.aspen.server.store.KVObjectState
-    import org.aspen_ddp.aspen.server.store.ValueState
-
-    var storeContent: Map[Key, ValueState] = Map()
-
-    contents.foreach { t =>
-      val (key, vs) = t
-      val idaEncodedValue = Value(pointer.ida.encode(vs.value.bytes)(idaIndex))
-      storeContent += (key -> new ValueState(idaEncodedValue, vs.revision, vs.timestamp, None))
-    }
-
-    val kvos = new KVObjectState(minimum, maximum, left, right, storeContent, Map())
-
-    kvos.encode()
-  }
+  def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] =
+    if storeId.poolId != pointer.poolId || storeId.poolIndex >= ida.width then
+      None
+    else
+      import org.aspen_ddp.aspen.server.store.KVObjectState
+      import org.aspen_ddp.aspen.server.store.ValueState
+      val idaIndex = storeId.poolIndex
+      var storeContent: Map[Key, ValueState] = Map()
+      contents.foreach { t =>
+        val (key, vs) = t
+        val idaEncodedValue = Value(ida.encode(vs.value.bytes)(idaIndex))
+        storeContent += (key -> new ValueState(idaEncodedValue, vs.revision, vs.timestamp, None))
+      }
+      val kvos = new KVObjectState(minimum, maximum, left, right, storeContent, Map())
+      Some(kvos.encode())
 }
 
 object KeyValueObjectState {
@@ -264,12 +268,13 @@ object KeyValueObjectState {
                refcount:ObjectRefcount,
                timestamp: HLCTimestamp,
                readTimestamp: HLCTimestamp,
+               ida: IDA,
                minimum: Option[Key],
                maximum: Option[Key],
                left: Option[Value],
                right: Option[Value],
                contents: Map[Key, KeyValueObjectState.ValueState]): KeyValueObjectState =
-    KeyValueObjectState(pointer, revision, refcount, timestamp, readTimestamp, minimum, maximum, left, right, contents)
+    KeyValueObjectState(pointer, revision, refcount, timestamp, readTimestamp, ida, minimum, maximum, left, right, contents)
 
   def cmp(a: Option[Array[Byte]], b: Option[Array[Byte]]): Boolean = (a,b) match
     case (None, None) => true

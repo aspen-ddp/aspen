@@ -1,3 +1,85 @@
+Allocation special-case removal
+  - Probably ought to get Transactions with Allocations working
+    without AllocationManager and the like.
+
+    - Looks like this can be done in SinglePoolObjectAllocater
+      - Add the ObjectId to allocatingObjects in Tx
+      - Add finalization action
+
+      - When Store sees an "update" to an object being allocated:
+        - Create the object state that would result from a backend read
+          and immediately "complete" the read action.
+        - Try to avoid placing this in the read cache for correctness reasons
+          - Shouldn't be able to read uncommitted data
+        - ALTERNATIVELY - place an "allowRead" boolean on object state
+          - Set to false when creating allocating object
+          - Set to true if allocated object commits
+
+      - If ObjectRevision matches current Transaction, that's also a success
+
+    - Add "allocatingObjects" - List of ObjectIds that are being allocated
+      - Allows stores to detect this if needed in the future
+
+    - NOTE: Use case for writing to allocated objects:
+      - Multi-node add to linked list. Allocate 3 nodes then fill them with
+        content and pointers to each other
+      - COULD
+        - Allocate w/o content, Subsequent update IS allowed and sets the initial
+          content.
+        - Allocate w/ content. Subsequent updates are NOT allowed
+          - Implemented as Allocate w/o then .map: ptr =>
+            tx.overwrite/update
+            ptr
+        - Tx - At build time, if no update/overwrite called for an object being
+          allocated, just use an empty buffer for content.
+
+        - After creating the ObjectPointer
+           - Add to tx.allocatingObjects list
+           - Add the AllocationFinalizationAction
+
+    - NOTE: For reading objects currently being allocated, do this from
+      within AspenClient
+        - Do we really need this capability?
+          - What's the valid use case of reading content from a Tx that isn't
+            committed?
+        - When we stop using Allocate messages, we should see unit test failures
+          if this is really needed. Then we can figure out why and if it makes
+          sense to support.
+        - IF NEEDED, we can probably handle this entirely inside the AspenClient
+        - Use AllocationTracker instance (shared by SimpleAspenClient
+          and TestClient in unitest framework). Read from here first then go to
+          network
+
+     - NOTE: ObjectCache in Frontend DOES have Objects Under Allocation
+           - Hopefully we can remove this entirely.
+           - Only do this as a last resort
+           - Need to easily distinguish objects pending allocation so they can be
+             added to the cache
+           - Need to create object and add to cache like in Fronend.allocateObject()
+           - In Frontend: if allocating, add to objectCache
+             - On commit, just overwrite the entry (no harm)
+             - On abort, remove all allocating objects from cache
+
+  - THEN remove the supportinginfrastructure
+
+  - AllocationRevisionGuard - no longer needed
+  - AllocationFinalizationAction
+    - Still Required for new objects
+    - Currently added in AllocationManager
+  - Allocation Manager - no longer needed
+  - Allocation Messages - removed
+  - CRL AllocationState tracking - removed
+
+ObjectPointer creation - Will need generic mechanism for creating ObjectPointers for
+advanced use cases like Flat-file backed stores.
+  - Maybe StoragePoolState has an allocatorImplUUID - for TypeRegistry factory
+  - Maybe also has an optional allocatorStatePtr field pointing to the root object for
+    implementing the allocator strategy
+
+For OutOfSpace errors, could put "allocatingObjects" in Txd.
+  - Stores could then use this to detect allocations
+  - Vote abort if not enough space?
+
 
 Refactor StoragePools and Allocation design
 
@@ -165,6 +247,21 @@ Need a gossip protocol for spreading the word about cache invalidation for
   2. StoreId has been migrated to a new hostState
 For now we can ignore this. Hosts don't change frequently and store moves
 can be found via error messages to read/write operations
+
+-----------------------------------------------------------
+- Brainstorming
+
+For maximum recovery speed, DurableRecoveryManagerTask
+  - Delegates restore operations to groups of workers
+  - Workers restore objects
+     - Store the results locally (not re-erasure coded)
+       - Could use a RocksDB-like backend. Key = ObjId + PoolIndex
+     - Update dist datastructure noting their location
+  - End-location downloads rebulit slices as they're created
+
+  + End-location can be throttled so as not to overload bandwidth
+  + Data can be rebuilt at maximum speed (no choke points)
+  + Rebuilt data can be read from dist data structure at a speed penalty
 
 -----------------------------------------------------------
 

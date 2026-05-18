@@ -33,7 +33,7 @@ object Bootstrap:
     )
 
     val bootstrapMetadata = Metadata(
-      ObjectRevision(TransactionId(new UUID(0,0))),
+      ObjectRevision(TransactionId(UUID.randomUUID())),
       ObjectRefcount(1,1),
       HLCTimestamp.now
     )

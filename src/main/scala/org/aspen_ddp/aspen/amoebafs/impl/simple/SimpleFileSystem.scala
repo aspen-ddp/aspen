@@ -67,17 +67,17 @@ object SimpleFileSystem {
     for
       kvos <- client.read(fsRoot)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
-      defaultAllocator = new SinglePoolObjectAllocator(client, rootPool, rootPool.defaultIDA, None)
+      defaultAllocator = new SinglePoolObjectAllocator(client, rootPool, rootPool.ida, None)
       executorRoot = KeyValueObjectPointer(kvos.contents(TaskExecutorRootKey).value.bytes)
       executor <- SimpleTaskExecutor(client, defaultAllocator, executorRoot)
     yield
-      new SimpleFileSystem(client, kvos, rootPool.defaultIDA, defaultAllocator, executor, numContextThreads)
+      new SimpleFileSystem(client, kvos, rootPool.ida, defaultAllocator, executor, numContextThreads)
 
   }
 }
 class SimpleFileSystem(aclient: AspenClient,
                        fsRoot: KeyValueObjectState,
-                       val defaultIDA: IDA,
+                       val ida: IDA,
                        defaultAllocator: ObjectAllocator,
                        executor: TaskExecutor,
                        val numContextThreads: Int = 4,

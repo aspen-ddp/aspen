@@ -19,7 +19,7 @@ class NamespacedUUIDRegistrySuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator(Replication(3, 2))
+      alloc = pool.createAllocator
       ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
       nodeAllocator = SinglePoolNodeAllocator(client, Radicle.poolId)
       _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())

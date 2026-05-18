@@ -228,8 +228,8 @@ class SimpleFileContent(file: SimpleFile,
           ObjectRefcount(0, 1),
           HLCTimestamp.now,
           HLCTimestamp.now,
-          fs.defaultIDA,
-          fs.defaultIDA.calculateEncodedSegmentLength(db.size),
+          fs.ida,
+          fs.ida.calculateEncodedSegmentLength(db.size),
           db)
 
         (dos, remaining)

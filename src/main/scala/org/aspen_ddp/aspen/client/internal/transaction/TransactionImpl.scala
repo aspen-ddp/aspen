@@ -138,7 +138,7 @@ class TransactionImpl(val client: AspenClient,
         val poolIds = bldr.allReferencedPoolIds
 
         val poolIDAMapFuture = Future.sequence(
-          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.defaultIDA))
+          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.ida))
         ).map(_.toMap)
 
         poolIDAMapFuture.failed.foreach { cause =>

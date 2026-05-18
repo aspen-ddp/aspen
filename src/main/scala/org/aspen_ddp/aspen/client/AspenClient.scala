@@ -98,12 +98,12 @@ trait AspenClient extends ObjectReader:
       transact(prepare)
       
   def createNewStoragePool(name: String,
-                           defaultIDA: IDA,
+                           ida: IDA,
                            maxObjectSize: Option[Int],
                            storageDeviceIds: List[StorageDeviceId],
                            backendConfig: BackendConfig): Future[PoolId] =
-    if storageDeviceIds.size < defaultIDA.width then
-      Future.failed(new IllegalArgumentException("storageDeviceIds list must be at least as long as defaultIDA.width"))
+    if storageDeviceIds.size < ida.width then
+      Future.failed(new IllegalArgumentException("storageDeviceIds list must be at least as long as ida.width"))
     else
       given ExecutionContext = this.clientContext
       val poolId = PoolId(UUID.randomUUID())
@@ -113,9 +113,9 @@ trait AspenClient extends ObjectReader:
         config = StoragePoolState(
           poolId,
           name,
-          defaultIDA, 
-          maxObjectSize, 
-          stores, 
+          ida,
+          maxObjectSize,
+          stores,
           backendConfig
         )
         _ <- createStoragePool(config)

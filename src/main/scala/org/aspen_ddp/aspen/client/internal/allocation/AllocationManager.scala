@@ -38,7 +38,7 @@ class AllocationManager(val client: AspenClient,
                                                       revisionGuard: AllocationRevisionGuard
                                                     ): Future[PointerType] = {
 
-    val hosts = pool.selectStoresForAllocation(objectIDA)
+    val hosts = (0 until objectIDA.width).toArray
     val objectData = hosts.map(_.toByte).zip(encodedContent).toMap
     val newObjectId = ObjectId(UUID.randomUUID())
 

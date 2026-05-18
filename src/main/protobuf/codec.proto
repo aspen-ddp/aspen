@@ -520,7 +520,7 @@ enum BackendConfig {
 message StoragePoolState {
   UUID poolId = 1;
   string name = 2;
-  IDA defaultIDA = 3;
+  IDA ida = 3;
   uint32 maxObjectSize = 4;
   repeated PoolStoreEntry stores = 5;
   BackendConfig backendConfig = 6;

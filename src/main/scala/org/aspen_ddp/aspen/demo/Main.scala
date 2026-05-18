@@ -373,7 +373,7 @@ object Main {
         println("Creating Amoeba")
         val guard = ObjectRevisionGuard(kvos.pointer, kvos.revision)
         client.getStoragePool(kvos.pointer.poolId).flatMap { pool =>
-          val allocator = new SinglePoolObjectAllocator(client, pool, pool.defaultIDA, None)
+          val allocator = new SinglePoolObjectAllocator(client, pool, pool.ida, None)
           SimpleFileSystem.bootstrap(client, guard, allocator, kvos.pointer, AmoebafsKey)
         }
     }
@@ -472,7 +472,7 @@ object Main {
       kvos <- client.read(radicle)
       _ = println("------------ Getting Storage Pool---------------")
       pool <- client.getStoragePool(kvos.pointer.poolId)
-      alloc = pool.createAllocator(Replication(3,2))
+      alloc = pool.createAllocator
       _ = println("------------ Allocating Data Object ---------------")
       key = Key(100)
       dptr <- allocObject(kvos.contents.get(key), kvos, alloc)

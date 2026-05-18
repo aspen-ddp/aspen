@@ -16,26 +16,16 @@ trait StoragePool:
 
   val name: String
 
-  val numberOfStores: Int
-
   val maxObjectSize: Option[Int]
 
-  val defaultIDA: IDA
+  val ida: IDA
 
   val stores: Array[StoragePoolState.StoreEntry]
-  
+
   val backendConfig: BackendConfig
 
-  def supportsIDA(ida: IDA): Boolean
-
-  def createAllocator(ida: IDA): ObjectAllocator
-  
-  def defaultAllocator: ObjectAllocator = createAllocator(defaultIDA)
-
-  /** Throws AllocationError: UnsupportedIDA if the IDA is not supported*/
-  private[client] def selectStoresForAllocation(ida: IDA): Array[Int]
+  def createAllocator: ObjectAllocator
 
   def allocationTree: TieredKeyValueList
 
   def errorTree: TieredKeyValueList
-

@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
 object SimpleStoragePool:
-  
+
   def apply(client: AspenClient, kvos: KeyValueObjectState): SimpleStoragePool =
 
     val cfg = StoragePoolState(kvos)
@@ -22,7 +22,7 @@ object SimpleStoragePool:
     val errorTree = new TieredKeyValueList(client,
       new KVObjectRootManager(client, StoragePoolState.ErrorTreeKey, kvos.pointer))
 
-    new SimpleStoragePool(client, cfg.poolId, cfg.name, cfg.numberOfStores, cfg.defaultIDA, cfg.stores,
+    new SimpleStoragePool(client, cfg.poolId, cfg.name, cfg.ida, cfg.stores,
       cfg.backendConfig, cfg.maxObjectSize,
       allocTree, errorTree)
 
@@ -30,22 +30,12 @@ object SimpleStoragePool:
 class SimpleStoragePool(val client: AspenClient,
                         val poolId: PoolId,
                         val name: String,
-                        val numberOfStores: Int,
-                        val defaultIDA: IDA,
+                        val ida: IDA,
                         val stores: Array[StoragePoolState.StoreEntry],
                         val backendConfig: BackendConfig,
                         val maxObjectSize: Option[Int],
                         val allocationTree: TieredKeyValueList,
                         val errorTree: TieredKeyValueList) extends StoragePool:
 
-  override def supportsIDA(ida: IDA): Boolean = numberOfStores >= ida.width
-
-  override def createAllocator(ida: IDA): ObjectAllocator = new SinglePoolObjectAllocator(client,
+  override def createAllocator: ObjectAllocator = new SinglePoolObjectAllocator(client,
     this, ida, maxObjectSize)
-
-  override def selectStoresForAllocation(ida: IDA): Array[Int] = 
-    val arr = new Array[Int](ida.width)
-    for (i <- 0 until ida.width)
-      arr(i) = i
-    arr
-

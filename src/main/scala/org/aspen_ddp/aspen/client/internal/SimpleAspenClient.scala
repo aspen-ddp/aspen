@@ -47,12 +47,12 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
     getStoragePool(pointer.poolId).flatMap { pool =>
-      rmgr.read(pointer, pool.defaultIDA, comment).map(_.asInstanceOf[DataObjectState])
+      rmgr.read(pointer, pool.ida, comment).map(_.asInstanceOf[DataObjectState])
     }
 
   override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
     getStoragePool(pointer.poolId).flatMap { pool =>
-      rmgr.read(pointer, pool.defaultIDA, comment).map(_.asInstanceOf[KeyValueObjectState])
+      rmgr.read(pointer, pool.ida, comment).map(_.asInstanceOf[KeyValueObjectState])
     }
 
   private val txManager = new TransactionManager(this, SimpleClientTransactionDriver.factory(txRetransmitDelay))
@@ -150,7 +150,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
-        poolPtr <- createPoolObj(bsPool.defaultAllocator)
+        poolPtr <- createPoolObj(bsPool.createAllocator)
         _ <- objectRegistry.prepareRegisterObject(config.poolId.uuid, poolPtr)
         _ <- namespacedRegistry.prepareRegisterObject("pool", config.name, config.poolId.uuid)
         devUpdates <- Future.sequence(collectDevices(config.stores))

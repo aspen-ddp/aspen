@@ -1139,7 +1139,7 @@ object Codec extends Logging:
 
     builder.setPoolId(encodeUUID(o.poolId.uuid))
     builder.setName(o.name)
-    builder.setDefaultIDA(encode(o.defaultIDA))
+    builder.setIda(encode(o.ida))
     builder.setMaxObjectSize(o.maxObjectSize.getOrElse(0))
     builder.setBackendConfig(encodeBackendConfig(o.backendConfig))
 
@@ -1151,12 +1151,12 @@ object Codec extends Logging:
   def decode(m: codec.StoragePoolState): StoragePoolState =
     val poolId = PoolId(decodeUUID(m.getPoolId))
     val name = m.getName
-    val defaultIDA = decode(m.getDefaultIDA)
+    val ida = decode(m.getIda)
     val maxObjectSize = if m.getMaxObjectSize == 0 then None else Some(m.getMaxObjectSize)
     val stores = m.getStoresList.asScala.map(decode).toArray
     val backendConfig = decodeBackendConfig(m.getBackendConfig)
 
-    StoragePoolState(poolId, name, defaultIDA, maxObjectSize, stores, backendConfig)
+    StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig)
 
 
   def encode(o: HostState): codec.HostState =

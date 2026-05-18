@@ -202,7 +202,7 @@ class StoreManager(val client: AspenClient,
                 
             val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
               aspenSystemId,
-              poolCfg.defaultIDA,
+              poolCfg.ida,
               hostsList,
               storeMap
             )

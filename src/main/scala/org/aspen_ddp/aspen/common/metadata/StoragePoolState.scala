@@ -25,12 +25,11 @@ object StoragePoolState:
 final case class StoragePoolState(
                                    poolId: PoolId,
                                    name: String,
-                                   defaultIDA: IDA,
+                                   ida: IDA,
                                    maxObjectSize: Option[Int],
                                    stores: Array[StoragePoolState.StoreEntry],
                                    backendConfig: BackendConfig
                                  ):
-  def numberOfStores: Int = stores.length
 
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
 

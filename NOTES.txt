@@ -1,11 +1,6 @@
 
-Refactor StoragePools, ObjectPointers, and Allocation design
-  - StoragePools use a fixed IDA
-  - IDA removed from ObjectPointer
-
-  - IndexMap removed from ObjectPointer
-  - storeLocators list replaced with singular, optional StoreLocator
-    - Idea being a fixed value assigned at allocation time for all stores
+Refactor StoragePools and Allocation design
+  - Update StoragePool to have fixed IDA
 
   - Allocations
     - Allocations only need writeThreshold responses
@@ -29,6 +24,10 @@ Refactor StoragePools, ObjectPointers, and Allocation design
     - Will clog up the CRL if left untreated
     - Might start with just relying on TransferStore to a device with space
       - Might be able to automate this eventually
+
+getStoragePool()
+  - Needs use a cache
+  - Called every time there is a read
 
 How to know space usage
   - Added Backend.estimateSize(): Long

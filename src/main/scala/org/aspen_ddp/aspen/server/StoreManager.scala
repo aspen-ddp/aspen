@@ -658,7 +658,7 @@ class StoreManager(val client: AspenClient,
 
           case r: Read =>
             if r.objectPointer.poolId == store.storeId.poolId then
-              store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer.id)
+              store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer)
 
           case op: OpportunisticRebuild => store.frontend.readObjectForOpportunisticRebuild(op)
 

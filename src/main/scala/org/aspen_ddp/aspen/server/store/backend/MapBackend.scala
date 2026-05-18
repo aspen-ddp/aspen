@@ -3,7 +3,8 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.store.{Locater, ObjectState}
+import org.aspen_ddp.aspen.common.objects.ObjectPointer
+import org.aspen_ddp.aspen.server.store.ObjectState
 
 import java.nio.file.Path
 import scala.concurrent.{Future, Promise}
@@ -61,14 +62,15 @@ class MapBackend(val storeId: StoreId) extends Backend {
     //m -= objectId
   }
 
-  override def read(locater: Locater): Unit = {
+  override def read(pointer: ObjectPointer): Unit = {
     chandler.foreach { handler =>
-      m.get(locater) match {
+      val objectId = pointer.id
+      m.get(objectId) match {
         case None =>
-          handler.complete(Read(storeId, locater, Right(ReadError.ObjectNotFound)))
+          handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
         case Some(os) =>
           val rs = ReadState(os.objectId, os.metadata, os.objectType, os.data, Set())
-          handler.complete(Read(storeId, locater, Left(rs)))
+          handler.complete(Read(storeId, objectId, Left(rs)))
       }
     }
   }

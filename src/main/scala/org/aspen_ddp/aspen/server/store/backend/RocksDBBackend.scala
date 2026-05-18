@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.store.Locater
+import org.aspen_ddp.aspen.common.objects.ObjectPointer
 
 import java.nio.file.Path
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -114,30 +114,31 @@ class RocksDBBackend(dbPath:Path,
     allocating -= objectId
   }
 
-  override def read(locater: Locater): Unit = {
-    logger.debug(s"RocksDBBackend beginning load of object: $locater")
+  override def read(pointer: ObjectPointer): Unit = {
+    val objectId = pointer.id
+    logger.debug(s"RocksDBBackend beginning load of object: $objectId")
 
-    synchronized { allocating.get(locater) } match {
+    synchronized { allocating.get(objectId) } match {
       case Some((objectType, metadata, data)) =>
         chandler.foreach { handler =>
-          val rs = ReadState(locater, metadata, objectType, data, Set())
-          handler.complete(Read(storeId, locater, Left(rs)))
+          val rs = ReadState(objectId, metadata, objectType, data, Set())
+          handler.complete(Read(storeId, objectId, Left(rs)))
         }
       case None =>
-        val key = tokey(locater)
+        val key = tokey(objectId)
         db.get(key).onComplete {
-          case Failure(err) => logger.error(s"RocksDBBackend failed to load object: $locater. Error: $err")
+          case Failure(err) => logger.error(s"RocksDBBackend failed to load object: $objectId. Error: $err")
           case Success(oresult) =>
             chandler.foreach { handler =>
               oresult match {
                 case None =>
-                  logger.info(s"RocksDBBackend ObjectNotFound: $locater")
-                  handler.complete(Read(storeId, locater, Right(ReadError.ObjectNotFound)))
+                  logger.info(s"RocksDBBackend ObjectNotFound: $objectId")
+                  handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
                 case Some(value) =>
-                  logger.debug(s"RocksDBBackend loaded object: $locater")
+                  logger.debug(s"RocksDBBackend loaded object: $objectId")
                   val (objectType, metadata, data) = decodeDBValue(value)
-                  val rs = ReadState(locater, metadata, objectType, data, Set())
-                  handler.complete(Read(storeId, locater, Left(rs)))
+                  val rs = ReadState(objectId, metadata, objectType, data, Set())
+                  handler.complete(Read(storeId, objectId, Left(rs)))
               }
             }
         }

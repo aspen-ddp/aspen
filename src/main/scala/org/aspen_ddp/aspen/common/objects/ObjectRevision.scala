@@ -37,7 +37,8 @@ object ObjectRevision {
     new ObjectRevision(new UUID(msb, lsb))
   }
 
-  val Null = ObjectRevision(TransactionId(new UUID(0,0)))
+  val Null: ObjectRevision = ObjectRevision(TransactionId(new UUID(0,0)))
+  val Allocating: ObjectRevision = ObjectRevision(TransactionId(new UUID(0,0)))
 
   val EncodedSize: Int = 16
 }

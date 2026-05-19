@@ -24,7 +24,8 @@ class KeyValueListSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      //lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      lptr <- alloc.allocateKeyValueObject()
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)

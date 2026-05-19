@@ -70,7 +70,7 @@ trait Transaction {
     */
   def commit(): Future[HLCTimestamp]
 
-  protected[client] def addAllocatingObject(objectId: ObjectId): Unit
+  protected[client] def addAllocatingObject(objectPtr: ObjectPointer): Unit
 
   /** Used by allocations to ensure they receive notice of the allocating transaction result
     */

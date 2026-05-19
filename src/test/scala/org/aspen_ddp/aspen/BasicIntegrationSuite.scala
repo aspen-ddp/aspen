@@ -93,7 +93,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
 
       alloc = pool.createAllocator
-
+      
       kp <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(key -> value))
 
       _ <- tx.commit().map(_=>())

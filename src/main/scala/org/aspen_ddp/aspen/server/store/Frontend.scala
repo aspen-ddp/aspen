@@ -3,9 +3,9 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{Allocate, AllocateResponse, ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRevision, ObjectType, ReadError}
+import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
-import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitState, Completion, Read}
@@ -151,7 +151,8 @@ class Frontend(val storeId: StoreId,
 
   def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer): Unit = {
     val objectId = pointer.id
-    objectCache.get(objectId) match {
+
+    objectCache.get(objectId) match
       case Some(os) =>
         logger.trace(s"Reading Cached object for read $readUUID. Revision ${os.metadata.revision}")
         val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
@@ -160,20 +161,18 @@ class Frontend(val storeId: StoreId,
         val rr = ReadResponse(clientId, storeId, readUUID, HLCTimestamp.now, Right(cs) )
         net.sendClientResponse(rr)
 
-
       case None =>
         logger.trace(s"Reading uncached object from backing store for read $readUUID")
+
         val nr = NetworkRead(clientId, readUUID)
 
-        pendingReads.get(objectId) match {
+        pendingReads.get(objectId) match
           case Some(lst) =>
             pendingReads += (objectId -> (nr :: lst))
 
           case None =>
             pendingReads += (objectId -> (nr :: Nil))
             backend.read(pointer)
-        }
-    }
   }
 
   def readObjectForOpportunisticRebuild(op: OpportunisticRebuild): Unit = {
@@ -210,28 +209,45 @@ class Frontend(val storeId: StoreId,
     }
   }
 
-  private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit = {
+  private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit =
     val objectId = pointer.id
+    
     logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: $objectId")
-    objectCache.get(objectId) match {
-      case Some(os) =>
-        logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
-        transaction.objectLoaded(os)
-      case None =>
-        val tr = TransactionRead(transaction.transactionId)
 
-        pendingReads.get(objectId) match {
-          case Some(lst) =>
-            pendingReads += (objectId -> (tr :: lst))
+    if transaction.txd.allocatingObjects.contains(pointer.id) then
+      // Allocating new object.
+      // Create a new ObjectState with "default" metadata and empty content. The transaction
+      // requirements and object updates will overwrite the defaults
+      logger.trace(s"Allocating new object: $objectId in Tx: ${transaction.transactionId}.")
+      
+      val metadata = Metadata(
+        ObjectRevision.Allocating,
+        ObjectRefcount.Allocating,
+        transaction.txd.startTimestamp
+      )
+      
+      val os = new ObjectState(objectId, metadata, pointer.objectType, DataBuffer.Empty)
+      
+      transaction.objectLoaded(os)
+    else 
+      // Non-allocation, do a normal read
+      objectCache.get(objectId) match
+        case Some(os) =>
+          logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
+          transaction.objectLoaded(os)
+          
+        case None =>
+          val tr = TransactionRead(transaction.transactionId)
 
-          case None =>
-            pendingReads += (objectId -> (tr :: Nil))
-            logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $objectId")
-            backend.read(pointer)
-        }
-    }
-  }
+          pendingReads.get(objectId) match
+            case Some(lst) =>
+              pendingReads += (objectId -> (tr :: lst))
 
+            case None =>
+              pendingReads += (objectId -> (tr :: Nil))
+              logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $objectId")
+              backend.read(pointer)
+  
   private def opportunisticRebuild(op: OpportunisticRebuild, os: ObjectState): Unit = {
     if (os.metadata.revision == op.revision) {
       val rc = if (op.refcount.updateSerial > os.metadata.refcount.updateSerial)

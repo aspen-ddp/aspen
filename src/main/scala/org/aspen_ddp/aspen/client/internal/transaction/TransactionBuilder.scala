@@ -42,7 +42,7 @@ class TransactionBuilder(
 
   private  var finalizationActions = List[SerializedFinalizationAction]()
   private  var notifyOnResolution = Set[StoreId]()
-  private  var allocatingObjects = Set[ObjectId]()
+  private  var allocatingObjects = Set[ObjectPointer]()
   private  var notes = List[String]()
   private  var addMissedUpdateTrackingFA = true
   private  var missedCommitDelayInMs = 1000
@@ -55,9 +55,20 @@ class TransactionBuilder(
 
     val startTimestamp = HLCTimestamp.now
 
-    keyValueUpdates.valuesIterator.foreach { kvu =>
+    // Add "empty" content for any allocating objects that weren't given explicit content.
+    // This is required as completely missing content is what we use to attempt to drive transactions
+    // to failure during transaction recovery
+    allocatingObjects.filter(!updatingObjects.contains(_)).foreach: ptr =>
+      updatingObjects += ptr
+      requirements  = RefcountUpdate(ptr, ObjectRefcount.Allocating, ObjectRefcount.Default) :: requirements
+      ptr match
+        case dptr: DataObjectPointer =>
+          dataObjectUpdates += (dptr -> DataBuffer.Empty)
+        case kvptr: KeyValueObjectPointer =>
+          keyValueUpdates += (kvptr -> KVUpdate(kvptr, None, None, Nil, Nil))
+
+    keyValueUpdates.valuesIterator.foreach: kvu =>
       requirements = KeyValueUpdate(kvu.pointer, kvu.requiredRevision, kvu.contentLock, kvu.requirements) :: requirements
-    }
 
     // Ensure the transaction has at least one requirement
     require(requirements.nonEmpty)
@@ -77,7 +88,7 @@ class TransactionBuilder(
 
     val txd = TransactionDescription(transactionId, startTimestamp, primaryObject, designatedLeaderUID,
       requirements, finalizationActions, originatingClient, notifyOnResolution.toList,
-      notes, primaryObjectIDA, poolIDAMap, allocatingObjects)
+      notes, primaryObjectIDA, poolIDAMap, allocatingObjects.map(_.id))
 
     var updates = Map[StoreId, TransactionData]()
 
@@ -179,6 +190,7 @@ class TransactionBuilder(
     if (revisionLocks.contains(pointer))
       throw ConflictingRequirements(pointer)
 
+    updatingObjects += pointer
     keyValueUpdates += (pointer -> KVUpdate(pointer, requiredRevision, contentLock, requirements, operations))
   }
 
@@ -226,8 +238,8 @@ class TransactionBuilder(
     finalizationActions = SerializedFinalizationAction(finalizationActionId, new Array[Byte](0)) :: finalizationActions
   }
 
-  def addAllocatingObject(objectId: ObjectId): Unit = synchronized {
-    allocatingObjects += objectId
+  def addAllocatingObject(objectPtr: ObjectPointer): Unit = synchronized {
+    allocatingObjects += objectPtr
   }
 
   def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit = synchronized {

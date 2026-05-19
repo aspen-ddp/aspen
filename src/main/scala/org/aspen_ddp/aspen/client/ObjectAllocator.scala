@@ -6,11 +6,15 @@ import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, DataObjectPo
 
 import scala.concurrent.Future
 
-trait ObjectAllocator {
+trait ObjectAllocator:
 
   val maxObjectSize: Option[Int]
 
   val objectIDA: IDA
+
+  def allocateDataObject()(using t: Transaction): Future[DataObjectPointer]
+
+  def allocateKeyValueObject()(using t: Transaction): Future[KeyValueObjectPointer]
 
   def allocateDataObject(revisionGuard: AllocationRevisionGuard,
                          initialContent: DataBuffer,
@@ -24,4 +28,3 @@ trait ObjectAllocator {
                              right: Option[Value] = None,
                              initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[KeyValueObjectPointer]
 
-}

@@ -105,8 +105,8 @@ class TransactionImpl(val client: AspenClient,
     case Left(_) => throw PostCommitTransactionModification()
   }
 
-  def addAllocatingObject(objectId: ObjectId): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.addAllocatingObject(objectId)
+  def addAllocatingObject(objectPtr: ObjectPointer): Unit = synchronized { state } match {
+    case Right(bldr) => bldr.addAllocatingObject(objectPtr)
     case Left(_) => throw PostCommitTransactionModification()
   }
 

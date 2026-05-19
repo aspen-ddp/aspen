@@ -408,6 +408,8 @@ object Codec extends Logging:
           .setIda(encode(ida))
           .build
       )
+    o.allocatingObjects.foreach: oid =>
+      builder.addAllocatingObjects(encodeUUID(oid.uuid))
 
     builder.build
   def decode(m: codec.TransactionDescription): TransactionDescription =
@@ -424,9 +426,10 @@ object Codec extends Logging:
       PoolId(decodeUUID(pida.getPoolId)) -> decode(pida.getIda)
     .toMap
     val primaryObjectIDA = poolIDAMap(primaryObj.poolId)
+    val allocatingObjects = m.getAllocatingObjectsList.asScala.map(u => ObjectId(decodeUUID(u))).toSet
 
     TransactionDescription(txuuid, startTs, primaryObj, designatedLeader, requirements,
-      serializedFas, origClient, notifyOnRes, notes, primaryObjectIDA, poolIDAMap)
+      serializedFas, origClient, notifyOnRes, notes, primaryObjectIDA, poolIDAMap, allocatingObjects)
 
 
   def encode(o: ProposalId): codec.ProposalId =

@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, KeyValueOperation, ObjectPointer, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, KeyValueUpdate, TransactionId}
@@ -69,6 +69,8 @@ trait Transaction {
     *  The future successfully completes if the transaction commits. Otherwise it will fail with a TransactionError subclass.
     */
   def commit(): Future[HLCTimestamp]
+
+  protected[client] def addAllocatingObject(objectId: ObjectId): Unit
 
   /** Used by allocations to ensure they receive notice of the allocating transaction result
     */

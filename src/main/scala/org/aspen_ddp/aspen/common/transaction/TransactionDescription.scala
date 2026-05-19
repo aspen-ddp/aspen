@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.common.transaction
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, Codec}
-import org.aspen_ddp.aspen.common.objects.ObjectPointer
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -66,7 +66,10 @@ final case class TransactionDescription (
   primaryObjectIDA: IDA,
 
   /** Maps each pool referenced by the transaction to its IDA */
-  poolIDAMap: Map[PoolId, IDA]) {
+  poolIDAMap: Map[PoolId, IDA],
+
+  /** Objects being allocated by this transaction */
+  allocatingObjects: Set[ObjectId] = Set.empty) {
 
   def objectRequirements: List[TransactionObjectRequirement] = requirements.flatMap {
     case tor: TransactionObjectRequirement => Some(tor)

@@ -42,6 +42,7 @@ class TransactionBuilder(
 
   private  var finalizationActions = List[SerializedFinalizationAction]()
   private  var notifyOnResolution = Set[StoreId]()
+  private  var allocatingObjects = Set[ObjectId]()
   private  var notes = List[String]()
   private  var addMissedUpdateTrackingFA = true
   private  var missedCommitDelayInMs = 1000
@@ -76,7 +77,7 @@ class TransactionBuilder(
 
     val txd = TransactionDescription(transactionId, startTimestamp, primaryObject, designatedLeaderUID,
       requirements, finalizationActions, originatingClient, notifyOnResolution.toList,
-      notes, primaryObjectIDA, poolIDAMap)
+      notes, primaryObjectIDA, poolIDAMap, allocatingObjects)
 
     var updates = Map[StoreId, TransactionData]()
 
@@ -223,6 +224,10 @@ class TransactionBuilder(
 
   def addFinalizationAction(finalizationActionId: FinalizationActionId): Unit = synchronized {
     finalizationActions = SerializedFinalizationAction(finalizationActionId, new Array[Byte](0)) :: finalizationActions
+  }
+
+  def addAllocatingObject(objectId: ObjectId): Unit = synchronized {
+    allocatingObjects += objectId
   }
 
   def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit = synchronized {

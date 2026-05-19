@@ -44,8 +44,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   def createValue(byte: Byte): Value = Value(Array(byte))
 
   atest("splitAt - basic split with keys on both sides") {
-    given tx: Transaction = client.newTransaction()
-
     val key1 = createKey(1)
     val key2 = createKey(2)
     val key3 = createKey(3)
@@ -60,12 +58,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(3)
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       // Read the original hostState (should now contain only keys < splitAtKey)
@@ -103,8 +108,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - inclusive basic split with keys on both sides") {
-    given tx: Transaction = client.newTransaction()
-
     val key1 = createKey(1)
     val key2 = createKey(2)
     val key3 = createKey(3)
@@ -119,12 +122,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(3)
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, true, None, alloc)
-      _ <- tx.commit().map(_ => ())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, true, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       // Read the original hostState (should now contain only keys < splitAtKey)
@@ -161,8 +171,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - all keys go to right side") {
-    given tx: Transaction = client.newTransaction()
-
     val key3 = createKey(3)
     val key4 = createKey(4)
     val key5 = createKey(5)
@@ -175,12 +183,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(2) // All keys are >= 2
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)
@@ -206,8 +221,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - all keys go to left side") {
-    given tx: Transaction = client.newTransaction()
-
     val key1 = createKey(1)
     val key2 = createKey(2)
     val key3 = createKey(3)
@@ -220,12 +233,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(5) // All keys are < 5
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)
@@ -251,8 +271,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - with down pointer") {
-    given tx: Transaction = client.newTransaction()
-
     val key2 = createKey(2)
     val key4 = createKey(4)
 
@@ -263,16 +281,23 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(3)
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
+      tx2 = client.newTransaction()
 
-      // Create a down pointer to include
       downContents = Map(createKey(10) -> createValue(100))
-      downPtr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, node.revision), downContents)
+      downPtr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, node.revision), downContents)(using tx2)
 
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, Some(downPtr), alloc)
-      _ <- tx.commit().map(_=>())
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, Some(downPtr), alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)
@@ -298,18 +323,23 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - empty hostState") {
-    given tx: Transaction = client.newTransaction()
-
     val contents = Map.empty[Key, Value]
     val splitAtKey = createKey(3)
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)
@@ -329,8 +359,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - single key exactly at split point") {
-    given tx: Transaction = client.newTransaction()
-
     val key3 = createKey(3)
     val value3 = createValue(30)
 
@@ -338,12 +366,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(3)
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)
@@ -366,8 +401,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - hostState with existing tail pointer") {
-    given tx: Transaction = client.newTransaction()
-
     val key1 = createKey(1)
     val key2 = createKey(2)
     val value1 = createValue(10)
@@ -377,21 +410,27 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val tailValue = createValue(100)
 
     for {
-      // Create tail hostState first
+      // Create tail and main nodes in first transaction
+      _ <- Future.unit
+      tx1 = client.newTransaction()
       tailContents <- Future.successful(Map(tailKey -> tailValue))
-      tailNode <- createNode(tailContents, tailKey)
+      tailNode <- createNode(tailContents, tailKey)(using tx1)
       tailPtr = KeyValueListPointer(tailKey, tailNode.pointer)
 
-      // Create main hostState with tail pointer
       contents = Map(key1 -> value1, key2 -> value2)
-      node <- createNode(contents, tail = Some(tailPtr))
+      node <- createNode(contents, tail = Some(tailPtr))(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
 
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       splitAtKey = createKey(2)
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)
@@ -418,16 +457,22 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - require splitAtKey > AbsoluteMinimum") {
-    given tx: Transaction = client.newTransaction()
-
     val contents = Map(createKey(1) -> createValue(10))
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
+      tx2 = client.newTransaction()
 
-      result <- node.splitAt(ByteArrayKeyOrdering, Key.AbsoluteMinimum, false, None, alloc).recover {
+      result <- node.splitAt(ByteArrayKeyOrdering, Key.AbsoluteMinimum, false, None, alloc)(using tx2).recover {
         case _: IllegalArgumentException => "IllegalArgumentException caught"
         case other => throw other
       }
@@ -438,8 +483,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - preserves value data integrity") {
-    given tx: Transaction = client.newTransaction()
-
     val key1 = createKey(1)
     val key3 = createKey(3)
     val key5 = createKey(5)
@@ -453,12 +496,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(4)
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)
@@ -479,8 +529,6 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
   }
 
   atest("splitAt - large number of keys") {
-    given tx: Transaction = client.newTransaction()
-
     val numKeys = 20
     val contents = (1 to numKeys).map { i =>
       createKey(i.toByte) -> createValue((i * 10).toByte)
@@ -489,12 +537,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
     val splitAtKey = createKey(10)
 
     for {
-      node <- createNode(contents)
+      _ <- Future.unit
+      tx1 = client.newTransaction()
+      node <- createNode(contents)(using tx1)
+      _ <- tx1.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      node <- node.refresh()
+
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-
-      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)
-      _ <- tx.commit().map(_=>())
+      tx2 = client.newTransaction()
+      newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, None, alloc)(using tx2)
+      _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
       originalState <- client.read(node.pointer)

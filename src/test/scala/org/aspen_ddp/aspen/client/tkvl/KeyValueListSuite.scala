@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRefcount, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRefcount, Value}
 
 import scala.concurrent.Future
 import scala.language.implicitConversions
@@ -54,13 +54,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value2 = Value(Array[Byte](5))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
@@ -104,13 +103,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
       Future.unit
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0, 1), Map(), None)
@@ -156,13 +154,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value2 = Value(Array[Byte](5))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0, 1), Map(), None)
@@ -207,17 +204,15 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value2 = Value(new Array[Byte](60))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0, 1), Map(), None)
-
 
       _ <- lst.insert(key, value, 100, alloc)(using tx)
 
@@ -251,21 +246,20 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     val key2 = Key(Array[Byte](2))
     val value2 = Value(new Array[Byte](60))
-    
+
     var deletedKeys = Set[Key]()
 
-    def deleteKV(key: Key, vs: ValueState): Future[Unit] = 
+    def deleteKV(key: Key, vs: ValueState): Future[Unit] =
       deletedKeys = deletedKeys + key
       Future.unit
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0, 1), Map(), None)
@@ -304,17 +298,15 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value2 = Value(Array[Byte](5))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
-
 
       _ <- lst.insert(key, value, 100, alloc)(using tx)
 
@@ -349,13 +341,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value2 = Value(Array[Byte](5))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
@@ -396,13 +387,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value3 = Value(Array[Byte](5))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
@@ -451,13 +441,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value3 = Value(Array[Byte](6))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
@@ -523,13 +512,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
     val value3 = Value(Array[Byte](6))
 
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
 
-      lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)(using tx)
+      lptr <- alloc.allocateKeyValueObject()(using tx)
 
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)

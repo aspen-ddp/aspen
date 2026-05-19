@@ -1,9 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.*
 
 class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
@@ -17,18 +15,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value1 = createValue(10)
     val splitAtKey = createKey(5)
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -59,18 +59,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value1 = createValue(100)
     val splitAtKey = createKey(5)
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -124,18 +126,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value4 = createValue(90)
     val splitAtKey = createKey(5)
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -218,18 +222,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value7 = createValue(70)
     val splitAtKey = createKey(5)
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -297,18 +303,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value1 = createValue(100)
     val splitAtKey = createKey(5)  // All keys > splitAtKey
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -354,18 +362,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value2 = createValue(30)
     val splitAtKey = createKey(10)  // All keys < splitAtKey
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -418,18 +428,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value1 = createValue(10)
     val splitAtKey = createKey(5)
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -461,18 +473,20 @@ class TieredKeyValueListSplitTreeSuite extends IntegrationTestSuite {
     val value2 = createValue(30)
     val splitAtKey = createKey(10)  // All keys < splitAtKey (new tree will be empty)
 
-    given tx1: Transaction = client.newTransaction()
-
     for {
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
 
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
-
-      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key1 -> value1))(using tx1)
 
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()

@@ -140,7 +140,7 @@ class TieredKeyValueList(val client: AspenClient,
 
         down <- rpath.head.splitAt(ordering, splitAtKey, inclusive, None, alloc)
 
-        kvp <- rinsert(0, ordering, rpath, down.pointer)
+        kvp <- rinsert(1, ordering, rpath.tail, down.pointer)
       yield
         kvp
 

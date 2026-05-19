@@ -54,13 +54,14 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
   override def prepareInsert(name: String,
                              pointer: InodePointer,
                              incref: Boolean)(using tx: Transaction): Future[Unit] = {
-    val fcheck = tree.getContainingNode(name).flatMap:
-      case None => Future.unit
-      case Some(node) =>
-        if node.contains(name) then
-          prepareDelete(name, true)
-        else
-          Future.unit
+    val key = Key(name)
+
+    val fcleanupOldEntry = tree.get(key).flatMap:
+      case None => Future.successful(None)
+      case Some(vs) =>
+        val oldPtr = InodePointer(vs.value.bytes)
+        checkForDeletion(oldPtr).flatMap: _ =>
+          UnlinkFileTask.prepareTask(fs, oldPtr).map(_ => Some(vs.revision))
 
     val fincref = if (incref) {
       fs.readInode(pointer) map { t =>
@@ -73,9 +74,10 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
     }
 
     for {
-      _ <- fcheck
+      oOldRevision <- fcleanupOldEntry
       _ <- fincref
-      _ <- tree.set(Key(name), Value(pointer.toArray))
+      requirement = oOldRevision.map(rev => Right(rev))
+      _ <- tree.set(key, Value(pointer.toArray), requirement)
     } yield ()
   }
 

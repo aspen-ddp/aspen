@@ -47,7 +47,6 @@ object SimpleFileSystem {
         TaskExecutorRootKey -> Value(taskRoot.toArray),
         InodeTableRootKey -> Value(inodeTableRoot.encode()))
       fsRootPointer <- allocator.allocateKeyValueObject(guard, content)
-      _=tx.overwrite(rootDirectory, tx.revision, rootDirInode.toArray) // ensure Tx has an object to modify
       _=tx.update(hostingObject,
         None,
         None,

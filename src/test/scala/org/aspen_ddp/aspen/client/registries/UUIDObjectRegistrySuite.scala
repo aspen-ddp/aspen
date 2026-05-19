@@ -1,10 +1,8 @@
 package org.aspen_ddp.aspen.client.registries
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, KeyValueObjectPointer, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, SinglePoolNodeAllocator}
 
@@ -16,15 +14,19 @@ class UUIDObjectRegistrySuite extends IntegrationTestSuite:
   val registryTreeKey = Key(Array[Byte](100))
 
   def createRegistry(): Future[UUIDObjectRegistry] =
-    given tx: Transaction = client.newTransaction()
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
       nodeAllocator = SinglePoolNodeAllocator(client, Radicle.poolId)
-      _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())
-      _ <- tx.commit()
+      tx1 = client.newTransaction()
+      _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())(using tx1)
+      _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
     yield
       UUIDObjectRegistry(client, ptr, registryTreeKey)
@@ -50,7 +52,7 @@ class UUIDObjectRegistrySuite extends IntegrationTestSuite:
       alloc = pool.createAllocator
 
       tx1 = client.newTransaction()
-      ptr1 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx1)
+      ptr1 <- alloc.allocateKeyValueObject()(using tx1)
       _ = tx1.update(radicle, Some(ikvos.revision), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](90)))), List(Insert(Key(Array[Byte](90)), Array[Byte](1))))
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -59,7 +61,7 @@ class UUIDObjectRegistrySuite extends IntegrationTestSuite:
 
       ikvos2 <- client.read(radicle)
       tx2 = client.newTransaction()
-      ptr2 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos2.revision), Map())(using tx2)
+      ptr2 <- alloc.allocateKeyValueObject()(using tx2)
       _ = tx2.update(radicle, Some(ikvos2.revision), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](89)))), List(Insert(Key(Array[Byte](89)), Array[Byte](1))))
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()

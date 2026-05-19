@@ -1,10 +1,8 @@
 package org.aspen_ddp.aspen.client.registries
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyValueObjectPointer, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, SinglePoolNodeAllocator}
 
 import java.util.UUID
@@ -15,15 +13,19 @@ class NamespacedUUIDRegistrySuite extends IntegrationTestSuite:
   val registryTreeKey = Key(Array[Byte](100))
 
   def createRegistry(): Future[NamespacedUUIDRegistry] =
-    given tx: Transaction = client.newTransaction()
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
       nodeAllocator = SinglePoolNodeAllocator(client, Radicle.poolId)
-      _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())
-      _ <- tx.commit()
+      tx1 = client.newTransaction()
+      _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())(using tx1)
+      _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
     yield
       NamespacedUUIDRegistry(client, ptr, registryTreeKey)

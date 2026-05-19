@@ -1,10 +1,8 @@
 package org.aspen_ddp.aspen.client.registries
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
-import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, KeyAlreadyExists, KeyValueObjectPointer, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, KeyAlreadyExists, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, SinglePoolNodeAllocator}
 
@@ -15,15 +13,19 @@ class RegistrySuite extends IntegrationTestSuite:
   val registryTreeKey = Key(Array[Byte](100))
 
   def createRegistry(): Future[Registry] =
-    given tx: Transaction = client.newTransaction()
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
       nodeAllocator = SinglePoolNodeAllocator(client, Radicle.poolId)
-      _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())
-      _ <- tx.commit()
+      tx1 = client.newTransaction()
+      _ <- KVObjectRootManager.createNewTree(client, ptr, registryTreeKey, ByteArrayKeyOrdering, nodeAllocator, Map())(using tx1)
+      _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
     yield
       Registry(client, ptr, registryTreeKey)
@@ -40,12 +42,11 @@ class RegistrySuite extends IntegrationTestSuite:
       registry <- createRegistry()
       key = Key("test-value-1")
 
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx)
+      ptr <- alloc.allocateKeyValueObject()(using tx)
       value = Value(ptr.toArray)
       _ <- registry.prepareRegister(key, value)(using tx)
       _ <- tx.commit()
@@ -60,20 +61,18 @@ class RegistrySuite extends IntegrationTestSuite:
       registry <- createRegistry()
       key = Key("test-value-2")
 
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       tx1 = client.newTransaction()
-      ptr1 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx1)
+      ptr1 <- alloc.allocateKeyValueObject()(using tx1)
       value1 = Value(ptr1.toArray)
       _ <- registry.prepareRegister(key, value1)(using tx1)
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
 
-      ikvos2 <- client.read(radicle)
       tx2 = client.newTransaction()
-      ptr2 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos2.revision), Map())(using tx2)
+      ptr2 <- alloc.allocateKeyValueObject()(using tx2)
       value2 = Value(ptr2.toArray)
       result <- registry.prepareRegister(key, value2)(using tx2).failed
     yield
@@ -100,7 +99,7 @@ class RegistrySuite extends IntegrationTestSuite:
       alloc = pool.createAllocator
 
       tx = client.newTransaction()
-      ptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx)
+      ptr <- alloc.allocateKeyValueObject()(using tx)
       _ = tx.update(radicle, Some(ikvos.revision), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](99)))), List(Insert(Key(Array[Byte](99)), Array[Byte](1))))
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
@@ -123,7 +122,7 @@ class RegistrySuite extends IntegrationTestSuite:
       alloc = pool.createAllocator
 
       tx1 = client.newTransaction()
-      ptr1 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map())(using tx1)
+      ptr1 <- alloc.allocateKeyValueObject()(using tx1)
       _ = tx1.update(radicle, Some(ikvos.revision), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](98)))), List(Insert(Key(Array[Byte](98)), Array[Byte](1))))
       _ <- tx1.commit()
       _ <- waitForTransactionsToComplete()
@@ -133,7 +132,7 @@ class RegistrySuite extends IntegrationTestSuite:
 
       ikvos2 <- client.read(radicle)
       tx2 = client.newTransaction()
-      ptr2 <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos2.revision), Map())(using tx2)
+      ptr2 <- alloc.allocateKeyValueObject()(using tx2)
       _ = tx2.update(radicle, Some(ikvos2.revision), None, List(KeyValueUpdate.DoesNotExist(Key(Array[Byte](97)))), List(Insert(Key(Array[Byte](97)), Array[Byte](1))))
       _ <- tx2.commit()
       _ <- waitForTransactionsToComplete()

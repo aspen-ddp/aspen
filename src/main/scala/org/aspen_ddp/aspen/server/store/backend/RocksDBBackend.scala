@@ -62,7 +62,6 @@ class RocksDBBackend(dbPath:Path,
 
   private val db = new BufferedConsistentRocksDB(dbPath)
 
-  private var allocating = Map[ObjectId, (ObjectType.Value, Metadata, DataBuffer)]()
 
   override def close(): Future[Unit] = db.close()
   
@@ -100,47 +99,25 @@ class RocksDBBackend(dbPath:Path,
 
   override def rebuildFlush(): Unit = db.rebuildFlush()
 
-  override def allocate(objectId: ObjectId,
-                        objectType: ObjectType.Value,
-                        metadata: Metadata,
-                        data: DataBuffer): Either[Unit, AllocationError.Value] = {
-    synchronized {
-      allocating += (objectId -> (objectType, metadata, data))
-    }
-    Left(())
-  }
-
-  override def abortAllocation(objectId: ObjectId): Unit = synchronized {
-    allocating -= objectId
-  }
-
   override def read(pointer: ObjectPointer): Unit = {
     val objectId = pointer.id
     logger.debug(s"RocksDBBackend beginning load of object: $objectId")
 
-    synchronized { allocating.get(objectId) } match {
-      case Some((objectType, metadata, data)) =>
+    val key = tokey(objectId)
+    db.get(key).onComplete {
+      case Failure(err) => logger.error(s"RocksDBBackend failed to load object: $objectId. Error: $err")
+      case Success(oresult) =>
         chandler.foreach { handler =>
-          val rs = ReadState(objectId, metadata, objectType, data, Set())
-          handler.complete(Read(storeId, objectId, Left(rs)))
-        }
-      case None =>
-        val key = tokey(objectId)
-        db.get(key).onComplete {
-          case Failure(err) => logger.error(s"RocksDBBackend failed to load object: $objectId. Error: $err")
-          case Success(oresult) =>
-            chandler.foreach { handler =>
-              oresult match {
-                case None =>
-                  logger.info(s"RocksDBBackend ObjectNotFound: $objectId")
-                  handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
-                case Some(value) =>
-                  logger.debug(s"RocksDBBackend loaded object: $objectId")
-                  val (objectType, metadata, data) = decodeDBValue(value)
-                  val rs = ReadState(objectId, metadata, objectType, data, Set())
-                  handler.complete(Read(storeId, objectId, Left(rs)))
-              }
-            }
+          oresult match {
+            case None =>
+              logger.info(s"RocksDBBackend ObjectNotFound: $objectId")
+              handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
+            case Some(value) =>
+              logger.debug(s"RocksDBBackend loaded object: $objectId")
+              val (objectType, metadata, data) = decodeDBValue(value)
+              val rs = ReadState(objectId, metadata, objectType, data, Set())
+              handler.complete(Read(storeId, objectId, Left(rs)))
+          }
         }
     }
   }
@@ -153,9 +130,6 @@ class RocksDBBackend(dbPath:Path,
         db.put(tokey(state.objectId), encodeDBValue(state.objectType, state.metadata, state.data))
 
       fcommit.foreach { _ =>
-        synchronized {
-          allocating -= state.objectId
-        }
         handler.complete(Commit(storeId, state.objectId, transactionId, Left(())))
       }
     }

@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.Radicle
@@ -199,8 +198,6 @@ trait AspenClient extends ObjectReader:
   private[client] def opportunisticRebuildManager: OpportunisticRebuildManager
 
   private[client] val messenger: Messenger
-
-  private[client] val allocationManager: AllocationManager
 
   private[client] val objectCache: ObjectCache
   

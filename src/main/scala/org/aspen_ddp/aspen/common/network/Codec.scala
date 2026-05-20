@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.codec.ObjectReadError
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyRevisionGuard, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectRevisionGuard, ObjectType, ReadError, SingleKey}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, PreTransactionOpportunisticRebuild, RefcountUpdate, RevisionLock, SerializedFinalizationAction, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
 import org.aspen_ddp.aspen.server.cnc
 import org.aspen_ddp.aspen.server.cnc.{NewStore, ShutdownStore, TransferStore}
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, RocksDBConfig}
 
 import java.nio.{ByteBuffer, ByteOrder}
@@ -901,70 +901,6 @@ object Codec extends Logging:
     TransactionFinalized(toClient, fromStore, transactionId, committed)
 
 
-  def encode(o: Allocate): codec.Allocate =
-    val builder = codec.Allocate.newBuilder()
-      .setToStore(encode(o.toStore))
-      .setFromClient(encodeUUID(o.fromClient.uuid))
-      .setNewObjectUuid(encodeUUID(o.newObjectId.uuid))
-      .setObjectType(encodeObjectType(o.objectType))
-      .setInitialRefcount(encode(o.initialRefcount))
-      .setObjectData(ByteString.copyFrom(o.objectData.asReadOnlyBuffer()))
-      .setTimestamp(o.timestamp.asLong)
-      .setAllocationTransactionUuid(encodeUUID(o.allocationTransactionId.uuid))
-      .setAllocatingObject(encode(o.revisionGuard.pointer))
-
-    o.revisionGuard match
-      case g: ObjectRevisionGuard => builder.setAllocatingObjectRevision(encode(g.requiredRevision))
-      case g: KeyRevisionGuard =>
-        val kvreq = KeyValueUpdate.KeyObjectRevision(g.key, g.keyRevision)
-        builder.setAllocatingObjectKeyRequirement(encode(kvreq))
-
-    builder.build
-
-  def decode(m: codec.Allocate): Allocate =
-    val toStore = decode(m.getToStore)
-    val fromClient = ClientId(decodeUUID(m.getFromClient))
-    val newObjectId = ObjectId(decodeUUID(m.getNewObjectUuid))
-    val objectType = decodeObjectType(m.getObjectType)
-    val initialRefcount = decode(m.getInitialRefcount)
-    val objectData = DataBuffer(m.getObjectData.toByteArray)
-    val timestamp = HLCTimestamp(m.getTimestamp)
-    val allocTxId = TransactionId(decodeUUID(m.getAllocationTransactionUuid))
-    val allocObj = decode(m.getAllocatingObject)
-    val revisionGuard = if m.hasAllocatingObjectRevision then
-      ObjectRevisionGuard(allocObj, decode(m.getAllocatingObjectRevision))
-    else
-      val kvreq = decode(m.getAllocatingObjectKeyRequirement)
-      val rev = kvreq match
-        case kor: KeyValueUpdate.KeyObjectRevision => kor.revision
-        case _ => throw new EncodingError("Only KeyObjectRevisions are allowed")
-      KeyRevisionGuard(allocObj.asInstanceOf[KeyValueObjectPointer], kvreq.key, rev)
-
-    Allocate(toStore, fromClient, newObjectId, objectType, initialRefcount,
-      objectData, timestamp, allocTxId, revisionGuard)
-
-
-  def encode(o: AllocateResponse): codec.AllocateResponse =
-    codec.AllocateResponse.newBuilder()
-      .setToClient(encodeUUID(o.toClient.uuid))
-      .setFromStore(encode(o.fromStore))
-      .setAllocationTransactionUuid(encodeUUID(o.allocationTransactionId.uuid))
-      .setNewObjectUuid(encodeUUID(o.newObjectId.uuid))
-      .setSuccess(o.success)
-      .setStoreNotFound(o.storeNotFound)
-      .build
-
-  def decode(m: codec.AllocateResponse): AllocateResponse =
-    val toClient = ClientId(decodeUUID(m.getToClient))
-    val fromStore = decode(m.getFromStore)
-    val allocTxId = TransactionId(decodeUUID(m.getAllocationTransactionUuid))
-    val newObjId = ObjectId(decodeUUID(m.getNewObjectUuid))
-    val success = m.getSuccess
-    val storeNotFound = m.getStoreNotFound
-
-    AllocateResponse(toClient, fromStore, allocTxId, newObjId, success, storeNotFound)
-
-
   def encode(o: HostHeartbeat): codec.HostHeartbeat =
     codec.HostHeartbeat.newBuilder()
       .setFromHostId(encodeUUID(o.hostId.uuid))
@@ -1089,34 +1025,6 @@ object Codec extends Logging:
     TransactionRecoveryState(storeId, serializedTxd, objectUpdates, disposition, status, paxosAcceptorState)
     
   
-  def encode(o: AllocationRecoveryState): codec.AllocationRecoveryState =
-    val builder = codec.AllocationRecoveryState.newBuilder()
-
-    builder.setStoreId(encode(o.storeId))
-    builder.setNewObjectId(encodeUUID(o.newObjectId.uuid))
-    builder.setObjectType(encodeObjectType(o.objectType))
-    builder.setObjectData(ByteString.copyFrom(o.objectData.asReadOnlyBuffer()))
-    builder.setInitialRefcount(encode(o.initialRefcount))
-    builder.setTimestamp(o.timestamp.asLong)
-    builder.setTransactionUuid(encodeUUID(o.allocationTransactionId.uuid))
-    builder.setSerializedRevisionGuard(ByteString.copyFrom(o.serializedRevisionGuard.asReadOnlyBuffer()))
-
-    builder.build
-
-  def decode(m: codec.AllocationRecoveryState): AllocationRecoveryState =
-    val storeId = decode(m.getStoreId)
-    val newObjectId = ObjectId(decodeUUID(m.getNewObjectId))
-    val objectType = decodeObjectType(m.getObjectType)
-    val objectData = DataBuffer(m.getObjectData.toByteArray)
-    val initialRefcount = decode(m.getInitialRefcount)
-    val timestamp = HLCTimestamp(m.getTimestamp)
-    val transactionId = TransactionId(decodeUUID(m.getTransactionUuid))
-    val serializedRevisionGuard = DataBuffer(m.getSerializedRevisionGuard.toByteArray)
-
-    AllocationRecoveryState(storeId, newObjectId, objectType, objectData,
-      initialRefcount, timestamp, transactionId, serializedRevisionGuard)
-
-
   def encode(o: StoragePoolState.StoreEntry): codec.PoolStoreEntry =
     codec.PoolStoreEntry.newBuilder()
       .setHostId(encodeUUID(o.hostId.uuid))

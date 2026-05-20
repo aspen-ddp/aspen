@@ -3,13 +3,13 @@ package org.aspen_ddp.aspen.server.crl.simple
 import org.aspen_ddp.aspen.FileBasedTests
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRevision}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
-import org.aspen_ddp.aspen.server.crl.simple.{Alloc, Recovery, StreamId, StreamLocation, Tx}
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation, Tx}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 
 import java.nio.ByteBuffer
 import java.nio.file.Path
@@ -40,19 +40,10 @@ object SimpleCRLSuite:
   val accept = ProposalId(2, 2)
   val pax = PersistentState(Some(promise), Some((accept, true)))
 
-  val objectId = ObjectId(new UUID(0,5))
-  val objectData = DataBuffer(Array[Byte](0,1))
-  val refcount = ObjectRefcount(1,1)
   val timestamp = HLCTimestamp(2)
-  val allocTxId = TransactionId(new UUID(0,6))
-  val serializedRevisionGuard = DataBuffer(Array[Byte](0,1,2,3,4))
-  val allocDataLocation = StreamLocation(StreamId(0), 5, 4)
 
   val trs = TransactionRecoveryState(storeId, txdata, List(ou1, ou2), disp, status, pax)
   val trs2 = TransactionRecoveryState(storeId2, txdata, Nil, disp, status, pax)
-
-  val ars = AllocationRecoveryState(storeId, objectId, ObjectType.Data, objectData, refcount, timestamp , transactionId, serializedRevisionGuard)
-  val ars2 = AllocationRecoveryState(storeId2, objectId, ObjectType.Data, objectData, refcount, timestamp, transactionId2, serializedRevisionGuard)
 
   val txdLoc = StreamLocation(StreamId(0), 16, 4)
   val ou1Loc = StreamLocation(StreamId(0), 25, 2)
@@ -101,58 +92,42 @@ class SimpleCRLSuite extends FileBasedTests {
 
     queue.take() // Block till completion handlers are run
 
-    i.crl.save(ars, completionHandler)
-
-    queue.take() // Block till completion handlers are run
-
-    i.crl.save(ars2, completionHandler)
-
-    queue.take() // Block till completion handlers are run
-
-    val (trs1, ars1) = i.crl.getFullRecoveryState(storeId)
+    val trs1 = i.crl.getFullRecoveryState(storeId)
 
     assert(trs1.size == 1)
-    assert(ars1.size == 1)
 
-    val (t2, a2) = i.crl.getFullRecoveryState(storeId2)
+    val t2 = i.crl.getFullRecoveryState(storeId2)
 
     assert(t2.size == 1)
-    assert(a2.size == 1)
 
-    val (t, a) = Await.result(i.crl.closeStore(storeId), Duration(5000, MILLISECONDS))
+    val t = Await.result(i.crl.closeStore(storeId), Duration(5000, MILLISECONDS))
 
-    val (t3, a3) = i.crl.getFullRecoveryState(storeId)
+    val t3 = i.crl.getFullRecoveryState(storeId)
 
     assert(t3.size == 0)
-    assert(a3.size == 0)
 
-    val (t4, a4) = i.crl.getFullRecoveryState(storeId2)
+    val t4 = i.crl.getFullRecoveryState(storeId2)
 
     assert(t4.size == 1)
-    assert(a4.size == 1)
 
-    CrashRecoveryLog.saveStoreState(storeId, t, a, savePath)
+    CrashRecoveryLog.saveStoreState(storeId, t, savePath)
 
-    val (sid, trl, arl) = CrashRecoveryLog.loadStoreState(savePath)
+    val (sid, trl) = CrashRecoveryLog.loadStoreState(savePath)
 
     assert(sid == storeId)
     assert(trl.length == 1)
-    assert(arl.length == 1)
 
     assert(trl.head == trsValidTxd)
-    assert(arl.head == ars)
 
-    Await.result(i.crl.loadStore(sid, trl, arl), Duration(5000, MILLISECONDS))
+    Await.result(i.crl.loadStore(sid, trl), Duration(5000, MILLISECONDS))
 
-    val (t5, a5) = i.crl.getFullRecoveryState(storeId)
+    val t5 = i.crl.getFullRecoveryState(storeId)
 
     assert(t5.size == 1)
-    assert(a5.size == 1)
 
-    val (t6, a6) = i.crl.getFullRecoveryState(storeId2)
+    val t6 = i.crl.getFullRecoveryState(storeId2)
 
     assert(t6.size == 1)
-    assert(a6.size == 1)
 
     i.crl.shutdown()
   }
@@ -177,7 +152,6 @@ class SimpleCRLSuite extends FileBasedTests {
     val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
-    assert(i2.arsList.length == 0)
 
     assert(i2.trsList.head.storeId == txid.storeId)
     assert(i2.trsList.head.disposition == disp)
@@ -244,7 +218,6 @@ class SimpleCRLSuite extends FileBasedTests {
     val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
 
     assert(i2.trsList.length == 1)
-    assert(i2.arsList.length == 0)
 
     assert(i2.trsList.head.storeId == txid.storeId)
     assert(i2.trsList.head.disposition == disp)
@@ -301,7 +274,6 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i.crl.currentStreamNumber == 2)
 
     assert(i2.trsList.length == 1)
-    assert(i2.arsList.length == 0)
 
     assert(i2.trsList.head.storeId == txid.storeId)
     assert(i2.trsList.head.disposition == disp)
@@ -346,7 +318,6 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i.crl.currentStreamNumber == 1)
 
     assert(i2.trsList.length == 1)
-    assert(i2.arsList.length == 0)
 
     assert(i2.trsList.head.storeId == txid.storeId)
     assert(i2.trsList.head.disposition == disp)
@@ -381,7 +352,6 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i2.crl.currentEntrySerialNumber == 2)
 
     assert(i2.trsList.length == 1)
-    assert(i2.arsList.length == 0)
 
     assert(i2.trsList.head.storeId == txid.storeId)
     assert(i2.trsList.head.disposition == disp)
@@ -419,7 +389,6 @@ class SimpleCRLSuite extends FileBasedTests {
     val r = Recovery.recover(streams(1))
 
     assert(r.trsList.length == 1)
-    assert(r.arsList.length == 0)
     assert(r.activeStreamId == stream0)
 
     assert(r.trsList.head.storeId == txid.storeId)
@@ -427,161 +396,6 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(r.trsList.head.serializedTxd == trs.serializedTxd)
     assert(r.trsList.head.objectUpdates == trs.objectUpdates)
     assert(r.trsList.head.paxosAcceptorState == pax)
-  }
-
-  test("Save & Recover with Multiple Log Entries Tx & Alloc") {
-    val queue = new LinkedBlockingQueue[String]()
-
-    def completionHandler(): Unit = queue.put("")
-
-    val streamWriter = new StreamWriter(4096 * 1000, streams(1))
-
-    val tx = Tx(txid, trs, None, None)
-    val tx2 = Tx(txid2, trs2, None, None)
-    val alloc = Alloc(None, ars)
-    val alloc2 = Alloc(None, ars2)
-    val le = LogEntry(StreamLocation.Null, 0, 0)
-    val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
-
-    le.addTx(tx, completionHandler)
-    le.addAllocation(alloc, completionHandler)
-
-    val entry1Location = stream.writeEntry(le, () => ())
-
-    val le2 = LogEntry(entry1Location, 1, 0)
-
-    le2.deleteTx(txid)
-    le2.deleteAllocation(txid)
-    le2.addTx(tx2, completionHandler)
-    le2.addAllocation(alloc2, completionHandler)
-
-    val entry2Location = stream.writeEntry(le2, () => ())
-
-    queue.take() // Block till completion handlers are run
-
-    streamWriter.shutdown()
-
-    val r = Recovery.recover(streams(1))
-
-    assert(r.trsList.length == 1)
-    assert(r.arsList.length == 1)
-    assert(r.activeStreamId == stream0)
-
-    assert(r.trsList.head.storeId == txid2.storeId)
-    assert(r.trsList.head.disposition == disp)
-    assert(r.trsList.head.serializedTxd == trs2.serializedTxd)
-    assert(r.trsList.head.objectUpdates == trs2.objectUpdates)
-    assert(r.trsList.head.paxosAcceptorState == pax)
-
-    val x = r.arsList.head
-    assert(x.storeId == ars2.storeId)
-    assert(x.newObjectId == ars2.newObjectId)
-    assert(x.objectData == ars2.objectData)
-    assert(x.initialRefcount == ars2.initialRefcount)
-    assert(x.timestamp == ars2.timestamp)
-    assert(x.allocationTransactionId == ars2.allocationTransactionId)
-    assert(x.serializedRevisionGuard == ars2.serializedRevisionGuard)
-  }
-
-  test("Save & Recover with Multiple Tx & Alloc") {
-    val queue = new LinkedBlockingQueue[String]()
-
-    def completionHandler(): Unit = queue.put("")
-
-    val streamWriter = new StreamWriter(4096 * 1000, streams(1))
-
-    val tx = Tx(txid, trs, None, None)
-    val tx2 = Tx(txid2, trs2, None, None)
-    val alloc = Alloc(None, ars)
-    val alloc2 = Alloc(None, ars2)
-    val le = LogEntry(StreamLocation.Null, 0, 0)
-    val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
-
-    le.addTx(tx, completionHandler)
-    le.addAllocation(alloc, completionHandler)
-
-    le.addTx(tx2, completionHandler)
-    le.addAllocation(alloc2, completionHandler)
-
-    val entryLocation = stream.writeEntry(le, () => ())
-
-    queue.take() // Block till completion handlers are run
-
-    streamWriter.shutdown()
-
-    val r = Recovery.recover(streams(1))
-
-    assert(r.trsList.length == 2)
-    assert(r.arsList.length == 2)
-    assert(r.activeStreamId == stream0)
-
-    assert(r.trsList.head.storeId == txid.storeId)
-    assert(r.trsList.head.disposition == disp)
-    assert(r.trsList.head.serializedTxd == trs.serializedTxd)
-    assert(r.trsList.head.objectUpdates == trs.objectUpdates)
-    assert(r.trsList.head.paxosAcceptorState == pax)
-
-    assert(r.trsList.tail.head.storeId == txid2.storeId)
-    assert(r.trsList.tail.head.disposition == disp)
-    assert(r.trsList.tail.head.serializedTxd == trs2.serializedTxd)
-    assert(r.trsList.tail.head.objectUpdates == trs2.objectUpdates)
-    assert(r.trsList.tail.head.paxosAcceptorState == pax)
-
-    val x = r.arsList.head
-    assert(x.storeId == ars.storeId)
-    assert(x.newObjectId == ars.newObjectId)
-    assert(x.objectData == ars.objectData)
-    assert(x.initialRefcount == ars.initialRefcount)
-    assert(x.timestamp == ars.timestamp)
-    assert(x.allocationTransactionId == ars.allocationTransactionId)
-    assert(x.serializedRevisionGuard == ars.serializedRevisionGuard)
-
-    val x2 = r.arsList.tail.head
-    assert(x2.storeId == ars2.storeId)
-    assert(x2.newObjectId == ars2.newObjectId)
-    assert(x2.objectData == ars2.objectData)
-    assert(x2.initialRefcount == ars2.initialRefcount)
-    assert(x2.timestamp == ars2.timestamp)
-    assert(x2.allocationTransactionId == ars2.allocationTransactionId)
-    assert(x2.serializedRevisionGuard == ars2.serializedRevisionGuard)
-  }
-
-  test("Alloc Save & Recover with Single Alloc") {
-    val queue = new LinkedBlockingQueue[String]()
-
-    def completionHandler(): Unit = queue.put("")
-
-    val streamWriter = new StreamWriter(4096 * 1000, streams(1))
-
-    val alloc = Alloc(None, ars)
-    val le = LogEntry(StreamLocation.Null, 0, 0)
-    val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
-
-    le.addAllocation(alloc, completionHandler)
-
-    val entryLocation = stream.writeEntry(le, () => ())
-
-    assert(entryLocation.streamId == stream0)
-    assert(entryLocation.offset == 0)
-
-    queue.take() // Block till completion handlers are run
-
-    streamWriter.shutdown()
-
-    val r = Recovery.recover(streams(1))
-
-    assert(r.trsList.length == 0)
-    assert(r.arsList.length == 1)
-    assert(r.activeStreamId == stream0)
-
-    val x = r.arsList.head
-    assert(x.storeId == ars.storeId)
-    assert(x.newObjectId == ars.newObjectId)
-    assert(x.objectData == ars.objectData)
-    assert(x.initialRefcount == ars.initialRefcount)
-    assert(x.timestamp == ars.timestamp)
-    assert(x.allocationTransactionId == ars.allocationTransactionId)
-    assert(x.serializedRevisionGuard == ars.serializedRevisionGuard)
   }
 
   test("Tx Save & Recover with Single Transaction") {
@@ -608,7 +422,6 @@ class SimpleCRLSuite extends FileBasedTests {
     val r = Recovery.recover(streams(1))
 
     assert(r.trsList.length == 1)
-    assert(r.arsList.length == 0)
     assert(r.activeStreamId == stream0)
 
     assert(r.trsList.head.storeId == txid.storeId)
@@ -622,53 +435,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val r = Recovery.recover(Nil)
 
     assert(r.trsList.length == 0)
-    assert(r.arsList.length == 0)
     assert(r.activeStreamId == stream0)
-  }
-
-  test("Alloc Static Save & Load With Empty Data") {
-    val ars = AllocationRecoveryState( storeId, objectId, ObjectType.KeyValue, objectData, refcount, timestamp, allocTxId, serializedRevisionGuard)
-
-    val a = Alloc(Some(allocDataLocation), ars)
-
-    val buffer = new Array[Byte](4096 * 5)
-
-    assert(a.dynamicDataSize == 0)
-
-    a.writeStaticEntry(ByteBuffer.wrap(buffer))
-
-    val la = Alloc.loadAlloc(ByteBuffer.wrap(buffer))
-
-    assert(la.txid.storeId == ars.storeId)
-    assert(la.txid.transactionId == ars.allocationTransactionId)
-    assert(la.newObjectId == ars.newObjectId)
-    assert(la.objectType == ars.objectType)
-    assert(la.initialRefcount == ars.initialRefcount)
-    assert(la.timestamp == ars.timestamp)
-    assert(la.serializedRevisionGuard == ars.serializedRevisionGuard)
-  }
-
-  test("Alloc Static Save & Load With No Data") {
-    val noObjectData = DataBuffer(Array[Byte]())
-    val ars = AllocationRecoveryState(storeId, objectId, ObjectType.Data, noObjectData, refcount, timestamp, allocTxId, serializedRevisionGuard)
-
-    val a = Alloc(Some(allocDataLocation), ars)
-
-    val buffer = new Array[Byte](4096 * 5)
-
-    assert(a.dynamicDataSize == 0)
-
-    a.writeStaticEntry(ByteBuffer.wrap(buffer))
-
-    val la = Alloc.loadAlloc(ByteBuffer.wrap(buffer))
-
-    assert(la.txid.storeId == ars.storeId)
-    assert(la.txid.transactionId == ars.allocationTransactionId)
-    assert(la.newObjectId == ars.newObjectId)
-    assert(la.objectType == ars.objectType)
-    assert(la.initialRefcount == ars.initialRefcount)
-    assert(la.timestamp == ars.timestamp)
-    assert(la.serializedRevisionGuard == ars.serializedRevisionGuard)
   }
 
   test("Tx Static Save & Load with ObjectUpdate data") {

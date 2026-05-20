@@ -38,13 +38,6 @@ trait Backend extends Logging {
   /** Force all cached/in-memory data to stable storage before returning */
   def rebuildFlush(): Unit
 
-  def allocate(objectId: ObjectId,
-               objectType: ObjectType.Value,
-               metadata: Metadata,
-               data: DataBuffer): Either[Unit, AllocationError.Value]
-
-  def abortAllocation(objectId: ObjectId): Unit
-
   def read(pointer: ObjectPointer): Unit
 
   def commit(state: CommitState, transactionId: TransactionId): Unit

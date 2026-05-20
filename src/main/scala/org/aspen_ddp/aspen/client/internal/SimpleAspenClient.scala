@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.client.internal
 
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
-import org.aspen_ddp.aspen.client.internal.allocation.{AllocationManager, SuperSimpleAllocationDriver}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
@@ -11,7 +10,7 @@ import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObject
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.network.{AllocateResponse, CheckStorageDevice, ClientId, ClientResponse, HostMessage, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved}
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{KeyRequirement, KeyRevision}
@@ -167,9 +166,6 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   val messenger: ClientMessenger = msngr
 
-  val allocationManager: AllocationManager = new AllocationManager(this,
-    SuperSimpleAllocationDriver.factory(allocationRetransmitDelay))
-
   val objectCache: ObjectCache = new SimpleObjectCache
 
   def receiveClientResponse(msg: ClientResponse): Unit = msg match
@@ -177,7 +173,6 @@ class SimpleAspenClient(val msngr: ClientMessenger,
     case m: TransactionCompletionResponse => rmgr.receive(m)
     case m: TransactionResolved => txManager.receive(m)
     case m: TransactionFinalized => txManager.receive(m)
-    case m: AllocateResponse => allocationManager.receive(m)
 
   private[aspen] def sendHostMessage(msg: HostMessage): Unit =
     messenger.sendHostMessage(msg)

@@ -1,11 +1,14 @@
-Allocation special-case removal
 
-  - AllocationRevisionGuard - no longer needed
-  - Allocation Manager - no longer needed
-  - Frontend.pendingAllocations - remove
-  - Allocation Messages - remove
-    - Remove all send/receive methods
-  - CRL AllocationState tracking - removed
+ObjectAllocator
+  - add protected def createKeyValue/DataPointer: Future[ptr]
+  - public-facing API calls this then adds the tx.allocaing % finalizationAction
+    - Prevents implementation from needing to remember to do this
+
+Simplify CRL
+  - Get back up to speed on design and validate approach
+  - Use brainstorming session to simplify design now that only
+    Tx state is being tracked.
+  - Use Claude to look for bugs
 
 ObjectPointer creation - Will need generic mechanism for creating ObjectPointers for
 advanced use cases like Flat-file backed stores.

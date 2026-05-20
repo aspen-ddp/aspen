@@ -370,40 +370,6 @@ message TransactionFinalized {
 }
 
 //---------------------------------------------------------------------------
-//- Allocation Messages
-//---------------------------------------------------------------------------
-
-message Allocate {
-  StoreId to_store = 1;
-  UUID from_client = 2;
-  UUID new_object_uuid = 3;
-  ObjectType object_type = 4;
-  // field 5 removed (was object_size)
-  ObjectRefcount initial_refcount = 6;
-  bytes object_data = 7;
-  uint64 timestamp = 8;
-  UUID allocation_transaction_uuid = 9;
-  ObjectPointer allocating_object = 10;
-  ObjectRevision allocating_object_revision = 11;
-  KVReq allocating_object_key_requirement = 12;
-}
-
-enum AllocationError {
-  ALLOCATION_ERROR_INSUFFICIENT_SPACE = 0;
-}
-
-message AllocateResponse {
-  UUID to_client = 1;
-  StoreId from_store = 2;
-  UUID allocation_transaction_uuid = 3;
-  UUID new_object_uuid = 4;
-  bool success = 5;
-  AllocationError result_error = 6;
-  bool store_not_found = 7;
-}
-
-
-//---------------------------------------------------------------------------
 //- Node Support Message
 //---------------------------------------------------------------------------
 
@@ -447,8 +413,6 @@ message Message {
     TxCommitted committed = 6;
     TxFinalized finalized = 7;
     TxHeartbeat heartbeat = 8;
-    Allocate allocate = 9;
-    AllocateResponse allocate_response = 10;
     Read read = 11;
     ReadResponse read_response = 12;
     OpportunisticRebuild opportunistic_rebuild = 13;
@@ -489,23 +453,9 @@ message TransactionRecoveryState {
   PersistentState paxos_acceptor_state = 6;
 }
 
-message AllocationRecoveryState {
-  StoreId store_id = 1;
-  // field 2 removed (was store_pointer)
-  UUID new_object_id = 3;
-  ObjectType object_type = 4;
-  // field 5 removed (was object_size)
-  bytes object_data = 6;
-  ObjectRefcount initial_refcount = 7;
-  uint64 timestamp = 8;
-  UUID transaction_uuid = 9;
-  bytes serialized_revision_guard = 10;
-}
-
 message StoreCRLEntry {
   oneof msg {
     TransactionRecoveryState trs = 1;
-    AllocationRecoveryState ars = 2;
   }
 }
 

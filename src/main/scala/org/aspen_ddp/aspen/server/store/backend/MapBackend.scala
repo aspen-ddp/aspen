@@ -46,22 +46,6 @@ class MapBackend(val storeId: StoreId) extends Backend {
   /** Force all cached/in-memory data to stable storage before returning */
   def rebuildFlush(): Unit = ???
 
-  override def allocate(objectId: ObjectId,
-                        objectType: ObjectType.Value,
-                        metadata: Metadata,
-                        data: DataBuffer): Either[Unit, AllocationError.Value] = {
-
-    // Do not add to store during allocation since not all store implementations will be
-    // able to do so.
-    //val os = new ObjectState(objectId, metadata, objectType, data)
-    //m += (objectId -> os)
-    Left(())
-  }
-
-  override def abortAllocation(objectId: ObjectId): Unit = {
-    //m -= objectId
-  }
-
   override def read(pointer: ObjectPointer): Unit = {
     chandler.foreach { handler =>
       val objectId = pointer.id

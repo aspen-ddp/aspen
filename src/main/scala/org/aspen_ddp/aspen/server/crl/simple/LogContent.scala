@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDisposition, TransactionId}
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -224,88 +224,4 @@ class Tx(val id: TxId,
     objectUpdateLocations = None
 
 
-object Alloc:
-  case class LoadingAlloc( txid: TxId,
-                           dataLocation: StreamLocation,
-                           newObjectId: ObjectId,
-                           objectType: ObjectType.Value,
-                           initialRefcount: ObjectRefcount,
-                           timestamp: HLCTimestamp,
-                           serializedRevisionGuard: DataBuffer )
-
-  def loadAlloc(bb: ByteBuffer): LoadingAlloc =
-    val txid = LogContent.getTxId(bb)
-    val newObjectId = ObjectId(LogContent.getUUID(bb))
-    val objectType = bb.get() match {
-      case 0 => ObjectType.Data
-      case 1 => ObjectType.KeyValue
-      case _ => throw new CorruptedEntry("Invalid Object Type")
-    }
-    val dataLocation = LogContent.getStreamLocation(bb)
-    val rserial = bb.getInt()
-    val rcount = bb.getInt()
-    val refcount = ObjectRefcount(rserial, rcount)
-    val timestamp = HLCTimestamp(bb.getLong())
-    val guard = new Array[Byte](bb.getInt())
-    bb.get(guard)
-    val serializedRevisionGuard = DataBuffer(guard)
-
-    LoadingAlloc(txid, dataLocation, newObjectId, objectType, refcount,
-      timestamp, serializedRevisionGuard)
-
-
-class Alloc(var dataLocation: Option[StreamLocation],
-            var state: AllocationRecoveryState) extends LogContent:
-
-  def txid: TxId = TxId(state.storeId, state.allocationTransactionId)
-
-  override def clearDynamicData(): Unit =
-    dataLocation = None
-
-  override def dynamicDataSize: Long =
-    if dataLocation.isEmpty then
-      state.objectData.size
-    else
-      0
-
-  override def staticDataSize: Long =
-    // Allocation Entry
-    //     txid: StoreId 17 + allocation_transaction_id 16
-    //     id: ObjectId, 16
-    //     objectType: ObjectType, 1
-    //     data: StreamLocation, 14
-    //     refcount: Refcount, 8 (4-byte serial, 4-byte count)
-    //     timestamp: HLCTimestamp, 8
-    //     serialized_revision_guard: DataBuffer <== 4 + nbytes
-    //
-    17 + 16 + 16 + 1 + StreamLocation.StaticSize + 8 + 8 + 4 + state.serializedRevisionGuard.size
-
-  override def writeStaticEntry(bb: ByteBuffer): Unit =
-    require(dataLocation.nonEmpty)
-
-    LogContent.putTxId(bb, TxId(state.storeId, state.allocationTransactionId))
-    LogContent.putUUID(bb, state.newObjectId.uuid)
-    val kind = state.objectType match {
-      case ObjectType.Data => 0
-      case ObjectType.KeyValue => 1
-    }
-    bb.put(kind.toByte)
-    dataLocation.foreach: loc =>
-      LogContent.putStreamLocation(bb, loc)
-    bb.putInt(state.initialRefcount.updateSerial)
-    bb.putInt(state.initialRefcount.count)
-    bb.putLong(state.timestamp.asLong)
-    bb.putInt(state.serializedRevisionGuard.size)
-    bb.put(state.serializedRevisionGuard.asReadOnlyBuffer())
-  
-  override def closeStream(id: StreamId): Boolean =
-    dataLocation match
-      case None => false
-      case Some(loc) => 
-        if loc.streamId == id then
-          dataLocation = None
-          true
-        else
-          false
-    
   

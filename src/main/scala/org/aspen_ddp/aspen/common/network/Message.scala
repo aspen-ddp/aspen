@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
@@ -58,38 +58,6 @@ sealed abstract class TxMessage extends Message {
   val from: StoreId
   val transactionId: TransactionId
 }
-
-final case class Allocate(
-                           toStore: StoreId,
-                           fromClient: ClientId,
-                           newObjectId: ObjectId,
-                           objectType: ObjectType.Value,
-                           initialRefcount: ObjectRefcount,
-                           objectData: DataBuffer,
-                           timestamp: HLCTimestamp,
-                           allocationTransactionId: TransactionId,
-                           revisionGuard: AllocationRevisionGuard
-                         ) extends ClientRequest {
-
-  override def equals(other: Any): Boolean = other match {
-    case rhs: Allocate => toStore == rhs.toStore && fromClient == rhs.fromClient &&
-      objectData.compareTo(rhs.objectData) == 0 &&
-      initialRefcount == rhs.initialRefcount && timestamp.compareTo(rhs.timestamp) == 0 &&
-      allocationTransactionId == rhs.allocationTransactionId &&
-      revisionGuard == rhs.revisionGuard
-    case _ => false
-  }
-
-  override def toString: String = f"Allocate from $fromClient to $toStore type $objectType objectId $newObjectId allocationTx $allocationTransactionId"
-}
-
-final case class AllocateResponse(toClient: ClientId,
-                                  fromStore: StoreId,
-                                  allocationTransactionId: TransactionId,
-                                  newObjectId: ObjectId,
-                                  success: Boolean,
-                                  storeNotFound: Boolean) extends ClientResponse:
-  override def toString: String = f"AllocateResponse from $fromStore to $toClient tx $allocationTransactionId objId $newObjectId"
 
 final case class Read(
                        toStore: StoreId,

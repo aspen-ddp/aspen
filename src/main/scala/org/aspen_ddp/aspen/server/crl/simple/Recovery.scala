@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionStatus}
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.apache.logging.log4j.scala.Logging
 
 import java.nio.file.Path
@@ -18,12 +18,11 @@ object Recovery extends Logging:
                     initialNextEntryOffset: Long,
                     initialOldestEntryNeeded: Long,
                     initialPreviousEntryLocation: StreamLocation,
-                    trsList: List[TransactionRecoveryState],
-                    arsList: List[AllocationRecoveryState])
+                    trsList: List[TransactionRecoveryState])
 
   def recover(files: List[(StreamId, Path)]): Result =
     val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2)).toArray
-    val rs = LogEntry.RecoveringState(HashMap(), Set(), HashMap(), Set())
+    val rs = LogEntry.RecoveringState(HashMap(), Set())
     var highestHead: Option[(StreamId, LogEntry.EntryHeader)] = None
     var activeStreamId = StreamId(0)
     var initialNextEntrySerialNumber: Long = 0
@@ -87,18 +86,6 @@ object Recovery extends Logging:
         ltx.paxosAcceptorState)
     ).toList
 
-    val arsLst = rs.allocations.valuesIterator.map( a =>
-      AllocationRecoveryState(
-        a.txid.storeId,
-        a.newObjectId,
-        a.objectType,
-        readStreamLocation(a.dataLocation),
-        a.initialRefcount,
-        a.timestamp,
-        a.txid.transactionId,
-        a.serializedRevisionGuard)
-    ).toList
-
     Result(
       activeStreamId,
       currentStreamUUID,
@@ -106,8 +93,4 @@ object Recovery extends Logging:
       initialNextEntryOffset,
       initialOldestEntryNeeded,
       initialPreviousEntryLocation,
-      trsList,
-      arsLst)
-
-
-
+      trsList)

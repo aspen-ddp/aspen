@@ -2,11 +2,11 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{Allocate, AllocateResponse, ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
+import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionId}
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -43,52 +43,32 @@ class Frontend(val storeId: StoreId,
   var transactions: Map[TransactionId, Tx] = Map()
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
-  private var pendingAllocations: Map[TransactionId, List[AllocateResponse]] = Map()
-  private var allocationCommits: Set[TransactionId] = Set()
 
-  {
-    val (ltrs, lalloc) = crl.getFullRecoveryState(storeId)
-
-    ltrs.foreach { trs =>
-      val txd = TransactionDescription.deserialize(trs.serializedTxd)
-      val pointers = txd.allHostedObjects(storeId)
-      val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers)
-      transactions += (txd.transactionId -> tx)
-      pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
-    }
-
-    lalloc.foreach { ars =>
-      val msg = AllocateResponse(ClientId.Null, storeId, ars.allocationTransactionId,
-        ars.newObjectId, true, false)
-      var l = pendingAllocations.get(ars.allocationTransactionId) match {
-        case None => Nil
-        case Some(lst) => lst
-      }
-
-      l = msg :: l
-
-      pendingAllocations += (ars.allocationTransactionId -> l)
-    }
+  crl.getFullRecoveryState(storeId).foreach { trs =>
+    val txd = TransactionDescription.deserialize(trs.serializedTxd)
+    val pointers = txd.allHostedObjects(storeId)
+    val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers)
+    transactions += (txd.transactionId -> tx)
+    pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }
-  
+
+
   def close(): Future[Unit] = backend.close()
 
   def path: Path = backend.path
-  
+
   def commit(os: ObjectState, cs: CommitState, txid: TransactionId): Unit =
-    //println(s"Committing object ${cs.objectId} refcount ${os.metadata.refcount}")
     if os.metadata.refcount.count == 0 then
       objectCache.remove(os.objectId)
     else
       objectCache.insert(os)
     backend.commit(cs, txid)
-  
+
   def receiveTransactionMessage(msg: TxMessage): Unit = msg match {
     case m: TxPrepare => receivePrepare(m)
     case m: TxAccept => transactions.get(m.transactionId).foreach(tx => tx.receiveAccept(m))
     case m: TxResolved =>
       transactions.get(m.transactionId).foreach(tx => tx.receiveResolved(m))
-      receiveResolved(m)
     case m: TxFinalized =>
       transactions.get(m.transactionId).foreach(tx => tx.receiveFinalized(m))
       transactions -= m.transactionId
@@ -111,41 +91,11 @@ class Frontend(val storeId: StoreId,
       pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }
 
-  /** TxResolved messages are the one and only mechanism for resolving pending allocations */
-  private def receiveResolved(m: TxResolved): Unit = {
-    pendingAllocations.get(m.transactionId).foreach { lst =>
-      lst.foreach { ars =>
-        // Guaranteed to be in the cache due to the transaction reference
-        val os = objectCache.get(ars.newObjectId).get
-
-        // Remove the reference count we added when this ObjectState was created
-        os.transactionReferences -= 1
-
-        if (m.committed) {
-          val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
-          allocationCommits += m.transactionId
-          backend.commit(cs, m.transactionId)
-        } else {
-          crl.deleteAllocation(storeId, m.transactionId)
-          objectCache.remove(os.objectId)
-          backend.abortAllocation(os.objectId)
-        }
-      }
-
-      pendingAllocations -= m.transactionId
-    }
-  }
-
   def backendOperationComplete(completion: Completion): Unit = completion match {
     case r: Read => backendReadComplete(r.objectId, r.result)
     case c: Commit =>
       transactions.get(c.transactionId).foreach { tx =>
         tx.commitComplete(c.objectId, c.result)
-      }
-
-      if (allocationCommits.contains(c.transactionId)) {
-        allocationCommits -= c.transactionId
-        crl.deleteAllocation(storeId, c.transactionId)
       }
   }
 
@@ -211,31 +161,27 @@ class Frontend(val storeId: StoreId,
 
   private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit =
     val objectId = pointer.id
-    
+
     logger.trace(s"Loading object for Tx: ${transaction.transactionId}. Object: $objectId")
 
     if transaction.txd.allocatingObjects.contains(pointer.id) then
-      // Allocating new object.
-      // Create a new ObjectState with "default" metadata and empty content. The transaction
-      // requirements and object updates will overwrite the defaults
       logger.trace(s"Allocating new object: $objectId in Tx: ${transaction.transactionId}.")
-      
+
       val metadata = Metadata(
         ObjectRevision.Allocating,
         ObjectRefcount.Allocating,
         transaction.txd.startTimestamp
       )
-      
+
       val os = new ObjectState(objectId, metadata, pointer.objectType, DataBuffer.Empty)
-      
+
       transaction.objectLoaded(os)
-    else 
-      // Non-allocation, do a normal read
+    else
       objectCache.get(objectId) match
         case Some(os) =>
           logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
           transaction.objectLoaded(os)
-          
+
         case None =>
           val tr = TransactionRead(transaction.transactionId)
 
@@ -247,7 +193,7 @@ class Frontend(val storeId: StoreId,
               pendingReads += (objectId -> (tr :: Nil))
               logger.trace(s"Loading object from Backend for Tx: ${transaction.transactionId}. Object: $objectId")
               backend.read(pointer)
-  
+
   private def opportunisticRebuild(op: OpportunisticRebuild, os: ObjectState): Unit = {
     if (os.metadata.revision == op.revision) {
       val rc = if (op.refcount.updateSerial > os.metadata.refcount.updateSerial)
@@ -332,61 +278,5 @@ class Frontend(val storeId: StoreId,
     }
 
     pendingReads -= objectId
-  }
-
-  def allocateObject(msg: Allocate): Unit = {
-    // Check to see if we've already received an allocation request for this object
-    pendingAllocations.get(msg.allocationTransactionId) match {
-      case Some(lst) =>
-        if (lst.exists(p => p.newObjectId == msg.newObjectId))
-          return
-      case None =>
-    }
-
-    val metadata = Metadata(ObjectRevision(msg.allocationTransactionId),
-      msg.initialRefcount, msg.timestamp)
-
-    val either = backend.allocate(msg.newObjectId, msg.objectType, metadata, msg.objectData)
-
-    either match {
-      case Right(err) =>
-        val r = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId, false, false)
-        logger.debug(s"Failed to allocate object ${msg.newObjectId} for tx ${msg.allocationTransactionId}. Error: $err")
-        net.sendClientResponse(r)
-
-      case Left(()) =>
-        logger.trace(s"Backend allocated new object ${msg.newObjectId}. Saving in CRL. tx ${msg.allocationTransactionId}")
-        val rmsg = AllocateResponse(msg.fromClient, msg.toStore, msg.allocationTransactionId, msg.newObjectId,
-          true, false)
-
-        val arList = pendingAllocations.get(msg.allocationTransactionId) match
-          case Some(lst) => rmsg :: lst
-          case None => rmsg :: Nil
-
-        pendingAllocations += (msg.allocationTransactionId -> arList)
-
-        val os = new ObjectState(msg.newObjectId, metadata, msg.objectType, msg.objectData)
-
-        // Ensure this object stays in the cache
-        os.transactionReferences += 1
-
-        objectCache.insert(os)
-
-        val ars = AllocationRecoveryState(
-          storeId,
-          msg.newObjectId,
-          msg.objectType,
-          msg.objectData,
-          msg.initialRefcount,
-          msg.timestamp,
-          msg.allocationTransactionId,
-          msg.revisionGuard.serialize()
-        )
-
-        crl.save(ars, () =>
-          logger.trace(s"CRL Save Completed for Allocation of object ${msg.newObjectId} tx ${msg.allocationTransactionId}")
-          net.sendClientResponse(rmsg)
-        )
-    }
   }
 }

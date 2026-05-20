@@ -1,10 +1,8 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, StoragePool, Transaction}
-import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision, SetLeft, SetMax, SetMin, SetRight, Value}
-import org.aspen_ddp.aspen.server.store.ValueState
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId}
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}

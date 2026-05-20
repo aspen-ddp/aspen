@@ -629,17 +629,7 @@ class StoreManager(val client: AspenClient,
 
       case ClientReq(msg) => stores.get(msg.toStore) match
         case None => msg match
-          case a: Allocate =>
-            if ! offlineStores.contains(a.toStore) then
-              val msg = AllocateResponse(
-                a.fromClient,
-                a.toStore,
-                a.allocationTransactionId,
-                a.newObjectId,
-                false,
-                true)
-              net.sendClientResponse(msg)
-          case r: Read => 
+          case r: Read =>
             if ! offlineStores.contains(r.toStore) then
               val msg = ReadResponse(
                 r.fromClient,
@@ -649,13 +639,11 @@ class StoreManager(val client: AspenClient,
                 Left(ReadError.StoreNotFound)
               )
               net.sendClientResponse(msg)
-              
+
           case op: OpportunisticRebuild =>
           case s: TransactionCompletionQuery =>
-          
-        case Some(store) => msg match
-          case a: Allocate => store.frontend.allocateObject(a)
 
+        case Some(store) => msg match
           case r: Read =>
             if r.objectPointer.poolId == store.storeId.poolId then
               store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer)
@@ -691,8 +679,8 @@ class StoreManager(val client: AspenClient,
         stores += (backend.storeId -> store)
 
         if Files.exists(backend.crlSaveFile) then
-          val (storeId, trs, ars) = CrashRecoveryLog.loadStoreState(backend.crlSaveFile)
-          crl.loadStore(storeId, trs, ars).foreach: _ =>
+          val (storeId, trs) = CrashRecoveryLog.loadStoreState(backend.crlSaveFile)
+          crl.loadStore(storeId, trs).foreach: _ =>
             Files.delete(backend.crlSaveFile)
             p.success(())
         else
@@ -718,8 +706,8 @@ class StoreManager(val client: AspenClient,
             offlineStores += storeId
             storageDevices.get(store.storageDeviceId).foreach: sds =>
               sds.offlineStores += storeId
-            crl.closeStore(storeId).foreach: (trs, ars) =>
-              CrashRecoveryLog.saveStoreState(storeId, trs, ars, store.backend.crlSaveFile)
+            crl.closeStore(storeId).foreach: trs =>
+              CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)
               store.close().foreach: _ =>
                 completion.success(())
         

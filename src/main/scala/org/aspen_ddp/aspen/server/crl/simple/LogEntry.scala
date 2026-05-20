@@ -14,29 +14,21 @@ class LogEntry(val previousEntryLocation: StreamLocation,
   private var completionHandlers: List[() => Unit] = Nil
   private var txs: HashMap[TxId, Tx] = new HashMap()
   private var txDeletions: List[TxId] = Nil
-  private var allocations: List[Alloc] = Nil
-  private var allocDeletions: List[TxId] = Nil
   private var txDelSet: Set[TxId] = Set()
-  private var allocDelSet: Set[TxId] = Set()
 
 
   def isEmpty: Boolean =
     txs.isEmpty
-      && allocations.isEmpty
       && txDeletions.isEmpty
-      && allocDeletions.isEmpty
 
 
   def staticDataSize: Long =
     txs.valuesIterator.foldLeft(0L)((s, tx) => s + tx.staticDataSize)
-    + allocations.foldLeft(0L)((s, a) => s + a.staticDataSize)
     + TxId.StaticSize * txDeletions.length
-    + TxId.StaticSize * allocDeletions.length
     + 16 // Trailing file UUID. Must match header UUID during load process or corrupted entry
 
   def dynamicDataSize: Long =
     txs.valuesIterator.foldLeft(0L)((s, t) => s + t.dynamicDataSize)
-    + allocations.foldLeft(0L)((s, a) => s + a.dynamicDataSize)
 
   def entrySize: Long =
     val base = StaticEntryHeaderSize + dynamicDataSize + staticDataSize
@@ -52,18 +44,9 @@ class LogEntry(val previousEntryLocation: StreamLocation,
       txs += (tx.id -> tx)
       completionHandlers = completionHandler :: completionHandlers
 
-  def addAllocation(alloc: Alloc, completionHandler: () => Unit): Unit =
-    if !allocDelSet.contains(alloc.txid) then
-      allocations = alloc :: allocations
-      completionHandlers = completionHandler :: completionHandlers
-
   def deleteTx(txid: TxId): Unit =
     txDeletions = txid :: txDeletions
     txDelSet = txDelSet + txid
-
-  def deleteAllocation(txid: TxId): Unit =
-    allocDeletions = txid :: allocDeletions
-    allocDelSet = allocDelSet + txid
 
   def createEntryBuffers(startingOffset: Long,
                          streamUUID: UUID,
@@ -84,9 +67,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     hbuff.putLong(dynDataSize)
     hbuff.putLong(statDataSize)
     hbuff.putInt(txs.size)
-    hbuff.putInt(allocations.length)
     hbuff.putInt(txDeletions.length)
-    hbuff.putInt(allocDeletions.length)
 
     buffers = ByteBuffer.wrap(harr) :: buffers
 
@@ -108,19 +89,13 @@ class LogEntry(val previousEntryLocation: StreamLocation,
           (ou.objectId, allocate(ou.data.asReadOnlyBuffer()))
         )
 
-    allocations.foreach: a =>
-      if a.dataLocation.isEmpty then
-        a.dataLocation = Some(allocate(a.state.objectData.asReadOnlyBuffer()))
-
     // StaticData ---------
     val staticArr = new Array[Byte](statDataSize.toInt)
 
     val bb = ByteBuffer.wrap(staticArr)
 
     txs.valuesIterator.foreach(_.writeStaticEntry(bb))
-    allocations.foreach(_.writeStaticEntry(bb))
     txDeletions.foreach(LogContent.putTxId(bb, _))
-    allocDeletions.foreach(LogContent.putTxId(bb, _))
     LogContent.putUUID(bb, streamUUID)
 
     assert(bb.position() == bb.limit)
@@ -138,7 +113,7 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
 object LogEntry:
 
-  val StaticEntryHeaderSize: Int = 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4 + 4 + 4
+  val StaticEntryHeaderSize: Int = 16 + 8 + 8 + 14 + 8 + 8 + 4 + 4
 
   /// Entry Header
   ///   stream_uuid - 16
@@ -148,9 +123,7 @@ object LogEntry:
   ///   dynamic_data_size - 8
   ///   static_data_size - 8
   ///   num_transactions - 4
-  ///   num_allocations - 4
   ///   num_tx_deletions - 4
-  ///   num_alloc_deletions - 4
   case class EntryHeader(streamUUID: UUID,
                          entrySerialNumber: Long,
                          oldestEntryNeeded: Long,
@@ -158,9 +131,7 @@ object LogEntry:
                          dynamicDataSize: Long,
                          staticDataSize: Long,
                          numTransactions: Int,
-                         numAllocations: Int,
-                         numDeletedTransactions: Int,
-                         numDeletedAllocations: Int):
+                         numDeletedTransactions: Int):
     def trailingUUIDOffset: Long =
       StaticEntryHeaderSize + dynamicDataSize + staticDataSize - 16
 
@@ -170,9 +141,7 @@ object LogEntry:
 
 
   class RecoveringState(var txs: HashMap[TxId, Tx.LoadingTx],
-                        var txDeletions: Set[TxId],
-                        var allocations: HashMap[TxId, Alloc.LoadingAlloc],
-                        var allocDeletions: Set[TxId])
+                        var txDeletions: Set[TxId])
 
 
   def loadHeader(hbuff: ByteBuffer): EntryHeader =
@@ -183,12 +152,10 @@ object LogEntry:
     val dynamicDataSize = hbuff.getLong()
     val staticDataSize = hbuff.getLong()
     val numTransactions = hbuff.getInt()
-    val numAllocations = hbuff.getInt()
     val numTxDeletions = hbuff.getInt()
-    val numAllocDeletions = hbuff.getInt()
 
     EntryHeader(streamUUID, entrySerialNumber, oldestEntryNeeded, previousEntryLocation, dynamicDataSize,
-      staticDataSize, numTransactions, numAllocations, numTxDeletions, numAllocDeletions)
+      staticDataSize, numTransactions, numTxDeletions)
 
 
   def loadStaticEntryContent(header: EntryHeader,
@@ -200,20 +167,10 @@ object LogEntry:
       if !rstate.txDeletions.contains(ltx.id) && !rstate.txs.contains(ltx.id) then
         rstate.txs += (ltx.id -> ltx)
 
-    for (_ <- 0 until header.numAllocations)
-      val la = Alloc.loadAlloc(bb)
-      if !rstate.allocDeletions.contains(la.txid) && !rstate.allocations.contains(la.txid) then
-        rstate.allocations += (la.txid -> la)
-
     for (_ <- 0 until header.numDeletedTransactions)
       val txid = LogContent.getTxId(bb)
       rstate.txs -= txid
       rstate.txDeletions += txid
-
-    for (_ <- 0 until header.numDeletedAllocations)
-      val txid = LogContent.getTxId(bb)
-      rstate.allocations -= txid
-      rstate.allocDeletions += txid
 
 
   def padTo4k(offset: Long): Int =

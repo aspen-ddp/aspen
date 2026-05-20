@@ -437,10 +437,6 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       logger.trace(s"Got $message")
       onClientResponseReceived(message)
 
-    else if m.hasAllocateResponse then
-      val message = Codec.decode(m.getAllocateResponse)
-      logger.trace(s"Got $message")
-      onClientResponseReceived(message)
   }
 
   private def updateClientId(clientId: ClientId, routerAddress: Array[Byte]): Unit = {
@@ -572,13 +568,6 @@ class ZMQNetwork(val oclientId: Option[ClientId],
       val message = Codec.decode(m.getHeartbeat)
       logger.trace(s"Got $message")
       onTransactionMessageReceived(message)
-
-    else if m.hasAllocate then
-      //println(s"got allocate request. Receiver: $a")
-      val message = Codec.decode(m.getAllocate)
-      logger.trace(s"Got $message")
-      updateClientId(message.fromClient, from)
-      onClientRequestReceived(message)
 
     else if m.hasOpportunisticRebuild then
       val message = Codec.decode(m.getOpportunisticRebuild)

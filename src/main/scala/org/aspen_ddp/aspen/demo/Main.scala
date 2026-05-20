@@ -579,8 +579,6 @@ object Main {
               node: KeyValueListNode, key: Key): Future[Unit] = ovalue match
       case None =>
         // No object found in the allocation tree. It must have been deleted. Remove error tree entry
-        // TODO - Race condition here where an outstanding AllocationFinalizationAction may not have completed
-        //        before we come along to do a repair. Very unlikely but still possible
         deleteErrorEntry(node, key)
       case Some(value) => step2(pool, storeId, ObjectPointer(value.value.bytes), node, key)
 

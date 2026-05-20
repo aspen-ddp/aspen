@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.crl.simple
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.apache.logging.log4j.scala.Logging
 
 import java.io.File
@@ -20,13 +20,9 @@ object SimpleCRL:
                              state: TransactionRecoveryState,
                              completionHandler: () => Unit) extends ActionRequest
 
-  case class SaveAllocation(ars: AllocationRecoveryState, completionHandler: () => Unit) extends ActionRequest
-
   case class DropTransactionData(storeId: StoreId, transactionId: TransactionId) extends ActionRequest
 
   case class DeleteTransaction(storeId: StoreId, transactionId: TransactionId) extends ActionRequest
-
-  case class DeleteAllocation(storeId: StoreId, transactionId: TransactionId) extends ActionRequest
 
   case class WriteComplete(serialNumber: Long) extends ActionRequest
 
@@ -34,13 +30,12 @@ object SimpleCRL:
 
   case class GetRecoveryState(storeId: StoreId,
                               removeStore: Boolean,
-                              completion: (List[TransactionRecoveryState], List[AllocationRecoveryState]) => Unit
+                              completion: List[TransactionRecoveryState] => Unit
                              ) extends ActionRequest
 
 
   case class InitialCRLState(crl: SimpleCRL,
-                             trsList: List[TransactionRecoveryState],
-                             arsList: List[AllocationRecoveryState])
+                             trsList: List[TransactionRecoveryState])
 
   case class Factory(streamsDir: Path,
                      numStreams: Int,
@@ -62,8 +57,7 @@ object SimpleCRL:
         maxSizeInBytes,
         files,
         r),
-      r.trsList,
-      r.arsList)
+      r.trsList)
 
 
 class SimpleCRL private (val maxSizeInBytes: Long,
@@ -71,7 +65,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
                          r: Recovery.Result) extends CrashRecoveryLog with Logging:
 
   import SimpleCRL._
-  
+
   val numStreams: Int = files.size
 
   private val writer = StreamWriter(maxSizeInBytes, files)
@@ -81,7 +75,6 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   private val streams: Array[Stream] = new Array[Stream](files.length)
 
   private var transactions: HashMap[TxId, Tx] = new HashMap()
-  private var allocations: HashMap[TxId, List[Alloc]] = new HashMap()
 
   private var queueHead: Option[LogContent] = None
   private var queueTail: Option[LogContent] = None
@@ -99,18 +92,10 @@ class SimpleCRL private (val maxSizeInBytes: Long,
       streams(tpl._1.number) = new Stream(tpl._1, writer, UUID.randomUUID(), 0)
 
   r.trsList.foreach(trs => onSaveTransaction(trs.txd.transactionId, trs, () => ()))
-  r.arsList.foreach(ars => onSaveAllocation(ars, () => ()))
 
-  // If we have any outstanding transactions or allocations, create a new log entry with
-  // their full content. This ensures our oldestSerialNumberNeeded is equal to the current
-  // entry serial number. Otherwise we'd have to figure out where each tx/alloc is to
-  // accurately track how far back we need to go.
   if !currentLogEntry.isEmpty then
     writeCurrentLogEntry()
-    // Only the writer has a reference to this instance during initialization so this call
-    // will block until the writer enqueues a WriteComplete message
     val event = ioQueue.take()
-    // Put this back on the queue for the I/O thread to handle the WriteComplete event
     ioQueue.put(event)
 
   initializing = false
@@ -144,11 +129,6 @@ class SimpleCRL private (val maxSizeInBytes: Long,
         if tx._2.closeStream(streamId) then
           moveToQueueHead(tx._2)
           currentLogEntry.addTx(tx._2, () => ())
-      allocations.foreach: tpl =>
-        tpl._2.foreach: a =>
-          if a.closeStream(streamId) then
-            moveToQueueHead(a)
-            currentLogEntry.addAllocation(a, () => ())
 
     writeInProgress = true
     logger.trace(s"CRL beginning write for entry ${currentLogEntry.entrySerialNumber}")
@@ -163,13 +143,9 @@ class SimpleCRL private (val maxSizeInBytes: Long,
       ioQueue.take() match
         case SaveTransaction(transactionId, state, completionHandler) => onSaveTransaction(transactionId, state, completionHandler)
 
-        case SaveAllocation(ars, completionHandler) => onSaveAllocation(ars, completionHandler)
-
         case DropTransactionData(storeId, transactionId) => onDropTransactionObjectData(storeId, transactionId)
 
         case DeleteTransaction(storeId, transactionId) => onDeleteTransaction(storeId, transactionId)
-
-        case DeleteAllocation(storeId, transactionId) => onDeleteAllocation(storeId, transactionId)
 
         case WriteComplete(serialNumber) =>
           logger.trace(s"CRL write complete for entry serial number: ${serialNumber}")
@@ -214,11 +190,10 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   private def onGetRecoveryState(storeId: StoreId,
                                  removeStore: Boolean,
-                                 completion: (List[TransactionRecoveryState], List[AllocationRecoveryState]) => Unit
+                                 completion: List[TransactionRecoveryState] => Unit
                                 ): Unit =
 
     var trsList: List[TransactionRecoveryState] = Nil
-    var arsList: List[AllocationRecoveryState] = Nil
 
     transactions = transactions.filter: (txid, tx) =>
       if txid.storeId == storeId then
@@ -227,15 +202,7 @@ class SimpleCRL private (val maxSizeInBytes: Long,
       else
         true
 
-    allocations = allocations.filter: (txid, allocList) =>
-      if txid.storeId == storeId then
-        allocList.foreach: alloc =>
-          arsList = alloc.state :: arsList
-        !removeStore
-      else
-        true
-
-    completion(trsList, arsList)
+    completion(trsList)
 
   private def onSaveTransaction(transactionId: TransactionId,
                       state: TransactionRecoveryState,
@@ -257,24 +224,6 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     currentLogEntry.addTx(tx, completionHandler)
     startWrite()
 
-  private def onSaveAllocation(ars: AllocationRecoveryState,
-                               completionHandler: () => Unit): Unit =
-    val txid = TxId(ars.storeId, ars.allocationTransactionId)
-    val allocs = allocations.get(txid) match
-      case Some(lst) => lst
-      case None => Nil
-
-    val alloc = new Alloc(None, ars)
-
-    addToQueueHead(alloc)
-
-    val lst: List[Alloc] = alloc :: allocs
-    allocations += (txid -> lst)
-
-    logger.trace(s"CRL adding allocation to log entry ${currentLogEntry.entrySerialNumber}")
-    currentLogEntry.addAllocation(alloc, completionHandler)
-    startWrite()
-
   private def onDeleteTransaction(storeId: StoreId, transactionid: TransactionId): Unit =
     val txid = TxId(storeId, transactionid)
     currentLogEntry.deleteTx(txid)
@@ -282,108 +231,79 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     transactions -= txid
     startWrite()
 
-  private def onDeleteAllocation(storeId: StoreId, transactionid: TransactionId): Unit =
-    val txid = TxId(storeId, transactionid)
-    currentLogEntry.deleteAllocation(txid)
-    allocations.get(txid).foreach(lst => lst.foreach(removeFromQueue(_)))
-    allocations -= txid
-    startWrite()
-
   private def onDropTransactionObjectData(storeId: StoreId, transactionid: TransactionId): Unit =
-    // Don't add to current entry. Allow the dropped data to take effect on the next
-    // state write or propagation
     transactions.get(TxId(storeId, transactionid)).foreach(_.dropTransactionObjectData())
 
-  def getFullRecoveryState(storeId: StoreId): (List[TransactionRecoveryState], List[AllocationRecoveryState]) =
+  def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
     var trsList: List[TransactionRecoveryState] = Nil
-    var arsList: List[AllocationRecoveryState] = Nil
 
     val blockingQueue = new LinkedBlockingQueue[String]()
 
-    def completion(tl: List[TransactionRecoveryState], al: List[AllocationRecoveryState]): Unit =
+    def completion(tl: List[TransactionRecoveryState]): Unit =
       trsList = tl
-      arsList = al
       blockingQueue.put("")
 
     ioQueue.put(GetRecoveryState(storeId, false, completion))
 
     blockingQueue.take()
 
-    (trsList, arsList)
+    trsList
 
   def save(transactionId: TransactionId,
            state: TransactionRecoveryState,
            completionHandler: () => Unit): Unit =
     ioQueue.put(SaveTransaction(transactionId, state, completionHandler))
 
-  def save(ars: AllocationRecoveryState,
-           completionHandler: () => Unit): Unit =
-    ioQueue.put(SaveAllocation(ars, completionHandler))
-
   def deleteTransaction(storeId: StoreId, transactionid: TransactionId): Unit =
     ioQueue.put(DeleteTransaction(storeId, transactionid))
-
-  def deleteAllocation(storeId: StoreId, transactionid: TransactionId): Unit =
-    ioQueue.put(DeleteAllocation(storeId, transactionid))
 
   def dropTransactionObjectData(storeId: StoreId, transactionid: TransactionId): Unit =
     ioQueue.put(DropTransactionData(storeId, transactionid))
 
-  def closeStore(storeId: StoreId): Future[(List[TransactionRecoveryState], List[AllocationRecoveryState])] =
-    val p = Promise[(List[TransactionRecoveryState], List[AllocationRecoveryState])]()
+  def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+    val p = Promise[List[TransactionRecoveryState]]()
 
-    def completion(trsList: List[TransactionRecoveryState], arsList: List[AllocationRecoveryState]): Unit =
-      p.success((trsList, arsList))
+    def completion(trsList: List[TransactionRecoveryState]): Unit =
+      p.success(trsList)
 
     ioQueue.put(GetRecoveryState(storeId, true, completion))
 
     p.future
 
-  def loadStoreState(storeId: StoreId, 
-                     trsList: List[TransactionRecoveryState], 
-                     arsList: List[AllocationRecoveryState]): Future[Unit] =
-    
-    logger.info(s"Loading transaction and allocation state for store: $storeId")
-    
-    if trsList.isEmpty && arsList.isEmpty then
-      logger.info(s"Completed load of empty transaction and allocation state for store: $storeId")
+  def loadStoreState(storeId: StoreId,
+                     trsList: List[TransactionRecoveryState]): Future[Unit] =
+
+    logger.info(s"Loading transaction state for store: $storeId")
+
+    if trsList.isEmpty then
+      logger.info(s"Completed load of empty transaction state for store: $storeId")
       return Future.successful(())
-    
+
     val completion = Promise[Unit]()
     var outstandingSaves = 1
     var allStateWritten = false
 
     def onComplete(): Unit = synchronized {
       outstandingSaves -= 1
-      // Use allStateWritten to prevent race condition of backend thread writing so fast that we
-      // hit zero before all of the recovery state instances have been written
       if allStateWritten && outstandingSaves == 0 then
-        logger.info(s"Completed load of transaction and allocation state for store: $storeId")
+        logger.info(s"Completed load of transaction state for store: $storeId")
         completion.success(())
     }
-    
+
     trsList.foreach: trs =>
       synchronized {
         outstandingSaves += 1
       }
       save(trs.txd.transactionId, trs, onComplete)
 
-    arsList.foreach: ars =>
-      synchronized {
-        outstandingSaves += 1
-      }
-      save(ars, onComplete)
-
     synchronized{
-      allStateWritten = true  
+      allStateWritten = true
     }
-    onComplete() // Ensure there's at least one call after allStateWritten has been set
-    
+    onComplete()
+
     completion.future
 
-  def shutdown(): Unit = 
+  def shutdown(): Unit =
     val q = new LinkedBlockingQueue[String]()
     ioQueue.put(Shutdown(() => q.put("")))
     q.take()
-
-

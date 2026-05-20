@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen
 import java.util.UUID
 import org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.internal.{OpportunisticRebuildManager, StaticTypeRegistry}
-import org.aspen_ddp.aspen.client.internal.allocation.{AllocationManager, BaseAllocationDriver}
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
@@ -13,14 +12,14 @@ import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObject
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{AllocateResponse, ClientId, ClientRequest, ClientResponse, HostMessage, Read, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, Read, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreManager, transaction}
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, MapBackend}
@@ -41,10 +40,10 @@ object TestNetwork {
   val bootstrapHost = HostState(HostId.BootstrapHostId, "testhost", "localhost", 1234, 1235, 1236, Set())
 
   class TestCRL extends CrashRecoveryLog {
-    override def getFullRecoveryState(storeId: StoreId): (List[TransactionRecoveryState], List[AllocationRecoveryState]) = (Nil, Nil)
+    override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = Nil
 
-    override def closeStore(storeId: StoreId): Future[(List[TransactionRecoveryState], List[AllocationRecoveryState])] =
-      Future.successful((List[TransactionRecoveryState](), List[AllocationRecoveryState]()))
+    override def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+      Future.successful(Nil)
 
     override def save(txid: TransactionId,
                       state: TransactionRecoveryState,
@@ -52,15 +51,9 @@ object TestNetwork {
       completionHandler()
     }
 
-    override def save(state: AllocationRecoveryState, completionHandler: () => Unit): Unit = {
-      completionHandler()
-    }
-
     override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit = ()
 
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = ()
-
-    override def deleteAllocation(storeId: StoreId, txid: TransactionId): Unit = ()
   }
 
   object TestCRL extends CrashRecoveryLogFactory {
@@ -104,7 +97,7 @@ object TestNetwork {
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
 
     def getHostId(hostName: String): Future[HostId] = ???
-    
+
     val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
     val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
 
@@ -116,7 +109,7 @@ object TestNetwork {
 
     private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
       objectRegistry.getRegisteredKeyValueObject(storageDeviceId.uuid)
-      
+
     protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 
     override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
@@ -127,9 +120,6 @@ object TestNetwork {
 
     val messenger: ClientMessenger = msngr
 
-    val allocationManager: AllocationManager = new AllocationManager(this,
-      BaseAllocationDriver.NoErrorRecoveryAllocationDriver)
-
     val objectCache: ObjectCache = ObjectCache.NoCache
 
     def receiveClientResponse(msg: ClientResponse): Unit = msg match {
@@ -137,7 +127,6 @@ object TestNetwork {
       case m: TransactionCompletionResponse => rmgr.receive(m)
       case m: TransactionResolved => txManager.receive(m)
       case m: TransactionFinalized => txManager.receive(m)
-      case m: AllocateResponse => allocationManager.receive(m)
     }
 
     override def sendHostMessage(msg: HostMessage): Unit = messenger.sendHostMessage(msg)

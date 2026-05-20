@@ -3,13 +3,13 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{Allocate, AllocateResponse, ClientId, ClientResponse, TxMessage, TxPrepare, TxResolved}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ObjectRevisionGuard, ObjectType}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, TxMessage, TxPrepare, TxResolved}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionId}
-import org.aspen_ddp.aspen.server.crl.{AllocationRecoveryState, CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
@@ -43,7 +43,7 @@ object FrontendSuite {
     override def sendTransactionMessage(msg: TxMessage): Unit = tx = Some(msg)
 
     override def sendTransactionMessages(msg: List[TxMessage]): Unit = Some(msg.head)
-    
+
     override def dropCacheForStore(storeId: StoreId): Unit = ()
 
     def clientMessage(): Option[ClientResponse] = {
@@ -62,138 +62,27 @@ object FrontendSuite {
   class TestCrl extends CrashRecoveryLog {
 
     var txSaved = false
-    var aSaved = false
     var txDel = false
-    var aDel = false
     var aDrop = false
 
-    override def getFullRecoveryState(storeId: StoreId): (List[TransactionRecoveryState], List[AllocationRecoveryState]) = (Nil, Nil)
+    override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = Nil
 
-    override def closeStore(storeId: StoreId): Future[(List[TransactionRecoveryState], List[AllocationRecoveryState])] =
-      Future.successful((List[TransactionRecoveryState](), List[AllocationRecoveryState]()))
+    override def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] =
+      Future.successful(Nil)
 
-    override def save(txid: TransactionId, 
+    override def save(txid: TransactionId,
                       state: TransactionRecoveryState,
-                      completionHandler: () => Unit): Unit = 
+                      completionHandler: () => Unit): Unit =
       txSaved = true
-      completionHandler()
-
-    override def save(state: AllocationRecoveryState, completionHandler: () => Unit): Unit = 
-      aSaved = true
       completionHandler()
 
     override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit = aDrop = true
 
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = txDel = true
-
-    override def deleteAllocation(storeId: StoreId, txid: TransactionId): Unit = aDel = true
   }
 }
 
 class FrontendSuite extends AnyFunSuite with Matchers {
   import FrontendSuite._
 
-  test("Allocation") {
-    val backend = new MapBackend(storeId)
-    val cache = new SimpleLRUObjectCache(100)
-    val net = new TestNet
-    val crl = new TestCrl
-    val iref = ObjectRefcount(1,1)
-
-    val idata = DataBuffer(Array[Byte](0,1))
-    val its = HLCTimestamp(1)
-
-
-    val f = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
-
-    val ma = Allocate( toStore = storeId,
-      fromClient = clientId,
-      newObjectId = oid1,
-      objectType = ObjectType.Data,
-      initialRefcount = iref,
-      objectData = idata,
-      timestamp = its,
-      allocationTransactionId = txid1,
-      revisionGuard = ObjectRevisionGuard(op1, rev0)
-    )
-
-    assert(backend.get(oid1).isEmpty)
-
-    f.allocateObject(ma)
-
-    assert(crl.aSaved)
-
-    assert(cache.get(oid1).nonEmpty)
-    assert(backend.get(oid1).isEmpty)
-
-    //f.crlSaveComplete(AllocSaveComplete(crlClient, txid1, storeId, oid1))
-
-    assert(net.cr.nonEmpty)
-
-    val ar = net.cr.get.asInstanceOf[AllocateResponse]
-
-    assert(ar.toClient == clientId)
-    assert(ar.fromStore == storeId)
-    assert(ar.allocationTransactionId == txid1)
-    assert(ar.newObjectId == oid1)
-    assert(ar.success)
-
-    assert(cache.get(oid1).nonEmpty)
-    assert(backend.get(oid1).isEmpty)
-
-    f.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, true))
-
-    assert(backend.get(oid1).nonEmpty)
-  }
-
-  test("Update Allocating Object") {
-    val backend = new MapBackend(storeId)
-    val cache = new SimpleLRUObjectCache(100)
-    val net = new TestNet
-    val crl = new TestCrl
-    val iref = ObjectRefcount(1,1)
-
-    val idata = DataBuffer(Array[Byte](0,1))
-    val its = HLCTimestamp(1)
-
-
-    val f = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
-
-    val ma = Allocate( toStore = storeId,
-      fromClient = clientId,
-      newObjectId = oid1,
-      objectType = ObjectType.Data,
-      initialRefcount = iref,
-      objectData = idata,
-      timestamp = its,
-      allocationTransactionId = txid1,
-      revisionGuard = ObjectRevisionGuard(op1, rev0)
-    )
-
-    assert(backend.get(oid1).isEmpty)
-
-    f.allocateObject(ma)
-
-    //f.crlSaveComplete(AllocSaveComplete(crlClient, txid1, storeId, oid1))
-
-    assert(backend.get(oid1).isEmpty)
-
-    val txd = TransactionDescription(txid1, its, op1, 1.toByte,
-      List(DataUpdate(op1, ObjectRevision(txid1), DataUpdateOperation.Overwrite)),
-      List(), None, List(), List(), ida, Map(poolId -> ida))
-
-    val db = DataBuffer(Array[Byte](0, 1, 2, 3))
-    val ou = ObjectUpdate(oid1, db)
-    val prep = TxPrepare(storeId, storeId, txd, ProposalId.initialProposal(1), List(ou), List())
-
-    f.receiveTransactionMessage(prep)
-
-    f.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, true))
-
-    assert(backend.get(oid1).nonEmpty)
-
-    val os = backend.get(oid1).get
-
-    assert(os.data.size == db.size)
-  }
 }

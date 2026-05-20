@@ -80,7 +80,6 @@ object ProtobufMessageEncoder:
 
     message match
       case m: Read => builder.setRead(Codec.encode(m))
-      case m: Allocate => builder.setAllocate(Codec.encode(m))
       case m: OpportunisticRebuild => builder.setOpportunisticRebuild(Codec.encode(m))
       case m: TransactionCompletionQuery => builder.setTransactionCompletionQuery(Codec.encode(m))
 
@@ -100,7 +99,6 @@ object ProtobufMessageEncoder:
 
     message match
       case m: ReadResponse => builder.setReadResponse(Codec.encode(m))
-      case m: AllocateResponse => builder.setAllocateResponse(Codec.encode(m))
       case m: TransactionCompletionResponse => builder.setTransactionCompletionResponse(Codec.encode(m))
       case m: TransactionFinalized => builder.setTxFinalized(Codec.encode(m))
       case m: TransactionResolved => builder.setTxResolved(Codec.encode(m))

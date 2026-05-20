@@ -2,7 +2,6 @@ package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.client.internal.allocation.AllocationManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage, ReadResponse}
@@ -77,8 +76,6 @@ object BaseReadDriverSuite {
     private[client] def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
 
     private[client] val messenger: Messenger = Messenger.None
-
-    private[client] val allocationManager: AllocationManager = null
 
     private[client] val objectCache: ObjectCache = ObjectCache.NoCache
 

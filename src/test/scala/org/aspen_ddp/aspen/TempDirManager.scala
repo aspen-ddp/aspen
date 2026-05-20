@@ -1,23 +1,21 @@
 package org.aspen_ddp.aspen
 
 import java.io.File
+import java.nio.file.Files
 
 class TempDirManager {
 
-  private  val tfile = File.createTempFile("scalatest", "UnitTestTempDir")
-  tfile.delete()
-
-  val tdir:File = new File(tfile.toString)
-  tdir.mkdir()
-
+  val tdir: File = Files.createTempDirectory("scalatest").toFile
 
   def delete(): Unit =
 
-    def cleanup(f:File): Unit =
+    def cleanup(f: File): Unit =
       if f.isFile then
         f.delete()
       else
-        f.listFiles().foreach( cleanup )
+        val children = f.listFiles()
+        if children != null then
+          children.foreach(cleanup)
         f.delete()
 
     cleanup(tdir)

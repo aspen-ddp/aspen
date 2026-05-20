@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal
 
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.allocation.{AllocationManager, SuperSimpleAllocationDriver}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{ReadManager, SimpleReadDriver}
@@ -81,20 +81,16 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   
       def createPoolObj(alloc: ObjectAllocator): Future[KeyValueObjectPointer] =
         for
-          radicleKvos <- read(radicle)
-          
-          revisionGuard = ObjectRevisionGuard(radicleKvos.pointer, radicleKvos.revision)
-          
-          errTreeRoot <- alloc.allocateKeyValueObject(revisionGuard, Map())
-          allocTreeRoot <- alloc.allocateKeyValueObject(revisionGuard, Map())
-          
+          errTreeRoot <- alloc.allocateKeyValueObject(Map())
+          allocTreeRoot <- alloc.allocateKeyValueObject(Map())
+
           nodeAllocator = SinglePoolNodeAllocator(this, radicle.poolId)
-  
+
           poolConfig = config.encode()
           errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), nodeAllocator).encode()
           allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), nodeAllocator).encode()
-          
-          poolPtr <- alloc.allocateKeyValueObject(revisionGuard, Map(
+
+          poolPtr <- alloc.allocateKeyValueObject(Map(
             StoragePoolState.ConfigKey -> Value(poolConfig),
             StoragePoolState.ErrorTreeKey -> Value(errorTree),
             StoragePoolState.AllocationTreeKey -> Value(allocTree)

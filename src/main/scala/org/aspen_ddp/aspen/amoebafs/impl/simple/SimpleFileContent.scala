@@ -5,7 +5,7 @@ import java.util.UUID
 import com.github.blemale.scaffeine.{Cache, Scaffeine}
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, InvalidObject, KeyValueObjectState, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.util.{Varint, db2string}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer}
 import org.aspen_ddp.aspen.amoebafs.{FileInode, FileSystem}
@@ -215,8 +215,7 @@ class SimpleFileContent(file: SimpleFile,
       for
         tree <- initializeContentTree()
         alloc <- fs.defaultSegmentAllocator()
-        guard = ObjectRevisionGuard(file.pointer.pointer, file.revision)
-        ptr <- alloc.allocateDataObject(guard, db)
+        ptr <- alloc.allocateDataObject(db)
         _ <- tree.set(
           Key(segment.segmentBeginOffset),
           Value(ptr.toArray),

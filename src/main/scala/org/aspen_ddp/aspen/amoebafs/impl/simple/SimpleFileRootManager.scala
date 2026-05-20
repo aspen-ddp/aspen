@@ -68,10 +68,6 @@ class SimpleFileRootManager(client: AspenClient,
     getRData().map: rd =>
       rd.root.nodeAllocator.getMaxNodeSize(tier)
 
-  override def getRootRevisionGuard(): Future[AllocationRevisionGuard] = 
-    getRData().map: rd =>
-      ObjectRevisionGuard(inodePointer, rd.rootRevision)
-
   override def encode(): Array[Byte] =
     val arr = new Array[Byte]( inodePointer.encodedSize )
     val bb = ByteBuffer.wrap(arr)
@@ -98,25 +94,23 @@ class SimpleFileRootManager(client: AspenClient,
 
     p.future
 
-  override def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[AllocationRevisionGuard] =
+  override def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit] =
     for
       dos <- client.read(inodePointer)
       RData(root, _, onode) <- getRData(Some(dos))
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
-      rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(inodePointer, dos.revision), contents)
-    yield 
+      rptr <- alloc.allocateKeyValueObject(contents)
+    yield
       val finode = FileInode(client, dos.data)
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator)
       val newInode = finode.setContentTree(newRoot)
-      
+
       tx.overwrite(inodePointer, dos.revision, newInode.toArray)
-      
+
       onode.foreach: _ =>
         // Check for a race condition where multiple concurrent attempts to
         // create the initial hostState might clash with each other
         tx.invalidateTransaction(new Exception("Initial TKVL hostState already exists."))
-      
-      ObjectRevisionGuard(inodePointer, dos.revision)
       
 
 object SimpleFileRootManager extends RootManagerFactory:

@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.amoebafs
 
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, DataObjectPointer}
+import org.aspen_ddp.aspen.common.objects.DataObjectPointer
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -15,8 +15,7 @@ trait InodeTable {
   val fs: FileSystem
 
   /** Future completes when the transaction is ready for commit */
-  def prepareInodeAllocation(inode: Inode,
-                             guard: AllocationRevisionGuard)(using tx: Transaction): Future[InodePointer]
+  def prepareInodeAllocation(inode: Inode)(using tx: Transaction): Future[InodePointer]
 
   /** Removes the Inode from the table. This method does NOT decrement the reference count on the Inode object. */
   def delete(pointer: InodePointer)(using tx: Transaction): Future[Unit]

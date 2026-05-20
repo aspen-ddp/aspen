@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.{KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.Future
@@ -60,7 +60,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      dp <- alloc.allocateDataObject(ObjectRevisionGuard(radicle, ikvos.revision), Array[Byte](0))
+      dp <- alloc.allocateDataObject(Array[Byte](0))
 
       _ <- tx.commit().map(_=>())
 
@@ -88,13 +88,11 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
       List(Insert(key, value.bytes)))
 
     for {
-      ikvos <- client.read(radicle)
-
       pool <- client.getStoragePool(Radicle.poolId)
 
       alloc = pool.createAllocator
-      
-      kp <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(key -> value))
+
+      kp <- alloc.allocateKeyValueObject(Map(key -> value))
 
       _ <- tx.commit().map(_=>())
 
@@ -126,13 +124,11 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
       List(Insert(key, value.bytes)))
 
     for {
-      ikvos <- client.read(radicle)
-
       pool <- client.getStoragePool(Radicle.poolId)
 
       alloc = pool.createAllocator
 
-      kp <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(key -> value))
+      kp <- alloc.allocateKeyValueObject(Map(key -> value))
 
       _ <- tx.commit().map(_ => ())
 
@@ -168,7 +164,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
-      dp <- alloc.allocateDataObject(ObjectRevisionGuard(radicle, ikvos.revision), Array[Byte](0))
+      dp <- alloc.allocateDataObject(Array[Byte](0))
 
       _ <- tx.commit().map(_=>())
 

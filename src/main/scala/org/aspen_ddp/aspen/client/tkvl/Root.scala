@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, Key, KeyOrdering, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -38,7 +38,6 @@ case class Root(tier: Int,
 object Root {
 
   def create(client: AspenClient,
-             guard: AllocationRevisionGuard,
              ordering: KeyOrdering,
              nodeAllocator: NodeAllocator,
              initialContent: Map[Key, Value] = Map())(using t: Transaction): Future[Root] = {
@@ -50,7 +49,7 @@ object Root {
     } else {
       for {
         alloc <- nodeAllocator.getAllocatorForTier(0)
-        rp <- alloc.allocateKeyValueObject(guard, initialContent)
+        rp <- alloc.allocateKeyValueObject(initialContent)
       } yield {
         new Root(0, ordering, Some(rp), nodeAllocator)
       }

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectRefcount, ObjectRevision, SetLeft, SetMax, SetMin, SetRight, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectRefcount, ObjectRevision, SetLeft, SetMax, SetMin, SetRight, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -18,8 +18,7 @@ trait ObjectAllocator:
 
   def allocateKeyValueObject()(using t: Transaction): Future[KeyValueObjectPointer]
 
-  def allocateDataObject(revisionGuard: AllocationRevisionGuard,
-                         initialContent: DataBuffer,
+  def allocateDataObject(initialContent: DataBuffer,
                          initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[DataObjectPointer] =
     given ExecutionContext = executionContext
     allocateDataObject().map: ptr =>
@@ -27,8 +26,7 @@ trait ObjectAllocator:
       t.setRefcount(ptr, ObjectRefcount.Allocating, initialRefcount)
       ptr
 
-  def allocateKeyValueObject(revisionGuard: AllocationRevisionGuard,
-                             initialContent: Map[Key,Value],
+  def allocateKeyValueObject(initialContent: Map[Key,Value],
                              minimum: Option[Key] = None,
                              maximum: Option[Key] = None,
                              left: Option[Value] = None,

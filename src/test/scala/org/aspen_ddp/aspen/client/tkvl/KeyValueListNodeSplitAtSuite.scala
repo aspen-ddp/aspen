@@ -15,14 +15,12 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
                  minimum: Key = Key.AbsoluteMinimum,
                  tail: Option[KeyValueListPointer] = None)(using tx: Transaction): Future[KeyValueListNode] = {
     for {
-      ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
       alloc = pool.createAllocator
 
       contentStates = contents.map((k, v) => k -> ValueState(v, tx.revision, HLCTimestamp.now))
 
       lptr <- alloc.allocateKeyValueObject(
-        ObjectRevisionGuard(radicle, ikvos.revision),
         contents,
         if minimum == Key.AbsoluteMinimum then None else Some(minimum),
         None,
@@ -294,7 +292,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       tx2 = client.newTransaction()
 
       downContents = Map(createKey(10) -> createValue(100))
-      downPtr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, node.revision), downContents)(using tx2)
+      downPtr <- alloc.allocateKeyValueObject(downContents)(using tx2)
 
       newLeftPtr <- node.splitAt(ByteArrayKeyOrdering, splitAtKey, false, Some(downPtr), alloc)(using tx2)
       _ <- tx2.commit().map(_ => ())

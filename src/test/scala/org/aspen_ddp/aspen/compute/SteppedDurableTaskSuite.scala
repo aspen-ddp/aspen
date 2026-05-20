@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -79,9 +79,8 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
 
       // Allocate executor root and data object in one transaction
       tx0 = client.newTransaction()
-      guard0 = ObjectRevisionGuard(radicle, kvos.revision)
-      executorRoot <- allocator.allocateKeyValueObject(guard0, Map())(using tx0)
-      dataPtr <- allocator.allocateDataObject(guard0,
+      executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)
+      dataPtr <- allocator.allocateDataObject(
         DataBuffer("initial".getBytes(StandardCharsets.UTF_8)))(using tx0)
       _ = tx0.bumpVersion(radicle, kvos.revision)
       _ <- tx0.commit()

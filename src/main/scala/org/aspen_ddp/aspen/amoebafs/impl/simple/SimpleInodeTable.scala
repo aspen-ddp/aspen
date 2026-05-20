@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.client.tkvl.{RootManager, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, DataObjectPointer, Key, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
 import org.aspen_ddp.aspen.amoebafs.{FileSystem, Inode, InodePointer, InodeTable}
@@ -38,8 +38,7 @@ class SimpleInodeTable(
   }
 
   /** Future completes when the transaction is ready for commit */
-  override def prepareInodeAllocation(inode: Inode,
-                                      guard: AllocationRevisionGuard)(using tx: Transaction): Future[InodePointer] = {
+  override def prepareInodeAllocation(inode: Inode)(using tx: Transaction): Future[InodePointer] = {
 
     // Jump to new location if the transaction fails for any reason
     tx.result.failed.foreach( _ => selectNewInodeAllocationPosition() )
@@ -49,7 +48,7 @@ class SimpleInodeTable(
     val key = Key(inodeNumber)
 
     for {
-      ptr <- fs.defaultInodeAllocator.allocateDataObject(guard, updatedInode.toArray)
+      ptr <- fs.defaultInodeAllocator.allocateDataObject(updatedInode.toArray)
       iptr = InodePointer(inode.fileType, inodeNumber, ptr)
       _ <- table.set(key, Value(iptr.toArray), requirement = Some(Left(true)))
     } yield {

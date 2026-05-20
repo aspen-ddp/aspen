@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.client.{AspenClient, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, Insert, IntegerKeyOrdering, Key, KeyValueObjectPointer, KeyValueOperation, LexicalKeyOrdering, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, IntegerKeyOrdering, Key, KeyValueObjectPointer, KeyValueOperation, LexicalKeyOrdering, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
 import org.aspen_ddp.aspen.compute.TaskExecutor
@@ -23,7 +23,6 @@ object SimpleFileSystem {
   private val InodeTableRootKey    = Key(3)
 
   def bootstrap(client: AspenClient,
-                guard: AllocationRevisionGuard,
                 allocator: ObjectAllocator,
                 hostingObject: KeyValueObjectPointer,
                 amoebafsKey: Key): Future[FileSystem] = {
@@ -36,17 +35,17 @@ object SimpleFileSystem {
     val rootDirMode = FileMode.S_IFDIR | FileMode.S_IRWXU
 
     for
-      taskRoot <- allocator.allocateKeyValueObject(guard, Map())
+      taskRoot <- allocator.allocateKeyValueObject(Map())
       rootRoot = new Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(client, taskRoot.poolId))
       rootDirInode = DirectoryInode.init(rootDirMode, 0, 0, None, Some(1), rootRoot)
-      rootDirectory <- allocator.allocateDataObject(guard, rootDirInode.toArray)
+      rootDirectory <- allocator.allocateDataObject(rootDirInode.toArray)
       rootDirectoryPointer = new DirectoryPointer(1, rootDirectory)
-      inodeTableContentRoot <- allocator.allocateKeyValueObject(guard, Map(Key(1) -> Value(rootDirectoryPointer.toArray)))
+      inodeTableContentRoot <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(rootDirectoryPointer.toArray)))
       inodeTableRoot = new Root(0, IntegerKeyOrdering, Some(inodeTableContentRoot), new SinglePoolNodeAllocator(client, taskRoot.poolId) )
       content = Map( FileSystemUUIDKey -> Value(uuid2byte(fileSystemUUID)),
         TaskExecutorRootKey -> Value(taskRoot.toArray),
         InodeTableRootKey -> Value(inodeTableRoot.encode()))
-      fsRootPointer <- allocator.allocateKeyValueObject(guard, content)
+      fsRootPointer <- allocator.allocateKeyValueObject(content)
       _=tx.update(hostingObject,
         None,
         None,

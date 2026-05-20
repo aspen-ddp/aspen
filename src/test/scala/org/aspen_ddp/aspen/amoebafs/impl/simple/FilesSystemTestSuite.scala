@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevisionGuard}
+import org.aspen_ddp.aspen.common.objects.Key
 import org.aspen_ddp.aspen.amoebafs.FileSystem
 import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
 
@@ -20,7 +20,6 @@ class FilesSystemTestSuite  extends IntegrationTestSuite {
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
       allocator = new SinglePoolObjectAllocator(client, rootPool, rootPool.ida, None )
       fs <- SimpleFileSystem.bootstrap(client,
-        ObjectRevisionGuard(radicle, kvos.revision),
         allocator,
         kvos.pointer,
         Key(100))

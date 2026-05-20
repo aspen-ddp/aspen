@@ -4,7 +4,7 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, RegisteredTypeFactory, Transaction}
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, Insert, Key, KeyOrdering, KeyRevisionGuard, KeyValueObjectPointer, ObjectRevision, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyOrdering, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -97,18 +97,12 @@ class KVObjectRootManager(val client: AspenClient,
     }
   }
 
-  def getRootRevisionGuard(): Future[AllocationRevisionGuard] = {
-    getRData().map { rd =>
-      KeyRevisionGuard(pointer, treeKey, rd.rootRevision)
-    }
-  }
-
-  def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[AllocationRevisionGuard] = {
+  def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit] = {
     for {
       RData(root, _, _) <- getRData()
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
       kvos <- client.read(pointer, s"Reading root hostState of TKVL tree $treeKey for createInitialNode")
-      rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(pointer, kvos.revision), contents)
+      rptr <- alloc.allocateKeyValueObject(contents)
     } yield {
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator)
       val kreqs = KeyValueUpdate.KeyRevision(treeKey, kvos.contents(treeKey).revision) :: Nil
@@ -116,7 +110,6 @@ class KVObjectRootManager(val client: AspenClient,
       tx.result.map { _ =>
         new KVObjectRootManager(client, treeKey, pointer)
       }
-      ObjectRevisionGuard(pointer, kvos.revision)
     }
   }
 }
@@ -181,7 +174,7 @@ object KVObjectRootManager extends RootManagerFactory {
     for
       alloc <- nodeAllocator.getAllocatorForTier(0)
       kvos <- client.read(pointer, s"Reading hostState hosting new TKVL tree $key")
-      rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(pointer, kvos.revision), initialContent)
+      rptr <- alloc.allocateKeyValueObject(initialContent)
     yield
       setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
     /*
@@ -191,7 +184,7 @@ object KVObjectRootManager extends RootManagerFactory {
       for
         alloc <- nodeAllocator.getAllocatorForTier(0)
         kvos <- client.read(pointer, s"Reading hostState hosting new TKVL tree $key")
-        rptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(pointer, kvos.revision), initialContent)
+        rptr <- alloc.allocateKeyValueObject(initialContent)
       yield
         setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
      */

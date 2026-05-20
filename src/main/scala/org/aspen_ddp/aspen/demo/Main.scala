@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, R
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.{ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectPointer, ObjectRevisionGuard, ObjectType, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectPointer, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -371,10 +371,9 @@ object Main {
 
       case None =>
         println("Creating Amoeba")
-        val guard = ObjectRevisionGuard(kvos.pointer, kvos.revision)
         client.getStoragePool(kvos.pointer.poolId).flatMap { pool =>
           val allocator = new SinglePoolObjectAllocator(client, pool, pool.ida, None)
-          SimpleFileSystem.bootstrap(client, guard, allocator, kvos.pointer, AmoebafsKey)
+          SimpleFileSystem.bootstrap(client, allocator, kvos.pointer, AmoebafsKey)
         }
     }
 
@@ -459,8 +458,7 @@ object Main {
         val tx = client.newTransaction()
         val key = Key(100)
         for
-          ptr <- alloc.allocateDataObject(ObjectRevisionGuard(kvos.pointer, kvos.revision),
-            randomContent)(using tx)
+          ptr <- alloc.allocateDataObject(randomContent)(using tx)
           _ = tx.update(kvos.pointer, None, None, DoesNotExist(key) :: Nil, Insert(key, ptr.toArray) :: Nil)
           _ <- tx.commit()
         yield

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectRevision, ObjectRevisionGuard, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.apache.logging.log4j.scala.Logging
 
@@ -151,9 +151,9 @@ class TieredKeyValueList(val client: AspenClient,
         case Some(root) => nonEmpty(tier, ordering, root)
         case None =>
           for
-            allocGuard <- rootManager.createInitialNode(Map())
+            _ <- rootManager.createInitialNode(Map())
             alloc <- rootManager.getAllocatorForTier(0)
-            ptr <- alloc.allocateKeyValueObject(allocGuard, Map())
+            ptr <- alloc.allocateKeyValueObject(Map[Key, Value]())
           yield
             ptr
     yield

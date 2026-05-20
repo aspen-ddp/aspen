@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.compute.impl
 import java.util.UUID
 
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, Transaction}
-import org.aspen_ddp.aspen.common.objects.{AllocationRevisionGuard, Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision, ObjectRevisionGuard}
+import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.compute.{DurableTaskPointer, DurableTaskFactory, TaskExecutor}
 import org.aspen_ddp.aspen.common.util.{uuid2byte, byte2uuid}
@@ -25,14 +25,13 @@ object SimpleTaskExecutor {
 
   def createNewExecutor(client: AspenClient,
                         executorAllocator: ObjectAllocator,
-                        taskStateAllocator: ObjectAllocator,
-                        revisionGuard: AllocationRevisionGuard)
+                        taskStateAllocator: ObjectAllocator)
                        (using t: Transaction): Future[(KeyValueObjectPointer, SimpleTaskExecutor)] = {
 
     given ExecutionContext = client.clientContext
 
     for {
-      executor <- executorAllocator.allocateKeyValueObject(revisionGuard, Map())
+      executor <- executorAllocator.allocateKeyValueObject(Map())
       kvos <- client.read(executor)
     } yield {
       (executor, new SimpleTaskExecutor(client, taskStateAllocator, kvos))
@@ -89,11 +88,10 @@ class SimpleTaskExecutor(val client: AspenClient,
     client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail) { tx =>
       given Transaction = tx
       synchronized {
-        val guard = ObjectRevisionGuard(executorObject, executorRevision)
         val taskKey = Key(UUID.randomUUID())
         val kreqs = KeyValueUpdate.DoesNotExist(taskKey) :: Nil
         for {
-          ptr <- taskStateAllocator.allocateKeyValueObject(guard, Map())
+          ptr <- taskStateAllocator.allocateKeyValueObject(Map())
         } yield {
           tx.update(executorObject, None, None, kreqs, Insert(taskKey, ptr.toArray) :: Nil)
           DurableTaskPointer(ptr)

@@ -332,7 +332,7 @@ object KeyValueListNode {
 
       val newContent = moveList.map(k => k -> fullContent(k).value).toMap
 
-      allocator.allocateKeyValueObject(ObjectRevisionGuard(node.pointer, node.revision), newContent,
+      allocator.allocateKeyValueObject(newContent,
         Some(newMinimum), None, None, node.tail.map(p => Value(p.toArray))).flatMap { newObjectPointer =>
 
         val rightPtr = KeyValueListPointer(newMinimum, newObjectPointer)
@@ -422,7 +422,7 @@ object KeyValueListNode {
 
       val newContent = moveList.map(k => k -> fullContent(k).value).toMap
 
-      allocator.allocateKeyValueObject(ObjectRevisionGuard(node.pointer, node.revision), newContent,
+      allocator.allocateKeyValueObject(newContent,
         Some(newMinimum), None, None, node.tail.map(p => Value(p.toArray))).flatMap { newObjectPointer =>
 
         val rightPtr = KeyValueListPointer(newMinimum, newObjectPointer)
@@ -705,15 +705,13 @@ object KeyValueListNode {
     
     for 
       newRightPtr <- allocator.allocateKeyValueObject(
-        ObjectRevisionGuard(node.pointer, node.revision),
         rightContents.map((k,vs) => (k -> vs.value)),
         Some(splitAtKey),
         None,
         None,
         node.tail.map(p => Value(p.toArray)))
-      
+
       newLeftPtr <- allocator.allocateKeyValueObject(
-        ObjectRevisionGuard(node.pointer, node.revision),
         newLeftContent,
         None,
         Some(splitAtKey),

@@ -4,7 +4,7 @@ import java.nio.charset.StandardCharsets
 import java.util.UUID
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyRevisionGuard, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, SteppedDurableTask, TaskExecutor}
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
 import org.aspen_ddp.aspen.amoebafs.{DirectoryPointer, FileSystem, Inode, InodePointer}
@@ -59,8 +59,7 @@ class CreateFileTask(
 
   def allocateInode(tx: Transaction, state: Map[String, Array[Byte]], stepRevision: ObjectRevision): Future[Map[String, Array[Byte]]] =
     given Transaction = tx
-    val guard = KeyRevisionGuard(taskPointer.kvPointer, SteppedDurableTask.StepStateKey, stepRevision)
-    fs.inodeTable.prepareInodeAllocation(inode, guard).map: iptr =>
+    fs.inodeTable.prepareInodeAllocation(inode).map: iptr =>
       state.updated("newFilePointer", iptr.toArray)
 
   def addToDirectory(tx: Transaction, state: Map[String, Array[Byte]], stepRevision: ObjectRevision): Future[Map[String, Array[Byte]]] =

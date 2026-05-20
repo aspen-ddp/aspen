@@ -38,8 +38,7 @@ class SplitFinalizationAction(val client: AspenClient,
 
         for {
           alloc <- rootManager.getAllocatorForTier(tier)
-          guard <- rootManager.getRootRevisionGuard()
-          nroot <- alloc.allocateKeyValueObject(guard, rootContent)
+          nroot <- alloc.allocateKeyValueObject(rootContent)
           _ <- rootManager.prepareRootUpdate(tier, Some(nroot))
           _ <- tx.commit()
         } yield ()

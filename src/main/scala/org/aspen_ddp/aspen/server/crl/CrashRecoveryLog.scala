@@ -71,9 +71,7 @@ object CrashRecoveryLog:
       entry.position(0)
 
       val m = codec.StoreCRLEntry.parseFrom(entry)
-
-      if m.hasTrs then
-        trsList = Codec.decode(m.getTrs) :: trsList
+      trsList = Codec.decode(m.getTrs) :: trsList
 
     (storeId, trsList)
 

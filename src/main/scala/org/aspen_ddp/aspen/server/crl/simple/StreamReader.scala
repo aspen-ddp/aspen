@@ -29,7 +29,7 @@ class StreamReader(val streamId: StreamId, val filePath: Path):
       channel.read(buff)
       channel.position(startPosition)
       buff.position(0)
-      LogContent.getUUID(buff)
+      Tx.getUUID(buff)
 
 
   def headEntry: Option[LogEntry.EntryHeader] = readEntry(0).map(_._2)

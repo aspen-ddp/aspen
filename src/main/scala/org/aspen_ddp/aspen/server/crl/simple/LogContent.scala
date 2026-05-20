@@ -11,26 +11,8 @@ import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import java.nio.ByteBuffer
 import java.util.UUID
 
-sealed abstract class LogContent:
 
-  var next: Option[LogContent] = None
-  var prev: Option[LogContent] = None
-  var entrySerialNumber: Long = 0
-
-  def clearDynamicData(): Unit
-
-  def dynamicDataSize: Long
-  
-  def staticDataSize: Long
-
-  // Sets all optional StreamLocations with matching StreamIds to None and returns
-  // true if any matching streams are found
-  def closeStream(id: StreamId): Boolean
-
-  def writeStaticEntry(bb: ByteBuffer): Unit
-
-
-object LogContent:
+object Tx:
 
   // 16 bytes - 8 bytes MostSignificantBits, 8 bytes LeastSignificantBits
   def putUUID(bb: ByteBuffer, uuid: UUID): Unit =
@@ -66,8 +48,6 @@ object LogContent:
     val length = bb.getInt()
     StreamLocation(StreamId(streamId), offset, length)
 
-
-object Tx:
   case class LoadingTx(id: TxId,
                        txdLocation: StreamLocation,
                        updateLocations: Option[List[(ObjectId, StreamLocation)]],
@@ -75,8 +55,8 @@ object Tx:
                        paxosAcceptorState: PersistentState)
 
   def loadTx(bb: ByteBuffer): LoadingTx =
-    val txid = LogContent.getTxId(bb)
-    val txdLocation = LogContent.getStreamLocation(bb)
+    val txid = getTxId(bb)
+    val txdLocation = getStreamLocation(bb)
     val disposition = bb.get() match
       case 0 => TransactionDisposition.Undetermined
       case 1 => TransactionDisposition.VoteCommit
@@ -96,8 +76,8 @@ object Tx:
     var updateList: List[(ObjectId, StreamLocation)] = Nil
 
     for (_ <- 0 until numObjectUpdates)
-      val uuid = LogContent.getUUID(bb)
-      val loc = LogContent.getStreamLocation(bb)
+      val uuid = getUUID(bb)
+      val loc = getStreamLocation(bb)
       updateList = (ObjectId(uuid), loc) :: updateList
 
     updateLocations = if numObjectUpdates <= 0 then
@@ -112,13 +92,17 @@ class Tx(val id: TxId,
          var state: TransactionRecoveryState,
          var txdLocation: Option[StreamLocation] = None,
          var objectUpdateLocations: Option[List[(ObjectId, StreamLocation)]] = None,
-         var keepObjectUpdates: Boolean = true) extends LogContent:
+         var keepObjectUpdates: Boolean = true):
 
-  override def clearDynamicData(): Unit =
+  var next: Option[Tx] = None
+  var prev: Option[Tx] = None
+  var entrySerialNumber: Long = 0
+
+  def clearDynamicData(): Unit =
     txdLocation = None
     objectUpdateLocations = None
 
-  override def dynamicDataSize: Long =
+  def dynamicDataSize: Long =
     val updatesSize = if !keepObjectUpdates || objectUpdateLocations.nonEmpty then
       0 // Dropped or already written to an active stream. No need to write them now
     else
@@ -129,7 +113,7 @@ class Tx(val id: TxId,
     updatesSize + txdSize
 
 
-  override def staticDataSize: Long =
+  def staticDataSize: Long =
     // Transaction Entry
     //     txid:  33 bytes - store id (16-bye pool id + 1 byte index) + 16 byte Transaction UUID
     //     serialized_transaction_description: FileLocation, 14
@@ -147,14 +131,14 @@ class Tx(val id: TxId,
     else
       base
 
-  override def writeStaticEntry(bb: ByteBuffer): Unit =
+  def writeStaticEntry(bb: ByteBuffer): Unit =
     require(txdLocation.nonEmpty) // Must be set
     if keepObjectUpdates then
       require(state.objectUpdates.isEmpty || objectUpdateLocations.nonEmpty)
 
-    LogContent.putTxId(bb, id)
+    Tx.putTxId(bb, id)
 
-    txdLocation.foreach(loc => LogContent.putStreamLocation(bb, loc))
+    txdLocation.foreach(loc => Tx.putStreamLocation(bb, loc))
 
     val encodedDisposition = state.disposition match
       case TransactionDisposition.Undetermined => 0
@@ -192,13 +176,13 @@ class Tx(val id: TxId,
       bb.putInt(state.objectUpdates.length)
       objectUpdateLocations.foreach: lst =>
         lst.foreach: tpl =>
-          LogContent.putUUID(bb, tpl._1.uuid)
-          LogContent.putStreamLocation(bb, tpl._2)
+          Tx.putUUID(bb, tpl._1.uuid)
+          Tx.putStreamLocation(bb, tpl._2)
     else
       bb.putInt(0)
 
 
-  override def closeStream(id: StreamId): Boolean =
+  def closeStream(id: StreamId): Boolean =
     val txd = txdLocation match
       case None => false
       case Some(loc) =>
@@ -222,6 +206,3 @@ class Tx(val id: TxId,
   def dropTransactionObjectData(): Unit =
     keepObjectUpdates = false
     objectUpdateLocations = None
-
-
-  

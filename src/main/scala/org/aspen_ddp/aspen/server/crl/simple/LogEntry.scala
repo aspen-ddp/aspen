@@ -60,10 +60,10 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     val harr = new Array[Byte](StaticEntryHeaderSize)
     val hbuff = ByteBuffer.wrap(harr)
 
-    LogContent.putUUID(hbuff, streamUUID)
+    Tx.putUUID(hbuff, streamUUID)
     hbuff.putLong(entrySerialNumber)
     hbuff.putLong(oldestEntryNeeded)
-    LogContent.putStreamLocation(hbuff, previousEntryLocation)
+    Tx.putStreamLocation(hbuff, previousEntryLocation)
     hbuff.putLong(dynDataSize)
     hbuff.putLong(statDataSize)
     hbuff.putInt(txs.size)
@@ -95,8 +95,8 @@ class LogEntry(val previousEntryLocation: StreamLocation,
     val bb = ByteBuffer.wrap(staticArr)
 
     txs.valuesIterator.foreach(_.writeStaticEntry(bb))
-    txDeletions.foreach(LogContent.putTxId(bb, _))
-    LogContent.putUUID(bb, streamUUID)
+    txDeletions.foreach(Tx.putTxId(bb, _))
+    Tx.putUUID(bb, streamUUID)
 
     assert(bb.position() == bb.limit)
 
@@ -145,10 +145,10 @@ object LogEntry:
 
 
   def loadHeader(hbuff: ByteBuffer): EntryHeader =
-    val streamUUID = LogContent.getUUID(hbuff)
+    val streamUUID = Tx.getUUID(hbuff)
     val entrySerialNumber = hbuff.getLong()
     val oldestEntryNeeded = hbuff.getLong()
-    val previousEntryLocation = LogContent.getStreamLocation(hbuff)
+    val previousEntryLocation = Tx.getStreamLocation(hbuff)
     val dynamicDataSize = hbuff.getLong()
     val staticDataSize = hbuff.getLong()
     val numTransactions = hbuff.getInt()
@@ -168,7 +168,7 @@ object LogEntry:
         rstate.txs += (ltx.id -> ltx)
 
     for (_ <- 0 until header.numDeletedTransactions)
-      val txid = LogContent.getTxId(bb)
+      val txid = Tx.getTxId(bb)
       rstate.txs -= txid
       rstate.txDeletions += txid
 

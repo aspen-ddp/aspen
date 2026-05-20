@@ -595,7 +595,7 @@ class StoreManager(val client: AspenClient,
 
   protected def addRecoveryEvent(): Unit = events.add(RecoveryEvent())
 
-  /** Placeholder for mixin class to implement transaction and allocation recovery */
+  /** Placeholder for mixin class to implement transaction recovery */
   protected def handleRecoveryEvent(): Unit = ()
 
   def hasEvents: Boolean = synchronized {

@@ -454,9 +454,7 @@ message TransactionRecoveryState {
 }
 
 message StoreCRLEntry {
-  oneof msg {
-    TransactionRecoveryState trs = 1;
-  }
+  TransactionRecoveryState trs = 1;
 }
 
 message PoolStoreEntry {

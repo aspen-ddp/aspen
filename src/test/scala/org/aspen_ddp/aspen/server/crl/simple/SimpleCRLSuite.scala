@@ -473,4 +473,33 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(ltx.updateLocations.isEmpty)
     assert(ltx.paxosAcceptorState == pax)
   }
+
+  test("Recovery after deleting oldest transaction") {
+    val queue = new LinkedBlockingQueue[String]()
+
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.storeId == storeId2)
+    assert(i2.trsList.head.disposition == disp)
+    assert(i2.trsList.head.serializedTxd == trsValidTxd2.serializedTxd)
+    assert(i2.trsList.head.objectUpdates == trsValidTxd2.objectUpdates)
+    assert(i2.trsList.head.paxosAcceptorState == pax)
+  }
 }

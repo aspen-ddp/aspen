@@ -5,8 +5,7 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.apache.logging.log4j.scala.Logging
 
-import java.io.File
-import java.nio.file.{Path, Paths}
+import java.nio.file.Path
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import scala.collection.immutable.HashMap
@@ -76,8 +75,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
 
   private var transactions: HashMap[TxId, Tx] = new HashMap()
 
-  private var queueHead: Option[LogContent] = None
-  private var queueTail: Option[LogContent] = None
+  private var queueHead: Option[Tx] = None
+  private var queueTail: Option[Tx] = None
 
   private val ioQueue = new LinkedBlockingQueue[ActionRequest]()
 
@@ -160,12 +159,12 @@ class SimpleCRL private (val maxSizeInBytes: Long,
           writer.shutdown(completionHandler)
           return
 
-  private def moveToQueueHead(lc: LogContent): Unit =
+  private def moveToQueueHead(lc: Tx): Unit =
     lc.clearDynamicData()
     removeFromQueue(lc)
     addToQueueHead(lc)
 
-  private def removeFromQueue(lc: LogContent): Unit =
+  private def removeFromQueue(lc: Tx): Unit =
     queueHead.foreach: h =>
       if h eq lc then
         queueHead = lc.prev
@@ -180,9 +179,10 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     lc.prev = None
     lc.next = None
 
-  private def addToQueueHead(lc: LogContent): Unit =
+  private def addToQueueHead(lc: Tx): Unit =
     lc.next = None
     lc.prev = queueHead
+    queueHead.foreach(_.next = Some(lc))
     lc.entrySerialNumber = currentLogEntry.entrySerialNumber
     queueHead = Some(lc)
     if queueTail.isEmpty then
@@ -269,39 +269,6 @@ class SimpleCRL private (val maxSizeInBytes: Long,
     ioQueue.put(GetRecoveryState(storeId, true, completion))
 
     p.future
-
-  def loadStoreState(storeId: StoreId,
-                     trsList: List[TransactionRecoveryState]): Future[Unit] =
-
-    logger.info(s"Loading transaction state for store: $storeId")
-
-    if trsList.isEmpty then
-      logger.info(s"Completed load of empty transaction state for store: $storeId")
-      return Future.successful(())
-
-    val completion = Promise[Unit]()
-    var outstandingSaves = 1
-    var allStateWritten = false
-
-    def onComplete(): Unit = synchronized {
-      outstandingSaves -= 1
-      if allStateWritten && outstandingSaves == 0 then
-        logger.info(s"Completed load of transaction state for store: $storeId")
-        completion.success(())
-    }
-
-    trsList.foreach: trs =>
-      synchronized {
-        outstandingSaves += 1
-      }
-      save(trs.txd.transactionId, trs, onComplete)
-
-    synchronized{
-      allStateWritten = true
-    }
-    onComplete()
-
-    completion.future
 
   def shutdown(): Unit =
     val q = new LinkedBlockingQueue[String]()

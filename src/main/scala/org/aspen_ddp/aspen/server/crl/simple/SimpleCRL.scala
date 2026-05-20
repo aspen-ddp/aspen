@@ -129,6 +129,8 @@ class SimpleCRL private (val maxSizeInBytes: Long,
           moveToQueueHead(tx._2)
           currentLogEntry.addTx(tx._2, () => ())
 
+      currentLogEntry.oldestEntryNeeded = oldestEntryNeeded
+
     writeInProgress = true
     logger.trace(s"CRL beginning write for entry ${currentLogEntry.entrySerialNumber}")
     val location = streams(currentStream).writeEntry(currentLogEntry, () => {

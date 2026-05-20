@@ -8,7 +8,7 @@ import scala.collection.immutable.HashMap
 
 class LogEntry(val previousEntryLocation: StreamLocation,
                val entrySerialNumber: Long,
-               val oldestEntryNeeded: Long) extends Logging:
+               var oldestEntryNeeded: Long) extends Logging:
   import LogEntry._
 
   private var completionHandlers: List[() => Unit] = Nil

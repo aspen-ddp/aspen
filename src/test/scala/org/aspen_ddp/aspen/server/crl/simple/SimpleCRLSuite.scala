@@ -12,7 +12,8 @@ import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 
 import java.nio.ByteBuffer
-import java.nio.file.Path
+import java.nio.channels.FileChannel
+import java.nio.file.{Path, StandardOpenOption}
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import scala.concurrent.Await
@@ -64,6 +65,20 @@ object SimpleCRLSuite:
   val trsValidTxd = TransactionRecoveryState(storeId, txd.serialize(), List(ou1, ou2), disp, status, pax)
   val trsValidTxd2 = TransactionRecoveryState(storeId2, txd.serialize(), List(ou1, ou2), disp, status, pax)
 
+  val transactionId3 = TransactionId(new UUID(0, 5))
+  val transactionId4 = TransactionId(new UUID(0, 6))
+  val storeId3 = StoreId(poolId, 3)
+
+  val paxInitial = PersistentState.initial
+  val paxPromiseOnly = PersistentState(Some(promise), None)
+
+  val trsUndetermined = TransactionRecoveryState(storeId, txd.serialize(), List(ou1, ou2),
+    TransactionDisposition.Undetermined, TransactionStatus.Unresolved, paxInitial)
+  val trsPromised = TransactionRecoveryState(storeId, txd.serialize(), List(ou1, ou2),
+    TransactionDisposition.VoteCommit, TransactionStatus.Unresolved, paxPromiseOnly)
+
+  val trsValidTxd3 = TransactionRecoveryState(storeId, txd.serialize(), List(ou1), disp, status, pax)
+  val trsValidTxd4 = TransactionRecoveryState(storeId3, txd.serialize(), List(ou1, ou2), disp, status, pax)
 
 
 class SimpleCRLSuite extends FileBasedTests {
@@ -75,6 +90,10 @@ class SimpleCRLSuite extends FileBasedTests {
       lst = (StreamId(i), tdir.toPath.resolve(f"$i.log")) :: lst
     lst.reverse
 
+  private def saveAndWait(crl: CrashRecoveryLog, txid: TransactionId, trs: TransactionRecoveryState): Unit =
+    val q = new LinkedBlockingQueue[String]()
+    crl.save(txid, trs, () => q.put(""))
+    q.take()
 
   test("Save & Recover CRL Saved State File Foo") {
     val savePath = tdir.toPath.resolve("crl_save_file.log")
@@ -501,5 +520,530 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i2.trsList.head.serializedTxd == trsValidTxd2.serializedTxd)
     assert(i2.trsList.head.objectUpdates == trsValidTxd2.objectUpdates)
     assert(i2.trsList.head.paxosAcceptorState == pax)
+  }
+
+  // ===== Tier 1: Critical Crash Recovery Correctness =====
+
+  test("Recovery after crash without clean shutdown") {
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+    saveAndWait(i.crl, transactionId2, trsValidTxd2)
+
+    // Simulate crash: do NOT call shutdown
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 2)
+    val byStore = i2.trsList.groupBy(_.storeId)
+    assert(byStore(storeId).head.serializedTxd == trsValidTxd.serializedTxd)
+    assert(byStore(storeId).head.objectUpdates == trsValidTxd.objectUpdates)
+    assert(byStore(storeId).head.paxosAcceptorState == pax)
+    assert(byStore(storeId2).head.serializedTxd == trsValidTxd2.serializedTxd)
+
+    i.crl.shutdown()
+    i2.crl.shutdown()
+  }
+
+  test("Recovery preserves latest paxos state after multiple saves") {
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    saveAndWait(i.crl, transactionId, trsUndetermined)
+    saveAndWait(i.crl, transactionId, trsPromised)
+    saveAndWait(i.crl, transactionId, trsValidTxd)
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.disposition == TransactionDisposition.VoteCommit)
+    assert(i2.trsList.head.paxosAcceptorState.promised == Some(promise))
+    assert(i2.trsList.head.paxosAcceptorState.accepted == Some((accept, true)))
+
+    i2.crl.shutdown()
+  }
+
+  test("Recovery after stream recycling re-writes tx data from recycled stream") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    assert(i.crl.currentStreamNumber == 0)
+
+    // Fill all three streams: 3 entries per stream (each ~4k, max=12k), 4th triggers switch
+    // Need 9 more saves to cycle through streams 0->1->2 and back to 0
+    for _ <- 1 to 9 do
+      i.crl.save(transactionId, trsValidTxd, completionHandler)
+      queue.take()
+
+    assert(i.crl.currentStreamNumber == 0)
+
+    // Simulate crash, then recover
+    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.storeId == storeId)
+    assert(i2.trsList.head.serializedTxd == trsValidTxd.serializedTxd)
+    assert(i2.trsList.head.objectUpdates == trsValidTxd.objectUpdates)
+    assert(i2.trsList.head.paxosAcceptorState == pax)
+
+    i.crl.shutdown()
+    i2.crl.shutdown()
+  }
+
+  test("oldestEntryNeeded advances correctly as tail transactions are deleted") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+    i.crl.save(transactionId3, trsValidTxd3, completionHandler)
+    queue.take()
+
+    Thread.sleep(50)
+    assert(i.crl.oldestEntryNeeded == 0)
+
+    // Delete oldest (tx1), flush with a save
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId3, trsValidTxd3, completionHandler)
+    queue.take()
+    Thread.sleep(50)
+    assert(i.crl.oldestEntryNeeded == 1)
+
+    // Delete new oldest (tx2), flush
+    i.crl.deleteTransaction(storeId2, transactionId2)
+    i.crl.save(transactionId3, trsValidTxd3, completionHandler)
+    queue.take()
+    Thread.sleep(50)
+    assert(i.crl.oldestEntryNeeded == 2)
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.storeId == storeId)
+
+    i2.crl.shutdown()
+  }
+
+  test("Delete newest transaction (queue head removal)") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    // Delete the newest (head of queue)
+    i.crl.deleteTransaction(storeId2, transactionId2)
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.storeId == storeId)
+    assert(i2.trsList.head.serializedTxd == trsValidTxd.serializedTxd)
+
+    i2.crl.shutdown()
+  }
+
+  test("Delete middle transaction from queue of three") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+    i.crl.save(transactionId3, trsValidTxd3, completionHandler)
+    queue.take()
+
+    Thread.sleep(50)
+    assert(i.crl.oldestEntryNeeded == 0)
+
+    // Delete the middle node (tx2)
+    i.crl.deleteTransaction(storeId2, transactionId2)
+    i.crl.save(transactionId3, trsValidTxd3, completionHandler)
+    queue.take()
+
+    // tx1 is still oldest, so oldestEntryNeeded should remain 0
+    Thread.sleep(50)
+    assert(i.crl.oldestEntryNeeded == 0)
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 2)
+    assert(i2.trsList.exists(_.storeId == storeId))
+    assert(!i2.trsList.exists(_.storeId == storeId2))
+
+    i2.crl.shutdown()
+  }
+
+  // ===== Tier 2: Important Functional Coverage =====
+
+  test("Multiple independent transactions across different stores") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    // Save 4 transactions across 3 stores
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+    i.crl.save(transactionId3, trsValidTxd3, completionHandler)
+    queue.take()
+    i.crl.save(transactionId4, trsValidTxd4, completionHandler)
+    queue.take()
+
+    // Delete tx2, update tx1 with different paxos state
+    i.crl.deleteTransaction(storeId2, transactionId2)
+    i.crl.save(transactionId, trsPromised, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 3)
+    assert(!i2.trsList.exists(_.storeId == storeId2))
+
+    // tx1 should have updated paxos state (promised only, no accepted)
+    val tx1Recovered = i2.trsList.filter(t => t.storeId == storeId)
+    assert(tx1Recovered.length == 2) // tx1 and tx3 are both on storeId
+    assert(tx1Recovered.exists(_.paxosAcceptorState == paxPromiseOnly)) // tx1 updated
+    assert(tx1Recovered.exists(_.paxosAcceptorState == pax)) // tx3 unchanged
+
+    // tx4 on storeId3
+    assert(i2.trsList.exists(_.storeId == storeId3))
+
+    i2.crl.shutdown()
+  }
+
+  test("getFullRecoveryState filters correctly by storeId") {
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    saveAndWait(i.crl, transactionId, trsValidTxd)   // storeId
+    saveAndWait(i.crl, transactionId2, trsValidTxd2) // storeId2
+    saveAndWait(i.crl, transactionId3, trsValidTxd3) // storeId
+
+    assert(i.crl.getFullRecoveryState(storeId).length == 2)
+    assert(i.crl.getFullRecoveryState(storeId2).length == 1)
+    assert(i.crl.getFullRecoveryState(storeId3).isEmpty)
+
+    i.crl.shutdown()
+  }
+
+  test("moveToQueueHead during recycling preserves all transactions") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+
+    // Save two transactions — their dynamic data goes to stream 0
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+    assert(i.crl.currentStreamNumber == 0)
+
+    // Fill streams to cycle back to 0. Need to advance through streams 0->1->2->0
+    // Stream 0 already has 2 entries. One more fits, then switch.
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    assert(i.crl.currentStreamNumber == 0)
+
+    // 4th entry on stream 0 doesn't fit, switches to stream 1
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    assert(i.crl.currentStreamNumber == 1)
+
+    // Fill stream 1 (3 entries)
+    for _ <- 1 to 2 do
+      i.crl.save(transactionId, trsValidTxd, completionHandler)
+      queue.take()
+    assert(i.crl.currentStreamNumber == 1)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    assert(i.crl.currentStreamNumber == 2)
+
+    // Fill stream 2 (3 entries)
+    for _ <- 1 to 2 do
+      i.crl.save(transactionId, trsValidTxd, completionHandler)
+      queue.take()
+    assert(i.crl.currentStreamNumber == 2)
+
+    // Wrap to stream 0: triggers recycling, moveToQueueHead for both tx1 and tx2
+    // (both had dynamic data in stream 0)
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    assert(i.crl.currentStreamNumber == 0)
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+
+    assert(i2.trsList.length == 2)
+    val byStore = i2.trsList.groupBy(_.storeId)
+    assert(byStore(storeId).head.serializedTxd == trsValidTxd.serializedTxd)
+    assert(byStore(storeId).head.objectUpdates == trsValidTxd.objectUpdates)
+    assert(byStore(storeId2).head.serializedTxd == trsValidTxd2.serializedTxd)
+    assert(byStore(storeId2).head.objectUpdates == trsValidTxd2.objectUpdates)
+
+    i2.crl.shutdown()
+  }
+
+  test("dropTransactionObjectData then stream recycling preserves txd only") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    assert(i.crl.currentStreamNumber == 0)
+
+    // Drop object data (simulates post-commit)
+    i.crl.dropTransactionObjectData(storeId, transactionId)
+
+    // Re-save to record the drop
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+
+    // Fill streams to cycle back to 0, forcing re-write of txd (but not object updates)
+    for _ <- 1 to 8 do
+      i.crl.save(transactionId, trsValidTxd, completionHandler)
+      queue.take()
+
+    assert(i.crl.currentStreamNumber == 0)
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.serializedTxd == trsValidTxd.serializedTxd)
+    assert(i2.trsList.head.objectUpdates == List())
+
+    i2.crl.shutdown()
+  }
+
+  test("Delete and re-save same transaction ID") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    // Save tx1, then delete it
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    // Re-save tx1 with the same TxId
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 2)
+    assert(i2.trsList.exists(_.storeId == storeId))
+    assert(i2.trsList.exists(_.storeId == storeId2))
+
+    i2.crl.shutdown()
+  }
+
+  // ===== Tier 3: Edge Cases and Corruption =====
+
+  test("Corrupted entry detected — recovery stops at last valid entry") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    // Corrupt the trailing UUID of the second entry in stream 0
+    val streamFile = tdir.toPath.resolve("0.crl")
+    val reader = StreamReader(StreamId(0), streamFile)
+    val Some((entry1Start, _)) = reader.readEntry(0): @unchecked
+    val Some((_, entry1Header)) = reader.readEntry(entry1Start): @unchecked
+    val corruptOffset = entry1Start + entry1Header.trailingUUIDOffset
+
+    val fc = FileChannel.open(streamFile, StandardOpenOption.WRITE)
+    fc.position(corruptOffset)
+    fc.write(ByteBuffer.wrap(Array.fill(16)(0xFF.toByte)))
+    fc.close()
+
+    // Recovery should only find the first (uncorrupted) entry
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.storeId == storeId)
+    assert(i2.trsList.head.serializedTxd == trsValidTxd.serializedTxd)
+
+    i2.crl.shutdown()
+  }
+
+  test("Recovery from fresh empty stream files") {
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    assert(i2.trsList.isEmpty)
+    i2.crl.shutdown()
+  }
+
+  test("closeStore does not record log deletion") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    // closeStore removes from in-memory state but NOT from the log
+    val closedTrs = Await.result(i.crl.closeStore(storeId), Duration(5000, MILLISECONDS))
+    assert(closedTrs.length == 1)
+    assert(closedTrs.head.storeId == storeId)
+
+    assert(i.crl.getFullRecoveryState(storeId).isEmpty)
+    assert(i.crl.getFullRecoveryState(storeId2).length == 1)
+
+    // Flush to disk
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    // On recovery, tx1 reappears because closeStore never wrote a deletion to the log.
+    // This is expected behavior: the migrate-out process must use deleteTransaction
+    // or the store must be re-closed after recovery.
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    val store1Txs = i2.trsList.filter(_.storeId == storeId)
+    val store2Txs = i2.trsList.filter(_.storeId == storeId2)
+    assert(store1Txs.length == 1)
+    assert(store2Txs.length == 1)
+
+    i2.crl.shutdown()
+  }
+
+  test("Delete in same log entry as save") {
+    val queue = new LinkedBlockingQueue[String]()
+
+    val streamWriter = new StreamWriter(4096 * 1000, streams(1))
+    val stream = new Stream(stream0, streamWriter, UUID.randomUUID(), 0)
+
+    val tx1 = Tx(txid, trs, None, None)
+    val tx2 = Tx(txid2, trs2, None, None)
+
+    val le = LogEntry(StreamLocation.Null, 0, 0)
+    le.addTx(tx1, () => ())
+    le.addTx(tx2, () => ())
+    le.deleteTx(txid)
+
+    stream.writeEntry(le, () => queue.put(""))
+    queue.take()
+    streamWriter.shutdown()
+
+    val r = Recovery.recover(streams(1))
+
+    assert(r.trsList.length == 1)
+    assert(r.trsList.head.storeId == storeId2)
+  }
+
+  test("Rapid-fire saves all recovered") {
+    val queue = new LinkedBlockingQueue[String]()
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, () => queue.put("a"))
+    i.crl.save(transactionId2, trsValidTxd2, () => queue.put("b"))
+    i.crl.save(transactionId3, trsValidTxd3, () => queue.put("c"))
+
+    queue.take()
+    queue.take()
+    queue.take()
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 3)
+    assert(i2.trsList.exists(_.storeId == storeId))
+    assert(i2.trsList.exists(_.storeId == storeId2))
+
+    i2.crl.shutdown()
+  }
+
+  test("Recovery spanning many entries with interleaved saves and deletes") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+    i.crl.save(transactionId3, trsValidTxd3, completionHandler)
+    queue.take()
+
+    // Delete tx1, flush
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    // Delete tx3, flush
+    i.crl.deleteTransaction(storeId, transactionId3)
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    queue.take()
+
+    // Add tx4
+    i.crl.save(transactionId4, trsValidTxd4, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 2)
+    assert(i2.trsList.exists(_.storeId == storeId2))
+    assert(i2.trsList.exists(_.storeId == storeId3))
+    assert(!i2.trsList.exists(t => t.storeId == storeId))
+
+    i2.crl.shutdown()
   }
 }

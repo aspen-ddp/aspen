@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client
 
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{ThreadLocalRandom, TimeUnit}
 
 import scala.concurrent.duration.Duration
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -18,18 +18,17 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
     given ExecutionContext = client.clientContext
 
     def scheduleNextAttempt(retryCount: Int): Unit =
-      var countdown = retryCount
-      var window = 2
+      var window = initialRetryDelay
 
-      while countdown > 0 && countdown < backoffLimit do
+      var countdown = retryCount
+      while countdown > 0 && window < backoffLimit do
         window = window * 2
         countdown -= 1
 
-      if countdown > backoffLimit then
+      if window > backoffLimit then
         window = backoffLimit
 
-      val rand = new java.util.Random
-      val delay = rand.nextInt(window)
+      val delay = ThreadLocalRandom.current().nextInt(window)
 
       client.backgroundTaskManager.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)
@@ -65,18 +64,17 @@ class ExponentialBackoffRetryStrategy(client: AspenClient, backoffLimit: Int = 6
     given ExecutionContext = client.clientContext
 
     def scheduleNextAttempt(retryCount: Int): Unit =
-      var countdown = retryCount
-      var window = 2
+      var window = initialRetryDelay
 
-      while countdown > 0 && countdown < backoffLimit do
+      var countdown = retryCount
+      while countdown > 0 && window < backoffLimit do
         window = window * 2
         countdown -= 1
 
-      if countdown > backoffLimit then
+      if window > backoffLimit then
         window = backoffLimit
 
-      val rand = new java.util.Random
-      val delay = rand.nextInt(window)
+      val delay = ThreadLocalRandom.current().nextInt(window)
 
       client.backgroundTaskManager.schedule(Duration(delay, TimeUnit.MILLISECONDS)) {
         retry(retryCount + 1)

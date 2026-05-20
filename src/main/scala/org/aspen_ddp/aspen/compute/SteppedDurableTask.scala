@@ -6,6 +6,8 @@ import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
+import java.util.concurrent.ThreadLocalRandom
+import scala.concurrent.duration.{Duration, MILLISECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
@@ -30,10 +32,17 @@ abstract class SteppedDurableTask(
   def resultFromState(state: Map[String, Array[Byte]]): Option[AnyRef] = None
 
   private val promise = Promise[Option[AnyRef]]()
+  private var retryDelay: Int = 16
 
   def completed: Future[Option[AnyRef]] = promise.future
 
   doNextStep()
+
+  private def scheduleRetry(step: Int): Unit =
+    val delay = ThreadLocalRandom.current().nextInt(retryDelay)
+    retryDelay = Math.min(retryDelay * 2, 60000)
+    client.backgroundTaskManager.schedule(Duration(delay, MILLISECONDS)):
+      doNextStep()
 
   def doNextStep(): Unit =
     for
@@ -57,7 +66,7 @@ abstract class SteppedDurableTask(
                   promise.failure(e)
             case e =>
               logger.error(s"Step $step failed for task ${taskPointer.kvPointer}, retrying", e)
-              doNextStep()
+              scheduleRetry(step)
 
           case Success(newState) =>
             val encoded = Codec.encodeSteppedDurableTaskState(step + 1, newState)
@@ -73,8 +82,9 @@ abstract class SteppedDurableTask(
                     logger.warn(s"Commit aborted at step $step for task ${taskPointer.kvPointer}, retrying")
                   case _ =>
                     logger.error(s"Commit failed at step $step for task ${taskPointer.kvPointer}, retrying", err)
-                doNextStep()
+                scheduleRetry(step)
               case Success(_) =>
+                retryDelay = 16
                 if step + 1 >= steps.length then
                   synchronized:
                     if !promise.isCompleted then

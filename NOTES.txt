@@ -1,73 +1,10 @@
 Allocation special-case removal
-  - Probably ought to get Transactions with Allocations working
-    without AllocationManager and the like.
-
-    - Looks like this can be done in SinglePoolObjectAllocater
-      - Add the ObjectId to allocatingObjects in Tx
-      - Add finalization action
-
-      - When Store sees an "update" to an object being allocated:
-        - Create the object state that would result from a backend read
-          and immediately "complete" the read action.
-        - Try to avoid placing this in the read cache for correctness reasons
-          - Shouldn't be able to read uncommitted data
-        - ALTERNATIVELY - place an "allowRead" boolean on object state
-          - Set to false when creating allocating object
-          - Set to true if allocated object commits
-
-      - If ObjectRevision matches current Transaction, that's also a success
-
-    - Add "allocatingObjects" - List of ObjectIds that are being allocated
-      - Allows stores to detect this if needed in the future
-
-    - NOTE: Use case for writing to allocated objects:
-      - Multi-node add to linked list. Allocate 3 nodes then fill them with
-        content and pointers to each other
-      - COULD
-        - Allocate w/o content, Subsequent update IS allowed and sets the initial
-          content.
-        - Allocate w/ content. Subsequent updates are NOT allowed
-          - Implemented as Allocate w/o then .map: ptr =>
-            tx.overwrite/update
-            ptr
-        - Tx - At build time, if no update/overwrite called for an object being
-          allocated, just use an empty buffer for content.
-
-        - After creating the ObjectPointer
-           - Add to tx.allocatingObjects list
-           - Add the AllocationFinalizationAction
-
-    - NOTE: For reading objects currently being allocated, do this from
-      within AspenClient
-        - Do we really need this capability?
-          - What's the valid use case of reading content from a Tx that isn't
-            committed?
-        - When we stop using Allocate messages, we should see unit test failures
-          if this is really needed. Then we can figure out why and if it makes
-          sense to support.
-        - IF NEEDED, we can probably handle this entirely inside the AspenClient
-        - Use AllocationTracker instance (shared by SimpleAspenClient
-          and TestClient in unitest framework). Read from here first then go to
-          network
-
-     - NOTE: ObjectCache in Frontend DOES have Objects Under Allocation
-           - Hopefully we can remove this entirely.
-           - Only do this as a last resort
-           - Need to easily distinguish objects pending allocation so they can be
-             added to the cache
-           - Need to create object and add to cache like in Fronend.allocateObject()
-           - In Frontend: if allocating, add to objectCache
-             - On commit, just overwrite the entry (no harm)
-             - On abort, remove all allocating objects from cache
-
-  - THEN remove the supportinginfrastructure
 
   - AllocationRevisionGuard - no longer needed
-  - AllocationFinalizationAction
-    - Still Required for new objects
-    - Currently added in AllocationManager
   - Allocation Manager - no longer needed
-  - Allocation Messages - removed
+  - Frontend.pendingAllocations - remove
+  - Allocation Messages - remove
+    - Remove all send/receive methods
   - CRL AllocationState tracking - removed
 
 ObjectPointer creation - Will need generic mechanism for creating ObjectPointers for
@@ -82,15 +19,6 @@ For OutOfSpace errors, could put "allocatingObjects" in Txd.
 
 
 Refactor StoragePools and Allocation design
-
-  - Allocations
-    - Allocations only need writeThreshold responses
-    - Remove Allocate/AllocateResponse messages
-    - Just 1RTT just like any other transaction
-      - Allocates write to store just like an update (no special
-        "allocation" notification)
-    - Eliminates the need for AllocationRecovery!!!
-      - Failed "allocations" are cleaned up just like normal out-of-date objects
 
   - StoragePools get a maxStoreSize - Stored in State
     - Required for pool creation

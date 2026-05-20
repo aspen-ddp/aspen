@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.client
 
+import org.aspen_ddp.aspen.client.internal.allocation.AllocationFinalizationAction
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectRefcount, ObjectRevision, SetLeft, SetMax, SetMin, SetRight, Value}
@@ -14,9 +15,23 @@ trait ObjectAllocator:
 
   protected val executionContext: ExecutionContext
 
-  def allocateDataObject()(using t: Transaction): Future[DataObjectPointer]
+  protected def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer]
 
-  def allocateKeyValueObject()(using t: Transaction): Future[KeyValueObjectPointer]
+  protected def createKeyValueObjectPointer()(using t: Transaction): Future[KeyValueObjectPointer]
+
+  def allocateDataObject()(using t: Transaction): Future[DataObjectPointer] =
+    given ExecutionContext = executionContext
+    createDataObjectPointer().map: ptr =>
+      t.addAllocatingObject(ptr)
+      AllocationFinalizationAction.addToTransaction(ptr, t)
+      ptr
+
+  def allocateKeyValueObject()(using t: Transaction): Future[KeyValueObjectPointer] =
+    given ExecutionContext = executionContext
+    createKeyValueObjectPointer().map: ptr =>
+      t.addAllocatingObject(ptr)
+      AllocationFinalizationAction.addToTransaction(ptr, t)
+      ptr
 
   def allocateDataObject(initialContent: DataBuffer,
                          initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[DataObjectPointer] =

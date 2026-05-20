@@ -1,9 +1,4 @@
 
-ObjectAllocator
-  - add protected def createKeyValue/DataPointer: Future[ptr]
-  - public-facing API calls this then adds the tx.allocaing % finalizationAction
-    - Prevents implementation from needing to remember to do this
-
 Simplify CRL
   - Get back up to speed on design and validate approach
   - Use brainstorming session to simplify design now that only

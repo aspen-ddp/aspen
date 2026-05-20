@@ -1,21 +1,4 @@
 
-Simplify CRL
-  - Get back up to speed on design and validate approach
-  - Use brainstorming session to simplify design now that only
-    Tx state is being tracked.
-  - Use Claude to look for bugs
-
-ObjectPointer creation - Will need generic mechanism for creating ObjectPointers for
-advanced use cases like Flat-file backed stores.
-  - Maybe StoragePoolState has an allocatorImplUUID - for TypeRegistry factory
-  - Maybe also has an optional allocatorStatePtr field pointing to the root object for
-    implementing the allocator strategy
-
-For OutOfSpace errors, could put "allocatingObjects" in Txd.
-  - Stores could then use this to detect allocations
-  - Vote abort if not enough space?
-
-
 Refactor StoragePools and Allocation design
 
   - StoragePools get a maxStoreSize - Stored in State
@@ -77,6 +60,16 @@ Rename StoreManager to Host?
 Switch AmoebaFS to use a registered object for the root
 
 Switch to ScalaPB
+
+ObjectPointer creation - Will need generic mechanism for creating ObjectPointers for
+advanced use cases like Flat-file backed stores.
+  - Maybe StoragePoolState has an allocatorImplUUID - for TypeRegistry factory
+  - Maybe also has an optional allocatorStatePtr field pointing to the root object for
+    implementing the allocator strategy
+
+For OutOfSpace errors, could put "allocatingObjects" in Txd.
+  - Stores could then use this to detect allocations
+  - Vote abort if not enough space?
 
 Consider removing usage of invalidateTransaction in favor of just throwing
 exceptions.

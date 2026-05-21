@@ -4,24 +4,23 @@ import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.StoragePoolState
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.server.store.backend.BackendConfig
+
+import scala.concurrent.Future
 
 trait StoragePool:
 
   val poolId: PoolId
 
-  val name: String
+  val ida: IDA
 
   val maxObjectSize: Option[Int]
 
-  val ida: IDA
-
-  val stores: Array[StoragePoolState.StoreEntry]
-
-  val backendConfig: BackendConfig
-
   def createAllocator: ObjectAllocator
 
-  def allocationTree: TieredKeyValueList
+  def getState(): Future[StoragePoolState]
 
-  def errorTree: TieredKeyValueList
+  def dropCachedState(): Unit
+
+  private[aspen] def allocationTree: TieredKeyValueList
+
+  private[aspen] def errorTree: TieredKeyValueList

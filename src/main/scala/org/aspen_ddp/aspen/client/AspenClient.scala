@@ -34,6 +34,8 @@ trait AspenClient extends ObjectReader:
 
   val typeRegistry: TypeRegistry
 
+  protected var storagePoolCache: Map[PoolId, StoragePool] = Map.empty
+
   def clientContext: ExecutionContext
 
   def client: AspenClient = this
@@ -48,17 +50,30 @@ trait AspenClient extends ObjectReader:
 
   def getStoragePool(poolId: PoolId): Future[StoragePool] =
     given ExecutionContext = this.clientContext
+    synchronized:
+      storagePoolCache.get(poolId) match
+        case Some(pool) => Future.successful(pool)
+        case None =>
+          getStoragePoolPointer(poolId).flatMap: pointer =>
+            read(pointer).map: kvos =>
+              val pool = SimpleStoragePool(this, kvos)
+              synchronized:
+                storagePoolCache += poolId -> pool
+              pool
+
+  def getStoragePoolState(poolId: PoolId): Future[StoragePoolState] =
+    given ExecutionContext = this.clientContext
     getStoragePoolPointer(poolId).flatMap: pointer =>
       read(pointer).map: kvos =>
-        SimpleStoragePool(this, kvos)
-  
-  def getHost(hostId: HostId): Future[HostState] =
+        StoragePoolState(kvos)
+
+  def getHostState(hostId: HostId): Future[HostState] =
     given ExecutionContext = this.clientContext
     getHostPointer(hostId).flatMap: pointer =>
       read(pointer).map: kvos =>
         HostState(kvos)
   
-  def getStorageDevice(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
+  def getStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     given ExecutionContext = this.clientContext
     getStorageDevicePointer(storageDeviceId).flatMap: pointer =>
       read(pointer).map: kvos =>
@@ -107,7 +122,7 @@ trait AspenClient extends ObjectReader:
       given ExecutionContext = this.clientContext
       val poolId = PoolId(UUID.randomUUID())
       for
-        devices <- Future.sequence(storageDeviceIds.map(sid => getStorageDevice(sid)))
+        devices <- Future.sequence(storageDeviceIds.map(sid => getStorageDeviceState(sid)))
         stores = devices.map(dev => StoragePoolState.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
         config = StoragePoolState(
           poolId,
@@ -134,7 +149,8 @@ trait AspenClient extends ObjectReader:
       
       for
         pool <- getStoragePool(storeId.poolId)
-        sourceId = pool.stores(storeId.poolIndex).storageDeviceId
+        poolState <- pool.getState()
+        sourceId = poolState.stores(storeId.poolIndex).storageDeviceId
         srcPtr <- getStorageDevicePointer(sourceId)
         srcKvos <- read(srcPtr)
         srcState = StorageDeviceState(srcKvos)

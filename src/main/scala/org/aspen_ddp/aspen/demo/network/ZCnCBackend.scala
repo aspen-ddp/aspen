@@ -114,7 +114,7 @@ class ZCnCBackend(val network: ZMQNetwork,
         Future.failed(new Exception(f"Store ${msg.storeId} not found"))
       case Some(storeManager) =>
         for
-          hostState <- someOrThrow(client.getHost(msg.toHost), new Exception(f"HostState name not found: ${msg.toHost}"))
+          hostState <- someOrThrow(client.getHostState(msg.toHost), new Exception(f"HostState name not found: ${msg.toHost}"))
         yield
           val stf = new ZStoreTransferFrontend(storeManager.storesDir, network)
           stf.send(msg.storeId, hostState.address, hostState.storeTransferPort)

@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.demo.BootstrapConfig
 import org.zeromq.ZMQ.{DONTWAIT, PollItem}
@@ -204,12 +204,12 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     storeToHost -= storeId
   }
 
-  private def poolLookedUp(pool: StoragePool): Unit = synchronized {
-    pool.stores.zipWithIndex.foreach: (entry, index) =>
-      val storeId = StoreId(pool.poolId, index.toByte)
+  private def poolLookedUp(pstate: StoragePoolState): Unit = synchronized {
+    pstate.stores.zipWithIndex.foreach: (entry, index) =>
+      val storeId = StoreId(pstate.poolId, index.toByte)
       storeToHost += storeId -> entry.hostId
 
-    pendingPoolLookup.get(pool.poolId).foreach: ppl =>
+    pendingPoolLookup.get(pstate.poolId).foreach: ppl =>
       ppl.storeMessages.foreach: (storeId, msgList) =>
         val hostId = storeToHost(storeId)
         hostStates.get(hostId) match
@@ -223,7 +223,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
                 p
             phl.addMessages(msgList)
 
-    pendingPoolLookup -= pool.poolId
+    pendingPoolLookup -= pstate.poolId
   }
 
   private def hostLookedUp(hostState: HostState): Unit = synchronized {
@@ -260,7 +260,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
           case None =>
             val p = PendingHostLookup()
             pendingHostLookup += hostId -> p
-            client.getHost(hostId).foreach(hostLookedUp)
+            client.getHostState(hostId).foreach(hostLookedUp)
             p
         phl.addMessage(msg)
 
@@ -275,7 +275,7 @@ class ZMQNetwork(val oclientId: Option[ClientId],
           case None =>
             val p = PendingPoolLookup()
             pendingPoolLookup += storeId.poolId -> p
-            client.getStoragePool(storeId.poolId).foreach(poolLookedUp)
+            client.getStoragePoolState(storeId.poolId).foreach(poolLookedUp)
             p
         ppl.addMessage(storeId, msg)
 

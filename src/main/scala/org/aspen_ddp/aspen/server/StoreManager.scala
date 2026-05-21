@@ -188,8 +188,8 @@ class StoreManager(val client: AspenClient,
           Future.unit
         else 
           for
-            toHost <- client.getHost(toDevice.hostId)
-            poolHosts <- Future.sequence(poolCfg.stores.zipWithIndex.toList.map((e, index) => client.getHost(e.hostId).map(host => (StoreId(storeId.poolId, index.toByte), host))))
+            toHost <- client.getHostState(toDevice.hostId)
+            poolHosts <- Future.sequence(poolCfg.stores.zipWithIndex.toList.map((e, index) => client.getHostState(e.hostId).map(host => (StoreId(storeId.poolId, index.toByte), host))))
             radicleKvos <- client.read(client.radicle)
           yield
             val hostsMap = poolHosts.map((_, host) => host.hostId -> host).toMap + (toHost.hostId -> toHost)
@@ -309,15 +309,16 @@ class StoreManager(val client: AspenClient,
 
       for
         pool <- client.getStoragePool(m.storeId.poolId)
-        poolEntry = pool.stores(m.storeId.poolIndex)
-        fromDevice <- client.getStorageDevice(poolEntry.storageDeviceId)
+        pstate <- pool.getState()
+        poolEntry = pstate.stores(m.storeId.poolIndex)
+        fromDevice <- client.getStorageDeviceState(poolEntry.storageDeviceId)
         devEntry = fromDevice.stores.get(m.storeId) match
           case None => err(s"Store ${m.storeId} missing from device. Transfer probably completed")
           case Some(e) => e
         toDeviceId = devEntry.transferDevice match
           case None => err(s"Store ${m.storeId} not in transfer state. Transfer probably completed")
           case Some(sid) => sid
-        toDevice <- client.getStorageDevice(toDeviceId)
+        toDevice <- client.getStorageDeviceState(toDeviceId)
         sourceDs = storageDevices.get(fromDevice.storageDeviceId) match
           case None => err(s"Source storage device for transfer ${fromDevice.storageDeviceId} not loaded. Disk removed?")
           case Some(sds) => sds
@@ -462,8 +463,8 @@ class StoreManager(val client: AspenClient,
       val fcreate = if os.exists(storePath) then
         Future.unit
       else
-        client.getStoragePool(storeId.poolId).flatMap: pool =>
-          val backend = pool.backendConfig match
+        client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
+          val backend = pstate.backendConfig match
             case cfg: RocksDBConfig => new RocksDBBackend(storePath.toNIO, storeId, ec)
 
           loadStore(local.storageDeviceId, backend)
@@ -531,12 +532,12 @@ class StoreManager(val client: AspenClient,
           (storeId, status.transferDevice)
         }.toList.foreach: (storeId, ofromDeviceId) =>
           ofromDeviceId.foreach: fromDeviceId =>
-            client.getStorageDevice(fromDeviceId).foreach: fromDevice =>
+            client.getStorageDeviceState(fromDeviceId).foreach: fromDevice =>
               startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
     }
 
     synchronized { storageDevices.get(storageDeviceId) }.foreach: local =>
-      client.getStorageDevice(storageDeviceId).foreach: remote =>
+      client.getStorageDeviceState(storageDeviceId).foreach: remote =>
         check(local, remote)
 
   def containsStore(storeId: StoreId): Boolean = synchronized {

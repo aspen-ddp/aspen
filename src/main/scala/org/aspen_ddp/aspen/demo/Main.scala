@@ -684,7 +684,7 @@ object Main {
       storeManager,
       hostCfg.cncPort)
 
-    client.getHost(hostCfg.hostId).foreach: host =>
+    client.getHostState(hostCfg.hostId).foreach: host =>
       val transferBackend = new ZStoreTransferBackend(
         hostCfg.storeTransferPort,
         network,
@@ -897,7 +897,7 @@ object Main {
 
     def getHost(name: String): Future[HostState] =
       client.getHostId(name).flatMap: hostId =>
-        client.getHost(hostId)
+        client.getHostState(hostId)
 
     for
       hlist <- Future.sequence(hosts.map(getHost))
@@ -926,10 +926,11 @@ object Main {
 
     for
       hostId <- client.getHostId(hostName)
-      newHost <- client.getHost(hostId)
+      newHost <- client.getHostState(hostId)
       sp <- client.getStoragePool(storeId.poolId)
-      curHostId = sp.stores(storeId.poolIndex).hostId
-      currentHost <- client.getHost(curHostId)
+      pstate <- sp.getState()
+      curHostId = pstate.stores(storeId.poolIndex).hostId
+      currentHost <- client.getHostState(curHostId)
 
       zfrontend = new ZCnCFrontend(network, currentHost)
       _ <- zfrontend.send(TransferStore(storeId, newHost.hostId))

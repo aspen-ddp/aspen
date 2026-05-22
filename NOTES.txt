@@ -1,4 +1,43 @@
 
+StoragePoolUsage
+  - poll all Store.estimateSize() (every 20sec? by default)
+  - UsageManager.updateStoreSize(StoreId, currentEstimatedSize)
+    - Manages an internal cache of StoreId -> (poolPointer, lastReportedSize)
+    - If (currentEstimatedSize - lastReportedSize).abs.toDouble / lastReportedSize.toDobule
+      * 100 > 0.5 (i.e. changes by more than 1/2 percent) update size in pool object
+    - Read StoragePoolState
+      - update Key(s"sz${storeId.poolIndex}") w/ new value
+      - sum all the sizes and calculate overall pool usage
+        - If > 0.5 percent change
+          - In Tx:
+            - update pool usage
+            - Create UpdateAllocationGroupsUsageTask
+
+- UpdateAllocationGroupsUsageTask
+  - Config: (updateTimestamp, Pool/Group Type, UUID, maxSize, newUsage, list-of-group-ids)
+  - completion = Future.sequence(gid-list.map.updateGroup(_))
+    - When all Futures complete, exit task
+    - Idempotent. No complex knowledge or state tracking needed
+  - updateGroup(gorupId): Future[Unit]
+    - retryTillSuccessfulWithRecovery - recover: stop if fetch state object fails
+      - fetch AllocationGroupState
+      - createTx
+      - If kvos.contents.get(uuid) is None or lastUpdateTimestamp < updateTimestamp
+        - update entry
+        - Iterate over all keys 16-bytes in size:
+          - decode as GroupEntry
+          - sum all usage and maxSize
+          - If usage differs by 0.5% or maxSize has changed AND has parent groups:
+            - Create UpdateAllocationGroupUsageTask to update parent groups
+
+- AddToAllocationGroupTask
+  - (Pool/Group Type, UUID, maxSize, currentUsage)
+  - Add and calculate effect on group usage
+    - CreateUpdateAllocationGroupUsageTask if necessary
+
+- RemoveFromAllocationGroupTask
+  - Same
+
 Refactor StoragePoolState
 
   - StoragePoolState get a maxStoreSize - Stored in State
@@ -166,6 +205,16 @@ can be found via error messages to read/write operations
 
 -----------------------------------------------------------
 - Brainstorming
+
+Could add concept of EventHandlers
+  - Identified by UUID
+  - Optionally able to be attached to "things of interest"
+    - Such as an AllocationGroup storage changing by 0.5%
+  - When an "event" triggers:
+    - Use TypeRegistry to get a factory for handler corresponding to UUID
+      - Factory type must castable to a base factory type
+        - Ensures that handler objects will have the needed API for handling events
+          of that type. like AllocGroupUsageChangeEventHandler
 
 For maximum recovery speed, DurableRecoveryManagerTask
   - Delegates restore operations to groups of workers

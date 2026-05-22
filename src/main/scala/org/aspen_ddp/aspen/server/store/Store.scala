@@ -36,6 +36,8 @@ class Store(val storageDeviceId: StorageDeviceId,
   
   def close(): Future[Unit] = frontend.close()
 
+  def estimateSize(): Long = backend.estimateSize()
+
   def heartbeat(): Unit = {
     transactionDrivers.values.foreach { td =>
       td.heartbeat()

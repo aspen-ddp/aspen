@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.client.RegisteredTypeFactory
 import org.aspen_ddp.aspen.client.internal.allocation.{AllocationFinalizationAction, DeletionFinalizationAction}
 import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateFinalizationAction
 import org.aspen_ddp.aspen.client.tkvl.{JoinFinalizationAction, KVObjectRootManager, SplitFinalizationAction}
+import org.aspen_ddp.aspen.server.usage.UpdateAllocationGroupUsageTask
 
 object StaticTypeRegistry {
 
@@ -15,7 +16,8 @@ object StaticTypeRegistry {
     JoinFinalizationAction,
     AllocationFinalizationAction,
     DeletionFinalizationAction,
-    MissedUpdateFinalizationAction
+    MissedUpdateFinalizationAction,
+    UpdateAllocationGroupUsageTask
   )
 
   val types: List[(UUID, RegisteredTypeFactory)] = registry.map(t => t.typeUUID -> t)

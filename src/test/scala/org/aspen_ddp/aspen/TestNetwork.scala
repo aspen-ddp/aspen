@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen
 
 import java.util.UUID
 import org.aspen_ddp.aspen
-import org.aspen_ddp.aspen.client.internal.{OpportunisticRebuildManager, StaticTypeRegistry}
+import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
@@ -73,7 +73,10 @@ object TestNetwork {
 
     val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
 
-    val typeRegistry: TypeRegistry = new TypeRegistry(StaticTypeRegistry.types.toMap)
+    val typeRegistry: TypeRegistry = TypeRegistry(
+      org.aspen_ddp.aspen.client.TypeFactories.factories,
+      org.aspen_ddp.aspen.server.TypeFactories.factories
+    )
 
     val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
     val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)

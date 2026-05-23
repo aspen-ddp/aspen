@@ -1,18 +1,4 @@
 
-StoragePoolUsage
-  - poll all Store.estimateSize() (every 20sec? by default)
-  - UsageManager.updateStoreSize(StoreId, currentEstimatedSize)
-    - Manages an internal cache of StoreId -> (poolPointer, lastReportedSize)
-    - If (currentEstimatedSize - lastReportedSize).abs.toDouble / lastReportedSize.toDobule
-      * 100 > 0.5 (i.e. changes by more than 1/2 percent) update size in pool object
-    - Read StoragePoolState
-      - update Key(s"sz${storeId.poolIndex}") w/ new value
-      - sum all the sizes and calculate overall pool usage
-        - If > 0.5 percent change
-          - In Tx:
-            - update pool usage
-            - Create UpdateAllocationGroupsUsageTask
-
 - UpdateAllocationGroupsUsageTask
   - Config: (updateTimestamp, Pool/Group Type, UUID, maxSize, newUsage, list-of-group-ids)
   - completion = Future.sequence(gid-list.map.updateGroup(_))

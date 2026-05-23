@@ -51,8 +51,7 @@ object StoreManager:
   private case class CheckAllDevices() extends Event
   private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
   private case class InitializeTaskExecutor() extends Event
-
-  private val TaskExecutorRootKey = Key(Array[Byte](3))
+  
 
   class IOHandler(mgr: StoreManager) extends CompletionHandler:
     override def complete(op: Completion): Unit =
@@ -149,7 +148,7 @@ class StoreManager(val client: AspenClient,
     hostPointerFuture.onComplete:
       case Success(hostPtr) =>
         client.read(hostPtr).foreach: hostKvos =>
-          hostKvos.contents.get(TaskExecutorRootKey) match
+          hostKvos.contents.get(HostState.TaskExecutorRootKey) match
             case Some(vs) =>
               val executorPtr = KeyValueObjectPointer(vs.value.bytes)
               client.getStoragePool(Radicle.poolId).foreach: pool =>
@@ -169,8 +168,8 @@ class StoreManager(val client: AspenClient,
                     executorRoot <- allocator.allocateKeyValueObject(Map())(using tx)
                     currentHostKvos <- client.read(hostPtr)
                   yield
-                    val reqs = List(DoesNotExist(TaskExecutorRootKey))
-                    val ops = List(Insert(TaskExecutorRootKey, executorRoot.toArray))
+                    val reqs = List(DoesNotExist(HostState.TaskExecutorRootKey))
+                    val ops = List(Insert(HostState.TaskExecutorRootKey, executorRoot.toArray))
                     tx.update(hostPtr, None, None, reqs, ops)
                     executorRoot
                 .foreach: executorRoot =>

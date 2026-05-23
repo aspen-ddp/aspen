@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RegisteredTypeFactory, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeFactories, TypeRegistry}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
@@ -28,13 +28,18 @@ class SimpleAspenClient(val msngr: ClientMessenger,
                         initialReadDelay: Duration,
                         maxReadDelay: Duration,
                         txRetransmitDelay: Duration,
-                        allocationRetransmitDelay: Duration) extends AspenClient:
+                        allocationRetransmitDelay: Duration,
+                        userTypeFactories: List[RegisteredTypeFactory] = Nil) extends AspenClient:
   
   given ec: ExecutionContext = executionContext
 
   var attributes: Map[String, String] = Map()
 
-  val typeRegistry: TypeRegistry = new TypeRegistry(StaticTypeRegistry.types.toMap)
+  val typeRegistry: TypeRegistry = TypeRegistry(
+    org.aspen_ddp.aspen.client.TypeFactories.factories,
+    org.aspen_ddp.aspen.server.TypeFactories.factories,
+    userTypeFactories
+  )
 
   override val txStatusCache: TransactionStatusCache = new TransactionStatusCache(txStatusCacheDuration)
 

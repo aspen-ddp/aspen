@@ -26,6 +26,7 @@ object HostId:
 
 object HostState:
   private [aspen] val StateKey = Key(Array[Byte](0))
+  private [aspen] val TaskExecutorRootKey = Key(Array[Byte](1))
 
   def apply(buff: Array[Byte]): HostState = Codec.decode(codec.HostState.parseFrom(buff))
   

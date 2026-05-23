@@ -1057,6 +1057,11 @@ object Codec extends Logging:
     o.stores.foreach: storeEntry =>
       builder.addStores(encode(storeEntry))
 
+    builder.setCurrentUsage(o.currentUsage)
+    builder.setMaximumStoreSize(o.maximumStoreSize)
+    o.allocationGroups.foreach: uuid =>
+      builder.addAllocationGroups(encodeUUID(uuid))
+
     builder.build
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
@@ -1066,8 +1071,12 @@ object Codec extends Logging:
     val maxObjectSize = if m.getMaxObjectSize == 0 then None else Some(m.getMaxObjectSize)
     val stores = m.getStoresList.asScala.map(decode).toArray
     val backendConfig = decodeBackendConfig(m.getBackendConfig)
+    val currentUsage = m.getCurrentUsage
+    val maximumStoreSize = m.getMaximumStoreSize
+    val allocationGroups = m.getAllocationGroupsList.asScala.map(decodeUUID).toList
 
-    StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig)
+    StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig,
+      currentUsage, maximumStoreSize, allocationGroups)
 
 
   def encode(o: HostState): codec.HostState =

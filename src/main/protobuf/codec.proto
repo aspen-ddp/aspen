@@ -473,6 +473,9 @@ message StoragePoolState {
   uint32 maxObjectSize = 4;
   repeated PoolStoreEntry stores = 5;
   BackendConfig backendConfig = 6;
+  int64 currentUsage = 7;
+  int64 maximumStoreSize = 8;
+  repeated UUID allocationGroups = 9;
 }
 
 message HostState {

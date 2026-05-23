@@ -1,4 +1,6 @@
 
+import scalapb.compiler.Version.scalapbVersion
+
 lazy val root = (project in file(".")).
   settings(
 
@@ -27,7 +29,7 @@ lazy val root = (project in file(".")).
       "org.dcache"                       %  "nfs4j-core"              % "0.24.0",
       "org.yaml"                         %  "snakeyaml"               % "1.25",
       "org.zeromq"                       %  "jeromq"                  % "0.6.0",
-      "com.google.protobuf"              %  "protobuf-java"           % "3.13.0" % "protobuf",
+      "com.thesamet.scalapb"             %% "scalapb-runtime"         % scalapbVersion % "protobuf",
       "com.lihaoyi"                      %% "os-lib"                  % "0.11.5",
     )
   )
@@ -35,5 +37,5 @@ lazy val root = (project in file(".")).
   Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-W", "10", "5")
 
  Compile / PB.targets := Seq(
-  PB.gens.java -> (Compile / sourceManaged).value
+  scalapb.gen(flatPackage = true) -> (Compile / sourceManaged).value
  )

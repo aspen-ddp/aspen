@@ -4,7 +4,6 @@ import com.google.protobuf.ByteString
 import org.aspen_ddp.aspen.client.StoragePool
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.codec
-import org.aspen_ddp.aspen.codec.ObjectReadError
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
@@ -20,21 +19,18 @@ import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, RocksDBConfig}
 
 import java.nio.{ByteBuffer, ByteOrder}
-import scala.jdk.CollectionConverters.*
 import java.util.UUID
 
 object Codec extends Logging:
 
   def encodeUUID(o: UUID): codec.UUID =
-    codec.UUID.newBuilder()
-      .setMostSigBits(o.getMostSignificantBits)
-      .setLeastSigBits(o.getLeastSignificantBits)
-      .build
+    codec.UUID(
+      mostSigBits = o.getMostSignificantBits,
+      leastSigBits = o.getLeastSignificantBits
+    )
 
   def decodeUUID(m: codec.UUID): UUID =
-    val msb = m.getMostSigBits
-    val lsb = m.getLeastSigBits
-    new UUID(msb, lsb)
+    new UUID(m.mostSigBits, m.leastSigBits)
 
 
   def encodeKeyComparison(o: KeyOrdering): codec.KeyComparison = o match
@@ -46,65 +42,58 @@ object Codec extends Logging:
     case codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY => ByteArrayKeyOrdering
     case codec.KeyComparison.KEY_COMPARISON_INTEGER => IntegerKeyOrdering
     case codec.KeyComparison.KEY_COMPARISON_LEXICAL => LexicalKeyOrdering
-    case f => throw new EncodingError(f"Invalid key comparison: $f")
+    case codec.KeyComparison.Unrecognized(v) => throw new EncodingError(f"Invalid key comparison: $v")
 
 
   def encode(o: Replication): codec.Replication =
-    codec.Replication.newBuilder()
-      .setWidth(o.width)
-      .setWriteThreshold(o.writeThreshold)
-      .build
+    codec.Replication(
+      width = o.width,
+      writeThreshold = o.writeThreshold
+    )
 
   def decode(m: codec.Replication): Replication =
-    Replication(m.getWidth, m.getWriteThreshold)
+    Replication(m.width, m.writeThreshold)
 
 
   def encode(o: ReedSolomon): codec.ReedSolomon =
-    codec.ReedSolomon.newBuilder()
-      .setWidth(o.width)
-      .setRestoreThreshold(o.restoreThreshold)
-      .setWriteThreshold(o.writeThreshold)
-      .build
+    codec.ReedSolomon(
+      width = o.width,
+      restoreThreshold = o.restoreThreshold,
+      writeThreshold = o.writeThreshold
+    )
 
   def decode(m: codec.ReedSolomon): ReedSolomon =
-    ReedSolomon(m.getWidth, m.getRestoreThreshold, m.getWriteThreshold)
+    ReedSolomon(m.width, m.restoreThreshold, m.writeThreshold)
 
 
   def encode(o: IDA): codec.IDA =
-    val builder = codec.IDA.newBuilder()
-    o match
-      case r: Replication => builder.setReplication(encode(r))
-      case r: ReedSolomon => builder.setReedSolomon(encode(r))
-    builder.build
+    val ida = o match
+      case r: Replication => codec.IDA.Ida.Replication(encode(r))
+      case r: ReedSolomon => codec.IDA.Ida.ReedSolomon(encode(r))
+    codec.IDA(ida = ida)
 
   def decode(m: codec.IDA): IDA =
-    if m.hasReplication then
-      decode(m.getReplication)
-    else if m.hasReedSolomon then
-      decode(m.getReedSolomon)
-    else
-      throw new EncodingError("Unknown IDA")
+    m.ida match
+      case codec.IDA.Ida.Replication(r) => decode(r)
+      case codec.IDA.Ida.ReedSolomon(r) => decode(r)
+      case codec.IDA.Ida.Empty => throw new EncodingError("Unknown IDA")
 
 
   def encode(o: ObjectRevision): codec.ObjectRevision =
-    codec.ObjectRevision.newBuilder()
-      .setUuid(encodeUUID(o.lastUpdateTxUUID))
-      .build
+    codec.ObjectRevision(uuid = Some(encodeUUID(o.lastUpdateTxUUID)))
 
   def decode(m: codec.ObjectRevision): ObjectRevision =
-    ObjectRevision(TransactionId(decodeUUID(m.getUuid)))
+    ObjectRevision(TransactionId(decodeUUID(m.uuid.get)))
 
 
   def encode(o: ObjectRefcount): codec.ObjectRefcount =
-    codec.ObjectRefcount.newBuilder()
-      .setUpdateSerial(o.updateSerial)
-      .setRefcount(o.count)
-      .build
+    codec.ObjectRefcount(
+      updateSerial = o.updateSerial,
+      refcount = o.count
+    )
 
   def decode(m: codec.ObjectRefcount): ObjectRefcount =
-    ObjectRefcount(m.getUpdateSerial.toInt, m.getRefcount)
-
-
+    ObjectRefcount(m.updateSerial.toInt, m.refcount)
 
 
   def encodeObjectType(o: ObjectType.Value): codec.ObjectType = o match
@@ -114,22 +103,22 @@ object Codec extends Logging:
   def decodeObjectType(m: codec.ObjectType): ObjectType.Value = m match
     case codec.ObjectType.OBJECT_TYPE_DATA => ObjectType.Data
     case codec.ObjectType.OBJECT_TYPE_KEYVALUE => ObjectType.KeyValue
-    case t => throw new EncodingError(f"Invalid ObjecType: $t")
+    case codec.ObjectType.Unrecognized(v) => throw new EncodingError(f"Invalid ObjectType: $v")
 
 
   def encode(o: ObjectPointer): codec.ObjectPointer =
-    codec.ObjectPointer.newBuilder()
-      .setUuid(encodeUUID(o.id.uuid))
-      .setPoolUuid(encodeUUID(o.poolId.uuid))
-      .setObjectType(encodeObjectType(o.objectType))
-      .setStorePointer(ByteString.copyFrom(o.storePointer))
-      .build
+    codec.ObjectPointer(
+      uuid = Some(encodeUUID(o.id.uuid)),
+      poolUuid = Some(encodeUUID(o.poolId.uuid)),
+      objectType = encodeObjectType(o.objectType),
+      storePointer = ByteString.copyFrom(o.storePointer)
+    )
 
   def decode(m: codec.ObjectPointer): ObjectPointer =
-    val uuid = decodeUUID(m.getUuid)
-    val poolUuid = decodeUUID(m.getPoolUuid)
-    val objectType = decodeObjectType(m.getObjectType)
-    val storePointer = m.getStorePointer.toByteArray
+    val uuid = decodeUUID(m.uuid.get)
+    val poolUuid = decodeUUID(m.poolUuid.get)
+    val objectType = decodeObjectType(m.objectType)
+    val storePointer = m.storePointer.toByteArray
 
     objectType match
       case ObjectType.Data => DataObjectPointer(ObjectId(uuid), PoolId(poolUuid), storePointer)
@@ -145,7 +134,7 @@ object Codec extends Logging:
     case codec.TransactionStatus.TRANSACTION_STATUS_UNRESOLVED => TransactionStatus.Unresolved
     case codec.TransactionStatus.TRANSACTION_STATUS_COMMITTED => TransactionStatus.Committed
     case codec.TransactionStatus.TRANSACTION_STATUS_ABORT => TransactionStatus.Aborted
-    case f => throw new EncodingError(f"Invalid Transaction Status: $f")
+    case codec.TransactionStatus.Unrecognized(v) => throw new EncodingError(f"Invalid Transaction Status: $v")
 
 
   def encodeTransactionDisposition(o: TransactionDisposition.Value): codec.TransactionDisposition = o match
@@ -157,7 +146,7 @@ object Codec extends Logging:
     case codec.TransactionDisposition.TRANSACTION_DISPOSITION_UNDETERMINED => TransactionDisposition.Undetermined
     case codec.TransactionDisposition.TRANSACTION_DISPOSITION_VOTE_COMMIT => TransactionDisposition.VoteCommit
     case codec.TransactionDisposition.TRANSACTION_DISPOSITION_VOTE_ABORT => TransactionDisposition.VoteAbort
-    case f => throw new EncodingError(f"Invalid Transaction Disposition: $f")
+    case codec.TransactionDisposition.Unrecognized(v) => throw new EncodingError(f"Invalid Transaction Disposition: $v")
 
 
   def encodeDataUpdateOperation(o: DataUpdateOperation.Value): codec.DataUpdateOperation = o match
@@ -167,98 +156,126 @@ object Codec extends Logging:
   def decodeDataUpdateOperation(m: codec.DataUpdateOperation): DataUpdateOperation.Value = m match
     case codec.DataUpdateOperation.DATA_UPDATE_OPERATION_APPEND => DataUpdateOperation.Append
     case codec.DataUpdateOperation.DATA_UPDATE_OPERATION_OVERWRITE => DataUpdateOperation.Overwrite
-    case f => throw new EncodingError(f"Invalid DataUpdateOperation: $f")
+    case codec.DataUpdateOperation.Unrecognized(v) => throw new EncodingError(f"Invalid DataUpdateOperation: $v")
 
 
   def encode(o: DataUpdate): codec.DataUpdate =
-    codec.DataUpdate.newBuilder()
-      .setObjectPointer(encode(o.objectPointer))
-      .setRequiredRevision(encode(o.requiredRevision))
-      .setOperation(encodeDataUpdateOperation(o.operation))
-      .build
-    
+    codec.DataUpdate(
+      objectPointer = Some(encode(o.objectPointer)),
+      requiredRevision = Some(encode(o.requiredRevision)),
+      operation = encodeDataUpdateOperation(o.operation)
+    )
+
   def decode(m: codec.DataUpdate): DataUpdate =
-    DataUpdate(decode(m.getObjectPointer),
-      decode(m.getRequiredRevision),
-      decodeDataUpdateOperation(m.getOperation))
+    DataUpdate(decode(m.objectPointer.get),
+      decode(m.requiredRevision.get),
+      decodeDataUpdateOperation(m.operation))
 
 
   def encode(o: RefcountUpdate): codec.RefcountUpdate =
-    codec.RefcountUpdate.newBuilder()
-      .setObjectPointer(encode(o.objectPointer))
-      .setRequiredRefcount(encode(o.requiredRefcount))
-      .setNewRefcount(encode(o.newRefcount))
-      .build
+    codec.RefcountUpdate(
+      objectPointer = Some(encode(o.objectPointer)),
+      requiredRefcount = Some(encode(o.requiredRefcount)),
+      newRefcount = Some(encode(o.newRefcount))
+    )
 
   def decode(m: codec.RefcountUpdate): RefcountUpdate =
-    RefcountUpdate(decode(m.getObjectPointer),
-      decode(m.getRequiredRefcount),
-      decode(m.getNewRefcount))
+    RefcountUpdate(decode(m.objectPointer.get),
+      decode(m.requiredRefcount.get),
+      decode(m.newRefcount.get))
 
 
   def encode(o: VersionBump): codec.VersionBump =
-    codec.VersionBump.newBuilder()
-      .setObjectPointer(encode(o.objectPointer))
-      .setRequiredRevision(encode(o.requiredRevision))
-      .build
+    codec.VersionBump(
+      objectPointer = Some(encode(o.objectPointer)),
+      requiredRevision = Some(encode(o.requiredRevision))
+    )
 
   def decode(m: codec.VersionBump): VersionBump =
-    VersionBump(decode(m.getObjectPointer),
-      decode(m.getRequiredRevision))
+    VersionBump(decode(m.objectPointer.get),
+      decode(m.requiredRevision.get))
 
 
   def encode(o: RevisionLock): codec.RevisionLock =
-    codec.RevisionLock.newBuilder()
-      .setObjectPointer(encode(o.objectPointer))
-      .setRequiredRevision(encode(o.requiredRevision))
-      .build
+    codec.RevisionLock(
+      objectPointer = Some(encode(o.objectPointer)),
+      requiredRevision = Some(encode(o.requiredRevision))
+    )
 
   def decode(m: codec.RevisionLock): RevisionLock =
-    RevisionLock(decode(m.getObjectPointer),
-      decode(m.getRequiredRevision))
+    RevisionLock(decode(m.objectPointer.get),
+      decode(m.requiredRevision.get))
 
 
   def encode(o: KeyValueUpdate.KeyRequirement): codec.KVReq =
-    val builder = codec.KVReq.newBuilder()
-    builder.setKey(ByteString.copyFrom(o.key.bytes))
+    val key = ByteString.copyFrom(o.key.bytes)
 
-    val req = o match
+    o match
       case r: KeyValueUpdate.KeyRevision =>
-        builder.setRevision(encode(r.revision))
-        codec.KeyRequirement.KEY_REQUIREMENT_KEY_REVISION
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_KEY_REVISION,
+          key = key,
+          revision = Some(encode(r.revision))
+        )
 
       case r: KeyValueUpdate.KeyObjectRevision =>
-        builder.setRevision(encode(r.revision))
-        codec.KeyRequirement.KEY_REQUIREMENT_KEY_OBJECT_REVISION
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_KEY_OBJECT_REVISION,
+          key = key,
+          revision = Some(encode(r.revision))
+        )
 
       case r: KeyValueUpdate.WithinRange =>
-        builder.setComparison(encodeKeyComparison(r.ordering))
-        codec.KeyRequirement.KEY_REQUIREMENT_WITHIN_RANGE
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_WITHIN_RANGE,
+          key = key,
+          comparison = encodeKeyComparison(r.ordering)
+        )
 
-      case _: KeyValueUpdate.Exists => codec.KeyRequirement.KEY_REQUIREMENT_EXISTS
-      case _: KeyValueUpdate.MayExist => codec.KeyRequirement.KEY_REQUIREMENT_MAY_EXIST
-      case _: KeyValueUpdate.DoesNotExist => codec.KeyRequirement.KEY_REQUIREMENT_DOES_NOT_EXIST
+      case _: KeyValueUpdate.Exists =>
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_EXISTS,
+          key = key
+        )
+
+      case _: KeyValueUpdate.MayExist =>
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_MAY_EXIST,
+          key = key
+        )
+
+      case _: KeyValueUpdate.DoesNotExist =>
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_DOES_NOT_EXIST,
+          key = key
+        )
 
       case r: KeyValueUpdate.TimestampEquals =>
-        builder.setTimestamp(r.timestamp.asLong)
-        codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_EQUALS
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_EQUALS,
+          key = key,
+          timestamp = r.timestamp.asLong
+        )
 
       case r: KeyValueUpdate.TimestampLessThan =>
-        builder.setTimestamp(r.timestamp.asLong)
-        codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_LESS_THAN
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_LESS_THAN,
+          key = key,
+          timestamp = r.timestamp.asLong
+        )
 
       case r: KeyValueUpdate.TimestampGreaterThan =>
-        builder.setTimestamp(r.timestamp.asLong)
-        codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_GREATER_THAN
-
-    builder.setRequirement(req)
-    builder.build
+        codec.KVReq(
+          requirement = codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_GREATER_THAN,
+          key = key,
+          timestamp = r.timestamp.asLong
+        )
 
   def decode(m: codec.KVReq): KeyValueUpdate.KeyRequirement =
-    val key = Key(m.getKey.toByteArray)
-    val timestamp = HLCTimestamp(m.getTimestamp)
+    val key = Key(m.key.toByteArray)
+    val timestamp = HLCTimestamp(m.timestamp)
 
-    m.getRequirement match
+    m.requirement match
       case codec.KeyRequirement.KEY_REQUIREMENT_EXISTS => KeyValueUpdate.Exists(key)
       case codec.KeyRequirement.KEY_REQUIREMENT_MAY_EXIST => KeyValueUpdate.MayExist(key)
       case codec.KeyRequirement.KEY_REQUIREMENT_DOES_NOT_EXIST => KeyValueUpdate.DoesNotExist(key)
@@ -266,57 +283,46 @@ object Codec extends Logging:
       case codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_LESS_THAN => KeyValueUpdate.TimestampLessThan(key, timestamp)
       case codec.KeyRequirement.KEY_REQUIREMENT_TIMESTAMP_GREATER_THAN => KeyValueUpdate.TimestampGreaterThan(key, timestamp)
       case codec.KeyRequirement.KEY_REQUIREMENT_KEY_REVISION =>
-        val rev = decode(m.getRevision)
+        val rev = decode(m.revision.get)
         KeyValueUpdate.KeyRevision(key, rev)
       case codec.KeyRequirement.KEY_REQUIREMENT_KEY_OBJECT_REVISION =>
-        val rev = decode(m.getRevision)
+        val rev = decode(m.revision.get)
         KeyValueUpdate.KeyObjectRevision(key, rev)
       case codec.KeyRequirement.KEY_REQUIREMENT_WITHIN_RANGE =>
-        val ord = decodeKeyComparison(m.getComparison)
+        val ord = decodeKeyComparison(m.comparison)
         KeyValueUpdate.WithinRange(key, ord)
-      case f => throw new EncodingError(f"Invalid KeyRequirement: $f")
+      case codec.KeyRequirement.Unrecognized(v) => throw new EncodingError(f"Invalid KeyRequirement: $v")
 
 
   def encode(o: KeyRevision): codec.KeyRevision =
-    codec.KeyRevision.newBuilder()
-      .setKey(ByteString.copyFrom(o.key.bytes))
-      .setRevision(encode(o.revision))
-      .build
+    codec.KeyRevision(
+      key = ByteString.copyFrom(o.key.bytes),
+      revision = Some(encode(o.revision))
+    )
 
   def decode(m: codec.KeyRevision): KeyRevision =
-    KeyRevision(Key(m.getKey.toByteArray), decode(m.getRevision))
+    KeyRevision(Key(m.key.toByteArray), decode(m.revision.get))
 
 
   def encode(o: KeyValueUpdate): codec.KeyValueUpdate =
-    val builder = codec.KeyValueUpdate.newBuilder()
-      .setObjectPointer(encode(o.objectPointer))
-
-    o.requiredRevision.foreach: rev =>
-      builder.setRequiredRevision(encode(rev))
-
-    o.contentLock.foreach: lck =>
-      lck.fullContents.foreach: kr =>
-        builder.addContentLock(encode(kr))
-
-    o.requirements.foreach: kr =>
-      builder.addRequirements(encode(kr))
-
-    builder.build
+    codec.KeyValueUpdate(
+      objectPointer = Some(encode(o.objectPointer)),
+      requiredRevision = o.requiredRevision.map(encode),
+      contentLock = o.contentLock.map(lck => lck.fullContents.map(encode)).getOrElse(Seq.empty),
+      requirements = o.requirements.map(encode)
+    )
 
   def decode(m: codec.KeyValueUpdate): KeyValueUpdate =
-    val objectPointer = decode(m.getObjectPointer).asInstanceOf[KeyValueObjectPointer]
+    val objectPointer = decode(m.objectPointer.get).asInstanceOf[KeyValueObjectPointer]
 
-    val requiredRevision = if m.hasRequiredRevision then
-      Some(decode(m.getRequiredRevision))
-    else
-      None
+    val requiredRevision = m.requiredRevision.map(decode)
 
-    val contentLock = if m.getContentLockCount == 0 then
+    val contentLock = if m.contentLock.isEmpty then
       None
     else
-      Some(KeyValueUpdate.FullContentLock(m.getContentLockList.asScala.map(decode).toList))
+      Some(KeyValueUpdate.FullContentLock(m.contentLock.map(decode).toList))
 
-    val requirements = m.getRequirementsList.asScala.map(decode).toList
+    val requirements = m.requirements.map(decode).toList
 
     KeyValueUpdate(objectPointer, requiredRevision, contentLock, requirements)
 
@@ -330,183 +336,174 @@ object Codec extends Logging:
     case codec.LocalTimeRequirementEnum.LOCAL_TIME_REQUIREMENT_ENUM_LESS_THAN => LocalTimeRequirement.Requirement.LessThan
     case codec.LocalTimeRequirementEnum.LOCAL_TIME_REQUIREMENT_ENUM_GREATER_THAN => LocalTimeRequirement.Requirement.GreaterThan
     case codec.LocalTimeRequirementEnum.LOCAL_TIME_REQUIREMENT_ENUM_EQUALS => LocalTimeRequirement.Requirement.Equals
-    case f => throw new EncodingError(f"Invalid LocalTimeRequirementEnum: $f")
+    case codec.LocalTimeRequirementEnum.Unrecognized(v) => throw new EncodingError(f"Invalid LocalTimeRequirementEnum: $v")
 
 
   def encode(o: LocalTimeRequirement): codec.LocalTimeRequirement =
-    codec.LocalTimeRequirement.newBuilder()
-      .setTimestamp(o.timestamp.asLong)
-      .setRequirement(encodeLocalTimeRequirementEnum(o.tsRequirement))
-      .build
+    codec.LocalTimeRequirement(
+      timestamp = o.timestamp.asLong,
+      requirement = encodeLocalTimeRequirementEnum(o.tsRequirement)
+    )
 
   def decode(m: codec.LocalTimeRequirement): LocalTimeRequirement =
-    LocalTimeRequirement(HLCTimestamp(m.getTimestamp), decodeLocalTimeRequirementEnum(m.getRequirement))
+    LocalTimeRequirement(HLCTimestamp(m.timestamp), decodeLocalTimeRequirementEnum(m.requirement))
 
 
   def encode(o: TransactionRequirement): codec.TransactionRequirement =
-    val builder = codec.TransactionRequirement.newBuilder()
     o match
-      case tr: DataUpdate => builder.setDataUpdate(encode(tr))
-      case tr: RefcountUpdate => builder.setRefcountUpdate(encode(tr))
-      case tr: VersionBump => builder.setVersionBump(encode(tr))
-      case tr: RevisionLock => builder.setRevisionLock(encode(tr))
-      case tr: KeyValueUpdate => builder.setKvUpdate(encode(tr))
-      case tr: LocalTimeRequirement => builder.setLocaltime(encode(tr))
-    builder.build
+      case tr: DataUpdate => codec.TransactionRequirement(dataUpdate = Some(encode(tr)))
+      case tr: RefcountUpdate => codec.TransactionRequirement(refcountUpdate = Some(encode(tr)))
+      case tr: VersionBump => codec.TransactionRequirement(versionBump = Some(encode(tr)))
+      case tr: RevisionLock => codec.TransactionRequirement(revisionLock = Some(encode(tr)))
+      case tr: KeyValueUpdate => codec.TransactionRequirement(kvUpdate = Some(encode(tr)))
+      case tr: LocalTimeRequirement => codec.TransactionRequirement(localtime = Some(encode(tr)))
 
   def decode(m: codec.TransactionRequirement): TransactionRequirement =
-    if m.hasDataUpdate then decode(m.getDataUpdate)
-    else if m.hasRefcountUpdate then decode(m.getRefcountUpdate)
-    else if m.hasVersionBump then decode(m.getVersionBump)
-    else if m.hasRevisionLock then decode(m.getRevisionLock)
-    else if m.hasKvUpdate then decode(m.getKvUpdate)
-    else if m.hasLocaltime then decode(m.getLocaltime)
-    else throw new EncodingError("Unknown Transaction Requirement")
+    m.dataUpdate.map(decode)
+      .orElse(m.refcountUpdate.map(decode))
+      .orElse(m.versionBump.map(decode))
+      .orElse(m.revisionLock.map(decode))
+      .orElse(m.kvUpdate.map(decode))
+      .orElse(m.localtime.map(decode))
+      .getOrElse(throw new EncodingError("Unknown Transaction Requirement"))
 
 
   def encode(o: SerializedFinalizationAction): codec.SerializedFinalizationAction =
-    codec.SerializedFinalizationAction.newBuilder()
-      .setTypeUuid(encodeUUID(o.typeId.uuid))
-      .setData(ByteString.copyFrom(o.data))
-      .build
+    codec.SerializedFinalizationAction(
+      typeUuid = Some(encodeUUID(o.typeId.uuid)),
+      data = ByteString.copyFrom(o.data)
+    )
 
   def decode(m: codec.SerializedFinalizationAction): SerializedFinalizationAction =
-    SerializedFinalizationAction(FinalizationActionId(decodeUUID(m.getTypeUuid)), m.getData.toByteArray)
+    SerializedFinalizationAction(FinalizationActionId(decodeUUID(m.typeUuid.get)), m.data.toByteArray)
 
 
   def encode(o: StoreId): codec.StoreId =
-    codec.StoreId.newBuilder()
-      .setStoragePoolUuid(encodeUUID(o.poolId.uuid))
-      .setStoragePoolIndex(o.poolIndex)
-      .build()
+    codec.StoreId(
+      storagePoolUuid = Some(encodeUUID(o.poolId.uuid)),
+      storagePoolIndex = o.poolIndex
+    )
 
   def decode(m: codec.StoreId): StoreId =
-    StoreId(PoolId(decodeUUID(m.getStoragePoolUuid)), m.getStoragePoolIndex.toByte)
+    StoreId(PoolId(decodeUUID(m.storagePoolUuid.get)), m.storagePoolIndex.toByte)
 
 
   def encode(o: TransactionDescription): codec.TransactionDescription =
-    val builder = codec.TransactionDescription.newBuilder()
+    codec.TransactionDescription(
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      startTimestamp = o.startTimestamp.asLong,
+      primaryObject = Some(encode(o.primaryObject)),
+      designatedLeaderUid = o.designatedLeaderUID,
+      requirements = o.requirements.map(encode),
+      finalizationActions = o.finalizationActions.map(encode),
+      originatingClient = o.originatingClient.map(c => encodeUUID(c.uuid)),
+      notifyOnResolution = o.notifyOnResolution.map(encode),
+      notes = o.notes,
+      poolIdas = o.poolIDAMap.map { (poolId, ida) =>
+        codec.PoolIDA(
+          poolId = Some(encodeUUID(poolId.uuid)),
+          ida = Some(encode(ida))
+        )
+      }.toSeq,
+      allocatingObjects = o.allocatingObjects.map(oid => encodeUUID(oid.uuid)).toSeq
+    )
 
-    builder.setTransactionUuid(encodeUUID(o.transactionId.uuid))
-    builder.setStartTimestamp(o.startTimestamp.asLong)
-    builder.setPrimaryObject(encode(o.primaryObject))
-    builder.setDesignatedLeaderUid(o.designatedLeaderUID)
-    o.requirements.foreach: tr =>
-      builder.addRequirements(encode(tr))
-    o.finalizationActions.foreach: sfa =>
-      builder.addFinalizationActions(encode(sfa))
-    o.originatingClient.foreach: clientId =>
-      builder.setOriginatingClient(encodeUUID(clientId.uuid))
-    o.notifyOnResolution.foreach: storeId =>
-      builder.addNotifyOnResolution(encode(storeId))
-    o.notes.foreach: s =>
-      builder.addNotes(s)
-    o.poolIDAMap.foreach: (poolId, ida) =>
-      builder.addPoolIdas(
-        codec.PoolIDA.newBuilder()
-          .setPoolId(encodeUUID(poolId.uuid))
-          .setIda(encode(ida))
-          .build
-      )
-    o.allocatingObjects.foreach: oid =>
-      builder.addAllocatingObjects(encodeUUID(oid.uuid))
-
-    builder.build
   def decode(m: codec.TransactionDescription): TransactionDescription =
-    val txuuid = TransactionId(decodeUUID(m.getTransactionUuid))
-    val startTs = HLCTimestamp(m.getStartTimestamp)
-    val primaryObj = decode(m.getPrimaryObject)
-    val designatedLeader = m.getDesignatedLeaderUid.toByte
-    val requirements = m.getRequirementsList.asScala.map(decode).toList
-    val serializedFas = m.getFinalizationActionsList.asScala.map(decode).toList
-    val origClient = if m.hasOriginatingClient then Some(ClientId(decodeUUID(m.getOriginatingClient))) else None
-    val notifyOnRes = m.getNotifyOnResolutionList.asScala.map(decode).toList
-    val notes = m.getNotesList.asScala.toList
-    val poolIDAMap = m.getPoolIdasList.asScala.map: pida =>
-      PoolId(decodeUUID(pida.getPoolId)) -> decode(pida.getIda)
-    .toMap
+    val txuuid = TransactionId(decodeUUID(m.transactionUuid.get))
+    val startTs = HLCTimestamp(m.startTimestamp)
+    val primaryObj = decode(m.primaryObject.get)
+    val designatedLeader = m.designatedLeaderUid.toByte
+    val requirements = m.requirements.map(decode).toList
+    val serializedFas = m.finalizationActions.map(decode).toList
+    val origClient = m.originatingClient.map(c => ClientId(decodeUUID(c)))
+    val notifyOnRes = m.notifyOnResolution.map(decode).toList
+    val notes = m.notes.toList
+    val poolIDAMap = m.poolIdas.map { pida =>
+      PoolId(decodeUUID(pida.poolId.get)) -> decode(pida.ida.get)
+    }.toMap
     val primaryObjectIDA = poolIDAMap(primaryObj.poolId)
-    val allocatingObjects = m.getAllocatingObjectsList.asScala.map(u => ObjectId(decodeUUID(u))).toSet
+    val allocatingObjects = m.allocatingObjects.map(u => ObjectId(decodeUUID(u))).toSet
 
     TransactionDescription(txuuid, startTs, primaryObj, designatedLeader, requirements,
       serializedFas, origClient, notifyOnRes, notes, primaryObjectIDA, poolIDAMap, allocatingObjects)
 
 
   def encode(o: ProposalId): codec.ProposalId =
-    codec.ProposalId.newBuilder()
-      .setNumber(o.number)
-      .setUid(o.peer)
-      .build
+    codec.ProposalId(
+      number = o.number,
+      uid = o.peer
+    )
 
   def decode(m: codec.ProposalId): ProposalId =
-    ProposalId(m.getNumber, m.getUid.toByte)
+    ProposalId(m.number, m.uid.toByte)
 
 
   def encode(o: TxPrepare): codec.TxPrepare =
-    codec.TxPrepare.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTxd(encode(o.txd))
-      .setProposalId(encode(o.proposalId))
-      .build
+    codec.TxPrepare(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      txd = Some(encode(o.txd)),
+      proposalId = Some(encode(o.proposalId))
+    )
 
   def decode(m: codec.TxPrepare,
              objectUpdates: List[ObjectUpdate],
              preTxRebuilds: List[PreTransactionOpportunisticRebuild]): TxPrepare =
-    TxPrepare(decode(m.getTo), decode(m.getFrom), decode(m.getTxd), decode(m.getProposalId),
+    TxPrepare(decode(m.to.get), decode(m.from.get), decode(m.txd.get), decode(m.proposalId.get),
       objectUpdates, preTxRebuilds)
 
 
   def encode(o: TxPrepareResponse): codec.TxPrepareResponse =
-    val builder = codec.TxPrepareResponse.newBuilder()
-
-    builder.setTo(encode(o.to))
-    builder.setFrom(encode(o.from))
-    builder.setTransactionUuid(encodeUUID(o.transactionId.uuid))
-    builder.setProposalId(encode(o.proposalId))
-    val prt = o.response match
+    val (responseType, promisedId, lastAcceptedId, lastAcceptedValue) = o.response match
       case Left(nack) =>
-        builder.setPromisedId(encode(nack.promisedId))
-        codec.TxPrepareResponseType.TX_PREPARE_RESPONSE_TYPE_NACK
+        (codec.TxPrepareResponseType.TX_PREPARE_RESPONSE_TYPE_NACK,
+          Some(encode(nack.promisedId)), None, false)
       case Right(promise) =>
-        promise.lastAccepted.foreach: (pid, value) =>
-          builder.setLastAcceptedId(encode(pid))
-          builder.setLastAcceptedValue(value)
-        codec.TxPrepareResponseType.TX_PREPARE_RESPONSE_TYPE_PROMISE
-    builder.setResponseType(prt)
-    builder.setDisposition(encodeTransactionDisposition(o.disposition))
+        promise.lastAccepted match
+          case Some((pid, value)) =>
+            (codec.TxPrepareResponseType.TX_PREPARE_RESPONSE_TYPE_PROMISE,
+              None, Some(encode(pid)), value)
+          case None =>
+            (codec.TxPrepareResponseType.TX_PREPARE_RESPONSE_TYPE_PROMISE,
+              None, None, false)
 
     val arr = new Array[Byte](o.collisions.size * 16)
-
     val bb = ByteBuffer.wrap(arr)
     bb.order(ByteOrder.BIG_ENDIAN)
     o.collisions.foreach: id =>
       bb.putLong(id.uuid.getMostSignificantBits)
       bb.putLong(id.uuid.getLeastSignificantBits)
 
-    builder.setTransactionCollisions(ByteString.copyFrom(arr))
-
-    builder.build
+    codec.TxPrepareResponse(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      responseType = responseType,
+      proposalId = Some(encode(o.proposalId)),
+      promisedId = promisedId,
+      lastAcceptedId = lastAcceptedId,
+      lastAcceptedValue = lastAcceptedValue,
+      disposition = encodeTransactionDisposition(o.disposition),
+      transactionCollisions = ByteString.copyFrom(arr)
+    )
 
   def decode(m: codec.TxPrepareResponse): TxPrepareResponse =
-    val to = decode(m.getTo)
-    val from = decode(m.getFrom)
-    val txid = TransactionId(decodeUUID(m.getTransactionUuid))
-    val response = m.getResponseType match
+    val to = decode(m.to.get)
+    val from = decode(m.from.get)
+    val txid = TransactionId(decodeUUID(m.transactionUuid.get))
+    val response = m.responseType match
       case codec.TxPrepareResponseType.TX_PREPARE_RESPONSE_TYPE_NACK =>
-        Left(TxPrepareResponse.Nack(decode(m.getPromisedId)))
+        Left(TxPrepareResponse.Nack(decode(m.promisedId.get)))
       case codec.TxPrepareResponseType.TX_PREPARE_RESPONSE_TYPE_PROMISE =>
-        val la = if m.hasLastAcceptedId then
-          Some((decode(m.getLastAcceptedId), m.getLastAcceptedValue))
-        else
-          None
+        val la = m.lastAcceptedId.map(pid => (decode(pid), m.lastAcceptedValue))
         Right(TxPrepareResponse.Promise(la))
-      case f => throw new EncodingError("Unknown Prepare Response Type")
-    val proposalId = decode(m.getProposalId)
-    val disposition = decodeTransactionDisposition(m.getDisposition)
+      case codec.TxPrepareResponseType.Unrecognized(_) =>
+        throw new EncodingError("Unknown Prepare Response Type")
+    val proposalId = decode(m.proposalId.get)
+    val disposition = decodeTransactionDisposition(m.disposition)
     var collisions = List[TransactionId]()
 
-    val bb = m.getTransactionCollisions.asReadOnlyByteBuffer()
+    val bb = m.transactionCollisions.asReadOnlyByteBuffer()
     bb.order(ByteOrder.BIG_ENDIAN)
     while (bb.remaining() != 0) {
       val msb = bb.getLong()
@@ -518,92 +515,89 @@ object Codec extends Logging:
 
 
   def encode(o: TxAccept): codec.TxAccept =
-    codec.TxAccept.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setProposalId(encode(o.proposalId))
-      .setValue(o.value)
-      .build
+    codec.TxAccept(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      proposalId = Some(encode(o.proposalId)),
+      value = o.value
+    )
 
   def decode(m: codec.TxAccept): TxAccept =
-    TxAccept(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)),
-      decode(m.getProposalId), m.getValue)
+    TxAccept(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
+      decode(m.proposalId.get), m.value)
 
 
   def encode(o: TxAcceptResponse): codec.TxAcceptResponse =
-    val builder = codec.TxAcceptResponse.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setProposalId(encode(o.proposalId))
+    val (isNack, promisedId, value) = o.response match
+      case Left(nack) =>
+        (true, Some(encode(nack.promisedId)), false)
+      case Right(accepted) =>
+        (false, None, accepted.value)
 
-      o.response match
-        case Left(nack) =>
-          builder.setIsNack(true)
-          builder.setPromisedId(encode(nack.promisedId))
-        case Right(accepted) =>
-          builder.setValue(accepted.value)
-
-      builder.build
+    codec.TxAcceptResponse(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      proposalId = Some(encode(o.proposalId)),
+      isNack = isNack,
+      promisedId = promisedId,
+      value = value
+    )
 
   def decode(m: codec.TxAcceptResponse): TxAcceptResponse =
-    val response = if m.getIsNack then
-      Left(TxAcceptResponse.Nack(decode(m.getPromisedId)))
+    val response = if m.isNack then
+      Left(TxAcceptResponse.Nack(decode(m.promisedId.get)))
     else
-      Right(TxAcceptResponse.Accepted(m.getValue))
+      Right(TxAcceptResponse.Accepted(m.value))
 
-    TxAcceptResponse(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)),
-      decode(m.getProposalId), response)
+    TxAcceptResponse(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
+      decode(m.proposalId.get), response)
 
 
   def encode(o: TxResolved): codec.TxResolved =
-    codec.TxResolved.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setCommitted(o.committed)
-      .build
+    codec.TxResolved(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      committed = o.committed
+    )
 
   def decode(m: codec.TxResolved): TxResolved =
-    TxResolved(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)),
-      m.getCommitted)
+    TxResolved(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
+      m.committed)
 
 
   def encode(o: TxUnknownStore): codec.TxUnknownStore =
-    codec.TxUnknownStore.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .build
+    codec.TxUnknownStore(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid))
+    )
 
   def decode(m: codec.TxUnknownStore): TxUnknownStore =
-    TxUnknownStore(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)))
+    TxUnknownStore(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)))
 
 
   def encode(o: TxCommitted): codec.TxCommitted =
-    val builder = codec.TxCommitted.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-
     val arr = new Array[Byte](o.objectCommitErrors.size * 16)
-
     val bb = ByteBuffer.wrap(arr)
     bb.order(ByteOrder.BIG_ENDIAN)
     o.objectCommitErrors.foreach: id =>
       bb.putLong(id.uuid.getMostSignificantBits)
       bb.putLong(id.uuid.getLeastSignificantBits)
 
-    builder.setObjectCommitErrors(ByteString.copyFrom(arr))
-
-    builder.build
+    codec.TxCommitted(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      objectCommitErrors = ByteString.copyFrom(arr)
+    )
 
   def decode(m: codec.TxCommitted): TxCommitted =
-
     var commitErrors = List[ObjectId]()
 
-    val bb = m.getObjectCommitErrors.asReadOnlyByteBuffer()
+    val bb = m.objectCommitErrors.asReadOnlyByteBuffer()
     bb.order(ByteOrder.BIG_ENDIAN)
     while (bb.remaining() != 0) {
       val msb = bb.getLong()
@@ -611,73 +605,70 @@ object Codec extends Logging:
       commitErrors = ObjectId(new UUID(msb, lsb)) :: commitErrors
     }
 
-    TxCommitted(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)),
+    TxCommitted(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
       commitErrors)
 
 
   def encode(o: TxFinalized): codec.TxFinalized =
-    codec.TxFinalized.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setCommitted(o.committed)
-      .build
+    codec.TxFinalized(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      committed = o.committed
+    )
 
   def decode(m: codec.TxFinalized): TxFinalized =
-    TxFinalized(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)),
-      m.getCommitted)
+    TxFinalized(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
+      m.committed)
 
 
   def encode(o: TxHeartbeat): codec.TxHeartbeat =
-    codec.TxHeartbeat.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .build
+    codec.TxHeartbeat(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid))
+    )
 
   def decode(m: codec.TxHeartbeat): TxHeartbeat =
-    TxHeartbeat(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)))
+    TxHeartbeat(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)))
 
 
   def encode(o: TxStatusRequest): codec.TxStatusRequest =
-    codec.TxStatusRequest.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setRequestUuid(encodeUUID(o.requestUUID))
-      .build
+    codec.TxStatusRequest(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      requestUuid = Some(encodeUUID(o.requestUUID))
+    )
 
   def decode(m: codec.TxStatusRequest): TxStatusRequest =
-    TxStatusRequest(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)),
-      decodeUUID(m.getRequestUuid))
+    TxStatusRequest(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
+      decodeUUID(m.requestUuid.get))
 
 
   def encode(o: TxStatusResponse): codec.TxStatusResponse =
-    val builder = codec.TxStatusResponse.newBuilder()
-      .setTo(encode(o.to))
-      .setFrom(encode(o.from))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setRequestUuid(encodeUUID(o.requestUUID))
+    val (haveStatus, isFinalized, status) = o.status match
+      case None => (false, false, codec.TransactionStatus.TRANSACTION_STATUS_UNRESOLVED)
+      case Some(stat) => (true, stat.finalized, encodeTransactionStatus(stat.status))
 
-    val status = o.status match
-      case None =>
-        builder.setHaveStatus(false)
-
-      case Some(stat) =>
-        builder.setHaveStatus(true)
-        builder.setIsFinalized(stat.finalized)
-        builder.setStatus(encodeTransactionStatus(stat.status))
-
-    builder.build
+    codec.TxStatusResponse(
+      to = Some(encode(o.to)),
+      from = Some(encode(o.from)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      requestUuid = Some(encodeUUID(o.requestUUID)),
+      haveStatus = haveStatus,
+      isFinalized = isFinalized,
+      status = status
+    )
 
   def decode(m: codec.TxStatusResponse): TxStatusResponse =
-    val status = if m.getHaveStatus then
-      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.getStatus), m.getIsFinalized))
+    val status = if m.haveStatus then
+      Some(TxStatusResponse.TxStatus(decodeTransactionStatus(m.status), m.isFinalized))
     else
       None
 
-    TxStatusResponse(decode(m.getTo), decode(m.getFrom), TransactionId(decodeUUID(m.getTransactionUuid)),
-      decodeUUID(m.getRequestUuid), status)
+    TxStatusResponse(decode(m.to.get), decode(m.from.get), TransactionId(decodeUUID(m.transactionUuid.get)),
+      decodeUUID(m.requestUuid.get), status)
 
 
   def encodeReadError(o: ReadError.Value): codec.ObjectReadError = o match
@@ -691,87 +682,78 @@ object Codec extends Logging:
     case codec.ObjectReadError.OBJECT_READ_ERROR_OBJECT_NOT_FOUND => ReadError.ObjectNotFound
     case codec.ObjectReadError.OBJECT_READ_ERROR_STORE_NOT_FOUND => ReadError.StoreNotFound
     case codec.ObjectReadError.OBJECT_READ_ERROR_CORRUPTED_OBJECT => ReadError.CorruptedObject
-    case f => throw new EncodingError(f"Invalid ObjectReadError: $f")
+    case codec.ObjectReadError.Unrecognized(v) => throw new EncodingError(f"Invalid ObjectReadError: $v")
 
 
   def encode(o: Read): codec.Read =
-    val builder = codec.Read.newBuilder()
-
-    builder.setToStore(encode(o.toStore))
-    builder.setFromClient(encodeUUID(o.fromClient.uuid))
-    builder.setReadUuid(encodeUUID(o.readUUID))
-    builder.setObjectPointer(encode(o.objectPointer))
-
-    val readType = o.readType match
+    val (readType, key, min, max, comparison, offset, length) = o.readType match
       case _: MetadataOnly =>
-        codec.ReadType.READ_TYPE_METADATA_ONLY
+        (codec.ReadType.READ_TYPE_METADATA_ONLY, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
+          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, 0, 0)
       case _: FullObject =>
-        codec.ReadType.READ_TYPE_FULL_OBJECT
+        (codec.ReadType.READ_TYPE_FULL_OBJECT, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
+          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, 0, 0)
       case rt: ByteRange =>
-        builder.setOffset(rt.offset)
-        builder.setLength(rt.length)
-        codec.ReadType.READ_TYPE_BYTE_RANGE
+        (codec.ReadType.READ_TYPE_BYTE_RANGE, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
+          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, rt.offset, rt.length)
       case rt: SingleKey =>
-        builder.setKey(ByteString.copyFrom(rt.key.bytes))
-        builder.setComparison(encodeKeyComparison(rt.ordering))
-        codec.ReadType.READ_TYPE_SINGLE_KEY
+        (codec.ReadType.READ_TYPE_SINGLE_KEY, ByteString.copyFrom(rt.key.bytes), ByteString.EMPTY, ByteString.EMPTY,
+          encodeKeyComparison(rt.ordering), 0, 0)
       case rt: LargestKeyLessThan =>
-        builder.setKey(ByteString.copyFrom(rt.key.bytes))
-        builder.setComparison(encodeKeyComparison(rt.ordering))
-        codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN
+        (codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN, ByteString.copyFrom(rt.key.bytes), ByteString.EMPTY, ByteString.EMPTY,
+          encodeKeyComparison(rt.ordering), 0, 0)
       case rt: LargestKeyLessThanOrEqualTo =>
-        builder.setKey(ByteString.copyFrom(rt.key.bytes))
-        builder.setComparison(encodeKeyComparison(rt.ordering))
-        codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO
+        (codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO, ByteString.copyFrom(rt.key.bytes), ByteString.EMPTY, ByteString.EMPTY,
+          encodeKeyComparison(rt.ordering), 0, 0)
       case rt: KeyRange =>
-        builder.setMin(ByteString.copyFrom(rt.minimum.bytes))
-        builder.setMax(ByteString.copyFrom(rt.maximum.bytes))
-        builder.setComparison(encodeKeyComparison(rt.ordering))
-        codec.ReadType.READ_TYPE_KEY_RANGE
+        (codec.ReadType.READ_TYPE_KEY_RANGE, ByteString.EMPTY, ByteString.copyFrom(rt.minimum.bytes), ByteString.copyFrom(rt.maximum.bytes),
+          encodeKeyComparison(rt.ordering), 0, 0)
 
-      builder.setReadType(readType)
-
-    builder.build
+    codec.Read(
+      toStore = Some(encode(o.toStore)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      readUuid = Some(encodeUUID(o.readUUID)),
+      objectPointer = Some(encode(o.objectPointer)),
+      readType = readType,
+      key = key,
+      min = min,
+      max = max,
+      comparison = comparison,
+      offset = offset,
+      length = length
+    )
 
   def decode(m: codec.Read): Read =
-    val toStore = decode(m.getToStore)
-    val from = ClientId(decodeUUID(m.getFromClient))
-    val readUuid = decodeUUID(m.getReadUuid)
-    val objPtr = decode(m.getObjectPointer)
-    val readType = m.getReadType match
+    val toStore = decode(m.toStore.get)
+    val from = ClientId(decodeUUID(m.fromClient.get))
+    val readUuid = decodeUUID(m.readUuid.get)
+    val objPtr = decode(m.objectPointer.get)
+    val readType = m.readType match
       case codec.ReadType.READ_TYPE_METADATA_ONLY => MetadataOnly()
       case codec.ReadType.READ_TYPE_FULL_OBJECT => FullObject()
-      case codec.ReadType.READ_TYPE_BYTE_RANGE => ByteRange(m.getOffset, m.getLength)
-      case codec.ReadType.READ_TYPE_SINGLE_KEY => SingleKey(Key(m.getKey.toByteArray), decodeKeyComparison(m.getComparison))
-      case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN => LargestKeyLessThan(Key(m.getKey.toByteArray), decodeKeyComparison(m.getComparison))
-      case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO => LargestKeyLessThanOrEqualTo(Key(m.getKey.toByteArray), decodeKeyComparison(m.getComparison))
-      case codec.ReadType.READ_TYPE_KEY_RANGE => KeyRange(Key(m.getMin.toByteArray), Key(m.getMax.toByteArray), decodeKeyComparison(m.getComparison))
-      case f => throw new EncodingError(f"Invalid Read Type: $f")
+      case codec.ReadType.READ_TYPE_BYTE_RANGE => ByteRange(m.offset, m.length)
+      case codec.ReadType.READ_TYPE_SINGLE_KEY => SingleKey(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
+      case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN => LargestKeyLessThan(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
+      case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO => LargestKeyLessThanOrEqualTo(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
+      case codec.ReadType.READ_TYPE_KEY_RANGE => KeyRange(Key(m.min.toByteArray), Key(m.max.toByteArray), decodeKeyComparison(m.comparison))
+      case codec.ReadType.Unrecognized(v) => throw new EncodingError(f"Invalid Read Type: $v")
 
     Read(toStore, from, readUuid, objPtr, readType)
 
 
   def encode(o: ReadResponse): codec.ReadResponse =
-    val builder = codec.ReadResponse.newBuilder()
-    builder.setFromStore(encode(o.fromStore))
-    builder.setReadUuid(encodeUUID(o.readUUID))
-    builder.setReadTime(o.readTime.asLong)
-
     o.result match
       case Left(err) =>
-        builder.setHaveData(false)
-        builder.setReadError(encodeReadError(err))
+        codec.ReadResponse(
+          fromStore = Some(encode(o.fromStore)),
+          toClient = Some(encodeUUID(o.toClient.uuid)),
+          readUuid = Some(encodeUUID(o.readUUID)),
+          readTime = o.readTime.asLong,
+          haveData = false,
+          readError = encodeReadError(err)
+        )
 
       case Right(r) =>
-        builder.setHaveData(true)
-        builder.setRevision(encode(r.revision))
-        builder.setRefcount(encode(r.refcount))
-        builder.setSizeOnStore(r.sizeOnStore)
-        builder.setTimestamp(r.timestamp.asLong)
-
-        r.objectData.foreach: data =>
-          builder.setObjectData(ByteString.copyFrom(data.asReadOnlyBuffer()))
-
         val arr = new Array[Byte](r.lockedWriteTransactions.size * 16)
         val bb = ByteBuffer.wrap(arr)
         bb.order(ByteOrder.BIG_ENDIAN)
@@ -779,30 +761,40 @@ object Codec extends Logging:
           bb.putLong(id.uuid.getMostSignificantBits)
           bb.putLong(id.uuid.getLeastSignificantBits)
 
-        builder.setLockedWriteTransactions(ByteString.copyFrom(arr))
-
-    builder.build
+        codec.ReadResponse(
+          fromStore = Some(encode(o.fromStore)),
+          toClient = Some(encodeUUID(o.toClient.uuid)),
+          readUuid = Some(encodeUUID(o.readUUID)),
+          readTime = o.readTime.asLong,
+          haveData = true,
+          revision = Some(encode(r.revision)),
+          refcount = Some(encode(r.refcount)),
+          sizeOnStore = r.sizeOnStore,
+          timestamp = r.timestamp.asLong,
+          objectData = r.objectData.map(data => ByteString.copyFrom(data.asReadOnlyBuffer())).getOrElse(ByteString.EMPTY),
+          lockedWriteTransactions = ByteString.copyFrom(arr)
+        )
 
   def decode(m: codec.ReadResponse): ReadResponse =
-    val fromStore = decode(m.getFromStore)
-    val toClient = ClientId(decodeUUID(m.getToClient))
-    val readUuid = decodeUUID(m.getReadUuid)
-    val readTime = HLCTimestamp(m.getReadTime)
-    val result = if ! m.getHaveData then
-      Left(decodeReadError(m.getReadError))
+    val fromStore = decode(m.fromStore.get)
+    val toClient = ClientId(decodeUUID(m.toClient.get))
+    val readUuid = decodeUUID(m.readUuid.get)
+    val readTime = HLCTimestamp(m.readTime)
+    val result = if ! m.haveData then
+      Left(decodeReadError(m.readError))
     else
-      val revision = decode(m.getRevision)
-      val refcount = decode(m.getRefcount)
-      val timestamp = HLCTimestamp(m.getTimestamp)
-      val sizeOnStore = m.getSizeOnStore
-      val data = if m.getObjectData.size == 0 then
+      val revision = decode(m.revision.get)
+      val refcount = decode(m.refcount.get)
+      val timestamp = HLCTimestamp(m.timestamp)
+      val sizeOnStore = m.sizeOnStore
+      val data = if m.objectData.size == 0 then
         None
       else
-        Some(DataBuffer(m.getObjectData.toByteArray))
+        Some(DataBuffer(m.objectData.toByteArray))
 
       var lockedTx = List[TransactionId]()
 
-      val bb = m.getLockedWriteTransactions.asReadOnlyByteBuffer()
+      val bb = m.lockedWriteTransactions.asReadOnlyByteBuffer()
       bb.order(ByteOrder.BIG_ENDIAN)
       while (bb.remaining() != 0) {
         val msb = bb.getLong()
@@ -816,224 +808,204 @@ object Codec extends Logging:
 
 
   def encode(o: OpportunisticRebuild): codec.OpportunisticRebuild =
-    codec.OpportunisticRebuild.newBuilder()
-      .setToStore(encode(o.toStore))
-      .setFromClient(encodeUUID(o.fromClient.uuid))
-      .setPointer(encode(o.pointer))
-      .setRevision(encode(o.revision))
-      .setRefcount(encode(o.refcount))
-      .setTimestamp(o.timestamp.asLong)
-      .setData(ByteString.copyFrom(o.data.asReadOnlyBuffer()))
-      .build
+    codec.OpportunisticRebuild(
+      toStore = Some(encode(o.toStore)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      pointer = Some(encode(o.pointer)),
+      revision = Some(encode(o.revision)),
+      refcount = Some(encode(o.refcount)),
+      timestamp = o.timestamp.asLong,
+      data = ByteString.copyFrom(o.data.asReadOnlyBuffer())
+    )
 
   def decode(m: codec.OpportunisticRebuild): OpportunisticRebuild =
-    val toStore = decode(m.getToStore)
-    val fromClient = ClientId(decodeUUID(m.getFromClient))
-    val pointer = decode(m.getPointer)
-    val revision = decode(m.getRevision)
-    val refcount = decode(m.getRefcount)
-    val timestamp = HLCTimestamp(m.getTimestamp)
-    val data = DataBuffer(m.getData.toByteArray)
+    val toStore = decode(m.toStore.get)
+    val fromClient = ClientId(decodeUUID(m.fromClient.get))
+    val pointer = decode(m.pointer.get)
+    val revision = decode(m.revision.get)
+    val refcount = decode(m.refcount.get)
+    val timestamp = HLCTimestamp(m.timestamp)
+    val data = DataBuffer(m.data.toByteArray)
     OpportunisticRebuild(toStore, fromClient, pointer, revision, refcount, timestamp, data)
 
 
   def encode(o: TransactionCompletionQuery): codec.TransactionCompletionQuery =
-    codec.TransactionCompletionQuery.newBuilder()
-      .setToStore(encode(o.toStore))
-      .setFromClient(encodeUUID(o.fromClient.uuid))
-      .setQueryUuid(encodeUUID(o.queryUUID))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .build
+    codec.TransactionCompletionQuery(
+      toStore = Some(encode(o.toStore)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      queryUuid = Some(encodeUUID(o.queryUUID)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid))
+    )
 
   def decode(m: codec.TransactionCompletionQuery): TransactionCompletionQuery =
-    val toStore = decode(m.getToStore)
-    val fromClient = ClientId(decodeUUID(m.getFromClient))
-    val queryUuid = decodeUUID(m.getQueryUuid)
-    val txid = TransactionId(decodeUUID(m.getTransactionUuid))
+    val toStore = decode(m.toStore.get)
+    val fromClient = ClientId(decodeUUID(m.fromClient.get))
+    val queryUuid = decodeUUID(m.queryUuid.get)
+    val txid = TransactionId(decodeUUID(m.transactionUuid.get))
     TransactionCompletionQuery(toStore, fromClient, queryUuid, txid)
 
 
   def encode(o: TransactionCompletionResponse): codec.TransactionCompletionResponse =
-    codec.TransactionCompletionResponse.newBuilder()
-      .setToClient(encodeUUID(o.toClient.uuid))
-      .setFromStore(encode(o.fromStore))
-      .setQueryUuid(encodeUUID(o.queryUUID))
-      .setIsComplete(o.isComplete)
-      .build
+    codec.TransactionCompletionResponse(
+      toClient = Some(encodeUUID(o.toClient.uuid)),
+      fromStore = Some(encode(o.fromStore)),
+      queryUuid = Some(encodeUUID(o.queryUUID)),
+      isComplete = o.isComplete
+    )
 
   def decode(m: codec.TransactionCompletionResponse): TransactionCompletionResponse =
-    val fromStore = decode(m.getFromStore)
-    val toClient = ClientId(decodeUUID(m.getToClient))
-    val queryUuid = decodeUUID(m.getQueryUuid)
-    val isComplete = m.getIsComplete
+    val fromStore = decode(m.fromStore.get)
+    val toClient = ClientId(decodeUUID(m.toClient.get))
+    val queryUuid = decodeUUID(m.queryUuid.get)
+    val isComplete = m.isComplete
     TransactionCompletionResponse(toClient, fromStore, queryUuid, isComplete)
 
 
   def encode(o: TransactionResolved): codec.TransactionResolved =
-    codec.TransactionResolved.newBuilder()
-      .setToClient(encodeUUID(o.toClient.uuid))
-      .setFromStore(encode(o.fromStore))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setCommitted(o.committed)
-      .build
+    codec.TransactionResolved(
+      toClient = Some(encodeUUID(o.toClient.uuid)),
+      fromStore = Some(encode(o.fromStore)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      committed = o.committed
+    )
 
   def decode(m: codec.TransactionResolved): TransactionResolved =
-    val fromStore = decode(m.getFromStore)
-    val toClient = ClientId(decodeUUID(m.getToClient))
-    val transactionId = TransactionId(decodeUUID(m.getTransactionUuid))
-    val committed = m.getCommitted
+    val fromStore = decode(m.fromStore.get)
+    val toClient = ClientId(decodeUUID(m.toClient.get))
+    val transactionId = TransactionId(decodeUUID(m.transactionUuid.get))
+    val committed = m.committed
     TransactionResolved(toClient, fromStore, transactionId, committed)
 
 
   def encode(o: TransactionFinalized): codec.TransactionFinalized =
-    codec.TransactionFinalized.newBuilder()
-      .setToClient(encodeUUID(o.toClient.uuid))
-      .setFromStore(encode(o.fromStore))
-      .setTransactionUuid(encodeUUID(o.transactionId.uuid))
-      .setCommitted(o.committed)
-      .build
+    codec.TransactionFinalized(
+      toClient = Some(encodeUUID(o.toClient.uuid)),
+      fromStore = Some(encode(o.fromStore)),
+      transactionUuid = Some(encodeUUID(o.transactionId.uuid)),
+      committed = o.committed
+    )
 
   def decode(m: codec.TransactionFinalized): TransactionFinalized =
-    val fromStore = decode(m.getFromStore)
-    val toClient = ClientId(decodeUUID(m.getToClient))
-    val transactionId = TransactionId(decodeUUID(m.getTransactionUuid))
-    val committed = m.getCommitted
+    val fromStore = decode(m.fromStore.get)
+    val toClient = ClientId(decodeUUID(m.toClient.get))
+    val transactionId = TransactionId(decodeUUID(m.transactionUuid.get))
+    val committed = m.committed
     TransactionFinalized(toClient, fromStore, transactionId, committed)
 
 
   def encode(o: HostHeartbeat): codec.HostHeartbeat =
-    codec.HostHeartbeat.newBuilder()
-      .setFromHostId(encodeUUID(o.hostId.uuid))
-      .build
+    codec.HostHeartbeat(fromHostId = Some(encodeUUID(o.hostId.uuid)))
 
   def decode(m: codec.HostHeartbeat): HostHeartbeat =
-    HostHeartbeat(HostId(decodeUUID(m.getFromHostId)))
+    HostHeartbeat(HostId(decodeUUID(m.fromHostId.get)))
 
 
   def encode(o: StartStoreTransfer): codec.StartStoreTransfer =
-    codec.StartStoreTransfer.newBuilder()
-      .setToHost(encodeUUID(o.toHost.uuid))
-      .setFromClient(encodeUUID(o.fromClient.uuid))
-      .setFromDevice(encode(o.fromDevice))
-      .setStoreId(encode(o.storeId))
-      .setTimestamp(o.timestamp.asLong)
-      .setTransferUUID(encodeUUID(o.transferUUID))
-      .build
+    codec.StartStoreTransfer(
+      toHost = Some(encodeUUID(o.toHost.uuid)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      fromDevice = Some(encode(o.fromDevice)),
+      storeId = Some(encode(o.storeId)),
+      timestamp = o.timestamp.asLong,
+      transferUUID = Some(encodeUUID(o.transferUUID))
+    )
 
   def decode(m: codec.StartStoreTransfer): StartStoreTransfer =
-    val toHost = HostId(decodeUUID(m.getToHost))
-    val fromClient = ClientId(decodeUUID(m.getFromClient))
-    val fromDevice = decode(m.getFromDevice)
-    val storeId = decode(m.getStoreId)
-    val timestamp = HLCTimestamp(m.getTimestamp)
-    val transferUUID = decodeUUID(m.getTransferUUID)
+    val toHost = HostId(decodeUUID(m.toHost.get))
+    val fromClient = ClientId(decodeUUID(m.fromClient.get))
+    val fromDevice = decode(m.fromDevice.get)
+    val storeId = decode(m.storeId.get)
+    val timestamp = HLCTimestamp(m.timestamp)
+    val transferUUID = decodeUUID(m.transferUUID.get)
     StartStoreTransfer(toHost, fromClient, fromDevice, storeId, timestamp, transferUUID)
 
 
   def encode(o: StoreTransferData): codec.StoreTransferData =
-    codec.StoreTransferData.newBuilder()
-      .setToHost(encodeUUID(o.toHost.uuid))
-      .setFromClient(encodeUUID(o.fromClient.uuid))
-      .setTransferUUID(encodeUUID(o.transferUUID))
-      .setData(ByteString.copyFrom(o.data.asReadOnlyBuffer()))
-      .build
+    codec.StoreTransferData(
+      toHost = Some(encodeUUID(o.toHost.uuid)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      transferUUID = Some(encodeUUID(o.transferUUID)),
+      data = ByteString.copyFrom(o.data.asReadOnlyBuffer())
+    )
 
   def decode(m: codec.StoreTransferData): StoreTransferData =
-    val toHost = HostId(decodeUUID(m.getToHost))
-    val fromClient = ClientId(decodeUUID(m.getFromClient))
-    val transferUUID = decodeUUID(m.getTransferUUID)
-    val data = DataBuffer(m.getData.toByteArray)
+    val toHost = HostId(decodeUUID(m.toHost.get))
+    val fromClient = ClientId(decodeUUID(m.fromClient.get))
+    val transferUUID = decodeUUID(m.transferUUID.get)
+    val data = DataBuffer(m.data.toByteArray)
     StoreTransferData(toHost, fromClient, transferUUID, data)
 
 
   def encode(o: CheckStorageDevice): codec.CheckStorageDevice =
-    codec.CheckStorageDevice.newBuilder()
-      .setToHost(encodeUUID(o.toHost.uuid))
-      .setFromClient(encodeUUID(o.fromClient.uuid))
-      .setDeviceId(encode(o.deviceId))
-      .build
+    codec.CheckStorageDevice(
+      toHost = Some(encodeUUID(o.toHost.uuid)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      deviceId = Some(encode(o.deviceId))
+    )
 
   def decode(m: codec.CheckStorageDevice): CheckStorageDevice =
-    val toHost = HostId(decodeUUID(m.getToHost))
-    val fromClient = ClientId(decodeUUID(m.getFromClient))
-    val deviceId = decode(m.getDeviceId)
+    val toHost = HostId(decodeUUID(m.toHost.get))
+    val fromClient = ClientId(decodeUUID(m.fromClient.get))
+    val deviceId = decode(m.deviceId.get)
     CheckStorageDevice(toHost, fromClient, deviceId)
 
 
   // ----------------------- Non Network Messages -----------------------
 
   def encode(o: ObjectUpdate): codec.ObjectUpdate =
-    val builder = codec.ObjectUpdate.newBuilder()
-      .setObjectId(encodeUUID(o.objectId.uuid))
-      .setData(ByteString.copyFrom(o.data.asReadOnlyBuffer()))
-
-    builder.build
+    codec.ObjectUpdate(
+      objectId = Some(encodeUUID(o.objectId.uuid)),
+      data = ByteString.copyFrom(o.data.asReadOnlyBuffer())
+    )
 
   def decode(m: codec.ObjectUpdate): ObjectUpdate =
-    val oid = ObjectId(decodeUUID(m.getObjectId))
-    val objectData = DataBuffer(m.getData.toByteArray)
-    
+    val oid = ObjectId(decodeUUID(m.objectId.get))
+    val objectData = DataBuffer(m.data.toByteArray)
     ObjectUpdate(oid, objectData)
 
 
   def encode(o: PersistentState): codec.PersistentState =
-    val builder = codec.PersistentState.newBuilder()
-    
-    o.promised.foreach: p =>
-      builder.setPromised(encode(p))
-    o.accepted.foreach: (pid, value) =>
-      builder.setAcceptedProposalId(encode(pid))
-      builder.setAcceptedValue(value)
-      
-    builder.build
+    codec.PersistentState(
+      promised = o.promised.map(encode),
+      acceptedProposalId = o.accepted.map((pid, _) => encode(pid)),
+      acceptedValue = o.accepted.map((_, value) => value).getOrElse(false)
+    )
 
   def decode(m: codec.PersistentState): PersistentState =
-    val promised = if m.hasPromised then
-      Some(decode(m.getPromised))
-    else
-      None
-      
-    val accepted = if m.hasAcceptedProposalId then
-      Some((decode(m.getAcceptedProposalId), m.getAcceptedValue))
-    else
-      None
-
+    val promised = m.promised.map(decode)
+    val accepted = m.acceptedProposalId.map(pid => (decode(pid), m.acceptedValue))
     PersistentState(promised, accepted)
 
 
   def encode(o: TransactionRecoveryState): codec.TransactionRecoveryState =
-    val builder = codec.TransactionRecoveryState.newBuilder()
-
-    builder.setStoreId(encode(o.storeId))
-    builder.setSerializedTxd(ByteString.copyFrom(o.serializedTxd.asReadOnlyBuffer()))
-    o.objectUpdates.foreach: ou =>
-      builder.addObjectUpdates(encode(ou))
-    builder.setDisposition(encodeTransactionDisposition(o.disposition))
-    builder.setStatus(encodeTransactionStatus(o.status))
-    builder.setPaxosAcceptorState(encode(o.paxosAcceptorState))
-
-    builder.build
+    codec.TransactionRecoveryState(
+      storeId = Some(encode(o.storeId)),
+      serializedTxd = ByteString.copyFrom(o.serializedTxd.asReadOnlyBuffer()),
+      objectUpdates = o.objectUpdates.map(encode),
+      disposition = encodeTransactionDisposition(o.disposition),
+      status = encodeTransactionStatus(o.status),
+      paxosAcceptorState = Some(encode(o.paxosAcceptorState))
+    )
 
   def decode(m: codec.TransactionRecoveryState): TransactionRecoveryState =
-    val storeId = decode(m.getStoreId)
-    val serializedTxd = DataBuffer(m.getSerializedTxd.toByteArray)
-    val objectUpdates = m.getObjectUpdatesList.asScala.map(decode).toList
-    val disposition = decodeTransactionDisposition(m.getDisposition)
-    val status = decodeTransactionStatus(m.getStatus)
-    val paxosAcceptorState = decode(m.getPaxosAcceptorState)
-    
+    val storeId = decode(m.storeId.get)
+    val serializedTxd = DataBuffer(m.serializedTxd.toByteArray)
+    val objectUpdates = m.objectUpdates.map(decode).toList
+    val disposition = decodeTransactionDisposition(m.disposition)
+    val status = decodeTransactionStatus(m.status)
+    val paxosAcceptorState = decode(m.paxosAcceptorState.get)
     TransactionRecoveryState(storeId, serializedTxd, objectUpdates, disposition, status, paxosAcceptorState)
-    
-  
+
+
   def encode(o: StoragePoolState.StoreEntry): codec.PoolStoreEntry =
-    codec.PoolStoreEntry.newBuilder()
-      .setHostId(encodeUUID(o.hostId.uuid))
-      .setStorageDeviceId(encode(o.storageDeviceId))
-      .build
+    codec.PoolStoreEntry(
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      storageDeviceId = Some(encode(o.storageDeviceId))
+    )
 
   def decode(m: codec.PoolStoreEntry): StoragePoolState.StoreEntry =
-    val hostId = HostId(decodeUUID(m.getHostId))
-    val storageDeviceId = decode(m.getStorageDeviceId)
+    val hostId = HostId(decodeUUID(m.hostId.get))
+    val storageDeviceId = decode(m.storageDeviceId.get)
     StoragePoolState.StoreEntry(hostId, storageDeviceId)
 
 
@@ -1042,134 +1014,105 @@ object Codec extends Logging:
 
   def decodeBackendConfig(m: codec.BackendConfig): BackendConfig = m match
     case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig()
-    case f => throw new EncodingError(f"Invalid Backend Config: $f")
-    
-    
+    case codec.BackendConfig.Unrecognized(v) => throw new EncodingError(f"Invalid Backend Config: $v")
+
+
   def encode(o: StoragePoolState): codec.StoragePoolState =
-    val builder = codec.StoragePoolState.newBuilder()
-
-    builder.setPoolId(encodeUUID(o.poolId.uuid))
-    builder.setName(o.name)
-    builder.setIda(encode(o.ida))
-    builder.setMaxObjectSize(o.maxObjectSize.getOrElse(0))
-    builder.setBackendConfig(encodeBackendConfig(o.backendConfig))
-
-    o.stores.foreach: storeEntry =>
-      builder.addStores(encode(storeEntry))
-
-    builder.setCurrentUsage(o.currentUsage)
-    builder.setMaximumStoreSize(o.maximumStoreSize)
-    o.allocationGroups.foreach: uuid =>
-      builder.addAllocationGroups(encodeUUID(uuid))
-
-    builder.build
+    codec.StoragePoolState(
+      poolId = Some(encodeUUID(o.poolId.uuid)),
+      name = o.name,
+      ida = Some(encode(o.ida)),
+      maxObjectSize = o.maxObjectSize.getOrElse(0),
+      stores = o.stores.map(encode).toSeq,
+      backendConfig = encodeBackendConfig(o.backendConfig),
+      currentUsage = o.currentUsage,
+      maximumStoreSize = o.maximumStoreSize,
+      allocationGroups = o.allocationGroups.map(encodeUUID)
+    )
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
-    val poolId = PoolId(decodeUUID(m.getPoolId))
-    val name = m.getName
-    val ida = decode(m.getIda)
-    val maxObjectSize = if m.getMaxObjectSize == 0 then None else Some(m.getMaxObjectSize)
-    val stores = m.getStoresList.asScala.map(decode).toArray
-    val backendConfig = decodeBackendConfig(m.getBackendConfig)
-    val currentUsage = m.getCurrentUsage
-    val maximumStoreSize = m.getMaximumStoreSize
-    val allocationGroups = m.getAllocationGroupsList.asScala.map(decodeUUID).toList
+    val poolId = PoolId(decodeUUID(m.poolId.get))
+    val name = m.name
+    val ida = decode(m.ida.get)
+    val maxObjectSize = if m.maxObjectSize == 0 then None else Some(m.maxObjectSize)
+    val stores = m.stores.map(decode).toArray
+    val backendConfig = decodeBackendConfig(m.backendConfig)
+    val currentUsage = m.currentUsage
+    val maximumStoreSize = m.maximumStoreSize
+    val allocationGroups = m.allocationGroups.map(decodeUUID).toList
 
     StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig,
       currentUsage, maximumStoreSize, allocationGroups)
 
 
   def encode(o: HostState): codec.HostState =
-    val builder = codec.HostState.newBuilder()
-
-    builder.setHostId(encodeUUID(o.hostId.uuid))
-    builder.setName(o.name)
-    builder.setAddress(o.address)
-    builder.setDataPort(o.dataPort)
-    builder.setCncPort(o.cncPort)
-    builder.setStoreTransferPort(o.storeTransferPort)
-
-    o.storageDevices.foreach { deviceId =>
-      builder.addStorageDevices(encode(deviceId))
-    }
-
-    builder.build
+    codec.HostState(
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      name = o.name,
+      address = o.address,
+      dataPort = o.dataPort,
+      cncPort = o.cncPort,
+      storeTransferPort = o.storeTransferPort,
+      storageDevices = o.storageDevices.map(encode).toSeq
+    )
 
   def decode(m: codec.HostState): HostState =
-    val hostId = HostId(decodeUUID(m.getHostId))
-    val name = m.getName
-    val address = m.getAddress
-    val dataPort = m.getDataPort
-    val cncPort = m.getCncPort
-    val storeTransferPort = m.getStoreTransferPort
-    val storageDevices = m.getStorageDevicesList.asScala.map(decode).toSet
+    val hostId = HostId(decodeUUID(m.hostId.get))
+    val name = m.name
+    val address = m.address
+    val dataPort = m.dataPort
+    val cncPort = m.cncPort
+    val storeTransferPort = m.storeTransferPort
+    val storageDevices = m.storageDevices.map(decode).toSet
 
     HostState(hostId, name, address, dataPort, cncPort, storeTransferPort, storageDevices)
 
   // CnC Messages -----------------------------------------------------------------
-  
+
   def encode(o: NewStore): codec.NewStore =
-    val builder = codec.NewStore.newBuilder()
-
-    builder.setStoreId(encode(o.storeId))
-    builder.setBackendConfig(encodeBackendConfig(o.backendType))
-
-    builder.build
+    codec.NewStore(
+      storeId = Some(encode(o.storeId)),
+      backendConfig = encodeBackendConfig(o.backendType)
+    )
 
   def decode(m: codec.NewStore): NewStore =
-    val storeId = decode(m.getStoreId)
-    val backendType = decodeBackendConfig(m.getBackendConfig)
-
+    val storeId = decode(m.storeId.get)
+    val backendType = decodeBackendConfig(m.backendConfig)
     NewStore(storeId, backendType)
 
 
   def encode(o: ShutdownStore): codec.ShutdownStore =
-    val builder = codec.ShutdownStore.newBuilder()
-
-    builder.setStoreId(encode(o.storeId))
-
-    builder.build
+    codec.ShutdownStore(storeId = Some(encode(o.storeId)))
 
   def decode(m: codec.ShutdownStore): ShutdownStore =
-    val storeId = decode(m.getStoreId)
-
-    ShutdownStore(storeId)
+    ShutdownStore(decode(m.storeId.get))
 
 
   def encode(o: TransferStore): codec.TransferStore =
-    val builder = codec.TransferStore.newBuilder()
-
-    builder.setStoreId(encode(o.storeId))
-    builder.setToHost(encodeUUID(o.toHost.uuid))
-
-    builder.build
+    codec.TransferStore(
+      storeId = Some(encode(o.storeId)),
+      toHost = Some(encodeUUID(o.toHost.uuid))
+    )
 
   def decode(m: codec.TransferStore): TransferStore =
-    val storeId = decode(m.getStoreId)
-    val toHost = HostId(decodeUUID(m.getToHost))
-
+    val storeId = decode(m.storeId.get)
+    val toHost = HostId(decodeUUID(m.toHost.get))
     TransferStore(storeId, toHost)
 
 
   def encode(o: cnc.Error): codec.CnCError =
-    val builder = codec.CnCError.newBuilder()
-
-    builder.setMessage(o.message)
-
-    builder.build
+    codec.CnCError(message = o.message)
 
   def decode(m: codec.CnCError): cnc.Error =
-    cnc.Error(m.getMessage)
+    cnc.Error(m.message)
 
   // Storage Device Messages -----------------------------------------------------------------
 
   def encode(o: StorageDeviceId): codec.StorageDeviceId =
-    codec.StorageDeviceId.newBuilder()
-      .setDeviceUuid(encodeUUID(o.uuid))
-      .build
+    codec.StorageDeviceId(deviceUuid = Some(encodeUUID(o.uuid)))
 
   def decode(m: codec.StorageDeviceId): StorageDeviceId =
-    StorageDeviceId(decodeUUID(m.getDeviceUuid))
+    StorageDeviceId(decodeUUID(m.deviceUuid.get))
 
 
   def encodeStorageDeviceStoreStatus(o: StorageDeviceState.StoreStatus): codec.StorageDeviceStoreStatus = o match
@@ -1185,72 +1128,59 @@ object Codec extends Logging:
     case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN => StorageDeviceState.StoreStatus.TransferringIn
     case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT => StorageDeviceState.StoreStatus.TransferringOut
     case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING => StorageDeviceState.StoreStatus.Rebuilding
-    case f => throw new EncodingError(f"Invalid StorageDeviceStoreStatus: $f")
+    case codec.StorageDeviceStoreStatus.Unrecognized(v) => throw new EncodingError(f"Invalid StorageDeviceStoreStatus: $v")
 
 
   def encode(o: StorageDeviceState.StoreEntry): codec.StorageDeviceStoreEntry =
-    val builder = codec.StorageDeviceStoreEntry.newBuilder()
-      .setStatus(encodeStorageDeviceStoreStatus(o.status))
-
-    o.transferDevice.foreach: device =>
-      builder.setTransferDevice(encode(device))
-
-    builder.build
+    codec.StorageDeviceStoreEntry(
+      status = encodeStorageDeviceStoreStatus(o.status),
+      transferDevice = o.transferDevice.map(encode)
+    )
 
   def decode(m: codec.StorageDeviceStoreEntry): StorageDeviceState.StoreEntry =
-    val status = decodeStorageDeviceStoreStatus(m.getStatus)
-    val transferDevice = if m.hasTransferDevice then
-      Some(decode(m.getTransferDevice))
-    else
-      None
-
+    val status = decodeStorageDeviceStoreStatus(m.status)
+    val transferDevice = m.transferDevice.map(decode)
     StorageDeviceState.StoreEntry(status, transferDevice)
 
 
   def encode(o: StorageDeviceState): codec.StorageDeviceState =
-    val builder = codec.StorageDeviceState.newBuilder()
-      .setStorageDeviceId(encode(o.storageDeviceId))
-    
-    builder.setHostId(encodeUUID(o.hostId.uuid))
-
-    o.stores.foreach: (storeId, storeEntry) =>
-      val keyValue = codec.StorageDeviceStoreKeyValue.newBuilder()
-        .setStoreId(ByteString.copyFrom(storeId.toBytes))
-        .setEntry(encode(storeEntry))
-        .build()
-      builder.addStores(keyValue)
-
-    builder.build
+    codec.StorageDeviceState(
+      storageDeviceId = Some(encode(o.storageDeviceId)),
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      stores = o.stores.map { (storeId, storeEntry) =>
+        codec.StorageDeviceStoreKeyValue(
+          storeId = ByteString.copyFrom(storeId.toBytes),
+          entry = Some(encode(storeEntry))
+        )
+      }.toSeq
+    )
 
   def decode(m: codec.StorageDeviceState): StorageDeviceState =
-    val storageDeviceId = decode(m.getStorageDeviceId)
-    val hostId = HostId(decodeUUID(m.getHostId))
-    val stores = m.getStoresList.asScala.map: keyValue =>
-      val storeId = StoreId(keyValue.getStoreId.toByteArray)
-      val entry = decode(keyValue.getEntry)
+    val storageDeviceId = decode(m.storageDeviceId.get)
+    val hostId = HostId(decodeUUID(m.hostId.get))
+    val stores = m.stores.map { keyValue =>
+      val storeId = StoreId(keyValue.storeId.toByteArray)
+      val entry = decode(keyValue.entry.get)
       storeId -> entry
-    .toMap
+    }.toMap
 
     new StorageDeviceState(storageDeviceId, hostId, stores)
 
   def encodeSteppedDurableTaskState(step: Int, state: Map[String, Array[Byte]]): Array[Byte] =
-    val builder = codec.SteppedDurableTaskState.newBuilder()
-    builder.setStep(step)
-    state.foreach: (key, value) =>
-      builder.addEntries(
-        codec.SteppedDurableTaskEntry.newBuilder()
-          .setKey(key)
-          .setValue(ByteString.copyFrom(value))
-          .build
-      )
-    builder.build.toByteArray
+    codec.SteppedDurableTaskState(
+      step = step,
+      entries = state.map { (key, value) =>
+        codec.SteppedDurableTaskEntry(
+          key = key,
+          value = ByteString.copyFrom(value)
+        )
+      }.toSeq
+    ).toByteArray
 
   def decodeSteppedDurableTaskState(data: Array[Byte]): (Int, Map[String, Array[Byte]]) =
     val m = codec.SteppedDurableTaskState.parseFrom(data)
-    val step = m.getStep
-    val state = m.getEntriesList.asScala.map: entry =>
-      entry.getKey -> entry.getValue.toByteArray
-    .toMap
+    val step = m.step
+    val state = m.entries.map { entry =>
+      entry.key -> entry.value.toByteArray
+    }.toMap
     (step, state)
-
-

@@ -416,26 +416,36 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     bb.order(ByteOrder.BIG_ENDIAN)
 
     val msgLen = bb.getInt()
+    val pbBytes = new Array[Byte](msgLen)
+    bb.get(pbBytes)
 
-    val m = try codec.Message.parseFrom(bb) catch
+    val m = try codec.Message.parseFrom(pbBytes) catch
       case t: Throwable =>
         logger.error(s"******* PARSE DEALER MESSAGE ERROR: $t", t)
         throw t
 
-    if m.hasReadResponse then
-      val message = Codec.decode(m.getReadResponse)
-      logger.trace(s"Got $message")
-      onClientResponseReceived(message)
+    m.msg match
+      case codec.Message.Msg.ReadResponse(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
 
-    else if m.hasTxResolved then
-      val message = Codec.decode(m.getTxResolved)
-      logger.trace(s"Got $message")
-      onClientResponseReceived(message)
+      case codec.Message.Msg.TxResolved(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
 
-    else if m.hasTxFinalized then
-      val message = Codec.decode(m.getTxFinalized)
-      logger.trace(s"Got $message")
-      onClientResponseReceived(message)
+      case codec.Message.Msg.TxFinalized(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
+
+      case codec.Message.Msg.TransactionCompletionResponse(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
+
+      case _ =>
 
   }
 
@@ -455,153 +465,151 @@ class ZMQNetwork(val oclientId: Option[ClientId],
     lastRouterMessageReceived = System.nanoTime()
 
     val msgLen = bb.getInt()
-    bb.limit(4 + msgLen)
+    val pbBytes = new Array[Byte](msgLen)
+    bb.get(pbBytes)
 
-    // Must pass a read-only copy to the following method. It'll corrupt the rest of the buffer otherwise
-    val m = try codec.Message.parseFrom(bb) catch
+    val m = try codec.Message.parseFrom(pbBytes) catch
       case t: Throwable =>
         logger.error(s"******* PARSE ROUTER MESSAGE ERROR: $t", t)
         throw t
 
-    if m.hasHostHeartbeat then
-      val msg = Codec.decode(m.getHostHeartbeat)
-      logger.trace(s"Got $msg")
-      hostStates.get(msg.hostId) match
-        case None =>
-          //val ns = new ZHostState(msg.nodeName,0, false)
-          //ns.heartbeatReceived()
-          //nodeStates += msg.nodeName -> ns
-        case Some(ns) => ns.heartbeatReceived()
+    m.msg match
+      case codec.Message.Msg.HostHeartbeat(r) =>
+        val hbMsg = Codec.decode(r)
+        logger.trace(s"Got $hbMsg")
+        hostStates.get(hbMsg.hostId) match
+          case None =>
+          case Some(ns) => ns.heartbeatReceived()
 
-    else if m.hasRead then
-      val message = Codec.decode(m.getRead)
-      logger.trace(s"Got $message")
-      updateClientId(message.fromClient, from)
-      onClientRequestReceived(message)
+      case codec.Message.Msg.Read(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        updateClientId(message.fromClient, from)
+        onClientRequestReceived(message)
 
-    else if m.hasPrepare then
-      bb.limit(msg.length)
-      bb.position(4 + msgLen)
-      val contentSize = bb.getInt()
-      val preTxSize = bb.getInt()
+      case codec.Message.Msg.Prepare(p) =>
+        bb.position(4 + msgLen)
+        val contentSize = bb.getInt()
+        val preTxSize = bb.getInt()
 
-      val contentEndPos = bb.position() + contentSize
-      val preTxEndPos = contentEndPos + preTxSize
+        val contentEndPos = bb.position() + contentSize
+        val preTxEndPos = contentEndPos + preTxSize
 
-      //val sb = message.txd.allReferencedObjectsSet.foldLeft(new StringBuilder)((sb, o) => sb.append(s" ${o.uuid}"))
-      //println(s"got prepare txid ${message.txd.transactionUUID} Leader ${message.txd.designatedLeaderUID} for objects: ${sb.toString()}")
+        val updateContent = if (bb.remaining() == 0) (Nil, Nil) else {
 
-      val updateContent = if (bb.remaining() == 0) (Nil, Nil) else {
+          var localUpdates: List[ObjectUpdate] = Nil
+          var preTxRebuilds: List[PreTransactionOpportunisticRebuild] = Nil
 
-        var localUpdates: List[ObjectUpdate] = Nil
-        var preTxRebuilds: List[PreTransactionOpportunisticRebuild] = Nil
+          while (bb.position() != contentEndPos) {
+            val msb = bb.getLong()
+            val lsb = bb.getLong()
+            val len = bb.getInt()
+            val uuid = new UUID(msb, lsb)
 
-        // local update content is a series of <16-byte-uuid><4-byte-length><data>
+            val slice = bb.asReadOnlyBuffer()
 
-        while (bb.position() != contentEndPos) {
-          val msb = bb.getLong()
-          val lsb = bb.getLong()
-          val len = bb.getInt()
-          val uuid = new UUID(msb, lsb)
+            slice.limit( slice.position() + len )
+            bb.position( bb.position() + len )
+            localUpdates = ObjectUpdate(ObjectId(uuid), DataBuffer(slice)) :: localUpdates
+          }
 
-          val slice = bb.asReadOnlyBuffer()
+          while (bb.position() != preTxEndPos) {
+            val msb = bb.getLong()
+            val lsb = bb.getLong()
+            val uuid = new UUID(msb, lsb)
+            val metadata = Metadata(bb)
+            val len = bb.getInt()
 
-          slice.limit( slice.position() + len )
-          bb.position( bb.position() + len )
-          localUpdates = ObjectUpdate(ObjectId(uuid), DataBuffer(slice)) :: localUpdates
+            val slice = bb.asReadOnlyBuffer()
+            slice.limit( slice.position() + len )
+            bb.position( bb.position() + len )
+            preTxRebuilds = PreTransactionOpportunisticRebuild(ObjectId(uuid), metadata, DataBuffer(slice)) :: preTxRebuilds
+          }
+
+          (localUpdates, preTxRebuilds)
         }
+        val message = Codec.decode(p, updateContent._1, updateContent._2)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-        // PreTx Rebuilds are a series of <16-byte-uuid><encoded-object-metadata><4-byte-length><data>
+      case codec.Message.Msg.PrepareResponse(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-        while (bb.position() != preTxEndPos) {
-          val msb = bb.getLong()
-          val lsb = bb.getLong()
-          val uuid = new UUID(msb, lsb)
-          val metadata = Metadata(bb)
-          val len = bb.getInt()
+      case codec.Message.Msg.Accept(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-          val slice = bb.asReadOnlyBuffer()
-          slice.limit( slice.position() + len )
-          bb.position( bb.position() + len )
-          preTxRebuilds = PreTransactionOpportunisticRebuild(ObjectId(uuid), metadata, DataBuffer(slice)) :: preTxRebuilds
-        }
+      case codec.Message.Msg.AcceptResponse(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-        (localUpdates, preTxRebuilds)
-      }
-      val message = Codec.decode(m.getPrepare, updateContent._1, updateContent._2)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.Resolved(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-    else if m.hasPrepareResponse then
-      //println("got prepareResponse")
-      val message = Codec.decode(m.getPrepareResponse)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.Committed(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-    else if m.hasAccept then
-      //println("got accept")
-      val message = Codec.decode(m.getAccept)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.Finalized(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-    else if m.hasAcceptResponse then
-      val message = Codec.decode(m.getAcceptResponse)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.Heartbeat(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-    else if m.hasResolved then
-      val message = Codec.decode(m.getResolved)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.OpportunisticRebuild(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        updateClientId(message.fromClient, from)
+        onClientRequestReceived(message)
 
-    else if m.hasCommitted then
-      val message = Codec.decode(m.getCommitted)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.TransactionCompletionQuery(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        updateClientId(message.fromClient, from)
+        onClientRequestReceived(message)
 
-    else if m.hasFinalized then
-      val message = Codec.decode(m.getFinalized)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.StoreTransferData(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onHostMessageReceived(message)
 
-    else if m.hasHeartbeat then
-      val message = Codec.decode(m.getHeartbeat)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
+      case codec.Message.Msg.StartStoreTransfer(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onHostMessageReceived(message)
 
-    else if m.hasOpportunisticRebuild then
-      val message = Codec.decode(m.getOpportunisticRebuild)
-      logger.trace(s"Got $message")
-      updateClientId(message.fromClient, from)
-      onClientRequestReceived(message)
+      case codec.Message.Msg.CheckStorageDevice(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onHostMessageReceived(message)
 
-    else if m.hasTransactionCompletionQuery then
-      val message = Codec.decode(m.getTransactionCompletionQuery)
-      logger.trace(s"Got $message")
-      updateClientId(message.fromClient, from)
-      onClientRequestReceived(message)
+      case codec.Message.Msg.UnknownStore(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-    else if m.hasStoreTransferData then
-      val message = Codec.decode(m.getStoreTransferData)
-      logger.trace(s"Got $message")
-      onHostMessageReceived(message)
+      case codec.Message.Msg.StatusRequest(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-    else if m.hasStartStoreTransfer then
-      val message = Codec.decode(m.getStartStoreTransfer)
-      logger.trace(s"Got $message")
-      onHostMessageReceived(message)
+      case codec.Message.Msg.StatusResponse(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onTransactionMessageReceived(message)
 
-    else if m.hasCheckStorageDevice then
-      val message = Codec.decode(m.getCheckStorageDevice)
-      logger.trace(s"Got $message")
-      onHostMessageReceived(message)
-
-    else if m.hasUnknownStore then
-      val message = Codec.decode(m.getUnknownStore)
-      logger.trace(s"Got $message")
-      onTransactionMessageReceived(message)
-
-    else
-      logger.error("Unknown Message!")
+      case codec.Message.Msg.Empty =>
+        logger.error("Empty Message!")
   }
 }

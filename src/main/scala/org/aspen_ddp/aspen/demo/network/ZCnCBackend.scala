@@ -42,10 +42,7 @@ class ZCnCBackend(val network: ZMQNetwork,
 
       val encodedMessage = repSocket.recv()
 
-      val bb = ByteBuffer.wrap(encodedMessage)
-      bb.order(ByteOrder.BIG_ENDIAN)
-
-      val r = try Some(codec.CnCRequest.parseFrom(bb)) catch
+      val r = try Some(codec.CnCRequest.parseFrom(encodedMessage)) catch
         case t: Throwable =>
           logger.error(s"******* PARSE CNC MESSAGE ERROR: $t", t)
           None
@@ -54,31 +51,22 @@ class ZCnCBackend(val network: ZMQNetwork,
         case None =>
         case Some(cmsg) =>
 
-          val replyBuilder = codec.CnCReply.newBuilder()
+          cmsg.msg match
+            case codec.CnCRequest.Msg.NewStore(ns) =>
+              val message = Codec.decode(ns)
+              logger.trace(s"Got CnC message $message")
+            case codec.CnCRequest.Msg.ShutdownStore(ss) =>
+              val message = Codec.decode(ss)
+              logger.trace(s"Got CnC message $message")
+            case codec.CnCRequest.Msg.TransferStore(ts) =>
+              val message = Codec.decode(ts)
+              logger.trace(s"Got CnC message $message")
+            case codec.CnCRequest.Msg.Empty =>
 
-          if cmsg.hasNewStore then
-            val message = Codec.decode(cmsg.getNewStore)
-            logger.trace(s"Got CnC message $message")
-            //onNewStore(message)
-
-          if cmsg.hasShutdownStore then
-            val message = Codec.decode(cmsg.getShutdownStore)
-            logger.trace(s"Got CnC message $message")
-            //onShutdownStore(message)
-
-          if cmsg.hasTransferStore then
-            val message = Codec.decode(cmsg.getTransferStore)
-            logger.trace(s"Got CnC message $message")
-            //onTransferStore(message)
-
-          // Wait for operation completion
           val m = completionQueue.take()
 
-          val okBuilder = codec.CnCOk.newBuilder()
-
-          replyBuilder.setOk(okBuilder.build)
-
-          val rmsg = replyBuilder.build.toByteArray
+          val reply = codec.CnCReply(msg = codec.CnCReply.Msg.Ok(codec.CnCOk()))
+          val rmsg = reply.toByteArray
 
           repSocket.send(rmsg)
 

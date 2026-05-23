@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.objects.Metadata
 object ProtobufMessageEncoder:
 
   def encodeMessage(msg: HostHeartbeat): Array[Byte] = {
-    val arr = codec.Message.newBuilder().setHostHeartbeat(Codec.encode(msg)).build.toByteArray
+    val arr = codec.Message(msg = codec.Message.Msg.HostHeartbeat(Codec.encode(msg))).toByteArray
 
     val msgarr = new Array[Byte](4 + arr.length)
     val bb = ByteBuffer.wrap(msgarr)
@@ -21,26 +21,24 @@ object ProtobufMessageEncoder:
 
   def encodeMessage(message: TxMessage): Array[Byte] = {
 
-    val builder = codec.Message.newBuilder()
-
     var updateContent: Option[TransactionData] = None
 
-    message match
+    val msgVariant: codec.Message.Msg = message match
       case m: TxPrepare =>
-        builder.setPrepare(Codec.encode(m))
         updateContent = Some(TransactionData(m.objectUpdates, m.preTxRebuilds))
-      case m: TxPrepareResponse => builder.setPrepareResponse(Codec.encode(m))
-      case m: TxAccept => builder.setAccept(Codec.encode(m))
-      case m: TxAcceptResponse => builder.setAcceptResponse(Codec.encode(m))
-      case m: TxResolved => builder.setResolved(Codec.encode(m))
-      case m: TxCommitted => builder.setCommitted(Codec.encode(m))
-      case m: TxFinalized => builder.setFinalized(Codec.encode(m))
-      case m: TxHeartbeat => builder.setHeartbeat(Codec.encode(m))
-      case m: TxStatusRequest => builder.setStatusRequest(Codec.encode(m))
-      case m: TxStatusResponse => builder.setStatusResponse(Codec.encode(m))
-      case m: TxUnknownStore => builder.setUnknownStore(Codec.encode(m))
+        codec.Message.Msg.Prepare(Codec.encode(m))
+      case m: TxPrepareResponse => codec.Message.Msg.PrepareResponse(Codec.encode(m))
+      case m: TxAccept => codec.Message.Msg.Accept(Codec.encode(m))
+      case m: TxAcceptResponse => codec.Message.Msg.AcceptResponse(Codec.encode(m))
+      case m: TxResolved => codec.Message.Msg.Resolved(Codec.encode(m))
+      case m: TxCommitted => codec.Message.Msg.Committed(Codec.encode(m))
+      case m: TxFinalized => codec.Message.Msg.Finalized(Codec.encode(m))
+      case m: TxHeartbeat => codec.Message.Msg.Heartbeat(Codec.encode(m))
+      case m: TxStatusRequest => codec.Message.Msg.StatusRequest(Codec.encode(m))
+      case m: TxStatusResponse => codec.Message.Msg.StatusResponse(Codec.encode(m))
+      case m: TxUnknownStore => codec.Message.Msg.UnknownStore(Codec.encode(m))
 
-    val encodedMsg = builder.build.toByteArray
+    val encodedMsg = codec.Message(msg = msgVariant).toByteArray
 
     val (contentSize, preTxSize) = updateContent match
       case None => (0, 0)
@@ -76,14 +74,12 @@ object ProtobufMessageEncoder:
   }
 
   def encodeMessage(message: ClientRequest): Array[Byte] =
-    val builder = codec.Message.newBuilder()
+    val msgVariant: codec.Message.Msg = message match
+      case m: Read => codec.Message.Msg.Read(Codec.encode(m))
+      case m: OpportunisticRebuild => codec.Message.Msg.OpportunisticRebuild(Codec.encode(m))
+      case m: TransactionCompletionQuery => codec.Message.Msg.TransactionCompletionQuery(Codec.encode(m))
 
-    message match
-      case m: Read => builder.setRead(Codec.encode(m))
-      case m: OpportunisticRebuild => builder.setOpportunisticRebuild(Codec.encode(m))
-      case m: TransactionCompletionQuery => builder.setTransactionCompletionQuery(Codec.encode(m))
-
-    val encodedMsg = builder.build.toByteArray
+    val encodedMsg = codec.Message(msg = msgVariant).toByteArray
 
     val msg = new Array[Byte](4 + encodedMsg.length)
     val bb = ByteBuffer.wrap(msg)
@@ -95,15 +91,13 @@ object ProtobufMessageEncoder:
 
 
   def encodeMessage(message: ClientResponse): Array[Byte] =
-    val builder = codec.Message.newBuilder()
+    val msgVariant: codec.Message.Msg = message match
+      case m: ReadResponse => codec.Message.Msg.ReadResponse(Codec.encode(m))
+      case m: TransactionCompletionResponse => codec.Message.Msg.TransactionCompletionResponse(Codec.encode(m))
+      case m: TransactionFinalized => codec.Message.Msg.TxFinalized(Codec.encode(m))
+      case m: TransactionResolved => codec.Message.Msg.TxResolved(Codec.encode(m))
 
-    message match
-      case m: ReadResponse => builder.setReadResponse(Codec.encode(m))
-      case m: TransactionCompletionResponse => builder.setTransactionCompletionResponse(Codec.encode(m))
-      case m: TransactionFinalized => builder.setTxFinalized(Codec.encode(m))
-      case m: TransactionResolved => builder.setTxResolved(Codec.encode(m))
-
-    val encodedMsg = builder.build.toByteArray
+    val encodedMsg = codec.Message(msg = msgVariant).toByteArray
 
     val msg = new Array[Byte](4 + encodedMsg.length)
     val bb = ByteBuffer.wrap(msg)
@@ -114,14 +108,12 @@ object ProtobufMessageEncoder:
     msg
 
   def encodeMessage(message: HostMessage): Array[Byte] =
-    val builder = codec.Message.newBuilder()
+    val msgVariant: codec.Message.Msg = message match
+      case m: StartStoreTransfer => codec.Message.Msg.StartStoreTransfer(Codec.encode(m))
+      case m: StoreTransferData => codec.Message.Msg.StoreTransferData(Codec.encode(m))
+      case m: CheckStorageDevice => codec.Message.Msg.CheckStorageDevice(Codec.encode(m))
 
-    message match
-      case m: StartStoreTransfer => builder.setStartStoreTransfer(Codec.encode(m))
-      case m: StoreTransferData => builder.setStoreTransferData(Codec.encode(m))
-      case m: CheckStorageDevice => builder.setCheckStorageDevice(Codec.encode(m))
-
-    val encodedMsg = builder.build.toByteArray
+    val encodedMsg = codec.Message(msg = msgVariant).toByteArray
 
     val msg = new Array[Byte](4 + encodedMsg.length)
     val bb = ByteBuffer.wrap(msg)

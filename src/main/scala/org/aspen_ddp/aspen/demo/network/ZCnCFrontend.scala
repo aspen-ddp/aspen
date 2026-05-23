@@ -40,26 +40,23 @@ class ZCnCFrontend(val network: ZMQNetwork,
   private def ioThread(): Unit =
     while true do
       val m = msgQueue.take()
-      val builder = codec.CnCRequest.newBuilder()
 
-      m match
+      val msgVariant: codec.CnCRequest.Msg = m match
         case Shutdown(p) =>
           p.success(())
           return
-        case CnCNewStore(msg, p) => builder.setNewStore(Codec.encode(msg))
-        case CnCShutdownStore(msg, p) => builder.setShutdownStore(Codec.encode(msg))
-        case CnCTransferStore(msg, p) => builder.setTransferStore(Codec.encode(msg))
+        case CnCNewStore(msg, p) => codec.CnCRequest.Msg.NewStore(Codec.encode(msg))
+        case CnCShutdownStore(msg, p) => codec.CnCRequest.Msg.ShutdownStore(Codec.encode(msg))
+        case CnCTransferStore(msg, p) => codec.CnCRequest.Msg.TransferStore(Codec.encode(msg))
 
-      val encodedMessage = builder.build.toByteArray
+      val encodedMessage = codec.CnCRequest(msg = msgVariant).toByteArray
 
       reqSocket.send(encodedMessage)
 
       val rmsg = reqSocket.recv()
 
       if rmsg != null then
-        val bb = ByteBuffer.wrap(rmsg)
-        bb.order(ByteOrder.BIG_ENDIAN)
-        val rm = try codec.CnCReply.parseFrom(bb) catch
+        val rm = try codec.CnCReply.parseFrom(rmsg) catch
           case t: Throwable =>
             logger.error(s"******* PARSE CnCReply ERROR: $t", t)
             m match
@@ -69,24 +66,21 @@ class ZCnCFrontend(val network: ZMQNetwork,
               case CnCTransferStore(msg, p) => p.failure(t)
             throw t
 
+        val isOk = rm.msg match
+          case codec.CnCReply.Msg.Ok(_) => true
+          case _ => false
+
         m match
           case Shutdown(p) =>
           case CnCNewStore(msg, p) =>
-            if rm.hasOk then
-              p.success(())
-            else
-              p.failure(new Exception("Invalid CnCReply received"))
+            if isOk then p.success(())
+            else p.failure(new Exception("Invalid CnCReply received"))
           case CnCShutdownStore(msg, p) =>
-            if rm.hasOk then
-              p.success(())
-            else
-              p.failure(new Exception("Invalid CnCReply received"))
+            if isOk then p.success(())
+            else p.failure(new Exception("Invalid CnCReply received"))
           case CnCTransferStore(msg, p) =>
-            // msg.storeId, msg.toHost,
-            if rm.hasOk then
-              p.success(())
-            else
-              p.failure(new Exception("Invalid CnCReply received"))
+            if isOk then p.success(())
+            else p.failure(new Exception("Invalid CnCReply received"))
 
 
   

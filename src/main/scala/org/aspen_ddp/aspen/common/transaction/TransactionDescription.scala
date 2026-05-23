@@ -11,7 +11,10 @@ import scala.language.implicitConversions
 
 object TransactionDescription {
   def deserialize(db: DataBuffer): TransactionDescription = {
-    Codec.decode(codec.TransactionDescription.parseFrom(db.asReadOnlyBuffer()))
+    val bb = db.asReadOnlyBuffer()
+    val bytes = new Array[Byte](bb.remaining())
+    bb.get(bytes)
+    Codec.decode(codec.TransactionDescription.parseFrom(bytes))
   }
 }
 

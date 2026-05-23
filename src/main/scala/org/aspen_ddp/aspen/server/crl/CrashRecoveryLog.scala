@@ -29,11 +29,10 @@ object CrashRecoveryLog:
     fos.write(header)
 
     def write(trs: TransactionRecoveryState): Unit =
-      val builder = codec.StoreCRLEntry.newBuilder()
-      builder.setTrs(Codec.encode(trs))
+      val entry = codec.StoreCRLEntry(trs = Some(Codec.encode(trs)))
 
       val length = new Array[Byte](8)
-      val msg = builder.build.toByteArray
+      val msg = entry.toByteArray
 
       ByteBuffer.wrap(length).order(ByteOrder.BIG_ENDIAN).putLong(msg.size)
 
@@ -65,13 +64,12 @@ object CrashRecoveryLog:
       lbb.position(0)
       val entryLength = lbb.getLong
 
-      val entry = ByteBuffer.allocate(entryLength.toInt)
-      entry.order(ByteOrder.BIG_ENDIAN)
-      fc.read(entry)
-      entry.position(0)
+      val entryBytes = new Array[Byte](entryLength.toInt)
+      val entryBuf = ByteBuffer.wrap(entryBytes)
+      fc.read(entryBuf)
 
-      val m = codec.StoreCRLEntry.parseFrom(entry)
-      trsList = Codec.decode(m.getTrs) :: trsList
+      val m = codec.StoreCRLEntry.parseFrom(entryBytes)
+      trsList = Codec.decode(m.trs.get) :: trsList
 
     (storeId, trsList)
 

@@ -38,6 +38,14 @@ package object util {
   }
   def byte2int(arr: Array[Byte]): Int = ByteBuffer.wrap(arr).getInt()
 
+  def long2byte(l: Long): Array[Byte] = {
+    val arr = new Array[Byte](8)
+    val bb = ByteBuffer.wrap(arr)
+    bb.putLong(l)
+    arr
+  }
+  def byte2long(arr: Array[Byte]): Long = ByteBuffer.wrap(arr).getLong()
+
   def getStack: String = {
     val e = new Exception("printing stack")
     val sw = new StringWriter()

@@ -81,7 +81,7 @@ abstract class SteppedDurableTask(
                   case _: TransactionAborted =>
                     logger.warn(s"Commit aborted at step $step for task ${taskPointer.kvPointer}, retrying")
                   case _ =>
-                    logger.error(s"Commit failed at step $step for task ${taskPointer.kvPointer}, retrying", err)
+                    //logger.error(s"Commit failed at step $step for task ${taskPointer.kvPointer}, retrying", err)
                 scheduleRetry(step)
               case Success(_) =>
                 retryDelay = 16

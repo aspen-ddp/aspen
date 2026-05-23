@@ -17,10 +17,15 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFin
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer, ReadError}
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ReadError, Value}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.demo.BootstrapConfig
 import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
+import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.compute.TaskExecutor
+import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
+import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -45,6 +50,9 @@ object StoreManager:
   private case class HeartbeatEvent() extends Event
   private case class CheckAllDevices() extends Event
   private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
+  private case class InitializeTaskExecutor() extends Event
+
+  private val TaskExecutorRootKey = Key(Array[Byte](3))
 
   class IOHandler(mgr: StoreManager) extends CompletionHandler:
     override def complete(op: Completion): Unit =
@@ -100,6 +108,10 @@ class StoreManager(val client: AspenClient,
   private var transferringInStoreIds: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
 
+  private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
+  private val usageManager = new StoragePoolUsageManager(client)
+  private var usageUpdateTask: Option[ScheduledTask] = None
+
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
     synchronized {
       val now = HLCTimestamp.now
@@ -127,6 +139,59 @@ class StoreManager(val client: AspenClient,
   // devices in case operations were preformed while we were down and missed
   // the CheckDeviceState messages
   events.put(CheckAllDevices())
+  events.put(InitializeTaskExecutor())
+
+  private def initializeTaskExecutor(): Unit =
+    import scala.util.{Failure, Success}
+
+    val hostPointerFuture = client.getHostPointer(hostId)
+
+    hostPointerFuture.onComplete:
+      case Success(hostPtr) =>
+        client.read(hostPtr).foreach: hostKvos =>
+          hostKvos.contents.get(TaskExecutorRootKey) match
+            case Some(vs) =>
+              val executorPtr = KeyValueObjectPointer(vs.value.bytes)
+              client.getStoragePool(Radicle.poolId).foreach: pool =>
+                val allocator = new SinglePoolObjectAllocator(client, pool, pool.ida, None)
+                SimpleTaskExecutor(client, allocator, executorPtr).foreach: executor =>
+                  synchronized:
+                    taskExecutorPromise.success(executor)
+                    startUsageTracking(executor)
+
+            case None =>
+              client.getStoragePool(Radicle.poolId).foreach: pool =>
+                val allocator = new SinglePoolObjectAllocator(client, pool, pool.ida, None)
+
+                client.transactUntilSuccessful: tx =>
+                  given scala.concurrent.ExecutionContext = ec
+                  for
+                    executorRoot <- allocator.allocateKeyValueObject(Map())(using tx)
+                    currentHostKvos <- client.read(hostPtr)
+                  yield
+                    val reqs = List(DoesNotExist(TaskExecutorRootKey))
+                    val ops = List(Insert(TaskExecutorRootKey, executorRoot.toArray))
+                    tx.update(hostPtr, None, None, reqs, ops)
+                    executorRoot
+                .foreach: executorRoot =>
+                  SimpleTaskExecutor(client, allocator, executorRoot).foreach: executor =>
+                    synchronized:
+                      taskExecutorPromise.success(executor)
+                      startUsageTracking(executor)
+
+      case Failure(err) =>
+        // In test environments or when host is not yet registered, silently skip initialization
+        logger.debug(s"TaskExecutor initialization skipped: ${err.getMessage}")
+
+  private def startUsageTracking(executor: TaskExecutor): Unit =
+    usageManager.setTaskExecutor(executor)
+    usageUpdateTask = Some(backgroundTasks.schedulePeriodic(Duration(20, SECONDS)):
+      synchronized:
+        stores.valuesIterator.foreach: store =>
+          usageManager.updateStoreSize(store.storeId, store.estimateSize())
+    )
+
+  def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
 
   private def tryLoadDevice(sdFile: File): Unit =
     val storageDevicePath = sdFile.toPath
@@ -585,6 +650,7 @@ class StoreManager(val client: AspenClient,
     pendingStartTask.cancel()
     heartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
+    usageUpdateTask.foreach(_.cancel())
     shutdownPromise.future
   }
   
@@ -698,7 +764,10 @@ class StoreManager(val client: AspenClient,
       case CheckAllDevices() =>
         storageDevices.valuesIterator.foreach: sds =>
           checkStorageDevice(sds.storageDeviceId)
-        
+
+      case InitializeTaskExecutor() =>
+        initializeTaskExecutor()
+
       case ShutdownStore(storeId, completion) =>
         stores.get(storeId) match
           case None => completion.success(())

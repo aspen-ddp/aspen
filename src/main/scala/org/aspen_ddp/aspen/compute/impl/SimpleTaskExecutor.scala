@@ -10,38 +10,35 @@ import org.aspen_ddp.aspen.common.util.{uuid2byte, byte2uuid}
 
 import scala.concurrent.{ExecutionContext, Future}
 
-object SimpleTaskExecutor {
+object SimpleTaskExecutor:
 
   val TaskTypeKey = Key(UUID.fromString("f13fbfd4-85fa-449c-b279-9859ee5e7de0"))
 
   def apply(client: AspenClient,
             taskStateAllocator: ObjectAllocator,
-            executorObject: KeyValueObjectPointer): Future[SimpleTaskExecutor] = {
+            executorObject: KeyValueObjectPointer): Future[SimpleTaskExecutor] =
 
     given ExecutionContext = client.clientContext
 
-    client.read(executorObject).map( kvos => new SimpleTaskExecutor(client, taskStateAllocator, kvos))
-  }
+    client.read(executorObject).map(kvos => new SimpleTaskExecutor(client, taskStateAllocator, kvos))
 
   def createNewExecutor(client: AspenClient,
                         executorAllocator: ObjectAllocator,
                         taskStateAllocator: ObjectAllocator)
-                       (using t: Transaction): Future[(KeyValueObjectPointer, SimpleTaskExecutor)] = {
+                       (using t: Transaction): Future[(KeyValueObjectPointer, SimpleTaskExecutor)] =
 
     given ExecutionContext = client.clientContext
 
-    for {
+    for
       executor <- executorAllocator.allocateKeyValueObject(Map())
       kvos <- client.read(executor)
-    } yield {
+    yield
       (executor, new SimpleTaskExecutor(client, taskStateAllocator, kvos))
-    }
-  }
-}
+
 
 class SimpleTaskExecutor(val client: AspenClient,
                          val taskStateAllocator: ObjectAllocator,
-                         kvos: KeyValueObjectState) extends TaskExecutor {
+                         kvos: KeyValueObjectState) extends TaskExecutor:
 
   import SimpleTaskExecutor._
 
@@ -53,107 +50,82 @@ class SimpleTaskExecutor(val client: AspenClient,
   protected var active: Set[DurableTaskPointer] = Set()
   protected var inactive: List[DurableTaskPointer] = Nil
 
-  synchronized {
-    kvos.contents.valuesIterator.foreach { vs =>
+  synchronized:
+    kvos.contents.valuesIterator.foreach: vs =>
       val taskPointer = DurableTaskPointer(KeyValueObjectPointer(vs.value.bytes))
-      client.read(taskPointer.kvPointer).foreach { kvos =>
-        synchronized {
-          if (kvos.contents.isEmpty || !kvos.contents.contains(TaskTypeKey))
+      client.read(taskPointer.kvPointer).foreach: kvos =>
+        synchronized:
+          if kvos.contents.isEmpty || !kvos.contents.contains(TaskTypeKey) then
             inactive = taskPointer :: inactive
-          else {
+          else
             val taskType = byte2uuid(kvos.contents(TaskTypeKey).value.bytes)
 
-            client.typeRegistry.getType[DurableTaskFactory](taskType) match {
-              case None => // TODO Log a warning. This should not be possible
+            client.typeRegistry.getType[DurableTaskFactory](taskType) match
+              case None =>
                 inactive = taskPointer :: inactive
 
               case Some(dtt) =>
                 dtt.createTask(client, taskPointer, kvos.revision, kvos.contents)
                 active += taskPointer
-            }
-          }
-        }
-      }
-    }
-  }
 
-  private def allocateTask(): Future[DurableTaskPointer] = {
-    def onFail(err: Throwable): Future[Unit] = {
-      client.read(executorObject).map { kvos =>
-        synchronized {
+  private def allocateTask(): Future[DurableTaskPointer] =
+    def onFail(err: Throwable): Future[Unit] =
+      client.read(executorObject).map: kvos =>
+        synchronized:
           executorRevision = kvos.revision
-        }
-      }
-    }
-    client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail) { tx =>
+
+    client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail): tx =>
       given Transaction = tx
-      synchronized {
+      synchronized:
         val taskKey = Key(UUID.randomUUID())
         val kreqs = KeyValueUpdate.DoesNotExist(taskKey) :: Nil
-        for {
+        for
           ptr <- taskStateAllocator.allocateKeyValueObject(Map())
-        } yield {
+        yield
           tx.update(executorObject, None, None, kreqs, Insert(taskKey, ptr.toArray) :: Nil)
           DurableTaskPointer(ptr)
-        }
-      }
-    }
-  }
 
-  private def deallocateTask(task: DurableTaskPointer): Unit = {
-    client.transactUntilSuccessful[Unit] { tx =>
+  private def deallocateTask(task: DurableTaskPointer): Unit =
+    client.transactUntilSuccessful[Unit]: tx =>
       given Transaction = tx
-      
-      client.read(task.kvPointer).map { kvos =>
+
+      client.read(task.kvPointer).map: kvos =>
         val deletes = kvos.contents.keys.map(k => Delete(k)).toList
         tx.update(task.kvPointer, None, None, Nil, deletes)
-        tx.result.foreach { _ =>
-          synchronized {
+        tx.result.foreach: _ =>
+          synchronized:
             active -= task
             inactive = task :: inactive
-          }
-        }
-      }
-    }
-  }
 
   override def prepareTask(taskType: DurableTaskFactory,
                            initialState: List[(Key, Array[Byte])])
-                          (using tx: Transaction): Future[Future[Option[AnyRef]]] = synchronized {
+                          (using tx: Transaction): Future[Future[Option[AnyRef]]] = synchronized:
     val initial = initialState.map(t => Insert(t._1, t._2))
 
-    val ins = Insert(TaskTypeKey,uuid2byte(taskType.typeUUID)) :: initial
+    val ins = Insert(TaskTypeKey, uuid2byte(taskType.typeUUID)) :: initial
 
-    val fptr = if (inactive.isEmpty) allocateTask() else {
-      val p = inactive.head
-      inactive = inactive.tail
-      Future.successful(p)
-    }
+    val fptr =
+      if inactive.isEmpty then allocateTask()
+      else
+        val p = inactive.head
+        inactive = inactive.tail
+        Future.successful(p)
 
-    for {
+    for
       taskPointer <- fptr
-    } yield {
+    yield
       tx.update(taskPointer.kvPointer, None, None, Nil, ins)
 
-      tx.result.failed.foreach { _ =>
-        synchronized {
+      tx.result.failed.foreach: _ =>
+        synchronized:
           inactive = taskPointer :: inactive
-        }
-      }
 
-      tx.result.flatMap { _ =>
-        client.read(taskPointer.kvPointer).flatMap { kvos =>
-          synchronized {
+      tx.result.flatMap: _ =>
+        client.read(taskPointer.kvPointer).flatMap: kvos =>
+          synchronized:
             val task = taskType.createTask(client, taskPointer, kvos.revision, kvos.contents)
 
             active += taskPointer
-            task.completed.foreach { _ =>
+            task.completed.foreach: _ =>
               deallocateTask(taskPointer)
-            }
             task.completed
-          }
-        }
-      }
-    }
-  }
-}

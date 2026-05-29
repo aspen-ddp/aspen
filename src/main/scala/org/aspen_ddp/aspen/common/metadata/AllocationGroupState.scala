@@ -26,7 +26,8 @@ final case class AllocationGroupState(
                                      groupId: AllocationGroupId,
                                      level: Int,
                                      name: String,
-                                     members: List[AllocationGroupState.Member]
+                                     members: List[AllocationGroupState.Member],
+                                     parentGroups: List[AllocationGroupId]
                                      ):
 
   def toBytes: Array[Byte] = Codec.encode(this).toByteArray

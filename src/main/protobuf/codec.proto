@@ -496,6 +496,7 @@ message AllocationGroupState {
   int32 level = 2;
   string name = 3;
   repeated AllocationGroupMember members = 4;
+  repeated UUID parentGroups = 5;
 }
 
 message HostState {

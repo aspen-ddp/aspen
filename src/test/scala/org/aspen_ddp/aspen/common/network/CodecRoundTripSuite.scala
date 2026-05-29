@@ -562,7 +562,8 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       members = List(
         AllocationGroupState.Member(AllocationGroupState.MemberType.Pool, uuid(2), Some(1024), 500L, 10000L),
         AllocationGroupState.Member(AllocationGroupState.MemberType.Group, uuid(3), None, 200L, 5000L)
-      )
+      ),
+      parentGroups = List(AllocationGroupId(uuid(4)), AllocationGroupId(uuid(5)))
     )
     val decoded = Codec.decode(Codec.encode(original))
     decoded.groupId shouldBe original.groupId
@@ -576,6 +577,7 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.members.head.maximumSize shouldBe 10000L
     decoded.members(1).memberType shouldBe AllocationGroupState.MemberType.Group
     decoded.members(1).maxObjectSize shouldBe None
+    decoded.parentGroups shouldBe List(AllocationGroupId(uuid(4)), AllocationGroupId(uuid(5)))
 
     val bytes = original.toBytes
     val fromBytes = AllocationGroupState(bytes)
@@ -584,9 +586,10 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     fromBytes.name shouldBe original.name
     fromBytes.members.size shouldBe original.members.size
 
-    val empty = AllocationGroupState(AllocationGroupId(uuid(10)), level = 0, name = "empty", members = Nil)
+    val empty = AllocationGroupState(AllocationGroupId(uuid(10)), level = 0, name = "empty", members = Nil, parentGroups = Nil)
     val decodedEmpty = Codec.decode(Codec.encode(empty))
     decodedEmpty.members shouldBe Nil
+    decodedEmpty.parentGroups shouldBe Nil
 
   test("HostState round-trip"):
     val original = HostState(

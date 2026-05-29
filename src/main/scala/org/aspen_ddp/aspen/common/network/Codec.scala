@@ -1075,7 +1075,8 @@ object Codec extends Logging:
       groupId = Some(encodeUUID(o.groupId.uuid)),
       level = o.level,
       name = o.name,
-      members = o.members.map(encode)
+      members = o.members.map(encode),
+      parentGroups = o.parentGroups.map(g => encodeUUID(g.uuid))
     )
 
   def decode(m: codec.AllocationGroupState): AllocationGroupState =
@@ -1083,7 +1084,8 @@ object Codec extends Logging:
     val level = m.level
     val name = m.name
     val members = m.members.map(decode).toList
-    new AllocationGroupState(groupId, level, name, members)
+    val parentGroups = m.parentGroups.map(u => AllocationGroupId(decodeUUID(u))).toList
+    new AllocationGroupState(groupId, level, name, members, parentGroups)
 
 
   def encode(o: HostState): codec.HostState =

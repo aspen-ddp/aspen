@@ -1,4 +1,13 @@
 
+- AllocationGroupState
+  - removePool/Group
+  - addPool(client:AspenClient, poolId: PoolId): Future[Unit]
+  - addAllocationGroup(client:AspenClient, groupId: AllocationGroupId): Future[Unit]
+    - Throw exception if level check fails
+    - implemented in transactUntillSuccessful
+    - If overall size/usage changes and parentGroups.nonEmpty,
+        Create UpdateAllocationGroupUsageTask
+      
 - UpdateAllocationGroupsUsageTask
   - Config: (updateTimestamp, Pool/Group Type, UUID, maxSize, newUsage, list-of-group-ids)
   - completion = Future.sequence(gid-list.map.updateGroup(_))
@@ -7,24 +16,10 @@
   - updateGroup(gorupId): Future[Unit]
     - retryTillSuccessfulWithRecovery - recover: stop if fetch state object fails
       - fetch AllocationGroupState
-      - createTx
-      - If kvos.contents.get(uuid) is None or lastUpdateTimestamp < updateTimestamp
-        - update entry
-        - Iterate over all keys 16-bytes in size:
-          - decode as GroupEntry
-          - sum all usage and maxSize
-          - If usage differs by 0.5% or maxSize has changed AND has parent groups:
-            - Create UpdateAllocationGroupUsageTask to update parent groups
-
-- AddToAllocationGroupTask
-  - Does this really need to be a task?
-    - Just use multi-object transaction
-  - (Pool/Group Type, UUID, maxSize, currentUsage)
-  - Add and calculate effect on group usage
-    - CreateUpdateAllocationGroupUsageTask if necessary
-
-- RemoveFromAllocationGroupTask
-  - Same
+      - update member entry
+      - If usage/maxsize changes by > 0.5%, create updateAllocationGroupsUsageTask
+        for updating parent groups
+      - overwrite object
 
 Refactor StoragePoolState
 

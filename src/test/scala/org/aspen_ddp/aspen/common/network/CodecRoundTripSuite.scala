@@ -4,7 +4,8 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -552,6 +553,40 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     )
     val decodedNoMax = Codec.decode(Codec.encode(noMaxSize))
     decodedNoMax.maxObjectSize shouldBe None
+
+  test("AllocationGroupState round-trip"):
+    val original = AllocationGroupState(
+      AllocationGroupId(uuid(1)),
+      level = 2,
+      name = "test-group",
+      members = List(
+        AllocationGroupState.Member(AllocationGroupState.MemberType.Pool, uuid(2), Some(1024), 500L, 10000L),
+        AllocationGroupState.Member(AllocationGroupState.MemberType.Group, uuid(3), None, 200L, 5000L)
+      )
+    )
+    val decoded = Codec.decode(Codec.encode(original))
+    decoded.groupId shouldBe original.groupId
+    decoded.level shouldBe 2
+    decoded.name shouldBe "test-group"
+    decoded.members.size shouldBe 2
+    decoded.members.head.memberType shouldBe AllocationGroupState.MemberType.Pool
+    decoded.members.head.uuid shouldBe uuid(2)
+    decoded.members.head.maxObjectSize shouldBe Some(1024)
+    decoded.members.head.currentUsage shouldBe 500L
+    decoded.members.head.maximumSize shouldBe 10000L
+    decoded.members(1).memberType shouldBe AllocationGroupState.MemberType.Group
+    decoded.members(1).maxObjectSize shouldBe None
+
+    val bytes = original.toBytes
+    val fromBytes = AllocationGroupState(bytes)
+    fromBytes.groupId shouldBe original.groupId
+    fromBytes.level shouldBe original.level
+    fromBytes.name shouldBe original.name
+    fromBytes.members.size shouldBe original.members.size
+
+    val empty = AllocationGroupState(AllocationGroupId(uuid(10)), level = 0, name = "empty", members = Nil)
+    val decodedEmpty = Codec.decode(Codec.encode(empty))
+    decodedEmpty.members shouldBe Nil
 
   test("HostState round-trip"):
     val original = HostState(

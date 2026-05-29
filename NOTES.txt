@@ -17,6 +17,8 @@
             - Create UpdateAllocationGroupUsageTask to update parent groups
 
 - AddToAllocationGroupTask
+  - Does this really need to be a task?
+    - Just use multi-object transaction
   - (Pool/Group Type, UUID, maxSize, currentUsage)
   - Add and calculate effect on group usage
     - CreateUpdateAllocationGroupUsageTask if necessary

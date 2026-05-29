@@ -6,7 +6,8 @@ import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -1043,6 +1044,46 @@ object Codec extends Logging:
 
     StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig,
       currentUsage, maximumStoreSize, allocationGroups)
+
+
+  def encodeAllocationGroupMemberType(o: AllocationGroupState.MemberType): codec.AllocationGroupMemberType = o match
+    case AllocationGroupState.MemberType.Pool => codec.AllocationGroupMemberType.ALLOCATION_GROUP_MEMBER_TYPE_POOL
+    case AllocationGroupState.MemberType.Group => codec.AllocationGroupMemberType.ALLOCATION_GROUP_MEMBER_TYPE_GROUP
+
+  def decodeAllocationGroupMemberType(m: codec.AllocationGroupMemberType): AllocationGroupState.MemberType = m match
+    case codec.AllocationGroupMemberType.ALLOCATION_GROUP_MEMBER_TYPE_POOL => AllocationGroupState.MemberType.Pool
+    case codec.AllocationGroupMemberType.ALLOCATION_GROUP_MEMBER_TYPE_GROUP => AllocationGroupState.MemberType.Group
+    case codec.AllocationGroupMemberType.Unrecognized(v) => throw new EncodingError(f"Invalid AllocationGroup MemberType: $v")
+
+  def encode(o: AllocationGroupState.Member): codec.AllocationGroupMember =
+    codec.AllocationGroupMember(
+      memberType = encodeAllocationGroupMemberType(o.memberType),
+      uuid = Some(encodeUUID(o.uuid)),
+      maxObjectSize = o.maxObjectSize.getOrElse(0),
+      currentUsage = o.currentUsage,
+      maximumSize = o.maximumSize
+    )
+
+  def decode(m: codec.AllocationGroupMember): AllocationGroupState.Member =
+    val memberType = decodeAllocationGroupMemberType(m.memberType)
+    val uuid = decodeUUID(m.uuid.get)
+    val maxObjectSize = if m.maxObjectSize == 0 then None else Some(m.maxObjectSize)
+    AllocationGroupState.Member(memberType, uuid, maxObjectSize, m.currentUsage, m.maximumSize)
+
+  def encode(o: AllocationGroupState): codec.AllocationGroupState =
+    codec.AllocationGroupState(
+      groupId = Some(encodeUUID(o.groupId.uuid)),
+      level = o.level,
+      name = o.name,
+      members = o.members.map(encode)
+    )
+
+  def decode(m: codec.AllocationGroupState): AllocationGroupState =
+    val groupId = AllocationGroupId(decodeUUID(m.groupId.get))
+    val level = m.level
+    val name = m.name
+    val members = m.members.map(decode).toList
+    new AllocationGroupState(groupId, level, name, members)
 
 
   def encode(o: HostState): codec.HostState =

@@ -478,6 +478,26 @@ message StoragePoolState {
   repeated UUID allocationGroups = 9;
 }
 
+enum AllocationGroupMemberType {
+  ALLOCATION_GROUP_MEMBER_TYPE_POOL = 0;
+  ALLOCATION_GROUP_MEMBER_TYPE_GROUP = 1;
+}
+
+message AllocationGroupMember {
+  AllocationGroupMemberType memberType = 1;
+  UUID uuid = 2;
+  uint32 maxObjectSize = 3;
+  int64 currentUsage = 4;
+  int64 maximumSize = 5;
+}
+
+message AllocationGroupState {
+  UUID groupId = 1;
+  int32 level = 2;
+  string name = 3;
+  repeated AllocationGroupMember members = 4;
+}
+
 message HostState {
   UUID hostId = 1;
   string name = 2;

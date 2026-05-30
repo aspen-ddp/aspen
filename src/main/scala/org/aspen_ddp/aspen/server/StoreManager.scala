@@ -25,6 +25,7 @@ import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.compute.TaskExecutor
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
+import org.aspen_ddp.aspen.server.usage.StorageDeviceUsageManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 
 import java.io.File
@@ -113,6 +114,7 @@ class StoreManager(val client: AspenClient,
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
   private val poolUsageManager = new StoragePoolUsageManager(client)
+  private val deviceUsageManager = new StorageDeviceUsageManager(client)
   private var usageUpdateTask: Option[ScheduledTask] = None
 
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
@@ -192,6 +194,8 @@ class StoreManager(val client: AspenClient,
       synchronized:
         stores.valuesIterator.foreach: store =>
           poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
+        storageDevices.valuesIterator.foreach: sds =>
+          deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
     )
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future

@@ -20,7 +20,8 @@ object UpdateAllocationGroupUsageTask extends DurableTaskFactory:
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
                  revision: ObjectRevision,
-                 state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+                 state: Map[Key, KeyValueObjectState.ValueState],
+                 taskExecutor: TaskExecutor): DurableTask =
     new UpdateAllocationGroupUsageTask(pointer)
 
   def prepareTask(childUUID: UUID,

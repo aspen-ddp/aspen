@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, Directory
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, Directory, DirectoryEntry, DirectoryInode, DirectoryPointer, FileSystem, InodePointer}
 import org.apache.logging.log4j.scala.Logging
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
-import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor}
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -196,7 +196,8 @@ object SimpleDirectory:
     override def createTask(client: AspenClient,
                             pointer: DurableTaskPointer,
                             revision: ObjectRevision,
-                            state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+                            state: Map[Key, KeyValueObjectState.ValueState],
+                            taskExecutor: TaskExecutor): DurableTask =
       val fsUUID = byte2uuid(state(FileSystemUUIDKey).value.bytes)
       val dptr = InodePointer(state(InodePointerKey).value.bytes).asInstanceOf[DirectoryPointer]
 

@@ -65,7 +65,7 @@ class SimpleTaskExecutor(val client: AspenClient,
                 inactive = taskPointer :: inactive
 
               case Some(dtt) =>
-                dtt.createTask(client, taskPointer, kvos.revision, kvos.contents)
+                dtt.createTask(client, taskPointer, kvos.revision, kvos.contents, this)
                 active += taskPointer
 
   private def allocateTask(): Future[DurableTaskPointer] =
@@ -123,7 +123,7 @@ class SimpleTaskExecutor(val client: AspenClient,
       tx.result.flatMap: _ =>
         client.read(taskPointer.kvPointer).flatMap: kvos =>
           synchronized:
-            val task = taskType.createTask(client, taskPointer, kvos.revision, kvos.contents)
+            val task = taskType.createTask(client, taskPointer, kvos.revision, kvos.contents, this)
 
             active += taskPointer
             task.completed.foreach: _ =>

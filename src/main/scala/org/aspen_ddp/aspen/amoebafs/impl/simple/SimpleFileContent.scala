@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, InvalidObject, 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.util.{Varint, db2string}
-import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor}
 import org.aspen_ddp.aspen.amoebafs.{FileInode, FileSystem}
 import org.apache.logging.log4j.scala.{Logger, Logging}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
@@ -285,7 +285,8 @@ object SimpleFileContent:
     override def createTask(client: AspenClient,
                             pointer: DurableTaskPointer,
                             revision: ObjectRevision,
-                            state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+                            state: Map[Key, KeyValueObjectState.ValueState],
+                            taskExecutor: TaskExecutor): DurableTask =
       new DeleteFileContentTask(client, pointer, revision, state)
   
     /** Returns a Future that completes then the task creation is prepared for commit of the transaction. The inner future

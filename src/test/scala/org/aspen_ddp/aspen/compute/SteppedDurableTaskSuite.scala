@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
+import org.aspen_ddp.aspen.compute.TaskExecutor
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -20,7 +21,8 @@ object TestSteppedTask extends DurableTaskFactory:
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
                  revision: ObjectRevision,
-                 state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+                 state: Map[Key, KeyValueObjectState.ValueState],
+                 taskExecutor: TaskExecutor): DurableTask =
 
     val dataPointer = org.aspen_ddp.aspen.common.objects.DataObjectPointer(state(DataPointerKey).value.bytes)
     new TestSteppedTask(pointer, client, dataPointer)

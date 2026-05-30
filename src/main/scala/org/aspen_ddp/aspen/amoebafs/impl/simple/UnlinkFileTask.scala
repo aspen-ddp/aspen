@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRefcount, ObjectRevision}
-import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, SteppedDurableTask}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, SteppedDurableTask, TaskExecutor}
 import org.aspen_ddp.aspen.common.util.{byte2int, byte2uuid, int2byte, uuid2byte}
 import org.aspen_ddp.aspen.amoebafs.{FileSystem, InodePointer}
 
@@ -19,7 +19,8 @@ object UnlinkFileTask extends DurableTaskFactory:
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
                  revision: ObjectRevision,
-                 state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+                 state: Map[Key, KeyValueObjectState.ValueState],
+                 taskExecutor: TaskExecutor): DurableTask =
     val fsUUID = byte2uuid(state(FileSystemUUIDKey).value.bytes)
     val ptr = InodePointer(state(InodePointerKey).value.bytes)
     val fs = FileSystem.getRegisteredFileSystem(fsUUID).get

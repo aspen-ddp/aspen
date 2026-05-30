@@ -10,5 +10,6 @@ trait DurableTaskFactory extends RegisteredTypeFactory:
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
                  revision: ObjectRevision,
-                 state: Map[Key, KeyValueObjectState.ValueState]): DurableTask
+                 state: Map[Key, KeyValueObjectState.ValueState],
+                 taskExecutor: TaskExecutor): DurableTask
 

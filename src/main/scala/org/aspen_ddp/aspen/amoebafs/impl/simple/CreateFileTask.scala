@@ -23,7 +23,8 @@ object CreateFileTask extends DurableTaskFactory:
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
                  revision: ObjectRevision,
-                 state: Map[Key, KeyValueObjectState.ValueState]): DurableTask =
+                 state: Map[Key, KeyValueObjectState.ValueState],
+                 taskExecutor: TaskExecutor): DurableTask =
     val fsUUID = byte2uuid(state(FileSystemUUIDKey).value.bytes)
     val ptr = InodePointer(state(DirectoryInodeKey).value.bytes).asInstanceOf[DirectoryPointer]
     val inode = Inode(client, state(InodeKey).value.bytes)

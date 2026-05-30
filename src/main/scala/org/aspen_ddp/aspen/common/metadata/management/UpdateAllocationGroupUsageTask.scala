@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.metadata.management
 
 import org.apache.logging.log4j.scala.Logging
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadError, StopRetrying, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadError, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
@@ -123,63 +123,12 @@ class UpdateAllocationGroupUsageTask(
           val groupUUID = allocationGroups(nextIndex)
           val groupId = AllocationGroupId(groupUUID)
 
-          val fUpdate = for
+          val fFetch = for
             agsPtr <- client.getAllocationGroupPointer(groupId)
             agsDos <- client.read(agsPtr)
-          yield
-            val ags = AllocationGroupState(agsDos)
+          yield (agsPtr, agsDos)
 
-            ags.members.find(_.uuid == childUUID) match
-              case None =>
-                advanceIndex(kvos)
-
-              case Some(member) =>
-                val oldGroupUsage = ags.currentUsage
-                val oldGroupMaxSize = ags.maximumSize
-
-                val updatedMembers = ags.members.map: m =>
-                  if m.uuid == childUUID then
-                    m.copy(currentUsage = currentUsage, maximumSize = maximumSize)
-                  else m
-
-                val nags = ags.copy(members = updatedMembers)
-                val newGroupUsage = nags.currentUsage
-                val newGroupMaxSize = nags.maximumSize
-
-                val needsCascade = nags.parentGroups.nonEmpty &&
-                  (exceedsThreshold(newGroupUsage, oldGroupUsage) ||
-                    exceedsThreshold(newGroupMaxSize, oldGroupMaxSize))
-
-                val tx = client.newTransaction()
-
-                tx.overwrite(agsPtr, agsDos.revision, DataBuffer(nags.toBytes))
-
-                val requirements = KeyValueUpdate.KeyRevision(NextIndexKey, vs.revision) :: Nil
-                val operations = Insert(NextIndexKey, long2byte(nextIndex + 1)) :: Nil
-                tx.update(taskPointer.kvPointer, None, None, requirements, operations)
-
-                given Transaction = tx
-
-                val fCascade =
-                  if needsCascade then
-                    UpdateAllocationGroupUsageTask.prepareTask(
-                      groupId.uuid, newGroupUsage, newGroupMaxSize,
-                      nags.parentGroups.map(_.uuid), taskExecutor
-                    ).map(_ => ())
-                  else
-                    Future.unit
-
-                fCascade.flatMap: _ =>
-                  tx.commit().transform:
-                    case Success(_) =>
-                      retryDelay = 16
-                      updateNextGroup()
-                      Success(())
-                    case Failure(err) =>
-                      scheduleRetry()
-                      Success(())
-
-          fUpdate.onComplete:
+          fFetch.onComplete:
             case Failure(err) => err match
               case _: NoSuchElementException | _: ReadError =>
                 advanceIndex(kvos)
@@ -187,4 +136,55 @@ class UpdateAllocationGroupUsageTask(
                 failTask(e)
               case _ =>
                 scheduleRetry()
-            case Success(_) => ()
+
+            case Success((agsPtr, agsDos)) =>
+              val ags = AllocationGroupState(agsDos)
+
+              ags.members.find(_.uuid == childUUID) match
+                case None =>
+                  advanceIndex(kvos)
+
+                case Some(member) =>
+                  val oldGroupUsage = ags.currentUsage
+                  val oldGroupMaxSize = ags.maximumSize
+
+                  val updatedMembers = ags.members.map: m =>
+                    if m.uuid == childUUID then
+                      m.copy(currentUsage = currentUsage, maximumSize = maximumSize)
+                    else m
+
+                  val nags = ags.copy(members = updatedMembers)
+                  val newGroupUsage = nags.currentUsage
+                  val newGroupMaxSize = nags.maximumSize
+
+                  val needsCascade = nags.parentGroups.nonEmpty &&
+                    (exceedsThreshold(newGroupUsage, oldGroupUsage) ||
+                      exceedsThreshold(newGroupMaxSize, oldGroupMaxSize))
+
+                  val tx = client.newTransaction()
+
+                  tx.overwrite(agsPtr, agsDos.revision, DataBuffer(nags.toBytes))
+
+                  val requirements = KeyValueUpdate.KeyRevision(NextIndexKey, vs.revision) :: Nil
+                  val operations = Insert(NextIndexKey, long2byte(nextIndex + 1)) :: Nil
+                  tx.update(taskPointer.kvPointer, None, None, requirements, operations)
+
+                  given Transaction = tx
+
+                  val fCascade =
+                    if needsCascade then
+                      UpdateAllocationGroupUsageTask.prepareTask(
+                        groupId.uuid, newGroupUsage, newGroupMaxSize,
+                        nags.parentGroups.map(_.uuid), taskExecutor
+                      ).map(_ => ())
+                    else
+                      Future.unit
+
+                  fCascade.flatMap: _ =>
+                    tx.commit()
+                  .onComplete:
+                    case Success(_) =>
+                      retryDelay = 16
+                      updateNextGroup()
+                    case Failure(_) =>
+                      scheduleRetry()

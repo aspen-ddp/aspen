@@ -609,6 +609,26 @@ class ZMQNetwork(val oclientId: Option[ClientId],
         logger.trace(s"Got $message")
         onTransactionMessageReceived(message)
 
+      case codec.Message.Msg.ReadResponse(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
+
+      case codec.Message.Msg.TransactionCompletionResponse(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
+
+      case codec.Message.Msg.TxResolved(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
+
+      case codec.Message.Msg.TxFinalized(r) =>
+        val message = Codec.decode(r)
+        logger.trace(s"Got $message")
+        onClientResponseReceived(message)
+
       case codec.Message.Msg.Empty =>
         logger.error("Empty Message!")
   }

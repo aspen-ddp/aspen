@@ -1,13 +1,4 @@
 
-- AllocationGroupState
-  - removePool/Group
-  - addPool(client:AspenClient, poolId: PoolId): Future[Unit]
-  - addAllocationGroup(client:AspenClient, groupId: AllocationGroupId): Future[Unit]
-    - Throw exception if level check fails
-    - implemented in transactUntillSuccessful
-    - If overall size/usage changes and parentGroups.nonEmpty,
-        Create UpdateAllocationGroupUsageTask
-      
 - UpdateAllocationGroupsUsageTask
   - Config: (updateTimestamp, Pool/Group Type, UUID, maxSize, newUsage, list-of-group-ids)
   - completion = Future.sequence(gid-list.map.updateGroup(_))

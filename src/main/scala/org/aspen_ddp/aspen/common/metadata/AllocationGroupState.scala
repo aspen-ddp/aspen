@@ -225,6 +225,11 @@ final case class AllocationGroupState(
     members.foldLeft(0L): (acc, m) =>
       val sz = if m.uuid == uuid then newUsage else m.currentUsage
       acc + sz
+
+  def newMaximumSize(uuid: UUID, newMaxSize: Long): Long =
+    members.foldLeft(0L): (acc, m) =>
+      val sz = if m.uuid == uuid then newMaxSize else m.maximumSize
+      acc + sz
   
   /** Returns the smallest maximumObjectSize for all members */
   def maximumObjectSize: Option[Int] =

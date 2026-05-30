@@ -147,3 +147,148 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       ps2.allocationGroups should contain(groupId2.uuid)
       ags1b.members.exists(_.uuid == Radicle.poolId.uuid) should be(false)
       ags2b.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
+
+  atest("addGroup adds child group to parent group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- waitForTransactionsToComplete()
+
+      child <- readGroupState(childId)
+      parent <- readGroupState(parentId)
+    yield
+      child.parentGroups.exists(_.uuid == parentId.uuid) should be(true)
+      parent.members.exists(_.uuid == childId.uuid) should be(true)
+
+  atest("addGroup sets correct member fields"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- waitForTransactionsToComplete()
+
+      child <- readGroupState(childId)
+      parent <- readGroupState(parentId)
+    yield
+      val member = parent.members.find(_.uuid == childId.uuid).get
+      member.memberType should be(AllocationGroupState.MemberType.Group)
+      member.maxObjectSize should be(child.maximumObjectSize)
+      member.currentUsage should be(child.currentUsage)
+      member.maximumSize should be(child.maximumSize)
+
+  atest("removeGroup removes child group from parent group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.removeGroup(client, childId, parentId, executor)
+      _ <- waitForTransactionsToComplete()
+
+      child <- readGroupState(childId)
+      parent <- readGroupState(parentId)
+    yield
+      child.parentGroups.exists(_.uuid == parentId.uuid) should be(false)
+      parent.members.exists(_.uuid == childId.uuid) should be(false)
+
+  atest("addGroup is idempotent"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- waitForTransactionsToComplete()
+
+      child <- readGroupState(childId)
+      parent <- readGroupState(parentId)
+    yield
+      child.parentGroups.count(_.uuid == parentId.uuid) should be(1)
+      parent.members.count(_.uuid == childId.uuid) should be(1)
+
+  atest("addGroup rejects equal level"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      groupA <- client.createAllocationGroup("group-a", level = 0)
+      _ <- waitForTransactionsToComplete()
+      groupB <- client.createAllocationGroup("group-b", level = 0)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- recoverToSucceededIf[AllocationGroupState.InvalidLevel](
+        AllocationGroupState.addGroup(client, groupA, groupB, executor)
+      )
+    yield succeed
+
+  atest("addGroup rejects lower-level parent"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-group", level = 1)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- recoverToSucceededIf[AllocationGroupState.InvalidLevel](
+        AllocationGroupState.addGroup(client, childId, parentId, executor)
+      )
+    yield succeed
+
+  atest("add and remove group with multiple parents"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId1 <- client.createAllocationGroup("parent-1", level = 1)
+      _ <- waitForTransactionsToComplete()
+      parentId2 <- client.createAllocationGroup("parent-2", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId1, executor)
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addGroup(client, childId, parentId2, executor)
+      _ <- waitForTransactionsToComplete()
+
+      child1 <- readGroupState(childId)
+      parent1a <- readGroupState(parentId1)
+      parent2a <- readGroupState(parentId2)
+      _ = child1.parentGroups.exists(_.uuid == parentId1.uuid) should be(true)
+      _ = child1.parentGroups.exists(_.uuid == parentId2.uuid) should be(true)
+      _ = parent1a.members.exists(_.uuid == childId.uuid) should be(true)
+      _ = parent2a.members.exists(_.uuid == childId.uuid) should be(true)
+
+      _ <- AllocationGroupState.removeGroup(client, childId, parentId1, executor)
+      _ <- waitForTransactionsToComplete()
+
+      child2 <- readGroupState(childId)
+      parent1b <- readGroupState(parentId1)
+      parent2b <- readGroupState(parentId2)
+    yield
+      child2.parentGroups.exists(_.uuid == parentId1.uuid) should be(false)
+      child2.parentGroups.exists(_.uuid == parentId2.uuid) should be(true)
+      parent1b.members.exists(_.uuid == childId.uuid) should be(false)
+      parent2b.members.exists(_.uuid == childId.uuid) should be(true)

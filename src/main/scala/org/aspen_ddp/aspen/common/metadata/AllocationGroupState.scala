@@ -24,6 +24,9 @@ object AllocationGroupState:
                     maxObjectSize: Option[Int],
                     currentUsage: Long,
                     maximumSize: Long)
+  
+  /** Thrown if attempting to add a group to one of an equal or lower level */
+  class InvalidLevel extends Throwable
 
   def apply(cfg: Array[Byte]): AllocationGroupState = Codec.decode(codec.AllocationGroupState.parseFrom(cfg))
   def apply(dos: DataObjectState): AllocationGroupState = apply(dos.data.getByteArray)
@@ -110,6 +113,96 @@ object AllocationGroupState:
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
+
+    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      prep(tx)
+
+
+  def addGroup(client: AspenClient,
+               childId: AllocationGroupId,
+               parentId: AllocationGroupId,
+               taskExecutor: TaskExecutor): Future[Unit] =
+
+    def mod(childPtr: DataObjectPointer, childDos: DataObjectState,
+            parentPtr: DataObjectPointer, parentDos: DataObjectState,
+            child: AllocationGroupState, parent: AllocationGroupState,
+            tx: Transaction): (AllocationGroupState, AllocationGroupState) =
+      if child.parentGroups.exists(_.uuid == parentId.uuid) && parent.members.exists(_.uuid == childId.uuid) then
+        (child, parent)
+      else
+        if child.level >= parent.level then
+          throw new InvalidLevel()
+        
+        val nchild = child.copy(parentGroups = parentId :: child.parentGroups)
+        
+        tx.overwrite(childPtr, childDos.revision, DataBuffer(nchild.toBytes))
+        
+        val m = Member(MemberType.Group, child.groupId.uuid, child.maximumObjectSize, 
+          child.currentUsage, child.maximumSize)
+        val nags = parent.copy(members = m :: parent.members)
+
+        tx.overwrite(parentPtr, parentDos.revision, DataBuffer(nags.toBytes))
+
+        (nchild, nags)
+
+    modifyGroup(client, childId, parentId, taskExecutor, mod)
+
+  def removeGroup(client: AspenClient,
+                  childId: AllocationGroupId,
+                  parentId: AllocationGroupId,
+                  taskExecutor: TaskExecutor): Future[Unit] =
+
+    def mod(childPtr: DataObjectPointer, childDos: DataObjectState,
+            parentPtr: DataObjectPointer, parentDos: DataObjectState,
+            child: AllocationGroupState, parent: AllocationGroupState,
+            tx: Transaction): (AllocationGroupState, AllocationGroupState) =
+      if !child.parentGroups.exists(_.uuid == parentId.uuid) && !parent.members.exists(_.uuid == childId.uuid) then
+        (child, parent)
+      else
+        val nchild = child.copy(parentGroups = child.parentGroups.filter(_ != parentId))
+
+        tx.overwrite(childPtr, childDos.revision, DataBuffer(nchild.toBytes))
+
+        val nparent = parent.copy(members = parent.members.filter(_.uuid != child.groupId.uuid))
+
+        tx.overwrite(parentPtr, parentDos.revision, DataBuffer(nparent.toBytes))
+
+        (nchild, nparent)
+
+    modifyGroup(client, childId, parentId, taskExecutor, mod)
+    
+  private def modifyGroup(client: AspenClient,
+                          childId: AllocationGroupId,
+                          parentId: AllocationGroupId,
+                          taskExecutor: TaskExecutor,
+                          mod: (DataObjectPointer, DataObjectState, DataObjectPointer, DataObjectState,
+                            AllocationGroupState, AllocationGroupState,
+                            Transaction) => (AllocationGroupState, AllocationGroupState)
+                         ): Future[Unit] =
+    given ExecutionContext = client.clientContext
+
+    def prep(tx: Transaction): Future[Unit] =
+      given Transaction = tx
+
+      for
+        childPtr <- client.getAllocationGroupPointer(childId)
+        parentPtr <- client.getAllocationGroupPointer(parentId)
+        childDos <- client.read(childPtr)
+        parentDos <- client.read(parentPtr)
+      yield
+        val child = AllocationGroupState(childDos)
+        val parent = AllocationGroupState(parentDos)
+
+        val (nchild, nparent) = mod(childPtr, childDos, parentPtr, parentDos, child, parent, tx)
+
+        if nparent.parentGroups.nonEmpty then
+          UpdateAllocationGroupUsageTask.prepareTask(childId.uuid,
+            nparent.currentUsage, nparent.maximumSize, nparent.parentGroups.map(_.uuid), taskExecutor)
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: ReadError => throw StopRetrying(e)
+      case e: InvalidLevel => throw StopRetrying(e)
 
     client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prep(tx)

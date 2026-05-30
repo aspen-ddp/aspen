@@ -50,3 +50,66 @@ class StorageDeviceUsageManagerSuite extends IntegrationTestSuite:
       kvos2 <- client.read(devPtr)
     yield
       kvos2.contents(StorageDeviceState.StateKey).revision should be(rev1)
+
+  atest("Update when currentUsage changes significantly"):
+    given ExecutionContext = executionContext
+    val mgr = new StorageDeviceUsageManager(client)
+
+    for
+      _ <- mgr.updateDeviceUsage(net.storageDeviceId, 10000L, 100000L)
+      _ <- waitForTransactionsToComplete()
+
+      devPtr <- client.getStorageDevicePointer(net.storageDeviceId)
+      kvos1 <- client.read(devPtr)
+      rev1 = kvos1.contents(StorageDeviceState.StateKey).revision
+
+      _ <- mgr.updateDeviceUsage(net.storageDeviceId, 10200L, 100000L)
+      _ <- waitForTransactionsToComplete()
+
+      kvos2 <- client.read(devPtr)
+      state2 = StorageDeviceState(kvos2)
+    yield
+      kvos2.contents(StorageDeviceState.StateKey).revision should not be rev1
+      state2.currentUsage should be(10200L)
+      state2.totalSize should be(100000L)
+
+  atest("Update when totalSize changes significantly"):
+    given ExecutionContext = executionContext
+    val mgr = new StorageDeviceUsageManager(client)
+
+    for
+      _ <- mgr.updateDeviceUsage(net.storageDeviceId, 10000L, 100000L)
+      _ <- waitForTransactionsToComplete()
+
+      devPtr <- client.getStorageDevicePointer(net.storageDeviceId)
+      kvos1 <- client.read(devPtr)
+      rev1 = kvos1.contents(StorageDeviceState.StateKey).revision
+
+      _ <- mgr.updateDeviceUsage(net.storageDeviceId, 10000L, 101000L)
+      _ <- waitForTransactionsToComplete()
+
+      kvos2 <- client.read(devPtr)
+      state2 = StorageDeviceState(kvos2)
+    yield
+      kvos2.contents(StorageDeviceState.StateKey).revision should not be rev1
+      state2.currentUsage should be(10000L)
+      state2.totalSize should be(101000L)
+
+  atest("No update when both changes are below threshold"):
+    given ExecutionContext = executionContext
+    val mgr = new StorageDeviceUsageManager(client)
+
+    for
+      _ <- mgr.updateDeviceUsage(net.storageDeviceId, 10000L, 100000L)
+      _ <- waitForTransactionsToComplete()
+
+      devPtr <- client.getStorageDevicePointer(net.storageDeviceId)
+      kvos1 <- client.read(devPtr)
+      rev1 = kvos1.contents(StorageDeviceState.StateKey).revision
+
+      _ <- mgr.updateDeviceUsage(net.storageDeviceId, 10040L, 100400L)
+      _ <- waitForTransactionsToComplete()
+
+      kvos2 <- client.read(devPtr)
+    yield
+      kvos2.contents(StorageDeviceState.StateKey).revision should be(rev1)

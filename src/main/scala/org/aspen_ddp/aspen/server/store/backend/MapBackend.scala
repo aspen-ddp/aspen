@@ -15,7 +15,7 @@ class MapBackend(val storeId: StoreId) extends Backend {
 
   var m: Map[ObjectId, ObjectState] = Map()
 
-  override def close(): Future[Unit] = Future.successful(())
+  override def close(): Future[Unit] = Future.unit
   
   override def estimateSize(): Long = 0
   

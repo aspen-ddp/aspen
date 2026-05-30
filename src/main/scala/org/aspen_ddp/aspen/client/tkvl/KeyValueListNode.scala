@@ -84,7 +84,7 @@ class KeyValueListNode(val reader: ObjectReader,
              value: Value,
              maxNodeSize: Int,
              allocator: ObjectAllocator,
-             prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
+             prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
              requirement: Option[Either[Boolean, ObjectRevision]] = None
             )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
     logger.trace(s"KeyValueListNode got containing hostState for key $key. Min: ${node.minimum}")
@@ -95,13 +95,13 @@ class KeyValueListNode(val reader: ObjectReader,
              newKey: Key,
              maxNodeSize: Int,
              allocator: ObjectAllocator,
-             prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
+             prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
             )(using tx: Transaction): Future[Unit] = fetchContainingNode(oldKey).flatMap { node =>
     KeyValueListNode.rename(node, ordering, oldKey, newKey, maxNodeSize, allocator, prepareForSplit)
   }
 
   def delete(key: Key,
-             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(())
+             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit
             )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
     KeyValueListNode.delete(node, key, reader, prepareForJoin)
   }
@@ -258,7 +258,7 @@ object KeyValueListNode {
                      value: Value,
                      maxNodeSize: Int,
                      allocator: ObjectAllocator,
-                     prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
+                     prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
                      requirement: Option[Either[Boolean, ObjectRevision]] = None
                     )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
 
@@ -293,7 +293,7 @@ object KeyValueListNode {
       tx.update(node.pointer, None, None,
         WithinRange(key, ordering) :: reqs, List(Insert(key, value.bytes)))
 
-      Future.successful(())
+      Future.unit
     } else {
       val fullContent = node.contents + (key -> ValueState(value, tx.revision, HLCTimestamp.now))
       val keys = fullContent.keysIterator.toArray
@@ -352,7 +352,7 @@ object KeyValueListNode {
                      newKey: Key,
                      maxNodeSize: Int,
                      allocator: ObjectAllocator,
-                     prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()),
+                     prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
                     )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
 
     assert(node.contents.contains(oldKey))
@@ -383,7 +383,7 @@ object KeyValueListNode {
       tx.update(node.pointer, None, None,
         WithinRange(newKey, ordering) :: reqs, List(Delete(oldKey), Insert(newKey, value.bytes)))
 
-      Future.successful(())
+      Future.unit
     } else {
       val fullContent = node.contents - oldKey + (newKey -> ValueState(value, tx.revision, HLCTimestamp.now))
       val keys = fullContent.keysIterator.toArray
@@ -438,19 +438,19 @@ object KeyValueListNode {
   def delete(node: KeyValueListNode,
              key: Key,
              reader: ObjectReader,
-             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.successful(()))(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
+             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit)(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
 
     if (! node.contents.contains(key))
-      Future.successful(())
+      Future.unit
     else {
       if (node.contents.size > 1) {
         tx.update(node.pointer, None, None, List(KeyValueUpdate.Exists(key)), List(Delete(key)))
-        Future.successful(())
+        Future.unit
       } else {
         node.tail match {
           case None =>
             tx.update(node.pointer, None, None, List(KeyValueUpdate.Exists(key)), List(Delete(key)))
-            Future.successful(())
+            Future.unit
 
           case Some(rp) =>
             reader.read(rp.pointer, s"Deleting key from KVListNode hostState ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
@@ -485,16 +485,16 @@ object KeyValueListNode {
              prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit])(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
 
     if (!node.contents.contains(key))
-      Future.successful(())
+      Future.unit
     else {
       if (node.contents.size > 1) {
         tx.update(node.pointer, requiredRevision, None, requirements, List(Delete(key)))
-        Future.successful(())
+        Future.unit
       } else {
         node.tail match {
           case None =>
             tx.update(node.pointer, requiredRevision, None, requirements, List(Delete(key)))
-            Future.successful(())
+            Future.unit
 
           case Some(rp) =>
             reader.read(rp.pointer, s"Deleting key from KVListNode hostState ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>

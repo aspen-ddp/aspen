@@ -70,7 +70,7 @@ object TransactionDriverSuite {
 
     override def cancel(): Unit = cancelled = true
 
-    def complete: Future[Unit] = if (autoComplete) Future.successful(()) else Promise[Unit]().future
+    def complete: Future[Unit] = if (autoComplete) Future.unit else Promise[Unit]().future
 
     def debugStatus: List[(String, Boolean)] = Nil
 

@@ -63,7 +63,7 @@ object SimpleFile:
         val updatedInode = inode.asInstanceOf[FileInode].updateContent(offset, Timespec.now)
         tx.overwrite(pointer, revision, updatedInode.toDataBuffer)
 
-        (updatedInode, () => Future.successful(()))
+        (updatedInode, () => Future.unit)
 
   case class Write(file: SimpleFile, offset: Long, buffers: List[DataBuffer]) extends FileOperation:
     val writePromise: Promise[(Long, List[DataBuffer])] = Promise()

@@ -1,55 +1,72 @@
 
 
-StoragePoolState
+AllocationGroupObjectAllocator
+  - init via AllocationGroupId
+  - fetches State and caches for fixed period of time
+    - constructor arg. Default to 30 sec?
+    - Allocation function passively triggers a cache refresh
+      - Don't wait for result
+      - Future calls will pick up and use the updated state
+  - Throw EmptyAllocationGroup exception if members is empty
+  - Random selection weighted by %free-space
 
-  - Need a mechanism to handle "out of space" errors
-    - Will present when we attempt to commit an object update to the store
-      - Read-Only or out of space underlying media will cause it to fail
-    - Will clog up the CRL if left untreated
-    - Might start with just relying on TransferStore to a device with space
-      - Might be able to automate this eventually
-    - Could set up "spillover stores"
-      - Dedicated to hosting data for full stores
-      - Lots of implications though, will require some thought
+NodeAllocator for TKVLs could be a list of AllocationGroups UUIDs. Last
+entry is for tier-0, each entry going up the list is for the next tier up.
+Top entry is used for all tiers above that. Makes it easy for there to be
+just a single entry (same allocator for all tiers).
 
-How to know space usage
-  - Added Backend.estimateSize(): Long
-    - Not perfect but should give us a basis for starting out
-  - File.getTotalSpace() and getUsableSpace can be used to get drive/partition sizes
-    - Can call this on the storage device config file
-    - Should work the same across platforms
-  - Can poll disks at set interval and update StorageDevice state when changes by
-    some configurable factor. Say 0.5% to start
+Add add-host command
+  - takes address & ports
+  - generates a host config file in current directory
 
+Add add-storage-device command
+  - takes host-root and device dirname
+  - Impl in function that can be called later by the Host
+    - Maybe via a CnC message
+    - Listing and configuring new devices could be valid CnC
+  - Once device is initialized, create link in <hostRootDir>/storage-devices/
+  - Update host to use FileSystems.getDefault().newWatchService() to monitor for additions
+    - Wrap this in a helper class to simplify Host impl
 
-aspen.store.usage
-  - StorageDeviceUsageManager
-    - update(storageDeviceId, totalSize, currentUsage)
-  - StoragePoolUsageManager
-    - takes an AllocatorUsageManager as constructor arg
-    - Pools could be used by multiple allocators
-      - probably need a list of AllocatorIds (up pointers)
-    - update(poolId, index, currentUsage)
+Need some wey to list hosts & devices
+  - UUIDs will be pretty meaningless
+  - Add storage-devices/<link/dirname> to localDeviceName in Host state?
+    - need to modify hostState state every time a device is added anyway
+  - convert from Set[stoargeDeviceId] to Map[storageDeviceId, String]
+
+Move ZMQNetwork to aspen-ddp.common.network.implementations.zmqnet
+
+Rework Main.scala
+  - Move to aspen-ddp.cmdline
+  - Update transfer-store to take target device and use new transfer Impl
+  - Remove old CnC based StoreTransfer code
+
+Need a plan for getting the storageDevices needed for pool creation
+
+Handle transfer of a bootstrap store
+  - Need some way to update config file
+
+Switch AmoebaFS to use a registered object for the root
+
+Rename StoreManager to Host?
 
 os.Path note:
   - can convert to java Path via os.Path.toNIO
   - then to File via java Path.toFile()
 
-Rename StoreManager to Host?
+Need official mechanism for rebuilding a failed store
+  - Use Rebuilding state to StoreEntry in target StorageDeviceState?
+  - Simple and can be picked up by periodic host scans
+    - Same as TransferIn/TransferOut
 
-Switch AmoebaFS to use a registered object for the root
-
-Switch to ScalaPB
+Need a way to connect AllocationGroups to App-defined Allocators
+  - Application can just create them during initialization
 
 ObjectPointer creation - Will need generic mechanism for creating ObjectPointers for
 advanced use cases like Flat-file backed stores.
   - Maybe StoragePoolState has an allocatorImplUUID - for TypeRegistry factory
   - Maybe also has an optional allocatorStatePtr field pointing to the root object for
     implementing the allocator strategy
-
-For OutOfSpace errors, could put "allocatingObjects" in Txd.
-  - Stores could then use this to detect allocations
-  - Vote abort if not enough space?
 
 Consider removing usage of invalidateTransaction in favor of just throwing
 exceptions.
@@ -59,81 +76,18 @@ exceptions.
   - Hides the source of the error
   - Limited to just a single error per tx setup
 
-** Testing of all the stuff that's been coded
+Need a mechanism to handle "out of space" errors
+  - Will present when we attempt to commit an object update to the store
+    - Read-Only or out of space underlying media will cause it to fail
+  - Will clog up the CRL if left untreated
+  - Might start with just relying on TransferStore to a device with space
+    - Might be able to automate this eventually
+  - Could set up "spillover stores"
+    - Dedicated to hosting data for full stores
+    - Lots of implications though, will require some thought
 
-Need to think about how to handle allocation.
-  - How to choose which pool to use
-     - Balance across pools created at different times with different utilizations
-  - Can create AllocationGroups
-     - collects pools into logical groups for allocation
-     - Named as this helps bridge app design with deployment policy?
-     - Stored in DataObject
-       - timestamp of object indicates time of last pool size refresh
-       - stores list (poolId, approximateCurrentSize, maxSize)
-  - Store Allocator config in DataObject
-     - could use system ObjectRegistry
-       - random UUID would guarantee no collisions
-  - Allocation groups could be of two types: PoolGroup or GroupGroup
-    - Contains a list of sub entities to allocate from
-      - each entity has a currentUsage that is periodically refreshed
-        - Optional max capacity?
-        - Probalby a combination of polling + event triggers (like
-          a pool detecting a 0.5% change)
-      - Configurable allocation policies?
-        - Round Robin
-        - Least utilization first
-        - Weighted
-        - Sequential (fill to full then next)
-
-Allocator could just be a client-side class that takes an AllocationGroup
-no actual state representation themselves.
-
-NodeAllocator for TKVLs could be a list of AllocationGroups UUIDs. Last
-entry is for tier-0, each entry going up the list is for the next tier up.
-Top entry is used for all tiers above that. Makes it easy for there to be
-just a single entry (same allocator for all tiers).
-
-Allocator ideas
-  - can add an Allocators TKVL tree where each allocator is stored in a DataObject
-    - Or just use system ObjectRegistry
-    - Randomized UUID works just as well as hard-coded. No collisions
-  - can use Protobuf for flexible serial/deserial
-  - NodeAllocator going into Root can store 2 UUIDs for easy/cheap serial/storage
-    - UUID of allocator
-    - UUID of registered factory that knows how to deserial the allocator
-       - Prevents huge union type in Protobuf
-
-Need a way to connect AllocationGroups to App-defined Allocators
-  -
-
-Add add-hostState command
-  - takes address & ports
-  - generates a hostState config file in current directory
-
-Add add-storage-device command
-  - takes link/dirname
-    - Can find hostState config at os.Path(devDir) / os.up / os.up / "aspen-hostState-conf.."
-
-update transfer-store to take target device
-
-Need some wey to list hostStates & devices
-  - UUIDs will be pretty meaningless
-  - Add storage-devices/<link/dirname> to localDeviceName in Host state?
-    - need to modify hostState state every time a device is added anyway
-  - convert from Set[stoargeDeviceId] to Map[storageDeviceId, String]
-
-Move ZMQNetwork to aspen-ddp.common.network.zmqnet
-
-Move Main to aspen-ddp.cmdline ?
-
-Need a plan for getting the storageDevices needed for pool creation
-
-Handle transfer of a bootstrap store
-  - Need some way to update config file
-
-Remove old CnC based StoreTransfer code
-
-Implement AllocationRecovery
+Add TLS Cert generation for hosts
+Add a Quic/Netty Network implementation
 
 ----------------
 - Down the road
@@ -173,9 +127,7 @@ For maximum recovery speed, DurableRecoveryManagerTask
   + Rebuilt data can be read from dist data structure at a speed penalty
 
 -----------------------------------------------------------
-
-TODO:
-  * Globally replace Future.successful(()) with Future.unit
+- Setup/Testing Notes
 
 # Setting up intellij to use a JDK installed by homebrew:
 # homebrew install openjdk
@@ -259,40 +211,5 @@ export CLASSPATH="<sbt content>"
 
 exec java -cp $CLASSPATH com.ibm.aspen.demo.Main "$@"
 
----------------------------------------------------------------------------
-- TODO
--
-
-Allocatoresponse
-    - Add error string to message on failure
-    - Handle allocation failure
-    
-KeyRevisionGuard
-    - Add Zeroed DoesNotExist variable
-    - Test for zeroed UUID in Tx, use this for does not exist requirement
-
-Transaction Finalizers
-    - Improve error handling
-    - Move to dedicated registry rather than the generic one
-        - Should be argument to AmoebaClient for user-defined FAs
-    - Consider moving this registry to Server side only. That's where they're used
-
-AllocationDriver
-    - Detect stalled allocations and force commit failure
-    - Recover from successful completions
-
-SimpleCRL
-    Problem if LogEntry exceeds the Maximum stream size. Can modify LogEntry to skip writes until its size
-    is once again less than the size of a log file. Need to allow tx/alloc deletes to remove entries from
-    the LogEntry.
-    - Move completionHandler into the LogContent base class
-    - Iterate over all Tx and Alloc to call completion handlers
-    - Modify LogEntry to remove Tx and Alloc instances when deletions are made
-
-FIXME - When setting Maximum on KeyValue object, we must check to ensure that no keys exceeding that
-        maximum will be present when transaction ends. Must run through adds and deletes to local keys
-        to determine this.
-   |-> Prevents hole where KV additions are made after a read which results in a split. could leave
-       behind keys with value > maximum
 
 

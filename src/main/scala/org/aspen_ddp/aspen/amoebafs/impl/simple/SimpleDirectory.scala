@@ -70,7 +70,7 @@ class SimpleDirectory(override val pointer: DirectoryPointer,
         tx.overwrite(pointer.pointer, frevision, updatedInode.toArray)
       }
     } else {
-      Future.successful(())
+      Future.unit
     }
 
     for {

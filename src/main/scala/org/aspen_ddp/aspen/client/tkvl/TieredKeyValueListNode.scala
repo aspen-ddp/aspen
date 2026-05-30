@@ -27,7 +27,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
 
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(tkvl.rootManager, 1, newMinimum, newNode, t)
-      Future.successful(())
+      Future.unit
     }
 
     for {
@@ -43,7 +43,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
   def delete(key: Key)(using t: Transaction): Future[Unit] = {
     def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
       JoinFinalizationAction.addToTransaction(tkvl.rootManager, 1, delMinimum, delNode, t)
-      Future.successful(())
+      Future.unit
     }
 
     node.delete(key, onJoin)
@@ -55,7 +55,7 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
 
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(tkvl.rootManager, 1, newMinimum, newNode, t)
-      Future.successful(())
+      Future.unit
     }
 
     for {

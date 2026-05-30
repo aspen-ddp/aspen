@@ -280,7 +280,7 @@ object Main {
               }
               else failure("Store name must match the format \"pool-uuid:storeNumber\"")
             },
-          arg[String]("<new-hostState>").text("Name of the hostState to receive the store").
+          arg[String]("<new-host>").text("Name of the host to receive the store").
             action((x, c) => c.copy(host = x)),
         )
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
@@ -554,7 +554,7 @@ object Main {
       val fdeletePrep = node.delete(key,
         None,
         List(KeyValueUpdate.TimestampLessThan(key, timestamp)),
-        (_,_) => Future.successful(()))(using tx)
+        (_,_) => Future.unit)(using tx)
       for
         _ <- fdeletePrep
         _ <- tx.commit()
@@ -847,7 +847,7 @@ object Main {
       println(f"Rebuilding object: $objectId")
 
       if ptr.poolId != storeId.poolId then
-        return Future.successful(())
+        return Future.unit
 
       val fos = ptr match
         case p: KeyValueObjectPointer => client.read(p)

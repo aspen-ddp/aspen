@@ -61,7 +61,7 @@ class SplitFinalizationAction(val client: AspenClient,
             case Right(node) =>
               def onSplit(min: Key, ptr: KeyValueObjectPointer): Future[Unit] = {
                 SplitFinalizationAction.addToTransaction(rootManager, tier+1, min, ptr, tx)
-                Future.successful(())
+                Future.unit
               }
 
               node.insert(newMinimum, Value(newNode.toArray), nodeSize, alloc, onSplit).map(_=>())
@@ -86,7 +86,7 @@ class SplitFinalizationAction(val client: AspenClient,
         orootNode match {
           case None => 
             // Tree must have been deleted. Should be safe to ignore
-            Future.successful(()) 
+            Future.unit 
             
           case Some(rootNode) =>
             if (tier > rootTier)

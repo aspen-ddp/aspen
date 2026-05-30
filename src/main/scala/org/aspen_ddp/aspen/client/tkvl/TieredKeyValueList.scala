@@ -167,7 +167,7 @@ class TieredKeyValueList(val client: AspenClient,
 
     def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
       SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
-      Future.successful(())
+      Future.unit
     }
     def empty(tier: Int, ordering: KeyOrdering): Future[Unit] = {
       rootManager.createInitialNode(Map(key -> value)).map(_=>())
@@ -200,7 +200,7 @@ class TieredKeyValueList(val client: AspenClient,
   def delete(key: Key)(using t: Transaction): Future[Unit] = {
     def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
-      Future.successful(())
+      Future.unit
     }
     def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] = {
       for {
@@ -218,7 +218,7 @@ class TieredKeyValueList(val client: AspenClient,
     rootManager.getRootNode().flatMap { t =>
       val (tier, ordering, oroot) = t
       oroot match {
-        case None => Future.successful(())
+        case None => Future.unit
         case Some(root) => nonEmpty(tier, ordering, root)
       }
     }
@@ -229,7 +229,7 @@ class TieredKeyValueList(val client: AspenClient,
              requirements: List[KeyValueUpdate.KeyRequirement])(using t: Transaction): Future[Unit] = {
     def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
-      Future.successful(())
+      Future.unit
     }
 
     def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] = {
@@ -248,7 +248,7 @@ class TieredKeyValueList(val client: AspenClient,
     rootManager.getRootNode().flatMap { t =>
       val (tier, ordering, oroot) = t
       oroot match {
-        case None => Future.successful(())
+        case None => Future.unit
         case Some(root) => nonEmpty(tier, ordering, root)
       }
     }
@@ -292,7 +292,7 @@ class TieredKeyValueList(val client: AspenClient,
     rootManager.getRootNode().flatMap: t =>
       val (tier, ordering, oroot) = t
       oroot match
-        case None => Future.successful(())
+        case None => Future.unit
         case Some(root) => nonEmpty(tier, ordering, root)
 
   def foreachInRange(minKey: Key,
@@ -312,7 +312,7 @@ class TieredKeyValueList(val client: AspenClient,
     rootManager.getRootNode().flatMap: t =>
       val (tier, ordering, oroot) = t
       oroot match
-        case None => Future.successful(())
+        case None => Future.unit
         case Some(root) => nonEmpty(tier, ordering, root)
 }
 

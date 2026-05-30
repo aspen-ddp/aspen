@@ -49,13 +49,13 @@ class JoinFinalizationAction(val client: AspenClient,
             case Right(node) =>
 
               if (!node.contents.contains(deleteMinimum))
-                Future.successful(())
+                Future.unit
               else {
                 given tx: Transaction = client.newTransaction()
 
                 def onJoin(min: Key, ptr: KeyValueObjectPointer): Future[Unit] = {
                   JoinFinalizationAction.addToTransaction(rootManager, tier + 1, min, ptr, tx)
-                  Future.successful(())
+                  Future.unit
                 }
 
                 node.delete(deleteMinimum, onJoin)
@@ -74,7 +74,7 @@ class JoinFinalizationAction(val client: AspenClient,
       rootManager.getRootNode().flatMap { t =>
         val (rootTier, ordering, orootNode) = t
         orootNode match {
-          case None =>  Future.successful(())// Nothing to do
+          case None =>  Future.unit// Nothing to do
           case Some(rootNode) =>
             if (tier == rootTier && rootNode.contents.size == 2)
               setNewRoot(rootTier, ordering, rootNode)

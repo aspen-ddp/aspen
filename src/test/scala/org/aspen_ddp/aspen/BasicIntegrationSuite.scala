@@ -15,6 +15,14 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     client.read(radicle).map( kvos => kvos.contents.isEmpty should be (false) )
   }
 
+  atest("Empty transaction commits successfully") {
+    val tx = client.newTransaction()
+    for
+      _ <- tx.commit()
+    yield
+      tx.result.isCompleted should be (true)
+  }
+
   atest("Insert key value pair into radicle") {
     val key = Key(Array[Byte](100))
     val value = Value(Array[Byte](2))

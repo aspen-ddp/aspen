@@ -48,6 +48,15 @@ class TransactionBuilder(
   private  var missedCommitDelayInMs = 1000
   private  val minimumTimestamp = HLCTimestamp.now
 
+  def isEmpty: Boolean =
+    requirements.isEmpty &&
+      refcountUpdates.isEmpty &&
+      updatingObjects.isEmpty &&
+      dataObjectUpdates.isEmpty &&
+      keyValueUpdates.isEmpty &&
+      finalizationActions.isEmpty &&
+      allocatingObjects.isEmpty
+
   def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager, poolIDAMap: Map[PoolId, IDA]): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {
 

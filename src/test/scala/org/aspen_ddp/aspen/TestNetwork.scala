@@ -135,6 +135,7 @@ object TestNetwork {
         ptr <- bsPool.createAllocator.allocateDataObject(DataBuffer(ags.toBytes))
         _ <- objectRegistry.prepareRegisterObject(ags.groupId.uuid, ptr)
         _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
+        _ <- tx.commit()
       yield
         ags.groupId
 

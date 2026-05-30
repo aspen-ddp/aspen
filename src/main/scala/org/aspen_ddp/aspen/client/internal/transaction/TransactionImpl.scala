@@ -140,54 +140,60 @@ class TransactionImpl(val client: AspenClient,
     if (!promise.isCompleted) {
 
       state.foreach { bldr =>
-        val poolIds = bldr.allReferencedPoolIds
+        if bldr.isEmpty then {
+          // Completely empty transactions succeed immediately
+          val timestamp = HLCTimestamp.now
+          state = Left(timestamp)
+          promise.success(timestamp)
+        } else
+          val poolIds = bldr.allReferencedPoolIds
 
-        val poolIDAMapFuture = Future.sequence(
-          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.ida))
-        ).map(_.toMap)
+          val poolIDAMapFuture = Future.sequence(
+            poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.ida))
+          ).map(_.toMap)
 
-        poolIDAMapFuture.failed.foreach { cause =>
-          promise.tryFailure(cause)
-        }
+          poolIDAMapFuture.failed.foreach { cause =>
+            promise.tryFailure(cause)
+          }
 
-        poolIDAMapFuture.foreach { poolIDAMap =>
-          try
-            val (txd, transactionData, timestamp) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap)
+          poolIDAMapFuture.foreach { poolIDAMap =>
+            try
+              val (txd, transactionData, timestamp) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap)
 
-            //---- Tx Debugging ----
-            result.onComplete {
-              case Success(_) =>
-                logger.info(s"TX SUCCESS: ${txd.shortString}\n${txd.shortString}")
-              case Failure(e) =>
-                logger.info(s"TX FAILURE: ${txd.shortString}: $e\n$stack")
-            }
-            //---------------------
-
-            state = Left(timestamp)
-            if (txd.requirements.isEmpty)
-              promise.success(txd.startTimestamp)
-            else
-
-              txManager.runTransaction(txd, transactionData, transactionDriverStrategy) onComplete {
-                case Failure(cause) =>
-                  // TODO Catch transaction timeout from lower layer and convert to TransactionError.TransactionTimedOut
-                  client.txStatusCache.transactionAborted(txd.transactionId)
-                  promise.failure(cause)
-                case Success(committed) =>
-
-                  if (committed) {
-                    val ts = txd.startTimestamp
-                    HLCTimestamp.update(ts)
-                    client.txStatusCache.transactionCommitted(txd.transactionId)
-                    promise.success(ts)
-                  } else {
-                    client.txStatusCache.transactionAborted(txd.transactionId)
-                    promise.failure(TransactionAborted(txd))
-                  }
+              //---- Tx Debugging ----
+              result.onComplete {
+                case Success(_) =>
+                  logger.info(s"TX SUCCESS: ${txd.shortString}\n${txd.shortString}")
+                case Failure(e) =>
+                  logger.info(s"TX FAILURE: ${txd.shortString}: $e\n$stack")
               }
-          catch
-            case e: Throwable => promise.tryFailure(e)
-        }
+              //---------------------
+
+              state = Left(timestamp)
+              if (txd.requirements.isEmpty)
+                promise.success(txd.startTimestamp)
+              else
+
+                txManager.runTransaction(txd, transactionData, transactionDriverStrategy) onComplete {
+                  case Failure(cause) =>
+                    // TODO Catch transaction timeout from lower layer and convert to TransactionError.TransactionTimedOut
+                    client.txStatusCache.transactionAborted(txd.transactionId)
+                    promise.failure(cause)
+                  case Success(committed) =>
+
+                    if (committed) {
+                      val ts = txd.startTimestamp
+                      HLCTimestamp.update(ts)
+                      client.txStatusCache.transactionCommitted(txd.transactionId)
+                      promise.success(ts)
+                    } else {
+                      client.txStatusCache.transactionAborted(txd.transactionId)
+                      promise.failure(TransactionAborted(txd))
+                    }
+                }
+            catch
+              case e: Throwable => promise.tryFailure(e)
+          }
       }
     }
     result

@@ -28,16 +28,16 @@ object AllocationGroupState:
   def apply(cfg: Array[Byte]): AllocationGroupState = Codec.decode(codec.AllocationGroupState.parseFrom(cfg))
   def apply(dos: DataObjectState): AllocationGroupState = apply(dos.data.getByteArray)
 
-  def addPool(client: AspenClient, 
-              poolId: PoolId, 
+  def addPool(client: AspenClient,
+              poolId: PoolId,
               parentId: AllocationGroupId,
               taskExecutor: TaskExecutor): Future[Unit] =
-    
+
     def mod(psPtr: KeyValueObjectPointer, psKvos: KeyValueObjectState,
             agsPtr: DataObjectPointer, agsDos: DataObjectState,
             ps: StoragePoolState, ags: AllocationGroupState,
             tx: Transaction): (StoragePoolState, AllocationGroupState) =
-      if ps.allocationGroups.contains(parentId.uuid) && ags.members.contains(poolId.uuid) then
+      if ps.allocationGroups.contains(parentId.uuid) && ags.members.exists(_.uuid == poolId.uuid) then
         (ps, ags)
       else
         val nps = ps.copy(allocationGroups = parentId.uuid :: ps.allocationGroups)
@@ -64,7 +64,7 @@ object AllocationGroupState:
             agsPtr: DataObjectPointer, agsDos: DataObjectState,
             ps: StoragePoolState, ags: AllocationGroupState,
             tx: Transaction): (StoragePoolState, AllocationGroupState) =
-      if !ps.allocationGroups.contains(parentId.uuid) && !ags.members.contains(poolId.uuid) then
+      if !ps.allocationGroups.contains(parentId.uuid) && !ags.members.exists(_.uuid == poolId.uuid) then
         (ps, ags)
       else
         val nps = ps.copy(allocationGroups = ps.allocationGroups.filter(_ != parentId.uuid))
@@ -72,7 +72,7 @@ object AllocationGroupState:
         val ops = List(Insert(StoragePoolState.ConfigKey, nps.encode()))
 
         tx.update(psPtr, None, None, reqs, ops)
-        
+
         val nags = ags.copy(members = ags.members.filter(_.uuid != ps.poolId.uuid))
 
         tx.overwrite(agsPtr, agsDos.revision, DataBuffer(nags.toBytes))
@@ -90,7 +90,7 @@ object AllocationGroupState:
                            Transaction) => (StoragePoolState, AllocationGroupState)
                         ): Future[Unit] =
     given ExecutionContext = client.clientContext
-    def prep(tx: Transaction): Future[Unit] = 
+    def prep(tx: Transaction): Future[Unit] =
       given Transaction = tx
       for
         psPtr <- client.getStoragePoolPointer(poolId)

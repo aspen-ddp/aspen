@@ -4,9 +4,9 @@ import java.util.UUID
 
 object TypeRegistry:
 
-  class DuplicateRegistration(uuid: UUID,
-                              firstClass: String,
-                              secondClass: String) extends Throwable(s"DuplicateRegistration: ${uuid}. $firstClass, $secondClass")
+  class DuplicateTypeRegistration(uuid: UUID,
+                                  firstClass: String,
+                                  secondClass: String) extends Throwable(s"DuplicateRegistration: ${uuid}. $firstClass, $secondClass")
 
   def apply(lists: List[RegisteredTypeFactory]*): TypeRegistry =
     var map = Map[UUID, RegisteredTypeFactory]()
@@ -15,7 +15,7 @@ object TypeRegistry:
         case None => map += rtf.typeUUID -> rtf
         case Some(prev) =>
           if rtf ne prev then
-            throw new DuplicateRegistration(rtf.typeUUID, rtf.getClass.getTypeName, prev.getClass.getTypeName)
+            throw new DuplicateTypeRegistration(rtf.typeUUID, rtf.getClass.getTypeName, prev.getClass.getTypeName)
 
     new TypeRegistry(map)
 

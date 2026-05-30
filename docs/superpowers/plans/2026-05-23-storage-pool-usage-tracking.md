@@ -253,12 +253,12 @@ object UpdateAllocationGroupUsageTask extends DurableTaskFactory:
     ) ++ allocationGroups.zipWithIndex.map: (uuid, idx) =>
       Key(AllocationGroupBaseKey + idx) -> uuid2byte(uuid)
 
-    taskExecutor.prepareTask(UpdateAllocationGroupUsageTask, istate)
+    taskExecutor.prepareTask(management.UpdateAllocationGroupUsageTask, istate)
 
 
 class UpdateAllocationGroupUsageTask(
-  val taskPointer: DurableTaskPointer
-) extends DurableTask:
+                                      val taskPointer: DurableTaskPointer
+                                    ) extends DurableTask:
   private val promise = Promise[Option[AnyRef]]()
   promise.success(None)
 

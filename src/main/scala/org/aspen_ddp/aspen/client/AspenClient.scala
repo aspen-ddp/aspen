@@ -4,8 +4,9 @@ import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -78,15 +79,25 @@ trait AspenClient extends ObjectReader:
     getStorageDevicePointer(storageDeviceId).flatMap: pointer =>
       read(pointer).map: kvos =>
         StorageDeviceState(kvos)
+
+  def getAllocationGroupState(allocationGroupId: AllocationGroupId): Future[AllocationGroupState] =
+    given ExecutionContext = this.clientContext
+    getAllocationGroupPointer(allocationGroupId).flatMap: pointer =>
+      read(pointer).map: dos =>
+        AllocationGroupState(dos)
         
   def getStoragePoolId(poolName: String): Future[PoolId]
   def getHostId(hostName: String): Future[HostId]
+  def getAllocationGroupId(groupName: String): Future[AllocationGroupId]
   
   private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer]
   private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]
   private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer]
+  private[aspen] def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer]
 
   protected def createStoragePool(config: StoragePoolState): Future[PoolId]
+  
+  def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId]
 
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()

@@ -7,9 +7,10 @@ import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
-import org.aspen_ddp.aspen.common.util.{long2byte, byte2long}
+import org.aspen_ddp.aspen.common.util.{byte2long, long2byte}
 import org.aspen_ddp.aspen.compute.TaskExecutor
 import org.apache.logging.log4j.scala.Logging
+import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -95,7 +96,7 @@ class StoragePoolUsageManager(client: AspenClient) extends Logging:
           _ <-
             if needTask && executor.isDefined then
               UpdateAllocationGroupUsageTask.prepareTask(
-                HLCTimestamp.now,
+                poolState.poolId.uuid,
                 meanUsage,
                 poolState.maximumStoreSize,
                 poolState.allocationGroups,

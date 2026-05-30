@@ -10,7 +10,8 @@ import org.aspen_ddp.aspen.client.internal.read.{BaseReadDriver, ReadManager}
 import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, MissedUpdateFinalizationAction, TransactionImpl, TransactionManager}
 import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, Read, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId}
@@ -27,7 +28,7 @@ import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 
 import java.nio.file.Path
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
@@ -74,6 +75,7 @@ object TestNetwork {
     val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
 
     val typeRegistry: TypeRegistry = TypeRegistry(
+      org.aspen_ddp.aspen.common.TypeFactories.factories,
       org.aspen_ddp.aspen.client.TypeFactories.factories,
       org.aspen_ddp.aspen.server.TypeFactories.factories
     )
@@ -98,8 +100,8 @@ object TestNetwork {
     }
 
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
-
     def getHostId(hostName: String): Future[HostId] = ???
+    def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
 
     val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
     val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
@@ -112,6 +114,29 @@ object TestNetwork {
 
     private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
       objectRegistry.getRegisteredKeyValueObject(storageDeviceId.uuid)
+
+    override def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] =
+      objectRegistry.getRegisteredDataObject(allocationGroupId.uuid)
+
+    override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
+      val ags = AllocationGroupState(
+        AllocationGroupId(UUID.randomUUID()),
+        level,
+        groupName,
+        Nil,
+        Nil
+      )
+
+      val tx = newTransaction()
+      given Transaction = tx
+
+      for
+        bsPool <- getStoragePool(PoolId.BootstrapPoolId)
+        ptr <- bsPool.createAllocator.allocateDataObject(DataBuffer(ags.toBytes))
+        _ <- objectRegistry.prepareRegisterObject(ags.groupId.uuid, ptr)
+        _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
+      yield
+        ags.groupId
 
     protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 

@@ -1,15 +1,17 @@
 package org.aspen_ddp.aspen.client.internal
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RegisteredTypeFactory, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeFactories, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RegisteredTypeFactory, RetryStrategy, StopRetrying, StoragePool, Transaction, TransactionStatusCache, TypeFactories, TypeRegistry}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{ReadManager, SimpleReadDriver}
 import org.aspen_ddp.aspen.client.internal.transaction.{SimpleClientTransactionDriver, TransactionImpl, TransactionManager}
+import org.aspen_ddp.aspen.client.registries.Registry.DuplicateRegistration
 import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -36,6 +38,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   var attributes: Map[String, String] = Map()
 
   val typeRegistry: TypeRegistry = TypeRegistry(
+    org.aspen_ddp.aspen.common.TypeFactories.factories,
     org.aspen_ddp.aspen.client.TypeFactories.factories,
     org.aspen_ddp.aspen.server.TypeFactories.factories,
     userTypeFactories
@@ -70,6 +73,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   override def getHostId(hostName: String): Future[HostId] =
     namespacedRegistry.getRegisteredObject("host", hostName).map(HostId(_))
 
+  override def getAllocationGroupId(groupName: String): Future[AllocationGroupId] =
+    namespacedRegistry.getRegisteredObject("group", groupName).map(AllocationGroupId(_))
+
   override def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
     objectRegistry.getRegisteredKeyValueObject(poolId.uuid)
 
@@ -79,7 +85,33 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   override def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
     objectRegistry.getRegisteredKeyValueObject(storageDeviceId.uuid)
 
-  override protected def createStoragePool(config: StoragePoolState): Future[PoolId] =
+  override def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] =
+    objectRegistry.getRegisteredDataObject(allocationGroupId.uuid)
+
+  override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
+    val ags = AllocationGroupState(
+      AllocationGroupId(UUID.randomUUID()),
+      level,
+      groupName,
+      Nil,
+      Nil
+    )
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: DuplicateRegistration => throw StopRetrying(e)
+
+    transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+      for
+        bsPool <- getStoragePool(PoolId.BootstrapPoolId)
+        ptr <- bsPool.createAllocator.allocateDataObject(DataBuffer(ags.toBytes))
+        _ <- objectRegistry.prepareRegisterObject(ags.groupId.uuid, ptr)
+        _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
+      yield
+        ags.groupId
+
+  override protected def createStoragePool(config: StoragePoolState): Future[PoolId] = {
+    // TODO: Need Recovery. Will forever retry if creating a pool with name that already exists!
     transactUntilSuccessful: tx =>
       given Transaction = tx
   
@@ -158,6 +190,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
         devUpdates.foreach(updateDevice)
         
         config.poolId
+  }
 
   override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
 

@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.common
 import java.io.{File, PrintWriter, StringWriter}
 import java.nio.ByteBuffer
 import java.util.UUID
+import scala.annotation.tailrec
 import scala.concurrent.{ExecutionContext, Future}
 
 package object util {
@@ -28,6 +29,31 @@ package object util {
     val msb = bb.getLong()
     val lsb = bb.getLong()
     new UUID(msb, lsb)
+  }
+
+  def uuids2byte(uuids: List[UUID]): Array[Byte] = {
+    val bb = ByteBuffer.allocate(16 * uuids.length)
+    uuids.foreach: uuid =>
+      bb.putLong(uuid.getMostSignificantBits)
+      bb.putLong(uuid.getLeastSignificantBits)
+    bb.array()
+  }
+
+  def byte2uuids(arr: Array[Byte]): List[UUID] = {
+    require(arr.length % 16 == 0)
+    
+    val bb = ByteBuffer.wrap(arr)
+
+    @tailrec
+    def recurse(count: Int, uuids: List[UUID]): List[UUID] =
+      if count * 16 == arr.length then
+        uuids.reverse
+      else
+        val msb = bb.getLong()
+        val lsb = bb.getLong()
+        recurse(count + 1, new UUID(msb, lsb) :: uuids)
+
+    recurse(0, Nil)
   }
 
   def int2byte(i: Int): Array[Byte] = {

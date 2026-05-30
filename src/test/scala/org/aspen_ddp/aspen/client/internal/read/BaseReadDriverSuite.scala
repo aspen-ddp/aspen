@@ -4,6 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -63,9 +64,14 @@ object BaseReadDriverSuite {
 
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
     def getHostId(hostName: String): Future[HostId] = ???
+    def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
+    
     def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] = ???
     def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] = ???
     def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] = ???
+    def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] = ???
+
+    def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] = ???
 
     val retryStrategy: RetryStrategy = null
 

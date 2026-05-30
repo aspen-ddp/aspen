@@ -1195,7 +1195,9 @@ object Codec extends Logging:
           storeId = ByteString.copyFrom(storeId.toBytes),
           entry = Some(encode(storeEntry))
         )
-      }.toSeq
+      }.toSeq,
+      currentUsage = o.currentUsage,
+      totalSize = o.totalSize
     )
 
   def decode(m: codec.StorageDeviceState): StorageDeviceState =
@@ -1207,7 +1209,7 @@ object Codec extends Logging:
       storeId -> entry
     }.toMap
 
-    new StorageDeviceState(storageDeviceId, hostId, stores)
+    new StorageDeviceState(storageDeviceId, hostId, m.currentUsage, m.totalSize, stores)
 
   def encodeSteppedDurableTaskState(step: Int, state: Map[String, Array[Byte]]): Array[Byte] =
     codec.SteppedDurableTaskState(

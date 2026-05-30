@@ -96,7 +96,7 @@ trait AspenClient extends ObjectReader:
   private[aspen] def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer]
 
   protected def createStoragePool(config: StoragePoolState): Future[PoolId]
-  
+
   def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId]
 
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
@@ -126,7 +126,8 @@ trait AspenClient extends ObjectReader:
                            ida: IDA,
                            maxObjectSize: Option[Int],
                            storageDeviceIds: List[StorageDeviceId],
-                           backendConfig: BackendConfig): Future[PoolId] =
+                           backendConfig: BackendConfig,
+                           maximumStoreSize: Long): Future[PoolId] =
     if storageDeviceIds.size < ida.width then
       Future.failed(new IllegalArgumentException("storageDeviceIds list must be at least as long as ida.width"))
     else
@@ -141,7 +142,9 @@ trait AspenClient extends ObjectReader:
           ida,
           maxObjectSize,
           stores,
-          backendConfig
+          backendConfig,
+          0L,
+          maximumStoreSize
         )
         _ <- createStoragePool(config)
       yield

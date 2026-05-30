@@ -58,9 +58,13 @@ object StoreManager:
       mgr.events.add(IOCompletion(op))
 
   class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
-                                val devicePath: Path):
+                                val devicePath: Path,
+                                val configFile: File):
     var loadedStores: Set[StoreId] = Set()
     var offlineStores: Set[StoreId] = Set()
+    
+    def totalSize: Long = configFile.getTotalSpace
+    def currentUsage: Long = totalSize - configFile.getFreeSpace
 
   class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
 
@@ -108,7 +112,7 @@ class StoreManager(val client: AspenClient,
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
-  private val usageManager = new StoragePoolUsageManager(client)
+  private val poolUsageManager = new StoragePoolUsageManager(client)
   private var usageUpdateTask: Option[ScheduledTask] = None
 
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
@@ -183,11 +187,11 @@ class StoreManager(val client: AspenClient,
         logger.debug(s"TaskExecutor initialization skipped: ${err.getMessage}")
 
   private def startUsageTracking(executor: TaskExecutor): Unit =
-    usageManager.setTaskExecutor(executor)
+    poolUsageManager.setTaskExecutor(executor)
     usageUpdateTask = Some(backgroundTasks.schedulePeriodic(Duration(20, SECONDS)):
       synchronized:
         stores.valuesIterator.foreach: store =>
-          usageManager.updateStoreSize(store.storeId, store.estimateSize())
+          poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
     )
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
@@ -198,11 +202,12 @@ class StoreManager(val client: AspenClient,
 
     if Files.isDirectory(sdFile.toPath) && Files.exists(sdCfgPath) then
       try
-        val sdCfg = StorageDeviceConfig.loadHostConfig(sdCfgPath.toFile)
+        val configFile = sdCfgPath.toFile
+        val sdCfg = StorageDeviceConfig.loadHostConfig(configFile)
         if sdCfg.aspenSystemId != aspenSystemId then
           logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
         else
-          val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath)
+          val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, configFile)
           storageDevices += sdCfg.storageDeviceId -> sds
           logger.info(s"Loading store $sdFile. StorageDeviceId ${sds.storageDeviceId}")
           sdFile.listFiles.foreach: potentialStoreFile =>

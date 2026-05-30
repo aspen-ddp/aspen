@@ -188,6 +188,8 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
   val bootstrapSD = StorageDeviceState(
     storageDeviceId,
     bootstrapHost.hostId,
+    0L,
+    0L,
     Map(
       store0.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
       store1.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),

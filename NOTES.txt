@@ -1,26 +1,6 @@
 
-- UpdateAllocationGroupsUsageTask
-  - Config: (updateTimestamp, Pool/Group Type, UUID, maxSize, newUsage, list-of-group-ids)
-  - completion = Future.sequence(gid-list.map.updateGroup(_))
-    - When all Futures complete, exit task
-    - Idempotent. No complex knowledge or state tracking needed
-  - updateGroup(gorupId): Future[Unit]
-    - retryTillSuccessfulWithRecovery - recover: stop if fetch state object fails
-      - fetch AllocationGroupState
-      - update member entry
-      - If usage/maxsize changes by > 0.5%, create updateAllocationGroupsUsageTask
-        for updating parent groups
-      - overwrite object
 
-Refactor StoragePoolState
-
-  - StoragePoolState get a maxStoreSize - Stored in State
-    - Required for pstate creation
-      - Idea is to prevent exeeding storageDevice limits and keep fast-media stores
-        small
-      - Default to 1Tb?
-    - Mutable
-      - Can increase but not decrease
+StoragePoolState
 
   - Need a mechanism to handle "out of space" errors
     - Will present when we attempt to commit an object update to the store
@@ -40,19 +20,9 @@ How to know space usage
     - Should work the same across platforms
   - Can poll disks at set interval and update StorageDevice state when changes by
     some configurable factor. Say 0.5% to start
-  - Similarly, can poll loaded stores
-    - update PoolState when store size changes by certain percentage
-       - May need to be careful for small stores to avoid update floods
-    - Can use Key(s"sz${storeId.poolIndex}") as key and Long as value. Cache
-      the last-successfully-updated Tx and we should be able to do quick updates
-      with minimal risk of Tx failure. If it happens, just read the PoolObj and
-      try again
+
 
 aspen.store.usage
-  - BaseUsageManager
-    - Provides tracking of in-flight updates so backups don't pile up
-  - AllocatorUsageManager
-    - update(allocatorId, poolId)
   - StorageDeviceUsageManager
     - update(storageDeviceId, totalSize, currentUsage)
   - StoragePoolUsageManager

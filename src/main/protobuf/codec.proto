@@ -579,6 +579,8 @@ message StorageDeviceState {
   StorageDeviceId storage_device_id = 1;
   UUID host_id = 2; // Optional field
   repeated StorageDeviceStoreKeyValue stores = 3;
+  int64 current_usage = 4;
+  int64 total_size = 5;
 }
 
 //---------------------------------------------------------------------------

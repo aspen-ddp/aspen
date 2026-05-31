@@ -1,10 +1,11 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.client.PoolObjectAllocatorId
 import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 
 import java.util.UUID
 import java.nio.charset.StandardCharsets
-import org.aspen_ddp.aspen.client.tkvl.{BootstrapPoolNodeAllocator, Root}
+import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceState, StoragePoolState}
@@ -37,6 +38,10 @@ object Bootstrap:
       ObjectRefcount(1,1),
       HLCTimestamp.now
     )
+    
+    val treeNodeSize =  1 * 1024 * 1024
+    
+    val bootstrapNodeAllocator = new NodeAllocator(null, List((PoolObjectAllocatorId(Radicle.poolId), treeNodeSize)))
 
     var allocTreeContent: List[(Key, Array[Byte])] = Nil
 
@@ -89,8 +94,8 @@ object Bootstrap:
 
     val errTreeRoot = allocate()
     val allocTreeRoot = allocate()
-    val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), BootstrapPoolNodeAllocator).encode()
-    val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), BootstrapPoolNodeAllocator).encode()
+    val errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), bootstrapNodeAllocator).encode()
+    val allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), bootstrapNodeAllocator).encode()
 
     val poolPointer = allocate(List(
       StoragePoolState.ConfigKey -> poolState,
@@ -115,7 +120,7 @@ object Bootstrap:
     val objectRegistryTree = Root(0,
       ByteArrayKeyOrdering,
       Some(objectRegistryRoot),
-      BootstrapPoolNodeAllocator)
+      bootstrapNodeAllocator)
 
     val namespacedRegistryRoot = allocate(List(
       NamespacedUUIDRegistry.makeKey("pool", PoolId.BootstrapPoolName) -> uuid2byte(Radicle.poolId.uuid),
@@ -124,7 +129,7 @@ object Bootstrap:
     val namespacedRegistryTree = Root(0,
       LexicalKeyOrdering,
       Some(namespacedRegistryRoot),
-      BootstrapPoolNodeAllocator)
+      bootstrapNodeAllocator)
 
     val radicleContent: List[(Key, Array[Byte])] = List(
       Radicle.BootstrapConfigKey -> bootstrapConfig.getBytes(StandardCharsets.UTF_8),

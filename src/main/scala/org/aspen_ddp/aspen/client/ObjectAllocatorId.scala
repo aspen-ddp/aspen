@@ -7,9 +7,15 @@ import java.nio.ByteBuffer
 import java.util.UUID
 
 object ObjectAllocatorId:
+
+  val encodedSize: Int = 17
+
   def apply(arr: Array[Byte]): ObjectAllocatorId =
     require(arr.length == 17)
     val bb = ByteBuffer.wrap(arr)
+    apply(bb)
+
+  def apply(bb: ByteBuffer): ObjectAllocatorId =
     val code = bb.get()
     val msb = bb.getLong()
     val lsb = bb.getLong()
@@ -19,16 +25,21 @@ object ObjectAllocatorId:
       case ObjectAllocatorType.Group.code => GroupObjectAllocatorId(AllocationGroupId(uuid))
       case _ => throw Exception(s"Unknown Allocator Type Code $code")
 
+
 sealed abstract class ObjectAllocatorId:
   def uuid: UUID
   def allocatorType: ObjectAllocatorType
 
   def toArray: Array[Byte] =
     val bb = ByteBuffer.allocate(17)
-    bb.put(allocatorType.code)
-    bb.putLong(0, uuid.getMostSignificantBits)
-    bb.putLong(8, uuid.getLeastSignificantBits)
+    encodeInto(bb)
     bb.array()
+
+  def encodeInto(bb:ByteBuffer): Unit =
+    bb.put(allocatorType.code)
+    bb.putLong(uuid.getMostSignificantBits)
+    bb.putLong(uuid.getLeastSignificantBits)
+
 
 case class PoolObjectAllocatorId(poolId: PoolId) extends ObjectAllocatorId:
   def uuid: UUID = poolId.uuid

@@ -1,10 +1,4 @@
 
-NodeAllocator for TKVLs could be a list of AllocationGroups UUIDs. Last
-entry is for tier-0, each entry going up the list is for the next tier up.
-Top entry is used for all tiers above that. Makes it easy for there to be
-just a single entry (same allocator for all tiers).
-  - Switch to ObjectAllocatorIds instead of pool ids
-
 Add add-host command
   - takes address & ports
   - generates a host config file in current directory

@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.*
 
 class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
@@ -149,3 +149,64 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
       // After refresh completes, the new state should be returned
       result3 should be(state2)
       stateCallCount should be(2)
+
+  test("fetchState does not trigger duplicate concurrent refreshes"):
+    val m = new TClient(clientId)
+    var stateCallCount = 0
+    val refreshPromise = Promise[AllocationGroupState]()
+
+    m.getAllocationGroupPointerFn = _ => Future.successful(pointer)
+    m.getAllocationGroupStateFn = _ =>
+      stateCallCount += 1
+      if stateCallCount == 1 then Future.successful(state)
+      else refreshPromise.future
+
+    val cache = new AllocationGroupCache(m, Duration(1, MILLISECONDS))
+
+    for
+      _ <- cache.fetchState(groupId)
+      _ <- Future { Thread.sleep(10) }
+      stale1 <- cache.fetchState(groupId)
+      stale2 <- cache.fetchState(groupId)
+      _ = refreshPromise.success(state2)
+      _ <- Future { Thread.sleep(50) }
+    yield
+      stale1 should be(state)
+      stale2 should be(state)
+      stateCallCount should be(2)
+
+  test("failed refresh preserves stale state and allows future refreshes"):
+    val m = new TClient(clientId)
+    var stateCallCount = 0
+
+    m.getAllocationGroupPointerFn = _ => Future.successful(pointer)
+    m.getAllocationGroupStateFn = _ =>
+      stateCallCount += 1
+      if stateCallCount == 1 then Future.successful(state)
+      else if stateCallCount == 2 then Future.failed(new Exception("network error"))
+      else Future.successful(state2)
+
+    val cache = new AllocationGroupCache(m, Duration(1, MILLISECONDS))
+
+    for
+      first <- cache.fetchState(groupId)
+      _ <- Future { Thread.sleep(10) }
+      _ <- cache.fetchState(groupId)
+      _ <- Future { Thread.sleep(50) }
+      stillCached <- cache.fetchState(groupId)
+      _ <- Future { Thread.sleep(50) }
+      recovered <- cache.fetchState(groupId)
+    yield
+      first should be(state)
+      stillCached should be(state)
+      recovered should be(state2)
+
+  test("fetchState propagates failure when no cached state exists"):
+    val m = new TClient(clientId)
+    m.getAllocationGroupPointerFn = _ => Future.successful(pointer)
+    m.getAllocationGroupStateFn = _ => Future.failed(new Exception("unavailable"))
+
+    val cache = new AllocationGroupCache(m)
+
+    recoverToSucceededIf[Exception]:
+      cache.fetchState(groupId)

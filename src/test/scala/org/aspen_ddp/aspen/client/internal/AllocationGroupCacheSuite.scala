@@ -3,10 +3,12 @@ package org.aspen_ddp.aspen.client.internal
 import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, StorageDeviceId, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
@@ -27,6 +29,15 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
   val state = AllocationGroupState(groupId, 0, "test-group", Nil, Nil)
   val state2 = AllocationGroupState(groupId, 0, "test-group-updated", Nil, Nil)
 
+  private val ida = Replication(3, 2)
+  private val rev = ObjectRevision.Null
+  private val ref = ObjectRefcount(1, 1)
+
+  def mkDataObjectState(ptr: DataObjectPointer, ags: AllocationGroupState): DataObjectState =
+    val bytes = ags.toBytes
+    val ts = HLCTimestamp.now
+    DataObjectState(ptr, rev, ref, ts, ts, ida, bytes.length, DataBuffer(bytes))
+
   class TClient(override val clientId: ClientId) extends AspenClient:
 
     var getAllocationGroupPointerFn: AllocationGroupId => Future[DataObjectPointer] =
@@ -35,10 +46,13 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
     var getAllocationGroupStateFn: AllocationGroupId => Future[AllocationGroupState] =
       _ => Future.failed(new Exception("getAllocationGroupState not configured"))
 
+    var readDataObjectFn: DataObjectPointer => Future[DataObjectState] =
+      _ => Future.failed(new Exception("read not configured"))
+
     val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
     val typeRegistry: TypeRegistry = null
 
-    def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] = Future.failed(new Exception("TODO"))
+    def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] = readDataObjectFn(pointer)
     def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = Future.failed(new Exception("TODO"))
 
     def newTransaction(): Transaction = null
@@ -121,45 +135,34 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
 
   test("stale state triggers background refresh and returns cached state immediately"):
     val m = new TClient(clientId)
-    var stateCallCount = 0
 
-    m.getAllocationGroupPointerFn = id =>
-      Future.successful(pointer)
+    m.getAllocationGroupPointerFn = _ => Future.successful(pointer)
+    m.getAllocationGroupStateFn = _ => Future.successful(state)
+    m.readDataObjectFn = ptr => Future.successful(mkDataObjectState(ptr, state2))
 
-    m.getAllocationGroupStateFn = id =>
-      stateCallCount += 1
-      if stateCallCount == 1 then Future.successful(state)
-      else Future.successful(state2)
-
-    // Use a refresh duration that the first sleep will exceed
     val cache = new AllocationGroupCache(m, refreshDuration = Duration(100, MILLISECONDS))
 
     for
       result1 <- cache.fetchState(groupId)
-      // Wait long enough to ensure the state is stale
       _ <- Future { Thread.sleep(150) }
       result2 <- cache.fetchState(groupId)
-      // The stale state should be returned immediately
       _ = result2 should be(state)
-      // Wait for the background refresh to complete
       _ <- Future { Thread.sleep(50) }
       result3 <- cache.fetchState(groupId)
     yield
       result1 should be(state)
-      // After refresh completes, the new state should be returned
       result3 should be(state2)
-      stateCallCount should be(2)
 
   test("fetchState does not trigger duplicate concurrent refreshes"):
     val m = new TClient(clientId)
-    var stateCallCount = 0
-    val refreshPromise = Promise[AllocationGroupState]()
+    var readCallCount = 0
+    val refreshPromise = Promise[DataObjectState]()
 
     m.getAllocationGroupPointerFn = _ => Future.successful(pointer)
-    m.getAllocationGroupStateFn = _ =>
-      stateCallCount += 1
-      if stateCallCount == 1 then Future.successful(state)
-      else refreshPromise.future
+    m.getAllocationGroupStateFn = _ => Future.successful(state)
+    m.readDataObjectFn = _ =>
+      readCallCount += 1
+      refreshPromise.future
 
     val cache = new AllocationGroupCache(m, Duration(1, MILLISECONDS))
 
@@ -168,23 +171,23 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
       _ <- Future { Thread.sleep(10) }
       stale1 <- cache.fetchState(groupId)
       stale2 <- cache.fetchState(groupId)
-      _ = refreshPromise.success(state2)
+      _ = refreshPromise.success(mkDataObjectState(pointer, state2))
       _ <- Future { Thread.sleep(50) }
     yield
       stale1 should be(state)
       stale2 should be(state)
-      stateCallCount should be(2)
+      readCallCount should be(1)
 
   test("failed refresh preserves stale state and allows future refreshes"):
     val m = new TClient(clientId)
-    var stateCallCount = 0
+    var readCallCount = 0
 
     m.getAllocationGroupPointerFn = _ => Future.successful(pointer)
-    m.getAllocationGroupStateFn = _ =>
-      stateCallCount += 1
-      if stateCallCount == 1 then Future.successful(state)
-      else if stateCallCount == 2 then Future.failed(new Exception("network error"))
-      else Future.successful(state2)
+    m.getAllocationGroupStateFn = _ => Future.successful(state)
+    m.readDataObjectFn = ptr =>
+      readCallCount += 1
+      if readCallCount == 1 then Future.failed(new Exception("network error"))
+      else Future.successful(mkDataObjectState(ptr, state2))
 
     val cache = new AllocationGroupCache(m, Duration(1, MILLISECONDS))
 

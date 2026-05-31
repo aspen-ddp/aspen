@@ -26,9 +26,14 @@ class AllocationGroupCache(client: AspenClient, refreshDuration: Duration = Dura
           val isRefreshing = refreshing.contains(groupId)
 
           if isStale && !isRefreshing then
-            refreshing += groupId
             // Fire-and-forget background refresh
-            client.getAllocationGroupState(groupId).onComplete:
+            refreshing += groupId
+
+            val fstate = pointers.get(groupId) match
+              case Some(pointer) => client.read(pointer).map(AllocationGroupState(_))
+              case None => client.getAllocationGroupState(groupId)
+
+            fstate.onComplete:
               case scala.util.Success(newState) =>
                 synchronized:
                   states += groupId -> (System.currentTimeMillis(), newState)

@@ -1,14 +1,19 @@
 
+Create AllocatorCache
+  - Super simple. Create and hold forever
 
 AllocationGroupObjectAllocator
   - init via AllocationGroupId
-  - fetches State and caches for fixed period of time
-    - constructor arg. Default to 30 sec?
-    - Allocation function passively triggers a cache refresh
-      - Don't wait for result
-      - Future calls will pick up and use the updated state
-  - Throw EmptyAllocationGroup exception if members is empty
-  - Random selection weighted by %free-space
+  - Constructor takes AllocationGroupCache
+    - fetch from cache each time to ensure continual refreshes
+  - Use WeightedSelector to choose among members for each allocation
+    - Cached private var in AllocationGroupState (synchronized)
+    - Members (MemberType, UUID)
+      - May need a cache for AlloccationGroupAllocators & PoolAllocators
+    - After selection get Allocator object from cache
+      - Call the Allocator
+      - Groups will chain down
+      - Pool Allocators will return result
 
 NodeAllocator for TKVLs could be a list of AllocationGroups UUIDs. Last
 entry is for tier-0, each entry going up the list is for the next tier up.

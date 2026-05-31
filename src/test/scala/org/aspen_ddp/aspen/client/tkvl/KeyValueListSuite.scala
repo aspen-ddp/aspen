@@ -22,7 +22,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       ikvos <- client.read(radicle)
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       //lptr <- alloc.allocateKeyValueObject(ObjectRevisionGuard(radicle, ikvos.revision), Map(), None, None, None)
       lptr <- alloc.allocateKeyValueObject()
@@ -55,7 +55,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -104,7 +104,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -155,7 +155,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -205,7 +205,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -255,7 +255,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -299,7 +299,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -342,7 +342,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -388,7 +388,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -442,7 +442,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 
@@ -513,7 +513,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
 

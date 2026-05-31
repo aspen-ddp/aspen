@@ -16,7 +16,7 @@ trait StoragePool:
 
   val maxObjectSize: Option[Int]
 
-  def createAllocator: ObjectAllocator
+  def allocator: ObjectAllocator
 
   def getState(): Future[StoragePoolState]
 

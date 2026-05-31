@@ -6,15 +6,13 @@ import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, uuid2byte}
-import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 
 import java.nio.charset.StandardCharsets
@@ -48,6 +46,8 @@ trait AspenClient extends ObjectReader:
   def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState]
 
   def newTransaction(): Transaction
+
+  def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator]
 
   def getStoragePool(poolId: PoolId): Future[StoragePool] =
     given ExecutionContext = this.clientContext
@@ -238,4 +238,7 @@ trait AspenClient extends ObjectReader:
 
   private[aspen] def getSystemAttribute(key: String): Option[String]
   private[aspen] def setSystemAttribute(key: String, value: String): Unit
+
+  private[aspen] def getCachedAllocator(allocatorId: ObjectAllocatorId): Option[ObjectAllocator] = None
+  private[aspen] def cacheAllocator(allocator: ObjectAllocator): Unit = ()
 

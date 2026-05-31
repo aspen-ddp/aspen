@@ -470,7 +470,7 @@ object Main {
       kvos <- client.read(radicle)
       _ = println("------------ Getting Storage Pool---------------")
       pool <- client.getStoragePool(kvos.pointer.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
       _ = println("------------ Allocating Data Object ---------------")
       key = Key(100)
       dptr <- allocObject(kvos.contents.get(key), kvos, alloc)

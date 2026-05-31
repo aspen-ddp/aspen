@@ -11,11 +11,13 @@ trait ObjectAllocator:
 
   val client: AspenClient
 
+  val allocatorId: ObjectAllocatorId
+
   def maxObjectSize: Option[Int]
 
-  protected def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer]
+  protected[client] def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer]
 
-  protected def createKeyValueObjectPointer()(using t: Transaction): Future[KeyValueObjectPointer]
+  protected[client] def createKeyValueObjectPointer()(using t: Transaction): Future[KeyValueObjectPointer]
 
   def allocateDataObject()(using t: Transaction): Future[DataObjectPointer] =
     given ExecutionContext = client.clientContext

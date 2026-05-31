@@ -17,7 +17,7 @@ class UUIDObjectRegistrySuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
       tx0 = client.newTransaction()
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
@@ -49,7 +49,7 @@ class UUIDObjectRegistrySuite extends IntegrationTestSuite:
 
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx1 = client.newTransaction()
       ptr1 <- alloc.allocateKeyValueObject()(using tx1)

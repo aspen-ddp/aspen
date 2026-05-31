@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.internal.read
 import java.util.UUID
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
-import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, InvalidObject, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, InvalidObject, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -59,6 +59,8 @@ object BaseReadDriverSuite {
     def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = Future.failed(new Exception("TODO"))
 
     def newTransaction(): Transaction = null
+
+    override def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] = ???
     
     protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 

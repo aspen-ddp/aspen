@@ -16,7 +16,7 @@ class RegistrySuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
       tx0 = client.newTransaction()
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)
@@ -43,7 +43,7 @@ class RegistrySuite extends IntegrationTestSuite:
       key = Key("test-value-1")
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
       ptr <- alloc.allocateKeyValueObject()(using tx)
@@ -62,7 +62,7 @@ class RegistrySuite extends IntegrationTestSuite:
       key = Key("test-value-2")
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx1 = client.newTransaction()
       ptr1 <- alloc.allocateKeyValueObject()(using tx1)
@@ -96,7 +96,7 @@ class RegistrySuite extends IntegrationTestSuite:
 
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx = client.newTransaction()
       ptr <- alloc.allocateKeyValueObject()(using tx)
@@ -119,7 +119,7 @@ class RegistrySuite extends IntegrationTestSuite:
 
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       tx1 = client.newTransaction()
       ptr1 <- alloc.allocateKeyValueObject()(using tx1)

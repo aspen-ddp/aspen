@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.common.util.WeightedSelector
 import org.aspen_ddp.aspen.compute.TaskExecutor
 
 import java.util.UUID
@@ -215,6 +216,24 @@ final case class AllocationGroupState(
                                      members: List[AllocationGroupState.Member],
                                      parentGroups: List[AllocationGroupId]
                                      ):
+
+  private var wselector: Option[WeightedSelector[AllocationGroupState.Member]] = None
+
+  def selectMemberForAllocation(): Option[AllocationGroupState.Member] =
+    val ws = synchronized:
+      wselector match
+        case Some(o) => o
+        case None =>
+          wselector = Some(new WeightedSelector[AllocationGroupState.Member](members.map: m =>
+            val freeSpace = m.maximumSize - m.currentUsage
+            if freeSpace >= 0 then
+              (m, freeSpace.toDouble)
+            else
+              (m, 0.0)
+          ))
+          wselector.get
+
+    ws.next()
 
   def toBytes: Array[Byte] = Codec.encode(this).toByteArray
 

@@ -16,7 +16,7 @@ class NamespacedUUIDRegistrySuite extends IntegrationTestSuite:
     for
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
       tx0 = client.newTransaction()
       ptr <- alloc.allocateKeyValueObject()(using tx0)
       _ = tx0.lockRevision(radicle, ikvos.revision)

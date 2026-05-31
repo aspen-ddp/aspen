@@ -2,8 +2,8 @@ package org.aspen_ddp.aspen
 
 import java.util.UUID
 import org.aspen_ddp.aspen
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.internal.{ObjectAllocatorManager, OpportunisticRebuildManager}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{BaseReadDriver, ReadManager}
@@ -82,6 +82,7 @@ object TestNetwork {
 
     val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
     val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
+    val allocatorManager: ObjectAllocatorManager = new ObjectAllocatorManager(this)
 
     val rmgr = new ReadManager(this, BaseReadDriver.noErrorRecoveryReadDriver)
 
@@ -98,6 +99,9 @@ object TestNetwork {
     def newTransaction(): Transaction = {
       new TransactionImpl(this, txManager, _ => 0, None)
     }
+
+    override def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] =
+      allocatorManager.getAllocator(allocatorId)
 
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
     def getHostId(hostName: String): Future[HostId] = ???
@@ -132,7 +136,7 @@ object TestNetwork {
 
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
-        ptr <- bsPool.createAllocator.allocateDataObject(DataBuffer(ags.toBytes))
+        ptr <- bsPool.allocator.allocateDataObject(DataBuffer(ags.toBytes))
         _ <- objectRegistry.prepareRegisterObject(ags.groupId.uuid, ptr)
         _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
         _ <- tx.commit()

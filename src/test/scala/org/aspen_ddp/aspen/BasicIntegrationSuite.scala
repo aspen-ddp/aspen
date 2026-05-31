@@ -66,7 +66,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
         List(Insert(key, value.bytes)))
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       dp <- alloc.allocateDataObject(Array[Byte](0))
 
@@ -98,7 +98,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     for {
       pool <- client.getStoragePool(Radicle.poolId)
 
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       kp <- alloc.allocateKeyValueObject(Map(key -> value))
 
@@ -134,7 +134,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     for {
       pool <- client.getStoragePool(Radicle.poolId)
 
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       kp <- alloc.allocateKeyValueObject(Map(key -> value))
 
@@ -170,7 +170,7 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
         List(Insert(key, value.bytes)))
 
       pool <- client.getStoragePool(Radicle.poolId)
-      alloc = pool.createAllocator
+      alloc = pool.allocator
 
       dp <- alloc.allocateDataObject(Array[Byte](0))
 

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.internal
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectCache, RegisteredTypeFactory, RetryStrategy, StopRetrying, StoragePool, Transaction, TransactionStatusCache, TypeFactories, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RegisteredTypeFactory, RetryStrategy, StopRetrying, StoragePool, Transaction, TransactionStatusCache, TypeFactories, TypeRegistry}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
@@ -51,6 +51,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   private val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
   private val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
+  private val allocatorManager = new ObjectAllocatorManager(this)
 
   override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
     getStoragePool(pointer.poolId).flatMap { pool =>
@@ -66,6 +67,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   
   override def newTransaction(): Transaction =
     TransactionImpl(this, txManager, _ => 0, None)
+    
+  override def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] =
+    allocatorManager.getAllocator(allocatorId)
   
   override def getStoragePoolId(poolName: String): Future[PoolId] =
     namespacedRegistry.getRegisteredObject("pool", poolName).map(PoolId(_))
@@ -104,7 +108,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       given Transaction = tx
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
-        ptr <- bsPool.createAllocator.allocateDataObject(DataBuffer(ags.toBytes))
+        ptr <- bsPool.allocator.allocateDataObject(DataBuffer(ags.toBytes))
         _ <- objectRegistry.prepareRegisterObject(ags.groupId.uuid, ptr)
         _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
       yield
@@ -182,7 +186,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
-        poolPtr <- createPoolObj(bsPool.createAllocator)
+        poolPtr <- createPoolObj(bsPool.allocator)
         _ <- objectRegistry.prepareRegisterObject(config.poolId.uuid, poolPtr)
         _ <- namespacedRegistry.prepareRegisterObject("pool", config.name, config.poolId.uuid)
         devUpdates <- Future.sequence(collectDevices(config.stores))
@@ -217,4 +221,10 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   def getSystemAttribute(key: String): Option[String] = attributes.get(key)
   def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value
+
+  override def getCachedAllocator(allocatorId: ObjectAllocatorId): Option[ObjectAllocator] =
+    allocatorManager.get(allocatorId)
+
+  override def cacheAllocator(allocator: ObjectAllocator): Unit =
+    allocatorManager.put(allocator)
 

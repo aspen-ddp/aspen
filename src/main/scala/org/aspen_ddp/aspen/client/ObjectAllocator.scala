@@ -11,7 +11,7 @@ trait ObjectAllocator:
 
   val client: AspenClient
 
-  val maxObjectSize: Option[Int]
+  def maxObjectSize: Option[Int]
 
   protected def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer]
 

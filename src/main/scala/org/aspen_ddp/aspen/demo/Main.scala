@@ -372,7 +372,7 @@ object Main {
       case None =>
         println("Creating Amoeba")
         client.getStoragePool(kvos.pointer.poolId).flatMap { pool =>
-          val allocator = new PoolObjectAllocator(client, pool, None)
+          val allocator = new PoolObjectAllocator(client, pool)
           SimpleFileSystem.bootstrap(client, allocator, kvos.pointer, AmoebafsKey)
         }
     }
@@ -420,7 +420,7 @@ object Main {
       _=println("------------ Commit Complete! ---------------")
 
       //guard = ObjectRevisionGuard(kvos.pointer, kvos.revision)
-      //allocator = new PoolObjectAllocator(client, pool, None)
+      //allocator = new PoolObjectAllocator(client, pool)
       //alloc <- allocator.allocateDataObject(guard, Array[Byte](0,1,2,3))(tx)
       //_ = tx.overwrite(kvos, tx.revision, rootDirInode.toArray) // ensure Tx has an object to modify
 

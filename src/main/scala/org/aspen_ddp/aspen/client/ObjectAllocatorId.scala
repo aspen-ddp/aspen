@@ -22,7 +22,7 @@ object ObjectAllocatorId:
 sealed abstract class ObjectAllocatorId:
   def uuid: UUID
   def allocatorType: ObjectAllocatorType
-  
+
   def toArray: Array[Byte] =
     val bb = ByteBuffer.allocate(17)
     bb.put(allocatorType.code)

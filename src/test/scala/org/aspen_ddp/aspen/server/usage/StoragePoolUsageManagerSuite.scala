@@ -18,7 +18,7 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       pool <- client.getStoragePool(Radicle.poolId)
-      allocator = new PoolObjectAllocator(client, pool, None)
+      allocator = new PoolObjectAllocator(client, pool)
 
       tx0 = client.newTransaction()
       executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)

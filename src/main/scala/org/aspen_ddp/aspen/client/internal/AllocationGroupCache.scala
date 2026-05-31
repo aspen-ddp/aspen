@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.DataObjectPointer
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.*
 
-class AllocationGroupCache(client: AspenClient, refreshDuration: Duration = Duration(20, SECONDS)):
+class AllocationGroupCache(val client: AspenClient, refreshDuration: Duration = Duration(20, SECONDS)):
 
   given ec: ExecutionContext = client.clientContext
 
@@ -16,6 +16,12 @@ class AllocationGroupCache(client: AspenClient, refreshDuration: Duration = Dura
   private var refreshing: Set[AllocationGroupId] = Set.empty
   private var states: Map[AllocationGroupId, (Long, AllocationGroupState)] = Map.empty
 
+  def get(groupId: AllocationGroupId): Option[AllocationGroupState] = synchronized(states.get(groupId).map(_._2))
+  
+  def put(state: AllocationGroupState): Unit = 
+    synchronized:
+      states += state.groupId -> (System.currentTimeMillis(), state)
+      
   def fetchState(groupId: AllocationGroupId): Future[AllocationGroupState] =
     synchronized:
       states.get(groupId) match

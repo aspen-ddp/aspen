@@ -18,7 +18,7 @@ class FilesSystemTestSuite  extends IntegrationTestSuite {
     for
       kvos <- client.read(radicle)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
-      allocator = new PoolObjectAllocator(client, rootPool, None )
+      allocator = new PoolObjectAllocator(client, rootPool)
       fs <- SimpleFileSystem.bootstrap(client,
         allocator,
         kvos.pointer,

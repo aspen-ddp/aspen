@@ -66,7 +66,7 @@ class SinglePoolNodeAllocator(val client:AspenClient, val poolId: PoolId) extend
   override def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = allocator match {
     case Some(alloc) => Future.successful(alloc)
     case None => client.getStoragePool(poolId).map { pool =>
-      val alloc = new PoolObjectAllocator(client, pool, None)
+      val alloc = new PoolObjectAllocator(client, pool)
       // Note, there's a race condition here if multiple getAllocatorForTier calls are made
       // simultaneously. It's harmless though so we'll ignore it and just keep the last one.
       allocator = Some(alloc)

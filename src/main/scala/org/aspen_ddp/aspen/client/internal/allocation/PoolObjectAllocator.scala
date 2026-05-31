@@ -7,10 +7,11 @@ import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
 class PoolObjectAllocator(val client: AspenClient,
-                          val pool: StoragePool,
-                          val maxObjectSize: Option[Int]) extends ObjectAllocator:
+                          val pool: StoragePool) extends ObjectAllocator:
 
   given ExecutionContext = client.clientContext
+
+  override def maxObjectSize: Option[Int] = pool.maxObjectSize
 
   override protected def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer] =
     Future.successful(new DataObjectPointer(ObjectId(UUID.randomUUID()), pool.poolId, Array.empty))

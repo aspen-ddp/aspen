@@ -158,7 +158,7 @@ class StoreManager(val client: AspenClient,
             case Some(vs) =>
               val executorPtr = KeyValueObjectPointer(vs.value.bytes)
               client.getStoragePool(Radicle.poolId).foreach: pool =>
-                val allocator = new PoolObjectAllocator(client, pool, None)
+                val allocator = new PoolObjectAllocator(client, pool)
                 SimpleTaskExecutor(client, allocator, executorPtr).foreach: executor =>
                   synchronized:
                     taskExecutorPromise.success(executor)
@@ -166,7 +166,7 @@ class StoreManager(val client: AspenClient,
 
             case None =>
               client.getStoragePool(Radicle.poolId).foreach: pool =>
-                val allocator = new PoolObjectAllocator(client, pool, None)
+                val allocator = new PoolObjectAllocator(client, pool)
 
                 client.transactUntilSuccessful: tx =>
                   given scala.concurrent.ExecutionContext = ec

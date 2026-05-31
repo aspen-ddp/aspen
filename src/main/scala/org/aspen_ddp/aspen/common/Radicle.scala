@@ -16,4 +16,9 @@ object Radicle:
   private[aspen] val ObjectRegistryKey = Key(Array[Byte](2))
   private[aspen] val NamespacedRegistryKey = Key(Array[Byte](3))
 
+  private[aspen] val StoragePoolsTreeKey = Key(Array[Byte](4))
+  private[aspen] val AllocationGroupsTreeKey = Key(Array[Byte](5))
+  private[aspen] val HostsTreeKey = Key(Array[Byte](6))
+  private[aspen] val StorageDevicesTreeKey = Key(Array[Byte](7))
+
 

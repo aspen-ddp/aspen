@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen
 
 import java.util.UUID
 import org.aspen_ddp.aspen
-import org.aspen_ddp.aspen.client.internal.{ObjectAllocatorManager, OpportunisticRebuildManager}
+import org.aspen_ddp.aspen.client.internal.{MetadataTree, ObjectAllocatorManager, OpportunisticRebuildManager}
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
@@ -110,17 +110,22 @@ object TestNetwork {
     val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
     val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
 
+    val storagePoolsTree = new MetadataTree(this, radicle, Radicle.StoragePoolsTreeKey)
+    val allocationGroupsTree = new MetadataTree(this, radicle, Radicle.AllocationGroupsTreeKey)
+    val hostsTree = new MetadataTree(this, radicle, Radicle.HostsTreeKey)
+    val storageDevicesTree = new MetadataTree(this, radicle, Radicle.StorageDevicesTreeKey)
+
     private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
-      objectRegistry.getRegisteredKeyValueObject(poolId.uuid)
+      storagePoolsTree.get(poolId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
 
     private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] =
-      objectRegistry.getRegisteredKeyValueObject(hostId.uuid)
+      hostsTree.get(hostId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
 
     private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
-      objectRegistry.getRegisteredKeyValueObject(storageDeviceId.uuid)
+      storageDevicesTree.get(storageDeviceId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
 
     override def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] =
-      objectRegistry.getRegisteredDataObject(allocationGroupId.uuid)
+      allocationGroupsTree.get(allocationGroupId.uuid).map(_.asInstanceOf[DataObjectPointer])
 
     override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
       val ags = AllocationGroupState(
@@ -137,7 +142,7 @@ object TestNetwork {
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         ptr <- bsPool.allocator.allocateDataObject(DataBuffer(ags.toBytes))
-        _ <- objectRegistry.prepareRegisterObject(ags.groupId.uuid, ptr)
+        _ <- allocationGroupsTree.preparePut(ags.groupId.uuid, ptr)
         _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
         _ <- tx.commit()
       yield

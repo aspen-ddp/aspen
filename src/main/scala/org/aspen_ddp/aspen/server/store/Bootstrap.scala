@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
@@ -80,6 +80,10 @@ object Bootstrap:
       }
     }
 
+    def allocateTree(ordering: KeyOrdering, content: (Key, Array[Byte])*): Root =
+      val rootObject = allocate(content.toList)
+      Root(0, ordering, Some(rootObject), bootstrapNodeAllocator)
+
     val storeEntrys = (0 until ida.width).map{ _ => 
       StoragePoolState.StoreEntry(bootstrapHostState.hostId, bootstrapStorageDeviceState.storageDeviceId)
     }.toArray
@@ -112,32 +116,44 @@ object Bootstrap:
     ))
     
     // Create registry trees 
-    val objectRegistryRoot = allocate(List(
-      Key(Radicle.poolId.uuid) -> poolPointer.toArray,
-      Key(bootstrapStorageDeviceState.storageDeviceId.uuid) -> storageDevicePtr.toArray,
-      Key(bootstrapHostState.hostId.uuid) -> hostPtr.toArray
-    ))
-    val objectRegistryTree = Root(0,
-      ByteArrayKeyOrdering,
-      Some(objectRegistryRoot),
-      bootstrapNodeAllocator)
-
-    val namespacedRegistryRoot = allocate(List(
+    
+    val objectRegistryTree = allocateTree(ByteArrayKeyOrdering) 
+    
+    val namespacedRegistryTree = allocateTree(
+      LexicalKeyOrdering,
       NamespacedUUIDRegistry.makeKey("pool", PoolId.BootstrapPoolName) -> uuid2byte(Radicle.poolId.uuid),
       NamespacedUUIDRegistry.makeKey("host", bootstrapHostState.name) -> uuid2byte(bootstrapHostState.hostId.uuid)
-    ))
-    val namespacedRegistryTree = Root(0,
-      LexicalKeyOrdering,
-      Some(namespacedRegistryRoot),
-      bootstrapNodeAllocator)
+    )
+    
+    // Create Metadata Trees
+    val storagePoolsTree = allocateTree(
+      ByteArrayKeyOrdering,
+      Key(Radicle.poolId.uuid) -> poolPointer.toArray,
+    )
+    
+    val allocationGroupsTree = allocateTree(ByteArrayKeyOrdering)
+
+    val hostsTree = allocateTree(
+      ByteArrayKeyOrdering,
+      Key(bootstrapHostState.hostId.uuid) -> hostPtr.toArray
+    )
+
+    val storageDevicesTree =allocateTree(
+      ByteArrayKeyOrdering,
+      Key(bootstrapStorageDeviceState.storageDeviceId.uuid) -> storageDevicePtr.toArray
+    )
 
     val radicleContent: List[(Key, Array[Byte])] = List(
       Radicle.BootstrapConfigKey -> bootstrapConfig.getBytes(StandardCharsets.UTF_8),
       Radicle.SystemIdKey -> uuid2byte(aspenSystemId),
       Radicle.ObjectRegistryKey -> objectRegistryTree.encode(),
-      Radicle.NamespacedRegistryKey -> namespacedRegistryTree.encode()
+      Radicle.NamespacedRegistryKey -> namespacedRegistryTree.encode(),
+      Radicle.StoragePoolsTreeKey -> storagePoolsTree.encode(),
+      Radicle.AllocationGroupsTreeKey -> allocationGroupsTree.encode(),
+      Radicle.HostsTreeKey -> hostsTree.encode(),
+      Radicle.StorageDevicesTreeKey -> storageDevicesTree.encode(),
     )
-
+ 
     val radicle = allocate(radicleContent, Some(Radicle.objectId))
 
     overwrite(allocTreeRoot, allocTreeContent)

@@ -1,26 +1,26 @@
 package org.aspen_ddp.aspen.client.internal
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RegisteredTypeFactory, RetryStrategy, StopRetrying, StoragePool, Transaction, TransactionStatusCache, TypeFactories, TypeRegistry}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
-import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{ReadManager, SimpleReadDriver}
 import org.aspen_ddp.aspen.client.internal.transaction.{SimpleClientTransactionDriver, TransactionImpl, TransactionManager}
 import org.aspen_ddp.aspen.client.registries.Registry.DuplicateRegistration
 import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved}
+import org.aspen_ddp.aspen.common.metadata.*
+import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{KeyRequirement, KeyRevision}
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, byte2uuid, uuid2byte}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 
 import java.util.UUID
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
 import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration.{Duration, FiniteDuration, HOURS, MILLISECONDS}
+import scala.util.Failure
 
 class SimpleAspenClient(val msngr: ClientMessenger,
                         override val clientId: ClientId,
@@ -32,7 +32,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
                         txRetransmitDelay: Duration,
                         allocationRetransmitDelay: Duration,
                         userTypeFactories: List[RegisteredTypeFactory] = Nil) extends AspenClient:
-  
+
+  import SimpleAspenClient.*
+
   given ec: ExecutionContext = executionContext
 
   var attributes: Map[String, String] = Map()
@@ -51,6 +53,12 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   private val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
   private val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
+
+  private val storagePoolsTree = new MetadataTree(this, radicle, Radicle.StoragePoolsTreeKey)
+  private val allocationGroupsTree = new MetadataTree(this, radicle, Radicle.AllocationGroupsTreeKey)
+  private val hostsTree = new MetadataTree(this, radicle, Radicle.HostsTreeKey)
+  private val storageDevicesTree = new MetadataTree(this, radicle, Radicle.StorageDevicesTreeKey)
+
   private val allocatorManager = new ObjectAllocatorManager(this)
 
   override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
@@ -67,7 +75,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   
   override def newTransaction(): Transaction =
     TransactionImpl(this, txManager, _ => 0, None)
-    
+
   override def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] =
     allocatorManager.getAllocator(allocatorId)
   
@@ -80,17 +88,19 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   override def getAllocationGroupId(groupName: String): Future[AllocationGroupId] =
     namespacedRegistry.getRegisteredObject("group", groupName).map(AllocationGroupId(_))
 
+
   override def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
-    objectRegistry.getRegisteredKeyValueObject(poolId.uuid)
+    storagePoolsTree.get(poolId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
 
   override def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] =
-    objectRegistry.getRegisteredKeyValueObject(hostId.uuid)
+    hostsTree.get(hostId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
 
   override def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
-    objectRegistry.getRegisteredKeyValueObject(storageDeviceId.uuid)
+    storageDevicesTree.get(storageDeviceId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
 
   override def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] =
-    objectRegistry.getRegisteredDataObject(allocationGroupId.uuid)
+    allocationGroupsTree.get(allocationGroupId.uuid).map(_.asInstanceOf[DataObjectPointer])
+
 
   override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
     val ags = AllocationGroupState(
@@ -109,7 +119,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         ptr <- bsPool.allocator.allocateDataObject(DataBuffer(ags.toBytes))
-        _ <- objectRegistry.prepareRegisterObject(ags.groupId.uuid, ptr)
+        _ <- allocationGroupsTree.preparePut(ags.groupId.uuid, ptr)
         _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
       yield
         ags.groupId
@@ -187,7 +197,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         poolPtr <- createPoolObj(bsPool.allocator)
-        _ <- objectRegistry.prepareRegisterObject(config.poolId.uuid, poolPtr)
+        _ <- storagePoolsTree.preparePut(config.poolId.uuid, poolPtr)
         _ <- namespacedRegistry.prepareRegisterObject("pool", config.name, config.poolId.uuid)
         devUpdates <- Future.sequence(collectDevices(config.stores))
       yield 

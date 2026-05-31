@@ -1,3 +1,17 @@
+Add Inspection Commands:
+  - list hosts, storage-devices, storage-pools, allocation-groups
+  - Use subcommand (think this is already done)
+
+Rework Main.scala
+  - Move to aspen-ddp.cmdline
+  - Update transfer-store to take target device and use new transfer Impl
+  - Remove old CnC based StoreTransfer code
+
+Need some wey to list hosts & devices
+  - UUIDs will be pretty meaningless
+  - Add storage-devices/<link/dirname> to localDeviceName in Host state?
+    - need to modify hostState state every time a device is added anyway
+  - convert from Set[stoargeDeviceId] to Map[storageDeviceId, String]
 
 Add add-host command
   - takes address & ports
@@ -12,18 +26,7 @@ Add add-storage-device command
   - Update host to use FileSystems.getDefault().newWatchService() to monitor for additions
     - Wrap this in a helper class to simplify Host impl
 
-Need some wey to list hosts & devices
-  - UUIDs will be pretty meaningless
-  - Add storage-devices/<link/dirname> to localDeviceName in Host state?
-    - need to modify hostState state every time a device is added anyway
-  - convert from Set[stoargeDeviceId] to Map[storageDeviceId, String]
-
 Move ZMQNetwork to aspen-ddp.common.network.implementations.zmqnet
-
-Rework Main.scala
-  - Move to aspen-ddp.cmdline
-  - Update transfer-store to take target device and use new transfer Impl
-  - Remove old CnC based StoreTransfer code
 
 Need a plan for getting the storageDevices needed for pool creation
 

@@ -6,11 +6,11 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPoin
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
-class SinglePoolObjectAllocator(val client: AspenClient,
-                                val pool: StoragePool,
-                                val maxObjectSize: Option[Int]) extends ObjectAllocator:
+class PoolObjectAllocator(val client: AspenClient,
+                          val pool: StoragePool,
+                          val maxObjectSize: Option[Int]) extends ObjectAllocator:
 
-  val executionContext: ExecutionContext = client.clientContext
+  given ExecutionContext = client.clientContext
 
   override protected def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer] =
     Future.successful(new DataObjectPointer(ObjectId(UUID.randomUUID()), pool.poolId, Array.empty))

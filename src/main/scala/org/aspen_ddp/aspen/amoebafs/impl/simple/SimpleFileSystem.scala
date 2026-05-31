@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeUnit}
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.client.{AspenClient, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.ida.IDA
@@ -65,7 +65,7 @@ object SimpleFileSystem {
     for
       kvos <- client.read(fsRoot)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
-      defaultAllocator = new SinglePoolObjectAllocator(client, rootPool, None)
+      defaultAllocator = new PoolObjectAllocator(client, rootPool, None)
       executorRoot = KeyValueObjectPointer(kvos.contents(TaskExecutorRootKey).value.bytes)
       executor <- SimpleTaskExecutor(client, defaultAllocator, executorRoot)
     yield

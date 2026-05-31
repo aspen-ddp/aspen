@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.metadata.management
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, StoragePoolState}
@@ -17,7 +17,7 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       pool <- client.getStoragePool(Radicle.poolId)
-      allocator = new SinglePoolObjectAllocator(client, pool, None)
+      allocator = new PoolObjectAllocator(client, pool, None)
 
       tx0 = client.newTransaction()
       executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)

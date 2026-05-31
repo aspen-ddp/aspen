@@ -381,7 +381,7 @@ Create `src/test/scala/org/aspen_ddp/aspen/common/metadata/management/UpdateAllo
 package org.aspen_ddp.aspen.common.metadata.management
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, StoragePoolState}
@@ -395,9 +395,10 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
 
   private def setup(): Future[TaskExecutor] =
     given ExecutionContext = executionContext
+
     for
       pool <- client.getStoragePool(Radicle.poolId)
-      allocator = new SinglePoolObjectAllocator(client, pool, pool.ida, None)
+      allocator = new PoolObjectAllocator(client, pool, pool.ida, None)
 
       tx0 = client.newTransaction()
       executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)
@@ -410,6 +411,7 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
 
   private def readGroupState(groupId: AllocationGroupId): Future[AllocationGroupState] =
     given ExecutionContext = executionContext
+
     for
       groupPtr <- client.getAllocationGroupPointer(groupId)
       groupDos <- client.read(groupPtr)
@@ -417,13 +419,16 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
 
   private def readPoolState(): Future[StoragePoolState] =
     given ExecutionContext = executionContext
+
     for
       poolPtr <- client.getStoragePoolPointer(Radicle.poolId)
       poolKvos <- client.read(poolPtr)
     yield StoragePoolState(poolKvos)
 
   atest("updates member usage in single parent group"):
+
     given ExecutionContext = executionContext
+
     for
       executor <- setup()
       groupId <- client.createAllocationGroup("test-group", level = 0)

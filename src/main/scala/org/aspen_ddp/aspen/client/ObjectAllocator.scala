@@ -9,23 +9,23 @@ import scala.concurrent.{ExecutionContext, Future}
 
 trait ObjectAllocator:
 
-  val maxObjectSize: Option[Int]
+  val client: AspenClient
 
-  protected val executionContext: ExecutionContext
+  val maxObjectSize: Option[Int]
 
   protected def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer]
 
   protected def createKeyValueObjectPointer()(using t: Transaction): Future[KeyValueObjectPointer]
 
   def allocateDataObject()(using t: Transaction): Future[DataObjectPointer] =
-    given ExecutionContext = executionContext
+    given ExecutionContext = client.clientContext
     createDataObjectPointer().map: ptr =>
       t.addAllocatingObject(ptr)
       AllocationFinalizationAction.addToTransaction(ptr, t)
       ptr
 
   def allocateKeyValueObject()(using t: Transaction): Future[KeyValueObjectPointer] =
-    given ExecutionContext = executionContext
+    given ExecutionContext = client.clientContext
     createKeyValueObjectPointer().map: ptr =>
       t.addAllocatingObject(ptr)
       AllocationFinalizationAction.addToTransaction(ptr, t)
@@ -33,7 +33,7 @@ trait ObjectAllocator:
 
   def allocateDataObject(initialContent: DataBuffer,
                          initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[DataObjectPointer] =
-    given ExecutionContext = executionContext
+    given ExecutionContext = client.clientContext
     allocateDataObject().map: ptr =>
       t.overwrite(ptr, ObjectRevision.Allocating, initialContent)
       t.setRefcount(ptr, ObjectRefcount.Allocating, initialRefcount)
@@ -45,7 +45,7 @@ trait ObjectAllocator:
                              left: Option[Value] = None,
                              right: Option[Value] = None,
                              initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[KeyValueObjectPointer] =
-    given ExecutionContext = executionContext
+    given ExecutionContext = client.clientContext
     allocateKeyValueObject().map: ptr =>
 
       var ops: List[KeyValueOperation] = initialContent.map((k, v) => Insert(k, v.bytes)).toList

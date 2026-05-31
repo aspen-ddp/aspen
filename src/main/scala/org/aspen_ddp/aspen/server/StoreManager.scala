@@ -21,7 +21,7 @@ import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, R
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.demo.BootstrapConfig
 import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.compute.TaskExecutor
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
@@ -158,7 +158,7 @@ class StoreManager(val client: AspenClient,
             case Some(vs) =>
               val executorPtr = KeyValueObjectPointer(vs.value.bytes)
               client.getStoragePool(Radicle.poolId).foreach: pool =>
-                val allocator = new SinglePoolObjectAllocator(client, pool, None)
+                val allocator = new PoolObjectAllocator(client, pool, None)
                 SimpleTaskExecutor(client, allocator, executorPtr).foreach: executor =>
                   synchronized:
                     taskExecutorPromise.success(executor)
@@ -166,7 +166,7 @@ class StoreManager(val client: AspenClient,
 
             case None =>
               client.getStoragePool(Radicle.poolId).foreach: pool =>
-                val allocator = new SinglePoolObjectAllocator(client, pool, None)
+                val allocator = new PoolObjectAllocator(client, pool, None)
 
                 client.transactUntilSuccessful: tx =>
                   given scala.concurrent.ExecutionContext = ec

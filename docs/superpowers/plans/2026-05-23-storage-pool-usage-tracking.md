@@ -446,16 +446,16 @@ git commit -m "Add StoragePoolUsageManager with threshold-based store size track
 
 - [ ] **Step 1: Add imports to StoreManager**
 
-At the top of `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala`, add these imports (after the existing imports):
-
+At the top of `src/main/scala/org/aspen_ddp/aspen/serv
 ```scala
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.objects.{Key, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
 import org.aspen_ddp.aspen.compute.TaskExecutor
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
+``` org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 ```
 
 - [ ] **Step 2: Add TaskExecutorRootKey to StoreManager companion object**
@@ -586,7 +586,7 @@ Create `src/test/scala/org/aspen_ddp/aspen/server/usage/StoragePoolUsageManagerS
 package org.aspen_ddp.aspen.server.usage
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.{KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.metadata.StoragePoolState
@@ -601,9 +601,10 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
 
   private def setupUsageManager(): Future[(StoragePoolUsageManager, SimpleTaskExecutor)] =
     given ExecutionContext = executionContext
+
     for
       pool <- client.getStoragePool(Radicle.poolId)
-      allocator = new SinglePoolObjectAllocator(client, pool, pool.ida, None)
+      allocator = new PoolObjectAllocator(client, pool, pool.ida, None)
 
       tx0 = client.newTransaction()
       executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)
@@ -619,6 +620,7 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
 
   private def readPoolState(): Future[(KeyValueObjectState, StoragePoolState)] =
     given ExecutionContext = executionContext
+
     for
       poolPtr <- client.getStoragePoolPointer(Radicle.poolId)
       poolKvos <- client.read(poolPtr)
@@ -626,7 +628,9 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
       (poolKvos, StoragePoolState(poolKvos))
 
   atest("No update when size is unchanged"):
+
     given ExecutionContext = executionContext
+
     for
       (mgr, _) <- setupUsageManager()
       storeId = net.storeId0
@@ -647,7 +651,9 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
       kvos3.contents(sizeKey).revision should be(kvos2.contents(sizeKey).revision)
 
   atest("Update store size KV pair on first report"):
+
     given ExecutionContext = executionContext
+
     for
       (mgr, _) <- setupUsageManager()
       storeId = net.storeId0
@@ -665,7 +671,9 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
       byte2long(kvos2.contents(sizeKey).value.bytes) should be(5000L)
 
   atest("Update store size KV pair on significant change"):
+
     given ExecutionContext = executionContext
+
     for
       (mgr, _) <- setupUsageManager()
       storeId = net.storeId0
@@ -686,7 +694,9 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
       kvos2.contents(sizeKey).revision should not be rev1
 
   atest("No update when change is below threshold"):
+
     given ExecutionContext = executionContext
+
     for
       (mgr, _) <- setupUsageManager()
       storeId = net.storeId0
@@ -706,7 +716,9 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
       kvos2.contents(sizeKey).revision should be(rev1)
 
   atest("currentUsage updated when mean changes significantly"):
+
     given ExecutionContext = executionContext
+
     for
       (mgr, _) <- setupUsageManager()
 
@@ -729,6 +741,7 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
       state2.currentUsage should be(expectedMean)
 
   atest("Durable task prepared when allocationGroups non-empty"):
+
     given ExecutionContext = executionContext
     import java.util.UUID
     val allocGroup = UUID.randomUUID()
@@ -767,7 +780,9 @@ class StoragePoolUsageManagerSuite extends IntegrationTestSuite:
       finalState.currentUsage should be(expectedMean)
 
   atest("No durable task when allocationGroups is empty"):
+
     given ExecutionContext = executionContext
+
     for
       (mgr, _) <- setupUsageManager()
 

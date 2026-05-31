@@ -5,7 +5,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
@@ -77,7 +77,7 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
     for
       kvos <- client.read(radicle)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
-      allocator = new SinglePoolObjectAllocator(client, rootPool, None)
+      allocator = new PoolObjectAllocator(client, rootPool, None)
 
       // Allocate executor root and data object in one transaction
       tx0 = client.newTransaction()

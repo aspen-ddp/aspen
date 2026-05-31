@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.AmoebaError
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectAllocator, ObjectState, StoragePool}
 import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.{ReedSolomon, Replication}
@@ -372,7 +372,7 @@ object Main {
       case None =>
         println("Creating Amoeba")
         client.getStoragePool(kvos.pointer.poolId).flatMap { pool =>
-          val allocator = new SinglePoolObjectAllocator(client, pool, None)
+          val allocator = new PoolObjectAllocator(client, pool, None)
           SimpleFileSystem.bootstrap(client, allocator, kvos.pointer, AmoebafsKey)
         }
     }
@@ -420,7 +420,7 @@ object Main {
       _=println("------------ Commit Complete! ---------------")
 
       //guard = ObjectRevisionGuard(kvos.pointer, kvos.revision)
-      //allocator = new SinglePoolObjectAllocator(client, pool, None)
+      //allocator = new PoolObjectAllocator(client, pool, None)
       //alloc <- allocator.allocateDataObject(guard, Array[Byte](0,1,2,3))(tx)
       //_ = tx.overwrite(kvos, tx.revision, rootDirInode.toArray) // ensure Tx has an object to modify
 

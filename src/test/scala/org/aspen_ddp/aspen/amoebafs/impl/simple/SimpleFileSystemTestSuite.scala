@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.client.internal.allocation.SinglePoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.objects.IntegerKeyOrdering
 import org.aspen_ddp.aspen.amoebafs.impl.simple.CreateFileTask
 import org.aspen_ddp.aspen.amoebafs.{DirectoryInode, DirectoryPointer, FileInode, FileType}

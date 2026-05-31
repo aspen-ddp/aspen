@@ -54,4 +54,4 @@ class SimpleStoragePool(val client: AspenClient,
       cachedState = None
 
   override def createAllocator: ObjectAllocator = new SinglePoolObjectAllocator(client,
-    this, ida, maxObjectSize)
+    this, maxObjectSize)

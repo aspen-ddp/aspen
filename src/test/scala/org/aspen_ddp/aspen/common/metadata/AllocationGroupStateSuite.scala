@@ -15,7 +15,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       pool <- client.getStoragePool(Radicle.poolId)
-      allocator = new SinglePoolObjectAllocator(client, pool, pool.ida, None)
+      allocator = new SinglePoolObjectAllocator(client, pool, None)
 
       tx0 = client.newTransaction()
       executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)

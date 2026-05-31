@@ -65,7 +65,7 @@ object SimpleFileSystem {
     for
       kvos <- client.read(fsRoot)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
-      defaultAllocator = new SinglePoolObjectAllocator(client, rootPool, rootPool.ida, None)
+      defaultAllocator = new SinglePoolObjectAllocator(client, rootPool, None)
       executorRoot = KeyValueObjectPointer(kvos.contents(TaskExecutorRootKey).value.bytes)
       executor <- SimpleTaskExecutor(client, defaultAllocator, executorRoot)
     yield

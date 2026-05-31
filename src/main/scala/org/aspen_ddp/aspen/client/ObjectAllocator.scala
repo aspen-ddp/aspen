@@ -2,16 +2,14 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.client.internal.allocation.AllocationFinalizationAction
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, ObjectRefcount, ObjectRevision, SetLeft, SetMax, SetMin, SetRight, Value}
+import org.aspen_ddp.aspen.common.objects.*
 
 import scala.concurrent.{ExecutionContext, Future}
+
 
 trait ObjectAllocator:
 
   val maxObjectSize: Option[Int]
-
-  val objectIDA: IDA
 
   protected val executionContext: ExecutionContext
 

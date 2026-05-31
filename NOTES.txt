@@ -14,6 +14,12 @@ AllocationGroupObjectAllocator
       - Call the Allocator
       - Groups will chain down
       - Pool Allocators will return result
+      
+StoragePool Types
+  - Add two keys to StoargePoolState
+    - AllocationStrategy - TypeRegistryUUID
+      - Missing key means generate ObjectIds with no embedded data
+    - AllocationStrategyConfig - Arbitrary byte array
 
 NodeAllocator for TKVLs could be a list of AllocationGroups UUIDs. Last
 entry is for tier-0, each entry going up the list is for the next tier up.

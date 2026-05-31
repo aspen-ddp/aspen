@@ -20,8 +20,6 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
   val clientId = ClientId(new UUID(0, 1))
 
   val groupId = AllocationGroupId(new UUID(0, 10))
-  val groupId2 = AllocationGroupId(new UUID(0, 11))
-
   val objId = ObjectId(new UUID(0, 20))
   val poolId = PoolId(new UUID(0, 30))
   val pointer = DataObjectPointer(objId, poolId)
@@ -77,8 +75,7 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
 
   end TClient
 
-  // Task 1: fetchState on empty cache fetches state and caches it
-  test("fetchState fetches and caches state on cache miss") {
+  test("fetchState fetches and caches state on cache miss"):
     val m = new TClient(clientId)
     var pointerCallCount = 0
     var stateCallCount = 0
@@ -93,16 +90,12 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
 
     val cache = new AllocationGroupCache(m)
 
-    cache.fetchState(groupId).map { result =>
+    cache.fetchState(groupId).map: result =>
       result should be(state)
       stateCallCount should be(1)
-      // pointer fetch is fire-and-forget in case 3, state fetch is the main path
       pointerCallCount should be(1)
-    }
-  }
 
-  // Task 2: cached state is returned on second call
-  test("fetchState returns cached state on second call without re-fetching") {
+  test("fetchState returns cached state on second call without re-fetching"):
     val m = new TClient(clientId)
     var pointerCallCount = 0
     var stateCallCount = 0
@@ -125,10 +118,8 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
       result2 should be(state)
       // getAllocationGroupState called once for the initial fetch
       stateCallCount should be(1)
-  }
 
-  // Task 3: stale state triggers background refresh
-  test("stale state triggers background refresh and returns cached state immediately") {
+  test("stale state triggers background refresh and returns cached state immediately"):
     val m = new TClient(clientId)
     var stateCallCount = 0
 
@@ -158,6 +149,3 @@ class AllocationGroupCacheSuite extends AsyncFunSuite with Matchers:
       // After refresh completes, the new state should be returned
       result3 should be(state2)
       stateCallCount should be(2)
-  }
-
-end AllocationGroupCacheSuite

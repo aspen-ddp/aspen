@@ -225,11 +225,15 @@ final case class AllocationGroupState(
         case Some(o) => o
         case None =>
           wselector = Some(new WeightedSelector[AllocationGroupState.Member](members.map: m =>
-            val freeSpace = m.maximumSize - m.currentUsage
-            if freeSpace >= 0 then
-              (m, freeSpace.toDouble)
+            if m.maximumSize == 0 then
+              // maximumSize of 0 means unconfigured/unlimited
+              (m, 1.0)
             else
-              (m, 0.0)
+              val freeSpace = m.maximumSize - m.currentUsage
+              if freeSpace > 0 then
+                (m, freeSpace.toDouble)
+              else
+                (m, 0.0)
           ))
           wselector.get
 

@@ -93,7 +93,6 @@ object Main {
   case class Args(mode:String="",
                   hostDirectory:File=null,
                   bootstrapConfigFile:File=null,
-                  log4jConfigFile: File=null,
                   hostName:String="",
                   storeName:String="",
                   host:String="",
@@ -122,10 +121,11 @@ object Main {
       onode.foreach(_.receiveHostMessage(msg))
   }
 
-  def setLog4jConfigFile(f: File): Unit =
-    // Set all loggers to Asynchronous Logging
-    System.setProperty("log4j2.contextSelector", "org.apache.logging.log4j.core.async.AsyncLoggerContextSelector")
-    System.setProperty("log4j2.configurationFile", s"file:${f.getAbsolutePath}")
+  def configureLogging(): Unit =
+    scribe.Logger.root
+      .clearHandlers()
+      .withHandler(minimumLevel = Some(scribe.Level.Trace))
+      .replace()
 
   def main(args: Array[String]): Unit = {
     val parser = new scopt.OptionParser[Args]("demo") {
@@ -159,11 +159,7 @@ object Main {
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x")),
-
-          arg[File]("<log4j-config-file>").text("Log4j Configuration File").
-            action( (x, c) => c.copy(log4jConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Log4j Config file does not exist: $x"))
+            validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
         )
 
       cmd("hostState").text("Starts an Amoeba Storage HostState").
@@ -183,20 +179,12 @@ object Main {
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[File]("<log4j-config-file>").text("Log4j Configuration File").
-            action( (x, c) => c.copy(log4jConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Log4j Config file does not exist: $x")),
+            validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x"))
         )
 
       cmd("rebuild").text("Rebuilds a store").
         action( (_,c) => c.copy(mode="rebuild")).
         children(
-          arg[File]("<log4j-config-file>").text("Log4j Configuration File").
-            action( (x, c) => c.copy(log4jConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Log4j Config file does not exist: $x")),
-
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
             validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
@@ -220,10 +208,6 @@ object Main {
       cmd("new-pool").text("Creates a new storage pool").
         action((_, c) => c.copy(mode = "new-pool")).
         children(
-          arg[File]("<log4j-config-file>").text("Log4j Configuration File").
-            action((x, c) => c.copy(log4jConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Log4j Config file does not exist: $x")),
-
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action((x, c) => c.copy(bootstrapConfigFile = x)).
             validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
@@ -257,10 +241,6 @@ object Main {
       cmd("transfer-store").text("Transfers a store to a new hostState").
         action((_, c) => c.copy(mode = "transfer-store")).
         children(
-          arg[File]("<log4j-config-file>").text("Log4j Configuration File").
-            action((x, c) => c.copy(log4jConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Log4j Config file does not exist: $x")),
-
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action((x, c) => c.copy(bootstrapConfigFile = x)).
             validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
@@ -297,11 +277,11 @@ object Main {
           cfg.mode match
             case "bootstrap" => bootstrap(createIDA(cfg), Paths.get("demo"), 4750, 4751, 4752)
             case "hostState" => host(bootstrapConfig, cfg.hostDirectory.toPath)
-            case "amoeba" => amoeba_server(cfg.log4jConfigFile, bootstrapConfig)
-            case "debug" => run_debug_code(cfg.log4jConfigFile, bootstrapConfig)
-            case "rebuild" => rebuild(cfg.log4jConfigFile, cfg.storeName, bootstrapConfig)
-            case "new-pool" => new_pool(cfg.log4jConfigFile, bootstrapConfig, cfg.newPoolName, cfg.idaType, cfg.width, cfg.readThreshold, cfg.writeThreshold, cfg.hosts)
-            case "transfer-store" => transfer_store(cfg.log4jConfigFile, bootstrapConfig, cfg.storeName, cfg.host)
+            case "amoeba" => amoeba_server(bootstrapConfig)
+            case "debug" => run_debug_code(bootstrapConfig)
+            case "rebuild" => rebuild(cfg.storeName, bootstrapConfig)
+            case "new-pool" => new_pool(bootstrapConfig, cfg.newPoolName, cfg.idaType, cfg.width, cfg.readThreshold, cfg.writeThreshold, cfg.hosts)
+            case "transfer-store" => transfer_store(bootstrapConfig, cfg.storeName, cfg.host)
         catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")
@@ -380,9 +360,8 @@ object Main {
     client.read(radicle).flatMap(loadFileSystem)
   }
 
-  def OLD_run_debug_code(log4jConfigFile: File, cfg: BootstrapConfig.Config): Unit = {
-    println(s"LOG4J CONFIG $log4jConfigFile")
-    setLog4jConfigFile(log4jConfigFile)
+  def OLD_run_debug_code(cfg: BootstrapConfig.Config): Unit = {
+    configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
@@ -428,9 +407,8 @@ object Main {
       ()
   }
 
-  def run_debug_code(log4jConfigFile: File, cfg: BootstrapConfig.Config): Unit = {
-    println(s"LOG4J CONFIG $log4jConfigFile")
-    setLog4jConfigFile(log4jConfigFile)
+  def run_debug_code(cfg: BootstrapConfig.Config): Unit = {
+    configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
@@ -486,9 +464,8 @@ object Main {
       ()
   }
 
-  def amoeba_server(log4jConfigFile: File, cfg: BootstrapConfig.Config): Unit = {
-    println(s"LOG4J CONFIG $log4jConfigFile")
-    setLog4jConfigFile(log4jConfigFile)
+  def amoeba_server(cfg: BootstrapConfig.Config): Unit = {
+    configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
@@ -627,7 +604,7 @@ object Main {
       throw Exception(s"HostState config file not found: $cfgFile")
 
     val hostCfg = HostConfig.loadHostConfig(cfgFile.toFile)
-    setLog4jConfigFile(hostCfg.log4jConfigFile)
+    configureLogging()
 
     val simpleCrl = hostCfg.crl match {
       case b: HostConfig.SimpleCRL =>
@@ -734,7 +711,6 @@ object Main {
       dataPort,
       cncPort,
       storeTransferPort,
-      new File("../log4j-conf.xml"),
       HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300)
     )
 
@@ -802,9 +778,9 @@ object Main {
     sched.shutdownNow()
   }
 
-  def rebuild(log4jConfigFile: File, storeName: String, cfg: BootstrapConfig.Config): Unit = {
+  def rebuild(storeName: String, cfg: BootstrapConfig.Config): Unit = {
 
-    setLog4jConfigFile(log4jConfigFile)
+    configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(cfg)
 
@@ -871,8 +847,7 @@ object Main {
       ()
   }
 
-  def new_pool(log4jConfigFile: File,
-               bootstrapConfig: BootstrapConfig.Config,
+  def new_pool(bootstrapConfig: BootstrapConfig.Config,
                newPoolName: String,
                idaType: String,
                width: Int,
@@ -884,7 +859,7 @@ object Main {
     require(width >= readThreshold && width >= writeThreshold)
     require(readThreshold <= writeThreshold)
 
-    setLog4jConfigFile(log4jConfigFile)
+    configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(bootstrapConfig)
 
@@ -911,12 +886,11 @@ object Main {
       println("******************************************")
   }
 
-  def transfer_store(log4jConfigFile: File,
-                     bootstrapConfig: BootstrapConfig.Config,
+  def transfer_store(bootstrapConfig: BootstrapConfig.Config,
                      storeName: String,
                      hostName: String): Unit = {
 
-    setLog4jConfigFile(log4jConfigFile)
+    configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(bootstrapConfig)
 

@@ -39,6 +39,7 @@ import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
 import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
+import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, mdc, messages, methodName}
 
 import java.nio.charset.StandardCharsets
 import java.nio.{ByteBuffer, ByteOrder}
@@ -122,9 +123,10 @@ object Main {
   }
 
   def configureLogging(): Unit =
+    val logFormat = formatter"$dateFull $classNameSimple.$methodName:$line $messages$mdc"
     scribe.Logger.root
       .clearHandlers()
-      .withHandler(minimumLevel = Some(scribe.Level.Trace))
+      .withHandler(formatter = logFormat, minimumLevel = Some(scribe.Level.Trace))
       .replace()
 
   def main(args: Array[String]): Unit = {

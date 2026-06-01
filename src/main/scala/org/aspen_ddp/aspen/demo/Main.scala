@@ -49,43 +49,6 @@ import scala.concurrent.duration.{Duration, HOURS, MILLISECONDS, SECONDS}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.language.implicitConversions
 
-/*
-place this file in the head of the CLASSPATH
----- log4j.properties ----
-
-# Set root logger level to DEBUG and its only appender to A1.
-log4j.rootLogger=TRACE, stdout
-
-# A1 is set to be a ConsoleAppender.
-log4j.appender.stdout=org.apache.log4j.ConsoleAppender
-log4j.appender.stdout.layout=org.apache.log4j.PatternLayout
-log4j.appender.stdout.layout.ConversionPattern=%-4r [%t] %-5p %c %x - %m%n
-
----- log4j-conf.xml ----
-
-<?xml version="1.0" encoding="UTF-8"?>
-<Configuration>
-    <Appenders>
-        <Console name="Console">
-            <PatternLayout pattern="%d{HH:mm:ss.SSS} [%t] %-5level %logger{36} - %msg%n"/>
-        </Console>
-    </Appenders>
-    <appender name="stdout" class="org.apache.log4j.ConsoleAppender">
-        <layout class="org.apache.log4j.PatternLayout">
-            <param name="ConversionPattern" value="%d{yyyy-MM-dd HH:mm:ss} %p %m%n"/>
-        </layout>
-    </appender>
-    <Loggers>
-        <Root level="trace">
-            <AppenderRef ref="Console"/>
-        </Root>
-        <logger name="org.dcache.oncrpc4j.rpc.OncRpcSvc" level="TRACE">
-            <AppenderRef ref="Console"/>
-        </logger>
-    </Loggers>
-</Configuration>
-
- */
 
 object Main {
 
@@ -164,8 +127,8 @@ object Main {
             validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
         )
 
-      cmd("hostState").text("Starts an Amoeba Storage HostState").
-        action( (_,c) => c.copy(mode="hostState")).
+      cmd("host").text("Starts an Amoeba Storage HostState").
+        action( (_,c) => c.copy(mode="host")).
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
@@ -325,14 +288,12 @@ object Main {
     val sched = Executors.newScheduledThreadPool(3)
     val ec: ExecutionContext = ExecutionContext.fromExecutorService(sched)
 
-    val radicle = KeyValueObjectPointer(Radicle.objectId, Radicle.poolId)
-
-    val ret = (new SimpleAspenClient(nnet.clientMessenger, nnet.clientId, ec, radicle,
+    val ret = (new SimpleAspenClient(nnet.clientMessenger, nnet.clientId, ec, Radicle.pointer,
       txStatusCacheDuration,
       initialReadDelay,
       maxReadDelay,
       txRetransmitDelay,
-      allocationRetransmitDelay),  nnet, radicle)
+      allocationRetransmitDelay),  nnet, Radicle.pointer)
 
     networkBridge.oclient = Some(ret._1)
 
@@ -360,53 +321,6 @@ object Main {
     }
 
     client.read(radicle).flatMap(loadFileSystem)
-  }
-
-  def OLD_run_debug_code(cfg: BootstrapConfig.Config): Unit = {
-    configureLogging()
-
-    val (client, network, radicle) = createAmoebaClient(cfg)
-
-    network.startIoThread(client)
-
-    given ExecutionContext = client.clientContext
-
-    println("------------ Reading Radicle ---------------")
-    for
-      kvos <- client.read(radicle)
-      _=println("------------ Getting Storage Pool---------------")
-      pool <- client.getStoragePool(kvos.pointer.poolId)
-      _=println("------------ New Transaction---------------")
-      tx = client.newTransaction()
-      _=println("------------ New Root Manager---------------")
-      frootMgr <- KVObjectRootManager.createNewTree(client, kvos.pointer, Key(100), ByteArrayKeyOrdering,
-        new SinglePoolNodeAllocator(client, kvos.pointer.poolId),
-        Map(Key(0) -> Value(Array[Byte](1,2,3))))(using tx)
-      _=println("------------ New Root Manager Step 2---------------")
-
-      _ <- tx.commit()
-
-      rootMgr <- frootMgr
-
-      tx = client.newTransaction()
-
-      _=println("------------ New TKVL ---------------")
-      tkvl = new TieredKeyValueList(client, rootMgr)
-
-      _=println("------------ Setting Key(1) ---------------")
-      _ <- tkvl.set(Key(2), Value(Array[Byte](1,2,3)))(using tx)
-
-      _=println("------------ Committing! ---------------")
-      _ <- tx.commit()
-      _=println("------------ Commit Complete! ---------------")
-
-      //guard = ObjectRevisionGuard(kvos.pointer, kvos.revision)
-      //allocator = new PoolObjectAllocator(client, pool)
-      //alloc <- allocator.allocateDataObject(guard, Array[Byte](0,1,2,3))(tx)
-      //_ = tx.overwrite(kvos, tx.revision, rootDirInode.toArray) // ensure Tx has an object to modify
-
-    yield
-      ()
   }
 
   def run_debug_code(cfg: BootstrapConfig.Config): Unit = {
@@ -690,7 +604,7 @@ object Main {
     val hostDirectory = baseDirectory.resolve("bootstrap-hostState")
 
     if Files.exists(hostDirectory) then
-      throw new Exception(s"Bootstrap hostState directory exists: $hostDirectory")
+      throw new Exception(s"Bootstrap host directory exists: $hostDirectory")
 
     val sched = Executors.newScheduledThreadPool(1)
     val ec = ExecutionContext.fromExecutorService(sched)
@@ -708,7 +622,7 @@ object Main {
     val hostConfig = HostConfig(
       HostId(UUID.randomUUID()),
       aspenSystemId,
-      "bootstrap-hostState",
+      "bootstrap-host",
       "127.0.0.1",
       dataPort,
       cncPort,

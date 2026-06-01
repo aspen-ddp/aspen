@@ -31,8 +31,9 @@ lazy val root = (project in file(".")).
       "com.lihaoyi"                      %% "os-lib"                  % "0.11.5",
     )
   )
-  
+
   Test / testOptions += Tests.Argument(TestFrameworks.ScalaTest, "-W", "10", "5")
+  Test / testOptions += Tests.Setup(cl => cl.loadClass("org.aspen_ddp.aspen.TestLoggingConfig$").getField("MODULE$").get(null))
 
  Compile / PB.targets := Seq(
   scalapb.gen(flatPackage = true) -> (Compile / sourceManaged).value

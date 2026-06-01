@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.StoreManager
 import org.aspen_ddp.aspen.server.cnc.*
 import org.aspen_ddp.aspen.server.store.backend.{RocksDBBackend, RocksDBConfig}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.zeromq.SocketType
 

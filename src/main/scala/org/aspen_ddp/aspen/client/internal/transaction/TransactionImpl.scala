@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, KeyValueUpd
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}

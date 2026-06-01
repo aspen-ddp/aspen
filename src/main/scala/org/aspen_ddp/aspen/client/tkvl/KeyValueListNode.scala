@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RevisionLock}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, FullContentLock, KeyObjectRevision, KeyRequirement, KeyRevision, WithinRange}
 import org.aspen_ddp.aspen.server.store.KVObjectState
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}

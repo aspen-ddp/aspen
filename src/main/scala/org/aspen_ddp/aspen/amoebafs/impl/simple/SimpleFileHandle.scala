@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.amoebafs.{File, FileHandle}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.collection.immutable.Queue
 import scala.concurrent.{ExecutionContext, Future, Promise}

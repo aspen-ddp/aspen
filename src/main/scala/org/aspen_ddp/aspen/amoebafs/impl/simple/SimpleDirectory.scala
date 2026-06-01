@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.client.tkvl.{Root, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, Directory, DirectoryEntry, DirectoryInode, DirectoryPointer, FileSystem, InodePointer}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor}
 

@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, Directory
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, BlockDevice, CharacterDevice, Directory, DirectoryInode, File, FileHandle, FileMode, FileSystem, FileType, InodePointer, Symlink, Timespec}
 
 import javax.security.auth.Subject
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS.given_Conversion_Long_Inode
 import org.dcache.nfs.util.UnixSubjects
 import org.dcache.nfs.status.{ExistException, InvalException, NoEntException, NotDirException, NotSuppException, ServerFaultException}

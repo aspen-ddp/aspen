@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.compute
 
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, Value}

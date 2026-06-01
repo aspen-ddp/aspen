@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, Completion
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ReadError, Value}

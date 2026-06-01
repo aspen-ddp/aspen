@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 import org.aspen_ddp.aspen.client.{InvalidObject, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, FileMode, FileSystem, Inode, InodePointer, Timespec}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}

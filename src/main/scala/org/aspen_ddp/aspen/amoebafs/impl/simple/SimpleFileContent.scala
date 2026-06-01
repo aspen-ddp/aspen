@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.util.{Varint, db2string}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor}
 import org.aspen_ddp.aspen.amoebafs.{FileInode, FileSystem}
-import org.apache.logging.log4j.scala.{Logger, Logging}
+import scribe.Logging
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TieredKeyValueList}
 

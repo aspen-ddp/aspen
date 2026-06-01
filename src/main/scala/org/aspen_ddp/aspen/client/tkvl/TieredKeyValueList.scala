@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}

@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId

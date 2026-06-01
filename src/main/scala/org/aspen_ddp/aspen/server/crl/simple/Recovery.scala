@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.crl.simple
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import java.nio.file.Path
 import java.util.UUID

@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.{TransactionFinalized, TransactionReso
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{Future, Promise}
 

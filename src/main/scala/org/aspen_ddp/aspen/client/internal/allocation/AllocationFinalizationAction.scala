@@ -5,7 +5,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.util.someOrThrow
 
 import scala.concurrent.{ExecutionContext, Future, Promise}

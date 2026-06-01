@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.common.util.{byte2long, long2byte}
 import org.aspen_ddp.aspen.compute.TaskExecutor
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
 
 import scala.concurrent.{ExecutionContext, Future}

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.metadata.management
 
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadError, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId

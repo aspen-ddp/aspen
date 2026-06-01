@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.demo.network
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, CnCRequest, NewStore, ShutdownStore, TransferStore}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.HostState
 import org.zeromq.SocketType
 

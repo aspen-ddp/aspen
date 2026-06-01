@@ -6,7 +6,6 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.apache.logging.log4j.scala.Logger
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*

@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder.TransactionData
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.Duration

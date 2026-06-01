@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.util.Varint
 import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleDirectoryRootManager
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 object Inode {
 

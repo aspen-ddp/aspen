@@ -37,7 +37,7 @@ import org.dcache.nfs.v4.{MDSOperationExecutor, NFSServerV41}
 import org.dcache.nfs.v4.xdr.nfs4_prot
 import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
 
 import java.nio.charset.StandardCharsets

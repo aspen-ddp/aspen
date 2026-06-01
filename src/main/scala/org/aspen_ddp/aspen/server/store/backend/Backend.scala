@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import java.nio.file.Path
 import scala.concurrent.{Future, Promise}

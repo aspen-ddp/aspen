@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.objects.{IntegerKeyOrdering, LexicalKeyOrdering, ObjectRevision}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty, InvalidInode}
 import org.aspen_ddp.aspen.amoebafs.impl.simple.CreateFileTask
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 

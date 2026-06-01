@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.network
 
 import com.google.protobuf.ByteString
 import org.aspen_ddp.aspen.client.StoragePool
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}

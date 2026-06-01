@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 

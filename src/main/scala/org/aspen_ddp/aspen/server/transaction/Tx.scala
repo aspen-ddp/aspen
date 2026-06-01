@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryStat
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState}
 import org.aspen_ddp.aspen.server.store.{Frontend, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.duration._
 

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.demo.network
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.deleteDirectory
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.zeromq.{SocketType, ZMQ}
 
 import java.nio.file.Path

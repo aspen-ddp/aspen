@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel

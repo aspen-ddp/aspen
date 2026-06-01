@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, StopRetrying}
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future}
 

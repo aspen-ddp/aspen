@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.demo.network
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreManager
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.zeromq.SocketType
 

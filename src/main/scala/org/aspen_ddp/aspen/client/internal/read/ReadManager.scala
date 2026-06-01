@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}

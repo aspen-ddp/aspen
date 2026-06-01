@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, InvalidObject, 
 import org.aspen_ddp.aspen.common.objects.ObjectRevision
 import org.aspen_ddp.aspen.compute.TaskExecutor
 import org.aspen_ddp.aspen.amoebafs.error.InvalidInode
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}

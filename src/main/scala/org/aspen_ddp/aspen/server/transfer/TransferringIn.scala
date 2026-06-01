@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.transfer
 
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}

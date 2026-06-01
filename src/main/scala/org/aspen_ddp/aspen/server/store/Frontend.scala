@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 
 import java.nio.file.Path

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 
 import scala.concurrent.Future
 

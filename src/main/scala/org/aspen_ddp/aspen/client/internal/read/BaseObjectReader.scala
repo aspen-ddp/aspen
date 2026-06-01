@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.ReadResponse
 import org.aspen_ddp.aspen.common.objects.{ObjectPointer, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.apache.logging.log4j.scala.Logging
+import scribe.Logging
 import org.aspen_ddp.aspen.common.objects.{ReadError => CommonReadError}
 
 object BaseObjectReader {

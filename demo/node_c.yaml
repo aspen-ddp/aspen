@@ -7,7 +7,6 @@ endpoint:
   data-port: 5020
   cnc-port: 5021
   store-transfer-port: 5022
-log4j-config: demo/log4j-conf.xml
 crl:
   storage-engine: simple-crl
 

@@ -24,7 +24,6 @@ case class HostConfig(hostId: HostId,
                       dataPort: Int,
                       cncPort: Int,
                       storeTransferPort: Int,
-                      log4jConfigFile: File,
                       crl: HostConfig.CRLBackend):
   def yamlConfig: String =
     val base = s"""hostState-id: $hostId
@@ -34,7 +33,6 @@ case class HostConfig(hostId: HostId,
        |data-port: $dataPort
        |cnc-port: $cncPort
        |store-transfer-port: $storeTransferPort
-       |log4j-config: $log4jConfigFile
        |crl:
        |""".stripMargin
 
@@ -73,7 +71,6 @@ object HostConfig extends YObject[HostConfig]:
   val dataPort: Required[Int]          = Required("data-port", YInt)
   val cncPort: Required[Int]           = Required("cnc-port", YInt)
   val storeTransferPort: Required[Int] = Required("store-transfer-port", YInt)
-  val log4jConf: Required[File]        = Required("log4j-config", YFile)
   val crl: Required[SimpleCRL]         = Required("crl", Choice("storage-engine", Map("simple-crl" -> SimpleCRL)))
 
   val attrs: List[Attr] = List(
@@ -84,7 +81,6 @@ object HostConfig extends YObject[HostConfig]:
     dataPort,
     cncPort,
     storeTransferPort,
-    log4jConf,
     crl
   )
 
@@ -96,7 +92,6 @@ object HostConfig extends YObject[HostConfig]:
     dataPort.get(o),
     cncPort.get(o),
     storeTransferPort.get(o),
-    log4jConf.get(o),
     crl.get(o)
   )
 

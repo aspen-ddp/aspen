@@ -1,3 +1,32 @@
+Re-implement ZMQNetwork
+  - common.netowrk.impl.ZMQNet
+  - Use MetadataHandler
+
+MetaData Change Management
+  - Hosts
+    - Adds - implicitly detected on first request to send a message to a host
+      - Normal lookup process takes care of it
+    - Removes - No big deal. just wastes a bit of memory
+    - Change (IP/port)
+      - Periodic Check
+         - For all hosts we have cached state for AND haven't heard from
+           in > silenceThreshold
+             - Drop connection & cached state (IF not bootstrap host)
+             - Next message send will re-lookup the Host
+  - Stores
+    - Rely on NoSuchStore(from hostid) responses from Host
+      - Triggers dropping cached mapping
+        - if current host id == NoSuchStore.fromHostId
+          - Don't want delayed messages causing cache drops
+
+  - StorageDevices
+    - Non issue
+
+Host should maintain a set of allAssignedStores: Set[StoreId]
+  - Only send UnknownStore(storeId, fromHostId) if the requested store isn't in this set
+  - Prevents errant messages arising from offline/failed StorageDevice
+
+
 Add Inspection Commands:
   - list hosts, storage-devices, storage-pools, allocation-groups
   - Use subcommand (think this is already done)
@@ -88,6 +117,13 @@ Need a gossip protocol for spreading the word about cache invalidation for
 For now we can ignore this. Hosts don't change frequently and store moves
 can be found via error messages to read/write operations
 
+Investigate hash4j
+  - faster hashing alternatives
+  - Consistent bucket hashing could be used for interesting distributed data structures
+    - worth considering
+
+May want to consider Apache Fory as Protobuf alternative
+  - faster but not so good with unknown fields
 -----------------------------------------------------------
 - Brainstorming
 

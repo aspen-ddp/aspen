@@ -1,7 +1,9 @@
 package org.aspen_ddp.aspen.common
 
-import java.io.{File, PrintWriter, StringWriter}
+import java.io.{File, IOException, PrintWriter, StringWriter}
 import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+import java.nio.file.*
 import java.util.UUID
 import scala.annotation.tailrec
 import scala.concurrent.{ExecutionContext, Future}
@@ -102,4 +104,33 @@ package object util {
   def someOrThrow[U, T <: Throwable](o: Future[Option[U]], exceptionToThrow: => T)(using ec: ExecutionContext): Future[U] = o.map:
     case None => throw exceptionToThrow
     case Some(u) => u
+
+  def atomicWrite(targetFile: Path, content: String): Unit =
+    // 1. Get the parent directory. 
+    // CRITICAL: The temp file MUST be on the same partition/volume as the target file,
+    // otherwise a native atomic rename is physically impossible.
+    val parentDir = Option(targetFile.getParent).getOrElse(Paths.get("."))
+
+    // 2. Create a temporary file in that same directory
+    val tempFile = Files.createTempFile(parentDir, "atomic-", ".tmp")
+
+    try
+      // 3. Write content to the temporary file
+      Files.writeString(tempFile, content, StandardCharsets.UTF_8)
+
+      // 4. Atomically replace the target file with the temp file
+      Files.move(
+        tempFile,
+        targetFile,
+        StandardCopyOption.REPLACE_EXISTING,
+        StandardCopyOption.ATOMIC_MOVE
+      )
+    catch
+      case ex: IOException =>
+        // 5. Clean up the temporary file if anything failed prior to the atomic move
+        try
+          Files.deleteIfExists(tempFile)
+        catch
+          case cleanupEx: IOException => ex.addSuppressed(cleanupEx)
+        throw ex
 }

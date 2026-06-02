@@ -12,9 +12,8 @@ import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.demo.BootstrapConfig
 import org.zeromq.ZMQ.{DONTWAIT, PollItem}
 import org.zeromq.{SocketType, ZContext, ZMQ}
 

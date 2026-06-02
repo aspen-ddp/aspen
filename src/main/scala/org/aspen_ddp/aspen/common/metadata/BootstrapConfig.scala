@@ -1,13 +1,14 @@
-package org.aspen_ddp.aspen.demo
+package org.aspen_ddp.aspen.common.metadata
 
-import java.io.{File, FileInputStream}
-import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.constructor.SafeConstructor
+
+import java.io.{File, FileInputStream}
+import java.util.UUID
 
 /*
 aspen-system-id:  BF1049AD-D2A8-4D17-8080-E01A4678C8B3

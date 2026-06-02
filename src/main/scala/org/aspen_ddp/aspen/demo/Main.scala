@@ -38,7 +38,7 @@ import org.dcache.nfs.v4.xdr.nfs4_prot
 import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
 import scribe.Logging
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceState}
 import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, mdc, messages, methodName}
 
 import java.nio.charset.StandardCharsets

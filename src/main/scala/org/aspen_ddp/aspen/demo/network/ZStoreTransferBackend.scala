@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.demo.network
 
 import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreManager
 import scribe.Logging
@@ -11,7 +12,7 @@ import java.nio.file.Files
 import scala.concurrent.ExecutionContext
 
 class ZStoreTransferBackend(val transferPort: Int,
-                            val net: ZMQNetwork,
+                            val net: ZMQNet,
                             val hostId: HostId,
                             val client: AspenClient,
                             val storeManager: StoreManager) extends Logging:

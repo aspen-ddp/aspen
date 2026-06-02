@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.demo.network
 
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, CnCRequest, NewStore, ShutdownStore, TransferStore}
 import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.HostState
@@ -20,7 +21,7 @@ object ZCnCFrontend:
 
   final case class Shutdown(promise: Promise[Unit]) extends QMsg
 
-class ZCnCFrontend(val network: ZMQNetwork, 
+class ZCnCFrontend(val network: ZMQNet,
                    val host: HostState) extends CnCFrontend with Logging:
 
   import ZCnCFrontend._

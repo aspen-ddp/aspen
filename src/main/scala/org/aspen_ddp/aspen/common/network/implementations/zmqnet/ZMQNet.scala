@@ -90,7 +90,7 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
 
   logger.debug(s"ZMQNet Client ID: ${clientId.uuid.toString}")
 
-  private val context = new ZContext()
+  val context = new ZContext()
 
   private var clients: Map[ClientId, Array[Byte]] = Map()
 

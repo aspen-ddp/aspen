@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.demo.network
 import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.someOrThrow
@@ -20,7 +21,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.ExecutionContext.Implicits.global
 
-class ZCnCBackend(val network: ZMQNetwork,
+class ZCnCBackend(val network: ZMQNet,
                   val client: AspenClient,
                   val storesManager: StoreManager,
                   val cncPort: Int) extends Logging:

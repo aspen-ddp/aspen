@@ -20,7 +20,9 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyR
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat, someOrThrow}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.amoebafs.FileSystem
-import org.aspen_ddp.aspen.demo.network.{ZCnCBackend, ZCnCFrontend, ZMQNetwork, ZStoreTransferBackend}
+import org.aspen_ddp.aspen.common.network.MessageHandler
+import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
+import org.aspen_ddp.aspen.demo.network.{ZCnCBackend, ZCnCFrontend, ZStoreTransferBackend}
 import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
 import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS
 import org.aspen_ddp.aspen.server.cnc.TransferStore
@@ -70,7 +72,7 @@ object Main {
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
-  class NetworkBridge extends Logging {
+  class NetworkBridge extends MessageHandler with Logging {
     var oclient: Option[AspenClient] = None
     var onode: Option[StoreManager] = None
 
@@ -237,16 +239,19 @@ object Main {
           println(s"Loading BootstrapConfig ${cfg.bootstrapConfigFile}")
           BootstrapConfig.loadBootstrapConfig(cfg.bootstrapConfigFile)
 
+        def bootstrapConfigPath: os.Path =
+          os.Path(cfg.bootstrapConfigFile.toPath)
+
         try
           //println(s"Config file: $config")
           cfg.mode match
             case "bootstrap" => bootstrap(createIDA(cfg), Paths.get("demo"), 4750, 4751, 4752)
-            case "hostState" => host(bootstrapConfig, cfg.hostDirectory.toPath)
-            case "amoeba" => amoeba_server(bootstrapConfig)
-            case "debug" => run_debug_code(bootstrapConfig)
-            case "rebuild" => rebuild(cfg.storeName, bootstrapConfig)
-            case "new-pool" => new_pool(bootstrapConfig, cfg.newPoolName, cfg.idaType, cfg.width, cfg.readThreshold, cfg.writeThreshold, cfg.hosts)
-            case "transfer-store" => transfer_store(bootstrapConfig, cfg.storeName, cfg.host)
+            case "hostState" => host(bootstrapConfig, bootstrapConfigPath, cfg.hostDirectory.toPath)
+            case "amoeba" => amoeba_server(bootstrapConfigPath)
+            case "debug" => run_debug_code(bootstrapConfigPath)
+            case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
+            case "new-pool" => new_pool(bootstrapConfigPath, cfg.newPoolName, cfg.idaType, cfg.width, cfg.readThreshold, cfg.writeThreshold, cfg.hosts)
+            case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
         catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")
@@ -261,23 +266,19 @@ object Main {
       case "reed-solomon" => ReedSolomon(args.width, args.readThreshold, args.writeThreshold)
       case _ => throw new Exception(s"Invalid IDA type: ${args.idaType}")
 
-  def createNetwork(cfg:BootstrapConfig.Config,
+  def createNetwork(bootstrapConfigFile: os.Path,
                     ohostNode: Option[(HostId, Int)],
-                    oclientId: Option[ClientId]): (NetworkBridge, ZMQNetwork) = {
+                    oclientId: Option[ClientId]): (NetworkBridge, ZMQNet) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    (b, new ZMQNetwork(oclientId, cfg, ohostNode, heartbeatPeriod,
-      b.onClientResponseReceived,
-      b.onClientRequestReceived,
-      b.onTransactionMessageReceived,
-      b.onHostMessageReceived))
+    (b, new ZMQNet(bootstrapConfigFile, oclientId, ohostNode, heartbeatPeriod, b))
   }
 
-  def createAmoebaClient(cfg: BootstrapConfig.Config,
-                         onnet: Option[(NetworkBridge, ZMQNetwork)]=None): (AspenClient, ZMQNetwork, KeyValueObjectPointer) = {
+  def createAmoebaClient(bootstrapConfigFile: os.Path,
+                         onnet: Option[(NetworkBridge, ZMQNet)]=None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
 
-    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(cfg, None, None))
+    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfigFile, None, None))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
     val initialReadDelay = Duration(10, SECONDS)
@@ -323,10 +324,10 @@ object Main {
     client.read(radicle).flatMap(loadFileSystem)
   }
 
-  def run_debug_code(cfg: BootstrapConfig.Config): Unit = {
+  def run_debug_code(bootstrapConfigFile: os.Path): Unit = {
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(cfg)
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -380,10 +381,10 @@ object Main {
       ()
   }
 
-  def amoeba_server(cfg: BootstrapConfig.Config): Unit = {
+  def amoeba_server(bootstrapConfigFile: os.Path): Unit = {
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(cfg)
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -508,6 +509,7 @@ object Main {
 
 
   def host(bootstrapCfg: BootstrapConfig.Config,
+           bootstrapConfigFile: os.Path,
            hostDir: Path): Unit = {
 
     val sched = Executors.newScheduledThreadPool(3)
@@ -532,9 +534,9 @@ object Main {
 
     val objectCacheFactory = () => new SimpleLRUObjectCache(100)
 
-    val (networkBridge, nnet) = createNetwork(bootstrapCfg, Some((hostCfg.hostId, hostCfg.dataPort)), None)
+    val (networkBridge, nnet) = createNetwork(bootstrapConfigFile, Some((hostCfg.hostId, hostCfg.dataPort)), None)
 
-    val (client, network, _) = createAmoebaClient(bootstrapCfg, Some((networkBridge, nnet)))
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile, Some((networkBridge, nnet)))
 
     networkBridge.oclient = Some(client)
 
@@ -694,11 +696,12 @@ object Main {
     sched.shutdownNow()
   }
 
-  def rebuild(storeName: String, cfg: BootstrapConfig.Config): Unit = {
+  def rebuild(storeName: String, bootstrapConfigFile: os.Path): Unit = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(cfg)
+    val cfg = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toNIO.toFile)
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
 
     network.startIoThread(client)
     
@@ -763,7 +766,7 @@ object Main {
       ()
   }
 
-  def new_pool(bootstrapConfig: BootstrapConfig.Config,
+  def new_pool(bootstrapConfigFile: os.Path,
                newPoolName: String,
                idaType: String,
                width: Int,
@@ -777,7 +780,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfig)
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -802,13 +805,13 @@ object Main {
       println("******************************************")
   }
 
-  def transfer_store(bootstrapConfig: BootstrapConfig.Config,
+  def transfer_store(bootstrapConfigFile: os.Path,
                      storeName: String,
                      hostName: String): Unit = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfig)
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 

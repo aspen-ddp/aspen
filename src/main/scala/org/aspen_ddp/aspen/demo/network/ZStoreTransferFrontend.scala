@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.demo.network
 
+import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.deleteDirectory
 import scribe.Logging
@@ -7,7 +8,7 @@ import org.zeromq.{SocketType, ZMQ}
 
 import java.nio.file.Path
 
-class ZStoreTransferFrontend(val storesDir: Path, val net: ZMQNetwork) extends Logging:
+class ZStoreTransferFrontend(val storesDir: Path, val net: ZMQNet) extends Logging:
 
   def send(storeId: StoreId, toHost: String, toPort: Int): Unit =
     val sendThread = new Thread {

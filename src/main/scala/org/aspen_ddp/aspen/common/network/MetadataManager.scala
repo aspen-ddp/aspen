@@ -134,6 +134,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
 
   private def refreshBootstrapConfig(): Unit =
     if !refreshingBootstrapConfig then
+      logger.info("Refreshing bootstrap config file")
       oClient match
         case None => logger.error(s"Refreshing bootstrap config before AspenClient initialized!")
         case Some(client) =>
@@ -143,6 +144,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
           client.getBootstrapConfig().foreach: cfg =>
             try
               atomicWrite(bootstrapConfigFile.toNIO, cfg)
+              logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
             catch
               case err => logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $err")
             finally
@@ -153,6 +155,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                     stores += storeId -> bsHost.hostId
 
                 refreshingBootstrapConfig = false
+
 
   private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =
     oClient match

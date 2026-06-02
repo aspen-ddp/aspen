@@ -132,6 +132,13 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
               startPoolLookup(storeId, msg)
               None
 
+  def dropStoreMapping(storeId: StoreId): Unit =
+    synchronized:
+      if isBootstrapStore(storeId) then
+        refreshBootstrapConfig()
+      else
+        stores -= storeId
+
   private def refreshBootstrapConfig(): Unit =
     if !refreshingBootstrapConfig then
       logger.info("Refreshing bootstrap config file")

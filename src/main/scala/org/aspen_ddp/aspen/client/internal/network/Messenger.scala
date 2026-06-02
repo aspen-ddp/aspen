@@ -13,10 +13,10 @@ trait Messenger:
 
   def sendHostMessage(msg: HostMessage): Unit
   
-  // Used in response to receiving an error message indicating that a hostState
+  // Used in response to receiving an error message indicating that a host
   // received a message for a store it does not know about. Usually this
   // means that the store has been transferred to a hew hostState but the network
-  // layer is still using the old hostState. This method will cause the network
+  // layer is still using the old host. This method will cause the network
   // layer to drop its cached value and lookup the new store location
   def dropCacheForStore(storeId: StoreId): Unit
 

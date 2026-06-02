@@ -1,14 +1,12 @@
 package org.aspen_ddp.aspen.common.network
 
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{EvictingQueue, atomicWrite}
 import scribe.Logging
 
-import java.util.UUID
 import scala.concurrent.ExecutionContext
 import scala.util.{Failure, Success}
 
@@ -32,7 +30,7 @@ object MetadataManager:
 
     def storeResolved(hostEntry: T, storeId: StoreId, queuedMessages: EvictingQueue[Message]): Unit
 
-  class PendingPoolLookup(storeQueueSize: Int):
+  private class PendingPoolLookup(storeQueueSize: Int):
     var storeQueues: Map[StoreId, EvictingQueue[Message]] = Map()
 
     def enqueueMessage(storeId: StoreId, msg: Message): Unit =
@@ -44,7 +42,7 @@ object MetadataManager:
           newQ
       q.enqueue(msg)
 
-  class PendingHostLookup(hostQueueSize: Int):
+  private class PendingHostLookup(hostQueueSize: Int):
     val messageQueue = new EvictingQueue[Message](hostQueueSize)
 
     def enqueueMessage(msg: Message): Unit = messageQueue.enqueue(msg)
@@ -67,26 +65,20 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
   private var hosts: Map[HostId, Either[PendingHostLookup, T]] = Map()
   private var refreshingBootstrapConfig: Boolean = false
 
-  val (aspenSystemId: UUID, bootstrapIDA: IDA) = {
-    val config = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO)
+  BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
+    bsHost.stores.foreach: storeId =>
+      stores += storeId -> bsHost.hostId
+      bootstrapStores += storeId
 
-    config.hosts.foreach: bsHost =>
-      bsHost.stores.foreach: storeId =>
-        stores += storeId -> bsHost.hostId
-        bootstrapStores += storeId
-
-      hosts += bsHost.hostId -> Right(networkImplInterface.createHostEntry(
-        bsHost.hostId,
-        bsHost.name,
-        bsHost.address,
-        bsHost.dataPort,
-        bsHost.cncPort,
-        bsHost.storeTransferPort,
-        new EvictingQueue[Message](1)
-      ))
-
-    (config.aspenSystemId, config.bootstrapIDA)
-  }
+    hosts += bsHost.hostId -> Right(networkImplInterface.createHostEntry(
+      bsHost.hostId,
+      bsHost.name,
+      bsHost.address,
+      bsHost.dataPort,
+      bsHost.cncPort,
+      bsHost.storeTransferPort,
+      new EvictingQueue[Message](1)
+    ))
 
   def setAspenClient(client: AspenClient): Unit =
     synchronized:
@@ -105,6 +97,16 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
             if oldHostId == hostId then
               stores -= storeId
 
+  def getHostEntry(hostId: HostId): Option[T] =
+    synchronized:
+      hosts.get(hostId) match
+        case Some(e) => e match
+          case Right(hostEntry) => Some(hostEntry)
+          case Left(pendingHostLookup) => None
+        case None =>
+          startHostLookup(hostId, None)
+          None
+
   def getHostEntryOrQueueMessage(hostId: HostId, msg: Message): Option[T] =
     synchronized:
       hosts.get(hostId) match
@@ -114,7 +116,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
             pendingHostLookup.enqueueMessage(msg)
             None
         case None =>
-          startHostLookup(hostId, msg)
+          startHostLookup(hostId, Some(msg))
           None
 
   def getHostEntryOrQueueMessage(storeId: StoreId, msg: Message): Option[T] =
@@ -137,28 +139,28 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
         case Some(client) =>
           refreshingBootstrapConfig = true
           given ExecutionContext = client.clientContext
-          
+
           client.getBootstrapConfig().foreach: cfg =>
             try
               atomicWrite(bootstrapConfigFile.toNIO, cfg)
             catch
-              case err => logger.error(s"Failed to update bootstrap config file ${bootstrapConfigFile}. Error: $err")
+              case err => logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $err")
             finally
               synchronized:
                 // Update the stores map to match the new host ids
                 BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
                   bsHost.stores.foreach: storeId =>
                     stores += storeId -> bsHost.hostId
-                
+
                 refreshingBootstrapConfig = false
 
-  private def startHostLookup(hostId: HostId, msg: Message): Unit =
+  private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =
     oClient match
       case None => logger.error(s"Host lookup preformed before AspenClient initialized. HostId: $hostId")
       case Some(client) =>
         given ExecutionContext = client.clientContext
         val phl = new PendingHostLookup(pendingHostLookupQueueSize)
-        phl.enqueueMessage(msg)
+        oMsg.foreach(phl.enqueueMessage)
         hosts += hostId -> Left(phl)
         client.getHostState(hostId).onComplete:
           case Failure(err) =>

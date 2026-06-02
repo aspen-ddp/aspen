@@ -231,6 +231,8 @@ class StoreManager(val client: AspenClient,
           val backend = storeCfg.backend match
             case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
           sds.loadedStores += backend.storeId
+          sds.offlineStores -= backend.storeId
+          offlineStores -= backend.storeId
           logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
           loadStore(sds.storageDeviceId, backend)
       catch
@@ -577,6 +579,8 @@ class StoreManager(val client: AspenClient,
         local.offlineStores.filter(storeId =>
           !remote.stores.contains(storeId)
         ).foreach: storeId =>
+          offlineStores -= storeId
+          local.offlineStores -= storeId
           val storePath = os.Path(local.devicePath) / storeId.directoryName
           if os.exists(storePath) then
             logger.info(s"Deleting successfully transferred store $storePath")
@@ -608,9 +612,17 @@ class StoreManager(val client: AspenClient,
               startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
     }
 
-    synchronized { storageDevices.get(storageDeviceId) }.foreach: local =>
-      client.getStorageDeviceState(storageDeviceId).foreach: remote =>
-        check(local, remote)
+    synchronized { storageDevices.get(storageDeviceId) } match
+      case Some(local) =>
+        client.getStorageDeviceState(storageDeviceId).foreach: remote =>
+          check(local, remote)
+      case None =>
+        // Find out what stores are on the offline/failed store and add them to our offlineStores
+        // set. We don't want to send "UnknownStore" responses while the device is down
+        client.getStorageDeviceState(storageDeviceId).foreach: remote =>
+          synchronized:
+            remote.stores.keysIterator.foreach: storeId =>
+              offlineStores += storeId
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
@@ -751,6 +763,7 @@ class StoreManager(val client: AspenClient,
           txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8)
         backend.setCompletionHandler(ioHandler)
         stores += (backend.storeId -> store)
+        offlineStores -= backend.storeId
 
         if Files.exists(backend.crlSaveFile) then
           val (storeId, trs) = CrashRecoveryLog.loadStoreState(backend.crlSaveFile)

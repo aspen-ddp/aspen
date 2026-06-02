@@ -1,40 +1,12 @@
-Re-implement ZMQNetwork
-  - common.netowrk.impl.ZMQNet
-  - Use MetadataHandler
-
-MetaData Change Management
-  - Hosts
-    - Adds - implicitly detected on first request to send a message to a host
-      - Normal lookup process takes care of it
-    - Removes - No big deal. just wastes a bit of memory
-    - Change (IP/port)
-      - Periodic Check
-         - For all hosts we have cached state for AND haven't heard from
-           in > silenceThreshold
-             - Drop connection & cached state (IF not bootstrap host)
-             - Next message send will re-lookup the Host
-  - Stores
-    - Rely on NoSuchStore(from hostid) responses from Host
-      - Triggers dropping cached mapping
-        - if current host id == NoSuchStore.fromHostId
-          - Don't want delayed messages causing cache drops
-
-  - StorageDevices
-    - Non issue
-
-Host should maintain a set of allAssignedStores: Set[StoreId]
-  - Only send UnknownStore(storeId, fromHostId) if the requested store isn't in this set
-  - Prevents errant messages arising from offline/failed StorageDevice
-
-
-Add Inspection Commands:
-  - list hosts, storage-devices, storage-pools, allocation-groups
-  - Use subcommand (think this is already done)
 
 Rework Main.scala
   - Move to aspen-ddp.cmdline
   - Update transfer-store to take target device and use new transfer Impl
   - Remove old CnC based StoreTransfer code
+
+Add Inspection Commands:
+  - list hosts, storage-devices, storage-pools, allocation-groups
+  - Use subcommand (think this is already done)
 
 Need some wey to list hosts & devices
   - UUIDs will be pretty meaningless
@@ -55,15 +27,11 @@ Add add-storage-device command
   - Update host to use FileSystems.getDefault().newWatchService() to monitor for additions
     - Wrap this in a helper class to simplify Host impl
 
-Move ZMQNetwork to aspen-ddp.common.network.implementations.zmqnet
-
 Need a plan for getting the storageDevices needed for pool creation
-
-Handle transfer of a bootstrap store
-  - Need some way to update config file
 
 Switch AmoebaFS to use a registered object for the root
 
+Remove ZMQNetwork
 Rename StoreManager to Host?
 
 os.Path note:
@@ -74,15 +42,11 @@ Need official mechanism for rebuilding a failed store
   - Use Rebuilding state to StoreEntry in target StorageDeviceState?
   - Simple and can be picked up by periodic host scans
     - Same as TransferIn/TransferOut
+  - Rebuilder should periodically checkpoint to disk the UUID of the last restored object
+    - That way can pick up from where it left off in hte event of a crash
 
 Need a way to connect AllocationGroups to App-defined Allocators
   - Application can just create them during initialization
-
-ObjectPointer creation - Will need generic mechanism for creating ObjectPointers for
-advanced use cases like Flat-file backed stores.
-  - Maybe StoragePoolState has an allocatorImplUUID - for TypeRegistry factory
-  - Maybe also has an optional allocatorStatePtr field pointing to the root object for
-    implementing the allocator strategy
 
 Consider removing usage of invalidateTransaction in favor of just throwing
 exceptions.
@@ -102,7 +66,13 @@ Need a mechanism to handle "out of space" errors
     - Dedicated to hosting data for full stores
     - Lots of implications though, will require some thought
 
+How handle changing Host IP?
+  - Rely on heartbeating and drop non-bootstrap HostEntries we haven't
+    heard from in a long time?
+  - Wait for gossip protocol implementation?
+
 Add TLS Cert generation for hosts
+
 Add a Quic/Netty Network implementation
 
 ----------------

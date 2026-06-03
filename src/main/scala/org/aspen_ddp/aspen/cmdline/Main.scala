@@ -1,4 +1,4 @@
-package org.aspen_ddp.aspen.demo
+package org.aspen_ddp.aspen.cmdline
 
 import java.io.{File, StringReader}
 import java.nio.file.{Files, Path, Paths}

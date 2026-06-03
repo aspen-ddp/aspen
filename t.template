@@ -20,7 +20,7 @@ then
   rm -rf demo/node_c
 fi
 
-$JAVA_HOME/bin/java -cp $CLASSPATH org.aspen_ddp.aspen.demo.Main "$@"
+$JAVA_HOME/bin/java -cp $CLASSPATH org.aspen_ddp.aspen.cmdline.Main "$@"
 
 if [[ $1 == "bootstrap" ]]
 then

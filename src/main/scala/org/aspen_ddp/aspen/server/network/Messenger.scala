@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen.server.network
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.{ClientResponse, TxMessage}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.cnc.CnCFrontend
 
 import scala.concurrent.Future
 

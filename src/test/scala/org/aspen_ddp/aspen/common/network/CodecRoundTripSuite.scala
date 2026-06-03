@@ -11,7 +11,6 @@ import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.*
-import org.aspen_ddp.aspen.server.cnc
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
@@ -605,26 +604,13 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.storeTransferPort shouldBe 5002
     decoded.storageDevices.size shouldBe 2
 
-  test("NewStore round-trip"):
-    val original = cnc.NewStore(storeId(1), RocksDBConfig())
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded.storeId shouldBe original.storeId
+  test("CnCReply round-trip"):
+    val ok: CnCReply = CnCReply.Ok()
+    Codec.decode(Codec.encode(ok)) shouldBe a[CnCReply.Ok]
 
-  test("ShutdownStore round-trip"):
-    val original = cnc.ShutdownStore(storeId(1))
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded.storeId shouldBe original.storeId
-
-  test("TransferStore round-trip"):
-    val original = cnc.TransferStore(storeId(1), HostId(uuid(2)))
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded.storeId shouldBe original.storeId
-    decoded.toHost shouldBe original.toHost
-
-  test("CnCError round-trip"):
-    val original = cnc.Error("something went wrong")
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded.message shouldBe "something went wrong"
+    val err: CnCReply = CnCReply.Error("boom")
+    val decodedErr = Codec.decode(Codec.encode(err)).asInstanceOf[CnCReply.Error]
+    decodedErr.message shouldBe "boom"
 
   test("StorageDeviceId round-trip"):
     val original = StorageDeviceId(uuid(42))

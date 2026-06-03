@@ -20,9 +20,10 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyR
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat, someOrThrow}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.amoebafs.FileSystem
-import org.aspen_ddp.aspen.common.network.MessageHandler
+import org.aspen_ddp.aspen.common.network.{CnCMessageReceiver, MessageHandler}
 import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
-import org.aspen_ddp.aspen.demo.network.{ZCnCBackend, ZCnCFrontend, ZStoreTransferBackend}
+import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZCnCBackend
+import org.aspen_ddp.aspen.demo.network.ZStoreTransferBackend
 import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
 import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
@@ -581,9 +582,8 @@ object Main {
 
     val cncBackend = new ZCnCBackend(
       nnet,
-      client,
-      storeManager,
-      hostCfg.cncPort)
+      hostCfg.cncPort,
+      CnCMessageReceiver.Unhandled)
 
     client.getHostState(hostCfg.hostId).foreach: host =>
       val transferBackend = new ZStoreTransferBackend(
@@ -802,8 +802,7 @@ object Main {
         client.getHostState(hostId)
 
     for
-      hlist <- Future.sequence(hosts.map(getHost))
-      frontends = hlist.map(host => new ZCnCFrontend(network, host))
+      _ <- Future.sequence(hosts.map(getHost))
       //sp <- client.newStoragePool(newPoolName, frontends, ida, RocksDBConfig())
     yield
       println("******************************************")

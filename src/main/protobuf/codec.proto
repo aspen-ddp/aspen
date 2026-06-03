@@ -513,27 +513,9 @@ message HostState {
 //- CnC Messages
 //---------------------------------------------------------------------------
 
-message NewStore {
-  StoreId storeId = 1;
-  BackendConfig backendConfig = 2;
-}
-
-message ShutdownStore {
-  StoreId storeId = 1;
-}
-
-message TransferStore {
-  StoreId storeId = 1;
-  UUID toHost = 2;
-}
-
-
 message CnCRequest {
-  oneof msg {
-    NewStore new_store = 1;
-    ShutdownStore shutdown_store = 2;
-    TransferStore transfer_store = 3;
-  }
+  string msgType = 1;
+  bytes  payload = 2;
 }
 
 message CnCOk {
@@ -546,6 +528,7 @@ message CnCError {
 message CnCReply {
   oneof msg {
     CnCOk ok = 1;
+    CnCError error = 2;
   }
 }
 

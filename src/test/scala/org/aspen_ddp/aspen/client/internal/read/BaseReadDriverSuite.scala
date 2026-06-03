@@ -16,7 +16,6 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
-import org.aspen_ddp.aspen.server.cnc.{CnCFrontend, NewStore}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StoragePoolState}
 

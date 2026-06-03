@@ -25,7 +25,6 @@ import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.demo.network.{ZCnCBackend, ZCnCFrontend, ZStoreTransferBackend}
 import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
 import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS
-import org.aspen_ddp.aspen.server.cnc.TransferStore
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.{HostConfig, RegisteredTransactionFinalizerFactory, SimpleDriverRecoveryMixin, StorageDeviceConfig, StoreConfig, StoreManager}
 import org.aspen_ddp.aspen.server.store.Bootstrap
@@ -40,7 +39,7 @@ import org.dcache.nfs.v4.xdr.nfs4_prot
 import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
 import scribe.Logging
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, mdc, messages, methodName}
 
 import java.nio.charset.StandardCharsets
@@ -227,8 +226,15 @@ object Main {
               }
               else failure("Store name must match the format \"pool-uuid:storeNumber\"")
             },
-          arg[String]("<new-host>").text("Name of the host to receive the store").
-            action((x, c) => c.copy(host = x)),
+          arg[String]("<target-storage-device-id>").text("UUID of the storage device to receive the store").
+            action((x, c) => c.copy(host = x)).
+            validate { x =>
+              try
+                UUID.fromString(x)
+                success
+              catch
+                case _: Throwable => failure("Target storage device id must be a valid UUID")
+            },
         )
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
@@ -807,7 +813,7 @@ object Main {
 
   def transfer_store(bootstrapConfigFile: os.Path,
                      storeName: String,
-                     hostName: String): Unit = {
+                     targetDeviceIdStr: String): Unit = {
 
     configureLogging()
 
@@ -818,19 +824,54 @@ object Main {
     given ExecutionContext = client.clientContext
 
     val storeId = StoreId(storeName)
+    val targetDeviceId = StorageDeviceId(UUID.fromString(targetDeviceIdStr))
+
+    // Validate the pool and target device exist before attempting the transfer. Each
+    // lookup is recovered individually so we can report precisely which argument is
+    // invalid rather than failing with an opaque error.
+    def lookupPoolState: Future[Either[String, StoragePoolState]] =
+      client.getStoragePoolState(storeId.poolId)
+        .map(Right(_))
+        .recover:
+          case _: Throwable => Left(f"Storage pool ${storeId.poolId.uuid} not found")
+
+    def lookupTargetDevice: Future[Either[String, StorageDeviceState]] =
+      client.getStorageDeviceState(targetDeviceId)
+        .map(Right(_))
+        .recover:
+          case _: Throwable => Left(f"Target storage device ${targetDeviceIdStr} not found")
+
+    // transferStore atomically marks the store as transferring-out on its current
+    // device and transferring-in on the target device, then nudges the destination
+    // host with a CheckStorageDevice message so it begins the transfer immediately
+    // rather than waiting for its next device-state poll.
+    def initiateTransfer(): Unit =
+      val f = client.transferStore(storeId, targetDeviceId)
+
+      f.foreach: _ =>
+        println(f"Store Transfer Initiated: Store: ${storeName} -> Device: ${targetDeviceIdStr}")
+
+      f.failed.foreach: err =>
+        println(f"Store Transfer Failed: ${err.getMessage}")
 
     for
-      hostId <- client.getHostId(hostName)
-      newHost <- client.getHostState(hostId)
-      sp <- client.getStoragePool(storeId.poolId)
-      pstate <- sp.getState()
-      curHostId = pstate.stores(storeId.poolIndex).hostId
-      currentHost <- client.getHostState(curHostId)
-
-      zfrontend = new ZCnCFrontend(network, currentHost)
-      _ <- zfrontend.send(TransferStore(storeId, newHost.hostId))
+      ePoolState <- lookupPoolState
+      eDeviceState <- lookupTargetDevice
     yield
-      println(f"Store Transfer Initiated: Store: ${storeName} From: ${currentHost.name} To: ${hostName}")
+      (ePoolState, eDeviceState) match
+        case (Left(msg), _) => println(f"Store Transfer Failed: $msg")
+        case (_, Left(msg)) => println(f"Store Transfer Failed: $msg")
+        case (Right(poolState), Right(_)) =>
+          if storeId.poolIndex < 0 || storeId.poolIndex >= poolState.stores.length then
+            println(f"Store Transfer Failed: Invalid store index ${storeId.poolIndex} for pool " +
+                    f"${storeId.poolId.uuid} (pool has ${poolState.stores.length} stores)")
+          else
+            val sourceDeviceId = poolState.stores(storeId.poolIndex).storageDeviceId
+            if sourceDeviceId == targetDeviceId then
+              println(f"Store Transfer Failed: Source and destination devices are the same " +
+                      f"(${targetDeviceIdStr}); nothing to transfer")
+            else
+              initiateTransfer()
   }
 
 }

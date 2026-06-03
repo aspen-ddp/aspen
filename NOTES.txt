@@ -1,8 +1,8 @@
 
 Rework Main.scala
   - Move to aspen-ddp.cmdline
-  - Update transfer-store to take target device and use new transfer Impl
-  - Remove old CnC based StoreTransfer code
+  - Remove old CnC based StoreTransfer code (TransferStore request type + CnC
+    backend wiring still present)
 
 Add Inspection Commands:
   - list hosts, storage-devices, storage-pools, allocation-groups
@@ -155,7 +155,7 @@ On Client:
 
 ./t new-pool demo/log4j-conf.xml demo/bootstrap_config.yaml new_pool_name replication 3 2 2 node_a,node_b,node_c
 
-./t transfer-store demo/log4j-conf.xml demo/bootstrap_config.yaml 3f1ca5f7-74be-405d-aa48-739fc23651a4:2 node_a
+./t transfer-store demo/bootstrap_config.yaml 3f1ca5f7-74be-405d-aa48-739fc23651a4:2 <target-storage-device-uuid>
 
 
 -------------------------------------------------------------------------------

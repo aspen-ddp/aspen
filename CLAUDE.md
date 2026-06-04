@@ -186,7 +186,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - **Common** (`org.aspen_ddp.aspen.common`): Shared data structures, network protocols, IDA (Information Dispersal Algorithms)
 - **Compute** (`org.aspen_ddp.aspen.compute`): Implements a durable, crash-and-recover tasking model on top of Aspen objects for long-lived and/or multi-step tasks.
 - **AmoebaFS** (`org.aspen_ddp.aspen.amoebafs`): NFS server that exports a distributed filesystem implemented on top of an Aspen client.
-- **Demo** (`org.aspen_ddp.aspen.demo`): Command line utilities for launching demo processes with ZeroMQ based networking. Very much a work-in-progress.
+- **Cmdline** (`org.aspen_ddp.aspen.cmdline`): Command line utilities for launching processes with ZeroMQ based networking. Very much a work-in-progress.
 
 ## Building and Testing
 - `sbt compile` - Compile the project

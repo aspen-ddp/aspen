@@ -1,9 +1,4 @@
 
-Rework Main.scala
-  - Move to aspen-ddp.cmdline
-  - Remove old CnC based StoreTransfer code (TransferStore request type + CnC
-    backend wiring still present)
-
 Add Inspection Commands:
   - list hosts, storage-devices, storage-pools, allocation-groups
   - Use subcommand (think this is already done)
@@ -31,7 +26,6 @@ Need a plan for getting the storageDevices needed for pool creation
 
 Switch AmoebaFS to use a registered object for the root
 
-Remove ZMQNetwork
 Rename StoreManager to Host?
 
 os.Path note:
@@ -202,7 +196,7 @@ Pre sbt-pack demo launch script:
 #
 export CLASSPATH="<sbt content>"
 
-exec java -cp $CLASSPATH com.ibm.aspen.demo.Main "$@"
+exec java -cp $CLASSPATH org.aspen_ddp.aspen.cmdline.Main "$@"
 
 
 

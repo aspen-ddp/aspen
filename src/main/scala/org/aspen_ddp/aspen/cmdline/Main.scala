@@ -1,54 +1,50 @@
 package org.aspen_ddp.aspen.cmdline
 
-import java.io.{File, StringReader}
-import java.nio.file.{Files, Path, Paths}
-import java.util.concurrent.Executors
 import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.amoebafs.FileSystem
+import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
+import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectAllocator, ObjectState, StoragePool}
 import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, KeyValueListNode, Root, SinglePoolNodeAllocator, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.ida.{ReedSolomon, Replication}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Insert, Key, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectPointer, ObjectType, Value}
+import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
+import org.aspen_ddp.aspen.client.*
+import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.metadata.*
+import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
+import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRequirement}
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat, someOrThrow}
-import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.amoebafs.FileSystem
-import org.aspen_ddp.aspen.common.network.{CnCMessageReceiver, MessageHandler}
-import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
-import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZCnCBackend
-import org.aspen_ddp.aspen.demo.network.ZStoreTransferBackend
-import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
-import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat}
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
-import org.aspen_ddp.aspen.server.{HostConfig, RegisteredTransactionFinalizerFactory, SimpleDriverRecoveryMixin, StorageDeviceConfig, StoreConfig, StoreManager}
 import org.aspen_ddp.aspen.server.store.Bootstrap
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend}
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
+import org.aspen_ddp.aspen.server.*
 import org.dcache.nfs.ExportFile
-import org.dcache.nfs.v3.{MountServer, NfsServerV3}
 import org.dcache.nfs.v3.xdr.{mount_prot, nfs3_prot}
-import org.dcache.nfs.v4.{MDSOperationExecutor, NFSServerV41}
+import org.dcache.nfs.v3.{MountServer, NfsServerV3}
 import org.dcache.nfs.v4.xdr.nfs4_prot
+import org.dcache.nfs.v4.{MDSOperationExecutor, NFSServerV41}
 import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
 import scribe.Logging
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, mdc, messages, methodName}
 
+import java.io.{File, StringReader}
 import java.nio.charset.StandardCharsets
+import java.nio.file.{Files, Path, Paths}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import scala.concurrent.{Await, ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, HOURS, MILLISECONDS, SECONDS}
+import java.util.concurrent.Executors
 import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration.{Duration, HOURS, MILLISECONDS, SECONDS}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.language.implicitConversions
 
 
@@ -580,21 +576,10 @@ object Main {
     
     storeManager.start()
 
-    val cncBackend = new ZCnCBackend(
+    /*val cncBackend = new ZCnCBackend(
       nnet,
       hostCfg.cncPort,
-      CnCMessageReceiver.Unhandled)
-
-    client.getHostState(hostCfg.hostId).foreach: host =>
-      val transferBackend = new ZStoreTransferBackend(
-        hostCfg.storeTransferPort,
-        network,
-        host.hostId,
-        client,
-        storeManager)
-
-    // Kickoff repair loop
-    repair(client, storeManager)
+      CnCMessageReceiver.Unhandled)*/
 
     network.joinIoThread()
   }

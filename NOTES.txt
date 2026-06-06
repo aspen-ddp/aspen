@@ -1,12 +1,18 @@
 
-Should we add StorageDeviceSet as official top-level Metadata?
+Add StorageDeviceSet as official top-level Metadata
   - Hierarchical, similiar to AllocationGroups but for physical devices
     - Strict distinction between SetOfSets and SetOfDevices
     - Defined by Level. 0 = SetOfDevices, 1+ = SetOfSets
+  - StorageDeviceSets can have zero or one parent set
+    - Parent set must be a higher level than the child set
+  - StorageDevices belong to a single StorageDeviceSet
+    - This cannot be changed without first draining the device of stores
+      - Not supported in this first pass
   - Pools belong to a single StorageDeviceSet which is assigned at creation
     - Allows automatic selection of StorageDevices
-  - Pool set assignment be changed
+  - Pool set assignment can be changed
     - Allows migration from site-specific pool to mutli-site pool
+    - Done via creation of a durable task to affect the move
 
 Allocation ignores balance concerns
   - Only care about avoiding Reliability and Availability weaknesses
@@ -70,7 +76,15 @@ Need System-Level Durable Task/Service
   - Means Executing tasks need a shutdown() method to stop execution
     - prevents collisions
     - May want custom transactUntilSuccessful that checks for this flag and exits if seen
-    
+  - To reduce load, may want to spread task execution
+    - Host message to ask it to execute a task on the SystemServiceManager's behalf
+      - Can poll the task state's heartbeat Key/Value pair to ensure it's alive?
+
+Need to be careful with polling objects
+  - Long offline durations could back up with thousands of reads
+  - Maybe make an ObjectPoller(ptr, periodDuration, checkObjectFn)
+    - Only fires off new reads if last read completed
+
 ---------
 
 Add Inspection Commands:

@@ -1,4 +1,78 @@
 
+Should we add StorageDeviceSet as official top-level Metadata?
+  - Hierarchical, similiar to AllocationGroups but for physical devices
+    - Strict distinction between SetOfSets and SetOfDevices
+    - Defined by Level. 0 = SetOfDevices, 1+ = SetOfSets
+  - Pools belong to a single StorageDeviceSet which is assigned at creation
+    - Allows automatic selection of StorageDevices
+  - Pool set assignment be changed
+    - Allows migration from site-specific pool to mutli-site pool
+
+Allocation ignores balance concerns
+  - Only care about avoiding Reliability and Availability weaknesses
+    - Will need to sacrifice this if devices.length < ida.width or ida.availability
+  - Allocation
+    - Set of set uses randomized round robin
+    - Within a device set, get hosts list and random shuffle
+      - Random shuffle the devices on each host
+      - Track set of devices already used
+      - Select one device from each host and add to set
+      - While any unused devices remain, iterate over hosts and allocate unused disks
+      - If still haven't allocated all stores, need to start reusing disks
+      - iterate over already-used set in round-robin order till all allocated
+
+Rebuilding Allocation
+  - Assign to same device set as the failed disk
+  - NEED to take space into account (can't rebuild on device if it will not fit)
+  - Filter disks to remove any currently hosting the pool
+      If have some, filter all hosts currently serving stores in pool
+        If have some, random choose one
+        If not, sort list by number stores on host, choose the minimum
+      If None, we need to reuse a device
+        sort list by number of stores on device, choose minimum
+
+Set Expansion
+  - Distinct from rebalancing
+  - System-level DurableTask
+  - Goal here is to migrate stores to improve pool reliability and availability
+  - Find pool with worst failure tolerance
+    - select store to move
+  - If no stores with reliability problems
+    - find pool with worst availability, select store to move
+  - If no reliability or availability problems, exit Task
+
+Reassignment to a new set:
+  - System-level DurableTask
+  - Always reassign each store and move it
+  - Keep it simple.
+    - Optimize for not moving existing stores that are already in the set later
+  - Durable task selects a device for a store, calls transferStore, polls for
+        completion then moves to next store. On complete, update PoolState to say
+        migration status is Complete
+
+Rebalancing is a passive background task
+  - System-level Durable Service
+  - Only cares about keeping %usage common across all storage devices in leaf set
+  - Attempts to find the best store to move from higher-usage to lower
+    - discards candidate store transfer if it would hurt reliability or availability
+      - if deviceFailureTolerance(): Int - stays the same or is better, move allowed
+      - if hostFailureTolerance(): Int - stays the same or is better, move allowed
+
+Need System-Level Durable Task/Service
+  - Singleton service
+  - By default, all hosts participate in ensuring it's running
+    - Use lease-based system
+      - State says how long the lease is valid for
+        - Successful overwrite of object after lease expires grants ownership
+          - Use NotValidBefore(existingLeaseExpiryTime) to prevent skewed host clock from taking the lease early
+  - May want dedicated system management hosts for larget systems
+    - Storage hosts may not have the compute or bandwidth necessary to fill the role
+  - Means Executing tasks need a shutdown() method to stop execution
+    - prevents collisions
+    - May want custom transactUntilSuccessful that checks for this flag and exits if seen
+    
+---------
+
 Add Inspection Commands:
   - list hosts, storage-devices, storage-pools, allocation-groups
   - Use subcommand (think this is already done)

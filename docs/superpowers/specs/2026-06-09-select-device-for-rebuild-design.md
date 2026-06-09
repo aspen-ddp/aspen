@@ -144,7 +144,8 @@ All failures are `Future.failed(AllocationError(msg))` with distinct messages:
   (`"StorageDeviceSet <id> (level 0) has no member devices"`).
 - `failedIndex` out of range ⇒ `"failedIndex <i> out of range for pool <id> (<n> stores)"`.
 - no candidate / none with space ⇒
-  `"no device in set <id> has >= <requiredSize> free bytes to rebuild store <i> of pool <id>"`.
+  `"no device in set <id> has >= <requiredSize> free bytes available for rebuild"`
+  (emitted by the core, which does not carry the pool/store context).
 
 ## Testing
 

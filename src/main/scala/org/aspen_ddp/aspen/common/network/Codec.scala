@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -1084,6 +1084,25 @@ object Codec extends Logging:
     val members = m.members.map(decode).toList
     val parentGroups = m.parentGroups.map(u => AllocationGroupId(decodeUUID(u))).toList
     new AllocationGroupState(groupId, level, name, members, parentGroups)
+
+  def encode(o: StorageDeviceSetState): codec.StorageDeviceSetState =
+    codec.StorageDeviceSetState(
+      setId = Some(encodeUUID(o.setId.uuid)),
+      level = o.level,
+      name = o.name,
+      parent = o.parent.map(p => encodeUUID(p.uuid)),
+      memberDevices = o.memberDevices.map(d => encodeUUID(d.uuid)),
+      memberSets = o.memberSets.map(s => encodeUUID(s.uuid)),
+      assignedPools = o.assignedPools.map(p => encodeUUID(p.uuid))
+    )
+
+  def decode(m: codec.StorageDeviceSetState): StorageDeviceSetState =
+    val setId = StorageDeviceSetId(decodeUUID(m.setId.get))
+    val parent = m.parent.map(u => StorageDeviceSetId(decodeUUID(u)))
+    val memberDevices = m.memberDevices.map(u => StorageDeviceId(decodeUUID(u))).toList
+    val memberSets = m.memberSets.map(u => StorageDeviceSetId(decodeUUID(u))).toList
+    val assignedPools = m.assignedPools.map(u => PoolId(decodeUUID(u))).toList
+    StorageDeviceSetState(setId, m.name, m.level, parent, memberDevices, memberSets, assignedPools)
 
 
   def encode(o: HostState): codec.HostState =

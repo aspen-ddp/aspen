@@ -499,6 +499,16 @@ message AllocationGroupState {
   repeated UUID parentGroups = 5;
 }
 
+message StorageDeviceSetState {
+  UUID setId = 1;
+  int32 level = 2;
+  string name = 3;
+  UUID parent = 4;                   // absent = no parent
+  repeated UUID memberDevices = 5;
+  repeated UUID memberSets = 6;
+  repeated UUID assignedPools = 7;
+}
+
 message HostState {
   UUID hostId = 1;
   string name = 2;

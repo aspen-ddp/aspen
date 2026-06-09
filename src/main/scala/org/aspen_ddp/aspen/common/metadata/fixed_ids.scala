@@ -11,3 +11,4 @@ object fixed_ids:
   val BootstrapPoolId: PoolId = new PoolId(new UUID(0, 1))
   val BootstrapStorageDeviceId: StorageDeviceId = new StorageDeviceId(new UUID(0, 2))
   val BootstrapHostId: HostId = new HostId(new UUID(0, 3))
+  val BootstrapStorageDeviceSetId: StorageDeviceSetId = new StorageDeviceSetId(new UUID(0, 4))

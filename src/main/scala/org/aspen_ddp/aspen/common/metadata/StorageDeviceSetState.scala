@@ -76,6 +76,9 @@ final case class StorageDeviceSetState(
     if level != 0 then
       Future.failed(AllocationError(
         s"selectDeviceForRebuild only supports level-0 sets; set ${setId.uuid} is level $level"))
+    else if memberDevices.isEmpty then
+      Future.failed(AllocationError(
+        s"StorageDeviceSet ${setId.uuid} (level 0) has no member devices"))
     else
       for
         poolPtr <- client.getStoragePoolPointer(poolId)

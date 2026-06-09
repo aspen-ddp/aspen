@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -128,6 +128,7 @@ trait AspenClient extends ObjectReader:
                            maxObjectSize: Option[Int],
                            storageDeviceIds: List[StorageDeviceId],
                            backendConfig: BackendConfig,
+                           storageDeviceSet: StorageDeviceSetId,
                            maximumStoreSize: Long): Future[PoolId] =
     if storageDeviceIds.size < ida.width then
       Future.failed(new IllegalArgumentException("storageDeviceIds list must be at least as long as ida.width"))
@@ -144,6 +145,7 @@ trait AspenClient extends ObjectReader:
           maxObjectSize,
           stores,
           backendConfig,
+          storageDeviceSet,
           0L,
           maximumStoreSize
         )

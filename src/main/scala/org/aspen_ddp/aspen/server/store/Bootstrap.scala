@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets
 import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -88,12 +88,13 @@ object Bootstrap:
     }.toArray
     
     val poolState = StoragePoolState(
-      PoolId.BootstrapPoolId, 
-      PoolId.BootstrapPoolName, 
-      ida, 
-      None, 
+      PoolId.BootstrapPoolId,
+      PoolId.BootstrapPoolName,
+      ida,
+      None,
       storeEntrys,
-      RocksDBConfig()).encode()
+      RocksDBConfig(),
+      StorageDeviceSetId.BootstrapStorageDeviceSetId).encode()
 
     val errTreeRoot = allocate()
     val allocTreeRoot = allocate()

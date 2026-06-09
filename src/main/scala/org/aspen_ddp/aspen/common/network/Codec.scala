@@ -1026,7 +1026,8 @@ object Codec extends Logging:
       backendConfig = encodeBackendConfig(o.backendConfig),
       currentUsage = o.currentUsage,
       maximumStoreSize = o.maximumStoreSize,
-      allocationGroups = o.allocationGroups.map(encodeUUID)
+      allocationGroups = o.allocationGroups.map(encodeUUID),
+      storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid))
     )
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
@@ -1039,9 +1040,10 @@ object Codec extends Logging:
     val currentUsage = m.currentUsage
     val maximumStoreSize = m.maximumStoreSize
     val allocationGroups = m.allocationGroups.map(decodeUUID).toList
+    val storageDeviceSet = StorageDeviceSetId(decodeUUID(m.storageDeviceSet.get))
 
     StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig,
-      currentUsage, maximumStoreSize, allocationGroups)
+      storageDeviceSet, currentUsage, maximumStoreSize, allocationGroups)
 
 
   def encodeAllocationGroupMemberType(o: AllocationGroupState.MemberType): codec.AllocationGroupMemberType = o match

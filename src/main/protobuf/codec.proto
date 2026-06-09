@@ -476,6 +476,7 @@ message StoragePoolState {
   int64 currentUsage = 7;
   int64 maximumStoreSize = 8;
   repeated UUID allocationGroups = 9;
+  UUID storageDeviceSet = 10;
 }
 
 enum AllocationGroupMemberType {

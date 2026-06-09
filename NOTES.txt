@@ -1,14 +1,4 @@
 
-Rebuilding Allocation
-  - Assign to same device set as the failed disk
-  - NEED to take space into account (can't rebuild on device if it will not fit)
-  - Filter disks to remove any currently hosting the pool
-      If have some, filter all hosts currently serving stores in pool
-        If have some, random choose one
-        If not, sort list by number stores on host, choose the minimum
-      If None, we need to reuse a device
-        sort list by number of stores on device, choose minimum
-
 Set Expansion
   - Distinct from rebalancing
   - System-level DurableTask

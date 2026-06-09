@@ -69,7 +69,7 @@ final case class StorageDeviceSetState(
     else if level == 0 then
       selectFromDevices(numStores, exclude, rng)
     else
-      Future.failed(new NotImplementedError("level 1+ selection added in Task 2"))
+      selectFromSets(numStores, exclude, lookup, rng)
 
   private def selectFromDevices(
       numStores: Int,
@@ -83,3 +83,28 @@ final case class StorageDeviceSetState(
       val preferred = shuffled.filterNot(exclude.contains)
       val ordered = preferred.iterator ++ Iterator.continually(shuffled).flatten
       Future.successful(ordered.take(numStores).toList)
+
+  private def selectFromSets(
+      numStores: Int,
+      exclude: Set[StorageDeviceId],
+      lookup: StorageDeviceSetId => Future[StorageDeviceSetState],
+      rng: Random
+  )(using ec: ExecutionContext): Future[List[StorageDeviceId]] =
+    if memberSets.isEmpty then
+      Future.failed(AllocationError(s"StorageDeviceSet ${setId.uuid} (level $level) has no member sets"))
+    else
+      val shuffled = rng.shuffle(memberSets)
+      // Round-robin visiting order gives per-member-set counts differing by <= 1.
+      val visits = Iterator.continually(shuffled).flatten.take(numStores).toList
+
+      // Sequential fold so each visit sees devices chosen by earlier visits,
+      // threading the growing exclusion set for best-effort deduplication.
+      val folded = visits.foldLeft(Future.successful((List.empty[StorageDeviceId], exclude))):
+        (accF, memberSetId) =>
+          accF.flatMap: (results, excludeSoFar) =>
+            lookup(memberSetId).flatMap: subState =>
+              subState.selectDevices(1, excludeSoFar, lookup, rng).map: chosen =>
+                val device = chosen.head
+                (results :+ device, excludeSoFar + device)
+
+      folded.map(_._1)

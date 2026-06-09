@@ -105,3 +105,67 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val set = leaf(Nil)
     assertThrows[AllocationError]:
       Await.result(set.selectDevices(2, Set.empty, noLookup, new Random(7)), timeout)
+
+  test("level 1: distributes evenly across member sets (counts differ by <= 1)"):
+    val leaves = List.fill(3)(leaf(List.fill(4)(dev())))
+    val root = upper(1, leaves)
+    val deviceToLeaf: Map[StorageDeviceId, StorageDeviceSetId] =
+      leaves.flatMap(l => l.memberDevices.map(_ -> l.setId)).toMap
+
+    val result = Await.result(
+      root.selectDevices(7, Set.empty, lookupFor(leaves*), new Random(11)), timeout)
+
+    result.length should be(7)
+    val perLeaf = result.groupBy(deviceToLeaf).view.mapValues(_.size).values.toList
+    (perLeaf.max - perLeaf.min) should be <= 1
+
+  test("level 1: no duplicates when each member set has enough distinct devices"):
+    val leaves = List.fill(3)(leaf(List.fill(4)(dev())))
+    val root = upper(1, leaves)
+
+    // numStores=6, 3 member sets => ceil(6/3)=2 visits each, each leaf has 4 devices.
+    val result = Await.result(
+      root.selectDevices(6, Set.empty, lookupFor(leaves*), new Random(12)), timeout)
+
+    result.length should be(6)
+    result.distinct.length should be(6)
+
+  test("level 1: duplicates only from an exhausted member set, distribution still even"):
+    val a1 = dev()
+    val small = leaf(List(a1))            // only 1 device
+    val big = leaf(List.fill(5)(dev()))   // plenty
+    val root = upper(1, List(small, big))
+    val deviceToLeaf: Map[StorageDeviceId, StorageDeviceSetId] =
+      (small.memberDevices ++ big.memberDevices).map { d =>
+        d -> (if d == a1 then small.setId else big.setId)
+      }.toMap
+
+    // numStores=4, 2 member sets => 2 visits each. `small` is revisited but has 1 device.
+    val result = Await.result(
+      root.selectDevices(4, Set.empty, lookupFor(small, big), new Random(13)), timeout)
+
+    result.length should be(4)
+    result.count(_ == a1) should be(2)        // the only possible duplicate, from `small`
+    result.distinct.length should be(3)
+    val perLeaf = result.groupBy(deviceToLeaf).view.mapValues(_.size).toMap
+    perLeaf(small.setId) should be(2)
+    perLeaf(big.setId) should be(2)
+
+  test("level 2: chains down through nested sets to leaf devices"):
+    val leavesA = List.fill(2)(leaf(List.fill(3)(dev())))
+    val leavesB = List.fill(2)(leaf(List.fill(3)(dev())))
+    val branchA = upper(1, leavesA)
+    val branchB = upper(1, leavesB)
+    val root = upper(2, List(branchA, branchB))
+    val allDevices = (leavesA ++ leavesB).flatMap(_.memberDevices).toSet
+    val lookup = lookupFor((leavesA ++ leavesB ++ List(branchA, branchB))*)
+
+    val result = Await.result(root.selectDevices(4, Set.empty, lookup, new Random(14)), timeout)
+
+    result.length should be(4)
+    result.toSet.subsetOf(allDevices) should be(true)
+
+  test("level 1: empty member sets fails with AllocationError"):
+    val root = upper(1, Nil)
+    assertThrows[AllocationError]:
+      Await.result(root.selectDevices(2, Set.empty, noLookup, new Random(15)), timeout)

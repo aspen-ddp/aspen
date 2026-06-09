@@ -55,6 +55,51 @@ final case class StorageDeviceSetState(
     given ExecutionContext = client.clientContext
     selectDevices(numStores, Set.empty, client.getStorageDeviceSetState, rng)
 
+  /** Select a device to host a store that must be rebuilt from scratch because its
+   *  data was lost. The store currently at `failedIndex` in pool `poolId` is the one
+   *  being rebuilt; its current size (the pool's per-store usage record, or 0 if absent)
+   *  is the amount of free space a candidate device must have.
+   *
+   *  Only valid for level-0 sets; level-1+ sets fail with `AllocationError` without any
+   *  reads. The pool object is read directly via its pointer so the per-store size key
+   *  and the config come from a single read. See `selectRebuildDevice` for the selection
+   *  policy (failed device hard-excluded, other pool devices soft-excluded, free space
+   *  required). All failures are `Future.failed(AllocationError(...))`.
+   */
+  def selectDeviceForRebuild(
+      poolId: PoolId,
+      failedIndex: Byte,
+      client: AspenClient,
+      rng: Random = new Random()
+  ): Future[StorageDeviceId] =
+    given ExecutionContext = client.clientContext
+    if level != 0 then
+      Future.failed(AllocationError(
+        s"selectDeviceForRebuild only supports level-0 sets; set ${setId.uuid} is level $level"))
+    else
+      for
+        poolPtr <- client.getStoragePoolPointer(poolId)
+        poolKvos <- client.read(poolPtr)
+        poolState = StoragePoolState(poolKvos)
+        device <-
+          if failedIndex < 0 || failedIndex >= poolState.stores.length then
+            Future.failed(AllocationError(
+              s"failedIndex $failedIndex out of range for pool ${poolId.uuid} (${poolState.stores.length} stores)"))
+          else
+            val requiredSize = poolKvos.contents
+              .get(StoragePoolState.getStoreUsageKey(failedIndex))
+              .map(vs => byte2long(vs.value.bytes))
+              .getOrElse(0L)
+            val failedDevice = poolState.stores(failedIndex).storageDeviceId
+            val poolDevices = poolState.stores.map(_.storageDeviceId).toSet
+            selectRebuildDevice(
+              requiredSize,
+              failedDevice,
+              poolDevices,
+              id => client.getStorageDeviceState(id).map(s => s.totalSize - s.currentUsage),
+              rng)
+      yield device
+
   /** Recursive core. Depends only on a narrow `lookup` so it is unit-testable
    *  without a full `AspenClient`. `exclude` carries device ids already chosen
    *  earlier in the overall selection, enabling best-effort deduplication.

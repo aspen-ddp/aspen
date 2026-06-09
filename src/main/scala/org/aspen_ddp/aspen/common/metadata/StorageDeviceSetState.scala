@@ -1,11 +1,13 @@
 package org.aspen_ddp.aspen.common.metadata
 
-import org.aspen_ddp.aspen.client.DataObjectState
+import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, DataObjectState}
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.pool.PoolId
 
 import java.util.UUID
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Random
 
 final case class StorageDeviceSetId(uuid: UUID) extends AnyVal
 
@@ -37,3 +39,47 @@ final case class StorageDeviceSetState(
     assignedPools: List[PoolId]
 ):
   def toBytes: Array[Byte] = Codec.encode(this).toByteArray
+
+  /** Select `numStores` device ids for a pool, walking this set's hierarchy.
+   *
+   *  Level-0 sets draw from their member devices. Level-1+ sets distribute the
+   *  request evenly across their member sets and recurse. `rng` is injectable so
+   *  tests can be deterministic.
+   */
+  def selectDevicesForPool(
+      numStores: Int,
+      client: AspenClient,
+      rng: Random = new Random()
+  ): Future[List[StorageDeviceId]] =
+    given ExecutionContext = client.clientContext
+    selectDevices(numStores, Set.empty, client.getStorageDeviceSetState, rng)
+
+  /** Recursive core. Depends only on a narrow `lookup` so it is unit-testable
+   *  without a full `AspenClient`. `exclude` carries device ids already chosen
+   *  earlier in the overall selection, enabling best-effort deduplication.
+   */
+  private[metadata] def selectDevices(
+      numStores: Int,
+      exclude: Set[StorageDeviceId],
+      lookup: StorageDeviceSetId => Future[StorageDeviceSetState],
+      rng: Random
+  )(using ec: ExecutionContext): Future[List[StorageDeviceId]] =
+    if numStores <= 0 then
+      Future.successful(Nil)
+    else if level == 0 then
+      selectFromDevices(numStores, exclude, rng)
+    else
+      Future.failed(new NotImplementedError("level 1+ selection added in Task 2"))
+
+  private def selectFromDevices(
+      numStores: Int,
+      exclude: Set[StorageDeviceId],
+      rng: Random
+  ): Future[List[StorageDeviceId]] =
+    if memberDevices.isEmpty then
+      Future.failed(AllocationError(s"StorageDeviceSet ${setId.uuid} (level 0) has no member devices"))
+    else
+      val shuffled = rng.shuffle(memberDevices)
+      val preferred = shuffled.filterNot(exclude.contains)
+      val ordered = preferred.iterator ++ Iterator.continually(shuffled).flatten
+      Future.successful(ordered.take(numStores).toList)

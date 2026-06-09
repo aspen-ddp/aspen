@@ -58,6 +58,7 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   private val allocationGroupsTree = new MetadataTree(this, radicle, Radicle.AllocationGroupsTreeKey)
   private val hostsTree = new MetadataTree(this, radicle, Radicle.HostsTreeKey)
   private val storageDevicesTree = new MetadataTree(this, radicle, Radicle.StorageDevicesTreeKey)
+  private val storageDeviceSetsTree = new MetadataTree(this, radicle, Radicle.StorageDeviceSetsTreeKey)
 
   private val allocatorManager = new ObjectAllocatorManager(this)
 
@@ -88,6 +89,8 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   override def getAllocationGroupId(groupName: String): Future[AllocationGroupId] =
     namespacedRegistry.getRegisteredObject("group", groupName).map(AllocationGroupId(_))
 
+  override def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] =
+    namespacedRegistry.getRegisteredObject("device-set", setName).map(StorageDeviceSetId(_))
 
   override def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
     storagePoolsTree.get(poolId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
@@ -101,6 +104,8 @@ class SimpleAspenClient(val msngr: ClientMessenger,
   override def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] =
     allocationGroupsTree.get(allocationGroupId.uuid).map(_.asInstanceOf[DataObjectPointer])
 
+  override def getStorageDeviceSetPointer(storageDeviceSetId: StorageDeviceSetId): Future[DataObjectPointer] =
+    storageDeviceSetsTree.get(storageDeviceSetId.uuid).map(_.asInstanceOf[DataObjectPointer])
 
   override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
     val ags = AllocationGroupState(
@@ -123,6 +128,30 @@ class SimpleAspenClient(val msngr: ClientMessenger,
         _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
       yield
         ags.groupId
+
+  override def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId] =
+    val sds = StorageDeviceSetState(
+      StorageDeviceSetId(UUID.randomUUID()),
+      name,
+      level,
+      parent,
+      Nil,
+      Nil,
+      Nil
+    )
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: DuplicateRegistration => throw StopRetrying(e)
+
+    transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+      for
+        bsPool <- getStoragePool(PoolId.BootstrapPoolId)
+        ptr <- bsPool.allocator.allocateDataObject(DataBuffer(sds.toBytes))
+        _ <- storageDeviceSetsTree.preparePut(sds.setId.uuid, ptr)
+        _ <- namespacedRegistry.prepareRegisterObject("device-set", sds.name, sds.setId.uuid)
+      yield
+        sds.setId
 
   override protected def createStoragePool(config: StoragePoolState): Future[PoolId] = {
     // TODO: Need Recovery. Will forever retry if creating a pool with name that already exists!

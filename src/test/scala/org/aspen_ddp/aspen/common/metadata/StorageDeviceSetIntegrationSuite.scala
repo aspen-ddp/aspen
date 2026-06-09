@@ -34,3 +34,23 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
     yield
       ps.storageDeviceSet should be(StorageDeviceSetId.BootstrapStorageDeviceSetId)
       ds.storageDeviceSet should be(StorageDeviceSetId.BootstrapStorageDeviceSetId)
+
+  atest("createStorageDeviceSet round-trips via the client"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("test-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      sds <- client.getStorageDeviceSetState(setId)
+    yield
+      sds.setId should be(setId)
+      sds.name should be("test-set")
+      sds.level should be(0)
+      sds.parent should be(None)
+      sds.memberDevices should be(Nil)
+      sds.memberSets should be(Nil)
+      sds.assignedPools should be(Nil)
+
+  atest("getStorageDeviceSetState reads the bootstrap set"):
+    given ExecutionContext = executionContext
+    client.getStorageDeviceSetState(StorageDeviceSetId.BootstrapStorageDeviceSetId).map: sds =>
+      sds.name should be("bootstrap")

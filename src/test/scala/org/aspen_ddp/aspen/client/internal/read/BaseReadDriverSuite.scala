@@ -17,7 +17,7 @@ import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
 
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.*
@@ -66,13 +66,16 @@ object BaseReadDriverSuite {
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
     def getHostId(hostName: String): Future[HostId] = ???
     def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
-    
+    def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] = ???
+
     def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] = ???
     def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] = ???
     def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] = ???
     def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] = ???
+    def getStorageDeviceSetPointer(storageDeviceSetId: StorageDeviceSetId): Future[DataObjectPointer] = ???
 
     def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] = ???
+    def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId] = ???
 
     val retryStrategy: RetryStrategy = null
 

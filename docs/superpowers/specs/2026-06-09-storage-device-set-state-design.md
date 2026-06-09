@@ -255,6 +255,13 @@ updated in parallel, following its existing per-tree pattern:
 `getStorageDeviceSetState` is concrete on `AspenClient`, so `TClient` inherits it
 without change.
 
+**`src/test/scala/org/aspen_ddp/aspen/client/internal/read/BaseReadDriverSuite.scala`
+(`TClient`)** — a third concrete `AspenClient` implementation that stubs every
+abstract method with `???`. The new abstract methods are unrelated to its purpose
+and are left unimplemented: add `getStorageDeviceSetPointer`,
+`getStorageDeviceSetId`, and `createStorageDeviceSet`, each `= ???`, matching the
+existing stubs.
+
 ## Testing
 
 - **Bootstrap round-trip:** after bootstrap, the Radicle resolves

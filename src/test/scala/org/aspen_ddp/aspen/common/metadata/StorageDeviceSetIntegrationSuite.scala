@@ -54,3 +54,12 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     client.getStorageDeviceSetState(StorageDeviceSetId.BootstrapStorageDeviceSetId).map: sds =>
       sds.name should be("bootstrap")
+
+  atest("getStorageDeviceSetId resolves a created set by name"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("named-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      resolved <- client.getStorageDeviceSetId("named-set")
+    yield
+      resolved should be(setId)

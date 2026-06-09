@@ -105,7 +105,8 @@ object TestNetwork {
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
     def getHostId(hostName: String): Future[HostId] = ???
     def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
-    def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] = ???
+    def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] =
+      namespacedRegistry.getRegisteredObject("device-set", setName).map(StorageDeviceSetId(_))
 
     val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
     val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)

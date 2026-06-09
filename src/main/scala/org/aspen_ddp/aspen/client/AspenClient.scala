@@ -133,6 +133,9 @@ trait AspenClient extends ObjectReader:
     retryStrategy.retryUntilSuccessful(onCommitFailure):
       transact(prepare)
       
+  // NOTE: This records storageDeviceSet on the new pool but does not add the pool to the
+  // set's assignedPools. Keeping both sides consistent is the responsibility of the
+  // StorageDeviceSet management API, which is not yet implemented.
   def createNewStoragePool(name: String,
                            ida: IDA,
                            maxObjectSize: Option[Int],

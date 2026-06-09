@@ -63,3 +63,17 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       resolved <- client.getStorageDeviceSetId("named-set")
     yield
       resolved should be(setId)
+
+  atest("createStorageDeviceSet links the new set into its parent"):
+    given ExecutionContext = executionContext
+    for
+      parentId <- client.createStorageDeviceSet("parent-set", level = 1, parent = None)
+      _ <- waitForTransactionsToComplete()
+      childId <- client.createStorageDeviceSet("child-set", level = 0, parent = Some(parentId))
+      _ <- waitForTransactionsToComplete()
+      parent <- client.getStorageDeviceSetState(parentId)
+      child <- client.getStorageDeviceSetState(childId)
+    yield
+      child.parent should be(Some(parentId))
+      parent.memberSets should contain(childId)
+      parent.memberSets.count(_ == childId) should be(1)

@@ -140,8 +140,20 @@ class SimpleAspenClient(val msngr: ClientMessenger,
       Nil
     )
 
+    // When a parent is supplied, add the new set to the parent's memberSets as part of
+    // the same transaction so the parent/child link is established atomically.
+    def addToParent(parentId: StorageDeviceSetId)(using tx: Transaction): Future[Unit] =
+      for
+        parentPtr <- getStorageDeviceSetPointer(parentId)
+        parentDos <- read(parentPtr)
+      yield
+        val parentState = StorageDeviceSetState(parentDos)
+        val updated = parentState.copy(memberSets = sds.setId :: parentState.memberSets)
+        tx.overwrite(parentPtr, parentDos.revision, DataBuffer(updated.toBytes))
+
     def onFail(err: Throwable): Future[Unit] = err match
       case e: DuplicateRegistration => throw StopRetrying(e)
+      case e: NoSuchElementException => throw StopRetrying(e)
 
     transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
@@ -150,6 +162,9 @@ class SimpleAspenClient(val msngr: ClientMessenger,
         ptr <- bsPool.allocator.allocateDataObject(DataBuffer(sds.toBytes))
         _ <- storageDeviceSetsTree.preparePut(sds.setId.uuid, ptr)
         _ <- namespacedRegistry.prepareRegisterObject("device-set", sds.name, sds.setId.uuid)
+        _ <- parent match
+               case None => Future.unit
+               case Some(parentId) => addToParent(parentId)
       yield
         sds.setId
 

@@ -167,11 +167,23 @@ object TestNetwork {
       val tx = newTransaction()
       given Transaction = tx
 
+      def addToParent(parentId: StorageDeviceSetId): Future[Unit] =
+        for
+          parentPtr <- getStorageDeviceSetPointer(parentId)
+          parentDos <- read(parentPtr)
+        yield
+          val parentState = StorageDeviceSetState(parentDos)
+          val updated = parentState.copy(memberSets = sds.setId :: parentState.memberSets)
+          tx.overwrite(parentPtr, parentDos.revision, DataBuffer(updated.toBytes))
+
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         ptr <- bsPool.allocator.allocateDataObject(DataBuffer(sds.toBytes))
         _ <- storageDeviceSetsTree.preparePut(sds.setId.uuid, ptr)
         _ <- namespacedRegistry.prepareRegisterObject("device-set", sds.name, sds.setId.uuid)
+        _ <- parent match
+               case None => Future.unit
+               case Some(parentId) => addToParent(parentId)
         _ <- tx.commit()
       yield
         sds.setId

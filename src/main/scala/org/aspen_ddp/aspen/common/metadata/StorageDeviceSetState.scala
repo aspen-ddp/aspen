@@ -4,10 +4,11 @@ import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, DataObjectState
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.util.byte2long
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.Random
+import scala.util.{Random, Success}
 
 final case class StorageDeviceSetId(uuid: UUID) extends AnyVal
 
@@ -108,3 +109,48 @@ final case class StorageDeviceSetState(
                 (results :+ device, excludeSoFar + device)
 
       folded.map(_._1)
+
+  /** Select a device to host a store rebuilt from scratch (its data was lost).
+   *
+   *  Only valid for level-0 sets. The failed device is hard-excluded (never chosen).
+   *  Devices already hosting a store in the pool (`poolDevices`) are soft-excluded:
+   *  preferred candidates that are not in `poolDevices` are tried first, falling back
+   *  to pool devices only if no preferred device has enough space. Free space is a hard
+   *  requirement in both phases.
+   *
+   *  Selection is optimistic and lazy: candidates are tried in random order, reading
+   *  each device's free space one at a time via `freeSpaceLookup`, stopping at the first
+   *  that fits. A candidate whose lookup fails is skipped. `rng` is injectable so tests
+   *  can be deterministic. Depends only on `freeSpaceLookup` so it is unit-testable
+   *  without a full `AspenClient`.
+   */
+  private[metadata] def selectRebuildDevice(
+      requiredSize: Long,
+      failedDevice: StorageDeviceId,
+      poolDevices: Set[StorageDeviceId],
+      freeSpaceLookup: StorageDeviceId => Future[Long],
+      rng: Random
+  )(using ec: ExecutionContext): Future[StorageDeviceId] =
+    if level != 0 then
+      Future.failed(AllocationError(
+        s"selectDeviceForRebuild only supports level-0 sets; set ${setId.uuid} is level $level"))
+    else if memberDevices.isEmpty then
+      Future.failed(AllocationError(
+        s"StorageDeviceSet ${setId.uuid} (level 0) has no member devices"))
+    else
+      val eligible = memberDevices.filterNot(_ == failedDevice)
+      val preferred = rng.shuffle(eligible.filterNot(poolDevices.contains))
+      val fallback = rng.shuffle(eligible.filter(poolDevices.contains))
+      val candidates = preferred ++ fallback
+
+      def scan(remaining: List[StorageDeviceId]): Future[StorageDeviceId] =
+        remaining match
+          case Nil =>
+            Future.failed(AllocationError(
+              s"no device in set ${setId.uuid} has >= $requiredSize free bytes available for rebuild"))
+          case head :: tail =>
+            freeSpaceLookup(head).transformWith:
+              case Success(free) if free >= requiredSize => Future.successful(head)
+              case _ => scan(tail)
+
+      scan(candidates)

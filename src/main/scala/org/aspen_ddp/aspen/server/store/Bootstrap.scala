@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets
 import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -129,6 +129,16 @@ object Bootstrap:
     val hostPtr = allocate(List(
       HostState.StateKey -> bootstrapHostState.encode()
     ))
+
+    val bootstrapDeviceSet = StorageDeviceSetState(
+      setId = StorageDeviceSetId.BootstrapStorageDeviceSetId,
+      name = "bootstrap",
+      level = 0,
+      parent = None,
+      memberDevices = List(bootstrapStorageDeviceState.storageDeviceId),
+      memberSets = Nil,
+      assignedPools = List(PoolId.BootstrapPoolId)
+    )
     
     // Create registry trees 
     
@@ -137,7 +147,8 @@ object Bootstrap:
     val namespacedRegistryTree = allocateTree(
       LexicalKeyOrdering,
       NamespacedUUIDRegistry.makeKey("pool", PoolId.BootstrapPoolName) -> uuid2byte(Radicle.poolId.uuid),
-      NamespacedUUIDRegistry.makeKey("host", bootstrapHostState.name) -> uuid2byte(bootstrapHostState.hostId.uuid)
+      NamespacedUUIDRegistry.makeKey("host", bootstrapHostState.name) -> uuid2byte(bootstrapHostState.hostId.uuid),
+      NamespacedUUIDRegistry.makeKey("device-set", bootstrapDeviceSet.name) -> uuid2byte(fixed_ids.BootstrapStorageDeviceSetId.uuid),
     )
     
     // Create Metadata Trees
@@ -157,17 +168,7 @@ object Bootstrap:
       ByteArrayKeyOrdering,
       Key(bootstrapStorageDeviceState.storageDeviceId.uuid) -> storageDevicePtr.toArray
     )
-
-    val bootstrapDeviceSet = StorageDeviceSetState(
-      setId = StorageDeviceSetId.BootstrapStorageDeviceSetId,
-      name = "bootstrap",
-      level = 0,
-      parent = None,
-      memberDevices = List(bootstrapStorageDeviceState.storageDeviceId),
-      memberSets = Nil,
-      assignedPools = List(PoolId.BootstrapPoolId)
-    )
-
+    
     val storageDeviceSetPtr = allocateData(bootstrapDeviceSet.toBytes)
 
     val storageDeviceSetsTree = allocateTree(

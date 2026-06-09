@@ -1102,7 +1102,7 @@ object Codec extends Logging:
     val memberDevices = m.memberDevices.map(u => StorageDeviceId(decodeUUID(u))).toList
     val memberSets = m.memberSets.map(u => StorageDeviceSetId(decodeUUID(u))).toList
     val assignedPools = m.assignedPools.map(u => PoolId(decodeUUID(u))).toList
-    StorageDeviceSetState(setId, m.name, m.level, parent, memberDevices, memberSets, assignedPools)
+    new StorageDeviceSetState(setId, m.name, m.level, parent, memberDevices, memberSets, assignedPools)
 
 
   def encode(o: HostState): codec.HostState =

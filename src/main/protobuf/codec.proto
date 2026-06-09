@@ -501,8 +501,8 @@ message AllocationGroupState {
 
 message StorageDeviceSetState {
   UUID setId = 1;
-  int32 level = 2;
-  string name = 3;
+  string name = 2;
+  int32 level = 3;
   UUID parent = 4;                   // absent = no parent
   repeated UUID memberDevices = 5;
   repeated UUID memberSets = 6;

@@ -5,7 +5,7 @@ import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -532,6 +532,7 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
         StoragePoolState.StoreEntry(HostId(uuid(4)), StorageDeviceId(uuid(5)))
       ),
       RocksDBConfig(),
+      storageDeviceSet = StorageDeviceSetId(uuid(8)),
       currentUsage = 500L,
       maximumStoreSize = 10000L,
       allocationGroups = List(uuid(6), uuid(7))
@@ -545,10 +546,11 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.currentUsage shouldBe 500L
     decoded.maximumStoreSize shouldBe 10000L
     decoded.allocationGroups.size shouldBe 2
+    decoded.storageDeviceSet shouldBe original.storageDeviceSet
 
     val noMaxSize = StoragePoolState(
       PoolId(uuid(10)), "pool2", ReedSolomon(5, 3, 4), None,
-      Array.empty, RocksDBConfig()
+      Array.empty, RocksDBConfig(), StorageDeviceSetId(uuid(11))
     )
     val decodedNoMax = Codec.decode(Codec.encode(noMaxSize))
     decodedNoMax.maxObjectSize shouldBe None

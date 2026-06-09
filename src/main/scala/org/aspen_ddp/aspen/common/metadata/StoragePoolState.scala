@@ -35,6 +35,7 @@ final case class StoragePoolState(
                                    maxObjectSize: Option[Int],
                                    stores: Array[StoragePoolState.StoreEntry],
                                    backendConfig: BackendConfig,
+                                   storageDeviceSet: StorageDeviceSetId,
                                    currentUsage: Long = 0,
                                    maximumStoreSize: Long = 0,
                                    allocationGroups: List[UUID] = Nil

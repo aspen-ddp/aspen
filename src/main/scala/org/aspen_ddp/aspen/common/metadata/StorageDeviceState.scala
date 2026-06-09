@@ -45,7 +45,8 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
                               hostId: HostId,
                               currentUsage: Long,
                               totalSize: Long,
-                              stores: Map[StoreId, StorageDeviceState.StoreEntry]):
+                              stores: Map[StoreId, StorageDeviceState.StoreEntry],
+                              storageDeviceSet: StorageDeviceSetId):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
   

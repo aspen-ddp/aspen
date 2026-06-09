@@ -6,10 +6,10 @@ import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 import java.util.UUID
 import java.nio.charset.StandardCharsets
 import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
-import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
@@ -83,17 +83,33 @@ object Bootstrap:
       val rootObject = allocate(content.toList)
       Root(0, ordering, Some(rootObject), bootstrapNodeAllocator)
 
+    def allocateData(content: Array[Byte],
+                     objectId: Option[ObjectId] = None): DataObjectPointer =
+      val oid = objectId.getOrElse(ObjectId(UUID.randomUUID()))
+
+      ida.encode(content).zip(stores).foreach { t =>
+        val (storeData, store) = t
+        store.bootstrapAllocate(oid, ObjectType.Data, bootstrapMetadata, DataBuffer(storeData))
+      }
+
+      val p = DataObjectPointer(oid, Radicle.poolId)
+
+      allocTreeContent = (Key(p.id.uuid) -> p.toArray) :: allocTreeContent
+
+      p
+
     val storeEntrys = (0 until ida.width).map{ _ => 
       StoragePoolState.StoreEntry(bootstrapHostState.hostId, bootstrapStorageDeviceState.storageDeviceId)
     }.toArray
     
     val poolState = StoragePoolState(
-      PoolId.BootstrapPoolId, 
-      PoolId.BootstrapPoolName, 
-      ida, 
-      None, 
+      PoolId.BootstrapPoolId,
+      PoolId.BootstrapPoolName,
+      ida,
+      None,
       storeEntrys,
-      RocksDBConfig()).encode()
+      RocksDBConfig(),
+      StorageDeviceSetId.BootstrapStorageDeviceSetId).encode()
 
     val errTreeRoot = allocate()
     val allocTreeRoot = allocate()
@@ -142,6 +158,23 @@ object Bootstrap:
       Key(bootstrapStorageDeviceState.storageDeviceId.uuid) -> storageDevicePtr.toArray
     )
 
+    val bootstrapDeviceSet = StorageDeviceSetState(
+      setId = StorageDeviceSetId.BootstrapStorageDeviceSetId,
+      name = "bootstrap",
+      level = 0,
+      parent = None,
+      memberDevices = List(bootstrapStorageDeviceState.storageDeviceId),
+      memberSets = Nil,
+      assignedPools = List(PoolId.BootstrapPoolId)
+    )
+
+    val storageDeviceSetPtr = allocateData(bootstrapDeviceSet.toBytes)
+
+    val storageDeviceSetsTree = allocateTree(
+      ByteArrayKeyOrdering,
+      Key(StorageDeviceSetId.BootstrapStorageDeviceSetId.uuid) -> storageDeviceSetPtr.toArray
+    )
+
     val radicleContent: List[(Key, Array[Byte])] = List(
       Radicle.BootstrapConfigKey -> bootstrapConfig.getBytes(StandardCharsets.UTF_8),
       Radicle.SystemIdKey -> uuid2byte(aspenSystemId),
@@ -151,6 +184,7 @@ object Bootstrap:
       Radicle.AllocationGroupsTreeKey -> allocationGroupsTree.encode(),
       Radicle.HostsTreeKey -> hostsTree.encode(),
       Radicle.StorageDevicesTreeKey -> storageDevicesTree.encode(),
+      Radicle.StorageDeviceSetsTreeKey -> storageDeviceSetsTree.encode(),
     )
  
     val radicle = allocate(radicleContent, Some(Radicle.objectId))

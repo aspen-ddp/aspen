@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -86,19 +86,29 @@ trait AspenClient extends ObjectReader:
     getAllocationGroupPointer(allocationGroupId).flatMap: pointer =>
       read(pointer).map: dos =>
         AllocationGroupState(dos)
-        
+
+  def getStorageDeviceSetState(storageDeviceSetId: StorageDeviceSetId): Future[StorageDeviceSetState] =
+    given ExecutionContext = this.clientContext
+    getStorageDeviceSetPointer(storageDeviceSetId).flatMap: pointer =>
+      read(pointer).map: dos =>
+        StorageDeviceSetState(dos)
+
   def getStoragePoolId(poolName: String): Future[PoolId]
   def getHostId(hostName: String): Future[HostId]
   def getAllocationGroupId(groupName: String): Future[AllocationGroupId]
-  
+  def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId]
+
   private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer]
   private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]
   private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer]
   private[aspen] def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer]
+  private[aspen] def getStorageDeviceSetPointer(storageDeviceSetId: StorageDeviceSetId): Future[DataObjectPointer]
 
   protected def createStoragePool(config: StoragePoolState): Future[PoolId]
 
   def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId]
+
+  def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId]
 
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
@@ -123,11 +133,15 @@ trait AspenClient extends ObjectReader:
     retryStrategy.retryUntilSuccessful(onCommitFailure):
       transact(prepare)
       
+  // NOTE: This records storageDeviceSet on the new pool but does not add the pool to the
+  // set's assignedPools. Keeping both sides consistent is the responsibility of the
+  // StorageDeviceSet management API, which is not yet implemented.
   def createNewStoragePool(name: String,
                            ida: IDA,
                            maxObjectSize: Option[Int],
                            storageDeviceIds: List[StorageDeviceId],
                            backendConfig: BackendConfig,
+                           storageDeviceSet: StorageDeviceSetId,
                            maximumStoreSize: Long): Future[PoolId] =
     if storageDeviceIds.size < ida.width then
       Future.failed(new IllegalArgumentException("storageDeviceIds list must be at least as long as ida.width"))
@@ -144,6 +158,7 @@ trait AspenClient extends ObjectReader:
           maxObjectSize,
           stores,
           backendConfig,
+          storageDeviceSet,
           0L,
           maximumStoreSize
         )

@@ -476,6 +476,7 @@ message StoragePoolState {
   int64 currentUsage = 7;
   int64 maximumStoreSize = 8;
   repeated UUID allocationGroups = 9;
+  UUID storageDeviceSet = 10;
 }
 
 enum AllocationGroupMemberType {
@@ -497,6 +498,16 @@ message AllocationGroupState {
   string name = 3;
   repeated AllocationGroupMember members = 4;
   repeated UUID parentGroups = 5;
+}
+
+message StorageDeviceSetState {
+  UUID setId = 1;
+  string name = 2;
+  int32 level = 3;
+  UUID parent = 4;                   // absent = no parent
+  repeated UUID memberDevices = 5;
+  repeated UUID memberSets = 6;
+  repeated UUID assignedPools = 7;
 }
 
 message HostState {
@@ -564,6 +575,7 @@ message StorageDeviceState {
   repeated StorageDeviceStoreKeyValue stores = 3;
   int64 current_usage = 4;
   int64 total_size = 5;
+  UUID storage_device_set = 6;
 }
 
 //---------------------------------------------------------------------------

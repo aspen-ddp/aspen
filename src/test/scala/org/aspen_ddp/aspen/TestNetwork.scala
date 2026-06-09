@@ -27,7 +27,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, MapBack
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 
 import java.nio.file.Path
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
@@ -105,6 +105,8 @@ object TestNetwork {
     def getStoragePoolId(poolName: String): Future[PoolId] = ???
     def getHostId(hostName: String): Future[HostId] = ???
     def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
+    def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] =
+      namespacedRegistry.getRegisteredObject("device-set", setName).map(StorageDeviceSetId(_))
 
     val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
     val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
@@ -113,6 +115,7 @@ object TestNetwork {
     val allocationGroupsTree = new MetadataTree(this, radicle, Radicle.AllocationGroupsTreeKey)
     val hostsTree = new MetadataTree(this, radicle, Radicle.HostsTreeKey)
     val storageDevicesTree = new MetadataTree(this, radicle, Radicle.StorageDevicesTreeKey)
+    val storageDeviceSetsTree = new MetadataTree(this, radicle, Radicle.StorageDeviceSetsTreeKey)
 
     private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
       storagePoolsTree.get(poolId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
@@ -125,6 +128,9 @@ object TestNetwork {
 
     override def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] =
       allocationGroupsTree.get(allocationGroupId.uuid).map(_.asInstanceOf[DataObjectPointer])
+
+    private[aspen] def getStorageDeviceSetPointer(storageDeviceSetId: StorageDeviceSetId): Future[DataObjectPointer] =
+      storageDeviceSetsTree.get(storageDeviceSetId.uuid).map(_.asInstanceOf[DataObjectPointer])
 
     override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
       val ags = AllocationGroupState(
@@ -146,6 +152,29 @@ object TestNetwork {
         _ <- tx.commit()
       yield
         ags.groupId
+
+    override def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId] =
+      val sds = StorageDeviceSetState(
+        StorageDeviceSetId(UUID.randomUUID()),
+        name,
+        level,
+        parent,
+        Nil,
+        Nil,
+        Nil
+      )
+
+      val tx = newTransaction()
+      given Transaction = tx
+
+      for
+        bsPool <- getStoragePool(PoolId.BootstrapPoolId)
+        ptr <- bsPool.allocator.allocateDataObject(DataBuffer(sds.toBytes))
+        _ <- storageDeviceSetsTree.preparePut(sds.setId.uuid, ptr)
+        _ <- namespacedRegistry.prepareRegisterObject("device-set", sds.name, sds.setId.uuid)
+        _ <- tx.commit()
+      yield
+        sds.setId
 
     protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
 
@@ -202,7 +231,8 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
       store0.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
       store1.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
       store2.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
-    )
+    ),
+    StorageDeviceSetId.BootstrapStorageDeviceSetId
   )
 
   val radicle: KeyValueObjectPointer = Bootstrap.initialize(

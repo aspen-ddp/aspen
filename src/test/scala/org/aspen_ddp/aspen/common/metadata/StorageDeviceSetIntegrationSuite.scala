@@ -1,0 +1,65 @@
+package org.aspen_ddp.aspen.common.metadata
+
+import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.internal.MetadataTree
+import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.objects.DataObjectPointer
+import org.aspen_ddp.aspen.common.pool.PoolId
+
+import scala.concurrent.ExecutionContext
+
+class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
+
+  atest("bootstrap creates the 'bootstrap' storage device set"):
+    given ExecutionContext = executionContext
+    val tree = new MetadataTree(client, radicle, Radicle.StorageDeviceSetsTreeKey)
+    for
+      ptr <- tree.get(StorageDeviceSetId.BootstrapStorageDeviceSetId.uuid)
+      dos <- client.read(ptr.asInstanceOf[DataObjectPointer])
+    yield
+      val sds = StorageDeviceSetState(dos)
+      sds.setId should be(StorageDeviceSetId.BootstrapStorageDeviceSetId)
+      sds.name should be("bootstrap")
+      sds.level should be(0)
+      sds.parent should be(None)
+      sds.memberDevices should contain(StorageDeviceId.BootstrapStorageDeviceId)
+      sds.memberSets should be(Nil)
+      sds.assignedPools should contain(PoolId.BootstrapPoolId)
+
+  atest("bootstrap pool and device reference the bootstrap set"):
+    given ExecutionContext = executionContext
+    for
+      ps <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      ds <- client.getStorageDeviceState(StorageDeviceId.BootstrapStorageDeviceId)
+    yield
+      ps.storageDeviceSet should be(StorageDeviceSetId.BootstrapStorageDeviceSetId)
+      ds.storageDeviceSet should be(StorageDeviceSetId.BootstrapStorageDeviceSetId)
+
+  atest("createStorageDeviceSet round-trips via the client"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("test-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      sds <- client.getStorageDeviceSetState(setId)
+    yield
+      sds.setId should be(setId)
+      sds.name should be("test-set")
+      sds.level should be(0)
+      sds.parent should be(None)
+      sds.memberDevices should be(Nil)
+      sds.memberSets should be(Nil)
+      sds.assignedPools should be(Nil)
+
+  atest("getStorageDeviceSetState reads the bootstrap set"):
+    given ExecutionContext = executionContext
+    client.getStorageDeviceSetState(StorageDeviceSetId.BootstrapStorageDeviceSetId).map: sds =>
+      sds.name should be("bootstrap")
+
+  atest("getStorageDeviceSetId resolves a created set by name"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("named-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      resolved <- client.getStorageDeviceSetId("named-set")
+    yield
+      resolved should be(setId)

@@ -1,6 +1,6 @@
 
-Add StorageDeviceSet as official top-level Metadata
-  - Hierarchical, similiar to AllocationGroups but for physical devices
+Add StorageDeviceSetState as official top-level Metadata
+  - Hierarchical, similiar to AllocationGroupState but for physical devices
     - Strict distinction between SetOfSets and SetOfDevices
     - Defined by Level. 0 = SetOfDevices, 1+ = SetOfSets
   - StorageDeviceSets can have zero or one parent set

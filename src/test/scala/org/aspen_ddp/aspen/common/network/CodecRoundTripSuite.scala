@@ -642,7 +642,8 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       Map(
         storeId(3) -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
         storeId(4) -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, Some(StorageDeviceId(uuid(5))))
-      )
+      ),
+      StorageDeviceSetId(uuid(6))
     )
     val decoded = Codec.decode(Codec.encode(original))
     decoded.storageDeviceId shouldBe original.storageDeviceId
@@ -650,6 +651,7 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.currentUsage shouldBe original.currentUsage
     decoded.totalSize shouldBe original.totalSize
     decoded.stores.size shouldBe 2
+    decoded.storageDeviceSet shouldBe original.storageDeviceSet
 
   test("SteppedDurableTaskState round-trip"):
     val step = 3

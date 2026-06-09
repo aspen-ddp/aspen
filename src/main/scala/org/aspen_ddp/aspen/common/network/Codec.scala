@@ -1201,7 +1201,8 @@ object Codec extends Logging:
         )
       }.toSeq,
       currentUsage = o.currentUsage,
-      totalSize = o.totalSize
+      totalSize = o.totalSize,
+      storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid))
     )
 
   def decode(m: codec.StorageDeviceState): StorageDeviceState =
@@ -1213,7 +1214,9 @@ object Codec extends Logging:
       storeId -> entry
     }.toMap
 
-    new StorageDeviceState(storageDeviceId, hostId, m.currentUsage, m.totalSize, stores)
+    val storageDeviceSet = StorageDeviceSetId(decodeUUID(m.storageDeviceSet.get))
+
+    new StorageDeviceState(storageDeviceId, hostId, m.currentUsage, m.totalSize, stores, storageDeviceSet)
 
   def encodeSteppedDurableTaskState(step: Int, state: Map[String, Array[Byte]]): Array[Byte] =
     codec.SteppedDurableTaskState(

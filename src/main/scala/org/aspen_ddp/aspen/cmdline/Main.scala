@@ -659,7 +659,8 @@ object Main {
       0L,
       bootstrapStores.map(backend =>
         backend.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
-      ).toMap
+      ).toMap,
+      StorageDeviceSetId.BootstrapStorageDeviceSetId
     )
 
     val bootstrapHost = HostState(

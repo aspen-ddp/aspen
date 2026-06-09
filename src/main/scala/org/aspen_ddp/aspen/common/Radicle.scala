@@ -22,5 +22,6 @@ object Radicle:
   private[aspen] val AllocationGroupsTreeKey = Key(Array[Byte](5))
   private[aspen] val HostsTreeKey = Key(Array[Byte](6))
   private[aspen] val StorageDevicesTreeKey = Key(Array[Byte](7))
+  private[aspen] val StorageDeviceSetsTreeKey = Key(Array[Byte](8))
 
 

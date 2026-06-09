@@ -238,6 +238,23 @@ into `Bootstrap.initialize`).
   currently has no in-tree callers — the cmdline `new-pool` is a WIP stub with
   creation commented out — so the signature change is safe.)
 
+**`src/test/scala/org/aspen_ddp/aspen/TestNetwork.scala` (`TClient`)** — this is a
+second concrete `AspenClient` implementation used by the test suite and must be
+updated in parallel, following its existing per-tree pattern:
+
+- Add `val storageDeviceSetsTree = new MetadataTree(this, radicle, Radicle.StorageDeviceSetsTreeKey)`
+  alongside the other tree fields.
+- Implement `getStorageDeviceSetPointer` (cast to `DataObjectPointer`) mirroring
+  `getAllocationGroupPointer`.
+- Implement `createStorageDeviceSet` mirroring `TClient.createAllocationGroup`
+  (which is fully implemented here: allocate DataObject, `preparePut` into the
+  tree, register the name).
+- Implement `getStorageDeviceSetId` as `???`, matching the existing
+  `getStoragePoolId` / `getAllocationGroupId` stubs in `TClient`.
+
+`getStorageDeviceSetState` is concrete on `AspenClient`, so `TClient` inherits it
+without change.
+
 ## Testing
 
 - **Bootstrap round-trip:** after bootstrap, the Radicle resolves

@@ -1,3 +1,24 @@
+Service Infrastructure
+  - Radicle has a Services TKVL
+  - Key = Service UUID
+  - Value = (hostId, leaseExpirationTimestamp, stateObjectPointer)
+  - All hosts poll the TKVL
+    - Read full content
+    - Look for expired leases
+    - Attempt to acquire a lease
+      - start service locally if successful
+  - Services
+    - Created through RegisteredTypeFactory
+    - Has start()/stop() methods
+      - Called on lease acquisition and loss
+    - backgroundTask to update the lease timestamp
+      - cache containing TKVL node
+        - Don't try to recover from split/join. Just let the lease time out
+      - retry with fixed backoff
+      - If no success before lease expiry, call stop() & cancel background task
+
+StorageDeviceManagementService
+  - Responsible for periodic balance, initiating set expansion, etc
 
 Set Expansion
   - Distinct from rebalancing

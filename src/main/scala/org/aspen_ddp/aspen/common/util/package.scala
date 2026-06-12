@@ -106,7 +106,7 @@ package object util {
     case Some(u) => u
 
   def atomicWrite(targetFile: Path, content: String): Unit =
-    // 1. Get the parent directory. 
+    // 1. Get the parent directory.
     // CRITICAL: The temp file MUST be on the same partition/volume as the target file,
     // otherwise a native atomic rename is physically impossible.
     val parentDir = Option(targetFile.getParent).getOrElse(Paths.get("."))
@@ -133,4 +133,31 @@ package object util {
         catch
           case cleanupEx: IOException => ex.addSuppressed(cleanupEx)
         throw ex
+
+  def runSequentially[A, B](items: Seq[A])(f: A => Future[B])(implicit ec: ExecutionContext): Future[Seq[B]] =
+    items.foldLeft(Future.successful(Vector.empty[B])): (accFuture, item) =>
+      accFuture.flatMap: accResults =>
+        // This body only executes after the previous Future finishes
+        f(item).map(result => accResults :+ result)
+
+  /** 
+   * This method ensures that repeated invocations of the supplied code block (such as a scheduled periodic task)
+   * will ignore redundant calls while the Future is outstanding. It's intent is to be used with schedulePeriodic
+   * to ensure that duplicate reads don't pile up during extended offline periods. An example is of a host polling
+   * the physical device state to look for new store creations or transfers. Without the use of this method, an
+   * offline period could result in hundreds of backed-up read operations.
+   *  */
+  def ignoreExtraCallsWhileRunning[T](fn: => Future[T])(implicit ec: ExecutionContext): () => Unit =
+    object tracker:
+      var running = false
+      def call(): Unit =
+        synchronized:
+          if !running then
+            running = true
+            fn.foreach: _ =>
+              synchronized:
+                running = false
+    tracker.call
+
+
 }

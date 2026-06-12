@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
-import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, ignoreExtraCallsWhileRunning, runSequentially}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler, RocksDBBackend, RocksDBConfig}
@@ -110,6 +110,7 @@ class StoreManager(val client: AspenClient,
   private var transferringInUUIDs: Map[UUID, TransferringIn] = Map()
   private var transferringInStoreIds: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
+  private var activeDeviceChecks: Set[StorageDeviceId] = Set()
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
   private val poolUsageManager = new StoragePoolUsageManager(client)
@@ -189,12 +190,20 @@ class StoreManager(val client: AspenClient,
 
   private def startUsageTracking(executor: TaskExecutor): Unit =
     poolUsageManager.setTaskExecutor(executor)
+
+    val execute = ignoreExtraCallsWhileRunning:
+      val (slist, dlist) =
+        synchronized:
+          (stores.valuesIterator.toList, storageDevices.valuesIterator.toList)
+      val fs = runSequentially(slist): store =>
+        poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
+      val fd = runSequentially(dlist): sds =>
+        deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
+
+      Future.sequence(List(fs, fd))
+
     usageUpdateTask = Some(backgroundTasks.schedulePeriodic(Duration(20, SECONDS)):
-      synchronized:
-        stores.valuesIterator.foreach: store =>
-          poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
-        storageDevices.valuesIterator.foreach: sds =>
-          deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
+      execute()
     )
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
@@ -491,7 +500,7 @@ class StoreManager(val client: AspenClient,
         // Check to ensure another concurrent call to this method didn't already
         // succeed
         if state.hostId != hostId then
-          logger.info(s"Updating hostState for storage device ${storageDeviceId}")
+          logger.info(s"Updating host for storage device ${storageDeviceId}")
 
           pools.foreach: ps =>
             updatePool(ps)
@@ -526,7 +535,7 @@ class StoreManager(val client: AspenClient,
             List(Insert(HostState.StateKey, updatedNewHostState.encode())))
 
           tx.result.foreach: _ =>
-            logger.info(s"Successfully updated hostState for storage device ${storageDeviceId}")
+            logger.info(s"Successfully updated host for storage device ${storageDeviceId}")
 
   private def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
     val storePath = os.Path(local.devicePath) / storeId.directoryName
@@ -568,7 +577,7 @@ class StoreManager(val client: AspenClient,
   }
 
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
-    def check(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit = synchronized {
+    def check(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit = {
       if remote.hostId != hostId then
         updateHostId(storageDeviceId).foreach: _ =>
           checkStorageDevice(storageDeviceId)
@@ -612,17 +621,26 @@ class StoreManager(val client: AspenClient,
               startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
     }
 
-    synchronized { storageDevices.get(storageDeviceId) } match
-      case Some(local) =>
-        client.getStorageDeviceState(storageDeviceId).foreach: remote =>
-          check(local, remote)
-      case None =>
-        // Find out what stores are on the offline/failed store and add them to our offlineStores
-        // set. We don't want to send "UnknownStore" responses while the device is down
-        client.getStorageDeviceState(storageDeviceId).foreach: remote =>
-          synchronized:
-            remote.stores.keysIterator.foreach: storeId =>
-              offlineStores += storeId
+    synchronized:
+      // Track which devices are currently being checked and skip the device if it is already in progress
+      // this protects against backups during offline periods
+      if ! activeDeviceChecks.contains(storageDeviceId) then
+        activeDeviceChecks += storageDeviceId
+
+        storageDevices.get(storageDeviceId) match
+          case Some(local) =>
+            client.getStorageDeviceState(storageDeviceId).foreach: remote =>
+              synchronized:
+                check(local, remote)
+                activeDeviceChecks -= storageDeviceId
+          case None =>
+            // Find out what stores are on the offline/failed store and add them to our offlineStores
+            // set. We don't want to send "UnknownStore" responses while the device is down
+            client.getStorageDeviceState(storageDeviceId).foreach: remote =>
+              synchronized:
+                remote.stores.keysIterator.foreach: storeId =>
+                  offlineStores += storeId
+                activeDeviceChecks -= storageDeviceId
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")

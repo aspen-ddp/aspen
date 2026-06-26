@@ -10,7 +10,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
-import scala.concurrent.{ExecutionContext, Promise}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 class ServiceEntrySpec extends AnyFunSuite with Matchers:
@@ -113,3 +113,26 @@ class DurableServiceSuite extends IntegrationTestSuite:
       val entry = ServiceEntry.decode(vs.get.value.bytes)
       entry.hostId shouldBe testHostId.uuid
       entry.leaseExpiry > HLCTimestamp.Zero shouldBe true
+
+  atest("executor renews lease before expiry"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val exec = makeExecutor()
+    val delayPromise = Promise[Unit]()
+    for
+      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _  <- claimedPromise.future                // wait for initial claim
+      v0 <- exec.servicesTkvl.get(Key(svcUUID)) // capture first TKVL entry
+      _  <- {                                    // non-blocking delay via background scheduler
+              client.backgroundTaskManager.schedule(Duration(300, MILLISECONDS)):
+                delayPromise.trySuccess(())
+              delayPromise.future
+            }
+      v1 <- exec.servicesTkvl.get(Key(svcUUID)) // check entry was updated
+    yield
+      exec.shutdown()
+      v0 shouldBe defined
+      v1 shouldBe defined
+      val e0 = ServiceEntry.decode(v0.get.value.bytes)
+      val e1 = ServiceEntry.decode(v1.get.value.bytes)
+      e1.leaseExpiry > e0.leaseExpiry shouldBe true

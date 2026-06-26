@@ -114,7 +114,38 @@ class SimpleDurableServiceExecutor(
     backgroundTasks.schedulePeriodic(renewalInterval):
       doRenewal(serviceUUID)
 
-  protected def doRenewal(serviceUUID: UUID): Unit = ()  // implementation added in Task 7
+  protected def doRenewal(serviceUUID: UUID): Unit =
+    val serviceKey = Key(serviceUUID)
+
+    def attempt(): Unit =
+      servicesTkvl.get(serviceKey).foreach:
+        case None =>
+          // Service was unregistered; scan will detect and clean up ownedServices
+          ()
+        case Some(vs) =>
+          val entry = ServiceEntry.decode(vs.value.bytes)
+          val now   = HLCTimestamp.now
+
+          if entry.hostId != hostId.uuid then
+            handleLeaseLoss(serviceUUID)
+          else if entry.leaseExpiry < now then
+            handleLeaseLoss(serviceUUID)
+          else
+            val newExpiry = HLCTimestamp(now.asLong + (leaseDuration.toMillis << 16))
+            val newEntry  = entry.copy(leaseExpiry = newExpiry)
+            client.transact: tx =>
+              given Transaction = tx
+              servicesTkvl.set(serviceKey, Value(newEntry.encode()), Some(Right(vs.revision)))(using tx)
+            .failed.foreach: _ =>
+              attempt()  // retry from a fresh read to pick up any ownership changes
+
+    attempt()
+
+  private def handleLeaseLoss(serviceUUID: UUID): Unit = synchronized:
+    ownedServices.get(serviceUUID).foreach: (service, timer) =>
+      timer.cancel()
+      service.shutdown()
+    ownedServices -= serviceUUID
 
   override def registerService(
     typeUUID: UUID,

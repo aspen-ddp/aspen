@@ -105,6 +105,10 @@ object BackgroundTaskManager:
   trait ScheduledTask:
     def cancel(): Unit
 
+  // Sentinel for "no task scheduled yet". cancel() is a no-op.
+  object NoTask extends ScheduledTask:
+    def cancel(): Unit = ()
+
   // Not much we can do if the scheduler has been shut down. Most likely the client
   // has been shut down and background finalization tasks are continuing to retry.
   // This object will be returned by the schedule* methods which should allow for

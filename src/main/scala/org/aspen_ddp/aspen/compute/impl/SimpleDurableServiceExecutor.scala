@@ -36,6 +36,8 @@ class SimpleDurableServiceExecutor(
   // One-shot task for the next scan (rescheduled after each scan completes)
   private var scanTask: ScheduledTask = NoTask
 
+  @volatile private var isShutdown = false
+
   val servicesTkvl: TieredKeyValueList =
     TieredKeyValueList(client, KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
 
@@ -44,6 +46,7 @@ class SimpleDurableServiceExecutor(
 
   /** Cancels all timers and shuts down all owned services. */
   def shutdown(): Unit = synchronized:
+    isShutdown = true
     scanTask.cancel()
     ownedServices.foreach: (_, pair) =>
       val (service, renewalTimer) = pair
@@ -113,12 +116,17 @@ class SimpleDurableServiceExecutor(
           given Transaction = tx
           servicesTkvl.set(serviceKey, Value(newEntry.encode()), Some(Right(oldRevision)))(using tx)
         .foreach: _ =>
-          client.read(statePointer).foreach: state =>
-            val svcUUID = byte2uuid(serviceKey.bytes)
-            val service = factory.createService(client, statePointer, state)
-            val timer   = startRenewalTimer(svcUUID)
-            synchronized:
-              ownedServices += svcUUID -> (service, timer)
+          if !isShutdown then
+            client.read(statePointer).foreach: state =>
+              val svcUUID = byte2uuid(serviceKey.bytes)
+              val service = factory.createService(client, statePointer, state)
+              val timer   = startRenewalTimer(svcUUID)
+              synchronized:
+                if !isShutdown then
+                  ownedServices += svcUUID -> (service, timer)
+                else
+                  timer.cancel()
+                  service.shutdown()
 
   protected def startRenewalTimer(serviceUUID: UUID): ScheduledTask =
     backgroundTasks.schedulePeriodic(renewalInterval):
@@ -190,8 +198,11 @@ class SimpleDurableServiceExecutor(
 
     servicesTkvl.get(serviceKey).flatMap:
       case None => Future.unit  // already gone
-      case Some(_) =>
-        client.retryStrategy.retryUntilSuccessful:
-          client.transact: tx =>
-            given Transaction = tx
-            servicesTkvl.delete(serviceKey)(using tx)
+      case Some(vs) =>
+        val entry = ServiceEntry.decode(vs.value.bytes)
+        client.read(entry.statePointer).flatMap: stateKvos =>
+          client.retryStrategy.retryUntilSuccessful:
+            client.transact: tx =>
+              given Transaction = tx
+              for _ <- servicesTkvl.delete(serviceKey)(using tx) yield
+                tx.setRefcount(entry.statePointer, stateKvos.refcount, stateKvos.refcount.decrement())

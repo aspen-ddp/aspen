@@ -21,7 +21,7 @@ import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, R
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.compute.TaskExecutor
+import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTaskExecutor}
 import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
 import org.aspen_ddp.aspen.server.usage.StorageDeviceUsageManager
@@ -213,7 +213,7 @@ class StoreManager(val client: AspenClient,
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
 
-  def getServiceExecutor(): Future[SimpleDurableServiceExecutor] = serviceExecutorPromise.future
+  def getServiceExecutor(): Future[DurableServiceExecutor] = serviceExecutorPromise.future
 
   private def tryLoadDevice(sdFile: File): Unit =
     val storageDevicePath = sdFile.toPath

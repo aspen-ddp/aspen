@@ -21,6 +21,7 @@ class ServiceEntrySpec extends AnyFunSuite with Matchers:
     decoded.leaseExpiry shouldBe leaseExpiry
     decoded.statePointer.id shouldBe statePointer.id
     decoded.statePointer.poolId shouldBe statePointer.poolId
+    decoded.isClaimed shouldBe true
 
   test("ServiceEntry zero hostId represents unclaimed"):
     val entry = ServiceEntry(UUID.randomUUID(), new UUID(0, 0), HLCTimestamp.Zero,
@@ -28,3 +29,4 @@ class ServiceEntrySpec extends AnyFunSuite with Matchers:
     val decoded = ServiceEntry.decode(entry.encode())
     decoded.hostId shouldBe new UUID(0, 0)
     decoded.leaseExpiry shouldBe HLCTimestamp.Zero
+    decoded.isClaimed shouldBe false

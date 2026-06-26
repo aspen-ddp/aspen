@@ -16,7 +16,12 @@ object ServiceEntry:
     val leaseExpiry = HLCTimestamp(bb.getLong())
     val ptrBytes = new Array[Byte](bb.remaining())
     bb.get(ptrBytes)
-    ServiceEntry(typeUUID, hostId, leaseExpiry, ObjectPointer(ptrBytes).asInstanceOf[KeyValueObjectPointer])
+    ObjectPointer(ptrBytes) match
+      case p: KeyValueObjectPointer =>
+        ServiceEntry(typeUUID, hostId, leaseExpiry, p)
+      case other =>
+        throw new IllegalArgumentException(
+          s"ServiceEntry statePointer must be KeyValueObjectPointer, got ${other.objectType}")
 
 final case class ServiceEntry(
   typeUUID: UUID,

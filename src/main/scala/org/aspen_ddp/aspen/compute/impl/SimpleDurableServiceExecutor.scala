@@ -65,7 +65,17 @@ class SimpleDurableServiceExecutor(
       entries += ((key, ServiceEntry.decode(vs.value.bytes), vs.revision))
       Future.unit
     .map: _ =>
+      val tkvlUUIDs   = entries.map((key, _, _) => byte2uuid(key.bytes)).toSet
       val currentOwned = synchronized { ownedServices.keySet.toSet }
+
+      // Unregistration check: shutdown any owned service that disappeared from the TKVL
+      synchronized:
+        val removed = currentOwned.filter(svcUUID => !tkvlUUIDs.contains(svcUUID))
+        removed.foreach: svcUUID =>
+          ownedServices.get(svcUUID).foreach: (service, timer) =>
+            timer.cancel()
+            service.shutdown()
+          ownedServices -= svcUUID
 
       val candidates = entries.filter: (key, entry, _) =>
         val svcUUID = byte2uuid(key.bytes)

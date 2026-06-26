@@ -178,4 +178,20 @@ class SimpleDurableServiceExecutor(
               _         <- servicesTkvl.set(serviceKey, Value(entry.encode()), Some(Left(true)))
             yield ()
 
-  override def unregisterService(serviceUUID: UUID): Future[Unit] = Future.unit  // implementation added in Task 9
+  override def unregisterService(serviceUUID: UUID): Future[Unit] =
+    // If this host owns the service, shut it down immediately (before the transaction)
+    synchronized:
+      ownedServices.get(serviceUUID).foreach: (service, timer) =>
+        timer.cancel()
+        service.shutdown()
+      ownedServices -= serviceUUID
+
+    val serviceKey = Key(serviceUUID)
+
+    servicesTkvl.get(serviceKey).flatMap:
+      case None => Future.unit  // already gone
+      case Some(_) =>
+        client.retryStrategy.retryUntilSuccessful:
+          client.transact: tx =>
+            given Transaction = tx
+            servicesTkvl.delete(serviceKey)(using tx)

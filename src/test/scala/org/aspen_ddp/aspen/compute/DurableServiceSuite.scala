@@ -177,3 +177,38 @@ class DurableServiceSuite extends IntegrationTestSuite:
     yield
       exec.shutdown()
       succeed
+
+  atest("unregisterService removes TKVL entry and shuts down owned service"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val exec    = makeExecutor()
+    for
+      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _  <- claimedPromise.future         // wait for service to be claimed
+      _  <- exec.unregisterService(svcUUID)
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+      _  <- shutdownPromise.future        // verify shutdown() was called
+    yield
+      exec.shutdown()
+      vs shouldBe None
+
+  atest("unregisterService on unowned service just removes TKVL entry"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val exec    = makeExecutor()
+    // Use a typeUUID that has no registered factory — entry stays unclaimed
+    val unknownTypeUUID = UUID.fromString("ffffffff-ffff-ffff-ffff-ffffffffffff")
+    val delayPromise = Promise[Unit]()
+    for
+      _ <- exec.registerService(unknownTypeUUID, svcUUID, Map.empty)
+      _ <- {
+        // Wait long enough for a scan to run and fail to find a factory
+        exec.backgroundTasks.schedule(Duration(200, MILLISECONDS)):
+          delayPromise.trySuccess(())
+        delayPromise.future
+      }
+      _ <- exec.unregisterService(svcUUID)
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+    yield
+      exec.shutdown()
+      vs shouldBe None

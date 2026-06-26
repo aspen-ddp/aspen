@@ -23,5 +23,6 @@ object Radicle:
   private[aspen] val HostsTreeKey = Key(Array[Byte](6))
   private[aspen] val StorageDevicesTreeKey = Key(Array[Byte](7))
   private[aspen] val StorageDeviceSetsTreeKey = Key(Array[Byte](8))
+  private[aspen] val ServicesTreeKey = Key(Array[Byte](9))
 
 

@@ -176,6 +176,8 @@ object Bootstrap:
       Key(StorageDeviceSetId.BootstrapStorageDeviceSetId.uuid) -> storageDeviceSetPtr.toArray
     )
 
+    val servicesTree = allocateTree(ByteArrayKeyOrdering)
+
     val radicleContent: List[(Key, Array[Byte])] = List(
       Radicle.BootstrapConfigKey -> bootstrapConfig.getBytes(StandardCharsets.UTF_8),
       Radicle.SystemIdKey -> uuid2byte(aspenSystemId),
@@ -186,6 +188,7 @@ object Bootstrap:
       Radicle.HostsTreeKey -> hostsTree.encode(),
       Radicle.StorageDevicesTreeKey -> storageDevicesTree.encode(),
       Radicle.StorageDeviceSetsTreeKey -> storageDeviceSetsTree.encode(),
+      Radicle.ServicesTreeKey -> servicesTree.encode(),
     )
  
     val radicle = allocate(radicleContent, Some(Radicle.objectId))

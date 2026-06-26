@@ -5,10 +5,10 @@ import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
-import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
-import org.aspen_ddp.aspen.common.util.ignoreExtraCallsWhileRunning
+import org.aspen_ddp.aspen.common.util.{byte2uuid, ignoreExtraCallsWhileRunning}
 import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceExecutor, DurableServiceFactory, ServiceEntry}
 
 import java.util.UUID
@@ -58,7 +58,57 @@ class SimpleDurableServiceExecutor(
       scanTask = backgroundTasks.schedule(Duration(delayMillis, MILLISECONDS)):
         doScan()
 
-  protected def doScan(): Unit = ()  // implementation added in Task 6
+  private val scanFn: () => Unit = ignoreExtraCallsWhileRunning:
+    val entries = ListBuffer[(Key, ServiceEntry, ObjectRevision)]()
+
+    servicesTkvl.foreach: (_, key, vs) =>
+      entries += ((key, ServiceEntry.decode(vs.value.bytes), vs.revision))
+      Future.unit
+    .map: _ =>
+      val currentOwned = synchronized { ownedServices.keySet.toSet }
+
+      val candidates = entries.filter: (key, entry, _) =>
+        val svcUUID = byte2uuid(key.bytes)
+        (!entry.isClaimed || entry.isExpired) && !currentOwned.contains(svcUUID)
+
+      candidates.foreach: (key, entry, revision) =>
+        val delay =
+          val n = synchronized(ownedServices.size)
+          if n == 0 || claimDelayPerService == Duration.Zero then Duration.Zero
+          else Duration(ThreadLocalRandom.current().nextLong(n * claimDelayPerService.toMillis), MILLISECONDS)
+        backgroundTasks.schedule(delay):
+          attemptClaim(key, entry.typeUUID, entry.statePointer, revision)
+
+      scheduleScan()
+
+  protected def doScan(): Unit = scanFn()
+
+  private def attemptClaim(
+    serviceKey: Key,
+    typeUUID: UUID,
+    statePointer: KeyValueObjectPointer,
+    oldRevision: ObjectRevision
+  ): Unit =
+    client.typeRegistry.getType[DurableServiceFactory](typeUUID) match
+      case None =>
+        // No factory registered for this type on this host — skip silently
+        ()
+      case Some(factory) =>
+        val newExpiry = HLCTimestamp(HLCTimestamp.now.asLong + (leaseDuration.toMillis << 16))
+        val newEntry  = ServiceEntry(typeUUID, hostId.uuid, newExpiry, statePointer)
+        // Single attempt: if another host has already claimed, the revision check will
+        // reject the transaction and we simply drop this attempt. The next scan cycle
+        // will detect whoever won.
+        client.transact: tx =>
+          given Transaction = tx
+          servicesTkvl.set(serviceKey, Value(newEntry.encode()), Some(Right(oldRevision)))(using tx)
+        .foreach: _ =>
+          client.read(statePointer).foreach: state =>
+            val svcUUID = byte2uuid(serviceKey.bytes)
+            val service = factory.createService(client, statePointer, state)
+            val timer   = startRenewalTimer(svcUUID)
+            synchronized:
+              ownedServices += svcUUID -> (service, timer)
 
   protected def startRenewalTimer(serviceUUID: UUID): ScheduledTask =
     backgroundTasks.schedulePeriodic(renewalInterval):

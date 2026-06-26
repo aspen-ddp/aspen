@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.compute
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, RegisteredTypeFactory}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, Value}
@@ -9,7 +10,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 class ServiceEntrySpec extends AnyFunSuite with Matchers:
@@ -40,6 +41,24 @@ class ServiceEntrySpec extends AnyFunSuite with Matchers:
 class DurableServiceSuite extends IntegrationTestSuite:
 
   val testHostId: HostId = HostId(UUID.fromString("00000000-0000-0000-0000-000000000001"))
+
+  // Fixed typeUUID so the same factory object is always registered
+  val fixedTypeUUID: UUID = UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001")
+
+  // Per-test promise; reset in subFixtureSetup
+  private var claimedPromise: Promise[Unit] = scala.compiletime.uninitialized
+
+  // Stable factory object — captures claimedPromise by reference (reads it at call time)
+  private val stableFactory: DurableServiceFactory = new DurableServiceFactory:
+    val typeUUID: UUID = fixedTypeUUID
+    def createService(c: AspenClient, ptr: KeyValueObjectPointer, state: KeyValueObjectState): DurableService =
+      claimedPromise.trySuccess(())
+      new DurableService { def shutdown(): Unit = () }
+
+  override def userTypeFactories: List[RegisteredTypeFactory] = List(stableFactory)
+
+  override def subFixtureSetup(): Unit =
+    claimedPromise = Promise[Unit]()
 
   def makeExecutor(): SimpleDurableServiceExecutor =
     new SimpleDurableServiceExecutor(
@@ -79,3 +98,18 @@ class DurableServiceSuite extends IntegrationTestSuite:
     yield
       exec.shutdown()
       vs shouldBe defined
+
+  atest("executor claims an unclaimed service on scan"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val exec = makeExecutor()
+    for
+      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _  <- claimedPromise.future
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+    yield
+      exec.shutdown()
+      vs shouldBe defined
+      val entry = ServiceEntry.decode(vs.get.value.bytes)
+      entry.hostId shouldBe testHostId.uuid
+      entry.leaseExpiry > HLCTimestamp.Zero shouldBe true

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen
 import java.util.UUID
 import org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.internal.{MetadataTree, ObjectAllocatorManager, OpportunisticRebuildManager}
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RegisteredTypeFactory, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.client.internal.read.{BaseReadDriver, ReadManager}
@@ -63,7 +63,8 @@ object TestNetwork {
   class TClient(executionContext: ExecutionContext,
                 msngr: ClientMessenger,
                 val radicle: KeyValueObjectPointer,
-                ida: IDA) extends AspenClient {
+                ida: IDA,
+                userTypeFactories: List[RegisteredTypeFactory] = Nil) extends AspenClient {
 
     given ExecutionContext = executionContext
 
@@ -76,7 +77,8 @@ object TestNetwork {
     val typeRegistry: TypeRegistry = TypeRegistry(
       org.aspen_ddp.aspen.common.TypeFactories.factories,
       org.aspen_ddp.aspen.client.TypeFactories.factories,
-      org.aspen_ddp.aspen.server.TypeFactories.factories
+      org.aspen_ddp.aspen.server.TypeFactories.factories,
+      userTypeFactories
     )
 
     val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
@@ -215,7 +217,8 @@ object TestNetwork {
 }
 
 
-class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
+class TestNetwork(executionContext: ExecutionContext,
+                  userTypeFactories: List[RegisteredTypeFactory] = Nil) extends ServerMessenger {
   import TestNetwork._
 
   val objectCacheFactory: () => SimpleLRUObjectCache = () => new SimpleLRUObjectCache(1000)
@@ -288,7 +291,7 @@ class TestNetwork(executionContext: ExecutionContext) extends ServerMessenger {
     def dropCacheForStore(storeId: StoreId): Unit = ()
   }
 
-  val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida)
+  val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories)
   FinalizerFactory.client = client
 
   val smgr = new StoreManager(

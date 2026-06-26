@@ -22,7 +22,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyR
 import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.compute.TaskExecutor
-import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
+import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTaskExecutor}
 import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
 import org.aspen_ddp.aspen.server.usage.StorageDeviceUsageManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
@@ -113,6 +113,7 @@ class StoreManager(val client: AspenClient,
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
+  private val serviceExecutorPromise: Promise[SimpleDurableServiceExecutor] = Promise()
   private val poolUsageManager = new StoragePoolUsageManager(client)
   private val deviceUsageManager = new StorageDeviceUsageManager(client)
   private var usageUpdateTask: Option[ScheduledTask] = None
@@ -163,6 +164,8 @@ class StoreManager(val client: AspenClient,
                   synchronized:
                     taskExecutorPromise.success(executor)
                     startUsageTracking(executor)
+                    val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
+                    serviceExecutorPromise.success(serviceExec)
 
             case None =>
               client.getStoragePool(Radicle.poolId).foreach: pool =>
@@ -183,6 +186,8 @@ class StoreManager(val client: AspenClient,
                     synchronized:
                       taskExecutorPromise.success(executor)
                       startUsageTracking(executor)
+                      val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
+                      serviceExecutorPromise.success(serviceExec)
 
       case Failure(err) =>
         // In test environments or when host is not yet registered, silently skip initialization
@@ -207,6 +212,8 @@ class StoreManager(val client: AspenClient,
     )
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
+
+  def getServiceExecutor(): Future[SimpleDurableServiceExecutor] = serviceExecutorPromise.future
 
   private def tryLoadDevice(sdFile: File): Unit =
     val storageDevicePath = sdFile.toPath
@@ -684,6 +691,7 @@ class StoreManager(val client: AspenClient,
 
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     events.put(Exit())
+    serviceExecutorPromise.future.foreach(_.shutdown())
     pendingStartTask.cancel()
     heartbeatTask.cancel()
     checkStorageDeviceTask.cancel()

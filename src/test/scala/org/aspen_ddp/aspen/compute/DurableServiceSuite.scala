@@ -1,11 +1,16 @@
 package org.aspen_ddp.aspen.compute
 
+import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer
+import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.compute.impl.SimpleDurableServiceExecutor
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
+import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 class ServiceEntrySpec extends AnyFunSuite with Matchers:
 
@@ -30,3 +35,47 @@ class ServiceEntrySpec extends AnyFunSuite with Matchers:
     decoded.hostId shouldBe new UUID(0, 0)
     decoded.leaseExpiry shouldBe HLCTimestamp.Zero
     decoded.isClaimed shouldBe false
+
+
+class DurableServiceSuite extends IntegrationTestSuite:
+
+  val testHostId: HostId = HostId(UUID.fromString("00000000-0000-0000-0000-000000000001"))
+
+  def makeExecutor(): SimpleDurableServiceExecutor =
+    new SimpleDurableServiceExecutor(
+      client, testHostId, client.backgroundTaskManager,
+      leaseDuration        = Duration(200, MILLISECONDS),
+      renewalInterval      = Duration(50, MILLISECONDS),
+      minScanInterval      = Duration(50, MILLISECONDS),
+      maxScanInterval      = Duration(100, MILLISECONDS),
+      claimDelayPerService = Duration(0, MILLISECONDS)
+    )
+
+  atest("registerService creates a claimable TKVL entry"):
+    given ExecutionContext = executionContext
+    val exec = makeExecutor()
+    val typeUUID = UUID.randomUUID()
+    val svcUUID  = UUID.randomUUID()
+    for
+      _ <- exec.registerService(typeUUID, svcUUID, Map.empty)
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+    yield
+      exec.shutdown()
+      vs shouldBe defined
+      val entry = ServiceEntry.decode(vs.get.value.bytes)
+      entry.typeUUID shouldBe typeUUID
+      entry.hostId shouldBe ServiceEntry.UnclaimedHostId
+      entry.leaseExpiry shouldBe HLCTimestamp.Zero
+
+  atest("registerService is idempotent"):
+    given ExecutionContext = executionContext
+    val exec = makeExecutor()
+    val typeUUID = UUID.randomUUID()
+    val svcUUID  = UUID.randomUUID()
+    for
+      _ <- exec.registerService(typeUUID, svcUUID, Map.empty)
+      _ <- exec.registerService(typeUUID, svcUUID, Map.empty)
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+    yield
+      exec.shutdown()
+      vs shouldBe defined

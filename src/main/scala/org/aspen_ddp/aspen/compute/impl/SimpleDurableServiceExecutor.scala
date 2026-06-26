@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.compute.impl
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
@@ -69,6 +70,21 @@ class SimpleDurableServiceExecutor(
     typeUUID: UUID,
     serviceUUID: UUID,
     initialState: Map[Key, Array[Byte]]
-  ): Future[Unit] = Future.unit  // implementation added in Task 5
+  ): Future[Unit] =
+    val serviceKey = Key(serviceUUID)
+
+    client.retryStrategy.retryUntilSuccessful:
+      servicesTkvl.get(serviceKey).flatMap:
+        case Some(_) => Future.unit  // already registered — idempotent
+        case None =>
+          client.transact: tx =>
+            given Transaction = tx
+            for
+              pool      <- client.getStoragePool(Radicle.poolId)
+              allocator  = new PoolObjectAllocator(client, pool)
+              statePtr  <- allocator.allocateKeyValueObject(initialState.map((k, v) => k -> Value(v)))
+              entry      = ServiceEntry(typeUUID, ServiceEntry.UnclaimedHostId, HLCTimestamp.Zero, statePtr)
+              _         <- servicesTkvl.set(serviceKey, Value(entry.encode()), Some(Left(true)))
+            yield ()
 
   override def unregisterService(serviceUUID: UUID): Future[Unit] = Future.unit  // implementation added in Task 9

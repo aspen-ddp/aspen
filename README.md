@@ -17,6 +17,10 @@ completely different approach to the distributed data management problem and pro
 developers with a new set of tools for taking distributed system designs in directions that
 were not previously possible.
 
+In short: it's the storage substrate for distributed systems — you build distributed data 
+structures out of transactionally-updated, location-encoded objects, and Aspen handles consensus,
+dispersal, durability, and crash recovery underneath.
+
 ## Why Aspen?
 Aspen emphasizes flexibility for both application design and run time operation. It provides
 distributed system designers with a completely different set of capabilities for building

@@ -70,7 +70,7 @@ The public interface for registering and unregistering services.
 
 ```scala
 trait DurableServiceExecutor:
-  def registerService(typeUUID: UUID, serviceUUID: UUID, initialState: Array[Byte]): Future[Unit]
+  def registerService(typeUUID: UUID, serviceUUID: UUID, initialState: Map[Key, Array[Byte]]): Future[Unit]
   def unregisterService(serviceUUID: UUID): Future[Unit]
 ```
 
@@ -213,7 +213,7 @@ cancels all active timers and calls `service.shutdown()` on all currently-owned 
 Idempotent. Checks the TKVL for the given `serviceUUID` first. If already present, returns without
 modification. Otherwise, in a single transaction:
 
-1. Allocates a new KVO containing `initialState`.
+1. Allocates a new KVO with the key-value pairs from `initialState`.
 2. Writes a TKVL entry with `typeUUID`, `hostId = zero UUID`, `leaseExpiry = epoch 0`, and
    `stateObjectPointer` pointing to the new KVO.
 

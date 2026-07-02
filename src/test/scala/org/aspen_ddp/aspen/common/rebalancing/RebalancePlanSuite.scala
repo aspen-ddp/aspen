@@ -135,7 +135,8 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
 
   test("priority: balance prefers a store whose move does not co-locate"):
     // dev1 (host1) is full with a pool-1 and a pool-2 store; dev2 (host2) already holds pool 1.
-    // Balancing must move the pool-2 store (safe), never the pool-1 store (would co-locate on dev2).
+    // Balancing must move the pool-2 store (safe), never the pool-1 store (would co-locate on dev2,
+    // violating reliability constraints even in the balance phase).
     val st = planState(
       device(1, 1, 90, 100, store(1, 0, 50), store(2, 0, 40)),
       device(2, 2, 10, 100, store(1, 1, 10)))
@@ -158,10 +159,13 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
         device(2, 2, 0, 100)))                                          // balance
     for st <- scenarios do
       val plan = Plan.computePlan(st)
-      plan should not be empty
+      plan should have size 1   // each scenario triggers exactly one corrective move
       Plan.computePlan(applyPlan(st, plan)) shouldBe Nil
 
-  test("deterministic: identical output regardless of device insertion order"):
+  test("deterministic: input Map ordering does not change the plan"):
+    // Devices are keyed in a Map, so insertion order should be irrelevant; internal iteration is
+    // sorted by device uuid. Assert a concrete expected plan so a regression cannot pass vacuously.
+    val expected = List(Plan.Transfer(sid(1, 0), devId(1), devId(2)))
     val a = planState(
       device(1, 1, 80, 100, store(1, 0, 40)),
       device(2, 2, 0, 100),
@@ -170,7 +174,8 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
       device(3, 3, 0, 100),
       device(2, 2, 0, 100),
       device(1, 1, 80, 100, store(1, 0, 40)))
-    Plan.computePlan(a) shouldBe Plan.computePlan(b)
+    Plan.computePlan(a) shouldBe expected
+    Plan.computePlan(b) shouldBe expected
 
   test("deterministic: repeated calls produce the same plan"):
     val st = planState(

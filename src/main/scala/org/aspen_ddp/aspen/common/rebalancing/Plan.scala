@@ -119,22 +119,24 @@ object Plan:
           }
 
   private def availabilityRepair(w: Working): Unit =
+    // Terminates: each accepted move strictly reduces the max same-pool-per-host count, which is bounded.
     var progress = true
     while progress do
       progress = false
       val hosts = w.deviceIds.map(w.deviceHost).distinct.sortBy(_.uuid.toString)
       for host <- hosts do
         val hostDevices = w.deviceIds.filter(d => w.deviceHost(d) == host)
+        val hostStores = hostDevices.flatMap(w.storesOn)
         val poolCounts: Seq[(PoolId, Int)] =
-          hostDevices.flatMap(w.storesOn).groupBy(_.poolId).map((p, ss) => p -> ss.size)
+          hostStores.groupBy(_.poolId).map((p, ss) => p -> ss.size)
             .toSeq.sortBy(_._1.uuid.toString)
         for (pool, count) <- poolCounts if count >= 2 do
           val candidate: Option[StoreId] =
-            hostDevices.flatMap(w.storesOn)
+            hostStores
               .filter(s => s.poolId == pool && w.movable(s))
               .sortBy(_.poolIndex).headOption
           candidate.foreach { s =>
-            // different host, physically fits, and no device-level co-location (reliability safe)
+            // different host, physically fits, and no device-level co-location (reliability preserved)
             val dest: Option[StorageDeviceId] =
               w.deviceIds
                 .filter(d => w.deviceHost(d) != host && w.fits(d, s) && w.samePoolOnDevice(d, pool) == 0)

@@ -190,11 +190,13 @@ import scala.concurrent.{ExecutionContext, Future}
 
 object State:
   /** Default cap on the number of concurrent metadata reads issued while gathering planning state.
-   *  Bounds load on large systems with many devices and pools. */
+   * Bounds load on large systems with many devices and pools. */
   val DefaultMaxConcurrentReads: Int = 20
 
   case class Store(storeId: StoreId, currentSize: Long, status: StorageDeviceState.StoreStatus)
+
   case class Pool(poolId: PoolId, ida: IDA, stores: Map[StoreId, Store])
+
   case class Device(deviceId: StorageDeviceId,
                     currentUsage: Long,
                     totalSize: Long,
@@ -203,17 +205,17 @@ object State:
   case class PlanState(devices: Map[StorageDeviceId, Device], pools: Map[PoolId, Pool])
 
   /** Gather the device and pool state needed to compute a rebalancing plan for a level-0
-   *  (leaf) storage device set.
+   * (leaf) storage device set.
    *
-   *  Only level-0 sets are supported; a higher-level set fails with IllegalArgumentException.
-   *  An empty level-0 set yields an empty PlanState.
+   * Only level-0 sets are supported; a higher-level set fails with IllegalArgumentException.
+   * An empty level-0 set yields an empty PlanState.
    *
-   *  Reads are issued with at most `maxConcurrentReads` in flight at a time (see runBoundedParallel)
-   *  to bound load on large systems.
+   * Reads are issued with at most `maxConcurrentReads` in flight at a time (see runBoundedParallel)
+   * to bound load on large systems.
    */
   def getStateForRebalancePlanning(client: AspenClient,
                                    storageDeviceSet: StorageDeviceSetState,
-                                   maxConcurrentReads: Int = DefaultMaxConcurrentReads): Future[PlanState] =
+                                   maxConcurrentReads: Int = DefaultMaxConcurrentReads): Future[PlanningState] =
     given ExecutionContext = client.clientContext
 
     if storageDeviceSet.level != 0 then
@@ -231,14 +233,14 @@ object State:
 
       for
         deviceStates <- runBoundedParallel(storageDeviceSet.memberDevices, maxConcurrentReads)(
-                          client.getStorageDeviceState)
+          client.getStorageDeviceState)
 
         poolIds = deviceStates.flatMap(ds => ownedStores(ds).keys).map(_.poolId).toSet
 
         poolPairs <- runBoundedParallel(poolIds.toSeq, maxConcurrentReads): poolId =>
-                       client.getStoragePoolPointer(poolId)
-                         .flatMap(client.read)
-                         .map(kvos => poolId -> kvos)
+          client.getStoragePoolPointer(poolId)
+            .flatMap(client.read)
+            .map(kvos => poolId -> kvos)
       yield
         val poolKvos = poolPairs.toMap
 
@@ -267,7 +269,7 @@ object State:
             poolId -> Pool(poolId, ida, poolStores)
           .toMap
 
-        PlanState(devices, pools)
+        PlanningState(devices, pools)
 ```
 
 - [ ] **Step 2: Compile to verify it builds**

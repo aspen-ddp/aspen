@@ -1,62 +1,45 @@
 
+Make util.ignoreExtraCallsWhileRunning a first-class citizen
+  - Add method: AspenClient.addPollingOperation(fn: () => Future[Unit], duration, callNow): ScheduledTask
+    - Implemented in terms of BackgroundTaskManager
+    - Uses ignoreExtraCallsWhileRunning to safely call the function
+  - Provides a simple and consistent interface for all poll-based mechanisms to use
+
+Service Infrastructure
+  - Service Messages
+    - ServiceMessage(hostId: HostId, serviceUUID: UUID, contents: Array[Byte])
+    - DurableService has method: messageReceived(encodedMessage: Array[Byte]): Unit
+    - Lookup hostId currently owning the service, send message
+  - Extend DurableTask to be stoppable
+    - Allows cancellation of logic/retry logic if a lease is lost
+    - Optional
+      - Not needed for AmoebaFS as task is currently tied to the NFS-implementation host
+      - Can always extend this in the future to a
+    - Has final stop() method
+      - Called on lease loss & clean shutdown during unit testing
+      - unregisters background task used to update the lease timestamp
+      - Sets @volatile var isStopped: Boolean to true
+        - for use in async retry loops to detect that retries should be stopped
+      - calls def onStop(): Unit method to allow subclass to take action
+
 Rebalancing
   - Split into two phases: Planning & Execution
   - Planning phase takes current state of all devices in set and makes a full transfer plan
-    - Write plan to SetStateObject
-      - Can take reliability & current store sizes into account
-      - Done in single pass
-      - Testable
-    - Needs to be stable
-      - Once complete, a subequent run must return no-action plan
-        - no flapping
-  - Execution phase is a ServiceTask that
-    - Reads plan & moves one store at a time
-      - Can parallelize later
+    - Add varaible to StorageDeviceSetState
+      - pendingTransfers: List[(storeId, fromDeviceId, toDeviceId)]
+      - populate this with results from rebalance plan
+  - RebalancingService
+    - Create SetRebalanceDurableTask to drive a rebalance operation for a device set
+      - pendingTransfers list should already be populated
+      - For each store to be transferred, read state of destination device
+        - If in TransferringIn state, poll for its completion
+    - Destination host sends TransferComplete message to Service w/ SetId, StoreId, from/to devices
+    - Slow-poll for completion of all active transfers (every 2 mins?)
+      - use TransferComplete messages to speed up the process
+    - Transfer one store at a time, can parallelize later
     - Prior to transfer initiation, verify pool wont drop below write threshold
-      - Skip it if so
-    - Implement in terms of periodic poll for completion of transfer OR threshold changed so transfer can begin
-    - use backup-prevention function
-  - Planning Phase
-    - rebalancing.State.getStateForRebalancePlanning provides all the information we should need to develop a plan
-      - Resulting plan is a list of planned transfers: List[(storeId, fromDeviceId, toDeviceId)]
-      - Will need to add hostId State.Device and maybe State.Store to facilitate planning operation
-    - Goals (in priority order):
-      - 1: Reliability - Minimize same poolId on a device but re-use if not enough devices
-      - 2: Availability - Minimize same poolId on host but re-use if not enough hosts
-      - 3: Balanced percent usage - Ideally all devices will have close to the same percent usage
-    - General plan:
-      - First look for multiple poolId on same device those are highest priority
-      - Then look for multiple poolId on same host, secondary priority
-      - Then seek to balance usage without compromising 1 & 2
-        - This will be best-effort. Stores can vary wildly in size
-      - Must select only stores in "Active" state (not transferring/rebuilding/etc)
-      - Soruce and destination devices must be different (nonsensical to transfer to the device its already on)
-      - Store transfer is an expensive operation so it should only be done when a significant threshold is reached
-        - Rebalancing would bring reduce device deviation from mean by more than 5% or so?
-      - After rebalance plan is complete, subsequent call must return and empty plan
-        - No "flapping" allowed, must be stable
-    - Needs a comprehensive test suite
-      - Validate that reliability is primary goal. Rebalancing should never decrease reliability
-      - Availability is second and should also not decrease
-      - Two primary use cases where balancing will be useful
-        - Some stores are much larger than others so smaller stores need to be migrated to other devices to keep
-          percent usage similar.
-        - New, empty devices are added. Existing stores can be migrated over to balance usage.
-
-Service Infrastructure
-  - Service Tasks
-    - Similar to DurableTask
-    - Created through RegisteredTypeFactory
-    - Has start()/stop() methods
-      - Called on lease acquisition and loss
-    - backgroundTask to update the lease timestamp
-      - cache containing TKVL node
-        - Don't try to recover from split/join. Just let the lease time out
-      - retry with fixed backoff
-      - If no success before lease expiry, call stop() & cancel background task
-
-StorageDeviceManagementService
-  - Responsible for periodic balance, initiating set expansion, etc
+      - Add stub for AspenClient.offlineHosts(): Set[HostId] = Set()
+      - need to mark stores on devices backed by offline hosts as unavailable when checking the threshold
 
 Revisit pool creation
   - Should be implemented in terms of StorageDeviceSetState

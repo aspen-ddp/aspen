@@ -21,7 +21,7 @@ object Plan:
 
   /** Compute a stable, priority-ordered transfer plan for a level-0 device set. Pure: identical
    *  input always yields identical output, and re-running on the applied plan yields Nil. */
-  def computePlan(state: State.PlanState, config: Config = Config()): List[Transfer] =
+  def computePlan(state: State.PlanningState, config: Config = Config()): List[Transfer] =
     val w = new Working(state)
     reliabilityRepair(w)
     availabilityRepair(w)
@@ -29,7 +29,7 @@ object Plan:
     w.transfers.toList
 
   /** Mutable working copy of placement + usage. PlanState itself is never mutated. */
-  private class Working(state: State.PlanState):
+  private class Working(state: State.PlanningState):
     val deviceTotal: Map[StorageDeviceId, Long] =
       state.devices.map((id, d) => id -> d.totalSize)
     val deviceHost: Map[StorageDeviceId, HostId] =

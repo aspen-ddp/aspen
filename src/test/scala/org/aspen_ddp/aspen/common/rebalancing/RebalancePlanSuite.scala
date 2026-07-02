@@ -25,11 +25,11 @@ object RebalancePlanSuite:
     Device(devId(id), hstId(host), usage, total, stores.map(s => s.storeId -> s).toMap)
 
   /** PlanState from devices; pools are unused by the algorithm so left empty. */
-  def planState(devices: Device*): PlanState =
-    PlanState(devices.map(d => d.deviceId -> d).toMap, Map.empty)
+  def planState(devices: Device*): PlanningState =
+    PlanningState(devices.map(d => d.deviceId -> d).toMap, Map.empty)
 
   /** Apply a plan to a PlanState, producing the post-transfer state (for stability checks). */
-  def applyPlan(state: PlanState, plan: List[Plan.Transfer]): PlanState =
+  def applyPlan(state: PlanningState, plan: List[Plan.Transfer]): PlanningState =
     var devs = state.devices
     for t <- plan do
       val from = devs(t.fromDevice)

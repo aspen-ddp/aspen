@@ -26,7 +26,7 @@ object State:
                     totalSize: Long,
                     stores: Map[StoreId, Store])
 
-  case class PlanState(devices: Map[StorageDeviceId, Device], pools: Map[PoolId, Pool])
+  case class PlanningState(devices: Map[StorageDeviceId, Device], pools: Map[PoolId, Pool])
 
   /** Gather the device and pool state needed to compute a rebalancing plan for a level-0
    *  (leaf) storage device set.
@@ -39,7 +39,7 @@ object State:
    */
   def getStateForRebalancePlanning(client: AspenClient,
                                    storageDeviceSet: StorageDeviceSetState,
-                                   maxConcurrentReads: Int = DefaultMaxConcurrentReads): Future[PlanState] =
+                                   maxConcurrentReads: Int = DefaultMaxConcurrentReads): Future[PlanningState] =
     given ExecutionContext = client.clientContext
 
     if storageDeviceSet.level != 0 then
@@ -93,4 +93,4 @@ object State:
             poolId -> Pool(poolId, ida, poolStores)
           .toMap
 
-        PlanState(devices, pools)
+        PlanningState(devices, pools)

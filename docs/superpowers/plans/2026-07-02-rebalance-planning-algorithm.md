@@ -105,11 +105,15 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 object RebalancePlanSuite:
+
   import State.*
 
   def poolId(n: Int): PoolId = PoolId(new UUID(0L, n.toLong))
+
   def devId(n: Int): StorageDeviceId = StorageDeviceId(new UUID(1L, n.toLong))
+
   def hstId(n: Int): HostId = HostId(new UUID(2L, n.toLong))
+
   def sid(pool: Int, idx: Int): StoreId = StoreId(poolId(pool), idx.toByte)
 
   def store(pool: Int, idx: Int, size: Long,
@@ -121,24 +125,25 @@ object RebalancePlanSuite:
     Device(devId(id), hstId(host), usage, total, stores.map(s => s.storeId -> s).toMap)
 
   /** PlanState from devices; pools are unused by the algorithm so left empty. */
-  def planState(devices: Device*): PlanState =
-    PlanState(devices.map(d => d.deviceId -> d).toMap, Map.empty)
+  def planState(devices: Device*): PlanningState =
+    PlanningState(devices.map(d => d.deviceId -> d).toMap, Map.empty)
 
   /** Apply a plan to a PlanState, producing the post-transfer state (for stability checks). */
-  def applyPlan(state: PlanState, plan: List[Plan.Transfer]): PlanState =
+  def applyPlan(state: PlanningState, plan: List[Plan.Transfer]): PlanningState =
     var devs = state.devices
     for t <- plan do
       val from = devs(t.fromDevice)
       val to = devs(t.toDevice)
       val st = from.stores(t.storeId)
       val nf = from.copy(currentUsage = from.currentUsage - st.currentSize,
-                         stores = from.stores - t.storeId)
+        stores = from.stores - t.storeId)
       val nt = to.copy(currentUsage = to.currentUsage + st.currentSize,
-                       stores = to.stores + (t.storeId -> st))
+        stores = to.stores + (t.storeId -> st))
       devs = devs + (nf.deviceId -> nf) + (nt.deviceId -> nt)
     state.copy(devices = devs)
 
 class RebalancePlanSuite extends AnyFunSuite with Matchers:
+
   import RebalancePlanSuite.*
 
   test("empty state yields empty plan"):
@@ -173,15 +178,16 @@ object Plan:
   case class Transfer(storeId: StoreId, fromDevice: StorageDeviceId, toDevice: StorageDeviceId)
 
   /** Tuning knobs for the balance phase.
-   *  @param balanceSpreadThreshold begin/stop balancing when (max fill ratio - min fill ratio) crosses this
-   *  @param minBalanceMoveGain     a balance move must reduce spread by at least this to be emitted
+   *
+   * @param balanceSpreadThreshold begin/stop balancing when (max fill ratio - min fill ratio) crosses this
+   * @param minBalanceMoveGain     a balance move must reduce spread by at least this to be emitted
    */
   case class Config(balanceSpreadThreshold: Double = 0.05,
                     minBalanceMoveGain: Double = 0.01)
 
   /** Compute a stable, priority-ordered transfer plan for a level-0 device set. Pure: identical
-   *  input always yields identical output, and re-running on the applied plan yields Nil. */
-  def computePlan(state: State.PlanState, config: Config = Config()): List[Transfer] =
+   * input always yields identical output, and re-running on the applied plan yields Nil. */
+  def computePlan(state: State.PlanningState, config: Config = Config()): List[Transfer] =
     val w = new Working(state)
     reliabilityRepair(w)
     availabilityRepair(w)
@@ -189,7 +195,7 @@ object Plan:
     w.transfers.toList
 
   /** Mutable working copy of placement + usage. PlanState itself is never mutated. */
-  private class Working(state: State.PlanState):
+  private class Working(state: State.PlanningState):
     val deviceTotal: Map[StorageDeviceId, Long] =
       state.devices.map((id, d) => id -> d.totalSize)
     val deviceHost: Map[StorageDeviceId, HostId] =
@@ -244,7 +250,9 @@ object Plan:
 
   // Phases — filled in by later tasks.
   private def reliabilityRepair(w: Working): Unit = ()
+
   private def availabilityRepair(w: Working): Unit = ()
+
   private def balance(w: Working, config: Config): Unit = ()
 ```
 

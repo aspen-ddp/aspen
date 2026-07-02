@@ -120,9 +120,13 @@ All async work runs on `client.clientContext` (`given ExecutionContext = client.
    runBoundedParallel(storageDeviceSet.memberDevices, maxConcurrentReads)(client.getStorageDeviceState)
    ```
 
-3. **Collect unique pool ids** from every store on every device:
+3. **Collect unique pool ids** from every owned store on every device. `TransferringIn` entries are
+   excluded here too (see step 6), so the whole function works from one consistent, filtered view of
+   the stores:
    ```scala
-   deviceStates.flatMap(_.stores.keys).map(_.poolId).toSet
+   deviceStates
+     .flatMap(_.stores.filter(_._2.status != StoreStatus.TransferringIn).keys)
+     .map(_.poolId).toSet
    ```
 
 4. **Read each pool's KV object** with the concurrency limiter. A single read per pool yields both
@@ -142,19 +146,25 @@ All async work runs on `client.clientContext` (`given ExecutionContext = client.
    ```
 
 6. **Assemble `PlanState`:**
-   - Build a `Store(storeId, size, entry.status)` from each device's `StoreEntry`.
+   - **Ignore `TransferringIn` entries.** While a store is being transferred it appears as
+     `TransferringOut` on the source device and `TransferringIn` on the destination device. The store
+     is owned by the source device until the transfer completes (at which point the source device's
+     state drops the store entry entirely). So any `StoreEntry` with status
+     `StoreStatus.TransferringIn` is skipped when building `Store` objects. This attributes the store
+     to exactly one device (the source) and removes the possibility of a duplicate `StoreId` key.
+   - Build a `Store(storeId, size, entry.status)` from each remaining `StoreEntry`.
    - `devices`: each `StorageDeviceState` → `Device(deviceId, itsStores)`, where `itsStores` is built
-     directly from that device's own `stores` map (so a store mid-transfer is attributed to the
-     correct device on each side).
+     directly from that device's own `stores` map (excluding `TransferringIn` entries).
    - `pools`: for each collected pool id → `Pool(poolId, StoragePoolState(kvos).ida, storesForThatPool)`,
-     where `storesForThatPool` is every discovered store whose `poolId` matches.
+     where `storesForThatPool` is every discovered (non-`TransferringIn`) store whose `poolId` matches.
 
 ### Edge cases and notes
 
-- **Mid-transfer stores.** A store transferring between two devices can appear as `TransferringOut`
-  on the source and `TransferringIn` on the destination. In a pool's store map these collapse to a
-  single entry (last-wins). This is acceptable for a first pass because transferring stores are not
-  valid rebalancing move candidates; a code comment will note it.
+- **Mid-transfer stores.** A store transferring between two devices appears as `TransferringOut` on
+  the source and `TransferringIn` on the destination. `TransferringIn` entries are ignored during
+  assembly (see step 6): the store remains owned by the source device until the transfer completes,
+  so it is counted exactly once and no duplicate `StoreId` key can arise. A code comment will note
+  this ownership rule.
 - **Guard exception type.** `IllegalArgumentException` is used rather than the client package's
   `AllocationError`, since this operation is not an allocation.
 - **No unit test.** The function is straightforward I/O orchestration and testing it would require

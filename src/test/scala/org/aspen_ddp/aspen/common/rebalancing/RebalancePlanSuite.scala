@@ -90,3 +90,22 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
       device(1, 1, 20, 100, store(1, 0, 10), store(1, 1, 10)),
       device(2, 2, 20, 100, store(1, 2, 10), store(1, 3, 10)))
     Plan.computePlan(st) shouldBe Nil
+
+  test("availability: spreads same-pool stores across hosts"):
+    // host 1 has two devices, each with one pool-1 store; host 2 has an empty device
+    val st = planState(
+      device(1, 1, 10, 100, store(1, 0, 10)),
+      device(2, 1, 10, 100, store(1, 1, 10)),
+      device(3, 2, 0, 100))
+    val plan = Plan.computePlan(st)
+    plan.size shouldBe 1
+    plan.head.toDevice shouldBe devId(3)
+
+  test("availability: no move when it would create a device co-location (reliability preserved)"):
+    // host 1 has two pool-1 stores; the only other host's device already holds pool 1
+    val st = planState(
+      device(1, 1, 10, 100, store(1, 0, 10)),
+      device(2, 1, 10, 100, store(1, 1, 10)),
+      device(3, 2, 10, 100, store(1, 2, 10)))
+    val plan = Plan.computePlan(st)
+    plan shouldBe Nil

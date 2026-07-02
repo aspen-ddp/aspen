@@ -118,5 +118,34 @@ object Plan:
             }
           }
 
-  private def availabilityRepair(w: Working): Unit = ()
+  private def availabilityRepair(w: Working): Unit =
+    var progress = true
+    while progress do
+      progress = false
+      val hosts = w.deviceIds.map(w.deviceHost).distinct.sortBy(_.uuid.toString)
+      for host <- hosts do
+        val hostDevices = w.deviceIds.filter(d => w.deviceHost(d) == host)
+        val poolCounts: Seq[(PoolId, Int)] =
+          hostDevices.flatMap(w.storesOn).groupBy(_.poolId).map((p, ss) => p -> ss.size)
+            .toSeq.sortBy(_._1.uuid.toString)
+        for (pool, count) <- poolCounts if count >= 2 do
+          val candidate: Option[StoreId] =
+            hostDevices.flatMap(w.storesOn)
+              .filter(s => s.poolId == pool && w.movable(s))
+              .sortBy(_.poolIndex).headOption
+          candidate.foreach { s =>
+            // different host, physically fits, and no device-level co-location (reliability safe)
+            val dest: Option[StorageDeviceId] =
+              w.deviceIds
+                .filter(d => w.deviceHost(d) != host && w.fits(d, s) && w.samePoolOnDevice(d, pool) == 0)
+                .sortBy(d => (w.samePoolOnHost(w.deviceHost(d), pool),
+                              w.fillRatio(d),
+                              d.uuid.toString))
+                .headOption
+            dest.foreach { d =>
+              if w.samePoolOnHost(w.deviceHost(d), pool) + 1 < count then
+                w.move(s, d)
+                progress = true
+            }
+          }
   private def balance(w: Working, config: Config): Unit = ()

@@ -109,3 +109,26 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
       device(3, 2, 10, 100, store(1, 2, 10)))
     val plan = Plan.computePlan(st)
     plan shouldBe Nil
+
+  test("balance: migrates a store from a full device to an empty one"):
+    val st = planState(
+      device(1, 1, 80, 100, store(1, 0, 40)),
+      device(2, 2, 0, 100))
+    val plan = Plan.computePlan(st)
+    plan.size shouldBe 1
+    plan.head.storeId shouldBe sid(1, 0)
+    plan.head.fromDevice shouldBe devId(1)
+    plan.head.toDevice shouldBe devId(2)
+
+  test("balance: no move when within threshold"):
+    val st = planState(
+      device(1, 1, 50, 100, store(1, 0, 10)),
+      device(2, 2, 48, 100, store(2, 0, 10)))
+    Plan.computePlan(st) shouldBe Nil
+
+  test("balance: rejects a move that would overshoot"):
+    // the only movable store is so large that moving it makes the sink fuller than the source
+    val st = planState(
+      device(1, 1, 60, 100, store(1, 0, 50)),
+      device(2, 2, 0, 100))
+    Plan.computePlan(st) shouldBe Nil

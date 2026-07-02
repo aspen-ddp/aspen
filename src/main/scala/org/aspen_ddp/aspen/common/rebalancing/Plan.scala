@@ -150,4 +150,48 @@ object Plan:
                 progress = true
             }
           }
-  private def balance(w: Working, config: Config): Unit = ()
+  private def balance(w: Working, config: Config): Unit =
+    if w.deviceIds.size < 2 then return
+
+    def spread(): Double =
+      val ratios = w.deviceIds.map(w.fillRatio)
+      ratios.max - ratios.min
+
+    /** Spread that would result from moving `s` from `from` to `to`, without mutating state. */
+    def spreadIfMoved(s: StoreId, from: StorageDeviceId, to: StorageDeviceId): Double =
+      val size = w.storeSize(s)
+      val ratios = w.deviceIds.map { d =>
+        if d == to then (w.usage(to) + size).toDouble / w.deviceTotal(to).toDouble
+        else if d == from then (w.usage(from) - size).toDouble / w.deviceTotal(from).toDouble
+        else w.fillRatio(d)
+      }
+      ratios.max - ratios.min
+
+    def noOvershoot(s: StoreId, from: StorageDeviceId, to: StorageDeviceId): Boolean =
+      val size = w.storeSize(s)
+      val sinkAfter = (w.usage(to) + size).toDouble / w.deviceTotal(to).toDouble
+      val sourceAfter = (w.usage(from) - size).toDouble / w.deviceTotal(from).toDouble
+      sinkAfter <= sourceAfter
+
+    var continue = spread() > config.balanceSpreadThreshold
+    while continue do
+      continue = false
+      val byFill = w.deviceIds.sortBy(w.fillRatio)
+      val sink = byFill.head
+      val source = byFill.last
+      val before = spread()
+      // largest movable store on the source first; poolIndex as deterministic tiebreak
+      val candidates = w.storesOn(source).filter(w.movable)
+        .sortBy(s => (-w.storeSize(s), s.poolIndex))
+      val chosen = candidates.find { s =>
+        val pool = s.poolId
+        w.fits(sink, s) &&
+        w.samePoolOnDevice(sink, pool) == 0 &&
+        (w.deviceHost(sink) == w.deviceHost(source) || w.samePoolOnHost(w.deviceHost(sink), pool) == 0) &&
+        noOvershoot(s, source, sink) &&
+        (before - spreadIfMoved(s, source, sink)) >= config.minBalanceMoveGain
+      }
+      chosen.foreach { s =>
+        w.move(s, sink)
+        continue = spread() > config.balanceSpreadThreshold
+      }

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.rebalancing
 
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{byte2long, runBoundedParallel}
@@ -21,6 +21,7 @@ object State:
    *  sizes in `stores` (each Store.currentSize) come from the pool's separate per-store usage
    *  accounting, so they need not sum to `currentUsage`. */
   case class Device(deviceId: StorageDeviceId,
+                    hostId: HostId,
                     currentUsage: Long,
                     totalSize: Long,
                     stores: Map[StoreId, Store])
@@ -82,7 +83,7 @@ object State:
         val devices: Map[StorageDeviceId, Device] =
           deviceStates.map: ds =>
             val itsStores = ownedStores(ds).keys.map(sid => sid -> storesById(sid)).toMap
-            ds.storageDeviceId -> Device(ds.storageDeviceId, ds.currentUsage, ds.totalSize, itsStores)
+            ds.storageDeviceId -> Device(ds.storageDeviceId, ds.hostId, ds.currentUsage, ds.totalSize, itsStores)
           .toMap
 
         val pools: Map[PoolId, Pool] =

@@ -1,21 +1,3 @@
-Service Infrastructure
-  - Radicle has a Services TKVL
-  - Key = Service UUID
-  - Value = (hostId, leaseExpirationTimestamp, stateObjectPointer)
-  - All hosts poll the TKVL
-    - Read full content
-    - Look for expired leases
-    - Attempt to acquire a lease
-      - start service locally if successful
-  - Services
-    - Created through RegisteredTypeFactory
-    - Has start()/stop() methods
-      - Called on lease acquisition and loss
-    - backgroundTask to update the lease timestamp
-      - cache containing TKVL node
-        - Don't try to recover from split/join. Just let the lease time out
-      - retry with fixed backoff
-      - If no success before lease expiry, call stop() & cancel background task
 
 Rebalancing
   - Split into two phases: Planning & Execution
@@ -34,36 +16,52 @@ Rebalancing
       - Skip it if so
     - Implement in terms of periodic poll for completion of transfer OR threshold changed so transfer can begin
     - use backup-prevention function
-  - Need to read PoolState & StorageDeviceState for rebalance
-    - Use poolId from StoreId in StorageDeviceState
-      - Get set of all PoolId hosted by the device set
-      - Read each pool so we know the size of each store
-    - Separate pool & StorageDeviceState reads from calculation
-      - Improve testability
-      - Use dedicated classes for holding relevant Pool & Device state
-        - IDA, store sizes, set of hostId, set of deviceId, and storeId => state (operational vs transfer etc)
-          are important for Pools
-        - Device - set of storeId and current usage are important
-    - Minimize same poolId on host but re-use if not enough hosts
-    - Minimize same poolId on device but re-use if not enough devices
-    - When choosing stores to move:
+  - Planning Phase
+    - rebalancing.State.getStateForRebalancePlanning provides all the information we should need to develop a plan
+      - Resulting plan is a list of planned transfers: List[(storeId, fromDeviceId, toDeviceId)]
+      - Will need to add hostId State.Device and maybe State.Store to facilitate planning operation
+    - Goals (in priority order):
+      - 1: Reliability - Minimize same poolId on a device but re-use if not enough devices
+      - 2: Availability - Minimize same poolId on host but re-use if not enough hosts
+      - 3: Balanced percent usage - Ideally all devices will have close to the same percent usage
+    - General plan:
       - First look for multiple poolId on same device those are highest priority
       - Then look for multiple poolId on same host, secondary priority
       - Then seek to balance usage without compromising 1 & 2
         - This will be best-effort. Stores can vary wildly in size
-      - Must select only stores in "normal" state (not transferring/rebuilding/etc)
+      - Must select only stores in "Active" state (not transferring/rebuilding/etc)
+      - Soruce and destination devices must be different (nonsensical to transfer to the device its already on)
       - Store transfer is an expensive operation so it should only be done when a significant threshold is reached
         - Rebalancing would bring reduce device deviation from mean by more than 5% or so?
       - After rebalance plan is complete, subsequent call must return and empty plan
         - No "flapping" allowed, must be stable
+    - Needs a comprehensive test suite
+      - Validate that reliability is primary goal. Rebalancing should never decrease reliability
+      - Availability is second and should also not decrease
+      - Two primary use cases where balancing will be useful
+        - Some stores are much larger than others so smaller stores need to be migrated to other devices to keep
+          percent usage similar.
+        - New, empty devices are added. Existing stores can be migrated over to balance usage.
+
+Service Infrastructure
+  - Service Tasks
+    - Similar to DurableTask
+    - Created through RegisteredTypeFactory
+    - Has start()/stop() methods
+      - Called on lease acquisition and loss
+    - backgroundTask to update the lease timestamp
+      - cache containing TKVL node
+        - Don't try to recover from split/join. Just let the lease time out
+      - retry with fixed backoff
+      - If no success before lease expiry, call stop() & cancel background task
+
+StorageDeviceManagementService
+  - Responsible for periodic balance, initiating set expansion, etc
 
 Revisit pool creation
   - Should be implemented in terms of StorageDeviceSetState
   - Pool state object & device state object need to reference each other
      - think this is currently unimplemented
-
-StorageDeviceManagementService
-  - Responsible for periodic balance, initiating set expansion, etc
 
 Set Expansion
   - Distinct from rebalancing

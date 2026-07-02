@@ -64,9 +64,13 @@ object Plan:
     def samePoolOnHost(host: HostId, pool: PoolId): Int =
       location.count { case (s, d) => deviceHost(d) == host && s.poolId == pool }
 
-    def fillRatio(dev: StorageDeviceId): Double =
+    /** Fill ratio the device would have if `deltaBytes` were added to (or, if negative,
+     *  removed from) its current usage. total<=0 devices report 1.0 (treated as full). */
+    def fillRatioIf(dev: StorageDeviceId, deltaBytes: Long): Double =
       val tot = deviceTotal(dev)
-      if tot <= 0L then 1.0 else usage(dev).toDouble / tot.toDouble
+      if tot <= 0L then 1.0 else (usage(dev) + deltaBytes).toDouble / tot.toDouble
+
+    def fillRatio(dev: StorageDeviceId): Double = fillRatioIf(dev, 0L)
 
     def fits(dev: StorageDeviceId, s: StoreId): Boolean =
       usage(dev) + storeSize(s) <= deviceTotal(dev)
@@ -153,6 +157,7 @@ object Plan:
   private def balance(w: Working, config: Config): Unit =
     if w.deviceIds.size < 2 then return
 
+    /** Max fill ratio - min fill ratio across all devices. */
     def spread(): Double =
       val ratios = w.deviceIds.map(w.fillRatio)
       ratios.max - ratios.min
@@ -161,16 +166,16 @@ object Plan:
     def spreadIfMoved(s: StoreId, from: StorageDeviceId, to: StorageDeviceId): Double =
       val size = w.storeSize(s)
       val ratios = w.deviceIds.map { d =>
-        if d == to then (w.usage(to) + size).toDouble / w.deviceTotal(to).toDouble
-        else if d == from then (w.usage(from) - size).toDouble / w.deviceTotal(from).toDouble
+        if d == to then w.fillRatioIf(to, size)
+        else if d == from then w.fillRatioIf(from, -size)
         else w.fillRatio(d)
       }
       ratios.max - ratios.min
 
     def noOvershoot(s: StoreId, from: StorageDeviceId, to: StorageDeviceId): Boolean =
       val size = w.storeSize(s)
-      val sinkAfter = (w.usage(to) + size).toDouble / w.deviceTotal(to).toDouble
-      val sourceAfter = (w.usage(from) - size).toDouble / w.deviceTotal(from).toDouble
+      val sinkAfter = w.fillRatioIf(to, size)
+      val sourceAfter = w.fillRatioIf(from, -size)
       sinkAfter <= sourceAfter
 
     var continue = spread() > config.balanceSpreadThreshold

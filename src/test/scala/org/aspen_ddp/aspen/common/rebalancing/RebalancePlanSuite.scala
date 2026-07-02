@@ -132,3 +132,49 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
       device(1, 1, 60, 100, store(1, 0, 50)),
       device(2, 2, 0, 100))
     Plan.computePlan(st) shouldBe Nil
+
+  test("priority: balance prefers a store whose move does not co-locate"):
+    // dev1 (host1) is full with a pool-1 and a pool-2 store; dev2 (host2) already holds pool 1.
+    // Balancing must move the pool-2 store (safe), never the pool-1 store (would co-locate on dev2).
+    val st = planState(
+      device(1, 1, 90, 100, store(1, 0, 50), store(2, 0, 40)),
+      device(2, 2, 10, 100, store(1, 1, 10)))
+    val plan = Plan.computePlan(st)
+    plan.size shouldBe 1
+    plan.head.storeId shouldBe sid(2, 0)
+    plan.head.toDevice shouldBe devId(2)
+
+  test("stable: re-running on the applied plan yields an empty plan"):
+    val scenarios = List(
+      planState(
+        device(1, 1, 20, 100, store(1, 0, 10), store(1, 1, 10)),
+        device(2, 2, 0, 100)),                                          // reliability
+      planState(
+        device(1, 1, 10, 100, store(1, 0, 10)),
+        device(2, 1, 10, 100, store(1, 1, 10)),
+        device(3, 2, 0, 100)),                                          // availability
+      planState(
+        device(1, 1, 80, 100, store(1, 0, 40)),
+        device(2, 2, 0, 100)))                                          // balance
+    for st <- scenarios do
+      val plan = Plan.computePlan(st)
+      plan should not be empty
+      Plan.computePlan(applyPlan(st, plan)) shouldBe Nil
+
+  test("deterministic: identical output regardless of device insertion order"):
+    val a = planState(
+      device(1, 1, 80, 100, store(1, 0, 40)),
+      device(2, 2, 0, 100),
+      device(3, 3, 0, 100))
+    val b = planState(
+      device(3, 3, 0, 100),
+      device(2, 2, 0, 100),
+      device(1, 1, 80, 100, store(1, 0, 40)))
+    Plan.computePlan(a) shouldBe Plan.computePlan(b)
+
+  test("deterministic: repeated calls produce the same plan"):
+    val st = planState(
+      device(1, 1, 90, 100, store(1, 0, 30), store(2, 0, 30)),
+      device(2, 2, 0, 100),
+      device(3, 3, 0, 100))
+    Plan.computePlan(st) shouldBe Plan.computePlan(st)

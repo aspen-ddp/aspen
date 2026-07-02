@@ -16,6 +16,10 @@ object State:
 
   case class Store(storeId: StoreId, currentSize: Long, status: StorageDeviceState.StoreStatus)
   case class Pool(poolId: PoolId, ida: IDA, stores: Map[StoreId, Store])
+  /** `currentUsage` and `totalSize` are the device's own self-reported usage and capacity
+   *  (from StorageDeviceState), authoritative for the device's overall capacity. The per-store
+   *  sizes in `stores` (each Store.currentSize) come from the pool's separate per-store usage
+   *  accounting, so they need not sum to `currentUsage`. */
   case class Device(deviceId: StorageDeviceId,
                     currentUsage: Long,
                     totalSize: Long,

@@ -50,3 +50,34 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
 
   test("single device yields empty plan"):
     Plan.computePlan(planState(device(1, 1, 10, 100, store(1, 0, 10)))) shouldBe Nil
+
+  test("reliability: splits two same-pool stores off one device"):
+    val st = planState(
+      device(1, 1, 20, 100, store(1, 0, 10), store(1, 1, 10)),
+      device(2, 2, 0, 100))
+    val plan = Plan.computePlan(st)
+    plan.size shouldBe 1
+    // candidates sorted by poolIndex, so the idx-0 store moves
+    plan.head.storeId shouldBe sid(1, 0)
+    plan.head.fromDevice shouldBe devId(1)
+    plan.head.toDevice shouldBe devId(2)
+
+  test("reliability: not enough devices converges to minimal co-location (one move)"):
+    // three pool-1 stores on dev1, only one other device available
+    val st = planState(
+      device(1, 1, 30, 100, store(1, 0, 10), store(1, 1, 10), store(1, 2, 10)),
+      device(2, 2, 0, 100))
+    val plan = Plan.computePlan(st)
+    // dev1 3->2, dev2 0->1: max co-location becomes 2 (unavoidable); a second move (2->2) is rejected
+    plan.size shouldBe 1
+    plan.head.toDevice shouldBe devId(2)
+
+  test("reliability: immovable (non-Active) stores are not selected as sources"):
+    val st = planState(
+      device(1, 1, 20, 100,
+        store(1, 0, 10, StorageDeviceState.StoreStatus.Rebuilding),
+        store(1, 1, 10)),
+      device(2, 2, 0, 100))
+    val plan = Plan.computePlan(st)
+    plan.size shouldBe 1
+    plan.head.storeId shouldBe sid(1, 1)   // only the Active store can move

@@ -83,6 +83,37 @@ object Plan:
       transfers += Transfer(s, from, to)
 
   // Phases — filled in by later tasks.
-  private def reliabilityRepair(w: Working): Unit = ()
+  /** Devices (other than `from`) that physically fit `s`, ranked deterministically:
+   *  fewest same-pool on device, then on host, then lowest fill ratio, then uuid. */
+  private def rankedDestinations(w: Working, s: StoreId, from: StorageDeviceId): Seq[StorageDeviceId] =
+    val pool = s.poolId
+    w.deviceIds
+      .filter(d => d != from && w.fits(d, s))
+      .sortBy(d => (w.samePoolOnDevice(d, pool),
+                    w.samePoolOnHost(w.deviceHost(d), pool),
+                    w.fillRatio(d),
+                    d.uuid.toString))
+
+  private def reliabilityRepair(w: Working): Unit =
+    var progress = true
+    while progress do
+      progress = false
+      for dev <- w.deviceIds do
+        val poolCounts: Seq[(PoolId, Int)] =
+          w.storesOn(dev).groupBy(_.poolId).map((p, ss) => p -> ss.size)
+            .toSeq.sortBy(_._1.uuid.toString)
+        for (pool, count) <- poolCounts if count >= 2 do
+          val candidate: Option[StoreId] =
+            w.storesOn(dev).filter(s => s.poolId == pool && w.movable(s))
+              .sortBy(_.poolIndex).headOption
+          candidate.foreach { s =>
+            rankedDestinations(w, s, dev).headOption.foreach { dest =>
+              // accept only if it strictly reduces the max co-location of the two devices
+              if w.samePoolOnDevice(dest, pool) + 1 < count then
+                w.move(s, dest)
+                progress = true
+            }
+          }
+
   private def availabilityRepair(w: Working): Unit = ()
   private def balance(w: Working, config: Config): Unit = ()

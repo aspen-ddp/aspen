@@ -91,8 +91,18 @@ AtomicReferenceArray}` (and `ExecutionContext`/`Future` if not already imported)
 ### Location
 
 `src/main/scala/org/aspen_ddp/aspen/common/rebalancing/State.scala` — fill in the existing `= ???`
-stub. The `Store`/`Pool`/`Device`/`PlanState` case classes already present in the `State` object are
-kept unchanged.
+stub. The `Store`/`Pool`/`PlanState` case classes already present in the `State` object are kept
+unchanged. `Device` gains two fields carried straight from `StorageDeviceState`:
+
+```scala
+case class Device(deviceId: StorageDeviceId,
+                  currentUsage: Long,
+                  totalSize: Long,
+                  stores: Map[StoreId, Store])
+```
+
+The planner needs per-device usage and capacity to balance across devices; both are already present
+on each `StorageDeviceState` (`currentUsage`, `totalSize`), so no extra reads are required.
 
 ### Signature
 
@@ -153,7 +163,8 @@ All async work runs on `client.clientContext` (`given ExecutionContext = client.
      `StoreStatus.TransferringIn` is skipped when building `Store` objects. This attributes the store
      to exactly one device (the source) and removes the possibility of a duplicate `StoreId` key.
    - Build a `Store(storeId, size, entry.status)` from each remaining `StoreEntry`.
-   - `devices`: each `StorageDeviceState` → `Device(deviceId, itsStores)`, where `itsStores` is built
+   - `devices`: each `StorageDeviceState` → `Device(deviceId, currentUsage, totalSize, itsStores)`,
+     with `currentUsage` and `totalSize` copied from the `StorageDeviceState` and `itsStores` built
      directly from that device's own `stores` map (excluding `TransferringIn` entries).
    - `pools`: for each collected pool id → `Pool(poolId, StoragePoolState(kvos).ida, storesForThatPool)`,
      where `storesForThatPool` is every discovered (non-`TransferringIn`) store whose `poolId` matches.

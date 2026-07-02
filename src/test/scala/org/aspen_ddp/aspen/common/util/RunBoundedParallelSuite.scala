@@ -3,8 +3,8 @@ package org.aspen_ddp.aspen.common.util
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
-import scala.concurrent.{Await, ExecutionContext, Future, Promise}
+import java.util.concurrent.atomic.AtomicInteger
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.*
 
 class RunBoundedParallelSuite extends AnyFunSuite with Matchers:

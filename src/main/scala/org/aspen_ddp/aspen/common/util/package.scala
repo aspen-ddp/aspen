@@ -146,8 +146,9 @@ package object util {
    * invocations in flight at any instant. Results are returned in the same order as `items`
    * (matching Future.sequence semantics), regardless of completion order.
    *
-   * Fails fast: if any invocation fails, the returned Future fails with that error. Invocations
-   * already started are allowed to run to completion.
+   * Fails fast: on the first failure the returned Future fails immediately with that error. The
+   * remaining workers are not cancelled, however (Scala Futures are not cancellable), so they may
+   * continue to pull from the shared index and start and run further invocations of `f`.
    *
    * A fixed pool of min(maxConcurrent, n) worker chains pull from a shared atomic index, giving a
    * true sliding window (a new invocation starts the instant one finishes) rather than a

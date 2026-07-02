@@ -5,6 +5,7 @@ import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.*
 import java.util.UUID
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReferenceArray}
 import scala.annotation.tailrec
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -140,7 +141,42 @@ package object util {
         // This body only executes after the previous Future finishes
         f(item).map(result => accResults :+ result)
 
-  /** 
+  /**
+   * Executes the future-returning function `f` over `items` with at most `maxConcurrent`
+   * invocations in flight at any instant. Results are returned in the same order as `items`
+   * (matching Future.sequence semantics), regardless of completion order.
+   *
+   * Fails fast: if any invocation fails, the returned Future fails with that error. Invocations
+   * already started are allowed to run to completion.
+   *
+   * A fixed pool of min(maxConcurrent, n) worker chains pull from a shared atomic index, giving a
+   * true sliding window (a new invocation starts the instant one finishes) rather than a
+   * chunk-barrier where the slowest item in a batch stalls the next batch.
+   */
+  def runBoundedParallel[A, B](items: Seq[A], maxConcurrent: Int)
+                              (f: A => Future[B])
+                              (implicit ec: ExecutionContext): Future[Seq[B]] =
+    require(maxConcurrent > 0, s"maxConcurrent must be > 0, got $maxConcurrent")
+    val arr = items.toIndexedSeq
+    if arr.isEmpty then
+      Future.successful(Vector.empty)
+    else
+      val results   = new AtomicReferenceArray[B](arr.length)
+      val nextIndex = new AtomicInteger(0)
+
+      def worker(): Future[Unit] =
+        val i = nextIndex.getAndIncrement()
+        if i >= arr.length then
+          Future.unit
+        else
+          f(arr(i)).flatMap: b =>
+            results.set(i, b)
+            worker()
+
+      val workers = (0 until math.min(maxConcurrent, arr.length)).map(_ => worker())
+      Future.sequence(workers).map(_ => Vector.tabulate(arr.length)(results.get))
+
+  /**
    * This method ensures that repeated invocations of the supplied code block (such as a scheduled periodic task)
    * will ignore redundant calls while the Future is outstanding. It's intent is to be used with schedulePeriodic
    * to ensure that duplicate reads don't pile up during extended offline periods. An example is of a host polling

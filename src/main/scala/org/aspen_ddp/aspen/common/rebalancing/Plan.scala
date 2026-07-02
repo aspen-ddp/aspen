@@ -83,8 +83,9 @@ object Plan:
       transfers += Transfer(s, from, to)
 
   // Phases — filled in by later tasks.
-  /** Devices (other than `from`) that physically fit `s`, ranked deterministically:
-   *  fewest same-pool on device, then on host, then lowest fill ratio, then uuid. */
+  /** Devices (other than `from`) that physically fit `s`, ranked deterministically.
+   *  Priority order (ascending, lower wins): fewest same-pool on device, then on host,
+   *  then lowest fill ratio, then uuid string. */
   private def rankedDestinations(w: Working, s: StoreId, from: StorageDeviceId): Seq[StorageDeviceId] =
     val pool = s.poolId
     w.deviceIds
@@ -95,16 +96,18 @@ object Plan:
                     d.uuid.toString))
 
   private def reliabilityRepair(w: Working): Unit =
+    // Terminates: each accepted move strictly reduces the max same-pool-per-device count, which is bounded.
     var progress = true
     while progress do
       progress = false
       for dev <- w.deviceIds do
+        val devStores = w.storesOn(dev)
         val poolCounts: Seq[(PoolId, Int)] =
-          w.storesOn(dev).groupBy(_.poolId).map((p, ss) => p -> ss.size)
+          devStores.groupBy(_.poolId).map((p, ss) => p -> ss.size)
             .toSeq.sortBy(_._1.uuid.toString)
         for (pool, count) <- poolCounts if count >= 2 do
           val candidate: Option[StoreId] =
-            w.storesOn(dev).filter(s => s.poolId == pool && w.movable(s))
+            devStores.filter(s => s.poolId == pool && w.movable(s))
               .sortBy(_.poolIndex).headOption
           candidate.foreach { s =>
             rankedDestinations(w, s, dev).headOption.foreach { dest =>

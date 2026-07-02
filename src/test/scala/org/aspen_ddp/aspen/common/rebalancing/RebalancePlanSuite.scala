@@ -70,7 +70,9 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
     val plan = Plan.computePlan(st)
     // dev1 3->2, dev2 0->1: max co-location becomes 2 (unavoidable); a second move (2->2) is rejected
     plan.size shouldBe 1
+    plan.head.fromDevice shouldBe devId(1)
     plan.head.toDevice shouldBe devId(2)
+    Seq(sid(1, 0), sid(1, 1), sid(1, 2)) should contain (plan.head.storeId)
 
   test("reliability: immovable (non-Active) stores are not selected as sources"):
     val st = planState(
@@ -81,3 +83,10 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
     val plan = Plan.computePlan(st)
     plan.size shouldBe 1
     plan.head.storeId shouldBe sid(1, 1)   // only the Active store can move
+
+  test("reliability: no move when no destination reduces co-location"):
+    // both devices already hold two pool-1 stores; moving 2->3 never reduces the max, so no move
+    val st = planState(
+      device(1, 1, 20, 100, store(1, 0, 10), store(1, 1, 10)),
+      device(2, 2, 20, 100, store(1, 2, 10), store(1, 3, 10)))
+    Plan.computePlan(st) shouldBe Nil

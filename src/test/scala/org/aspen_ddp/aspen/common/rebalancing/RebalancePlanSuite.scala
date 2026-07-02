@@ -183,3 +183,26 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
       device(2, 2, 0, 100),
       device(3, 3, 0, 100))
     Plan.computePlan(st) shouldBe Plan.computePlan(st)
+
+  test("cross-phase: a reliability move and a balance move both fire in one plan"):
+    // dev1(host1) is completely full and holds two pool-1 stores (reliability violation) plus a
+    // pool-2 store. Reliability moves one pool-1 store to dev2; balance then moves the pool-2 store
+    // to the empty dev3. Later phases observe earlier phases' effects (shared working copy).
+    val st = planState(
+      device(1, 1, 100, 100, store(1, 0, 30), store(1, 1, 30), store(2, 0, 40)),
+      device(2, 2, 0, 100),
+      device(3, 3, 0, 100))
+    val plan = Plan.computePlan(st)
+    plan shouldBe List(
+      Plan.Transfer(sid(1, 0), devId(1), devId(2)),   // reliability
+      Plan.Transfer(sid(1, 1), devId(1), devId(3)))   // balance
+    // and the plan is stable
+    Plan.computePlan(applyPlan(st, plan)) shouldBe Nil
+
+  test("zero-capacity device is treated as full and receives no transfers"):
+    // dev2 has totalSize 0 (fillRatio reported as 1.0). It must never be chosen as a move target,
+    // and computePlan must not divide by zero or throw.
+    val st = planState(
+      device(1, 1, 80, 100, store(1, 0, 40)),
+      device(2, 2, 0, 0))
+    Plan.computePlan(st) shouldBe Nil

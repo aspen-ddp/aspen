@@ -86,7 +86,6 @@ object Plan:
       pinned += s
       transfers += Transfer(s, from, to)
 
-  // Phases — filled in by later tasks.
   /** Devices (other than `from`) that physically fit `s`, ranked deterministically.
    *  Priority order (ascending, lower wins): fewest same-pool on device, then on host,
    *  then lowest fill ratio, then uuid string. */

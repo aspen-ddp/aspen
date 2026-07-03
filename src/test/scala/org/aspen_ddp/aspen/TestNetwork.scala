@@ -247,6 +247,7 @@ class TestNetwork(executionContext: ExecutionContext,
   val storageDeviceId = StorageDeviceId.BootstrapStorageDeviceId
 
   var handleDepth = 0
+  var capturedHostMessages: List[HostMessage] = Nil
 
   val bootstrapSD = StorageDeviceState(
     storageDeviceId,
@@ -297,7 +298,8 @@ class TestNetwork(executionContext: ExecutionContext,
 
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
 
-    def sendHostMessage(msg: HostMessage): Unit = ()
+    def sendHostMessage(msg: HostMessage): Unit = TestNetwork.this.synchronized:
+      capturedHostMessages = capturedHostMessages :+ msg
 
     def dropCacheForStore(storeId: StoreId): Unit = ()
   }

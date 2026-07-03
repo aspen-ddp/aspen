@@ -251,6 +251,14 @@ trait AspenClient extends ObjectReader:
 
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
   private[aspen] def sendHostMessage(msg: HostMessage): Unit
+
+  def sendServiceMessage(serviceUUID: UUID, encodedContent: Array[Byte]): Future[Unit] =
+    given ExecutionContext = clientContext
+    getServiceHost(serviceUUID).map:
+      case Some(hostId) =>
+        sendHostMessage(ServiceMessage(hostId, clientId, serviceUUID, encodedContent))
+      case None => ()
+
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]
 
   private[aspen] def getSystemAttribute(key: String): Option[String]

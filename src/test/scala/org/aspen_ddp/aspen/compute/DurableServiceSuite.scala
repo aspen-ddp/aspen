@@ -259,3 +259,21 @@ class DurableServiceSuite extends IntegrationTestSuite:
       oh <- client.getServiceHost(UUID.randomUUID())
     yield
       oh shouldBe None
+
+  atest("sendServiceMessage sends a ServiceMessage to the owning host"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val content = Array[Byte](9, 8, 7)
+    val exec = makeExecutor()
+    for
+      _ <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _ <- claimedPromise.future
+      _ <- client.sendServiceMessage(svcUUID, content)
+    yield
+      exec.shutdown()
+      val sent = net.capturedHostMessages.collect:
+        case m: ServiceMessage if m.serviceUUID == svcUUID => m
+      sent.size shouldBe 1
+      sent.head.toHost shouldBe testHostId
+      sent.head.fromClient shouldBe client.clientId
+      sent.head.encodedContent.toList shouldBe content.toList

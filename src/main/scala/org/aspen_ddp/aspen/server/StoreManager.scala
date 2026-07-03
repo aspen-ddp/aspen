@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, ignoreExtraCallsWhileRunning, runSequentially}
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runSequentially}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler, RocksDBBackend, RocksDBConfig}
@@ -196,7 +196,7 @@ class StoreManager(val client: AspenClient,
   private def startUsageTracking(executor: TaskExecutor): Unit =
     poolUsageManager.setTaskExecutor(executor)
 
-    val execute = ignoreExtraCallsWhileRunning:
+    usageUpdateTask = Some(backgroundTasks.scheduleNonConcurrentPollingTask(Duration(20, SECONDS)):
       val (slist, dlist) =
         synchronized:
           (stores.valuesIterator.toList, storageDevices.valuesIterator.toList)
@@ -206,9 +206,6 @@ class StoreManager(val client: AspenClient,
         deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
 
       Future.sequence(List(fs, fd))
-
-    usageUpdateTask = Some(backgroundTasks.schedulePeriodic(Duration(20, SECONDS)):
-      execute()
     )
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future

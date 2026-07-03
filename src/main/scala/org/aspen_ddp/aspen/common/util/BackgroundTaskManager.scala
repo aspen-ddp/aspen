@@ -61,6 +61,20 @@ class BackgroundTaskManager(protected val executionContext: ExecutionContext) {
       case _: java.util.concurrent.RejectedExecutionException => ShutdownTask
   }
 
+  /** Schedules a periodic polling task where only one invocation of the supplied
+    * Future-returning function runs at a time. If a prior invocation's Future is still
+    * outstanding when the period elapses, that tick is ignored. Combines schedulePeriodic
+    * with ignoreExtraCallsWhileRunning to prevent polling operations from piling up during
+    * extended offline periods.
+    *
+    * @param callNow Defaults to false. If true, the function is executed immediately,
+    *               otherwise it waits for the polling period to elapse.
+    */
+  def scheduleNonConcurrentPollingTask[T](period: Duration, callNow: Boolean = false)(fn: => Future[T]): ScheduledTask = synchronized {
+    val execute = ignoreExtraCallsWhileRunning(fn)
+    schedulePeriodic(period, callNow) { execute() }
+  }
+
   def retryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)(fn: => Boolean): ScheduledTask = {
     RetryWithExponentialBackoff(tryNow, initialDelay, maxDelay)(fn)
   }
@@ -128,6 +142,8 @@ object BackgroundTaskManager:
     override def scheduleRandomlyWithinWindow(window: Duration)(fn: => Unit): ScheduledTask = ShutdownTask
 
     override def schedulePeriodic(period: Duration, callNow: Boolean)(fn: => Unit): ScheduledTask = ShutdownTask
+
+    override def scheduleNonConcurrentPollingTask[T](period: Duration, callNow: Boolean)(fn: => Future[T]): ScheduledTask = ShutdownTask
 
     override def retryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)(fn: => Boolean): ScheduledTask = ShutdownTask
   

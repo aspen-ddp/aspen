@@ -53,6 +53,14 @@ final case class CheckStorageDevice(
                                      deviceId: StorageDeviceId
                                    ) extends HostMessage
 
+final case class ServiceMessage(
+                                 toHost: HostId,
+                                 fromClient: ClientId,
+                                 serviceUUID: UUID,
+                                 encodedContent: Array[Byte]
+                               ) extends HostMessage
+
+
 sealed abstract class TxMessage extends Message {
   val to: StoreId
   val from: StoreId

@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.network.ServiceMessage
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
@@ -53,6 +54,10 @@ class SimpleDurableServiceExecutor(
       renewalTimer.cancel()
       service.shutdown()
     ownedServices = Map.empty
+
+  override def deliverMessage(msg: ServiceMessage): Unit = synchronized:
+    ownedServices.get(msg.serviceUUID).foreach: (service, _) =>
+      service.receiveMessage(msg)
 
   protected def scheduleScan(): Unit =
     val rangeMillis = maxScanInterval.toMillis - minScanInterval.toMillis

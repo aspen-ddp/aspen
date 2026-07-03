@@ -774,6 +774,8 @@ class StoreManager(val client: AspenClient,
         case m: StartStoreTransfer => startStoreTransferOut(m)
         case m: StoreTransferData => transferDataReceived(m)
         case m: CheckStorageDevice => checkStorageDevice(m.deviceId)
+        case m: ServiceMessage =>
+          serviceExecutorPromise.future.foreach(_.deliverMessage(m))
       
       case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
         store.repair(os, completion)

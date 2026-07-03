@@ -95,6 +95,8 @@ object BaseReadDriverSuite {
 
     override def sendHostMessage(msg: HostMessage): Unit = ()
 
+    private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]] = ???
+
     private[aspen] def getSystemAttribute(key: String): Option[String] = None
     private[aspen] def setSystemAttribute(key: String, value: String): Unit = ()
 

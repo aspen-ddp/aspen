@@ -178,3 +178,18 @@ class ProtobufMessageCodecSuite extends AnyFunSuite with Matchers:
     val tooShort = Array[Byte](1, 2)
     val decoded = ProtobufMessageCodec.decodeMessage(tooShort)
     decoded shouldBe None
+
+  test("ServiceMessage - roundtrip via encodeHostMessage"):
+    val serviceUUID = testUUID(777)
+    val content = Array[Byte](1, 2, 3, 4, 5)
+    val original = ServiceMessage(hostId1, clientId1, serviceUUID, content)
+    val encoded = ProtobufMessageCodec.encodeHostMessage(original)
+    val decoded = ProtobufMessageCodec.decodeMessage(encoded)
+
+    decoded shouldBe defined
+    decoded.get shouldBe a[ServiceMessage]
+    val result = decoded.get.asInstanceOf[ServiceMessage]
+    result.toHost shouldBe original.toHost
+    result.fromClient shouldBe original.fromClient
+    result.serviceUUID shouldBe original.serviceUUID
+    result.encodedContent.toList shouldBe original.encodedContent.toList

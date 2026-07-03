@@ -19,6 +19,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
+import org.aspen_ddp.aspen.compute.ServiceEntry
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreManager, transaction}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
@@ -211,6 +212,16 @@ object TestNetwork {
 
     override def sendHostMessage(msg: HostMessage): Unit = messenger.sendHostMessage(msg)
 
+    private lazy val servicesTkvl =
+      TieredKeyValueList(this, KVObjectRootManager(this, Radicle.ServicesTreeKey, radicle))
+
+    private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]] =
+      servicesTkvl.get(Key(serviceUUID)).map:
+        case None => None
+        case Some(vs) =>
+          val entry = ServiceEntry.decode(vs.value.bytes)
+          if entry.isClaimed then Some(HostId(entry.hostId)) else None
+
     def getSystemAttribute(key: String): Option[String] = attributes.get(key)
     def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value
   }
@@ -236,6 +247,7 @@ class TestNetwork(executionContext: ExecutionContext,
   val storageDeviceId = StorageDeviceId.BootstrapStorageDeviceId
 
   var handleDepth = 0
+  var capturedHostMessages: List[HostMessage] = Nil
 
   val bootstrapSD = StorageDeviceState(
     storageDeviceId,
@@ -286,7 +298,8 @@ class TestNetwork(executionContext: ExecutionContext,
 
     def sendTransactionMessages(msg: List[TxMessage]): Unit = msg.foreach(sendTransactionMessage)
 
-    def sendHostMessage(msg: HostMessage): Unit = ()
+    def sendHostMessage(msg: HostMessage): Unit = TestNetwork.this.synchronized:
+      capturedHostMessages = capturedHostMessages :+ msg
 
     def dropCacheForStore(storeId: StoreId): Unit = ()
   }

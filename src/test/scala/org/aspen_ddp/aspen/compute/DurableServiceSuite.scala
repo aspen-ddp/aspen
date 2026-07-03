@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.network.ServiceMessage
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.compute.impl.SimpleDurableServiceExecutor
 import org.scalatest.funsuite.AnyFunSuite
@@ -48,19 +49,23 @@ class DurableServiceSuite extends IntegrationTestSuite:
   // Per-test promises; reset in subFixtureSetup
   private var claimedPromise: Promise[Unit]  = scala.compiletime.uninitialized
   private var shutdownPromise: Promise[Unit] = scala.compiletime.uninitialized
+  private var receivedPromise: Promise[ServiceMessage] = scala.compiletime.uninitialized
 
   // Stable factory object — captures promises by reference (reads them at call time)
   private val stableFactory: DurableServiceFactory = new DurableServiceFactory:
     val typeUUID: UUID = fixedTypeUUID
     def createService(c: AspenClient, ptr: KeyValueObjectPointer, state: KeyValueObjectState): DurableService =
       claimedPromise.trySuccess(())
-      new DurableService { def shutdown(): Unit = shutdownPromise.trySuccess(()) }
+      new DurableService:
+        def shutdown(): Unit = shutdownPromise.trySuccess(())
+        override def receiveMessage(msg: ServiceMessage): Unit = receivedPromise.trySuccess(msg)
 
   override def userTypeFactories: List[RegisteredTypeFactory] = List(stableFactory)
 
   override def subFixtureSetup(): Unit =
     claimedPromise  = Promise[Unit]()
     shutdownPromise = Promise[Unit]()
+    receivedPromise = Promise[ServiceMessage]()
 
   def makeExecutor(): SimpleDurableServiceExecutor =
     new SimpleDurableServiceExecutor(
@@ -212,3 +217,63 @@ class DurableServiceSuite extends IntegrationTestSuite:
     yield
       exec.shutdown()
       vs shouldBe None
+
+  atest("deliverMessage routes to the owning service's receiveMessage"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val content = Array[Byte](1, 2, 3)
+    val exec = makeExecutor()
+    for
+      _   <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _   <- claimedPromise.future
+      _    = exec.deliverMessage(ServiceMessage(testHostId, client.clientId, svcUUID, content))
+      msg <- receivedPromise.future
+    yield
+      exec.shutdown()
+      msg.serviceUUID shouldBe svcUUID
+      msg.encodedContent.toList shouldBe content.toList
+
+  atest("deliverMessage is a no-op for a service this host does not own"):
+    given ExecutionContext = executionContext
+    val exec = makeExecutor()
+    noException should be thrownBy exec.deliverMessage(
+      ServiceMessage(testHostId, client.clientId, UUID.randomUUID(), Array.emptyByteArray))
+    exec.shutdown()
+    Future.successful(succeed)
+
+  atest("getServiceHost returns the claiming host"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val exec = makeExecutor()
+    for
+      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _  <- claimedPromise.future
+      oh <- client.getServiceHost(svcUUID)
+    yield
+      exec.shutdown()
+      oh shouldBe Some(testHostId)
+
+  atest("getServiceHost returns None for an unknown service"):
+    given ExecutionContext = executionContext
+    for
+      oh <- client.getServiceHost(UUID.randomUUID())
+    yield
+      oh shouldBe None
+
+  atest("sendServiceMessage sends a ServiceMessage to the owning host"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val content = Array[Byte](9, 8, 7)
+    val exec = makeExecutor()
+    for
+      _ <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _ <- claimedPromise.future
+      _ <- client.sendServiceMessage(svcUUID, content)
+    yield
+      exec.shutdown()
+      val sent = net.capturedHostMessages.collect:
+        case m: ServiceMessage if m.serviceUUID == svcUUID => m
+      sent.size shouldBe 1
+      sent.head.toHost shouldBe testHostId
+      sent.head.fromClient shouldBe client.clientId
+      sent.head.encodedContent.toList shouldBe content.toList

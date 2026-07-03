@@ -1,15 +1,9 @@
 
-Make util.ignoreExtraCallsWhileRunning a first-class citizen
-  - Add method: AspenClient.addPollingOperation(fn: () => Future[Unit], duration, callNow): ScheduledTask
-    - Implemented in terms of BackgroundTaskManager
-    - Uses ignoreExtraCallsWhileRunning to safely call the function
-  - Provides a simple and consistent interface for all poll-based mechanisms to use
+Re-implement TClient as subclass of SimpleAspenClient
+  - See if a refactor can do this
+  - duplicated impleentation is burdensome
 
 Service Infrastructure
-  - Service Messages
-    - ServiceMessage(hostId: HostId, serviceUUID: UUID, contents: Array[Byte])
-    - DurableService has method: messageReceived(encodedMessage: Array[Byte]): Unit
-    - Lookup hostId currently owning the service, send message
   - Extend DurableTask to be stoppable
     - Allows cancellation of logic/retry logic if a lease is lost
     - Optional

@@ -399,6 +399,13 @@ message CheckStorageDevice {
   StorageDeviceId deviceId = 3;
 }
 
+message ServiceMessage {
+  UUID toHost = 1;
+  UUID fromClient = 2;
+  UUID serviceUUID = 3;
+  bytes encodedContent = 4;
+}
+
 
 //---------------------------------------------------------------------------
 //- Root Message
@@ -427,6 +434,7 @@ message Message {
     StoreTransferData store_transfer_data = 22;
     CheckStorageDevice check_storage_device = 23;
     TxUnknownStore unknown_store = 24;
+    ServiceMessage service_message = 25;
   }
 }
 

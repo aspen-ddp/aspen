@@ -948,6 +948,20 @@ object Codec extends Logging:
     val deviceId = decode(m.deviceId.get)
     CheckStorageDevice(toHost, fromClient, deviceId)
 
+  def encode(o: ServiceMessage): codec.ServiceMessage =
+    codec.ServiceMessage(
+      toHost = Some(encodeUUID(o.toHost.uuid)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      serviceUUID = Some(encodeUUID(o.serviceUUID)),
+      encodedContent = ByteString.copyFrom(o.encodedContent)
+    )
+
+  def decode(m: codec.ServiceMessage): ServiceMessage =
+    val toHost = HostId(decodeUUID(m.toHost.get))
+    val fromClient = ClientId(decodeUUID(m.fromClient.get))
+    val serviceUUID = decodeUUID(m.serviceUUID.get)
+    ServiceMessage(toHost, fromClient, serviceUUID, m.encodedContent.toByteArray)
+
 
   // ----------------------- Non Network Messages -----------------------
 

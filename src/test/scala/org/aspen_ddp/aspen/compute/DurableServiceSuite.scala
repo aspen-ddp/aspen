@@ -240,3 +240,22 @@ class DurableServiceSuite extends IntegrationTestSuite:
       ServiceMessage(testHostId, client.clientId, UUID.randomUUID(), Array.emptyByteArray))
     exec.shutdown()
     Future.successful(succeed)
+
+  atest("getServiceHost returns the claiming host"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    val exec = makeExecutor()
+    for
+      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _  <- claimedPromise.future
+      oh <- client.getServiceHost(svcUUID)
+    yield
+      exec.shutdown()
+      oh shouldBe Some(testHostId)
+
+  atest("getServiceHost returns None for an unknown service"):
+    given ExecutionContext = executionContext
+    for
+      oh <- client.getServiceHost(UUID.randomUUID())
+    yield
+      oh shouldBe None

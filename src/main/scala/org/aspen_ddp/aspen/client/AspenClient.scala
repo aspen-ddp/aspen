@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage}
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage, ServiceMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -251,6 +251,7 @@ trait AspenClient extends ObjectReader:
 
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
   private[aspen] def sendHostMessage(msg: HostMessage): Unit
+  private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]
 
   private[aspen] def getSystemAttribute(key: String): Option[String]
   private[aspen] def setSystemAttribute(key: String, value: String): Unit

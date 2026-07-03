@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.compute.ServiceEntry
 
 import java.util.UUID
 import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
@@ -272,6 +273,16 @@ class SimpleAspenClient(val msngr: ClientMessenger,
 
   private[aspen] def sendHostMessage(msg: HostMessage): Unit =
     messenger.sendHostMessage(msg)
+
+  private lazy val servicesTkvl =
+    TieredKeyValueList(this, KVObjectRootManager(this, Radicle.ServicesTreeKey, radicle))
+
+  override def getServiceHost(serviceUUID: UUID): Future[Option[HostId]] =
+    servicesTkvl.get(Key(serviceUUID)).map:
+      case None => None
+      case Some(vs) =>
+        val entry = ServiceEntry.decode(vs.value.bytes)
+        if entry.isClaimed then Some(HostId(entry.hostId)) else None
 
   def getSystemAttribute(key: String): Option[String] = attributes.get(key)
   def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen
 
 import java.util.UUID
 import org.aspen_ddp.aspen
-import org.aspen_ddp.aspen.client.internal.{MetadataTree, ObjectAllocatorManager, OpportunisticRebuildManager}
+import org.aspen_ddp.aspen.client.internal.{BaseAspenClient, OpportunisticRebuildManager}
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, ExponentialBackoffRetryStrategy, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RegisteredTypeFactory, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, Read, ReadResponse, TransactionCompletionResponse, TransactionFinalized, TransactionResolved, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
@@ -63,168 +63,31 @@ object TestNetwork {
 
   class TClient(executionContext: ExecutionContext,
                 msngr: ClientMessenger,
-                val radicle: KeyValueObjectPointer,
+                radicle: KeyValueObjectPointer,
                 ida: IDA,
-                userTypeFactories: List[RegisteredTypeFactory] = Nil) extends AspenClient {
+                userTypeFactories: List[RegisteredTypeFactory] = Nil)
+    extends BaseAspenClient(
+      executionContext,
+      radicle,
+      ClientId(new UUID(0, 1)),
+      msngr,
+      TransactionStatusCache.NoCache,
+      ObjectCache.NoCache,
+      BaseReadDriver.noErrorRecoveryReadDriver,
+      ClientTransactionDriver.noErrorRecoveryFactory,
+      userTypeFactories):
 
-    given ExecutionContext = executionContext
+    override def opportunisticRebuildManager: OpportunisticRebuildManager =
+      OpportunisticRebuildManager.None
 
-    var attributes: Map[String, String] = Map()
+    // Fixed IDA: the test network lives entirely within the bootstrap pool, so resolving the
+    // pool per-read would recurse. Returning the known IDA breaks that cycle.
+    override protected def resolveIda(pointer: ObjectPointer): Future[IDA] =
+      Future.successful(ida)
 
-    override val clientId: ClientId = ClientId(new UUID(0,1))
-
-    val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
-
-    val typeRegistry: TypeRegistry = TypeRegistry(
-      org.aspen_ddp.aspen.common.TypeFactories.factories,
-      org.aspen_ddp.aspen.client.TypeFactories.factories,
-      org.aspen_ddp.aspen.server.TypeFactories.factories,
-      userTypeFactories
-    )
-
-    val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
-    val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
-    val allocatorManager: ObjectAllocatorManager = new ObjectAllocatorManager(this)
-
-    val rmgr = new ReadManager(this, BaseReadDriver.noErrorRecoveryReadDriver)
-
-    def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] = {
-      rmgr.read(pointer, ida, comment).map(_.asInstanceOf[DataObjectState])
-    }
-
-    def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = {
-      rmgr.read(pointer, ida, comment).map(_.asInstanceOf[KeyValueObjectState])
-    }
-
-    val txManager = new TransactionManager(this, ClientTransactionDriver.noErrorRecoveryFactory)
-
-    def newTransaction(): Transaction = {
-      new TransactionImpl(this, txManager, _ => 0, None)
-    }
-
-    override def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] =
-      allocatorManager.getAllocator(allocatorId)
-
-    def getStoragePoolId(poolName: String): Future[PoolId] = ???
-    def getHostId(hostName: String): Future[HostId] = ???
-    def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
-    def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] =
-      namespacedRegistry.getRegisteredObject("device-set", setName).map(StorageDeviceSetId(_))
-
-    val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
-    val namespacedRegistry = new NamespacedUUIDRegistry(this, radicle, Radicle.NamespacedRegistryKey)
-
-    val storagePoolsTree = new MetadataTree(this, radicle, Radicle.StoragePoolsTreeKey)
-    val allocationGroupsTree = new MetadataTree(this, radicle, Radicle.AllocationGroupsTreeKey)
-    val hostsTree = new MetadataTree(this, radicle, Radicle.HostsTreeKey)
-    val storageDevicesTree = new MetadataTree(this, radicle, Radicle.StorageDevicesTreeKey)
-    val storageDeviceSetsTree = new MetadataTree(this, radicle, Radicle.StorageDeviceSetsTreeKey)
-
-    private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =
-      storagePoolsTree.get(poolId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
-
-    private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] =
-      hostsTree.get(hostId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
-
-    private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] =
-      storageDevicesTree.get(storageDeviceId.uuid).map(_.asInstanceOf[KeyValueObjectPointer])
-
-    override def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] =
-      allocationGroupsTree.get(allocationGroupId.uuid).map(_.asInstanceOf[DataObjectPointer])
-
-    private[aspen] def getStorageDeviceSetPointer(storageDeviceSetId: StorageDeviceSetId): Future[DataObjectPointer] =
-      storageDeviceSetsTree.get(storageDeviceSetId.uuid).map(_.asInstanceOf[DataObjectPointer])
-
-    override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
-      val ags = AllocationGroupState(
-        AllocationGroupId(UUID.randomUUID()),
-        level,
-        groupName,
-        Nil,
-        Nil
-      )
-
-      val tx = newTransaction()
-      given Transaction = tx
-
-      for
-        bsPool <- getStoragePool(PoolId.BootstrapPoolId)
-        ptr <- bsPool.allocator.allocateDataObject(DataBuffer(ags.toBytes))
-        _ <- allocationGroupsTree.preparePut(ags.groupId.uuid, ptr)
-        _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
-        _ <- tx.commit()
-      yield
-        ags.groupId
-
-    override def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId] =
-      val sds = StorageDeviceSetState(
-        StorageDeviceSetId(UUID.randomUUID()),
-        name,
-        level,
-        parent,
-        Nil,
-        Nil,
-        Nil
-      )
-
-      val tx = newTransaction()
-      given Transaction = tx
-
-      def addToParent(parentId: StorageDeviceSetId): Future[Unit] =
-        for
-          parentPtr <- getStorageDeviceSetPointer(parentId)
-          parentDos <- read(parentPtr)
-        yield
-          val parentState = StorageDeviceSetState(parentDos)
-          val updated = parentState.copy(memberSets = sds.setId :: parentState.memberSets)
-          tx.overwrite(parentPtr, parentDos.revision, DataBuffer(updated.toBytes))
-
-      for
-        bsPool <- getStoragePool(PoolId.BootstrapPoolId)
-        ptr <- bsPool.allocator.allocateDataObject(DataBuffer(sds.toBytes))
-        _ <- storageDeviceSetsTree.preparePut(sds.setId.uuid, ptr)
-        _ <- namespacedRegistry.prepareRegisterObject("device-set", sds.name, sds.setId.uuid)
-        _ <- parent match
-               case None => Future.unit
-               case Some(parentId) => addToParent(parentId)
-        _ <- tx.commit()
-      yield
-        sds.setId
-
-    protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
-
-    override def shutdown(): Unit = backgroundTaskManager.shutdown(Duration(50, MILLISECONDS))
-
-    def clientContext: ExecutionContext = executionContext
-
-    def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
-
-    val messenger: ClientMessenger = msngr
-
-    val objectCache: ObjectCache = ObjectCache.NoCache
-
-    def receiveClientResponse(msg: ClientResponse): Unit = msg match {
-      case m: ReadResponse => rmgr.receive(m)
-      case m: TransactionCompletionResponse => rmgr.receive(m)
-      case m: TransactionResolved => txManager.receive(m)
-      case m: TransactionFinalized => txManager.receive(m)
-    }
-
-    override def sendHostMessage(msg: HostMessage): Unit = messenger.sendHostMessage(msg)
-
-    private lazy val servicesTkvl =
-      TieredKeyValueList(this, KVObjectRootManager(this, Radicle.ServicesTreeKey, radicle))
-
-    private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]] =
-      servicesTkvl.get(Key(serviceUUID)).map:
-        case None => None
-        case Some(vs) =>
-          val entry = ServiceEntry.decode(vs.value.bytes)
-          if entry.isClaimed then Some(HostId(entry.hostId)) else None
-
-    def getSystemAttribute(key: String): Option[String] = attributes.get(key)
-    def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value
-  }
+    // Single attempt, no retry: test failures must surface rather than being retried away.
+    override protected def runCreate[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T] =
+      transact(prepare)
 }
 
 

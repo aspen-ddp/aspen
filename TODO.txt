@@ -1,8 +1,4 @@
 
-Re-implement TClient as subclass of SimpleAspenClient
-  - See if a refactor can do this
-  - duplicated impleentation is burdensome
-
 Service Infrastructure
   - Extend DurableTask to be stoppable
     - Allows cancellation of logic/retry logic if a lease is lost

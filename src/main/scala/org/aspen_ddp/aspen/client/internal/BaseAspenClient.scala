@@ -55,7 +55,7 @@ abstract class BaseAspenClient(
 
   val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
 
-  val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
+  lazy val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
 
   private val rmgr = new ReadManager(this, readDriverFactory)
 

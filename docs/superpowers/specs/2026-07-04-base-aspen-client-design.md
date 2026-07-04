@@ -94,7 +94,10 @@ remain accessible/overridable). `abstract class BaseAspenClient(...) extends Asp
 - `userTypeFactories: List[RegisteredTypeFactory]`
 
 **Overridable extension points (abstract; only called post-construction):**
-- `def opportunisticRebuildManager: OpportunisticRebuildManager`
+- `def opportunisticRebuildManager: OpportunisticRebuildManager` — `SimpleAspenClient`
+  overrides this with a `lazy val` so the manager is created exactly once with thread-safe
+  initialization (fixing a latent bug where the current `def` returns a new instance on
+  every call). `TClient` overrides with a plain `def` returning the `None` singleton.
 - `protected def resolveIda(pointer: ObjectPointer): Future[IDA]`
 - `protected def runCreate[T](onFail: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T]`
 
@@ -123,7 +126,9 @@ class SimpleAspenClient(msngr, clientId, executionContext, radicle,
     SimpleClientTransactionDriver.factory(txRetransmitDelay),
     userTypeFactories):
 
-  override def opportunisticRebuildManager = new SimpleOpportunisticRebuildManager(this)
+  // lazy val: create the manager exactly once, with thread-safe initialization
+  // (the current `def` bug creates a new instance on every call).
+  override lazy val opportunisticRebuildManager = new SimpleOpportunisticRebuildManager(this)
   override protected def resolveIda(p) = getStoragePool(p.poolId).map(_.ida)
   override protected def runCreate(onFail)(prepare) = transactUntilSuccessfulWithRecovery(onFail)(prepare)
 

@@ -53,6 +53,10 @@ abstract class BaseAspenClient(
     userTypeFactories
   )
 
+  val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
+
+  val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
+
   private val rmgr = new ReadManager(this, readDriverFactory)
 
   private val objectRegistry = new UUIDObjectRegistry(this, radicle, Radicle.ObjectRegistryKey)
@@ -68,10 +72,6 @@ abstract class BaseAspenClient(
   protected val allocatorManager = new ObjectAllocatorManager(this)
 
   private val txManager = new TransactionManager(this, txDriverFactory)
-
-  val retryStrategy: RetryStrategy = new ExponentialBackoffRetryStrategy(this)
-
-  val backgroundTaskManager: BackgroundTaskManager = new BackgroundTaskManager(executionContext)
 
   def clientContext: ExecutionContext = executionContext
 

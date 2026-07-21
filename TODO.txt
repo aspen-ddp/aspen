@@ -4,32 +4,69 @@ Service Infrastructure
     - Allows cancellation of logic/retry logic if a lease is lost
     - Optional
       - Not needed for AmoebaFS as task is currently tied to the NFS-implementation host
-      - Can always extend this in the future to a
+      - Can always extend this in the future to a more robust implementation
     - Has final stop() method
       - Called on lease loss & clean shutdown during unit testing
-      - unregisters background task used to update the lease timestamp
-      - Sets @volatile var isStopped: Boolean to true
+      - Sets @volatile protected var isStopped: Boolean to true
         - for use in async retry loops to detect that retries should be stopped
-      - calls def onStop(): Unit method to allow subclass to take action
+        - Need to extend SteppedDurableTask logic to detect the stop before taking the next step
+          and in retry logic to exit rather than retry forever
+      - calls protected def onStop(): Unit method to allow subclass to take action
 
 Rebalancing
   - Split into two phases: Planning & Execution
   - Planning phase takes current state of all devices in set and makes a full transfer plan
-    - Add varaible to StorageDeviceSetState
+    - Most of the planning process is implemented in the aspen.common.rebalancing Plan & State modules
+    - Use these to create the transfer plan
+    - Add the following variable to StorageDeviceSetState to store the transfer plan
       - pendingTransfers: List[(storeId, fromDeviceId, toDeviceId)]
-      - populate this with results from rebalance plan
-  - RebalancingService
+  - RebalancingDurableService
+    - implement in the aspen.common.rebalancing package
+    - State object for the RebalancingDurableService has an ActiveRebalancingTasks key/value pair
+      - Value is list of (storageDeviceSetId, <durableTaskStateObjectPointer>)
+      - Polled every few minutes to find newly created SetRebalanceDurableTasks
+        - Use scheduleNonConcurrentPollingTask to protect against read pileups
+      - Poll is backup for failing to receive NewSetRebalanceInitiated messages sent to this service
+        - reception causes service to immediately re-read the state object and look for newly created tasks
+      - When a new task is detected, the service creates a new instance of SetRebalanceDurableTask to drive it to
+        completion
+      - If the lease is lost, call stop() on all active rebalancing tasks and discard them
+        - Next host to acquire this service will create new instances
+    - Companion object has a rebalanceStorageDeviceSet(storageDeviceSetId): Future[Unit]
+      - read StorageDeviceSetState object. If pendingTransfers list is not empty, return success
+      - If empty,
+        - Read RebalancingDurableService object state to load the ActiveRebalancingTasks key/value pair
+        - If storageDeviceSetId in the list, return success
+        - If not, create rebalancing plan then in a single transaction:
+          - write plan to pendingTransfers variable (tx requirement on revision to protect against simultaneous writes)
+          - create state object for a new SetRebalanceDurableTask state object to drive the transfer process
+          - write updated ActiveRebalancingTasks list including the new set id and state object pointer (use tx
+            requirement to protect against simultaneous writes to the kv pair)
+          - Send a NewSetRebalanceInitiated message to the RebalancingDurableService
     - Create SetRebalanceDurableTask to drive a rebalance operation for a device set
       - pendingTransfers list should already be populated
       - For each store to be transferred, read state of destination device
         - If in TransferringIn state, poll for its completion
-    - Destination host sends TransferComplete message to Service w/ SetId, StoreId, from/to devices
+          - Need to protect against read pileups.
+          - BackgroundTaskManager probably isn't appropriate, maybe the similar function in the util package would '
+            be better.
+    - Transfer Destination host sends TransferComplete message to Service w/ SetId, StoreId, from/to devices
     - Slow-poll for completion of all active transfers (every 2 mins?)
-      - use TransferComplete messages to speed up the process
-    - Transfer one store at a time, can parallelize later
+      - reception of TransferComplete messages will speed up the process. Polling is just in case the message is lost
+      - Use scheduleNonConcurrentPollingTask to protect against read pileups
+    - Transfer one store at a time.
+      - Can parallelize later
     - Prior to transfer initiation, verify pool wont drop below write threshold
       - Add stub for AspenClient.offlineHosts(): Set[HostId] = Set()
       - need to mark stores on devices backed by offline hosts as unavailable when checking the threshold
+      - All stores that are not currently in the Active state are also "offline"
+      - Total number of online and active stores must be greater than the write threshold
+    - After completion of a transfer, update the pendingTransfers variable to remove the corresponding entry
+    - When all transfers are complete, update the RebalancingDurableService state object to remove the task from the
+      ActiveRebalancingTasks list
+    - The service needs to detect completion of the task and discard it
+      - could be done either through seeing the task deleted when polling the state object, or, probably easier would
+        be to use the Future to task completion
 
 Revisit pool creation
   - Should be implemented in terms of StorageDeviceSetState

@@ -18,17 +18,17 @@ object TransferringIn:
 class TransferringIn( val client: AspenClient,
                       val storeId: StoreId,
                       val storageDeviceId: StorageDeviceId,
-                      val devicePath: Path ) extends Logging:
+                      val devicePath: Path ) extends StoreTransferIn with Logging:
 
   import TransferringIn.*
 
   val transferUUID: UUID = UUID.randomUUID()
   
-  private val completionPromise: Promise[TransferringIn] = Promise()
+  private val completionPromise: Promise[Unit] = Promise()
   private val transferInPath = os.Path(devicePath) / TransferDirectory / storeId.directoryName
   private val finalPath = os.Path(devicePath) / storeId.directoryName
-  
-  def complete: Future[TransferringIn] = completionPromise.future
+
+  def complete: Future[Unit] = completionPromise.future
 
   if os.exists(finalPath) then
     throw new Exception(s"Store path already exists! $finalPath")
@@ -92,6 +92,6 @@ class TransferringIn( val client: AspenClient,
 
         os.move(transferInPath, finalPath)
 
-        completionPromise.success(this)
+        completionPromise.success(())
       else
         extractionProcess.stdin.write(db.getByteArray)

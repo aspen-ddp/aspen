@@ -19,7 +19,7 @@ import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, 
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ReadError, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
-import org.aspen_ddp.aspen.server.transfer.{TransferringIn, TransferringOut}
+import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringIn, TransferringOut}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTaskExecutor}
@@ -81,7 +81,8 @@ class StoreManager(val client: AspenClient,
                    val finalizerFactory: TransactionFinalizer.Factory,
                    val txDriverFactory: TransactionDriver.Factory,
                    val heartbeatPeriod: Duration,
-                   val checkStorageDevicePeriod: Duration) extends Logging {
+                   val checkStorageDevicePeriod: Duration,
+                   val storeTransferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem) extends Logging {
   import StoreManager._
   
   given ExecutionContext = ec
@@ -106,8 +107,8 @@ class StoreManager(val client: AspenClient,
 
   private var offlineStores: Set[StoreId] = Set()
   private var creatingStores: Set[StoreId] = Set()
-  private var transferringOut: Map[StoreId, TransferringOut] = Map()
-  private var transferringInUUIDs: Map[UUID, TransferringIn] = Map()
+  private var transferringOut: Map[StoreId, StoreTransferOut] = Map()
+  private var transferringInUUIDs: Map[UUID, StoreTransferIn] = Map()
   private var transferringInStoreIds: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
@@ -351,7 +352,7 @@ class StoreManager(val client: AspenClient,
 
     if ! transferringInStoreIds.contains(storeId) then
       storageDevices.get(toDeviceid).foreach: toDevice =>
-        val ti = new TransferringIn(
+        val ti = storeTransferFactory.createTransferIn(
           client,
           storeId,
           toDeviceid,
@@ -420,7 +421,7 @@ class StoreManager(val client: AspenClient,
               fclosed.foreach: _ =>
                 synchronized {
                   if ! transferringOut.contains(m.storeId) then
-                    val to = new TransferringOut(
+                    val to = storeTransferFactory.createTransferOut(
                       client,
                       sourceDs.storageDeviceId,
                       sourceDs.devicePath,

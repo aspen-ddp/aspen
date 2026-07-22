@@ -21,14 +21,14 @@ class TransferringOut( val client: AspenClient,
                        val toHost: HostId,
                        val toDevice: StorageDeviceId,
                        val timestamp: HLCTimestamp,
-                       val transferUUID: UUID ) extends Logging:
+                       val transferUUID: UUID ) extends StoreTransferOut with Logging:
 
   import TransferringOut.*
 
   private val storePath = os.Path(devicePath) / storeId.directoryName
-  private val completionPromise: Promise[TransferringOut] = Promise()
+  private val completionPromise: Promise[Unit] = Promise()
 
-  def complete: Future[TransferringOut] = completionPromise.future
+  def complete: Future[Unit] = completionPromise.future
 
   // Create marker file so the server knows not to load this store
   os.write.over(storePath / MarkerFile, "")
@@ -86,4 +86,4 @@ class TransferringOut( val client: AspenClient,
     catch
       case t: Throwable => logger.warn(s"Transfer out of store $storeId failed. Error: $t")
 
-    completionPromise.success(this)
+    completionPromise.success(())

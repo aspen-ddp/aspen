@@ -1130,6 +1130,21 @@ object Codec extends Logging:
     new StorageDeviceSetState(setId, m.name, m.level, parent, memberDevices, memberSets,
       assignedPools, pendingTransfers)
 
+  def encode(o: (StorageDeviceSetId, KeyValueObjectPointer)): codec.ActiveRebalancingTask =
+    codec.ActiveRebalancingTask(
+      setId = Some(encodeUUID(o._1.uuid)),
+      taskState = Some(encode(o._2: ObjectPointer))
+    )
+
+  def decodeActiveRebalancingTask(m: codec.ActiveRebalancingTask):
+      (StorageDeviceSetId, KeyValueObjectPointer) =
+    val setId = StorageDeviceSetId(decodeUUID(m.setId.get))
+    decode(m.taskState.get) match
+      case p: KeyValueObjectPointer => (setId, p)
+      case other =>
+        throw new IllegalArgumentException(
+          s"ActiveRebalancingTask.taskState must be a KeyValueObjectPointer, got ${other.objectType}")
+
 
   def encode(o: HostState): codec.HostState =
     codec.HostState(

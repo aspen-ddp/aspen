@@ -514,6 +514,15 @@ message PendingTransfer {
   StorageDeviceId toDevice = 3;
 }
 
+message ActiveRebalancingTask {
+  UUID setId = 1;
+  ObjectPointer taskState = 2;
+}
+
+message ActiveRebalancingTasks {
+  repeated ActiveRebalancingTask tasks = 1;
+}
+
 message StorageDeviceSetState {
   UUID setId = 1;
   string name = 2;

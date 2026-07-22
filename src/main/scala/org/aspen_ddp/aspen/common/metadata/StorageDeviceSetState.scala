@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, DataObjectState
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.byte2long
 
 import java.util.UUID
@@ -37,7 +38,8 @@ final case class StorageDeviceSetState(
     parent: Option[StorageDeviceSetId],
     memberDevices: List[StorageDeviceId],
     memberSets: List[StorageDeviceSetId],
-    assignedPools: List[PoolId]
+    assignedPools: List[PoolId],
+    pendingTransfers: List[(StoreId, StorageDeviceId, StorageDeviceId)] = Nil
 ):
   def toBytes: Array[Byte] = Codec.encode(this).toByteArray
 

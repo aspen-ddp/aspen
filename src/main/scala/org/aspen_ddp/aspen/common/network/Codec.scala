@@ -1109,7 +1109,13 @@ object Codec extends Logging:
       parent = o.parent.map(p => encodeUUID(p.uuid)),
       memberDevices = o.memberDevices.map(d => encodeUUID(d.uuid)),
       memberSets = o.memberSets.map(s => encodeUUID(s.uuid)),
-      assignedPools = o.assignedPools.map(p => encodeUUID(p.uuid))
+      assignedPools = o.assignedPools.map(p => encodeUUID(p.uuid)),
+      pendingTransfers = o.pendingTransfers.map: (storeId, from, to) =>
+        codec.PendingTransfer(
+          storeId = Some(encode(storeId)),
+          fromDevice = Some(encode(from)),
+          toDevice = Some(encode(to))
+        )
     )
 
   def decode(m: codec.StorageDeviceSetState): StorageDeviceSetState =
@@ -1118,7 +1124,11 @@ object Codec extends Logging:
     val memberDevices = m.memberDevices.map(u => StorageDeviceId(decodeUUID(u))).toList
     val memberSets = m.memberSets.map(u => StorageDeviceSetId(decodeUUID(u))).toList
     val assignedPools = m.assignedPools.map(u => PoolId(decodeUUID(u))).toList
-    new StorageDeviceSetState(setId, m.name, m.level, parent, memberDevices, memberSets, assignedPools)
+    val pendingTransfers = m.pendingTransfers.map: pt =>
+      (decode(pt.storeId.get), decode(pt.fromDevice.get), decode(pt.toDevice.get))
+    .toList
+    new StorageDeviceSetState(setId, m.name, m.level, parent, memberDevices, memberSets,
+      assignedPools, pendingTransfers)
 
 
   def encode(o: HostState): codec.HostState =

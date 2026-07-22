@@ -241,6 +241,11 @@ trait AspenClient extends ObjectReader:
 
   def backgroundTaskManager: BackgroundTaskManager
 
+  /** Hosts currently believed to be offline. Stub returns empty until host
+   *  liveness tracking exists; used by rebalancing to avoid moving stores onto,
+   *  or counting availability from, offline hosts. */
+  def offlineHosts(): Set[HostId] = Set()
+
   private[client] def opportunisticRebuildManager: OpportunisticRebuildManager
 
   private[client] val messenger: Messenger

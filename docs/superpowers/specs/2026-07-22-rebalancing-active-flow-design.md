@@ -38,9 +38,16 @@ This is the plan the task drains. Requires:
 ### `RebalancingDurableService` state object — `ActiveRebalancingTasks`
 
 The service's KV state object (at its `statePointer`) holds one key/value pair,
-`ActiveRebalancingTasks` = `List[(StorageDeviceSetId, DurableTaskPointer)]`. This is the
-registry the service polls to discover and resume tasks. Encoded/decoded with a small
-helper following existing `Codec` patterns.
+`ActiveRebalancingTasks` = `List[(StorageDeviceSetId, KeyValueObjectPointer)]` — the second
+element is the pointer to that task's (minimal) state object. This is the registry the
+service polls to discover and resume tasks. Encoded/decoded with a small helper following
+existing `Codec` patterns.
+
+Each `SetRebalanceDurableTask` has a minimal KV state object (holding just its `setId`),
+allocated by `rebalanceStorageDeviceSet`. Its purpose is to satisfy the `DurableTask`
+`taskPointer` contract and to be the durable, refcount-tracked anchor the service points at;
+all *progress* lives in the set's `pendingTransfers`, so the object's contents are otherwise
+vestigial.
 
 **Two lists, two purposes:** `pendingTransfers` on the *set* is the plan a task drains;
 `ActiveRebalancingTasks` on the *service* is the registry the service uses to discover
@@ -53,9 +60,10 @@ when this host wins the lease inside `SimpleDurableServiceExecutor`.
 
 On construction:
 
-- Owns its own `SimpleTaskExecutor` (so its tasks are isolated and stoppable).
-- Reads `ActiveRebalancingTasks` and reconstructs a `SetRebalanceDurableTask` for each
-  `(setId, taskPointer)` to resume in-flight work.
+- Holds a `Map[StorageDeviceSetId, SetRebalanceDurableTask]` of the tasks it is driving.
+- Reads `ActiveRebalancingTasks` and directly constructs a `SetRebalanceDurableTask` for each
+  `(setId, taskStatePointer)` to resume in-flight work. (No `SimpleTaskExecutor`; the service
+  manages task instances directly.)
 - Starts a `scheduleNonConcurrentPollingTask` (~2 min) on `client.backgroundTaskManager`
   that re-reads state and reconciles: start tasks newly present in `ActiveRebalancingTasks`,
   and drop tasks whose completion has been observed.
@@ -72,10 +80,9 @@ to remove that `(setId, taskPointer)` from `ActiveRebalancingTasks` (revision-ch
 transaction) and drop the local instance. Using the completion future is simpler than
 detecting deletion during polling.
 
-`shutdown()` (lease loss / host shutdown): call `taskExecutor.shutdown()` (which `stop()`s
-every active task; they fail with `TaskStopped`), cancel the poll task, and clear local
-state. The next lease winner reconstructs everything from `ActiveRebalancingTasks` + each
-set's `pendingTransfers`.
+`shutdown()` (lease loss / host shutdown): call `stop()` on every task in the map (they fail
+with `TaskStopped`), cancel the poll task, and clear local state. The next lease winner
+reconstructs everything from `ActiveRebalancingTasks` + each set's `pendingTransfers`.
 
 `typeUUID`: a fresh, hard-coded UUID, registered in `server/TypeFactories.scala`, verified
 not to collide with existing factory UUIDs.
@@ -86,8 +93,9 @@ A custom `DurableTask` (not `SteppedDurableTask` — the number of transfers is 
 the durable state lives in the set's `pendingTransfers`, and the long async
 poll-for-completion wait does not fit `SteppedDurableTask`'s per-step-transaction model).
 
-Constructed with its `taskPointer`, the `client`, the `setId`, and a reference to the
-service (for polling helpers and message wake-ups). Serial: one transfer in flight at a time.
+Constructed by the service with its `taskPointer` (= `DurableTaskPointer(taskStatePointer)`),
+the `client`, the `setId`, and a reference to the service (for polling helpers and message
+wake-ups). Serial: one transfer in flight at a time.
 
 Main loop (`processNext`):
 
@@ -134,13 +142,15 @@ Before initiating a candidate transfer:
 
 `RebalancingDurableService.rebalanceStorageDeviceSet(client, setId): Future[Unit]`:
 
-1. Read `StorageDeviceSetState`. If `pendingTransfers` non-empty → return success (already running).
-2. Read the service state's `ActiveRebalancingTasks`. If `setId` present → return success.
+1. Read `StorageDeviceSetState` (a DataObject). If `pendingTransfers` non-empty → return success (already running).
+2. Locate the service state object: read the services TKVL (`Radicle.ServicesTreeKey`) entry for
+   the fixed `RebalancingDurableService.ServiceUUID` → `ServiceEntry.decode` → `statePointer`. Read it and
+   decode `ActiveRebalancingTasks`. If `setId` present → return success.
 3. Build the plan: `State.getStateForRebalancePlanning` → `Plan.computePlan`. If empty → return success.
 4. In a **single transaction**:
-   - Write the plan into the set's `pendingTransfers` (revision requirement on the set state).
-   - `prepareTask` a new `SetRebalanceDurableTask` (creates its state object), yielding the task pointer.
-   - Add `(setId, taskPointer)` to `ActiveRebalancingTasks` (revision requirement on the service state kv pair).
+   - Overwrite the set (DataObject) with the plan written into `pendingTransfers` (revision requirement on the set state).
+   - Allocate a minimal task state KV object (via `PoolObjectAllocator` on `Radicle.poolId`) holding `setId`.
+   - Add `(setId, taskStatePointer)` to `ActiveRebalancingTasks` (revision requirement on the service state kv pair).
 5. After commit, send `NewSetRebalanceInitiated(setId)` to the service (best-effort wake-up).
 
 Revision requirements make concurrent callers safe: the loser's transaction aborts and
@@ -233,7 +243,7 @@ moving a store between devices requires **no byte movement** — only the metada
 | `server/transfer/TransferringOut.scala` | Implement `StoreTransferOut` trait |
 | `server/StoreManager.scala` | Accept `StoreTransferFactory`; use factory; emit `TransferComplete` |
 | `client/AspenClient.scala` (+ `BaseAspenClient`) | `offlineHosts()` stub |
-| `server/TypeFactories.scala` | Register `RebalancingDurableServiceFactory` (+ task factory) |
+| `server/TypeFactories.scala` | Register `RebalancingDurableServiceFactory` (service only; the task is managed directly, not via a factory) |
 | `cmdline/...` | `rebalance <setId>` subcommand |
 | `src/test/.../TestNetwork.scala` | Second device, in-memory transfer factory, loopback host-message delivery |
 | New: `src/test/.../rebalancing/RebalancingServiceSuite.scala` | Integration tests |

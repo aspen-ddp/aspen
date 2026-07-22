@@ -1,18 +1,4 @@
 
-Service Infrastructure
-  - Extend DurableTask to be stoppable
-    - Allows cancellation of logic/retry logic if a lease is lost
-    - Optional
-      - Not needed for AmoebaFS as task is currently tied to the NFS-implementation host
-      - Can always extend this in the future to a more robust implementation
-    - Has final stop() method
-      - Called on lease loss & clean shutdown during unit testing
-      - Sets @volatile protected var isStopped: Boolean to true
-        - for use in async retry loops to detect that retries should be stopped
-        - Need to extend SteppedDurableTask logic to detect the stop before taking the next step
-          and in retry logic to exit rather than retry forever
-      - calls protected def onStop(): Unit method to allow subclass to take action
-
 Rebalancing
   - Split into two phases: Planning & Execution
   - Planning phase takes current state of all devices in set and makes a full transfer plan

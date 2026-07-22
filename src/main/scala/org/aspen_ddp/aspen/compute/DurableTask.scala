@@ -24,4 +24,12 @@ trait DurableTask {
   val taskPointer: DurableTaskPointer
 
   def completed: Future[Option[AnyRef]]
+
+  @volatile protected var isStopped: Boolean = false
+
+  final def stop(): Unit =
+    isStopped = true
+    onStop()
+
+  protected def onStop(): Unit = ()
 }

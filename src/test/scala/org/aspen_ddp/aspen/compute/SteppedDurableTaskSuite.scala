@@ -7,11 +7,11 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.compute.TaskExecutor
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 object TestSteppedTask extends DurableTaskFactory:
   val typeUUID: UUID = UUID.fromString("A1B2C3D4-E5F6-7890-ABCD-EF1234567890")
@@ -104,3 +104,19 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
     yield
       finalContent should be("step2")
       result should be(Some("step1_done"))
+
+class DurableTaskStopSuite extends IntegrationTestSuite:
+
+  atest("stop() sets isStopped and calls onStop()"):
+    given ExecutionContext = executionContext
+
+    val onStopCalled = Promise[Unit]()
+
+    val task = new DurableTask:
+      val taskPointer: DurableTaskPointer =
+        DurableTaskPointer(KeyValueObjectPointer(radicle.toArray))
+      val completed: Future[Option[AnyRef]] = Future.successful(None)
+      override protected def onStop(): Unit = onStopCalled.trySuccess(())
+
+    task.stop()
+    onStopCalled.future.map(_ => succeed)

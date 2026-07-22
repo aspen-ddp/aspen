@@ -523,6 +523,24 @@ message ActiveRebalancingTasks {
   repeated ActiveRebalancingTask tasks = 1;
 }
 
+message NewSetRebalanceInitiated {
+  UUID setId = 1;
+}
+
+message TransferComplete {
+  UUID setId = 1;
+  StoreId storeId = 2;
+  StorageDeviceId fromDevice = 3;
+  StorageDeviceId toDevice = 4;
+}
+
+message RebalancingMessage {
+  oneof msg {
+    NewSetRebalanceInitiated newSetRebalanceInitiated = 1;
+    TransferComplete transferComplete = 2;
+  }
+}
+
 message StorageDeviceSetState {
   UUID setId = 1;
   string name = 2;

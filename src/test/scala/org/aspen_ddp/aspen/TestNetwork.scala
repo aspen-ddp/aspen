@@ -4,16 +4,21 @@ import java.util.UUID
 import org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.internal.{BaseAspenClient, OpportunisticRebuildManager}
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectCache, RegisteredTypeFactory, Transaction, TransactionStatusCache}
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.BaseReadDriver
 import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, MissedUpdateFinalizationAction}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{KeyValueObjectPointer, ObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreManager, transaction}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
@@ -22,7 +27,6 @@ import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
 
 import java.nio.file.Path
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
@@ -182,6 +186,97 @@ class TestNetwork(executionContext: ExecutionContext,
   smgr.loadStore(storageDeviceId, store0)
   smgr.loadStore(storageDeviceId, store1)
   smgr.loadStore(storageDeviceId, store2)
+
+  // ---- Rebalancing test helpers -------------------------------------------------
+
+  /** A second, empty device in the bootstrap set so stores have a transfer destination. */
+  val secondDeviceId: StorageDeviceId = StorageDeviceId(new UUID(0, 100))
+
+  /** Register a second, empty StorageDeviceState in the StorageDevicesTree and append it to
+   *  the bootstrap set's memberDevices. Mirrors Bootstrap's device indexing. */
+  def createSecondDevice(): Future[Unit] =
+    given ExecutionContext = executionContext
+    val sd = StorageDeviceState(
+      secondDeviceId,
+      bootstrapHost.hostId,
+      0L, 1_000_000L,
+      Map.empty,
+      StorageDeviceSetId.BootstrapStorageDeviceSetId)
+    val devicesTkvl = TieredKeyValueList(client,
+      KVObjectRootManager(client, Radicle.StorageDevicesTreeKey, Radicle.pointer))
+    client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+      for
+        pool <- client.getStoragePool(Radicle.poolId)
+        allocator = new PoolObjectAllocator(client, pool)
+        devPtr <- allocator.allocateKeyValueObject(
+                    Map(StorageDeviceState.StateKey -> Value(sd.encode())))
+        setPtr <- client.getStorageDeviceSetPointer(StorageDeviceSetId.BootstrapStorageDeviceSetId)
+        setDos <- client.read(setPtr)
+      yield
+        val curSet = StorageDeviceSetState(setDos)
+        val updated = curSet.copy(memberDevices = curSet.memberDevices :+ secondDeviceId)
+        tx.overwrite(setPtr, setDos.revision, DataBuffer(updated.toBytes))
+
+        devicesTkvl.set(Key(secondDeviceId.uuid), Value(devPtr.toArray))
+
+  /** Simulate completion of a single store transfer by performing the same metadata flip
+   *  StoreManager.updateStateForTransferredStore performs: pool StoreEntry -> (destHost, toDevice),
+   *  remove store from source device, set store Active on destination device. In-memory KV only. */
+  def simulateTransferComplete(storeId: StoreId,
+                               fromDeviceId: StorageDeviceId,
+                               toDeviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+      for
+        poolPtr <- client.getStoragePoolPointer(storeId.poolId)
+        fromDevPtr <- client.getStorageDevicePointer(fromDeviceId)
+        toDevPtr <- client.getStorageDevicePointer(toDeviceId)
+        poolKvos <- client.read(poolPtr)
+        fromDevKvos <- client.read(fromDevPtr)
+        toDevKvos <- client.read(toDevPtr)
+      yield
+        val poolCfg = StoragePoolState(poolKvos)
+        val fromDev = StorageDeviceState(fromDevKvos)
+        val toDev = StorageDeviceState(toDevKvos)
+        if fromDev.stores.contains(storeId) then
+          poolCfg.stores(storeId.poolIndex) = StoragePoolState.StoreEntry(toDev.hostId, toDeviceId)
+          val poolReqs = List(KeyRevision(StoragePoolState.ConfigKey,
+            poolKvos.contents(StoragePoolState.ConfigKey).revision))
+          val poolOps = List(Insert(StoragePoolState.ConfigKey, poolCfg.encode()))
+          tx.update(poolPtr, None, None, poolReqs, poolOps)
+
+          val newFromDev = fromDev.removeStore(storeId)
+          val fromReqs = List(KeyRevision(StorageDeviceState.StateKey,
+            fromDevKvos.contents(StorageDeviceState.StateKey).revision))
+          val fromOps = List(Insert(StorageDeviceState.StateKey, newFromDev.encode()))
+          tx.update(fromDevPtr, None, None, fromReqs, fromOps)
+
+          val newToDev = toDev.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Active, None)
+          val toReqs = List(KeyRevision(StorageDeviceState.StateKey,
+            toDevKvos.contents(StorageDeviceState.StateKey).revision))
+          val toOps = List(Insert(StorageDeviceState.StateKey, newToDev.encode()))
+          tx.update(toDevPtr, None, None, toReqs, toOps)
+
+  /** Complete every store currently in TransferringIn across the given set's member devices.
+   *  Returns the number of transfers completed this pass. A store in TransferringIn on a
+   *  destination device carries transferDevice = Some(sourceDeviceId). */
+  def completeInFlightTransfers(setId: StorageDeviceSetId): Future[Int] =
+    given ExecutionContext = executionContext
+    for
+      setState <- client.getStorageDeviceSetState(setId)
+      deviceStates <- Future.sequence(setState.memberDevices.map(client.getStorageDeviceState))
+      inFlight = deviceStates.flatMap: ds =>
+                   ds.stores.collect:
+                     case (sid, entry)
+                       if entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+                          entry.transferDevice.isDefined =>
+                       (sid, entry.transferDevice.get, ds.storageDeviceId)
+      _ <- Future.sequence(inFlight.map((sid, from, to) => simulateTransferComplete(sid, from, to)))
+    yield inFlight.size
+
+  // -------------------------------------------------------------------------------
 
   var otestThreadId: Option[Long] = None
 

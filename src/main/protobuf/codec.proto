@@ -508,6 +508,12 @@ message AllocationGroupState {
   repeated UUID parentGroups = 5;
 }
 
+message PendingTransfer {
+  StoreId storeId = 1;
+  StorageDeviceId fromDevice = 2;
+  StorageDeviceId toDevice = 3;
+}
+
 message StorageDeviceSetState {
   UUID setId = 1;
   string name = 2;
@@ -516,6 +522,7 @@ message StorageDeviceSetState {
   repeated UUID memberDevices = 5;
   repeated UUID memberSets = 6;
   repeated UUID assignedPools = 7;
+  repeated PendingTransfer pendingTransfers = 8;
 }
 
 message HostState {

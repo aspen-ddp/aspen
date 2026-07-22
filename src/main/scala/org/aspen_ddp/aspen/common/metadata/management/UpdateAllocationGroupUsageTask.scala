@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.{byte2long, byte2uuid, byte2uuids, long2byte, uuid2byte, uuids2byte}
-import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor, TaskStopped}
 
 import java.util.UUID
 import java.util.concurrent.ThreadLocalRandom
@@ -111,6 +111,10 @@ class UpdateAllocationGroupUsageTask(
         updateNextGroup()
 
   private def updateNextGroup(): Unit =
+    if isStopped then
+      failTask(new TaskStopped)
+      return
+
     client.read(taskPointer.kvPointer).onComplete:
       case Failure(err) => scheduleRetry()
       case Success(kvos) =>

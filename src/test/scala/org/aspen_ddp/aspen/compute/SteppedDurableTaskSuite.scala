@@ -9,14 +9,17 @@ import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
-import org.aspen_ddp.aspen.compute.TaskExecutor
+import org.aspen_ddp.aspen.compute.{TaskExecutor, TaskStopped}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 object TestSteppedTask extends DurableTaskFactory:
   val typeUUID: UUID = UUID.fromString("A1B2C3D4-E5F6-7890-ABCD-EF1234567890")
 
   private val DataPointerKey = Key(2)
+
+  @volatile private var delayStep: Boolean = false
 
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
@@ -39,6 +42,9 @@ object TestSteppedTask extends DurableTaskFactory:
     )
     executor.prepareTask(TestSteppedTask, istate)
 
+  def setDelayStep(delay: Boolean): Unit =
+    delayStep = delay
+
 class TestSteppedTask(
   taskPointer: DurableTaskPointer,
   client: AspenClient,
@@ -49,13 +55,20 @@ class TestSteppedTask(
     Some(new String(state("result"), StandardCharsets.UTF_8))
 
   def step0(tx: Transaction, state: Map[String, Array[Byte]], stepRevision: ObjectRevision): Future[Map[String, Array[Byte]]] =
-    client.read(dataPointer).map: dos =>
-      val content = new String(dos.data.getByteArray, StandardCharsets.UTF_8)
-      assert(content == "initial", s"Step 0: expected 'initial' but got '$content'")
-      tx.overwrite(dataPointer, dos.revision, DataBuffer("step1".getBytes(StandardCharsets.UTF_8)))
-      state
-        .updated("step0_seen", content.getBytes(StandardCharsets.UTF_8))
-        .updated("result", "step0_done".getBytes(StandardCharsets.UTF_8))
+    val delay = if TestSteppedTask.delayStep then
+      Future:
+        Thread.sleep(500)
+    else
+      Future.successful(())
+
+    delay.flatMap: _ =>
+      client.read(dataPointer).map: dos =>
+        val content = new String(dos.data.getByteArray, StandardCharsets.UTF_8)
+        assert(content == "initial", s"Step 0: expected 'initial' but got '$content'")
+        tx.overwrite(dataPointer, dos.revision, DataBuffer("step1".getBytes(StandardCharsets.UTF_8)))
+        state
+          .updated("step0_seen", content.getBytes(StandardCharsets.UTF_8))
+          .updated("result", "step0_done".getBytes(StandardCharsets.UTF_8))
 
   def step1(tx: Transaction, state: Map[String, Array[Byte]], stepRevision: ObjectRevision): Future[Map[String, Array[Byte]]] =
     client.read(dataPointer).map: dos =>
@@ -104,6 +117,46 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
     yield
       finalContent should be("step2")
       result should be(Some("step1_done"))
+
+  atest("stopping a running stepped task completes with TaskStopped"):
+    given ExecutionContext = executionContext
+
+    for
+      kvos <- client.read(radicle)
+      rootPool <- client.getStoragePool(kvos.pointer.poolId)
+      allocator = new PoolObjectAllocator(client, rootPool)
+
+      tx0 = client.newTransaction()
+      executorRoot <- allocator.allocateKeyValueObject(Map())(using tx0)
+      dataPtr <- allocator.allocateDataObject(
+        DataBuffer("initial".getBytes(StandardCharsets.UTF_8)))(using tx0)
+      _ = tx0.bumpVersion(radicle, kvos.revision)
+      _ <- tx0.commit()
+
+      executor <- SimpleTaskExecutor(client, allocator, executorRoot)
+
+      // Enable delay in step0 to ensure task is running when we call shutdown
+      _ = TestSteppedTask.setDelayStep(true)
+
+      kvos2 <- client.read(radicle)
+      tx1 = client.newTransaction()
+      outerTaskFuture <- TestSteppedTask.prepareTask(executor, dataPtr)(using tx1)
+      _ = tx1.bumpVersion(radicle, kvos2.revision)
+      _ <- tx1.commit()
+
+      // Schedule shutdown after task starts executing
+      shutdownPromise = Promise[Unit]()
+      _ = client.backgroundTaskManager.schedule(Duration(250, MILLISECONDS)):
+        executor.shutdown()
+        shutdownPromise.success(())
+
+      _ <- shutdownPromise.future
+
+      // The task should fail with TaskStopped
+      result <- outerTaskFuture.failed
+    yield
+      TestSteppedTask.setDelayStep(false)  // Reset for other tests
+      result shouldBe a[TaskStopped]
 
 class DurableTaskStopSuite extends IntegrationTestSuite:
 

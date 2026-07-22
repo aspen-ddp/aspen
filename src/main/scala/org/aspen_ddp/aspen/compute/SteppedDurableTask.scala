@@ -45,6 +45,12 @@ abstract class SteppedDurableTask(
       doNextStep()
 
   def doNextStep(): Unit =
+    if isStopped then
+      synchronized:
+        if !promise.isCompleted then
+          promise.failure(new TaskStopped)
+      return
+
     for
       kvos <- client.read(taskPointer.kvPointer)
     yield

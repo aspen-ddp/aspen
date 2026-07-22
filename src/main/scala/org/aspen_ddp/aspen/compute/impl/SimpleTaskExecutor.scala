@@ -5,7 +5,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.compute.{DurableTaskPointer, DurableTaskFactory, TaskExecutor}
+import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, TaskExecutor}
 import org.aspen_ddp.aspen.common.util.{uuid2byte, byte2uuid}
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -47,8 +47,11 @@ class SimpleTaskExecutor(val client: AspenClient,
   private val executorObject: KeyValueObjectPointer = kvos.pointer
   private var executorRevision: ObjectRevision = kvos.revision
 
-  protected var active: Set[DurableTaskPointer] = Set()
+  protected var active: Map[DurableTaskPointer, DurableTask] = Map.empty
   protected var inactive: List[DurableTaskPointer] = Nil
+
+  def shutdown(): Unit = synchronized:
+    active.values.foreach(_.stop())
 
   synchronized:
     kvos.contents.valuesIterator.foreach: vs =>
@@ -65,8 +68,8 @@ class SimpleTaskExecutor(val client: AspenClient,
                 inactive = taskPointer :: inactive
 
               case Some(dtt) =>
-                dtt.createTask(client, taskPointer, kvos.revision, kvos.contents, this)
-                active += taskPointer
+                val task = dtt.createTask(client, taskPointer, kvos.revision, kvos.contents, this)
+                active += taskPointer -> task
 
   private def allocateTask(): Future[DurableTaskPointer] =
     def onFail(err: Throwable): Future[Unit] =
@@ -125,7 +128,7 @@ class SimpleTaskExecutor(val client: AspenClient,
           synchronized:
             val task = taskType.createTask(client, taskPointer, kvos.revision, kvos.contents, this)
 
-            active += taskPointer
+            active += taskPointer -> task
             task.completed.foreach: _ =>
               deallocateTask(taskPointer)
             task.completed

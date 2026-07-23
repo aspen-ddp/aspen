@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
+import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
 import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
@@ -64,7 +65,8 @@ object Main {
                   width:Int=0,
                   readThreshold:Int=0,
                   writeThreshold:Int=0,
-                  hosts:List[String]=Nil)
+                  hosts:List[String]=Nil,
+                  setId:String="")
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
@@ -233,6 +235,25 @@ object Main {
                 case _: Throwable => failure("Target storage device id must be a valid UUID")
             },
         )
+
+      cmd("rebalance").text("Rebalances a level-0 storage device set").
+        action((_, c) => c.copy(mode = "rebalance")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<storage-device-set-id>").text("UUID of the storage device set to rebalance").
+            action((x, c) => c.copy(setId = x)).
+            validate { x =>
+              try
+                UUID.fromString(x)
+                success
+              catch
+                case _: Throwable => failure("Storage device set id must be a valid UUID")
+            },
+        )
+
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
 
@@ -255,6 +276,7 @@ object Main {
             case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
             case "new-pool" => new_pool(bootstrapConfigPath, cfg.newPoolName, cfg.idaType, cfg.width, cfg.readThreshold, cfg.writeThreshold, cfg.hosts)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
+            case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
         catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")
@@ -858,5 +880,24 @@ object Main {
             else
               initiateTransfer()
   }
+
+  def rebalance(bootstrapConfigFile: os.Path, setIdStr: String): Unit =
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val setId = StorageDeviceSetId(UUID.fromString(setIdStr))
+
+    val f = RebalancingDurableService.rebalanceStorageDeviceSet(client, setId)
+    f.onComplete:
+      case scala.util.Success(_) =>
+        println(s"Rebalance enrolled for storage device set $setIdStr")
+      case scala.util.Failure(err) =>
+        println(s"Rebalance failed to enroll: ${err.getMessage}")
+
+    scala.concurrent.Await.ready(f, scala.concurrent.duration.Duration(30, scala.concurrent.duration.SECONDS))
 
 }

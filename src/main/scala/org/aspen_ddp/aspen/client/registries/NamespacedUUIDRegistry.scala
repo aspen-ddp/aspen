@@ -36,6 +36,8 @@ class NamespacedUUIDRegistry(val client: AspenClient,
     val fullPrefix = s"$namespace."
     registry.scan(namespace).map(_.flatMap { (key, value) =>
       val keyStr = new String(key.bytes, StandardCharsets.UTF_8)
+      // Safety belt: the scan range should already guarantee this prefix, but we
+      // verify explicitly to guard against any off-by-one in the range boundary.
       if keyStr.startsWith(fullPrefix) then
         Some(keyStr.substring(fullPrefix.length) -> decodeUUID(value))
       else

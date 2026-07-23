@@ -26,7 +26,11 @@ class Registry(val client: AspenClient,
 
   def scan(prefix: String): Future[List[(Key, Value)]] =
     val minKey = Key(s"$prefix.")
-    val maxKey = Key(s"$prefix/")   // '/' (0x2F) is the byte after '.' (0x2E)
+    // Boundary trick: '/' (0x2F) is the byte immediately after '.' (0x2E). Because
+    // keys are byte-ordered and namespace keys have the form "<prefix>.<name>", the
+    // range [ "<prefix>.", "<prefix>/" ) captures exactly the keys for this namespace
+    // and excludes any sibling namespace whose name merely starts with the same text.
+    val maxKey = Key(s"$prefix/")
     val buf = scala.collection.mutable.ListBuffer[(Key, Value)]()
     tkvl.foreachInRange(minKey, maxKey, (_, key, vs) => {
       buf += key -> vs.value

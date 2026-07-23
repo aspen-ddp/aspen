@@ -68,6 +68,11 @@ object BaseReadDriverSuite {
     def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
     def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] = ???
 
+    def listStoragePools(): Future[List[(String, PoolId)]] = ???
+    def listHosts(): Future[List[(String, HostId)]] = ???
+    def listAllocationGroups(): Future[List[(String, AllocationGroupId)]] = ???
+    def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]] = ???
+
     def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] = ???
     def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] = ???
     def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] = ???

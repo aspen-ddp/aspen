@@ -24,6 +24,19 @@ class Registry(val client: AspenClient,
       case None => throw new NoSuchElementException(key.toString)
       case Some(vs) => vs.value
 
+  def scan(prefix: String): Future[List[(Key, Value)]] =
+    val minKey = Key(s"$prefix.")
+    // Boundary trick: '/' (0x2F) is the byte immediately after '.' (0x2E). Because
+    // keys are byte-ordered and namespace keys have the form "<prefix>.<name>", the
+    // range [ "<prefix>.", "<prefix>/" ) captures exactly the keys for this namespace
+    // and excludes any sibling namespace whose name merely starts with the same text.
+    val maxKey = Key(s"$prefix/")
+    val buf = scala.collection.mutable.ListBuffer[(Key, Value)]()
+    tkvl.foreachInRange(minKey, maxKey, (_, key, vs) => {
+      buf += key -> vs.value
+      Future.unit
+    }).map(_ => buf.toList)
+
   def prepareRegister(key: Key, value: Value)(using tx: Transaction): Future[Unit] =
     tkvl.set(key, value, requirement = Some(Left(true))).map: _ =>
       tx.result.value match

@@ -280,6 +280,38 @@ object Main {
             },
         )
 
+      cmd("list-pools").text("Lists all storage pools").
+        action((_, c) => c.copy(mode = "list-pools")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+        )
+
+      cmd("list-hosts").text("Lists all hosts").
+        action((_, c) => c.copy(mode = "list-hosts")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+        )
+
+      cmd("list-allocation-groups").text("Lists all allocation groups").
+        action((_, c) => c.copy(mode = "list-allocation-groups")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+        )
+
+      cmd("list-device-sets").text("Lists all storage device sets").
+        action((_, c) => c.copy(mode = "list-device-sets")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+        )
+
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
 
@@ -304,6 +336,10 @@ object Main {
             case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
+            case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
+            case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             _.listHosts(),             _.uuid)
+            case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
+            case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       _.listStorageDeviceSets(), _.uuid)
         catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")
@@ -962,5 +998,36 @@ object Main {
         println(s"Rebalance failed to enroll: ${err.getMessage}")
 
     scala.concurrent.Await.ready(f, scala.concurrent.duration.Duration(30, scala.concurrent.duration.SECONDS))
+
+  def list_entries[A](bootstrapConfigFile: os.Path,
+                      title: String,
+                      fetch: AspenClient => Future[List[(String, A)]],
+                      idToUuid: A => UUID): Unit =
+
+    configureLogging()
+
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val f = fetch(client)
+
+    f.onComplete:
+      case scala.util.Success(entries) =>
+        if entries.isEmpty then
+          println(s"No $title found")
+        else
+          // Sort by name explicitly for a deterministic listing order, independent
+          // of the underlying registry's iteration order.
+          val sorted = entries.sortBy(_._1)
+          val width = sorted.map(_._1.length).max
+          println(title)
+          sorted.foreach { (name, id) => println(s"  ${name.padTo(width, ' ')}  ${idToUuid(id)}") }
+      case scala.util.Failure(err) =>
+        println(s"Error listing ${title.toLowerCase}: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
 
 }

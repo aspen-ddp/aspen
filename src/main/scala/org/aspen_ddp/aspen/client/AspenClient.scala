@@ -100,6 +100,11 @@ trait AspenClient extends ObjectReader:
   def getAllocationGroupId(groupName: String): Future[AllocationGroupId]
   def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId]
 
+  def listStoragePools(): Future[List[(String, PoolId)]]
+  def listHosts(): Future[List[(String, HostId)]]
+  def listAllocationGroups(): Future[List[(String, AllocationGroupId)]]
+  def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]]
+
   private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer]
   private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]
   private[aspen] def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer]

@@ -115,7 +115,7 @@ object Main {
           arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
             action((x, c) => c.copy(writeThreshold = x)),
 
-          arg[Int]("<width>").text("Number of hostStates holding slices/replicas").
+          arg[Int]("<width>").text("Number of hosts holding slices/replicas").
             action((x, c) => c.copy(width = x)),
         )
 
@@ -127,16 +127,16 @@ object Main {
             validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
         )
 
-      cmd("host").text("Starts an Amoeba Storage HostState").
+      cmd("host").text("Starts an Amoeba Storage Host").
         action( (_,c) => c.copy(mode="host")).
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
             validate( x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x")),
 
-          arg[File]("<hostState-directory>").text("HostState Directory").
+          arg[File]("<hoste-directory>").text("Host Directory").
             action( (x, c) => c.copy(hostDirectory=x)).
-            validate( x => if (x.exists()) success else failure(s"HostState directory does not exist: $x"))
+            validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
         )
 
       cmd("nfs").text("Launches a Amoeba NFS server").
@@ -190,7 +190,7 @@ object Main {
                 failure("IDA type must be Replication or Reed-Solomon")
             },
 
-          arg[Int]("<width>").text("Number of hostStates holding slices/replicas").
+          arg[Int]("<width>").text("Total number of slices/replicas").
             action((x, c) => c.copy(width = x)),
 
           arg[Int]("<read-threshold>").text("Minimum number of slices/replicas that must be read to reconstruct an object").
@@ -199,11 +199,11 @@ object Main {
           arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
             action((x, c) => c.copy(writeThreshold = x)),
 
-          arg[Seq[String]]("<hostStates>").text("Comma-separated list of hostState names to hostState the object slice/replicas").
+          arg[Seq[String]]("<hosts>").text("Comma-separated list of host names to host the object slice/replicas").
             action((x, c) => c.copy(hosts = x.toList)),
         )
 
-      cmd("transfer-store").text("Transfers a store to a new hostState").
+      cmd("transfer-store").text("Transfers a store to a different storage device").
         action((_, c) => c.copy(mode = "transfer-store")).
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
@@ -270,7 +270,7 @@ object Main {
           //println(s"Config file: $config")
           cfg.mode match
             case "bootstrap" => bootstrap(createIDA(cfg), Paths.get("demo"), 4750, 4751, 4752)
-            case "hostState" => host(bootstrapConfig, bootstrapConfigPath, cfg.hostDirectory.toPath)
+            case "host" => host(bootstrapConfig, bootstrapConfigPath, cfg.hostDirectory.toPath)
             case "amoeba" => amoeba_server(bootstrapConfigPath)
             case "debug" => run_debug_code(bootstrapConfigPath)
             case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
@@ -541,10 +541,10 @@ object Main {
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
 
-    val cfgFile = hostDir.resolve("aspen-hostState-config.yaml")
+    val cfgFile = hostDir.resolve("aspen-host-config.yaml")
 
     if ! Files.exists(cfgFile) then
-      throw Exception(s"HostState config file not found: $cfgFile")
+      throw Exception(s"Host config file not found: $cfgFile")
 
     val hostCfg = HostConfig.loadHostConfig(cfgFile.toFile)
     configureLogging()
@@ -616,7 +616,7 @@ object Main {
                 cncPort: Int,
                 storeTransferPort: Int): Unit = {
 
-    val hostDirectory = baseDirectory.resolve("bootstrap-hostState")
+    val hostDirectory = baseDirectory.resolve("bootstrap-host")
 
     if Files.exists(hostDirectory) then
       throw new Exception(s"Bootstrap host directory exists: $hostDirectory")
@@ -687,7 +687,7 @@ object Main {
 
     val bootstrapHost = HostState(
       hostConfig.hostId,
-      "bootstrap-hostState",
+      "bootstrap-host",
       "127.0.0.1",
       hostConfig.dataPort,
       hostConfig.cncPort,
@@ -729,7 +729,7 @@ object Main {
     var storeId: StoreId = null
 
     cfg.hosts.zipWithIndex.foreach: (node, index) =>
-      Path.of(s"demo/bootstrap-hostState/storage-devices/bootstrap-device").toFile.listFiles.toList.foreach: storeFn =>
+      Path.of(s"demo/bootstrap-host/storage-devices/bootstrap-device").toFile.listFiles.toList.foreach: storeFn =>
         val cfg = StoreConfig.loadStoreConfig(storeFn.toPath.resolve("store-config.yaml").toFile)
         if poolUuid == cfg.storeId.poolId && storeIndex == cfg.storeId.poolIndex then
           cfg.backend match {

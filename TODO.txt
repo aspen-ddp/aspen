@@ -1,123 +1,89 @@
 
-Rebalancing
-  - Split into two phases: Planning & Execution
-  - Planning phase takes current state of all devices in set and makes a full transfer plan
-    - Most of the planning process is implemented in the aspen.common.rebalancing Plan & State modules
-    - Use these to create the transfer plan
-    - Add the following variable to StorageDeviceSetState to store the transfer plan
-      - pendingTransfers: List[(storeId, fromDeviceId, toDeviceId)]
-  - RebalancingDurableService
-    - implement in the aspen.common.rebalancing package
-    - State object for the RebalancingDurableService has an ActiveRebalancingTasks key/value pair
-      - Value is list of (storageDeviceSetId, <durableTaskStateObjectPointer>)
-      - Polled every few minutes to find newly created SetRebalanceDurableTasks
-        - Use scheduleNonConcurrentPollingTask to protect against read pileups
-      - Poll is backup for failing to receive NewSetRebalanceInitiated messages sent to this service
-        - reception causes service to immediately re-read the state object and look for newly created tasks
-      - When a new task is detected, the service creates a new instance of SetRebalanceDurableTask to drive it to
-        completion
-      - If the lease is lost, call stop() on all active rebalancing tasks and discard them
-        - Next host to acquire this service will create new instances
-    - Companion object has a rebalanceStorageDeviceSet(storageDeviceSetId): Future[Unit]
-      - read StorageDeviceSetState object. If pendingTransfers list is not empty, return success
-      - If empty,
-        - Read RebalancingDurableService object state to load the ActiveRebalancingTasks key/value pair
-        - If storageDeviceSetId in the list, return success
-        - If not, create rebalancing plan then in a single transaction:
-          - write plan to pendingTransfers variable (tx requirement on revision to protect against simultaneous writes)
-          - create state object for a new SetRebalanceDurableTask state object to drive the transfer process
-          - write updated ActiveRebalancingTasks list including the new set id and state object pointer (use tx
-            requirement to protect against simultaneous writes to the kv pair)
-          - Send a NewSetRebalanceInitiated message to the RebalancingDurableService
-    - Create SetRebalanceDurableTask to drive a rebalance operation for a device set
-      - pendingTransfers list should already be populated
-      - For each store to be transferred, read state of destination device
-        - If in TransferringIn state, poll for its completion
-          - Need to protect against read pileups.
-          - BackgroundTaskManager probably isn't appropriate, maybe the similar function in the util package would '
-            be better.
-    - Transfer Destination host sends TransferComplete message to Service w/ SetId, StoreId, from/to devices
-    - Slow-poll for completion of all active transfers (every 2 mins?)
-      - reception of TransferComplete messages will speed up the process. Polling is just in case the message is lost
-      - Use scheduleNonConcurrentPollingTask to protect against read pileups
-    - Transfer one store at a time.
-      - Can parallelize later
-    - Prior to transfer initiation, verify pool wont drop below write threshold
-      - Add stub for AspenClient.offlineHosts(): Set[HostId] = Set()
-      - need to mark stores on devices backed by offline hosts as unavailable when checking the threshold
-      - All stores that are not currently in the Active state are also "offline"
-      - Total number of online and active stores must be greater than the write threshold
-    - After completion of a transfer, update the pendingTransfers variable to remove the corresponding entry
-    - When all transfers are complete, update the RebalancingDurableService state object to remove the task from the
-      ActiveRebalancingTasks list
-    - The service needs to detect completion of the task and discard it
-      - could be done either through seeing the task deleted when polling the state object, or, probably easier would
-        be to use the Future to task completion
-
-Revisit pool creation
-  - Should be implemented in terms of StorageDeviceSetState
+Revisit storage pool creation
+  - Remove storageDeviceIds from AspenClient.createNewStoragePool
+    - Instead, use StorageDeviceSetState.selectDevicesForPool to get the list of devices
   - Pool state object & device state object need to reference each other
-     - think this is currently unimplemented
+    - The pool object stores the device set id
+    - Need to update the device set state object to add the new pool id to assignedPools
+  - Update the CLI to specify a device set instead of hosts
+    - rename comand to "create-pool"
 
-Set Expansion
-  - Distinct from rebalancing
-  - System-level DurableTask
-  - Goal here is to migrate stores to improve pool reliability and availability
-  - Find pool with worst failure tolerance
-    - select store to move
-  - If no stores with reliability problems
-    - find pool with worst availability, select store to move
-  - If no reliability or availability problems, exit Task
+Add CLI command "create-device-set"
+  - Takes a name and a level as arguments
+  - fail if name already in use
+  - Add AspenClient.createNewDeviceSet
+    - Create the new device set state object, insert into tree, and add to namespaced registry
 
-Reassignment to a new set:
+Add CLI listing commands
+  - Add NamespacedUUIDRegistry.getAllEntires(prefix): List[(String, UUID)]
+    - scans TKVL and gets all entries with the matching prefix. Returns the registered name (without prefix)
+      and the corresponding UUID
+  - Add the following CLI commands
+    - list-device-sets
+    - list-pools
+    - list-hosts
+    - list-allocation-groups
+
+Add CLI command "list-devices"
+  - Requires a hostname argument
+  - Lists each device UUID, the device set name it belongs to, total capacity, & percent utilization
+
+Add CLI command "create-allocation-group"
+  - takes name and level arguments
+  - fail if name already in use
+
+Add CLI command "add-pool-to-group"
+  - takes pool name and allocation group name
+  - Update the state objects for both
+
+
+Need a reliable, distributed DurableTask executor
+  - For focused things that need to happen but isn't tied to a host and result is not needed
+    - Example: Migrating a pool to a new device set
+  - Goal is to spread the execution of these tasks across hosts so as to avoid overloading any one node
+  - Implement as a DurableService
+    - tkvl of tasks
+      - Key = UUID, Value = objectPointer
+    - service polls tkvl for new tasks but uses NewTaskAdded(uuid, pointer) message for performance
+    - service caches a list of all host UUIDs
+      - refreshed every 30 mins
+    - On New Task Detected
+      - Randomly select an online host
+      - Send ExecuteSystemTask(uuid, pointer) message to host
+    - Wait 30 seconds then start polling the task state object
+      - If object deleted, task is complete. Discard state
+      - If the revision hasn't changed in 45 seconds, reassign the task to a new host
+    - Each host listens for ExecuteSystemTask messages
+      - Upon reception, load and start executing the task
+      - Immediately use a transaction to VersionBump the task state object
+      - hosts have a background task that runs every 15 seconds.
+        - task does a VersionBump transaction on all system task state objects it's currently running
+          - This is effectively a "heartbeat" to tell the system durable service that the host is alive
+            and actively executing the task
+     - On task completion, delete tkvl entry of the DurableService
+    - Add an AspenClient.createSystemDurableTask(taskTypeUUID, initialState: Map[Key, Array[Byte]]): Future[Unit]
+      - retry until successful
+
+
+Reassignment of a pool to a new set:
   - System-level DurableTask
-  - Always reassign each store and move it
+  - Always reassign each store to a new device and move it
   - Keep it simple.
     - Optimize for not moving existing stores that are already in the set later
   - Durable task selects a device for a store, calls transferStore, polls for
         completion then moves to next store. On complete, update PoolState to say
         migration status is Complete
 
-Rebalancing is a passive background task
-  - System-level Durable Service
-  - Only cares about keeping %usage common across all storage devices in leaf set
-  - Attempts to find the best store to move from higher-usage to lower
-    - discards candidate store transfer if it would hurt reliability or availability
-      - if deviceFailureTolerance(): Int - stays the same or is better, move allowed
-      - if hostFailureTolerance(): Int - stays the same or is better, move allowed
+Rebalancing as a passive background task
+  - Part of the system-level Durable Service
+  - Periodically tries to rebalance each level 0 stoarge device set
+    - Every 4 hours by default?
+      - needs to be configurable
+    - If it results in a non-empty plan, kick off a rebalancing task
 
-Need System-Level Durable Task/Service
-  - Singleton service
-  - By default, all hosts participate in ensuring it's running
-    - Use lease-based system
-      - State says how long the lease is valid for
-        - Successful overwrite of object after lease expires grants ownership
-          - Use NotValidBefore(existingLeaseExpiryTime) to prevent skewed host clock from taking the lease early
-  - May want dedicated system management hosts for larget systems
-    - Storage hosts may not have the compute or bandwidth necessary to fill the role
-  - Means Executing tasks need a shutdown() method to stop execution
-    - prevents collisions
-    - May want custom transactUntilSuccessful that checks for this flag and exits if seen
-  - To reduce load, may want to spread task execution
-    - Host message to ask it to execute a task on the SystemServiceManager's behalf
-      - Can poll the task state's heartbeat Key/Value pair to ensure it's alive?
 
-Need to be careful with polling objects
-  - Long offline durations could back up with thousands of reads
-  - Maybe make an ObjectPoller(ptr, periodDuration, checkObjectFn)
-    - Only fires off new reads if last read completed
 
 ---------
-
-Add Inspection Commands:
-  - list hosts, storage-devices, storage-pools, allocation-groups
-  - Use subcommand (think this is already done)
-
-Need some wey to list hosts & devices
-  - UUIDs will be pretty meaningless
-  - Add storage-devices/<link/dirname> to localDeviceName in Host state?
-    - need to modify hostState state every time a device is added anyway
-  - convert from Set[stoargeDeviceId] to Map[storageDeviceId, String]
 
 Add add-host command
   - takes address & ports
@@ -131,8 +97,6 @@ Add add-storage-device command
   - Once device is initialized, create link in <hostRootDir>/storage-devices/
   - Update host to use FileSystems.getDefault().newWatchService() to monitor for additions
     - Wrap this in a helper class to simplify Host impl
-
-Need a plan for getting the storageDevices needed for pool creation
 
 Switch AmoebaFS to use a registered object for the root
 

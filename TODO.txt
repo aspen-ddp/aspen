@@ -1,14 +1,4 @@
 
-Add CLI listing commands
-  - Add NamespacedUUIDRegistry.getAllEntires(prefix): List[(String, UUID)]
-    - scans TKVL and gets all entries with the matching prefix. Returns the registered name (without prefix)
-      and the corresponding UUID
-  - Add the following CLI commands
-    - list-device-sets
-    - list-pools
-    - list-hosts
-    - list-allocation-groups
-
 Add CLI command "list-devices"
   - Requires a hostname argument
   - Lists each device UUID, the device set name it belongs to, total capacity, & percent utilization

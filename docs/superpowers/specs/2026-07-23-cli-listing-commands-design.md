@@ -89,34 +89,37 @@ Results are lexically sorted by key (already ordered in the TKVL).
 ### 2. Client API layer
 
 **`client/AspenClient.scala`** — add four typed methods next to the existing
-`getStoragePoolId`/`getHostId`/etc.:
+`getStoragePoolId`/`getHostId`/etc. Each returns its entity's typed ID wrapper
+(`PoolId`, `HostId`, `AllocationGroupId`, `StorageDeviceSetId` — all
+`case class X(uuid: UUID) extends AnyVal`), for consistency with the rest of the
+API (e.g. `getStoragePoolId` returns `PoolId`):
 
 ```scala
-def listStoragePools(): Future[List[(String, UUID)]]
-def listHosts(): Future[List[(String, UUID)]]
-def listAllocationGroups(): Future[List[(String, UUID)]]
-def listStorageDeviceSets(): Future[List[(String, UUID)]]
+def listStoragePools(): Future[List[(String, PoolId)]]
+def listHosts(): Future[List[(String, HostId)]]
+def listAllocationGroups(): Future[List[(String, AllocationGroupId)]]
+def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]]
 ```
-
-The return type is `(String, UUID)` — not typed IDs (`PoolId`, `HostId`, ...) —
-because the values are printed immediately and typed wrapping would be discarded.
 
 **`client/internal/BaseAspenClient.scala`** — implement each by delegating to the
-registry with the matching namespace:
+registry with the matching namespace and wrapping the raw UUID in its typed ID:
 
 ```scala
-override def listStoragePools(): Future[List[(String, UUID)]] =
-  namespacedRegistry.getAllEntries(Namespaces.Pool)
+override def listStoragePools(): Future[List[(String, PoolId)]] =
+  namespacedRegistry.getAllEntries(Namespaces.Pool).map(_.map((n, u) => n -> PoolId(u)))
 
-override def listHosts(): Future[List[(String, UUID)]] =
-  namespacedRegistry.getAllEntries(Namespaces.Host)
+override def listHosts(): Future[List[(String, HostId)]] =
+  namespacedRegistry.getAllEntries(Namespaces.Host).map(_.map((n, u) => n -> HostId(u)))
 
-override def listAllocationGroups(): Future[List[(String, UUID)]] =
-  namespacedRegistry.getAllEntries(Namespaces.Group)
+override def listAllocationGroups(): Future[List[(String, AllocationGroupId)]] =
+  namespacedRegistry.getAllEntries(Namespaces.Group).map(_.map((n, u) => n -> AllocationGroupId(u)))
 
-override def listStorageDeviceSets(): Future[List[(String, UUID)]] =
-  namespacedRegistry.getAllEntries(Namespaces.DeviceSet)
+override def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]] =
+  namespacedRegistry.getAllEntries(Namespaces.DeviceSet).map(_.map((n, u) => n -> StorageDeviceSetId(u)))
 ```
+
+`NamespacedUUIDRegistry.getAllEntries` continues to return raw `(String, UUID)`
+pairs; the typed-ID wrapping happens at the client-API boundary.
 
 **Namespace constants cleanup (in scope):** the namespace strings (`"pool"`,
 `"host"`, `"group"`, `"device-set"`) are currently magic-string literals repeated
@@ -143,22 +146,24 @@ cmd("list-pools").text("Lists all storage pools").
 
 ...and likewise `list-hosts`, `list-allocation-groups`, `list-device-sets`.
 
-Dispatch entries in the `cfg.mode` match:
+Dispatch entries in the `cfg.mode` match. Each passes an `id => uuid` extractor
+so the shared helper can print a clean UUID regardless of the typed-ID wrapper:
 
 ```scala
-case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     c => c.listStoragePools())
-case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             c => c.listHosts())
-case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", c => c.listAllocationGroups())
-case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       c => c.listStorageDeviceSets())
+case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),       _.uuid)
+case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             _.listHosts(),              _.uuid)
+case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),   _.uuid)
+case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       _.listStorageDeviceSets(),  _.uuid)
 ```
 
-A single shared helper — the four commands differ only in title and which client
-method they call:
+A single shared, generic helper — the four commands differ only in title, which
+client method they call, and how to extract the UUID for printing:
 
 ```scala
-def list_entries(bootstrapConfigFile: os.Path,
-                 title: String,
-                 fetch: AspenClient => Future[List[(String, UUID)]]): Unit =
+def list_entries[A](bootstrapConfigFile: os.Path,
+                    title: String,
+                    fetch: AspenClient => Future[List[(String, A)]],
+                    idToUuid: A => UUID): Unit =
   configureLogging()
   val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
   network.startIoThread(client)
@@ -170,17 +175,20 @@ def list_entries(bootstrapConfigFile: os.Path,
       if entries.isEmpty then
         println(s"No $title found")
       else
-        val width = entries.map(_._1.length).max
+        // Sort by name explicitly for a deterministic listing order, independent
+        // of the underlying registry's iteration order.
+        val sorted = entries.sortBy(_._1)
+        val width = sorted.map(_._1.length).max
         println(title)
-        entries.foreach { (name, uuid) => println(s"  ${name.padTo(width, ' ')}  $uuid") }
+        sorted.foreach { (name, id) => println(s"  ${name.padTo(width, ' ')}  ${idToUuid(id)}") }
     case scala.util.Failure(err) =>
       println(s"Error listing ${title.toLowerCase}: ${err.getMessage}")
 
   Await.ready(f, Duration(30, SECONDS))
 ```
 
-Output is name-padded two columns; entries arrive already sorted by name from the
-TKVL. Empty registries print a `No <title> found` message.
+Output is name-padded two columns, explicitly sorted by name before printing.
+Empty registries print a `No <title> found` message.
 
 ## Testing
 

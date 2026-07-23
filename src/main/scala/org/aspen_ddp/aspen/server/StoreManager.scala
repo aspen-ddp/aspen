@@ -26,6 +26,7 @@ import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTas
 import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
 import org.aspen_ddp.aspen.server.usage.StorageDeviceUsageManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
+import org.aspen_ddp.aspen.common.rebalancing.{RebalancingDurableService, RebalancingMessage, TransferComplete}
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -343,6 +344,13 @@ class StoreManager(val client: AspenClient,
               fromDev.storageDeviceId
             )
             client.sendHostMessage(msg)
+
+            // Best-effort wake-up for the rebalancing service (harmless for non-rebalance
+            // transfers; the service also polls, so delivery is not required for correctness).
+            client.sendServiceMessage(
+              RebalancingDurableService.ServiceUUID,
+              RebalancingMessage.encode(
+                TransferComplete(toDev.storageDeviceSet, storeId, fromDeviceId, toDeviceid)))
 
   private def startStoreTransferIn(storeId: StoreId,
                                    fromHostId: HostId,

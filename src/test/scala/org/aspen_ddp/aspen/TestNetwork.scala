@@ -213,12 +213,11 @@ class TestNetwork(executionContext: ExecutionContext,
                     Map(StorageDeviceState.StateKey -> Value(sd.encode())))
         setPtr <- client.getStorageDeviceSetPointer(StorageDeviceSetId.BootstrapStorageDeviceSetId)
         setDos <- client.read(setPtr)
+        _ <- devicesTkvl.set(Key(secondDeviceId.uuid), Value(devPtr.toArray))
       yield
         val curSet = StorageDeviceSetState(setDos)
         val updated = curSet.copy(memberDevices = curSet.memberDevices :+ secondDeviceId)
         tx.overwrite(setPtr, setDos.revision, DataBuffer(updated.toBytes))
-
-        devicesTkvl.set(Key(secondDeviceId.uuid), Value(devPtr.toArray))
 
   /** Simulate completion of a single store transfer by performing the same metadata flip
    *  StoreManager.updateStateForTransferredStore performs: pool StoreEntry -> (destHost, toDevice),

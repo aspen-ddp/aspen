@@ -23,7 +23,7 @@ import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
 import org.aspen_ddp.aspen.server.*
@@ -65,7 +65,8 @@ object Main {
                   width:Int=0,
                   readThreshold:Int=0,
                   writeThreshold:Int=0,
-                  hosts:List[String]=Nil,
+                  deviceSetName:String="",
+                  maximumStoreSize:Long=0L,
                   setId:String="")
 
   class ConfigError(msg: String) extends AmoebaError(msg)
@@ -170,14 +171,14 @@ object Main {
             }
         )
 
-      cmd("new-pool").text("Creates a new storage pool").
-        action((_, c) => c.copy(mode = "new-pool")).
+      cmd("create-pool").text("Creates a new storage pool").
+        action((_, c) => c.copy(mode = "create-pool")).
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action((x, c) => c.copy(bootstrapConfigFile = x)).
             validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
 
-          arg[String]("<new-pool-name>").text("Name of the new Pool").
+          arg[String]("<pool-name>").text("Name of the new Pool").
             action((x, c) => c.copy(newPoolName = x)),
 
           arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
@@ -199,8 +200,11 @@ object Main {
           arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
             action((x, c) => c.copy(writeThreshold = x)),
 
-          arg[Seq[String]]("<hosts>").text("Comma-separated list of host names to host the object slice/replicas").
-            action((x, c) => c.copy(hosts = x.toList)),
+          arg[String]("<device-set-name>").text("Name of the storage device set that will host the pool's stores").
+            action((x, c) => c.copy(deviceSetName = x)),
+
+          arg[Long]("<maximum-store-size>").optional().text("Maximum per-store size in bytes (0 = default/unbounded)").
+            action((x, c) => c.copy(maximumStoreSize = x)),
         )
 
       cmd("transfer-store").text("Transfers a store to a different storage device").
@@ -274,7 +278,7 @@ object Main {
             case "amoeba" => amoeba_server(bootstrapConfigPath)
             case "debug" => run_debug_code(bootstrapConfigPath)
             case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
-            case "new-pool" => new_pool(bootstrapConfigPath, cfg.newPoolName, cfg.idaType, cfg.width, cfg.readThreshold, cfg.writeThreshold, cfg.hosts)
+            case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
         catch
@@ -780,17 +784,11 @@ object Main {
       ()
   }
 
-  def new_pool(bootstrapConfigFile: os.Path,
-               newPoolName: String,
-               idaType: String,
-               width: Int,
-               readThreshold: Int,
-               writeThreshold: Int,
-               hosts: List[String]): Unit = {
-    println(s"READ $readThreshold, WRITE $writeThreshold")
-    require(hosts.length == width)
-    require(width >= readThreshold && width >= writeThreshold)
-    require(readThreshold <= writeThreshold)
+  def create_pool(bootstrapConfigFile: os.Path,
+                  poolName: String,
+                  ida: IDA,
+                  deviceSetName: String,
+                  maximumStoreSize: Long): Unit = {
 
     configureLogging()
 
@@ -800,22 +798,16 @@ object Main {
 
     given ExecutionContext = client.clientContext
 
-    val ida: IDA = idaType match
-      case "replication" => Replication(width, writeThreshold)
-      case "reed-solomon" => ReedSolomon(width, readThreshold, writeThreshold)
-      case _ => throw new Exception(s"Invalid IDA type: $idaType")
+    val f = for
+      setId <- client.getStorageDeviceSetId(deviceSetName)
+      poolId <- client.createNewStoragePool(poolName, ida, None, RocksDBConfig(), setId, maximumStoreSize)
+    yield poolId
 
-    def getHost(name: String): Future[HostState] =
-      client.getHostId(name).flatMap: hostId =>
-        client.getHostState(hostId)
+    val poolId = Await.result(f, Duration(30, SECONDS))
 
-    for
-      _ <- Future.sequence(hosts.map(getHost))
-      //sp <- client.newStoragePool(newPoolName, frontends, ida, RocksDBConfig())
-    yield
-      println("******************************************")
-      //println(f"* New Pool Created: ${sp.poolId}")
-      println("******************************************")
+    println("******************************************")
+    println(s"* New Pool Created: ${poolId.uuid}")
+    println("******************************************")
   }
 
   def transfer_store(bootstrapConfigFile: os.Path,

@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.MetadataTree
+import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.DataObjectPointer
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -100,3 +101,16 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       poolState.stores(0).storageDeviceId should be(StorageDeviceId.BootstrapStorageDeviceId)
       setState.assignedPools should contain(poolId)
       setState.assignedPools should contain(PoolId.BootstrapPoolId)
+
+  atest("createStorageDeviceSet rejects a parent at an equal or lower level"):
+    given ExecutionContext = executionContext
+    for
+      parentId <- client.createStorageDeviceSet("bad-parent", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      _ <- recoverToSucceededIf[AspenClient.InvalidDeviceSetLevel](
+             client.createStorageDeviceSet("bad-child-equal", level = 0, parent = Some(parentId))
+           )
+      _ <- recoverToSucceededIf[AspenClient.InvalidDeviceSetLevel](
+             client.createStorageDeviceSet("bad-child-higher", level = 1, parent = Some(parentId))
+           )
+    yield succeed

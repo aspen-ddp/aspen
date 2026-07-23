@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
+import org.aspen_ddp.aspen.client.registries.Registry.DuplicateRegistration
 import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
@@ -67,7 +68,10 @@ object Main {
                   writeThreshold:Int=0,
                   deviceSetName:String="",
                   maximumStoreSize:Long=0L,
-                  setId:String="")
+                  setId:String="",
+                  newSetName:String="",
+                  newSetLevel:Int=0,
+                  parentSetName:String="")
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
@@ -207,6 +211,24 @@ object Main {
             action((x, c) => c.copy(maximumStoreSize = x)),
         )
 
+      cmd("create-device-set").text("Creates a new storage device set").
+        action((_, c) => c.copy(mode = "create-device-set")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name>").text("Name of the new storage device set").
+            action((x, c) => c.copy(newSetName = x)),
+
+          arg[Int]("<level>").text("Hierarchy level (0 = set of physical devices, 1+ = set of sets)").
+            action((x, c) => c.copy(newSetLevel = x)).
+            validate(x => if (x >= 0) success else failure("Level must be >= 0")),
+
+          arg[String]("[parent-set-name]").optional().text("Optional name of the parent device set to link into").
+            action((x, c) => c.copy(parentSetName = x)),
+        )
+
       cmd("transfer-store").text("Transfers a store to a different storage device").
         action((_, c) => c.copy(mode = "transfer-store")).
         children(
@@ -279,6 +301,7 @@ object Main {
             case "debug" => run_debug_code(bootstrapConfigPath)
             case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
             case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
+            case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
         catch
@@ -808,6 +831,54 @@ object Main {
     println("******************************************")
     println(s"* New Pool Created: ${poolId.uuid}")
     println("******************************************")
+  }
+
+  def create_device_set(bootstrapConfigFile: os.Path,
+                        name: String,
+                        level: Int,
+                        parentSetName: String): Unit = {
+
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    // Resolve the optional parent set name to an id before creating the new set. An empty
+    // parentSetName means "no parent" (a top-level set).
+    val fParent: Future[Option[StorageDeviceSetId]] =
+      if parentSetName.isEmpty then
+        Future.successful(None)
+      else
+        client.getStorageDeviceSetId(parentSetName).map(Some(_))
+
+    val f = for
+      parentOpt <- fParent
+      setId <- client.createStorageDeviceSet(name, level, parentOpt)
+    yield setId
+
+    // Translate the known failure modes into human-readable messages. The client's retry
+    // strategy unwraps StopRetrying, so the future fails with the underlying cause.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: DuplicateRegistration =>
+        println(s"Error: a device set named '$name' already exists")
+      case _: NoSuchElementException =>
+        println(s"Error: parent device set '$parentSetName' not found")
+      case e: AspenClient.InvalidDeviceSetLevel =>
+        println(s"Error: ${e.getMessage}")
+      case e =>
+        println(s"Error creating device set: ${e.getMessage}")
+
+    f.onComplete:
+      case scala.util.Success(setId) =>
+        println("******************************************")
+        println(s"* New Device Set Created: ${setId.uuid}")
+        println("******************************************")
+      case scala.util.Failure(err) => reportError(err)
+
+    Await.ready(f, Duration(30, SECONDS))
   }
 
   def transfer_store(bootstrapConfigFile: os.Path,

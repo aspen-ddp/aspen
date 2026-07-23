@@ -97,27 +97,34 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
     val done: Future[Unit] = client.transactUntilSuccessful: tx =>
       given Transaction = tx
       for
-        pool <- client.getStoragePool(Radicle.poolId)
-        allocator = new PoolObjectAllocator(client, pool)
-        taskStatePtr <- allocator.allocateKeyValueObject(
-                          SetRebalanceTaskState.initialContent(setId).map((k, v) => k -> Value(v)))
         setPtr <- client.getStorageDeviceSetPointer(setId)
         setDos <- client.read(setPtr)
         stateKvos <- client.read(statePtr)
-      yield
-        val curSet = StorageDeviceSetState(setDos)
-        val updatedSet = curSet.copy(pendingTransfers = transfers)
-        tx.overwrite(setPtr, setDos.revision, DataBuffer(updatedSet.toBytes))
+        active = RebalancingServiceState.decodeActiveTasks(
+                   stateKvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
+        _ <-
+          if active.exists(_._1 == setId) then
+            // A concurrent caller enrolled this set between the pre-check and here. No-op:
+            // do not allocate a task-state object and do not write anything.
+            Future.unit
+          else
+            for
+              pool <- client.getStoragePool(Radicle.poolId)
+              allocator = new PoolObjectAllocator(client, pool)
+              taskStatePtr <- allocator.allocateKeyValueObject(
+                                SetRebalanceTaskState.initialContent(setId).map((k, v) => k -> Value(v)))
+            yield
+              val updatedSet = StorageDeviceSetState(setDos).copy(pendingTransfers = transfers)
+              tx.overwrite(setPtr, setDos.revision, DataBuffer(updatedSet.toBytes))
 
-        val active = RebalancingServiceState.decodeActiveTasks(
-                       stateKvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
-        val newActive = active :+ (setId -> taskStatePtr)
-        val reqs = KeyValueUpdate.KeyRevision(
-                     RebalancingServiceState.ActiveTasksKey,
-                     stateKvos.contents(RebalancingServiceState.ActiveTasksKey).revision) :: Nil
-        val ops = Insert(RebalancingServiceState.ActiveTasksKey,
-                    RebalancingServiceState.encodeActiveTasks(newActive)) :: Nil
-        tx.update(statePtr, None, None, reqs, ops)
+              val newActive = active :+ (setId -> taskStatePtr)
+              val reqs = KeyValueUpdate.KeyRevision(
+                           RebalancingServiceState.ActiveTasksKey,
+                           stateKvos.contents(RebalancingServiceState.ActiveTasksKey).revision) :: Nil
+              val ops = Insert(RebalancingServiceState.ActiveTasksKey,
+                          RebalancingServiceState.encodeActiveTasks(newActive)) :: Nil
+              tx.update(statePtr, None, None, reqs, ops)
+      yield ()
 
     done.map: _ =>
       client.sendServiceMessage(ServiceUUID, RebalancingMessage.encode(NewSetRebalanceInitiated(setId)))
@@ -131,6 +138,7 @@ class RebalancingDurableService(val client: AspenClient,
   private given ExecutionContext = client.clientContext
 
   private var tasks: Map[StorageDeviceSetId, SetRebalanceDurableTask] = Map.empty
+  private var completing: Set[StorageDeviceSetId] = Set.empty
   private var pollTask: ScheduledTask = NoTask
   @volatile private var stopped = false
 
@@ -143,6 +151,7 @@ class RebalancingDurableService(val client: AspenClient,
     pollTask.cancel()
     tasks.values.foreach(_.stop())
     tasks = Map.empty
+    completing = Set.empty
 
   override def receiveMessage(msg: ServiceMessage): Unit =
     RebalancingMessage.decode(msg.encodedContent) match
@@ -160,7 +169,7 @@ class RebalancingDurableService(val client: AspenClient,
         synchronized:
           if !stopped then
             active.foreach: (setId, taskStatePtr) =>
-              if !tasks.contains(setId) then
+              if !tasks.contains(setId) && !completing.contains(setId) then
                 startTask(setId, taskStatePtr)
       .recover:
         case err => logger.warn(s"RebalancingDurableService reconcile failed: $err")
@@ -168,25 +177,35 @@ class RebalancingDurableService(val client: AspenClient,
   private def startTask(setId: StorageDeviceSetId, taskStatePtr: KeyValueObjectPointer): Unit =
     val task = new SetRebalanceDurableTask(DurableTaskPointer(taskStatePtr), client, setId, pollPeriod)
     tasks += setId -> task
-    task.completed.onComplete: _ =>
-      synchronized { tasks -= setId }
-      if !stopped then
+    task.completed.onComplete: result =>
+      synchronized:
+        tasks -= setId
+        if result.isSuccess && !stopped then
+          completing += setId
+      if result.isSuccess && !stopped then
         removeCompleted(setId, taskStatePtr)
 
   private def removeCompleted(setId: StorageDeviceSetId, taskStatePtr: KeyValueObjectPointer): Unit =
-    client.transactUntilSuccessful: tx =>
+    val f = client.transactUntilSuccessful: tx =>
       given Transaction = tx
       for
         kvos <- client.read(statePointer)
-        taskKvos <- client.read(taskStatePtr)
-      yield
-        val active = RebalancingServiceState.decodeActiveTasks(
-                       kvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
-        val newActive = active.filterNot(_._1 == setId)
-        val reqs = KeyValueUpdate.KeyRevision(
-                     RebalancingServiceState.ActiveTasksKey,
-                     kvos.contents(RebalancingServiceState.ActiveTasksKey).revision) :: Nil
-        val ops = Insert(RebalancingServiceState.ActiveTasksKey,
-                    RebalancingServiceState.encodeActiveTasks(newActive)) :: Nil
-        tx.update(statePointer, None, None, reqs, ops)
-        tx.setRefcount(taskStatePtr, taskKvos.refcount, taskKvos.refcount.decrement())
+        active = RebalancingServiceState.decodeActiveTasks(
+                   kvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
+        _ <-
+          if !active.exists(e => e._1 == setId && e._2.id == taskStatePtr.id) then
+            // Already removed by a prior call (idempotent): do not double-decrement refcount.
+            Future.unit
+          else
+            client.read(taskStatePtr).map: taskKvos =>
+              val newActive = active.filterNot(e => e._1 == setId && e._2.id == taskStatePtr.id)
+              val reqs = KeyValueUpdate.KeyRevision(
+                           RebalancingServiceState.ActiveTasksKey,
+                           kvos.contents(RebalancingServiceState.ActiveTasksKey).revision) :: Nil
+              val ops = Insert(RebalancingServiceState.ActiveTasksKey,
+                          RebalancingServiceState.encodeActiveTasks(newActive)) :: Nil
+              tx.update(statePointer, None, None, reqs, ops)
+              tx.setRefcount(taskStatePtr, taskKvos.refcount, taskKvos.refcount.decrement())
+      yield ()
+    f.foreach: _ =>
+      synchronized { completing -= setId }

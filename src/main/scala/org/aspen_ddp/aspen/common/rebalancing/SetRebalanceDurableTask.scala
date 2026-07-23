@@ -86,7 +86,9 @@ class SetRebalanceDurableTask(
                 notStarted.find(t => TransferSafety.isSafe(planningState, offline,
                     Plan.Transfer(t._1, t._2, t._3))) match
                   case Some((storeId, _, toDevice)) =>
-                    client.transferStore(storeId, toDevice)
+                    client.transferStore(storeId, toDevice).failed.foreach: err =>
+                      logger.warn(s"Rebalance set $setId: transferStore for $storeId failed " +
+                        s"(will retry via poll): $err")
                     scheduleRecheck()
                   case None =>
                     scheduleRecheck()

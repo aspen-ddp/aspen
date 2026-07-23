@@ -168,7 +168,6 @@ class StoreManager(val client: AspenClient,
                     startUsageTracking(executor)
                     val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
                     serviceExecutorPromise.success(serviceExec)
-                    RebalancingDurableService.register(serviceExec)
 
             case None =>
               client.getStoragePool(Radicle.poolId).foreach: pool =>
@@ -191,7 +190,6 @@ class StoreManager(val client: AspenClient,
                       startUsageTracking(executor)
                       val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
                       serviceExecutorPromise.success(serviceExec)
-                      RebalancingDurableService.register(serviceExec)
 
       case Failure(err) =>
         // In test environments or when host is not yet registered, silently skip initialization

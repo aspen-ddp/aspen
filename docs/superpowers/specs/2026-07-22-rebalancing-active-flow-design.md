@@ -87,6 +87,14 @@ reconstructs everything from `ActiveRebalancingTasks` + each set's `pendingTrans
 `typeUUID`: a fresh, hard-coded UUID, registered in `server/TypeFactories.scala`, verified
 not to collide with existing factory UUIDs.
 
+**Registration (singleton instance):** the service is a system-critical singleton that must
+always be running, so its unclaimed entry is created **once, declaratively, by the Bootstrap
+process** (`server/store/Bootstrap.initialize` writes an `ServiceEntry` with `UnclaimedHostId`
+into the services tree, backed by a freshly allocated state object holding an empty
+`ActiveRebalancingTasks`). The first host to scan the services tree claims and runs it. There
+is no per-host `register()` step — `RebalancingDurableService.initialServiceState` supplies the
+initial state map that Bootstrap writes.
+
 ## SetRebalanceDurableTask
 
 A custom `DurableTask` (not `SteppedDurableTask` — the number of transfers is dynamic and

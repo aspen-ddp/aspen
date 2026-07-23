@@ -29,9 +29,10 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
+    // The RebalancingDurableService entry is created by Bootstrap (see TestNetwork), so the
+    // executor only needs to scan and claim it — no explicit registration here.
     val exec = makeExecutor()
     for
-      _ <- RebalancingDurableService.register(exec)
       _ <- net.createSecondDevice()
       _ <- RebalancingDurableService.rebalanceStorageDeviceSet(client, setId)
       _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))

@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
-import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceExecutor, DurableServiceFactory, DurableTaskPointer, ServiceEntry}
+import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceFactory, DurableTaskPointer, ServiceEntry}
 import scribe.Logging
 
 import java.util.UUID
@@ -35,13 +35,10 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
                              state: KeyValueObjectState): DurableService =
     new RebalancingDurableService(client, statePointer, pollPeriod)
 
-  /** Register the singleton service (idempotent). Call once per system at host startup, from
-   *  the same place the DurableServiceExecutor is created. */
-  def register(executor: DurableServiceExecutor): Future[Unit] =
-    executor.registerService(
-      ServiceTypeUUID,
-      ServiceUUID,
-      Map(RebalancingServiceState.ActiveTasksKey -> RebalancingServiceState.encodeActiveTasks(Nil)))
+  /** The initial contents of the service's KV state object. Written into the services tree by
+   *  the Bootstrap process (the service is a system-critical singleton that must always exist). */
+  def initialServiceState: Map[Key, Array[Byte]] =
+    Map(RebalancingServiceState.ActiveTasksKey -> RebalancingServiceState.encodeActiveTasks(Nil))
 
   /** Read the service state object's pointer via the services TKVL. */
   private def readServiceStatePointer(client: AspenClient): Future[KeyValueObjectPointer] =

@@ -14,6 +14,8 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.common.util.uuid2byte
+import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
+import org.aspen_ddp.aspen.compute.ServiceEntry
 
 object Bootstrap:
 
@@ -176,7 +178,20 @@ object Bootstrap:
       Key(StorageDeviceSetId.BootstrapStorageDeviceSetId.uuid) -> storageDeviceSetPtr.toArray
     )
 
-    val servicesTree = allocateTree(ByteArrayKeyOrdering)
+    // The RebalancingDurableService is a system-critical singleton that must always be running.
+    // Register it directly in the services tree as an unclaimed entry so the first host to scan
+    // the tree will claim and run it. This avoids relying on any per-host registration step.
+    val rebalancingServicePtr = allocate(RebalancingDurableService.initialServiceState.toList)
+    val rebalancingServiceEntry = ServiceEntry(
+      RebalancingDurableService.ServiceTypeUUID,
+      ServiceEntry.UnclaimedHostId,
+      HLCTimestamp.Zero,
+      rebalancingServicePtr)
+
+    val servicesTree = allocateTree(
+      ByteArrayKeyOrdering,
+      Key(RebalancingDurableService.ServiceUUID) -> rebalancingServiceEntry.encode()
+    )
 
     val radicleContent: List[(Key, Array[Byte])] = List(
       Radicle.BootstrapConfigKey -> bootstrapConfig.getBytes(StandardCharsets.UTF_8),

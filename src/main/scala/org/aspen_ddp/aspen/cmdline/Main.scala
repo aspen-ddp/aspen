@@ -859,8 +859,8 @@ object Main {
       setId <- client.createStorageDeviceSet(name, level, parentOpt)
     yield setId
 
-    // Translate the known failure modes into human-readable messages. The client unwraps
-    // StopRetrying to its underlying cause, but we match StopRetrying defensively as well.
+    // Translate the known failure modes into human-readable messages. The client's retry
+    // strategy unwraps StopRetrying, so the future fails with the underlying cause.
     def reportError(cause: Throwable): Unit = cause match
       case _: DuplicateRegistration =>
         println(s"Error: a device set named '$name' already exists")
@@ -876,7 +876,6 @@ object Main {
         println("******************************************")
         println(s"* New Device Set Created: ${setId.uuid}")
         println("******************************************")
-      case scala.util.Failure(StopRetrying(cause)) => reportError(cause)
       case scala.util.Failure(err) => reportError(err)
 
     Await.ready(f, Duration(30, SECONDS))

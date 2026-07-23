@@ -128,6 +128,18 @@ abstract class BaseAspenClient(
   override def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] =
     namespacedRegistry.getRegisteredObject(Namespaces.DeviceSet, setName).map(StorageDeviceSetId(_))
 
+  override def listStoragePools(): Future[List[(String, PoolId)]] =
+    namespacedRegistry.getAllEntries(Namespaces.Pool).map(_.map((n, u) => n -> PoolId(u)))
+
+  override def listHosts(): Future[List[(String, HostId)]] =
+    namespacedRegistry.getAllEntries(Namespaces.Host).map(_.map((n, u) => n -> HostId(u)))
+
+  override def listAllocationGroups(): Future[List[(String, AllocationGroupId)]] =
+    namespacedRegistry.getAllEntries(Namespaces.Group).map(_.map((n, u) => n -> AllocationGroupId(u)))
+
+  override def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]] =
+    namespacedRegistry.getAllEntries(Namespaces.DeviceSet).map(_.map((n, u) => n -> StorageDeviceSetId(u)))
+
   // ---- Pointer lookups ----
 
   override def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =

@@ -182,12 +182,15 @@ abstract class BaseAspenClient(
         parentDos <- read(parentPtr)
       yield
         val parentState = StorageDeviceSetState(parentDos)
+        if sds.level >= parentState.level then
+          throw AspenClient.InvalidDeviceSetLevel(sds.level, parentState.level)
         val updated = parentState.copy(memberSets = sds.setId :: parentState.memberSets)
         tx.overwrite(parentPtr, parentDos.revision, DataBuffer(updated.toBytes))
 
     def onFail(err: Throwable): Future[Unit] = err match
       case e: DuplicateRegistration => throw StopRetrying(e)
       case e: NoSuchElementException => throw StopRetrying(e)
+      case e: AspenClient.InvalidDeviceSetLevel => throw StopRetrying(e)
 
     runCreate(onFail): tx =>
       given Transaction = tx

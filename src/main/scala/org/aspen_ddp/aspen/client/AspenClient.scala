@@ -23,6 +23,8 @@ import scala.concurrent.{ExecutionContext, Future}
 object AspenClient:
   class InvalidDestination extends Exception("Source and destination devices must be different")
   class StoreNotActive(storeId: StoreId) extends Exception(s"Store $storeId is not in the Active state")
+  class InvalidDeviceSetLevel(childLevel: Int, parentLevel: Int)
+    extends Exception(s"Device set level $childLevel must be less than parent level $parentLevel")
 
 trait AspenClient extends ObjectReader:
   

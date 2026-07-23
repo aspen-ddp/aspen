@@ -23,6 +23,12 @@ import java.util.UUID
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 import scala.concurrent.{ExecutionContext, Future}
 
+private object Namespaces:
+  val Pool = "pool"
+  val Host = "host"
+  val Group = "group"
+  val DeviceSet = "device-set"
+
 /** Shared implementation for all AspenClient implementations.
   *
   * Everything that SimpleAspenClient and TestNetwork.TClient have in common lives here.
@@ -111,16 +117,16 @@ abstract class BaseAspenClient(
   // ---- Id lookups ----
 
   override def getStoragePoolId(poolName: String): Future[PoolId] =
-    namespacedRegistry.getRegisteredObject("pool", poolName).map(PoolId(_))
+    namespacedRegistry.getRegisteredObject(Namespaces.Pool, poolName).map(PoolId(_))
 
   override def getHostId(hostName: String): Future[HostId] =
-    namespacedRegistry.getRegisteredObject("host", hostName).map(HostId(_))
+    namespacedRegistry.getRegisteredObject(Namespaces.Host, hostName).map(HostId(_))
 
   override def getAllocationGroupId(groupName: String): Future[AllocationGroupId] =
-    namespacedRegistry.getRegisteredObject("group", groupName).map(AllocationGroupId(_))
+    namespacedRegistry.getRegisteredObject(Namespaces.Group, groupName).map(AllocationGroupId(_))
 
   override def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] =
-    namespacedRegistry.getRegisteredObject("device-set", setName).map(StorageDeviceSetId(_))
+    namespacedRegistry.getRegisteredObject(Namespaces.DeviceSet, setName).map(StorageDeviceSetId(_))
 
   // ---- Pointer lookups ----
 
@@ -159,7 +165,7 @@ abstract class BaseAspenClient(
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         ptr <- bsPool.allocator.allocateDataObject(DataBuffer(ags.toBytes))
         _ <- allocationGroupsTree.preparePut(ags.groupId.uuid, ptr)
-        _ <- namespacedRegistry.prepareRegisterObject("group", ags.name, ags.groupId.uuid)
+        _ <- namespacedRegistry.prepareRegisterObject(Namespaces.Group, ags.name, ags.groupId.uuid)
       yield
         ags.groupId
 
@@ -198,7 +204,7 @@ abstract class BaseAspenClient(
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         ptr <- bsPool.allocator.allocateDataObject(DataBuffer(sds.toBytes))
         _ <- storageDeviceSetsTree.preparePut(sds.setId.uuid, ptr)
-        _ <- namespacedRegistry.prepareRegisterObject("device-set", sds.name, sds.setId.uuid)
+        _ <- namespacedRegistry.prepareRegisterObject(Namespaces.DeviceSet, sds.name, sds.setId.uuid)
         _ <- parent match
                case None => Future.unit
                case Some(parentId) => addToParent(parentId)
@@ -281,7 +287,7 @@ abstract class BaseAspenClient(
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
         poolPtr <- createPoolObj(bsPool.allocator)
         _ <- storagePoolsTree.preparePut(config.poolId.uuid, poolPtr)
-        _ <- namespacedRegistry.prepareRegisterObject("pool", config.name, config.poolId.uuid)
+        _ <- namespacedRegistry.prepareRegisterObject(Namespaces.Pool, config.name, config.poolId.uuid)
         devUpdates <- Future.sequence(collectDevices(config.stores))
         setPtr <- getStorageDeviceSetPointer(config.storageDeviceSet)
         setDos <- read(setPtr)

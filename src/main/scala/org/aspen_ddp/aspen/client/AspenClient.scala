@@ -133,38 +133,33 @@ trait AspenClient extends ObjectReader:
     retryStrategy.retryUntilSuccessful(onCommitFailure):
       transact(prepare)
       
-  // NOTE: This records storageDeviceSet on the new pool but does not add the pool to the
-  // set's assignedPools. Keeping both sides consistent is the responsibility of the
-  // StorageDeviceSet management API, which is not yet implemented.
   def createNewStoragePool(name: String,
                            ida: IDA,
                            maxObjectSize: Option[Int],
-                           storageDeviceIds: List[StorageDeviceId],
                            backendConfig: BackendConfig,
                            storageDeviceSet: StorageDeviceSetId,
                            maximumStoreSize: Long): Future[PoolId] =
-    if storageDeviceIds.size < ida.width then
-      Future.failed(new IllegalArgumentException("storageDeviceIds list must be at least as long as ida.width"))
-    else
-      given ExecutionContext = this.clientContext
-      val poolId = PoolId(UUID.randomUUID())
-      for
-        devices <- Future.sequence(storageDeviceIds.map(sid => getStorageDeviceState(sid)))
-        stores = devices.map(dev => StoragePoolState.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
-        config = StoragePoolState(
-          poolId,
-          name,
-          ida,
-          maxObjectSize,
-          stores,
-          backendConfig,
-          storageDeviceSet,
-          0L,
-          maximumStoreSize
-        )
-        _ <- createStoragePool(config)
-      yield
-        poolId
+    given ExecutionContext = this.clientContext
+    val poolId = PoolId(UUID.randomUUID())
+    for
+      set <- getStorageDeviceSetState(storageDeviceSet)
+      deviceIds <- set.selectDevicesForPool(ida.width, this)
+      devices <- Future.sequence(deviceIds.map(sid => getStorageDeviceState(sid)))
+      stores = devices.map(dev => StoragePoolState.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
+      config = StoragePoolState(
+        poolId,
+        name,
+        ida,
+        maxObjectSize,
+        stores,
+        backendConfig,
+        storageDeviceSet,
+        0L,
+        maximumStoreSize
+      )
+      _ <- createStoragePool(config)
+    yield
+      poolId
       
   def transferStore(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = this.clientContext

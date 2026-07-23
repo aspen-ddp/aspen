@@ -5,6 +5,8 @@ import org.aspen_ddp.aspen.client.internal.MetadataTree
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.DataObjectPointer
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
 import scala.concurrent.ExecutionContext
 
@@ -77,3 +79,24 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       child.parent should be(Some(parentId))
       parent.memberSets should contain(childId)
       parent.memberSets.count(_ == childId) should be(1)
+
+  atest("createNewStoragePool selects devices from the set and records the pool in assignedPools"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      poolId <- client.createNewStoragePool(
+                  "rework-pool",
+                  Replication(1, 1),
+                  None,
+                  RocksDBConfig(),
+                  setId,
+                  0L)
+      _ <- waitForTransactionsToComplete()
+      poolState <- client.getStoragePoolState(poolId)
+      setState <- client.getStorageDeviceSetState(setId)
+    yield
+      poolState.storageDeviceSet should be(setId)
+      poolState.stores.length should be(1)
+      poolState.stores(0).storageDeviceId should be(StorageDeviceId.BootstrapStorageDeviceId)
+      setState.assignedPools should contain(poolId)
+      setState.assignedPools should contain(PoolId.BootstrapPoolId)

@@ -280,8 +280,17 @@ abstract class BaseAspenClient(
         _ <- storagePoolsTree.preparePut(config.poolId.uuid, poolPtr)
         _ <- namespacedRegistry.prepareRegisterObject("pool", config.name, config.poolId.uuid)
         devUpdates <- Future.sequence(collectDevices(config.stores))
+        setPtr <- getStorageDeviceSetPointer(config.storageDeviceSet)
+        setDos <- read(setPtr)
       yield
         devUpdates.foreach(updateDevice)
+
+        // Record the pool in the device set's assignedPools (reverse of the pool's
+        // storageDeviceSet reference). Idempotent so transaction retries are safe.
+        val setState = StorageDeviceSetState(setDos)
+        if !setState.assignedPools.contains(config.poolId) then
+          val updatedSet = setState.copy(assignedPools = config.poolId :: setState.assignedPools)
+          tx.overwrite(setPtr, setDos.revision, DataBuffer(updatedSet.toBytes))
 
         config.poolId
 

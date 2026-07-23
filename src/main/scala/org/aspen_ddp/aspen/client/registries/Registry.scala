@@ -24,6 +24,15 @@ class Registry(val client: AspenClient,
       case None => throw new NoSuchElementException(key.toString)
       case Some(vs) => vs.value
 
+  def scan(prefix: String): Future[List[(Key, Value)]] =
+    val minKey = Key(s"$prefix.")
+    val maxKey = Key(s"$prefix/")   // '/' (0x2F) is the byte after '.' (0x2E)
+    val buf = scala.collection.mutable.ListBuffer[(Key, Value)]()
+    tkvl.foreachInRange(minKey, maxKey, (_, key, vs) => {
+      buf += key -> vs.value
+      Future.unit
+    }).map(_ => buf.toList)
+
   def prepareRegister(key: Key, value: Value)(using tx: Transaction): Future[Unit] =
     tkvl.set(key, value, requirement = Some(Left(true))).map: _ =>
       tx.result.value match

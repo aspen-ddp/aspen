@@ -53,3 +53,40 @@ class NamespacedUUIDRegistrySuite extends IntegrationTestSuite:
       result <- registry.registerObject("storage", "pool-config", objectId2).failed
     yield
       result shouldBe a [Registry.DuplicateRegistration]
+
+  atest("getAllEntries returns only matching namespace, names stripped, sorted"):
+    for
+      registry <- createRegistry()
+      poolA = UUID.randomUUID()
+      poolB = UUID.randomUUID()
+      host1 = UUID.randomUUID()
+
+      // Register out of alphabetical order to prove sorting is by name.
+      _ <- registry.registerObject("pool", "zebra", poolB)
+      _ <- registry.registerObject("pool", "alpha", poolA)
+      _ <- registry.registerObject("host", "node-a", host1)
+
+      pools <- registry.getAllEntries("pool")
+      hosts <- registry.getAllEntries("host")
+    yield
+      pools should be (List("alpha" -> poolA, "zebra" -> poolB))
+      hosts should be (List("node-a" -> host1))
+
+  atest("getAllEntries returns empty list for unused namespace"):
+    for
+      registry <- createRegistry()
+      _ <- registry.registerObject("pool", "alpha", UUID.randomUUID())
+      groups <- registry.getAllEntries("group")
+    yield
+      groups should be (Nil)
+
+  atest("getAllEntries does not match a namespace that is a name substring"):
+    for
+      registry <- createRegistry()
+      poolId = UUID.randomUUID()
+      // A name in a different namespace whose text contains "pool" must not leak in.
+      _ <- registry.registerObject("host", "pool-host", UUID.randomUUID())
+      _ <- registry.registerObject("pool", "real", poolId)
+      pools <- registry.getAllEntries("pool")
+    yield
+      pools should be (List("real" -> poolId))

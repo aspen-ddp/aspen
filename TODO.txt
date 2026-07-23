@@ -1,10 +1,4 @@
 
-Add CLI command "create-device-set"
-  - Takes a name and a level as arguments
-  - fail if name already in use
-  - Add AspenClient.createNewDeviceSet
-    - Create the new device set state object, insert into tree, and add to namespaced registry
-
 Add CLI listing commands
   - Add NamespacedUUIDRegistry.getAllEntires(prefix): List[(String, UUID)]
     - scans TKVL and gets all entries with the matching prefix. Returns the registered name (without prefix)

@@ -108,6 +108,9 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       parentId <- client.createStorageDeviceSet("bad-parent", level = 0, parent = None)
       _ <- waitForTransactionsToComplete()
       _ <- recoverToSucceededIf[AspenClient.InvalidDeviceSetLevel](
-             client.createStorageDeviceSet("bad-child", level = 0, parent = Some(parentId))
+             client.createStorageDeviceSet("bad-child-equal", level = 0, parent = Some(parentId))
+           )
+      _ <- recoverToSucceededIf[AspenClient.InvalidDeviceSetLevel](
+             client.createStorageDeviceSet("bad-child-higher", level = 1, parent = Some(parentId))
            )
     yield succeed

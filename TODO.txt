@@ -5,8 +5,8 @@ Revisit storage pool creation
   - Pool state object & device state object need to reference each other
     - The pool object stores the device set id
     - Need to update the device set state object to add the new pool id to assignedPools
-  - Update the CLI to specify a device set instead of hosts
-    - rename comand to "create-pool"
+  - Update the CLI to specify a device set instead of a list of host names
+    - rename command to "create-pool"
 
 Add CLI command "create-device-set"
   - Takes a name and a level as arguments
@@ -28,6 +28,16 @@ Add CLI command "list-devices"
   - Requires a hostname argument
   - Lists each device UUID, the device set name it belongs to, total capacity, & percent utilization
 
+Add CLI "show" commands
+  - Requires a name or UUID
+  - Looks up the state for the specified entry and displays the content
+  - Commands to add
+    - show-host
+    - show-device
+    - show-pool
+    - show-device-set
+    - show-allocation-gorup
+
 Add CLI command "create-allocation-group"
   - takes name and level arguments
   - fail if name already in use
@@ -36,15 +46,41 @@ Add CLI command "add-pool-to-group"
   - takes pool name and allocation group name
   - Update the state objects for both
 
+Add CLI command "move-device-to-set"
+  - takes device UUID and device set UUID
+    - Set must be tier 0
+  - In one Transaction
+    - Update device state to point to new set
+    - Update new set to point to the device
+    - Update the old device set to no longer point to the device
 
-Need a reliable, distributed DurableTask executor
-  - For focused things that need to happen but isn't tied to a host and result is not needed
+Add CLI command "create-storage-device"
+  - Arguments: host configuration file and directory
+    - config file must exist and load correctly
+    - directory must exist and not contain a storage device config file
+  - Add aspen.server.StorageDeviceManager
+    - object contains createStorageDevice(hostId, deviceSetId, directoryName): Future[Unit]
+      - Generates a UUID for the new device
+      - transactUntilSuccessful:
+        - create new StorageDeviceState object
+        - Update HostState to include the new device
+        - Update StorageDeviceSetState to include the new device
+      - Create the StorageDeviceConfig file in the target directory
+  - cli command implemented in terms of above function.
+    - StoreManager will eventually need to automate the device creation process so we'll want to
+      minimize the logic going into the cli code
+
+Need a reliable, system-level distributed DurableTask execution strategy
+  - For focused things that need to happen but isn't tied to a host and the result is not needed
     - Example: Migrating a pool to a new device set
   - Goal is to spread the execution of these tasks across hosts so as to avoid overloading any one node
-  - Implement as a DurableService
-    - tkvl of tasks
+  - Implement SystemTaskExecutorService (subclass of DurableService)
+    - Global singleton that is always running
+      - Register this service in Bootstrap.scala like we do with RebalancingDurableService
+    - tkvl of tasks to execute
       - Key = UUID, Value = objectPointer
-    - service polls tkvl for new tasks but uses NewTaskAdded(uuid, pointer) message for performance
+    - service slow polls tkvl for new tasks for reliability
+      - Uses NewSystemTaskAdded(uuid, pointer) message for performance
     - service caches a list of all host UUIDs
       - refreshed every 30 mins
     - On New Task Detected
@@ -53,6 +89,10 @@ Need a reliable, distributed DurableTask executor
     - Wait 30 seconds then start polling the task state object
       - If object deleted, task is complete. Discard state
       - If the revision hasn't changed in 45 seconds, reassign the task to a new host
+    - All periodic operations need to guard against pileups
+      - System can experience long periods where objects are not writeable or readable
+      - Use util.ignoreExtraCallsWhileRunning or BackgroundTaskManager.scheduleNonConcurrentPollingTask
+        or something similar
     - Each host listens for ExecuteSystemTask messages
       - Upon reception, load and start executing the task
       - Immediately use a transaction to VersionBump the task state object
@@ -60,19 +100,24 @@ Need a reliable, distributed DurableTask executor
         - task does a VersionBump transaction on all system task state objects it's currently running
           - This is effectively a "heartbeat" to tell the system durable service that the host is alive
             and actively executing the task
-     - On task completion, delete tkvl entry of the DurableService
+    - On task completion
+      - Delete tkvl entry of the DurableTask
+      - Send SystemTaskComplete(uuid) to SystemTaskExecutorService
     - Add an AspenClient.createSystemDurableTask(taskTypeUUID, initialState: Map[Key, Array[Byte]]): Future[Unit]
       - retry until successful
 
-
 Reassignment of a pool to a new set:
-  - System-level DurableTask
+  - MigratePoolToSetDurableTask
+    - register with system task executor at time of creation
   - Always reassign each store to a new device and move it
   - Keep it simple.
     - Optimize for not moving existing stores that are already in the set later
   - Durable task selects a device for a store, calls transferStore, polls for
-        completion then moves to next store. On complete, update PoolState to say
-        migration status is Complete
+    completion then moves to next store. On complete, update PoolState to say
+    migration status is Complete
+    - protect against pileups while polling
+    - protect against case where source and destination devices are the same
+      - No-op in this case (already complete)
 
 Rebalancing as a passive background task
   - Part of the system-level Durable Service

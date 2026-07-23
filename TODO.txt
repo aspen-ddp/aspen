@@ -1,13 +1,4 @@
 
-Revisit storage pool creation
-  - Remove storageDeviceIds from AspenClient.createNewStoragePool
-    - Instead, use StorageDeviceSetState.selectDevicesForPool to get the list of devices
-  - Pool state object & device state object need to reference each other
-    - The pool object stores the device set id
-    - Need to update the device set state object to add the new pool id to assignedPools
-  - Update the CLI to specify a device set instead of a list of host names
-    - rename command to "create-pool"
-
 Add CLI command "create-device-set"
   - Takes a name and a level as arguments
   - fail if name already in use

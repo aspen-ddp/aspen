@@ -80,6 +80,9 @@ object Main {
   private case class HostNotFound(hostname: String)
     extends Exception(s"host '$hostname' not found")
 
+  private case class EntityNotFound(kind: String, ref: String)
+    extends Exception(s"$kind '$ref' not found")
+
   class NetworkBridge extends MessageHandler with Logging {
     var oclient: Option[AspenClient] = None
     var onode: Option[StoreManager] = None
@@ -1028,6 +1031,13 @@ object Main {
     catch
       case _: IllegalArgumentException => byName(ref)
 
+  /** Resolve a related entity's display name, best-effort. Any failure (missing
+   *  reference, read error) yields None so a `show` command still succeeds using the
+   *  raw UUID as a fallback. */
+  private def optName[A](f: Future[A])(name: A => String)
+                        (using ExecutionContext): Future[Option[String]] =
+    f.map(a => Some(name(a))).recover { case _ => None }
+
   private[cmdline] def formatHostState(s: HostState): String =
     val lines = scala.collection.mutable.ListBuffer[String]()
     lines += s"Host: ${s.name}"
@@ -1201,6 +1211,113 @@ object Main {
         println(s"Error: host '$hostname' not found")
       case scala.util.Failure(err) =>
         println(s"Error listing devices: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_host(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        hostId    <- resolveRef(ref, HostId(_), client.getHostId)
+        hostState <- client.getHostState(hostId)
+      yield formatHostState(hostState)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("host", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)                => println(text)
+      case scala.util.Failure(e: EntityNotFound)   => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)                 => println(s"Error showing host: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_device(bootstrapConfigFile: os.Path, uuidStr: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val deviceId = StorageDeviceId(UUID.fromString(uuidStr))
+
+    val f =
+      (for
+        dev      <- client.getStorageDeviceState(deviceId)
+        hostName <- optName(client.getHostState(dev.hostId))(_.name)
+        setName  <- optName(client.getStorageDeviceSetState(dev.storageDeviceSet))(_.name)
+      yield formatDeviceState(dev, hostName, setName)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("storage device", uuidStr))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing storage device: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_pool(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        poolId  <- resolveRef(ref, PoolId(_), client.getStoragePoolId)
+        pool    <- client.getStoragePoolState(poolId)
+        setName <- optName(client.getStorageDeviceSetState(pool.storageDeviceSet))(_.name)
+      yield formatPoolState(pool, setName)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("pool", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing pool: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_device_set(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        setId <- resolveRef(ref, StorageDeviceSetId(_), client.getStorageDeviceSetId)
+        set   <- client.getStorageDeviceSetState(setId)
+        parentName <- set.parent match
+          case None    => Future.successful(None)
+          case Some(p) => optName(client.getStorageDeviceSetState(p))(_.name)
+      yield formatDeviceSetState(set, parentName)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("device set", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing device set: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_allocation_group(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        groupId <- resolveRef(ref, AllocationGroupId(_), client.getAllocationGroupId)
+        group   <- client.getAllocationGroupState(groupId)
+      yield formatAllocationGroupState(group)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("allocation group", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing allocation group: ${err.getMessage}")
 
     Await.ready(f, Duration(30, SECONDS))
 

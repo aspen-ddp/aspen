@@ -4,7 +4,6 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.RegisteredTypeFactory
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.network.ServiceMessage
 import org.aspen_ddp.aspen.common.objects.Key
 import org.aspen_ddp.aspen.compute.ServiceEntry
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor

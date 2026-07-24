@@ -56,6 +56,21 @@ object UpdateAllocationGroupUsageTask extends DurableTaskFactory:
 
     taskExecutor.prepareTask(UpdateAllocationGroupUsageTask, istate)
 
+  def prepareSystemTask(client: AspenClient,
+                        childUUID: UUID,
+                        currentUsage: Long,
+                        maximumStoreSize: Long,
+                        allocationGroups: List[UUID])
+                       (using tx: Transaction): Future[Unit] =
+    require(allocationGroups.nonEmpty)
+
+    client.prepareSystemDurableTask(typeUUID, Map(
+      ChildUUIDKey        -> uuid2byte(childUUID),
+      CurrentUsageKey     -> long2byte(currentUsage),
+      MaxSizeKey          -> long2byte(maximumStoreSize),
+      AllocationGroupsKey -> uuids2byte(allocationGroups),
+      NextIndexKey        -> long2byte(0)))
+
 
 class UpdateAllocationGroupUsageTask(
   val taskPointer: DurableTaskPointer,

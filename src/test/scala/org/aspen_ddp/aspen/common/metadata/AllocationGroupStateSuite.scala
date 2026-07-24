@@ -353,3 +353,22 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
       enrolled.size should be >= 1
       byte2uuid(taskKvos.contents(SimpleTaskExecutor.TaskTypeKey).value.bytes) should be(UpdateAllocationGroupUsageTask.typeUUID)
+
+  atest("addPoolToGroup resolves names and adds the pool"):
+    given ExecutionContext = executionContext
+    for
+      groupId <- client.createAllocationGroup("named-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+
+      // Radicle bootstrap pool is registered under a known name; resolve it dynamically.
+      pools <- client.listStoragePools()
+      poolName = pools.find(_._2 == Radicle.poolId).get._1
+
+      _ <- client.addPoolToGroup(poolName, "named-group")
+      _ <- waitForTransactionsToComplete()
+
+      ps <- readPoolState()
+      ags <- readGroupState(groupId)
+    yield
+      ps.allocationGroups should contain(groupId.uuid)
+      ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)

@@ -117,6 +117,17 @@ trait AspenClient extends ObjectReader:
 
   def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId]
 
+  /** Add a storage pool to an allocation group, both identified by name. Fails with
+   *  NoSuchElementException if either name is not registered. Uses the system durable
+   *  task path for any usage cascade (no local TaskExecutor). */
+  def addPoolToGroup(poolName: String, groupName: String): Future[Unit] =
+    given ExecutionContext = this.clientContext
+    for
+      poolId  <- getStoragePoolId(poolName)
+      groupId <- getAllocationGroupId(groupName)
+      _       <- AllocationGroupState.addPool(this, poolId, groupId, None)
+    yield ()
+
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
 

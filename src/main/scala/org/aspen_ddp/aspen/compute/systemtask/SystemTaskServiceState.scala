@@ -46,3 +46,9 @@ object SystemTaskServiceState:
     client.transactUntilSuccessful: tx =>
       given Transaction = tx
       tkvl(client, statePtr).delete(Key(uuid2byte(taskId)))
+
+  /** Delete a task's registry entry within an existing transaction. */
+  def removeInTx(client: AspenClient,
+                 statePtr: KeyValueObjectPointer,
+                 taskId: UUID)(using tx: Transaction): Future[Unit] =
+    tkvl(client, statePtr).delete(Key(uuid2byte(taskId)))

@@ -1,8 +1,4 @@
 
-Add CLI command "list-devices"
-  - Requires a hostname argument
-  - Lists each device UUID, the device set name it belongs to, total capacity, & percent utilization
-
 Add CLI "show" commands
   - Requires a name or UUID
   - Looks up the state for the specified entry and displays the content
@@ -101,7 +97,10 @@ Rebalancing as a passive background task
       - needs to be configurable
     - If it results in a non-empty plan, kick off a rebalancing task
 
-
+Decouple AspenClient and BaseReadDriver
+  - Having to stub out every method added to AspenClient is annoying
+  - Use pluggable trait that has just the methods BaseReadDriver needs
+  - Test implementation & "real" one backed by AspenClient
 
 ---------
 

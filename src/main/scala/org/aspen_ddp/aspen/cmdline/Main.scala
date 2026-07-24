@@ -73,6 +73,8 @@ object Main {
                   newSetName:String="",
                   newSetLevel:Int=0,
                   parentSetName:String="",
+                  newGroupName:String="",
+                  newGroupLevel:Int=0,
                   entityRef:String="")
 
   class ConfigError(msg: String) extends AmoebaError(msg)
@@ -235,6 +237,21 @@ object Main {
 
           arg[String]("[parent-set-name]").optional().text("Optional name of the parent device set to link into").
             action((x, c) => c.copy(parentSetName = x)),
+        )
+
+      cmd("create-allocation-group").text("Creates a new allocation group").
+        action((_, c) => c.copy(mode = "create-allocation-group")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name>").text("Name of the new allocation group").
+            action((x, c) => c.copy(newGroupName = x)),
+
+          arg[Int]("<level>").text("Hierarchy level (0 = group of pools, 1+ = group of groups)").
+            action((x, c) => c.copy(newGroupLevel = x)).
+            validate(x => if (x >= 0) success else failure("Level must be >= 0")),
         )
 
       cmd("transfer-store").text("Transfers a store to a different storage device").
@@ -415,6 +432,7 @@ object Main {
             case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
             case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
             case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
+            case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
             case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
@@ -998,6 +1016,38 @@ object Main {
       case scala.util.Success(setId) =>
         println("******************************************")
         println(s"* New Device Set Created: ${setId.uuid}")
+        println("******************************************")
+      case scala.util.Failure(err) => reportError(err)
+
+    Await.ready(f, Duration(30, SECONDS))
+  }
+
+  def create_allocation_group(bootstrapConfigFile: os.Path,
+                              name: String,
+                              level: Int): Unit = {
+
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val f = client.createAllocationGroup(name, level)
+
+    // Translate the known failure mode into human-readable messages. The client's retry
+    // strategy unwraps StopRetrying, so the future fails with the underlying cause.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: DuplicateRegistration =>
+        println(s"Error: an allocation group named '$name' already exists")
+      case e =>
+        println(s"Error creating allocation group: ${e.getMessage}")
+
+    f.onComplete:
+      case scala.util.Success(groupId) =>
+        println("******************************************")
+        println(s"* New Allocation Group Created: ${groupId.uuid}")
         println("******************************************")
       case scala.util.Failure(err) => reportError(err)
 

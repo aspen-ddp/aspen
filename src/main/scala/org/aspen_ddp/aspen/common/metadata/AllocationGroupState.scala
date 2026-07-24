@@ -35,14 +35,14 @@ object AllocationGroupState:
   def addPool(client: AspenClient,
               poolId: PoolId,
               parentId: AllocationGroupId,
-              taskExecutor: TaskExecutor): Future[Unit] =
+              taskExecutor: Option[TaskExecutor] = None): Future[Unit] =
 
     def mod(psPtr: KeyValueObjectPointer, psKvos: KeyValueObjectState,
             agsPtr: DataObjectPointer, agsDos: DataObjectState,
             ps: StoragePoolState, ags: AllocationGroupState,
-            tx: Transaction): (StoragePoolState, AllocationGroupState) =
+            tx: Transaction): Option[(StoragePoolState, AllocationGroupState)] =
       if ps.allocationGroups.contains(parentId.uuid) && ags.members.exists(_.uuid == poolId.uuid) then
-        (ps, ags)
+        None
       else
         val nps = ps.copy(allocationGroups = parentId.uuid :: ps.allocationGroups)
         val reqs = List(KeyRevision(StoragePoolState.ConfigKey, psKvos.contents(StoragePoolState.ConfigKey).revision))
@@ -55,21 +55,21 @@ object AllocationGroupState:
 
         tx.overwrite(agsPtr, agsDos.revision, DataBuffer(nags.toBytes))
 
-        (nps, nags)
+        Some((nps, nags))
 
     modifyPool(client, poolId, parentId, taskExecutor, mod)
 
   def removePool(client: AspenClient,
                  poolId: PoolId,
                  parentId: AllocationGroupId,
-                 taskExecutor: TaskExecutor): Future[Unit] =
+                 taskExecutor: Option[TaskExecutor] = None): Future[Unit] =
 
     def mod(psPtr: KeyValueObjectPointer, psKvos: KeyValueObjectState,
             agsPtr: DataObjectPointer, agsDos: DataObjectState,
             ps: StoragePoolState, ags: AllocationGroupState,
-            tx: Transaction): (StoragePoolState, AllocationGroupState) =
+            tx: Transaction): Option[(StoragePoolState, AllocationGroupState)] =
       if !ps.allocationGroups.contains(parentId.uuid) && !ags.members.exists(_.uuid == poolId.uuid) then
-        (ps, ags)
+        None
       else
         val nps = ps.copy(allocationGroups = ps.allocationGroups.filter(_ != parentId.uuid))
         val reqs = List(KeyRevision(StoragePoolState.ConfigKey, psKvos.contents(StoragePoolState.ConfigKey).revision))
@@ -81,19 +81,40 @@ object AllocationGroupState:
 
         tx.overwrite(agsPtr, agsDos.revision, DataBuffer(nags.toBytes))
 
-        (nps, nags)
+        Some((nps, nags))
 
     modifyPool(client, poolId, parentId, taskExecutor, mod)
+
+  /** Enroll the usage-cascade task for `childUUID` (a pool or child group) atomically within
+   *  the current transaction, when the group has parent groups. Uses the supplied TaskExecutor
+   *  when present, otherwise the system durable task path. */
+  private def prepareUsageTask(client: AspenClient,
+                              childUUID: UUID,
+                              nags: AllocationGroupState,
+                              taskExecutor: Option[TaskExecutor])
+                             (using tx: Transaction): Future[Unit] =
+    given ExecutionContext = client.clientContext
+    if nags.parentGroups.nonEmpty then
+      taskExecutor match
+        case Some(exec) =>
+          UpdateAllocationGroupUsageTask.prepareTask(childUUID,
+            nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid), exec).map(_ => ())
+        case None =>
+          UpdateAllocationGroupUsageTask.prepareSystemTask(client, childUUID,
+            nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid))
+    else
+      Future.unit
 
   private def modifyPool(client: AspenClient,
                          poolId: PoolId,
                          parentId: AllocationGroupId,
-                         taskExecutor: TaskExecutor,
+                         taskExecutor: Option[TaskExecutor],
                          mod: (KeyValueObjectPointer, KeyValueObjectState, DataObjectPointer, DataObjectState,
                            StoragePoolState, AllocationGroupState,
-                           Transaction) => (StoragePoolState, AllocationGroupState)
+                           Transaction) => Option[(StoragePoolState, AllocationGroupState)]
                         ): Future[Unit] =
     given ExecutionContext = client.clientContext
+
     def prep(tx: Transaction): Future[Unit] =
       given Transaction = tx
       for
@@ -101,15 +122,12 @@ object AllocationGroupState:
         agsPtr <- client.getAllocationGroupPointer(parentId)
         psKvos <- client.read(psPtr)
         agsDos <- client.read(agsPtr)
-      yield
-        val ps = StoragePoolState(psKvos)
-        val ags = AllocationGroupState(agsDos)
-
-        val (nps, nags) = mod(psPtr, psKvos, agsPtr, agsDos, ps, ags, tx)
-
-        if nags.parentGroups.nonEmpty then
-          UpdateAllocationGroupUsageTask.prepareTask(poolId.uuid,
-            nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid), taskExecutor)
+        ps = StoragePoolState(psKvos)
+        ags = AllocationGroupState(agsDos)
+        _ <- mod(psPtr, psKvos, agsPtr, agsDos, ps, ags, tx) match
+          case Some((_, nags)) => prepareUsageTask(client, poolId.uuid, nags, taskExecutor)
+          case None            => Future.unit
+      yield ()
 
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
@@ -122,43 +140,43 @@ object AllocationGroupState:
   def addGroup(client: AspenClient,
                childId: AllocationGroupId,
                parentId: AllocationGroupId,
-               taskExecutor: TaskExecutor): Future[Unit] =
+               taskExecutor: Option[TaskExecutor] = None): Future[Unit] =
 
     def mod(childPtr: DataObjectPointer, childDos: DataObjectState,
             parentPtr: DataObjectPointer, parentDos: DataObjectState,
             child: AllocationGroupState, parent: AllocationGroupState,
-            tx: Transaction): (AllocationGroupState, AllocationGroupState) =
+            tx: Transaction): Option[(AllocationGroupState, AllocationGroupState)] =
       if child.parentGroups.exists(_.uuid == parentId.uuid) && parent.members.exists(_.uuid == childId.uuid) then
-        (child, parent)
+        None
       else
         if child.level >= parent.level then
           throw new InvalidLevel()
-        
+
         val nchild = child.copy(parentGroups = parentId :: child.parentGroups)
-        
+
         tx.overwrite(childPtr, childDos.revision, DataBuffer(nchild.toBytes))
-        
-        val m = Member(MemberType.Group, child.groupId.uuid, child.maximumObjectSize, 
+
+        val m = Member(MemberType.Group, child.groupId.uuid, child.maximumObjectSize,
           child.currentUsage, child.maximumSize)
         val nags = parent.copy(members = m :: parent.members)
 
         tx.overwrite(parentPtr, parentDos.revision, DataBuffer(nags.toBytes))
 
-        (nchild, nags)
+        Some((nchild, nags))
 
     modifyGroup(client, childId, parentId, taskExecutor, mod)
 
   def removeGroup(client: AspenClient,
                   childId: AllocationGroupId,
                   parentId: AllocationGroupId,
-                  taskExecutor: TaskExecutor): Future[Unit] =
+                  taskExecutor: Option[TaskExecutor] = None): Future[Unit] =
 
     def mod(childPtr: DataObjectPointer, childDos: DataObjectState,
             parentPtr: DataObjectPointer, parentDos: DataObjectState,
             child: AllocationGroupState, parent: AllocationGroupState,
-            tx: Transaction): (AllocationGroupState, AllocationGroupState) =
+            tx: Transaction): Option[(AllocationGroupState, AllocationGroupState)] =
       if !child.parentGroups.exists(_.uuid == parentId.uuid) && !parent.members.exists(_.uuid == childId.uuid) then
-        (child, parent)
+        None
       else
         val nchild = child.copy(parentGroups = child.parentGroups.filter(_ != parentId))
 
@@ -168,17 +186,17 @@ object AllocationGroupState:
 
         tx.overwrite(parentPtr, parentDos.revision, DataBuffer(nparent.toBytes))
 
-        (nchild, nparent)
+        Some((nchild, nparent))
 
     modifyGroup(client, childId, parentId, taskExecutor, mod)
-    
+
   private def modifyGroup(client: AspenClient,
                           childId: AllocationGroupId,
                           parentId: AllocationGroupId,
-                          taskExecutor: TaskExecutor,
+                          taskExecutor: Option[TaskExecutor],
                           mod: (DataObjectPointer, DataObjectState, DataObjectPointer, DataObjectState,
                             AllocationGroupState, AllocationGroupState,
-                            Transaction) => (AllocationGroupState, AllocationGroupState)
+                            Transaction) => Option[(AllocationGroupState, AllocationGroupState)]
                          ): Future[Unit] =
     given ExecutionContext = client.clientContext
 
@@ -190,15 +208,12 @@ object AllocationGroupState:
         parentPtr <- client.getAllocationGroupPointer(parentId)
         childDos <- client.read(childPtr)
         parentDos <- client.read(parentPtr)
-      yield
-        val child = AllocationGroupState(childDos)
-        val parent = AllocationGroupState(parentDos)
-
-        val (nchild, nparent) = mod(childPtr, childDos, parentPtr, parentDos, child, parent, tx)
-
-        if nparent.parentGroups.nonEmpty then
-          UpdateAllocationGroupUsageTask.prepareTask(childId.uuid,
-            nparent.currentUsage, nparent.maximumSize, nparent.parentGroups.map(_.uuid), taskExecutor)
+        child = AllocationGroupState(childDos)
+        parent = AllocationGroupState(parentDos)
+        _ <- mod(childPtr, childDos, parentPtr, parentDos, child, parent, tx) match
+          case Some((_, nparent)) => prepareUsageTask(client, childId.uuid, nparent, taskExecutor)
+          case None               => Future.unit
+      yield ()
 
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)

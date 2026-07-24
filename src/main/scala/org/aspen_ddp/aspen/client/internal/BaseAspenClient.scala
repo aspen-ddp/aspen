@@ -344,21 +344,28 @@ abstract class BaseAspenClient(
   override def createSystemDurableTask(taskTypeUUID: UUID,
                                        initialState: Map[Key, Array[Byte]]): Future[Unit] =
     given ExecutionContext = clientContext
+    transactUntilSuccessful: tx =>
+      given Transaction = tx
+      prepareSystemDurableTask(taskTypeUUID, initialState)
+
+  override def prepareSystemDurableTask(taskTypeUUID: UUID,
+                                        initialState: Map[Key, Array[Byte]])
+                                       (using tx: Transaction): Future[Unit] =
+    given ExecutionContext = clientContext
 
     // Sanity check: the type must resolve to a DurableTaskFactory.
     typeRegistry.getType[DurableTaskFactory](taskTypeUUID) match
       case None =>
         Future.failed(StopRetrying(
-          new IllegalArgumentException(s"createSystemDurableTask: no DurableTaskFactory registered for $taskTypeUUID")))
+          new IllegalArgumentException(s"prepareSystemDurableTask: no DurableTaskFactory registered for $taskTypeUUID")))
       case Some(_) =>
         val taskId = UUID.randomUUID()
 
         def serviceStatePtr(): Future[KeyValueObjectPointer] =
-          val servicesTkvl = TieredKeyValueList(this,
-            KVObjectRootManager(this, Radicle.ServicesTreeKey, radicle))
           servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID)).map:
             case Some(vs) => ServiceEntry.decode(vs.value.bytes).statePointer
-            case None => throw new IllegalStateException("SystemTaskExecutorService is not registered")
+            case None => throw StopRetrying(
+              new IllegalStateException("SystemTaskExecutorService is not registered"))
 
         val taskContent: Map[Key, Value] =
           (initialState + (SimpleTaskExecutor.TaskTypeKey -> uuid2byte(taskTypeUUID)))
@@ -368,13 +375,12 @@ abstract class BaseAspenClient(
           statePtr <- serviceStatePtr()
           pool <- getStoragePool(Radicle.poolId)
           allocator = new PoolObjectAllocator(this, pool)
-          taskStatePtr <- transactUntilSuccessful: tx =>
-                            given Transaction = tx
-                            allocator.allocateKeyValueObject(taskContent)
-          _ <- SystemTaskServiceState.enroll(this, statePtr, taskId, taskStatePtr)
-          _ <- sendServiceMessage(SystemTaskExecutorService.ServiceUUID,
-                 SystemTaskMessage.encode(NewSystemTaskAdded(taskId)))
-        yield ()
+          taskStatePtr <- allocator.allocateKeyValueObject(taskContent)
+          _ <- SystemTaskServiceState.enrollInTx(this, statePtr, taskId, taskStatePtr)
+        yield
+          tx.result.foreach: _ =>
+            sendServiceMessage(SystemTaskExecutorService.ServiceUUID,
+              SystemTaskMessage.encode(NewSystemTaskAdded(taskId)))
 
   def getSystemAttribute(key: String): Option[String] = attributes.get(key)
   def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value

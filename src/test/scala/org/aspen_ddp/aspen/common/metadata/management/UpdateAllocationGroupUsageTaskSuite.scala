@@ -49,7 +49,7 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("test-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       agsBefore <- readGroupState(groupId)
@@ -84,9 +84,9 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
       groupId2 <- client.createAllocationGroup("group-2", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId1, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId1, Some(executor))
       _ <- waitForTransactionsToComplete()
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId2, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId2, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       newUsage = 75000L
@@ -121,7 +121,7 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("test-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       agsBefore <- readGroupState(groupId)
@@ -152,9 +152,9 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
       parentGroupId <- client.createAllocationGroup("parent-group", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, Some(executor))
       _ <- waitForTransactionsToComplete()
-      _ <- AllocationGroupState.addGroup(client, childGroupId, parentGroupId, executor)
+      _ <- AllocationGroupState.addGroup(client, childGroupId, parentGroupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       childBefore <- readGroupState(childGroupId)
@@ -200,9 +200,9 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
       parentGroupId <- client.createAllocationGroup("parent-group", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, Some(executor))
       _ <- waitForTransactionsToComplete()
-      _ <- AllocationGroupState.addGroup(client, childGroupId, parentGroupId, executor)
+      _ <- AllocationGroupState.addGroup(client, childGroupId, parentGroupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       // Establish a large baseline usage so that later +1 is below threshold

@@ -62,7 +62,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("pool-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
@@ -86,7 +86,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("pool-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
@@ -112,10 +112,10 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
       group1Id <- client.createAllocationGroup("group1", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, group0Id, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, group0Id, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, group0Id, group1Id, executor)
+      _ <- AllocationGroupState.addGroup(client, group0Id, group1Id, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(group1Id))
@@ -142,13 +142,13 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
       group2Id <- client.createAllocationGroup("group2", level = 2)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, group0Id, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, group0Id, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, group0Id, group1Id, executor)
+      _ <- AllocationGroupState.addGroup(client, group0Id, group1Id, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, group1Id, group2Id, executor)
+      _ <- AllocationGroupState.addGroup(client, group1Id, group2Id, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(group2Id))
@@ -170,7 +170,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("multi-alloc-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
@@ -199,7 +199,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("readback-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))

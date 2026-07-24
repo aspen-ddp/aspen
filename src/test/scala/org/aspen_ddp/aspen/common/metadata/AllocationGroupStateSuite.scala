@@ -2,10 +2,15 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
+import org.aspen_ddp.aspen.common.objects.Key
+import org.aspen_ddp.aspen.common.util.byte2uuid
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
-import org.aspen_ddp.aspen.compute.TaskExecutor
+import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskServiceState}
+import org.aspen_ddp.aspen.compute.{ServiceEntry, TaskExecutor}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -47,7 +52,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("test-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       ps <- readPoolState()
@@ -65,7 +70,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
 
       psBefore <- readPoolState()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       ags <- readGroupState(groupId)
@@ -83,10 +88,10 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("test-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.removePool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.removePool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       ps <- readPoolState()
@@ -102,10 +107,10 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       groupId <- client.createAllocationGroup("test-group", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       ps <- readPoolState()
@@ -123,9 +128,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       groupId2 <- client.createAllocationGroup("group-2", level = 0)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId1, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId1, Some(executor))
       _ <- waitForTransactionsToComplete()
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId2, executor)
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId2, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       ps1 <- readPoolState()
@@ -136,7 +141,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       _ = ags1.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
       _ = ags2a.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
 
-      _ <- AllocationGroupState.removePool(client, Radicle.poolId, groupId1, executor)
+      _ <- AllocationGroupState.removePool(client, Radicle.poolId, groupId1, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       ps2 <- readPoolState()
@@ -157,7 +162,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       parentId <- client.createAllocationGroup("parent-group", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       child <- readGroupState(childId)
@@ -175,7 +180,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       parentId <- client.createAllocationGroup("parent-group", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       child <- readGroupState(childId)
@@ -196,10 +201,10 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       parentId <- client.createAllocationGroup("parent-group", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.removeGroup(client, childId, parentId, executor)
+      _ <- AllocationGroupState.removeGroup(client, childId, parentId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       child <- readGroupState(childId)
@@ -217,10 +222,10 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       parentId <- client.createAllocationGroup("parent-group", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, childId, parentId, executor)
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       child <- readGroupState(childId)
@@ -239,7 +244,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
 
       _ <- recoverToSucceededIf[AllocationGroupState.InvalidLevel](
-        AllocationGroupState.addGroup(client, groupA, groupB, executor)
+        AllocationGroupState.addGroup(client, groupA, groupB, Some(executor))
       )
     yield succeed
 
@@ -253,7 +258,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
 
       _ <- recoverToSucceededIf[AllocationGroupState.InvalidLevel](
-        AllocationGroupState.addGroup(client, childId, parentId, executor)
+        AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
       )
     yield succeed
 
@@ -268,9 +273,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       parentId2 <- client.createAllocationGroup("parent-2", level = 1)
       _ <- waitForTransactionsToComplete()
 
-      _ <- AllocationGroupState.addGroup(client, childId, parentId1, executor)
+      _ <- AllocationGroupState.addGroup(client, childId, parentId1, Some(executor))
       _ <- waitForTransactionsToComplete()
-      _ <- AllocationGroupState.addGroup(client, childId, parentId2, executor)
+      _ <- AllocationGroupState.addGroup(client, childId, parentId2, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       child1 <- readGroupState(childId)
@@ -281,7 +286,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       _ = parent1a.members.exists(_.uuid == childId.uuid) should be(true)
       _ = parent2a.members.exists(_.uuid == childId.uuid) should be(true)
 
-      _ <- AllocationGroupState.removeGroup(client, childId, parentId1, executor)
+      _ <- AllocationGroupState.removeGroup(client, childId, parentId1, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       child2 <- readGroupState(childId)
@@ -292,3 +297,78 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       child2.parentGroups.exists(_.uuid == parentId2.uuid) should be(true)
       parent1b.members.exists(_.uuid == childId.uuid) should be(false)
       parent2b.members.exists(_.uuid == childId.uuid) should be(true)
+
+  atest("addPool no-op re-add does not change membership"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-noop", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-noop", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+
+      // Re-add: this is a no-op and must not duplicate membership.
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+
+      ps <- readPoolState()
+      ags <- readGroupState(childId)
+    yield
+      ps.allocationGroups.count(_ == childId.uuid) should be(1)
+      ags.members.count(_.uuid == Radicle.poolId.uuid) should be(1)
+
+  atest("addPool with no executor enrolls a system usage task"):
+    given ExecutionContext = executionContext
+    val servicesTkvl = TieredKeyValueList(client,
+      KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child-sys", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-sys", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+
+      // No executor supplied -> system durable task path.
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childId, None)
+      _ <- waitForTransactionsToComplete()
+
+      stateVs <- servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID))
+      statePtr = ServiceEntry.decode(stateVs.get.value.bytes).statePointer
+      enrolled <- SystemTaskServiceState.scan(client, statePtr)
+      taskKvos <- client.read(enrolled.head._2)
+
+      ps <- readPoolState()
+      ags <- readGroupState(childId)
+    yield
+      ps.allocationGroups should contain(childId.uuid)
+      ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
+      enrolled.size should be >= 1
+      byte2uuid(taskKvos.contents(SimpleTaskExecutor.TaskTypeKey).value.bytes) should be(UpdateAllocationGroupUsageTask.typeUUID)
+
+  atest("addPoolToGroup resolves names and adds the pool"):
+    given ExecutionContext = executionContext
+    for
+      groupId <- client.createAllocationGroup("named-group", level = 0)
+      _ <- waitForTransactionsToComplete()
+
+      // Radicle bootstrap pool is registered under a known name; resolve it dynamically.
+      pools <- client.listStoragePools()
+      poolName = pools.find(_._2 == Radicle.poolId).get._1
+
+      _ <- client.addPoolToGroup(poolName, "named-group")
+      _ <- waitForTransactionsToComplete()
+
+      ps <- readPoolState()
+      ags <- readGroupState(groupId)
+    yield
+      ps.allocationGroups should contain(groupId.uuid)
+      ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)

@@ -28,6 +28,14 @@ object SystemTaskServiceState:
       given Transaction = tx
       tkvl(client, statePtr).set(Key(uuid2byte(taskId)), Value(taskStatePtr.toArray))
 
+  /** Insert a task into the registry within an existing transaction. Idempotent: a re-enroll
+   *  of the same key overwrites the value (the pointer is stable for a given task UUID). */
+  def enrollInTx(client: AspenClient,
+                 statePtr: KeyValueObjectPointer,
+                 taskId: UUID,
+                 taskStatePtr: KeyValueObjectPointer)(using tx: Transaction): Future[Unit] =
+    tkvl(client, statePtr).set(Key(uuid2byte(taskId)), Value(taskStatePtr.toArray))
+
   /** Read all enrolled (taskId, taskStatePointer) pairs. */
   def scan(client: AspenClient,
            statePtr: KeyValueObjectPointer): Future[List[(UUID, KeyValueObjectPointer)]] =

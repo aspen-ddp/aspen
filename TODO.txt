@@ -1,14 +1,4 @@
 
-Add CLI "show" commands
-  - Requires a name or UUID
-  - Looks up the state for the specified entry and displays the content
-  - Commands to add
-    - show-host
-    - show-device
-    - show-pool
-    - show-device-set
-    - show-allocation-gorup
-
 Add CLI command "create-allocation-group"
   - takes name and level arguments
   - fail if name already in use

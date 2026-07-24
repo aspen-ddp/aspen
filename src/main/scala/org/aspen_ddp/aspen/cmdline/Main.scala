@@ -17,6 +17,7 @@ import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
@@ -71,7 +72,8 @@ object Main {
                   setId:String="",
                   newSetName:String="",
                   newSetLevel:Int=0,
-                  parentSetName:String="")
+                  parentSetName:String="",
+                  entityRef:String="")
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
@@ -1013,6 +1015,18 @@ object Main {
         println(s"Rebalance failed to enroll: ${err.getMessage}")
 
     scala.concurrent.Await.ready(f, scala.concurrent.duration.Duration(30, scala.concurrent.duration.SECONDS))
+
+  /** Resolve a user-supplied entity reference that may be either a UUID or a name.
+   *  If `ref` parses as a UUID it is wrapped via `byUuid`; otherwise it is looked up
+   *  by name via `byName`. */
+  private[cmdline] def resolveRef[A](ref: String,
+                                     byUuid: UUID => A,
+                                     byName: String => Future[A]): Future[A] =
+    try
+      val uuid = UUID.fromString(ref)
+      Future.successful(byUuid(uuid))
+    catch
+      case _: IllegalArgumentException => byName(ref)
 
   /** Format a byte count using binary units (powers of 1024). Sub-KiB values are
    *  rendered as whole bytes; larger values use one decimal place and the largest

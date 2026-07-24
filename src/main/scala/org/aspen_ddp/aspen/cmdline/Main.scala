@@ -17,6 +17,7 @@ import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
@@ -71,12 +72,16 @@ object Main {
                   setId:String="",
                   newSetName:String="",
                   newSetLevel:Int=0,
-                  parentSetName:String="")
+                  parentSetName:String="",
+                  entityRef:String="")
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
   private case class HostNotFound(hostname: String)
     extends Exception(s"host '$hostname' not found")
+
+  private case class EntityNotFound(kind: String, ref: String)
+    extends Exception(s"$kind '$ref' not found")
 
   class NetworkBridge extends MessageHandler with Logging {
     var oclient: Option[AspenClient] = None
@@ -326,6 +331,68 @@ object Main {
             action((x, c) => c.copy(hostName = x)),
         )
 
+      cmd("show-host").text("Displays the full state of a host").
+        action((_, c) => c.copy(mode = "show-host")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Host name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
+      cmd("show-device").text("Displays the full state of a storage device").
+        action((_, c) => c.copy(mode = "show-device")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<uuid>").text("Storage device UUID").
+            action((x, c) => c.copy(entityRef = x)).
+            validate { x =>
+              try
+                UUID.fromString(x)
+                success
+              catch
+                case _: Throwable => failure("Storage device id must be a valid UUID")
+            },
+        )
+
+      cmd("show-pool").text("Displays the full state of a storage pool").
+        action((_, c) => c.copy(mode = "show-pool")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Pool name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
+      cmd("show-device-set").text("Displays the full state of a storage device set").
+        action((_, c) => c.copy(mode = "show-device-set")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Device set name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
+      cmd("show-allocation-group").text("Displays the full state of an allocation group").
+        action((_, c) => c.copy(mode = "show-allocation-group")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Allocation group name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
 
@@ -355,6 +422,11 @@ object Main {
             case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
             case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       _.listStorageDeviceSets(), _.uuid)
             case "list-devices"           => list_devices(bootstrapConfigPath, cfg.hostName)
+            case "show-host"              => show_host(bootstrapConfigPath, cfg.entityRef)
+            case "show-device"            => show_device(bootstrapConfigPath, cfg.entityRef)
+            case "show-pool"              => show_pool(bootstrapConfigPath, cfg.entityRef)
+            case "show-device-set"        => show_device_set(bootstrapConfigPath, cfg.entityRef)
+            case "show-allocation-group"  => show_allocation_group(bootstrapConfigPath, cfg.entityRef)
         catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")
@@ -1014,6 +1086,41 @@ object Main {
 
     scala.concurrent.Await.ready(f, scala.concurrent.duration.Duration(30, scala.concurrent.duration.SECONDS))
 
+  /** Resolve a user-supplied entity reference that may be either a UUID or a name.
+   *  If `ref` parses as a UUID it is wrapped via `byUuid`; otherwise it is looked up
+   *  by name via `byName`. */
+  private[cmdline] def resolveRef[A](ref: String,
+                                     byUuid: UUID => A,
+                                     byName: String => Future[A]): Future[A] =
+    try
+      val uuid = UUID.fromString(ref)
+      Future.successful(byUuid(uuid))
+    catch
+      case _: IllegalArgumentException => byName(ref)
+
+  /** Resolve a related entity's display name, best-effort. Any failure (missing
+   *  reference, read error) yields None so a `show` command still succeeds using the
+   *  raw UUID as a fallback. */
+  private def optName[A](f: Future[A])(name: A => String)
+                        (using ExecutionContext): Future[Option[String]] =
+    f.map(a => Some(name(a))).recover { case _ => None }
+
+  private[cmdline] def formatHostState(s: HostState): String =
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Host: ${s.name}"
+    lines += s"  UUID:                ${s.hostId.uuid}"
+    lines += s"  Address:             ${s.address}"
+    lines += s"  Data Port:           ${s.dataPort}"
+    lines += s"  CnC Port:            ${s.cncPort}"
+    lines += s"  Store Transfer Port: ${s.storeTransferPort}"
+    if s.storageDevices.isEmpty then
+      lines += "  Storage Devices:     none"
+    else
+      lines += "  Storage Devices:"
+      s.storageDevices.toList.map(_.uuid.toString).sorted.foreach: d =>
+        lines += s"    $d"
+    lines.mkString("\n")
+
   /** Format a byte count using binary units (powers of 1024). Sub-KiB values are
    *  rendered as whole bytes; larger values use one decimal place and the largest
    *  unit that keeps the value >= 1.0. */
@@ -1028,6 +1135,97 @@ object Main {
         value /= 1024.0
         idx += 1
       f"$value%.1f ${units(idx)}"
+
+  private[cmdline] def formatDeviceState(s: StorageDeviceState,
+                                         hostName: Option[String],
+                                         setName: Option[String]): String =
+    val host = hostName.getOrElse(s.hostId.uuid.toString)
+    val set  = setName.getOrElse(s.storageDeviceSet.uuid.toString)
+    val pct  = if s.totalSize > 0 then s.currentUsage.toDouble / s.totalSize * 100.0 else 0.0
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Storage Device: ${s.storageDeviceId.uuid}"
+    lines += s"  Host:       $host (${s.hostId.uuid})"
+    lines += s"  Device Set: $set (${s.storageDeviceSet.uuid})"
+    lines += f"  Usage:      ${formatBytes(s.currentUsage)} / ${formatBytes(s.totalSize)} ($pct%.1f%%)"
+    if s.stores.isEmpty then
+      lines += "  Stores:     none"
+    else
+      lines += "  Stores:"
+      s.stores.toList.sortBy(_._1.toString).foreach: (storeId, entry) =>
+        val xfer = entry.transferDevice.map(d => s" -> ${d.uuid}").getOrElse("")
+        lines += s"    $storeId  ${entry.status}$xfer"
+    lines.mkString("\n")
+
+  private[cmdline] def formatPoolState(s: StoragePoolState, setName: Option[String]): String =
+    val set = setName.getOrElse(s.storageDeviceSet.uuid.toString)
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Pool: ${s.name}"
+    lines += s"  UUID:         ${s.poolId.uuid}"
+    lines += s"  IDA:          ${s.ida}"
+    lines += s"  Max Obj Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"
+    lines += s"  Device Set:   $set (${s.storageDeviceSet.uuid})"
+    lines += s"  Usage:        ${formatBytes(s.currentUsage)}"
+    lines += s"  Max Store Sz: ${if s.maximumStoreSize == 0 then "unbounded" else formatBytes(s.maximumStoreSize)}"
+    if s.allocationGroups.isEmpty then
+      lines += "  Alloc Groups: none"
+    else
+      lines += "  Alloc Groups:"
+      s.allocationGroups.foreach: g =>
+        lines += s"    $g"
+    if s.stores.isEmpty then
+      lines += "  Stores:       none"
+    else
+      lines += "  Stores:"
+      s.stores.zipWithIndex.foreach: (entry, i) =>
+        lines += s"    [$i] host ${entry.hostId.uuid}  device ${entry.storageDeviceId.uuid}"
+    lines.mkString("\n")
+
+  private[cmdline] def formatDeviceSetState(s: StorageDeviceSetState,
+                                            parentName: Option[String]): String =
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Device Set: ${s.name}"
+    lines += s"  UUID:     ${s.setId.uuid}"
+    lines += s"  Level:    ${s.level}"
+    val parent = s.parent match
+      case None    => "none"
+      case Some(p) => s"${parentName.getOrElse(p.uuid.toString)} (${p.uuid})"
+    lines += s"  Parent:   $parent"
+    if s.memberDevices.isEmpty then
+      lines += "  Member Devices: none"
+    else
+      lines += "  Member Devices:"
+      s.memberDevices.foreach(d => lines += s"    ${d.uuid}")
+    if s.memberSets.isEmpty then
+      lines += "  Member Sets:    none"
+    else
+      lines += "  Member Sets:"
+      s.memberSets.foreach(m => lines += s"    ${m.uuid}")
+    if s.assignedPools.isEmpty then
+      lines += "  Assigned Pools: none"
+    else
+      lines += "  Assigned Pools:"
+      s.assignedPools.foreach(p => lines += s"    ${p.uuid}")
+    lines += s"  Pending Transfers: ${s.pendingTransfers.length}"
+    lines.mkString("\n")
+
+  private[cmdline] def formatAllocationGroupState(s: AllocationGroupState): String =
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Allocation Group: ${s.name}"
+    lines += s"  UUID:  ${s.groupId.uuid}"
+    lines += s"  Level: ${s.level}"
+    lines += s"  Usage: ${formatBytes(s.currentUsage)} / ${formatBytes(s.maximumSize)}"
+    if s.members.isEmpty then
+      lines += "  Members: none"
+    else
+      lines += "  Members:"
+      s.members.foreach: m =>
+        lines += s"    ${m.memberType} ${m.uuid}  ${formatBytes(m.currentUsage)} / ${formatBytes(m.maximumSize)}"
+    if s.parentGroups.isEmpty then
+      lines += "  Parent Groups: none"
+    else
+      lines += "  Parent Groups:"
+      s.parentGroups.foreach(p => lines += s"    ${p.uuid}")
+    lines.mkString("\n")
 
   def list_devices(bootstrapConfigFile: os.Path, hostname: String): Unit =
 
@@ -1080,6 +1278,113 @@ object Main {
         println(s"Error: host '$hostname' not found")
       case scala.util.Failure(err) =>
         println(s"Error listing devices: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_host(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        hostId    <- resolveRef(ref, HostId(_), client.getHostId)
+        hostState <- client.getHostState(hostId)
+      yield formatHostState(hostState)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("host", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)                => println(text)
+      case scala.util.Failure(e: EntityNotFound)   => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)                 => println(s"Error showing host: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_device(bootstrapConfigFile: os.Path, uuidStr: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val deviceId = StorageDeviceId(UUID.fromString(uuidStr))
+
+    val f =
+      (for
+        dev      <- client.getStorageDeviceState(deviceId)
+        hostName <- optName(client.getHostState(dev.hostId))(_.name)
+        setName  <- optName(client.getStorageDeviceSetState(dev.storageDeviceSet))(_.name)
+      yield formatDeviceState(dev, hostName, setName)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("storage device", uuidStr))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing storage device: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_pool(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        poolId  <- resolveRef(ref, PoolId(_), client.getStoragePoolId)
+        pool    <- client.getStoragePoolState(poolId)
+        setName <- optName(client.getStorageDeviceSetState(pool.storageDeviceSet))(_.name)
+      yield formatPoolState(pool, setName)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("pool", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing pool: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_device_set(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        setId <- resolveRef(ref, StorageDeviceSetId(_), client.getStorageDeviceSetId)
+        set   <- client.getStorageDeviceSetState(setId)
+        parentName <- set.parent match
+          case None    => Future.successful(None)
+          case Some(p) => optName(client.getStorageDeviceSetState(p))(_.name)
+      yield formatDeviceSetState(set, parentName)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("device set", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing device set: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
+
+  def show_allocation_group(bootstrapConfigFile: os.Path, ref: String): Unit =
+    configureLogging()
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f =
+      (for
+        groupId <- resolveRef(ref, AllocationGroupId(_), client.getAllocationGroupId)
+        group   <- client.getAllocationGroupState(groupId)
+      yield formatAllocationGroupState(group)).recoverWith:
+        case _: NoSuchElementException => Future.failed(EntityNotFound("allocation group", ref))
+
+    f.onComplete:
+      case scala.util.Success(text)              => println(text)
+      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case scala.util.Failure(err)               => println(s"Error showing allocation group: ${err.getMessage}")
 
     Await.ready(f, Duration(30, SECONDS))
 

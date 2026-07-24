@@ -1103,6 +1103,34 @@ object Main {
         lines += s"    [$i] host ${entry.hostId.uuid}  device ${entry.storageDeviceId.uuid}"
     lines.mkString("\n")
 
+  private[cmdline] def formatDeviceSetState(s: StorageDeviceSetState,
+                                            parentName: Option[String]): String =
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Device Set: ${s.name}"
+    lines += s"  UUID:     ${s.setId.uuid}"
+    lines += s"  Level:    ${s.level}"
+    val parent = s.parent match
+      case None    => "none"
+      case Some(p) => s"${parentName.getOrElse(p.uuid.toString)} (${p.uuid})"
+    lines += s"  Parent:   $parent"
+    if s.memberDevices.isEmpty then
+      lines += "  Member Devices: none"
+    else
+      lines += "  Member Devices:"
+      s.memberDevices.foreach(d => lines += s"    ${d.uuid}")
+    if s.memberSets.isEmpty then
+      lines += "  Member Sets:    none"
+    else
+      lines += "  Member Sets:"
+      s.memberSets.foreach(m => lines += s"    ${m.uuid}")
+    if s.assignedPools.isEmpty then
+      lines += "  Assigned Pools: none"
+    else
+      lines += "  Assigned Pools:"
+      s.assignedPools.foreach(p => lines += s"    ${p.uuid}")
+    lines += s"  Pending Transfers: ${s.pendingTransfers.length}"
+    lines.mkString("\n")
+
   def list_devices(bootstrapConfigFile: os.Path, hostname: String): Unit =
 
     configureLogging()

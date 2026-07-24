@@ -113,3 +113,26 @@ class MainSuite extends AnyFunSuite with Matchers:
     out should include ("33333333-3333-3333-3333-333333333333")
     out should include ("Alloc Groups: none")
     out should include ("Stores:       none")
+
+  test("formatDeviceSetState renders identity, parent name, and members"):
+    val setId    = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val parentId = StorageDeviceSetId(UUID.fromString("55555555-5555-5555-5555-555555555555"))
+    val devId    = StorageDeviceId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+    val s = StorageDeviceSetState(setId, "fast-nvme", 0, Some(parentId),
+      List(devId), Nil, Nil)
+    val out = Main.formatDeviceSetState(s, Some("root-set"))
+    out should include ("Device Set: fast-nvme")
+    out should include ("33333333-3333-3333-3333-333333333333")
+    out should include ("Level:    0")
+    out should include ("root-set")
+    out should include ("22222222-2222-2222-2222-222222222222")
+
+  test("formatDeviceSetState shows 'none' parent and empty member lists"):
+    val setId = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val s = StorageDeviceSetState(setId, "root-set", 1, None, Nil, Nil, Nil)
+    val out = Main.formatDeviceSetState(s, None)
+    out should include ("Parent:   none")
+    out should include ("Member Devices: none")
+    out should include ("Member Sets:    none")
+    out should include ("Assigned Pools: none")
+    out should include ("Pending Transfers: 0")

@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.client.internal
 
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.{ReadDriver, ReadManager}
 import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, TransactionImpl, TransactionManager}
@@ -15,9 +16,11 @@ import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, uuid2byte}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
-import org.aspen_ddp.aspen.compute.ServiceEntry
+import org.aspen_ddp.aspen.compute.{DurableTaskFactory, ServiceEntry}
+import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
+import org.aspen_ddp.aspen.compute.systemtask.{NewSystemTaskAdded, SystemTaskExecutorService, SystemTaskMessage, SystemTaskServiceState}
 
 import java.util.UUID
 import scala.concurrent.duration.{Duration, MILLISECONDS}
@@ -337,6 +340,41 @@ abstract class BaseAspenClient(
       case Some(vs) =>
         val entry = ServiceEntry.decode(vs.value.bytes)
         if entry.isClaimed then Some(HostId(entry.hostId)) else None
+
+  override def createSystemDurableTask(taskTypeUUID: UUID,
+                                       initialState: Map[Key, Array[Byte]]): Future[Unit] =
+    given ExecutionContext = clientContext
+
+    // Sanity check: the type must resolve to a DurableTaskFactory.
+    typeRegistry.getType[DurableTaskFactory](taskTypeUUID) match
+      case None =>
+        Future.failed(StopRetrying(
+          new IllegalArgumentException(s"createSystemDurableTask: no DurableTaskFactory registered for $taskTypeUUID")))
+      case Some(_) =>
+        val taskId = UUID.randomUUID()
+
+        def serviceStatePtr(): Future[KeyValueObjectPointer] =
+          val servicesTkvl = TieredKeyValueList(this,
+            KVObjectRootManager(this, Radicle.ServicesTreeKey, radicle))
+          servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID)).map:
+            case Some(vs) => ServiceEntry.decode(vs.value.bytes).statePointer
+            case None => throw new IllegalStateException("SystemTaskExecutorService is not registered")
+
+        val taskContent: Map[Key, Value] =
+          (initialState + (SimpleTaskExecutor.TaskTypeKey -> uuid2byte(taskTypeUUID)))
+            .map((k, v) => k -> Value(v))
+
+        for
+          statePtr <- serviceStatePtr()
+          pool <- getStoragePool(Radicle.poolId)
+          allocator = new PoolObjectAllocator(this, pool)
+          taskStatePtr <- transactUntilSuccessful: tx =>
+                            given Transaction = tx
+                            allocator.allocateKeyValueObject(taskContent)
+          _ <- SystemTaskServiceState.enroll(this, statePtr, taskId, taskStatePtr)
+          _ <- sendServiceMessage(SystemTaskExecutorService.ServiceUUID,
+                 SystemTaskMessage.encode(NewSystemTaskAdded(taskId)))
+        yield ()
 
   def getSystemAttribute(key: String): Option[String] = attributes.get(key)
   def setSystemAttribute(key: String, value: String): Unit = attributes += key -> value

@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.common.util.uuid2byte
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
 import org.aspen_ddp.aspen.compute.ServiceEntry
+import org.aspen_ddp.aspen.compute.systemtask.SystemTaskExecutorService
 
 object Bootstrap:
 
@@ -188,9 +189,22 @@ object Bootstrap:
       HLCTimestamp.Zero,
       rebalancingServicePtr)
 
+    // The SystemTaskExecutorService is likewise a system-critical singleton. Its state object
+    // holds an (initially empty) TKVL of pending system tasks.
+    val systemTaskTree = allocateTree(ByteArrayKeyOrdering)
+    val systemTaskServicePtr = allocate(List(
+      SystemTaskExecutorService.TaskTreeKey -> systemTaskTree.encode()
+    ))
+    val systemTaskServiceEntry = ServiceEntry(
+      SystemTaskExecutorService.ServiceTypeUUID,
+      ServiceEntry.UnclaimedHostId,
+      HLCTimestamp.Zero,
+      systemTaskServicePtr)
+
     val servicesTree = allocateTree(
       ByteArrayKeyOrdering,
-      Key(RebalancingDurableService.ServiceUUID) -> rebalancingServiceEntry.encode()
+      Key(RebalancingDurableService.ServiceUUID) -> rebalancingServiceEntry.encode(),
+      Key(SystemTaskExecutorService.ServiceUUID) -> systemTaskServiceEntry.encode()
     )
 
     val radicleContent: List[(Key, Array[Byte])] = List(

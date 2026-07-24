@@ -1131,6 +1131,25 @@ object Main {
     lines += s"  Pending Transfers: ${s.pendingTransfers.length}"
     lines.mkString("\n")
 
+  private[cmdline] def formatAllocationGroupState(s: AllocationGroupState): String =
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Allocation Group: ${s.name}"
+    lines += s"  UUID:  ${s.groupId.uuid}"
+    lines += s"  Level: ${s.level}"
+    lines += s"  Usage: ${formatBytes(s.currentUsage)} / ${formatBytes(s.maximumSize)}"
+    if s.members.isEmpty then
+      lines += "  Members: none"
+    else
+      lines += "  Members:"
+      s.members.foreach: m =>
+        lines += s"    ${m.memberType} ${m.uuid}  ${formatBytes(m.currentUsage)} / ${formatBytes(m.maximumSize)}"
+    if s.parentGroups.isEmpty then
+      lines += "  Parent Groups: none"
+    else
+      lines += "  Parent Groups:"
+      s.parentGroups.foreach(p => lines += s"    ${p.uuid}")
+    lines.mkString("\n")
+
   def list_devices(bootstrapConfigFile: os.Path, hostname: String): Unit =
 
     configureLogging()

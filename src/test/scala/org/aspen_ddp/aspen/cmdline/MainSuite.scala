@@ -4,6 +4,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import org.aspen_ddp.aspen.common.metadata.*
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -136,3 +137,24 @@ class MainSuite extends AnyFunSuite with Matchers:
     out should include ("Member Sets:    none")
     out should include ("Assigned Pools: none")
     out should include ("Pending Transfers: 0")
+
+  test("formatAllocationGroupState renders identity, usage, and members"):
+    val groupId = AllocationGroupId(UUID.fromString("66666666-6666-6666-6666-666666666666"))
+    val member = AllocationGroupState.Member(
+      AllocationGroupState.MemberType.Pool,
+      UUID.fromString("44444444-4444-4444-4444-444444444444"),
+      None, 1024L, 4096L)
+    val s = AllocationGroupState(groupId, 0, "gold", List(member), Nil)
+    val out = Main.formatAllocationGroupState(s)
+    out should include ("Allocation Group: gold")
+    out should include ("66666666-6666-6666-6666-666666666666")
+    out should include ("Level: 0")
+    out should include ("Pool")
+    out should include ("44444444-4444-4444-4444-444444444444")
+
+  test("formatAllocationGroupState shows 'none' for empty members and parents"):
+    val groupId = AllocationGroupId(UUID.fromString("66666666-6666-6666-6666-666666666666"))
+    val s = AllocationGroupState(groupId, 1, "platinum", Nil, Nil)
+    val out = Main.formatAllocationGroupState(s)
+    out should include ("Members: none")
+    out should include ("Parent Groups: none")

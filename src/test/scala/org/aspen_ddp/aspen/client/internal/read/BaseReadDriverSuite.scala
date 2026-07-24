@@ -105,6 +105,10 @@ object BaseReadDriverSuite {
     def createSystemDurableTask(taskTypeUUID: UUID,
                                 initialState: Map[org.aspen_ddp.aspen.common.objects.Key, Array[Byte]]): Future[Unit] = ???
 
+    def prepareSystemDurableTask(taskTypeUUID: UUID,
+                                 initialState: Map[org.aspen_ddp.aspen.common.objects.Key, Array[Byte]])
+                                (using tx: org.aspen_ddp.aspen.client.Transaction): Future[Unit] = ???
+
     private[aspen] def getSystemAttribute(key: String): Option[String] = None
     private[aspen] def setSystemAttribute(key: String, value: String): Unit = ()
 

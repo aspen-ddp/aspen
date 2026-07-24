@@ -274,6 +274,16 @@ trait AspenClient extends ObjectReader:
   def createSystemDurableTask(taskTypeUUID: UUID,
                               initialState: Map[Key, Array[Byte]]): Future[Unit]
 
+  /** Stage the allocation and enrollment of a system-level DurableTask into the supplied
+   *  transaction. The returned future resolves once both operations are staged in `tx`;
+   *  commit and retry are the caller's responsibility. A best-effort wake-up message to the
+   *  SystemTaskExecutorService is sent after the transaction commits.
+   *
+   *  `taskTypeUUID` must resolve to a DurableTaskFactory in the type registry. */
+  def prepareSystemDurableTask(taskTypeUUID: UUID,
+                               initialState: Map[Key, Array[Byte]])
+                              (using tx: Transaction): Future[Unit]
+
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]
 
   private[aspen] def getSystemAttribute(key: String): Option[String]

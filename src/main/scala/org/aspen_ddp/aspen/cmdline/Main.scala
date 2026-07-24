@@ -331,6 +331,68 @@ object Main {
             action((x, c) => c.copy(hostName = x)),
         )
 
+      cmd("show-host").text("Displays the full state of a host").
+        action((_, c) => c.copy(mode = "show-host")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Host name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
+      cmd("show-device").text("Displays the full state of a storage device").
+        action((_, c) => c.copy(mode = "show-device")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<uuid>").text("Storage device UUID").
+            action((x, c) => c.copy(entityRef = x)).
+            validate { x =>
+              try
+                UUID.fromString(x)
+                success
+              catch
+                case _: Throwable => failure("Storage device id must be a valid UUID")
+            },
+        )
+
+      cmd("show-pool").text("Displays the full state of a storage pool").
+        action((_, c) => c.copy(mode = "show-pool")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Pool name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
+      cmd("show-device-set").text("Displays the full state of a storage device set").
+        action((_, c) => c.copy(mode = "show-device-set")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Device set name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
+      cmd("show-allocation-group").text("Displays the full state of an allocation group").
+        action((_, c) => c.copy(mode = "show-allocation-group")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<name-or-uuid>").text("Allocation group name or UUID").
+            action((x, c) => c.copy(entityRef = x)),
+        )
+
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
 
@@ -360,6 +422,11 @@ object Main {
             case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
             case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       _.listStorageDeviceSets(), _.uuid)
             case "list-devices"           => list_devices(bootstrapConfigPath, cfg.hostName)
+            case "show-host"              => show_host(bootstrapConfigPath, cfg.entityRef)
+            case "show-device"            => show_device(bootstrapConfigPath, cfg.entityRef)
+            case "show-pool"              => show_pool(bootstrapConfigPath, cfg.entityRef)
+            case "show-device-set"        => show_device_set(bootstrapConfigPath, cfg.entityRef)
+            case "show-allocation-group"  => show_allocation_group(bootstrapConfigPath, cfg.entityRef)
         catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")

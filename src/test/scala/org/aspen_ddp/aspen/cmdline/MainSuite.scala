@@ -3,6 +3,8 @@ package org.aspen_ddp.aspen.cmdline
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import org.aspen_ddp.aspen.common.metadata.*
+
 import java.util.UUID
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.{Duration, SECONDS}
@@ -40,3 +42,19 @@ class MainSuite extends AnyFunSuite with Matchers:
       uuid => s"uuid:$uuid",
       n => Future.successful(s"name:$n"))
     Await.result(f, Duration(1, SECONDS)) shouldBe "name:mypool"
+
+  test("formatHostState renders identity, ports, and device list"):
+    val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))
+    val devId  = StorageDeviceId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+    val s = HostState(hostId, "node_a", "127.0.0.1", 4750, 4751, 4752, Set(devId))
+    val out = Main.formatHostState(s)
+    out should include ("Host: node_a")
+    out should include ("11111111-1111-1111-1111-111111111111")
+    out should include ("127.0.0.1")
+    out should include ("4750")
+    out should include ("22222222-2222-2222-2222-222222222222")
+
+  test("formatHostState shows 'none' when there are no devices"):
+    val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))
+    val s = HostState(hostId, "node_a", "127.0.0.1", 4750, 4751, 4752, Set.empty)
+    Main.formatHostState(s) should include ("Storage Devices:     none")

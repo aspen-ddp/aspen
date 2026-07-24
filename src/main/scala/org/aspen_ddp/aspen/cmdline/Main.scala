@@ -1028,6 +1028,22 @@ object Main {
     catch
       case _: IllegalArgumentException => byName(ref)
 
+  private[cmdline] def formatHostState(s: HostState): String =
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Host: ${s.name}"
+    lines += s"  UUID:                ${s.hostId.uuid}"
+    lines += s"  Address:             ${s.address}"
+    lines += s"  Data Port:           ${s.dataPort}"
+    lines += s"  CnC Port:            ${s.cncPort}"
+    lines += s"  Store Transfer Port: ${s.storeTransferPort}"
+    if s.storageDevices.isEmpty then
+      lines += "  Storage Devices:     none"
+    else
+      lines += "  Storage Devices:"
+      s.storageDevices.toList.map(_.uuid.toString).sorted.foreach: d =>
+        lines += s"    $d"
+    lines.mkString("\n")
+
   /** Format a byte count using binary units (powers of 1024). Sub-KiB values are
    *  rendered as whole bytes; larger values use one decimal place and the largest
    *  unit that keeps the value >= 1.0. */

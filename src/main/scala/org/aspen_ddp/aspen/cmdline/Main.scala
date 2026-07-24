@@ -74,6 +74,7 @@ object Main {
                   newSetLevel:Int=0,
                   parentSetName:String="",
                   newGroupName:String="",
+                  poolName:String="",
                   newGroupLevel:Int=0,
                   entityRef:String="")
 
@@ -252,6 +253,20 @@ object Main {
           arg[Int]("<level>").text("Hierarchy level (0 = group of pools, 1+ = group of groups)").
             action((x, c) => c.copy(newGroupLevel = x)).
             validate(x => if (x >= 0) success else failure("Level must be >= 0")),
+        )
+
+      cmd("add-pool-to-group").text("Adds a storage pool to an allocation group").
+        action((_, c) => c.copy(mode = "add-pool-to-group")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<pool-name>").text("Name of the pool to add").
+            action((x, c) => c.copy(poolName = x)),
+
+          arg[String]("<group-name>").text("Name of the allocation group").
+            action((x, c) => c.copy(newGroupName = x)),
         )
 
       cmd("transfer-store").text("Transfers a store to a different storage device").
@@ -433,6 +448,7 @@ object Main {
             case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
             case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
+            case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
             case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
@@ -1049,6 +1065,36 @@ object Main {
         println("******************************************")
         println(s"* New Allocation Group Created: ${groupId.uuid}")
         println("******************************************")
+      case scala.util.Failure(err) => reportError(err)
+
+    Await.ready(f, Duration(30, SECONDS))
+  }
+
+  def add_pool_to_group(bootstrapConfigFile: os.Path,
+                        poolName: String,
+                        groupName: String): Unit = {
+
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val f = client.addPoolToGroup(poolName, groupName)
+
+    // getStoragePoolId / getAllocationGroupId throw NoSuchElementException when a
+    // name is not registered; translate that into a precise message.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: NoSuchElementException =>
+        println(s"Error: pool '$poolName' or allocation group '$groupName' not found")
+      case e =>
+        println(s"Error adding pool to group: ${e.getMessage}")
+
+    f.onComplete:
+      case scala.util.Success(_) =>
+        println(s"Pool '$poolName' added to allocation group '$groupName'")
       case scala.util.Failure(err) => reportError(err)
 
     Await.ready(f, Duration(30, SECONDS))

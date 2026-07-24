@@ -1,37 +1,4 @@
 
-Add CLI command "add-pool-to-group"
-  - takes pool name and allocation group name
-  - Update the state objects for both
-
-Add CLI command "add-group-to-group"
-  - Takes source and destination group names/uuids
-  - Destination group level must be greater than the source group's level
-  - Updates the group state object accordingly
-
-Add CLI command "move-device-to-set"
-  - takes device UUID and device set name or UUID
-    - Set must be tier 0
-  - In one Transaction
-    - Update device state to point to new set
-    - Update new set to point to the device
-    - Update the old device set to no longer point to the device
-
-Add CLI command "create-storage-device"
-  - Arguments: host configuration file and directory
-    - config file must exist and load correctly
-    - directory must exist and not contain a storage device config file
-  - Add aspen.server.StorageDeviceManager
-    - object contains createStorageDevice(hostId, deviceSetId, directoryName): Future[Unit]
-      - Generates a UUID for the new device
-      - transactUntilSuccessful:
-        - create new StorageDeviceState object
-        - Update HostState to include the new device
-        - Update StorageDeviceSetState to include the new device
-      - Create the StorageDeviceConfig file in the target directory
-  - cli command implemented in terms of above function.
-    - StoreManager will eventually need to automate the device creation process so we'll want to
-      minimize the logic going into the cli code
-
 Need a reliable, system-level distributed DurableTask execution strategy
   - For focused things that need to happen but isn't tied to a host and the result is not needed
     - Example: Migrating a pool to a new device set
@@ -66,7 +33,49 @@ Need a reliable, system-level distributed DurableTask execution strategy
       - Delete tkvl entry of the DurableTask
       - Send SystemTaskComplete(uuid) to SystemTaskExecutorService
     - Add an AspenClient.createSystemDurableTask(taskTypeUUID, initialState: Map[Key, Array[Byte]]): Future[Unit]
+      - lookup the supplied UUID in the type registry and verify that it corresponds to a DurableTaskFactory
+        - sanity check
       - retry until successful
+      - Future completes when the task object is successfully created
+      - There is no notification of task complete
+
+Add CLI command "add-pool-to-group"
+  - takes pool name and allocation group name
+  - Implement as method on AspenClient
+    - calls AllocationGroupState.addPool internally if both pool and group exist
+  - Add UpdateAllocationGroupUsageTask.prepareSystemTask
+    - uses AspenClient.createSystemDurableTask instead of directly using a TaskExecutor instance
+  - Update addPool/removePool/modifyPool to optionally use a TaskExecutor. If not supplied, use the system
+    durable task instead
+
+Add CLI command "add-group-to-group"
+  - Takes source and destination group names/uuids
+  - Destination group level must be greater than the source group's level
+  - Updates the group state object accordingly
+
+Add CLI command "move-device-to-set"
+  - takes device UUID and device set name or UUID
+    - Set must be tier 0
+  - In one Transaction
+    - Update device state to point to new set
+    - Update new set to point to the device
+    - Update the old device set to no longer point to the device
+
+Add CLI command "create-storage-device"
+  - Arguments: host configuration file and directory
+    - config file must exist and load correctly
+    - directory must exist and not contain a storage device config file
+  - Add aspen.server.StorageDeviceManager
+    - object contains createStorageDevice(hostId, deviceSetId, directoryName): Future[Unit]
+      - Generates a UUID for the new device
+      - transactUntilSuccessful:
+        - create new StorageDeviceState object
+        - Update HostState to include the new device
+        - Update StorageDeviceSetState to include the new device
+      - Create the StorageDeviceConfig file in the target directory
+  - cli command implemented in terms of above function.
+    - StoreManager will eventually need to automate the device creation process so we'll want to
+      minimize the logic going into the cli code
 
 Reassignment of a pool to a new set:
   - MigratePoolToSetDurableTask

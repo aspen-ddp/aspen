@@ -39,3 +39,21 @@ class SystemTaskServiceStateSuite extends IntegrationTestSuite:
       afterEnroll.map(_._1) should contain (taskId)
       afterEnroll.find(_._1 == taskId).map(_._2.id) shouldBe Some(taskStatePtr.id)
       afterRemove.map(_._1) should not contain taskId
+
+  atest("enrollInTx enrolls within a caller-supplied transaction"):
+    given ExecutionContext = executionContext
+    val taskId = UUID.randomUUID()
+    for
+      statePtr <- servicePtr()
+      pool <- client.getStoragePool(Radicle.poolId)
+      allocator = new PoolObjectAllocator(client, pool)
+      // Allocate the task-state object and enroll it in a single transaction.
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             for
+               taskStatePtr <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(Array[Byte](9))))
+               _ <- SystemTaskServiceState.enrollInTx(client, statePtr, taskId, taskStatePtr)
+             yield ()
+      enrolled <- SystemTaskServiceState.scan(client, statePtr)
+    yield
+      enrolled.map(_._1) should contain (taskId)

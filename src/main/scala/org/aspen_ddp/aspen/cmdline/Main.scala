@@ -1059,6 +1059,26 @@ object Main {
         idx += 1
       f"$value%.1f ${units(idx)}"
 
+  private[cmdline] def formatDeviceState(s: StorageDeviceState,
+                                         hostName: Option[String],
+                                         setName: Option[String]): String =
+    val host = hostName.getOrElse(s.hostId.uuid.toString)
+    val set  = setName.getOrElse(s.storageDeviceSet.uuid.toString)
+    val pct  = if s.totalSize > 0 then s.currentUsage.toDouble / s.totalSize * 100.0 else 0.0
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Storage Device: ${s.storageDeviceId.uuid}"
+    lines += s"  Host:       $host (${s.hostId.uuid})"
+    lines += s"  Device Set: $set (${s.storageDeviceSet.uuid})"
+    lines += f"  Usage:      ${formatBytes(s.currentUsage)} / ${formatBytes(s.totalSize)} ($pct%.1f%%)"
+    if s.stores.isEmpty then
+      lines += "  Stores:     none"
+    else
+      lines += "  Stores:"
+      s.stores.toList.sortBy(_._1.toString).foreach: (storeId, entry) =>
+        val xfer = entry.transferDevice.map(d => s" -> ${d.uuid}").getOrElse("")
+        lines += s"    $storeId  ${entry.status}$xfer"
+    lines.mkString("\n")
+
   def list_devices(bootstrapConfigFile: os.Path, hostname: String): Unit =
 
     configureLogging()

@@ -4,6 +4,8 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import org.aspen_ddp.aspen.common.metadata.*
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.pool.PoolId
 
 import java.util.UUID
 import scala.concurrent.{Await, Future}
@@ -58,3 +60,28 @@ class MainSuite extends AnyFunSuite with Matchers:
     val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))
     val s = HostState(hostId, "node_a", "127.0.0.1", 4750, 4751, 4752, Set.empty)
     Main.formatHostState(s) should include ("Storage Devices:     none")
+
+  test("formatDeviceState renders identity, resolved names, usage, and stores"):
+    val devId  = StorageDeviceId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+    val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val storeId = StoreId(PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444")), 0.toByte)
+    val stores = Map(storeId ->
+      StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
+    val s = StorageDeviceState(devId, hostId, 512L, 2048L, stores, setId)
+    val out = Main.formatDeviceState(s, Some("node_a"), Some("fast-nvme"))
+    out should include ("Storage Device: 22222222-2222-2222-2222-222222222222")
+    out should include ("node_a")
+    out should include ("fast-nvme")
+    out should include ("Active")
+    out should include (storeId.toString)
+
+  test("formatDeviceState falls back to raw UUIDs when names are None"):
+    val devId  = StorageDeviceId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+    val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val s = StorageDeviceState(devId, hostId, 0L, 0L, Map.empty, setId)
+    val out = Main.formatDeviceState(s, None, None)
+    out should include ("11111111-1111-1111-1111-111111111111")
+    out should include ("33333333-3333-3333-3333-333333333333")
+    out should include ("Stores:     none")

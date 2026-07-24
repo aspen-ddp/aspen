@@ -75,6 +75,9 @@ object Main {
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
+  private case class HostNotFound(hostname: String)
+    extends Exception(s"host '$hostname' not found")
+
   class NetworkBridge extends MessageHandler with Logging {
     var oclient: Option[AspenClient] = None
     var onode: Option[StoreManager] = None
@@ -1036,11 +1039,19 @@ object Main {
 
     given ExecutionContext = client.clientContext
 
-    // Resolve hostname -> HostId -> HostState, then fetch each device's state and
-    // resolve the (deduplicated) set ids to names for display.
+    // Resolve the host first. A NoSuchElementException during host resolution means the
+    // hostname the user supplied does not exist; map it to a distinct error so a later
+    // missing device/set (corrupted metadata) is not mislabeled as "host not found".
+    val fHostState: Future[HostState] =
+      (for
+        hostId    <- client.getHostId(hostname)
+        hostState <- client.getHostState(hostId)
+      yield hostState).recoverWith:
+        case _: NoSuchElementException => Future.failed(HostNotFound(hostname))
+
+    // Fetch each device's state, then resolve the (deduplicated) set ids to names for display.
     val f = for
-      hostId    <- client.getHostId(hostname)
-      hostState <- client.getHostState(hostId)
+      hostState <- fHostState
       devStates <- Future.sequence(hostState.storageDevices.toList.map(client.getStorageDeviceState))
       setIds     = devStates.map(_.storageDeviceSet).distinct
       setStates <- Future.sequence(setIds.map(client.getStorageDeviceSetState))
@@ -1065,7 +1076,7 @@ object Main {
             val paddedCap = " " * (capWidth - capacity.length) + capacity
             println(f"  $uuid  ${setName.padTo(setWidth, ' ')}  $paddedCap  $pct%5.1f%%")
           }
-      case scala.util.Failure(_: NoSuchElementException) =>
+      case scala.util.Failure(_: HostNotFound) =>
         println(s"Error: host '$hostname' not found")
       case scala.util.Failure(err) =>
         println(s"Error listing devices: ${err.getMessage}")

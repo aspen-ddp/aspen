@@ -21,8 +21,10 @@ import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, R
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringIn, TransferringOut}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
+import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, ServiceEntry, TaskExecutor}
 import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTaskExecutor}
+import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskRunner}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
 import org.aspen_ddp.aspen.server.usage.StorageDeviceUsageManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
@@ -116,6 +118,7 @@ class StoreManager(val client: AspenClient,
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
   private val serviceExecutorPromise: Promise[SimpleDurableServiceExecutor] = Promise()
+  private val systemTaskRunnerPromise: Promise[SystemTaskRunner] = Promise()
   private val poolUsageManager = new StoragePoolUsageManager(client)
   private val deviceUsageManager = new StorageDeviceUsageManager(client)
   private var usageUpdateTask: Option[ScheduledTask] = None
@@ -168,6 +171,7 @@ class StoreManager(val client: AspenClient,
                     startUsageTracking(executor)
                     val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
                     serviceExecutorPromise.success(serviceExec)
+                    initializeSystemTaskRunner(executor)
 
             case None =>
               client.getStoragePool(Radicle.poolId).foreach: pool =>
@@ -190,10 +194,24 @@ class StoreManager(val client: AspenClient,
                       startUsageTracking(executor)
                       val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
                       serviceExecutorPromise.success(serviceExec)
+                      initializeSystemTaskRunner(executor)
 
       case Failure(err) =>
         // In test environments or when host is not yet registered, silently skip initialization
         logger.debug(s"TaskExecutor initialization skipped: ${err.getMessage}")
+
+  private def initializeSystemTaskRunner(executor: TaskExecutor): Unit =
+    val servicesTkvl = TieredKeyValueList(client,
+      KVObjectRootManager(client, Radicle.ServicesTreeKey, client.radicle))
+    servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID)).foreach:
+      case Some(vs) =>
+        val statePtr = ServiceEntry.decode(vs.value.bytes).statePointer
+        val runner = new SystemTaskRunner(client, statePtr, hostId, executor)
+        synchronized:
+          if !systemTaskRunnerPromise.isCompleted then
+            systemTaskRunnerPromise.success(runner)
+      case None =>
+        logger.debug("SystemTaskExecutorService not registered; system task runner not started")
 
   private def startUsageTracking(executor: TaskExecutor): Unit =
     poolUsageManager.setTaskExecutor(executor)
@@ -698,6 +716,7 @@ class StoreManager(val client: AspenClient,
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     events.put(Exit())
     serviceExecutorPromise.future.foreach(_.shutdown())
+    systemTaskRunnerPromise.future.foreach(_.shutdown())
     pendingStartTask.cancel()
     heartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
@@ -785,6 +804,8 @@ class StoreManager(val client: AspenClient,
         case m: CheckStorageDevice => checkStorageDevice(m.deviceId)
         case m: ServiceMessage =>
           serviceExecutorPromise.future.foreach(_.deliverMessage(m))
+        case m: ExecuteSystemTask =>
+          systemTaskRunnerPromise.future.foreach(_.receive(m))
       
       case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
         store.repair(os, completion)
@@ -814,6 +835,8 @@ class StoreManager(val client: AspenClient,
       case HeartbeatEvent() =>
         //logger.trace("Main loop got heartbeat event")
         stores.valuesIterator.foreach(_.heartbeat())
+        if systemTaskRunnerPromise.isCompleted then
+          systemTaskRunnerPromise.future.foreach(_.heartbeat())
 
       case CheckAllDevices() =>
         storageDevices.valuesIterator.foreach: sds =>

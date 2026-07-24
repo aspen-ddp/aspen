@@ -275,6 +275,13 @@ class TestNetwork(executionContext: ExecutionContext,
       _ <- Future.sequence(inFlight.map((sid, from, to) => simulateTransferComplete(sid, from, to)))
     yield inFlight.size
 
+  /** Remove and return all currently-captured host messages (best-effort delivery is the
+   *  caller's job). Mirrors how transfer tests inspect capturedHostMessages, but drains. */
+  def takeCapturedHostMessages(): List[HostMessage] = synchronized:
+    val msgs = capturedHostMessages
+    capturedHostMessages = Nil
+    msgs
+
   // -------------------------------------------------------------------------------
 
   var otestThreadId: Option[Long] = None

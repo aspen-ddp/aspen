@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage, ServiceMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -265,6 +265,14 @@ trait AspenClient extends ObjectReader:
       case Some(hostId) =>
         sendHostMessage(ServiceMessage(hostId, clientId, serviceUUID, encodedContent))
       case None => ()
+
+  /** Create and enroll a system-level DurableTask, executed by the SystemTaskExecutorService
+   *  on some host. Retries until the task object is created and enrolled. The returned Future
+   *  completes at enrollment; there is no task-completion notification.
+   *
+   *  `taskTypeUUID` must resolve to a DurableTaskFactory in the type registry. */
+  def createSystemDurableTask(taskTypeUUID: UUID,
+                              initialState: Map[Key, Array[Byte]]): Future[Unit]
 
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]
 

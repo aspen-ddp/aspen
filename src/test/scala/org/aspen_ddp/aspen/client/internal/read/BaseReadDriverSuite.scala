@@ -102,6 +102,9 @@ object BaseReadDriverSuite {
 
     private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]] = ???
 
+    def createSystemDurableTask(taskTypeUUID: UUID,
+                                initialState: Map[org.aspen_ddp.aspen.common.objects.Key, Array[Byte]]): Future[Unit] = ???
+
     private[aspen] def getSystemAttribute(key: String): Option[String] = None
     private[aspen] def setSystemAttribute(key: String, value: String): Unit = ()
 

@@ -962,6 +962,21 @@ object Codec extends Logging:
     val serviceUUID = decodeUUID(m.serviceUUID.get)
     ServiceMessage(toHost, fromClient, serviceUUID, m.encodedContent.toByteArray)
 
+  def encode(o: ExecuteSystemTask): codec.ExecuteSystemTask =
+    codec.ExecuteSystemTask(
+      toHost = Some(encodeUUID(o.toHost.uuid)),
+      fromClient = Some(encodeUUID(o.fromClient.uuid)),
+      taskId = Some(encodeUUID(o.taskId)),
+      taskStatePointer = ByteString.copyFrom(o.taskStatePointer.toArray)
+    )
+
+  def decode(m: codec.ExecuteSystemTask): ExecuteSystemTask =
+    val toHost = HostId(decodeUUID(m.toHost.get))
+    val fromClient = ClientId(decodeUUID(m.fromClient.get))
+    val taskId = decodeUUID(m.taskId.get)
+    val taskStatePointer = KeyValueObjectPointer(m.taskStatePointer.toByteArray)
+    ExecuteSystemTask(toHost, fromClient, taskId, taskStatePointer)
+
 
   // ----------------------- Non Network Messages -----------------------
 

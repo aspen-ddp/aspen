@@ -406,6 +406,13 @@ message ServiceMessage {
   bytes encodedContent = 4;
 }
 
+message ExecuteSystemTask {
+  UUID toHost = 1;
+  UUID fromClient = 2;
+  UUID taskId = 3;
+  bytes taskStatePointer = 4;
+}
+
 
 //---------------------------------------------------------------------------
 //- Root Message
@@ -435,6 +442,7 @@ message Message {
     CheckStorageDevice check_storage_device = 23;
     TxUnknownStore unknown_store = 24;
     ServiceMessage service_message = 25;
+    ExecuteSystemTask execute_system_task = 26;
   }
 }
 

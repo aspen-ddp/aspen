@@ -117,6 +117,7 @@ object ProtobufMessageCodec extends Logging:
       case m: StoreTransferData => codec.Message.Msg.StoreTransferData(Codec.encode(m))
       case m: CheckStorageDevice => codec.Message.Msg.CheckStorageDevice(Codec.encode(m))
       case m: ServiceMessage => codec.Message.Msg.ServiceMessage(Codec.encode(m))
+      case m: ExecuteSystemTask => codec.Message.Msg.ExecuteSystemTask(Codec.encode(m))
 
     val encodedMsg = codec.Message(msg = msgVariant).toByteArray
 
@@ -256,6 +257,9 @@ object ProtobufMessageCodec extends Logging:
           Some(Codec.decode(r))
 
         case codec.Message.Msg.ServiceMessage(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.ExecuteSystemTask(r) =>
           Some(Codec.decode(r))
 
         case codec.Message.Msg.UnknownStore(r) =>

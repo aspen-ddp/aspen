@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
@@ -59,6 +59,13 @@ final case class ServiceMessage(
                                  serviceUUID: UUID,
                                  encodedContent: Array[Byte]
                                ) extends HostMessage
+
+final case class ExecuteSystemTask(
+                                    toHost: HostId,
+                                    fromClient: ClientId,
+                                    taskId: UUID,
+                                    taskStatePointer: KeyValueObjectPointer
+                                  ) extends HostMessage
 
 
 sealed abstract class TxMessage extends Message {

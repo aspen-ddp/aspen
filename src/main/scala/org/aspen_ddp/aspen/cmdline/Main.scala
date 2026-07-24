@@ -75,6 +75,9 @@ object Main {
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
+  private case class HostNotFound(hostname: String)
+    extends Exception(s"host '$hostname' not found")
+
   class NetworkBridge extends MessageHandler with Logging {
     var oclient: Option[AspenClient] = None
     var onode: Option[StoreManager] = None
@@ -312,6 +315,17 @@ object Main {
             validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
         )
 
+      cmd("list-devices").text("Lists all storage devices for a host").
+        action((_, c) => c.copy(mode = "list-devices")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<hostname>").text("Name of the host whose devices to list").
+            action((x, c) => c.copy(hostName = x)),
+        )
+
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
 
@@ -340,6 +354,7 @@ object Main {
             case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             _.listHosts(),             _.uuid)
             case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
             case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       _.listStorageDeviceSets(), _.uuid)
+            case "list-devices"           => list_devices(bootstrapConfigPath, cfg.hostName)
         catch
           case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
           case e: ConfigError => println(s"Error: $e")
@@ -998,6 +1013,75 @@ object Main {
         println(s"Rebalance failed to enroll: ${err.getMessage}")
 
     scala.concurrent.Await.ready(f, scala.concurrent.duration.Duration(30, scala.concurrent.duration.SECONDS))
+
+  /** Format a byte count using binary units (powers of 1024). Sub-KiB values are
+   *  rendered as whole bytes; larger values use one decimal place and the largest
+   *  unit that keeps the value >= 1.0. */
+  private[cmdline] def formatBytes(n: Long): String =
+    val units = Array("KiB", "MiB", "GiB", "TiB", "PiB")
+    if n < 1024L then
+      s"$n B"
+    else
+      var value = n.toDouble / 1024.0
+      var idx = 0
+      while value >= 1024.0 && idx < units.length - 1 do
+        value /= 1024.0
+        idx += 1
+      f"$value%.1f ${units(idx)}"
+
+  def list_devices(bootstrapConfigFile: os.Path, hostname: String): Unit =
+
+    configureLogging()
+
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    // Resolve the host first. A NoSuchElementException during host resolution means the
+    // hostname the user supplied does not exist; map it to a distinct error so a later
+    // missing device/set (corrupted metadata) is not mislabeled as "host not found".
+    val fHostState: Future[HostState] =
+      (for
+        hostId    <- client.getHostId(hostname)
+        hostState <- client.getHostState(hostId)
+      yield hostState).recoverWith:
+        case _: NoSuchElementException => Future.failed(HostNotFound(hostname))
+
+    // Fetch each device's state, then resolve the (deduplicated) set ids to names for display.
+    val f = for
+      hostState <- fHostState
+      devStates <- Future.sequence(hostState.storageDevices.toList.map(client.getStorageDeviceState))
+      setIds     = devStates.map(_.storageDeviceSet).distinct
+      setStates <- Future.sequence(setIds.map(client.getStorageDeviceSetState))
+      setNameMap = setStates.map(s => s.setId -> s.name).toMap
+    yield
+      devStates.map { ds =>
+        val setName  = setNameMap.getOrElse(ds.storageDeviceSet, ds.storageDeviceSet.uuid.toString)
+        val capacity = formatBytes(ds.totalSize)
+        val pct      = if ds.totalSize > 0 then ds.currentUsage.toDouble / ds.totalSize * 100.0 else 0.0
+        (ds.storageDeviceId.uuid.toString, setName, capacity, pct)
+      }.sortBy(_._1)
+
+    f.onComplete:
+      case scala.util.Success(devices) =>
+        if devices.isEmpty then
+          println(s"No devices found for host '$hostname'")
+        else
+          val setWidth = devices.map(_._2.length).max
+          val capWidth = devices.map(_._3.length).max
+          println(s"Devices for host '$hostname'")
+          devices.foreach { (uuid, setName, capacity, pct) =>
+            val paddedCap = " " * (capWidth - capacity.length) + capacity
+            println(f"  $uuid  ${setName.padTo(setWidth, ' ')}  $paddedCap  $pct%5.1f%%")
+          }
+      case scala.util.Failure(_: HostNotFound) =>
+        println(s"Error: host '$hostname' not found")
+      case scala.util.Failure(err) =>
+        println(s"Error listing devices: ${err.getMessage}")
+
+    Await.ready(f, Duration(30, SECONDS))
 
   def list_entries[A](bootstrapConfigFile: os.Path,
                       title: String,

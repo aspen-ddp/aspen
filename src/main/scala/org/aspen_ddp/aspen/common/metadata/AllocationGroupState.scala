@@ -85,6 +85,26 @@ object AllocationGroupState:
 
     modifyPool(client, poolId, parentId, taskExecutor, mod)
 
+  /** Enroll the usage-cascade task for `childUUID` (a pool or child group) atomically within
+   *  the current transaction, when the group has parent groups. Uses the supplied TaskExecutor
+   *  when present, otherwise the system durable task path. */
+  private def prepareUsageTask(client: AspenClient,
+                              childUUID: UUID,
+                              nags: AllocationGroupState,
+                              taskExecutor: Option[TaskExecutor])
+                             (using tx: Transaction): Future[Unit] =
+    given ExecutionContext = client.clientContext
+    if nags.parentGroups.nonEmpty then
+      taskExecutor match
+        case Some(exec) =>
+          UpdateAllocationGroupUsageTask.prepareTask(childUUID,
+            nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid), exec).map(_ => ())
+        case None =>
+          UpdateAllocationGroupUsageTask.prepareSystemTask(client, childUUID,
+            nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid))
+    else
+      Future.unit
+
   private def modifyPool(client: AspenClient,
                          poolId: PoolId,
                          parentId: AllocationGroupId,
@@ -105,16 +125,8 @@ object AllocationGroupState:
         ps = StoragePoolState(psKvos)
         ags = AllocationGroupState(agsDos)
         _ <- mod(psPtr, psKvos, agsPtr, agsDos, ps, ags, tx) match
-          case Some((_, nags)) if nags.parentGroups.nonEmpty =>
-            taskExecutor match
-              case Some(exec) =>
-                UpdateAllocationGroupUsageTask.prepareTask(poolId.uuid,
-                  nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid), exec).map(_ => ())
-              case None =>
-                UpdateAllocationGroupUsageTask.prepareSystemTask(client, poolId.uuid,
-                  nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid))
-          case _ =>
-            Future.unit
+          case Some((_, nags)) => prepareUsageTask(client, poolId.uuid, nags, taskExecutor)
+          case None            => Future.unit
       yield ()
 
     def onFail(err: Throwable): Future[Unit] = err match
@@ -199,16 +211,8 @@ object AllocationGroupState:
         child = AllocationGroupState(childDos)
         parent = AllocationGroupState(parentDos)
         _ <- mod(childPtr, childDos, parentPtr, parentDos, child, parent, tx) match
-          case Some((_, nparent)) if nparent.parentGroups.nonEmpty =>
-            taskExecutor match
-              case Some(exec) =>
-                UpdateAllocationGroupUsageTask.prepareTask(childId.uuid,
-                  nparent.currentUsage, nparent.maximumSize, nparent.parentGroups.map(_.uuid), exec).map(_ => ())
-              case None =>
-                UpdateAllocationGroupUsageTask.prepareSystemTask(client, childId.uuid,
-                  nparent.currentUsage, nparent.maximumSize, nparent.parentGroups.map(_.uuid))
-          case _ =>
-            Future.unit
+          case Some((_, nparent)) => prepareUsageTask(client, childId.uuid, nparent, taskExecutor)
+          case None               => Future.unit
       yield ()
 
     def onFail(err: Throwable): Future[Unit] = err match

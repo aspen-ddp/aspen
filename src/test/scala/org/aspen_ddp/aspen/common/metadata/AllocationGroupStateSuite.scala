@@ -2,10 +2,15 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
+import org.aspen_ddp.aspen.common.objects.Key
+import org.aspen_ddp.aspen.common.util.byte2uuid
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
-import org.aspen_ddp.aspen.compute.TaskExecutor
+import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskServiceState}
+import org.aspen_ddp.aspen.compute.{ServiceEntry, TaskExecutor}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -320,9 +325,8 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
 
   atest("addPool with no executor enrolls a system usage task"):
     given ExecutionContext = executionContext
-    val servicesTkvl = org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList(client,
-      org.aspen_ddp.aspen.client.tkvl.KVObjectRootManager(client,
-        Radicle.ServicesTreeKey, Radicle.pointer))
+    val servicesTkvl = TieredKeyValueList(client,
+      KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
     for
       executor <- setup()
       childId <- client.createAllocationGroup("child-sys", level = 0)
@@ -337,10 +341,10 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, childId, None)
       _ <- waitForTransactionsToComplete()
 
-      stateVs <- servicesTkvl.get(org.aspen_ddp.aspen.common.objects.Key(
-                   org.aspen_ddp.aspen.compute.systemtask.SystemTaskExecutorService.ServiceUUID))
-      statePtr = org.aspen_ddp.aspen.compute.ServiceEntry.decode(stateVs.get.value.bytes).statePointer
-      enrolled <- org.aspen_ddp.aspen.compute.systemtask.SystemTaskServiceState.scan(client, statePtr)
+      stateVs <- servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID))
+      statePtr = ServiceEntry.decode(stateVs.get.value.bytes).statePointer
+      enrolled <- SystemTaskServiceState.scan(client, statePtr)
+      taskKvos <- client.read(enrolled.head._2)
 
       ps <- readPoolState()
       ags <- readGroupState(childId)
@@ -348,3 +352,4 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       ps.allocationGroups should contain(childId.uuid)
       ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
       enrolled.size should be >= 1
+      byte2uuid(taskKvos.contents(SimpleTaskExecutor.TaskTypeKey).value.bytes) should be(UpdateAllocationGroupUsageTask.typeUUID)

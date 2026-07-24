@@ -999,6 +999,21 @@ object Main {
 
     scala.concurrent.Await.ready(f, scala.concurrent.duration.Duration(30, scala.concurrent.duration.SECONDS))
 
+  /** Format a byte count using binary units (powers of 1024). Sub-KiB values are
+   *  rendered as whole bytes; larger values use one decimal place and the largest
+   *  unit that keeps the value >= 1.0. */
+  private[cmdline] def formatBytes(n: Long): String =
+    val units = Array("KiB", "MiB", "GiB", "TiB", "PiB")
+    if n < 1024L then
+      s"$n B"
+    else
+      var value = n.toDouble / 1024.0
+      var idx = 0
+      while value >= 1024.0 && idx < units.length - 1 do
+        value /= 1024.0
+        idx += 1
+      f"$value%.1f ${units(idx)}"
+
   def list_entries[A](bootstrapConfigFile: os.Path,
                       title: String,
                       fetch: AspenClient => Future[List[(String, A)]],

@@ -541,6 +541,21 @@ message RebalancingMessage {
   }
 }
 
+message NewSystemTaskAdded {
+  UUID taskId = 1;
+}
+
+message SystemTaskComplete {
+  UUID taskId = 1;
+}
+
+message SystemTaskMessage {
+  oneof msg {
+    NewSystemTaskAdded newSystemTaskAdded = 1;
+    SystemTaskComplete systemTaskComplete = 2;
+  }
+}
+
 message StorageDeviceSetState {
   UUID setId = 1;
   string name = 2;

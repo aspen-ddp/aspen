@@ -1,13 +1,4 @@
 
-Add CLI command "add-pool-to-group"
-  - takes pool name and allocation group name
-  - Implement as method on AspenClient
-    - calls AllocationGroupState.addPool internally if both pool and group exist
-  - Add UpdateAllocationGroupUsageTask.prepareSystemTask
-    - uses AspenClient.createSystemDurableTask instead of directly using a TaskExecutor instance
-  - Update addPool/removePool/modifyPool to optionally use a TaskExecutor. If not supplied, use the system
-    durable task instead
-
 Add CLI command "add-group-to-group"
   - Takes source and destination group names/uuids
   - Destination group level must be greater than the source group's level

@@ -1,8 +1,4 @@
 
-Add CLI command "create-allocation-group"
-  - takes name and level arguments
-  - fail if name already in use
-
 Add CLI command "add-pool-to-group"
   - takes pool name and allocation group name
   - Update the state objects for both

@@ -56,6 +56,7 @@ class SystemTaskExecutorService(val client: AspenClient,
   private given ExecutionContext = client.clientContext
 
   private var tracking: Map[UUID, TaskTrack] = Map.empty
+  private var dispatching: Set[UUID] = Set.empty
   private var hostCache: List[HostId] = Nil
   private var hostCacheStampNanos: Long = 0L
   private var reconcileTask: ScheduledTask = NoTask
@@ -73,6 +74,7 @@ class SystemTaskExecutorService(val client: AspenClient,
     reconcileTask.cancel()
     monitorTask.cancel()
     tracking = Map.empty
+    dispatching = Set.empty
 
   override def receiveMessage(msg: ServiceMessage): Unit =
     SystemTaskMessage.decode(msg.encodedContent) match
@@ -99,7 +101,17 @@ class SystemTaskExecutorService(val client: AspenClient,
       if candidates.isEmpty then None
       else Some(candidates(ThreadLocalRandom.current().nextInt(candidates.size)))
 
-  private def dispatch(taskId: UUID, taskStatePtr: KeyValueObjectPointer): Future[Unit] =
+  /** Reserve a NEW task for dispatch (must be neither tracked nor already dispatching). */
+  private def reserveNew(taskId: UUID): Boolean = synchronized:
+    if stopped || dispatching.contains(taskId) || tracking.contains(taskId) then false
+    else { dispatching += taskId; true }
+
+  /** Reserve a tracked task for REASSIGNMENT (only blocked by an in-flight dispatch). */
+  private def reserveReassign(taskId: UUID): Boolean = synchronized:
+    if stopped || dispatching.contains(taskId) then false
+    else { dispatching += taskId; true }
+
+  private def doDispatch(taskId: UUID, taskStatePtr: KeyValueObjectPointer): Future[Unit] =
     pickHost().flatMap:
       case None =>
         logger.warn(s"No online host to run system task $taskId")
@@ -111,8 +123,10 @@ class SystemTaskExecutorService(val client: AspenClient,
           synchronized:
             if !stopped then
               tracking += taskId -> TaskTrack(host, kvos.revision, now, now)
-        .recover:
-          case err => logger.warn(s"Dispatch of system task $taskId failed: $err")
+    .recover:
+      case err => logger.warn(s"Dispatch of system task $taskId failed: $err")
+    .andThen:
+      case _ => synchronized { dispatching -= taskId }
 
   /** Discover enrolled tasks and dispatch any not yet tracked; drop tracking for vanished tasks. */
   private def reconcile(): Future[Unit] =
@@ -121,8 +135,8 @@ class SystemTaskExecutorService(val client: AspenClient,
       SystemTaskServiceState.scan(client, statePointer).flatMap: enrolled =>
         val enrolledIds = enrolled.map(_._1).toSet
         synchronized { tracking = tracking.filter((id, _) => enrolledIds.contains(id)) }
-        val toDispatch = enrolled.filter((id, _) => synchronized(!tracking.contains(id)))
-        Future.traverse(toDispatch)((id, ptr) => dispatch(id, ptr)).map(_ => ())
+        val toDispatch = enrolled.filter((id, _) => reserveNew(id))
+        Future.traverse(toDispatch)((id, ptr) => doDispatch(id, ptr)).map(_ => ())
       .recover:
         case err => logger.warn(s"SystemTaskExecutorService reconcile failed: $err")
 
@@ -151,8 +165,11 @@ class SystemTaskExecutorService(val client: AspenClient,
                   val stalled = (now - track.lastChangeNanos) > stallTimeout.toNanos
                   val pastFirstCheck = (now - track.dispatchedNanos) > firstCheckDelay.toNanos
                   if stalled && pastFirstCheck then
-                    logger.info(s"System task $taskId stalled; reassigning")
-                    dispatch(taskId, taskStatePtr)
+                    if reserveReassign(taskId) then
+                      logger.info(s"System task $taskId stalled; reassigning")
+                      doDispatch(taskId, taskStatePtr)
+                    else
+                      Future.unit
                   else
                     Future.unit
               .recover:

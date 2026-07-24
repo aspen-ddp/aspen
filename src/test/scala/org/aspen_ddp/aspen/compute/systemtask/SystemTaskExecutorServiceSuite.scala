@@ -68,7 +68,7 @@ class SystemTaskExecutorServiceSuite extends IntegrationTestSuite:
     for
       statePtr <- serviceStatePtr()
       _ <- client.createSystemDurableTask(CountingSystemTask.typeUUID, CountingSystemTask.initialState(5))
-      dispatches <- countDispatchesFor(Duration(3000, MILLISECONDS))
+      dispatches <- countDispatchesFor(Duration(5000, MILLISECONDS))
     yield
       exec.shutdown()
       resetTuning()

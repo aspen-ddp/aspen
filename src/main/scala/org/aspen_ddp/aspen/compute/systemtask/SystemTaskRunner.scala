@@ -68,14 +68,22 @@ class SystemTaskRunner(val client: AspenClient,
     // Remove from the registry and drop the task-state object, then wake the service.
     val f = client.transactUntilSuccessful: tx =>
       given Transaction = tx
-      for
-        taskKvos <- client.read(taskStatePtr)
-        _ <- SystemTaskServiceState.removeInTx(client, serviceStatePtr, taskId)
-      yield
-        tx.setRefcount(taskStatePtr, taskKvos.refcount, taskKvos.refcount.decrement())
-    f.foreach: _ =>
-      client.sendServiceMessage(SystemTaskExecutorService.ServiceUUID,
-        SystemTaskMessage.encode(SystemTaskComplete(taskId)))
+      SystemTaskServiceState.scan(client, serviceStatePtr).flatMap: enrolled =>
+        if !enrolled.exists(_._1 == taskId) then
+          // Already cleaned up by a prior committed attempt (idempotent): do not double-decrement.
+          Future.unit
+        else
+          for
+            taskKvos <- client.read(taskStatePtr)
+            _ <- SystemTaskServiceState.removeInTx(client, serviceStatePtr, taskId)
+          yield
+            tx.setRefcount(taskStatePtr, taskKvos.refcount, taskKvos.refcount.decrement())
+    f.onComplete:
+      case scala.util.Success(_) =>
+        client.sendServiceMessage(SystemTaskExecutorService.ServiceUUID,
+          SystemTaskMessage.encode(SystemTaskComplete(taskId)))
+      case scala.util.Failure(err) =>
+        logger.warn(s"System task $taskId completion cleanup failed: $err")
 
   /** Bump the version of every running task's state object (the heartbeat). */
   def heartbeat(): Future[Unit] =

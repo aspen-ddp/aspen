@@ -47,7 +47,7 @@ class SystemTaskRunnerSuite extends IntegrationTestSuite:
       runner = new SystemTaskRunner(client, statePtr, HostId.BootstrapHostId)
       _ = runner.receive(ExecuteSystemTask(HostId.BootstrapHostId, client.clientId, taskId, taskStatePtr))
       _ <- pollUntil(() => SystemTaskServiceState.scan(client, statePtr).map(_.isEmpty),
-                     Duration(20000, MILLISECONDS))
+                     Duration(5000, MILLISECONDS))
       finalScan <- SystemTaskServiceState.scan(client, statePtr)
     yield
       runner.shutdown()

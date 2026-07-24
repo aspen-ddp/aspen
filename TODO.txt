@@ -3,8 +3,13 @@ Add CLI command "add-pool-to-group"
   - takes pool name and allocation group name
   - Update the state objects for both
 
+Add CLI command "add-group-to-group"
+  - Takes source and destination group names/uuids
+  - Destination group level must be greater than the source group's level
+  - Updates the group state object accordingly
+
 Add CLI command "move-device-to-set"
-  - takes device UUID and device set UUID
+  - takes device UUID and device set name or UUID
     - Set must be tier 0
   - In one Transaction
     - Update device state to point to new set

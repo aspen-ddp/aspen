@@ -1079,6 +1079,30 @@ object Main {
         lines += s"    $storeId  ${entry.status}$xfer"
     lines.mkString("\n")
 
+  private[cmdline] def formatPoolState(s: StoragePoolState, setName: Option[String]): String =
+    val set = setName.getOrElse(s.storageDeviceSet.uuid.toString)
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Pool: ${s.name}"
+    lines += s"  UUID:         ${s.poolId.uuid}"
+    lines += s"  IDA:          ${s.ida}"
+    lines += s"  Max Obj Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"
+    lines += s"  Device Set:   $set (${s.storageDeviceSet.uuid})"
+    lines += s"  Usage:        ${formatBytes(s.currentUsage)}"
+    lines += s"  Max Store Sz: ${if s.maximumStoreSize == 0 then "unbounded" else formatBytes(s.maximumStoreSize)}"
+    if s.allocationGroups.isEmpty then
+      lines += "  Alloc Groups: none"
+    else
+      lines += "  Alloc Groups:"
+      s.allocationGroups.foreach: g =>
+        lines += s"    $g"
+    if s.stores.isEmpty then
+      lines += "  Stores:       none"
+    else
+      lines += "  Stores:"
+      s.stores.zipWithIndex.foreach: (entry, i) =>
+        lines += s"    [$i] host ${entry.hostId.uuid}  device ${entry.storageDeviceId.uuid}"
+    lines.mkString("\n")
+
   def list_devices(bootstrapConfigFile: os.Path, hostname: String): Unit =
 
     configureLogging()

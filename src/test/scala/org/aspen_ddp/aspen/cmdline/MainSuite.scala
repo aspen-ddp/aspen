@@ -6,6 +6,8 @@ import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
 import java.util.UUID
 import scala.concurrent.{Await, Future}
@@ -85,3 +87,29 @@ class MainSuite extends AnyFunSuite with Matchers:
     out should include ("11111111-1111-1111-1111-111111111111")
     out should include ("33333333-3333-3333-3333-333333333333")
     out should include ("Stores:     none")
+
+  test("formatPoolState renders identity, IDA, device set, and stores"):
+    val poolId = PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444"))
+    val hostId = HostId(UUID.fromString("11111111-1111-1111-1111-111111111111"))
+    val devId  = StorageDeviceId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val stores = Array(StoragePoolState.StoreEntry(hostId, devId))
+    val s = StoragePoolState(poolId, "mypool", Replication(3, 2), None, stores,
+      RocksDBConfig(), setId, currentUsage = 1024L, maximumStoreSize = 0L, allocationGroups = Nil)
+    val out = Main.formatPoolState(s, Some("fast-nvme"))
+    out should include ("Pool: mypool")
+    out should include ("44444444-4444-4444-4444-444444444444")
+    out should include ("Replication")
+    out should include ("fast-nvme")
+    out should include ("[0]")
+    out should include ("22222222-2222-2222-2222-222222222222")
+
+  test("formatPoolState falls back to set UUID and shows 'none' lists"):
+    val poolId = PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val s = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
+      RocksDBConfig(), setId)
+    val out = Main.formatPoolState(s, None)
+    out should include ("33333333-3333-3333-3333-333333333333")
+    out should include ("Alloc Groups: none")
+    out should include ("Stores:       none")

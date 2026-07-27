@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceSetId}
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.nio.file.attribute.{BasicFileAttributes, PosixFilePermission, PosixFilePermissions}
-import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}
+import java.nio.file.{FileAlreadyExistsException, FileVisitResult, Files, LinkOption, Path, Paths, SimpleFileVisitor}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
@@ -188,3 +188,19 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
         waitForTransactionsToComplete().flatMap: _ =>
           client.getStorageDeviceState(err.storageDeviceId).map: ds =>
             ds.hostId should be(HostId.BootstrapHostId)
+
+  atest("does not remove a config that appeared during the transaction"):
+    given ExecutionContext = executionContext
+    val hostDir = newHostDir()
+    val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
+    Files.createDirectories(dir)
+    // Files.exists follows symlinks so the guard sees no config; the CREATE_NEW write
+    // opens with O_EXCL, which fails on the link itself -- the same arm a lost race takes.
+    val cfg = dir.resolve(StorageDeviceConfig.configFilename)
+    Files.createSymbolicLink(cfg, dir.resolve("no-such-target"))
+    recoverToExceptionIf[StorageDeviceManager.ConfigWriteFailed](
+      StorageDeviceManager.createStorageDevice(
+        client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
+      .map: err =>
+        err.getCause shouldBe a[FileAlreadyExistsException]
+        Files.exists(cfg, LinkOption.NOFOLLOW_LINKS) should be(true)

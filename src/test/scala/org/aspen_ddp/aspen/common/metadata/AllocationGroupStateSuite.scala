@@ -372,3 +372,32 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     yield
       ps.allocationGroups should contain(groupId.uuid)
       ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
+
+  atest("addGroupToGroup resolves names and nests the source group"):
+    given ExecutionContext = executionContext
+    for
+      childId <- client.createAllocationGroup("child-named", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent-named", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.addGroupToGroup("child-named", "parent-named")
+      _ <- waitForTransactionsToComplete()
+
+      childState <- readGroupState(childId)
+      parentState <- readGroupState(parentId)
+    yield
+      childState.parentGroups.exists(_.uuid == parentId.uuid) should be(true)
+      parentState.members.exists(_.uuid == childId.uuid) should be(true)
+
+  atest("addGroupToGroup fails with InvalidLevel when source level is not lower"):
+    given ExecutionContext = executionContext
+    for
+      _ <- client.createAllocationGroup("src-same", level = 1)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.createAllocationGroup("dst-same", level = 1)
+      _ <- waitForTransactionsToComplete()
+
+      err <- client.addGroupToGroup("src-same", "dst-same").failed
+    yield
+      err shouldBe a[AllocationGroupState.InvalidLevel]

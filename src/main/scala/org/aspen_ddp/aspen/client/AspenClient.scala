@@ -128,6 +128,20 @@ trait AspenClient extends ObjectReader:
       _       <- AllocationGroupState.addPool(this, poolId, groupId, None)
     yield ()
 
+  /** Nest a source allocation group inside a destination allocation group, both
+   *  identified by name. The destination group's level must be strictly greater than
+   *  the source group's level (enforced by AllocationGroupState.addGroup, which throws
+   *  AllocationGroupState.InvalidLevel otherwise). Fails with NoSuchElementException if
+   *  either name is not registered. Uses the system durable task path for any usage
+   *  cascade (no local TaskExecutor). */
+  def addGroupToGroup(sourceGroupName: String, destGroupName: String): Future[Unit] =
+    given ExecutionContext = this.clientContext
+    for
+      childId  <- getAllocationGroupId(sourceGroupName)
+      parentId <- getAllocationGroupId(destGroupName)
+      _        <- AllocationGroupState.addGroup(this, childId, parentId, None)
+    yield ()
+
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
 

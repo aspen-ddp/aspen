@@ -101,23 +101,34 @@ judgement and belongs in its own commit.
 ## Command
 
 ```
-create-storage-device <bootstrap-config-file> <host-directory> <device-directory> <set-name-or-uuid>
+create-storage-device <bootstrap-config-file> <host-directory> <device-name> <set-name-or-uuid>
 ```
 
 ```
-./t create-storage-device demo/bootstrap_config.yaml demo/node_a \
-    demo/node_a/storage-devices/dev2 default-set
+./t create-storage-device demo/bootstrap_config.yaml demo/node_a dev2 default-set
 ```
 
 - `<bootstrap-config-file>` — connects the client, and supplies the expected
   `aspenSystemId`.
 - `<host-directory>` — contains `aspen-host-config.yaml`; supplies `hostId`.
   Mirrors the `host` command, which also takes a host directory.
-- `<device-directory>` — must already exist; see validation below.
+- `<device-name>` — the base name of the device directory. Because the directory
+  is required to sit at a fixed location, the CLI accepts the name alone and
+  resolves `<host-directory>/storage-devices/<device-name>`. The directory must
+  already exist; see validation below.
 - `<set-name-or-uuid>` — the target level-0 device set.
 
-New `Args` field: `deviceDirectory: File = new File("")`. Reuses the existing
-`hostDirectory` and `deviceSetName` fields.
+New `Args` field: `deviceName: String = ""`. Reuses the existing `hostDirectory`
+and `deviceSetName` fields.
+
+This is a CLI ergonomic convenience only. `StorageDeviceManager` still takes a
+full `Path` and performs every check itself, because callers other than the CLI
+— `StoreManager`, once device creation is automated — will pass paths directly.
+
+The CLI needs no validation of its own: a name containing a separator
+(`foo/bar`) resolves to a grandchild of `storage-devices`, `..` resolves outside
+it, and an absolute path replaces the base entirely. All three fail the
+manager's containment check.
 
 Dispatch passes the loaded bootstrap config, as the `host` command does, because
 the `aspenSystemId` check needs it:
@@ -125,9 +136,16 @@ the `aspenSystemId` check needs it:
 ```scala
 case "create-storage-device" =>
   create_storage_device(bootstrapConfig, bootstrapConfigPath,
-                        cfg.hostDirectory.toPath, cfg.deviceDirectory.toPath,
+                        cfg.hostDirectory.toPath, cfg.deviceName,
                         cfg.deviceSetName)
 ```
+
+### Shared directory-name constant
+
+`"storage-devices"` is currently a bare literal in two places
+(`Main.bootstrap:851` and `StoreManager:106`) and this change would add a third.
+Introduce `StorageDeviceManager.StorageDevicesDirName = "storage-devices"` and
+use it at all three sites.
 
 ## Components
 
@@ -251,6 +269,10 @@ Follows the shape of `move_device_to_set`: `configureLogging()`,
 val hostCfg = HostConfig.loadHostConfig(
                 hostDirectory.resolve(HostConfig.configFilename).toFile)
 
+val deviceDirectory = hostDirectory
+                        .resolve(StorageDeviceManager.StorageDevicesDirName)
+                        .resolve(deviceName)
+
 val f = for
   setId    <- resolveRef(setRef, StorageDeviceSetId(_), client.getStorageDeviceSetId)
   deviceId <- StorageDeviceManager.createStorageDevice(
@@ -262,7 +284,7 @@ yield deviceId
 reporting via `onComplete` and `Await.ready(f, Duration(30, SECONDS))`.
 
 Success message:
-`Created storage device <uuid> at <device-directory>`.
+`Created storage device <uuid> at <resolved-device-directory>`.
 
 ### Error reporting
 
@@ -282,9 +304,10 @@ the operator has for recovery.
 ## Data flow
 
 ```
-create-storage-device <bootstrap-cfg> <host-dir> <device-dir> <set>
+create-storage-device <bootstrap-cfg> <host-dir> <device-name> <set>
   -> Main.create_storage_device
        load HostConfig from <host-dir>/aspen-host-config.yaml
+       device-dir = <host-dir>/storage-devices/<device-name>
        resolveRef(set, StorageDeviceSetId(_), client.getStorageDeviceSetId)
     -> StorageDeviceManager.createStorageDevice
          validate (4 checks, all pre-transaction)
@@ -324,7 +347,9 @@ Extends `IntegrationTestSuite`, alongside `StorageDeviceSetIntegrationSuite`.
 Validation behaviour, using a temp directory tree. The negative cases need no
 client.
 
-- Rejects a device dir whose parent is not `<host-dir>/storage-devices`.
+- Rejects a device dir whose parent is not `<host-dir>/storage-devices`. Cover
+  the three shapes a bad CLI `<device-name>` resolves to: a grandchild
+  (`foo/bar`), a path escaping upward (`..`), and an absolute path.
 - Rejects a nonexistent device dir.
 - Rejects a dir already holding `aspen-storage-device-config.yaml`.
 - Rejects a mismatched `aspenSystemId`.
@@ -338,7 +363,7 @@ client.
 ### `MainSuite`
 
 - `create-storage-device` parses into the correct mode with all four fields
-  populated.
+  populated, `deviceName` holding the bare name.
 
 ### Rename coverage
 
@@ -354,7 +379,8 @@ These prove the renamed keys stay consistent between writer and reader.
 2. `feat: add AspenClient.createStorageDevice` — trait method, `BaseAspenClient`
    implementation, `StorageDeviceCreationSuite`.
 3. `feat: add StorageDeviceManager.createStorageDevice` — validation, config file
-   write, `StorageDeviceManagerSuite`.
+   write, the `StorageDevicesDirName` constant applied at all three sites, and
+   `StorageDeviceManagerSuite`.
 4. `feat: add 'create-storage-device' CLI command` — `Main.scala`, `MainSuite`,
    and removal of the item from `TODO.txt`.
 

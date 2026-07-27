@@ -7,6 +7,9 @@ import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver,
 import org.aspen_ddp.aspen.client.registries.Registry.DuplicateRegistration
 import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
+// Explicit: common.objects also defines a ReadError (an Enumeration object). Only the client
+// one is a type, so the wildcards below would resolve correctly anyway, but name it outright.
+import org.aspen_ddp.aspen.client.ReadError
 import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
@@ -225,6 +228,56 @@ abstract class BaseAspenClient(
                case Some(parentId) => addToParent(parentId)
       yield
         sds.setId
+
+  override def createStorageDevice(hostId: HostId,
+                                   deviceSetId: StorageDeviceSetId): Future[StorageDeviceId] =
+    // The device id is generated once, outside runCreate, so a retried attempt reuses the
+    // same id rather than leaking a fresh UUID per attempt. (The allocated object itself is
+    // not reused -- each attempt mints a new ObjectId.) createStorageDeviceSet does the same
+    // with setId.
+    val deviceId = StorageDeviceId(UUID.randomUUID())
+    val state = StorageDeviceState(deviceId, hostId, 0L, 0L, Map(), deviceSetId)
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: ReadError => throw StopRetrying(e)
+      case e: StorageDeviceSetState.NotLevelZero => throw StopRetrying(e)
+      case _ => Future.unit
+
+    runCreate(onFail): tx =>
+      given Transaction = tx
+      for
+        bsPool   <- getStoragePool(PoolId.BootstrapPoolId)
+        devPtr   <- bsPool.allocator.allocateKeyValueObject(
+                      Map(StorageDeviceState.StateKey -> Value(state.encode())))
+        _        <- storageDevicesTree.preparePut(deviceId.uuid, devPtr)
+
+        hostPtr  <- getHostPointer(hostId)
+        hostKvos <- read(hostPtr)
+        setPtr   <- getStorageDeviceSetPointer(deviceSetId)
+        setDos   <- read(setPtr)
+      yield
+        // Validate before staging any object updates, so a rejected request leaves the
+        // transaction empty rather than relying on invalidation to unwind partial staging.
+        val setState = StorageDeviceSetState(setDos)
+
+        if setState.level != 0 then
+          throw new StorageDeviceSetState.NotLevelZero(deviceSetId)
+
+        val hostState = HostState(hostKvos)
+        tx.update(hostPtr, None, None,
+          List(KeyRevision(HostState.StateKey,
+                           hostKvos.contents(HostState.StateKey).revision)),
+          List(Insert(HostState.StateKey,
+                      hostState.addStorageDevice(deviceId).encode())))
+
+        // Dedup-guarded so a retried attempt cannot list the device twice. The host side is
+        // naturally safe because HostState.storageDevices is a Set.
+        tx.overwrite(setPtr, setDos.revision,
+          DataBuffer(setState.copy(
+            memberDevices = deviceId :: setState.memberDevices.filter(_ != deviceId)).toBytes))
+
+        deviceId
 
   override protected def createStoragePool(config: StoragePoolState): Future[PoolId] =
     // Pool creation has no special recovery handling, so onFail is a no-op. For the production

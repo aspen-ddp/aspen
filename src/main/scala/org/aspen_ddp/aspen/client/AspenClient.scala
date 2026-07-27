@@ -117,6 +117,17 @@ trait AspenClient extends ObjectReader:
 
   def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId]
 
+  /** Register a new storage device on `hostId` and place it in the level-0 device set
+   *  `deviceSetId`, in a single atomic transaction: a new StorageDeviceState object is
+   *  allocated and registered in the storage devices tree, the owning HostState gains the
+   *  device id, and the set's memberDevices gains the device id.
+   *
+   *  Fails with NoSuchElementException if the host or the set is unknown, or with
+   *  StorageDeviceSetState.NotLevelZero if the set is not level 0.
+   *
+   *  No store is created. Stores appear on the device when a pool is assigned to it. */
+  def createStorageDevice(hostId: HostId, deviceSetId: StorageDeviceSetId): Future[StorageDeviceId]
+
   /** Add a storage pool to an allocation group, both identified by name. Fails with
    *  NoSuchElementException if either name is not registered. Uses the system durable
    *  task path for any usage cascade (no local TaskExecutor). */

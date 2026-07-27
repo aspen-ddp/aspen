@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.objects.DataObjectPointer
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
+import org.aspen_ddp.aspen.common.DataBuffer
 
 import scala.concurrent.ExecutionContext
 
@@ -114,3 +115,22 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
              client.createStorageDeviceSet("bad-child-higher", level = 1, parent = Some(parentId))
            )
     yield succeed
+
+  atest("moveDeviceToSet moves the device and updates both sets"):
+    given ExecutionContext = executionContext
+    val deviceId = StorageDeviceId.BootstrapStorageDeviceId
+    val oldSetId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      destId <- client.createStorageDeviceSet("dest-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.moveDeviceToSet(deviceId, destId)
+      _ <- waitForTransactionsToComplete()
+
+      device <- client.getStorageDeviceState(deviceId)
+      dest <- client.getStorageDeviceSetState(destId)
+      old <- client.getStorageDeviceSetState(oldSetId)
+    yield
+      device.storageDeviceSet should be(destId)
+      dest.memberDevices should contain(deviceId)
+      old.memberDevices should not contain deviceId

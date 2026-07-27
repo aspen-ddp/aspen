@@ -142,6 +142,13 @@ trait AspenClient extends ObjectReader:
       _        <- AllocationGroupState.addGroup(this, childId, parentId, None)
     yield ()
 
+  /** Move a storage device (by id) from its current level-0 device set into
+   *  `targetSetId` (which must also be level 0), in a single atomic transaction.
+   *  Fails with NoSuchElementException if the device or target set is unknown, or
+   *  StorageDeviceSetState.NotLevelZero if the target set is not level 0. */
+  def moveDeviceToSet(deviceId: StorageDeviceId, targetSetId: StorageDeviceSetId): Future[Unit] =
+    StorageDeviceSetState.moveDevice(this, deviceId, targetSetId)
+
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
 

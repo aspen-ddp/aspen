@@ -75,6 +75,7 @@ object Main {
                   parentSetName:String="",
                   newGroupName:String="",
                   poolName:String="",
+                  srcGroupName:String="",
                   newGroupLevel:Int=0,
                   entityRef:String="")
 
@@ -269,6 +270,20 @@ object Main {
             action((x, c) => c.copy(newGroupName = x)),
         )
 
+      cmd("add-group-to-group").text("Nests one allocation group inside another").
+        action((_, c) => c.copy(mode = "add-group-to-group")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<source-group-name>").text("Name of the source (lower-level) allocation group").
+            action((x, c) => c.copy(srcGroupName = x)),
+
+          arg[String]("<destination-group-name>").text("Name of the destination allocation group (level must be strictly greater than the source)").
+            action((x, c) => c.copy(newGroupName = x)),
+        )
+
       cmd("transfer-store").text("Transfers a store to a different storage device").
         action((_, c) => c.copy(mode = "transfer-store")).
         children(
@@ -449,6 +464,7 @@ object Main {
             case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
             case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
+            case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
             case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
@@ -1095,6 +1111,39 @@ object Main {
     f.onComplete:
       case scala.util.Success(_) =>
         println(s"Pool '$poolName' added to allocation group '$groupName'")
+      case scala.util.Failure(err) => reportError(err)
+
+    Await.ready(f, Duration(30, SECONDS))
+  }
+
+  def add_group_to_group(bootstrapConfigFile: os.Path,
+                         sourceGroupName: String,
+                         destGroupName: String): Unit = {
+
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val f = client.addGroupToGroup(sourceGroupName, destGroupName)
+
+    // getAllocationGroupId throws NoSuchElementException when a name is not registered;
+    // addGroup throws AllocationGroupState.InvalidLevel when the destination level is not
+    // strictly greater than the source level. Translate both into precise messages.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: NoSuchElementException =>
+        println(s"Error: allocation group '$sourceGroupName' or '$destGroupName' not found")
+      case _: AllocationGroupState.InvalidLevel =>
+        println(s"Error: destination group '$destGroupName' must have a higher level than source group '$sourceGroupName'")
+      case e =>
+        println(s"Error adding group to group: ${e.getMessage}")
+
+    f.onComplete:
+      case scala.util.Success(_) =>
+        println(s"Allocation group '$sourceGroupName' added to allocation group '$destGroupName'")
       case scala.util.Failure(err) => reportError(err)
 
     Await.ready(f, Duration(30, SECONDS))

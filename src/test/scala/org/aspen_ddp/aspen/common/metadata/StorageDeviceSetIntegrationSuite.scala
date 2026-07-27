@@ -8,8 +8,9 @@ import org.aspen_ddp.aspen.common.objects.DataObjectPointer
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
+import org.aspen_ddp.aspen.common.DataBuffer
 
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future}
 
 class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
 
@@ -114,3 +115,86 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
              client.createStorageDeviceSet("bad-child-higher", level = 1, parent = Some(parentId))
            )
     yield succeed
+
+  atest("moveDeviceToSet moves the device and updates both sets"):
+    given ExecutionContext = executionContext
+    val deviceId = StorageDeviceId.BootstrapStorageDeviceId
+    val oldSetId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      destId <- client.createStorageDeviceSet("dest-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.moveDeviceToSet(deviceId, destId)
+      _ <- waitForTransactionsToComplete()
+
+      device <- client.getStorageDeviceState(deviceId)
+      dest <- client.getStorageDeviceSetState(destId)
+      old <- client.getStorageDeviceSetState(oldSetId)
+    yield
+      device.storageDeviceSet should be(destId)
+      dest.memberDevices should contain(deviceId)
+      old.memberDevices should not contain deviceId
+
+  atest("moveDeviceToSet is a no-op when the device is already in the target set"):
+    given ExecutionContext = executionContext
+    val deviceId = StorageDeviceId.BootstrapStorageDeviceId
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      _ <- client.moveDeviceToSet(deviceId, setId)
+      _ <- waitForTransactionsToComplete()
+
+      device <- client.getStorageDeviceState(deviceId)
+      set <- client.getStorageDeviceSetState(setId)
+    yield
+      device.storageDeviceSet should be(setId)
+      set.memberDevices should contain(deviceId)
+      set.memberDevices.count(_ == deviceId) should be(1)
+
+  atest("moveDeviceToSet fails with NotLevelZero when the target set is not level 0"):
+    given ExecutionContext = executionContext
+    val deviceId = StorageDeviceId.BootstrapStorageDeviceId
+    for
+      level1Id <- client.createStorageDeviceSet("higher-set", level = 1, parent = None)
+      _ <- waitForTransactionsToComplete()
+
+      err <- client.moveDeviceToSet(deviceId, level1Id).failed
+    yield
+      err shouldBe a[StorageDeviceSetState.NotLevelZero]
+
+  atest("moveDeviceToSet fails with NoSuchElementException for an unknown device"):
+    given ExecutionContext = executionContext
+    val unknownDevice = StorageDeviceId(java.util.UUID.randomUUID())
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    recoverToSucceededIf[NoSuchElementException](
+      client.moveDeviceToSet(unknownDevice, setId)
+    )
+
+  atest("moveDeviceToSet self-heals when the old set does not list the device"):
+    given ExecutionContext = executionContext
+    val deviceId = StorageDeviceId.BootstrapStorageDeviceId
+    val oldSetId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      destId <- client.createStorageDeviceSet("selfheal-dest", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+
+      // Corrupt state: remove the device from the old set's memberDevices while the
+      // device's storageDeviceSet still points at the old set.
+      oldPtr <- client.getStorageDeviceSetPointer(oldSetId)
+      oldDos <- client.read(oldPtr)
+      oldSet = StorageDeviceSetState(oldDos)
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.overwrite(oldPtr, oldDos.revision,
+               DataBuffer(oldSet.copy(memberDevices = oldSet.memberDevices.filter(_ != deviceId)).toBytes))
+             Future.unit
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.moveDeviceToSet(deviceId, destId)
+      _ <- waitForTransactionsToComplete()
+
+      device <- client.getStorageDeviceState(deviceId)
+      dest <- client.getStorageDeviceSetState(destId)
+      old <- client.getStorageDeviceSetState(oldSetId)
+    yield
+      device.storageDeviceSet should be(destId)
+      dest.memberDevices should contain(deviceId)
+      old.memberDevices should not contain deviceId

@@ -1,10 +1,13 @@
 package org.aspen_ddp.aspen.common.metadata
 
-import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, DataObjectState}
+import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, DataObjectState, ReadError, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.codec
+import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.byte2long
 
 import java.util.UUID
@@ -21,6 +24,71 @@ object StorageDeviceSetState:
     Codec.decode(codec.StorageDeviceSetState.parseFrom(cfg))
 
   def apply(dos: DataObjectState): StorageDeviceSetState = apply(dos.data.getByteArray)
+
+  /** Thrown when attempting to move a device into a set whose level is not 0.
+   *  Only level-0 sets hold devices. */
+  class NotLevelZero(val setId: StorageDeviceSetId)
+      extends Throwable(s"Storage device set ${setId.uuid} is not level 0")
+
+  /** Move `deviceId` from its current level-0 set into `targetSetId` (which must also be
+   *  level 0), in a single atomic transaction updating three objects: the device KV
+   *  state's `storageDeviceSet` field, the target set's `memberDevices` (device added),
+   *  and the old set's `memberDevices` (device removed).
+   *
+   *  No-op if the device is already in the target set. Fails with NoSuchElementException
+   *  if the device or a set object cannot be found, or NotLevelZero if the target set is
+   *  not level 0. The old set is updated even if it did not actually list the device
+   *  (self-healing toward the correct final state). */
+  def moveDevice(client: AspenClient,
+                 deviceId: StorageDeviceId,
+                 targetSetId: StorageDeviceSetId): Future[Unit] =
+    given ExecutionContext = client.clientContext
+
+    def prep(tx: Transaction): Future[Unit] =
+      for
+        devPtr <- client.getStorageDevicePointer(deviceId)
+        devKvos <- client.read(devPtr)
+        deviceState = StorageDeviceState(devKvos)
+        oldSetId = deviceState.storageDeviceSet
+        targetPtr <- client.getStorageDeviceSetPointer(targetSetId)
+        targetDos <- client.read(targetPtr)
+        target = StorageDeviceSetState(targetDos)
+        _ <-
+          if target.level != 0 then
+            throw new NotLevelZero(targetSetId)
+          else if oldSetId == targetSetId then
+            Future.unit
+          else
+            for
+              oldPtr <- client.getStorageDeviceSetPointer(oldSetId)
+              oldDos <- client.read(oldPtr)
+              oldSet = StorageDeviceSetState(oldDos)
+            yield
+              // Device KV state -> point at the target set
+              val newDeviceState = deviceState.copy(storageDeviceSet = targetSetId)
+              val devReqs = List(KeyRevision(StorageDeviceState.StateKey,
+                devKvos.contents(StorageDeviceState.StateKey).revision))
+              val devOps = List(Insert(StorageDeviceState.StateKey, newDeviceState.encode()))
+              tx.update(devPtr, None, None, devReqs, devOps)
+
+              // Target set -> add the device (dedup-guarded)
+              val newTarget = target.copy(
+                memberDevices = deviceId :: target.memberDevices.filter(_ != deviceId))
+              tx.overwrite(targetPtr, targetDos.revision, DataBuffer(newTarget.toBytes))
+
+              // Old set -> remove the device (self-healing if absent)
+              val newOld = oldSet.copy(
+                memberDevices = oldSet.memberDevices.filter(_ != deviceId))
+              tx.overwrite(oldPtr, oldDos.revision, DataBuffer(newOld.toBytes))
+      yield ()
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: ReadError => throw StopRetrying(e)
+      case e: NotLevelZero => throw StopRetrying(e)
+
+    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      prep(tx)
 
 /** Hierarchical grouping of physical storage, parallel to AllocationGroupState.
  *

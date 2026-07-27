@@ -1,12 +1,4 @@
 
-Add CLI command "move-device-to-set"
-  - takes device UUID and device set name or UUID
-    - Set must be tier 0
-  - In one Transaction
-    - Update device state to point to new set
-    - Update new set to point to the device
-    - Update the old device set to no longer point to the device
-
 Add CLI command "create-storage-device"
   - Arguments: host configuration file and directory
     - config file must exist and load correctly

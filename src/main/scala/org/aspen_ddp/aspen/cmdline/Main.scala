@@ -60,6 +60,7 @@ object Main {
                   bootstrapConfigFile:File=null,
                   hostName:String="",
                   storeName:String="",
+                  deviceId:String="",
                   host:String="",
                   port:Int=0,
                   newPoolName: String="",
@@ -284,6 +285,27 @@ object Main {
             action((x, c) => c.copy(newGroupName = x)),
         )
 
+      cmd("move-device-to-set").text("Moves a storage device into a different level-0 device set").
+        action((_, c) => c.copy(mode = "move-device-to-set")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<device-uuid>").text("UUID of the storage device to move").
+            action((x, c) => c.copy(deviceId = x)).
+            validate { x =>
+              try
+                UUID.fromString(x)
+                success
+              catch
+                case _: Throwable => failure("Storage device id must be a valid UUID")
+            },
+
+          arg[String]("<set-name-or-uuid>").text("Name or UUID of the target level-0 device set").
+            action((x, c) => c.copy(deviceSetName = x)),
+        )
+
       cmd("transfer-store").text("Transfers a store to a different storage device").
         action((_, c) => c.copy(mode = "transfer-store")).
         children(
@@ -465,6 +487,7 @@ object Main {
             case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
             case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
+            case "move-device-to-set" => move_device_to_set(bootstrapConfigPath, cfg.deviceId, cfg.deviceSetName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
             case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
@@ -1144,6 +1167,44 @@ object Main {
     f.onComplete:
       case scala.util.Success(_) =>
         println(s"Allocation group '$sourceGroupName' added to allocation group '$destGroupName'")
+      case scala.util.Failure(err) => reportError(err)
+
+    Await.ready(f, Duration(30, SECONDS))
+  }
+
+  def move_device_to_set(bootstrapConfigFile: os.Path,
+                         deviceIdStr: String,
+                         setRef: String): Unit = {
+
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val deviceId = StorageDeviceId(UUID.fromString(deviceIdStr))
+
+    val f = for
+      targetSetId <- resolveRef(setRef, StorageDeviceSetId(_), client.getStorageDeviceSetId)
+      _           <- client.moveDeviceToSet(deviceId, targetSetId)
+    yield ()
+
+    // getStorageDevicePointer / getStorageDeviceSetPointer / getStorageDeviceSetId throw
+    // NoSuchElementException for unknown ids/names; moveDevice throws NotLevelZero when the
+    // target set is not level 0. Translate both into precise messages.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: NoSuchElementException =>
+        println(s"Error: device '$deviceIdStr' or set '$setRef' not found")
+      case _: StorageDeviceSetState.NotLevelZero =>
+        println(s"Error: target set '$setRef' must be a level-0 (tier-0) set")
+      case e =>
+        println(s"Error moving device to set: ${e.getMessage}")
+
+    f.onComplete:
+      case scala.util.Success(_) =>
+        println(s"Device '$deviceIdStr' moved to set '$setRef'")
       case scala.util.Failure(err) => reportError(err)
 
     Await.ready(f, Duration(30, SECONDS))

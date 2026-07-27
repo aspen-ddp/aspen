@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId}
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
+import java.nio.file.{FileAlreadyExistsException, Files, Path, StandardOpenOption}
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -26,7 +26,8 @@ object StorageDeviceManager:
     extends Exception(s"$directory is not a direct child of $expectedParent")
 
   class DeviceDirectoryNotFound(val directory: Path)
-    extends Exception(s"Storage device directory does not exist: $directory")
+    extends Exception(
+      s"Storage device directory is not an existing directory (missing, not a directory, or a dangling symlink): $directory")
 
   class DeviceAlreadyConfigured(val directory: Path)
     extends Exception(s"$directory already contains ${StorageDeviceConfig.configFilename}")
@@ -56,6 +57,11 @@ object StorageDeviceManager:
    *  The directory must already exist. In production it is a mount point, or a symlink
    *  under `<host-directory>/storage-devices/` pointing at one; the config file has to land
    *  on the device itself, so this function never creates the directory.
+   *
+   *  Precondition: `hostConfig` must be the config loaded from `hostDirectory`. This is not
+   *  checked. Passing a mismatched pair registers the device to `hostConfig.hostId` while
+   *  the config file lands under a different host's `storage-devices/`, and that host will
+   *  load it -- StoreManager validates only `aspenSystemId`, never `hostId`.
    *
    *  Ordering: the transaction commits before the file is written, and the two cannot be
    *  made atomic. A crash in between leaves registered metadata with no on-disk device --
@@ -93,7 +99,17 @@ object StorageDeviceManager:
       client.createStorageDevice(hostConfig.hostId, deviceSetId).map: deviceId =>
         val cfg = StorageDeviceConfig(deviceId, aspenSystemId)
         try
-          Files.write(configFile, cfg.yamlConfig.getBytes(StandardCharsets.UTF_8))
+          // CREATE_NEW, not the default CREATE|TRUNCATE_EXISTING: a full distributed
+          // transaction separates the Files.exists guard above from this write, so a
+          // config appearing in that window must not be silently clobbered.
+          Files.write(configFile, cfg.yamlConfig.getBytes(StandardCharsets.UTF_8),
+                      StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
         catch
-          case t: Throwable => throw new ConfigWriteFailed(deviceId, configFile, t)
+          case t: FileAlreadyExistsException =>
+            // Raced with another creation; the existing file is not ours to remove.
+            throw new ConfigWriteFailed(deviceId, configFile, t)
+          case t: Throwable =>
+            // A partial write would otherwise be misreported as DeviceAlreadyConfigured on retry.
+            try Files.deleteIfExists(configFile) catch case _: Throwable => ()
+            throw new ConfigWriteFailed(deviceId, configFile, t)
         deviceId

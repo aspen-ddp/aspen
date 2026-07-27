@@ -3,16 +3,61 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceSetId}
 
+import java.io.IOException
 import java.nio.charset.StandardCharsets
-import java.nio.file.attribute.PosixFilePermissions
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.attribute.{BasicFileAttributes, PosixFilePermission, PosixFilePermissions}
+import java.nio.file.{FileVisitResult, Files, Path, Paths, SimpleFileVisitor}
 import java.util.UUID
+import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 
 class StorageDeviceManagerSuite extends IntegrationTestSuite:
 
   private val systemId = UUID.fromString("22222222-2222-2222-2222-222222222222")
   private val bootstrapSet = StorageDeviceSetId.BootstrapStorageDeviceSetId
+
+  /** Temp trees created by the current test, removed by subFixtureTeardown. */
+  private val tempRoots = mutable.ListBuffer[Path]()
+
+  /** Creates a tracked temp directory that teardown will remove. */
+  private def newTempDir(prefix: String): Path =
+    val dir = Files.createTempDirectory(prefix)
+    tempRoots += dir
+    dir
+
+  override def subFixtureTeardown(): Unit =
+    tempRoots.foreach(deleteTree)
+    tempRoots.clear()
+
+  /** Removes a tree bottom-up. Symlinks are unlinked rather than followed, and owner
+   *  write/execute is restored on the way down so the read-only device directory left by
+   *  the ConfigWriteFailed test can still be traversed and removed. */
+  private def deleteTree(root: Path): Unit =
+    try
+      Files.walkFileTree(root, new SimpleFileVisitor[Path]:
+        override def preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
+          try
+            val perms = Files.getPosixFilePermissions(dir)
+            perms.add(PosixFilePermission.OWNER_WRITE)
+            perms.add(PosixFilePermission.OWNER_EXECUTE)
+            Files.setPosixFilePermissions(dir, perms)
+          catch
+            case _: Throwable => ()
+          FileVisitResult.CONTINUE
+
+        override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
+          Files.deleteIfExists(file)
+          FileVisitResult.CONTINUE
+
+        override def visitFileFailed(file: Path, exc: IOException): FileVisitResult =
+          FileVisitResult.CONTINUE
+
+        override def postVisitDirectory(dir: Path, exc: IOException): FileVisitResult =
+          Files.deleteIfExists(dir)
+          FileVisitResult.CONTINUE
+      )
+    catch
+      case _: Throwable => ()
 
   /** A HostConfig for the TestNetwork's bootstrap host. Only hostId and aspenSystemId
    *  are consulted by createStorageDevice; the rest is filler. */
@@ -28,7 +73,7 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
 
   /** Creates `<tmp>/host/storage-devices` and returns the host directory. */
   private def newHostDir(): Path =
-    val base = Files.createTempDirectory("aspen-sdm-test")
+    val base = newTempDir("aspen-sdm-test")
     val hostDir = base.resolve("host")
     Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
     hostDir
@@ -67,7 +112,7 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
   atest("rejects an absolute device name"):
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
-    val elsewhere = Files.createTempDirectory("aspen-elsewhere")
+    val elsewhere = newTempDir("aspen-elsewhere")
     val dir = StorageDeviceManager.deviceDirectory(hostDir, elsewhere.toString)
     recoverToSucceededIf[StorageDeviceManager.DeviceDirectoryNotUnderHost](
       StorageDeviceManager.createStorageDevice(
@@ -114,7 +159,7 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
   atest("accepts a symlink under storage-devices and writes the config through it"):
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
-    val elsewhere = Files.createTempDirectory("aspen-real-device")
+    val elsewhere = newTempDir("aspen-real-device")
     val link = hostDir.resolve(StorageDeviceManager.StorageDevicesDirName).resolve("dev2")
     Files.createSymbolicLink(link, elsewhere)
     for
@@ -134,10 +179,12 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-xr-xr-x"))
     // A process running as root can still write to a read-only directory.
     assume(!Files.isWritable(dir))
-    StorageDeviceManager
-      .createStorageDevice(client, hostConfig(), hostDir, dir, bootstrapSet, systemId)
-      .failed
-      .map: err =>
-        err shouldBe a[StorageDeviceManager.ConfigWriteFailed]
-        val cwf = err.asInstanceOf[StorageDeviceManager.ConfigWriteFailed]
-        err.getMessage should include(cwf.storageDeviceId.uuid.toString)
+    recoverToExceptionIf[StorageDeviceManager.ConfigWriteFailed](
+      StorageDeviceManager.createStorageDevice(
+        client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
+      .flatMap: err =>
+        err.getMessage should include(err.storageDeviceId.uuid.toString)
+        // The device really was registered -- that is what makes the id actionable.
+        waitForTransactionsToComplete().flatMap: _ =>
+          client.getStorageDeviceState(err.storageDeviceId).map: ds =>
+            ds.hostId should be(HostId.BootstrapHostId)

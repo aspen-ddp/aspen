@@ -152,7 +152,7 @@ object Main {
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
             validate( x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x")),
 
-          arg[File]("<hoste-directory>").text("Host Directory").
+          arg[File]("<host-directory>").text("Host Directory").
             action( (x, c) => c.copy(hostDirectory=x)).
             validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
         )
@@ -764,7 +764,7 @@ object Main {
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
 
-    val cfgFile = hostDir.resolve("aspen-host-config.yaml")
+    val cfgFile = hostDir.resolve(HostConfig.configFilename)
 
     if ! Files.exists(cfgFile) then
       throw Exception(s"Host config file not found: $cfgFile")

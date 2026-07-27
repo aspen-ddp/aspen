@@ -848,7 +848,7 @@ object Main {
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
 
-    val storageDevicesDir = hostDirectory.resolve("storage-devices")
+    val storageDevicesDir = hostDirectory.resolve(StorageDeviceManager.StorageDevicesDirName)
     val bootstrapDevDir = storageDevicesDir.resolve("bootstrap-device")
 
     Files.createDirectories(hostDirectory)

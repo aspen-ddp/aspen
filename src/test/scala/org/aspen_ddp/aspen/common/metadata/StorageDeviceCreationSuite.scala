@@ -77,8 +77,9 @@ class StorageDeviceCreationSuite extends IntegrationTestSuite:
       l1After   <- client.getStorageDeviceSetState(level1Id)
     yield
       err shouldBe a[StorageDeviceSetState.NotLevelZero]
-      // The rejected attempt must leave no residue: the level check runs before any object
-      // update is staged, so nothing commits.
+      // The rejected attempt must leave no residue. The allocation and tree insert are
+      // already staged when the level check throws, so this holds because transact
+      // invalidates the transaction on failure, not because nothing was staged.
       hsAfter.storageDevices should be(hsBefore.storageDevices)
       setAfter.memberDevices should be(setBefore.memberDevices)
       l1After.memberDevices should be(Nil)

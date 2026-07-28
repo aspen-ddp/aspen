@@ -81,6 +81,7 @@ object BaseReadDriverSuite {
 
     def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] = ???
     def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId] = ???
+    def createStorageDevice(hostId: HostId, deviceSetId: StorageDeviceSetId): Future[StorageDeviceId] = ???
 
     val retryStrategy: RetryStrategy = null
 

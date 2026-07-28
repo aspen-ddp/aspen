@@ -10,12 +10,17 @@ import java.io.{File, FileInputStream}
 import java.util.UUID
 
 /*
-hostState-id: 00000000-0000-0000-0000-000000000000
-name: bootstrap-hostState
+host-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000
+name: bootstrap-host
+address: 127.0.0.1
 data-port: 4750
 cnc-port: 4751
 store-transfer-port: 4752
+crl:
+  storage-engine: simple-crl
+  num-streams: 3
+  max-file-size-mb: 300
 */
 case class HostConfig(hostId: HostId,
                       aspenSystemId: UUID,
@@ -26,7 +31,7 @@ case class HostConfig(hostId: HostId,
                       storeTransferPort: Int,
                       crl: HostConfig.CRLBackend):
   def yamlConfig: String =
-    val base = s"""hostState-id: $hostId
+    val base = s"""host-id: ${hostId.uuid}
        |aspen-system-id: $aspenSystemId
        |name: $name
        |address: $address
@@ -48,7 +53,7 @@ case class HostConfig(hostId: HostId,
 
 object HostConfig extends YObject[HostConfig]:
 
-  val configFilename = "aspen-hostState-config.yaml"
+  val configFilename = "aspen-host-config.yaml"
 
   sealed abstract class CRLBackend
 
@@ -64,7 +69,7 @@ object HostConfig extends YObject[HostConfig]:
       numStreams.get(o).getOrElse(3),
       fileSize.get(o).getOrElse(300))
 
-  val hostId: Required[HostId]         = Required("hostState-id", HostId.YHostId)
+  val hostId: Required[HostId]         = Required("host-id", HostId.YHostId)
   val aspenSystemId: Required[UUID]    = Required("aspen-system-id", YUUID)
   val name: Required[String]           = Required("name", YString)
   val address: Required[String]        = Required("address", YString)

@@ -103,7 +103,7 @@ class StoreManager(val client: AspenClient,
   protected var shutdownCalled = false
   private val shutdownPromise: Promise[Unit] = Promise()
 
-  val storageDevicesDir: Path = rootDir.resolve("storage-devices")
+  val storageDevicesDir: Path = rootDir.resolve(StorageDeviceManager.StorageDevicesDirName)
 
   protected var storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
   protected var stores: Map[StoreId, Store] = Map()

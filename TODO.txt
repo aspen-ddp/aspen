@@ -1,20 +1,4 @@
 
-Add CLI command "create-storage-device"
-  - Arguments: host configuration file and directory
-    - config file must exist and load correctly
-    - directory must exist and not contain a storage device config file
-  - Add aspen.server.StorageDeviceManager
-    - object contains createStorageDevice(hostId, deviceSetId, directoryName): Future[Unit]
-      - Generates a UUID for the new device
-      - transactUntilSuccessful:
-        - create new StorageDeviceState object
-        - Update HostState to include the new device
-        - Update StorageDeviceSetState to include the new device
-      - Create the StorageDeviceConfig file in the target directory
-  - cli command implemented in terms of above function.
-    - StoreManager will eventually need to automate the device creation process so we'll want to
-      minimize the logic going into the cli code
-
 Reassignment of a pool to a new set:
   - MigratePoolToSetDurableTask
     - register with system task executor at time of creation

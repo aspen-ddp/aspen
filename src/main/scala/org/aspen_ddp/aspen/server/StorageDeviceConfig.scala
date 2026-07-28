@@ -10,11 +10,12 @@ import java.util.UUID
 
 /*
 storage-device-id: 00000000-0000-0000-0000-000000000000
+aspen-system-id: 00000000-0000-0000-0000-000000000000
 */
 case class StorageDeviceConfig(storageDeviceId: StorageDeviceId,
                                aspenSystemId: UUID):
   def yamlConfig: String =
-    s"""storage-device-id: $storageDeviceId
+    s"""storage-device-id: ${storageDeviceId.uuid}
        |aspen-system-id: $aspenSystemId
        |""".stripMargin
 

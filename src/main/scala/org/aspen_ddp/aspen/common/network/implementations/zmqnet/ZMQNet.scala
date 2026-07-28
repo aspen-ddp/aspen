@@ -80,7 +80,7 @@ object ZMQNet:
 
 class ZMQNet(val bootstrapConfigFile: os.Path,
              val oclientId: Option[ClientId],
-             val ohostNode: Option[(HostId, Int)],
+             val ohost: Option[(HostId, Int)],
              val heartbeatPeriod: Duration,
              val messageHandler: MessageHandler) extends Logging:
 
@@ -106,7 +106,7 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
 
   private val sendQueuePollItem = new PollItem(sendQueueSocket, ZMQ.Poller.POLLIN)
 
-  private val orouterSocket = ohostNode.map: (_, port) =>
+  private val orouterSocket = ohost.map: (_, port) =>
     val router = context.createSocket(SocketType.ROUTER)
     router.bind(s"tcp://*:$port")
     router
@@ -114,7 +114,7 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
   private val orouterPollItem = orouterSocket.map: router =>
     new PollItem(router, ZMQ.Poller.POLLIN)
 
-  private val oheartbeatMessage = ohostNode.map: (hostId, _) =>
+  private val oheartbeatMessage = ohost.map: (hostId, _) =>
     ProtobufMessageCodec.encodeHeartbeat(HostHeartbeat(hostId))
 
   private val networkImpl = new MetadataManager.NetworkImplInterface[ZMQHostEntry]:

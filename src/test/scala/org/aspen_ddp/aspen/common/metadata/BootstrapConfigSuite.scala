@@ -76,9 +76,11 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       store3 -> hostId3
     )
 
+    // Four stores across three hosts: the store count matches the width, the host count
+    // deliberately does not.
     val yaml = BootstrapConfig.generateBootstrapConfig(
       systemId,
-      Replication(3, 2),
+      Replication(4, 2),
       List(host1, host2, host3),
       storeMap)
 
@@ -88,7 +90,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       val cfg = BootstrapConfig.loadBootstrapConfig(f.toFile)
 
       cfg.aspenSystemId should be(systemId)
-      cfg.bootstrapIDA should be(Replication(3, 2))
+      cfg.bootstrapIDA should be(Replication(4, 2))
       cfg.hosts.length should be(3)
 
       val h1 = cfg.hosts(0)
@@ -157,7 +159,37 @@ bootstrap-hosts:
     finally
       Files.deleteIfExists(f)
 
-  test("loadBootstrapConfig rejects config with host count mismatch"):
+  test("loadBootstrapConfig accepts every bootstrap store on a single host"):
+    // This is what "./t bootstrap <dir> replication 2 3 3" produces: one host, three stores.
+    val singleHostYaml = """aspen-system-id: 22222222-2222-2222-2222-222222222222
+bootstrap-ida:
+  type: replication
+  write-threshold: 2
+  width: 3
+bootstrap-hosts:
+  - host-id: 11111111-1111-1111-1111-111111111111
+    name: bootstrap-host
+    address: 127.0.0.1
+    data-port: 4750
+    cnc-port: 4751
+    store-transfer-port: 4752
+    stores:
+      - 00000000-0000-0000-0000-000000000000:0
+      - 00000000-0000-0000-0000-000000000000:1
+      - 00000000-0000-0000-0000-000000000000:2
+"""
+
+    val f = Files.createTempFile("aspen-bootstrap-single-host", ".yaml")
+    try
+      Files.write(f, singleHostYaml.getBytes(StandardCharsets.UTF_8))
+      val cfg = BootstrapConfig.loadBootstrapConfig(f.toFile)
+
+      cfg.hosts.length should be(1)
+      cfg.hosts.head.stores.length should be(3)
+    finally
+      Files.deleteIfExists(f)
+
+  test("loadBootstrapConfig rejects config with store count mismatch"):
     val mismatchYaml = """aspen-system-id: 22222222-2222-2222-2222-222222222222
 bootstrap-ida:
   type: replication
@@ -187,6 +219,6 @@ bootstrap-hosts:
       Files.write(f, mismatchYaml.getBytes(StandardCharsets.UTF_8))
       val ex = intercept[FormatError]:
         BootstrapConfig.loadBootstrapConfig(f.toFile)
-      ex.getMessage should include("Number of hosts must exactly match the Bootstrap IDA width")
+      ex.getMessage should include("Number of bootstrap stores (2) must exactly match the Bootstrap IDA width (3)")
     finally
       Files.deleteIfExists(f)

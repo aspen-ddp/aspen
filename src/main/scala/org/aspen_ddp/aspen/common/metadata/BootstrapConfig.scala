@@ -92,9 +92,15 @@ object BootstrapConfig:
     )
 
   case class Config(aspenSystemId: UUID, bootstrapIDA: IDA, hosts: List[BootstrapHost]):
-    // Validate config
-    if hosts.length != bootstrapIDA.width then
-      throw new FormatError("Number of hosts must exactly match the Bootstrap IDA width")
+    // Validate config. The bootstrap pool has exactly one store per IDA element, but those
+    // stores may sit on any number of hosts: a freshly bootstrapped system puts all of them
+    // on the single bootstrap host and they spread out from there as hosts are added. So it
+    // is the store count, not the host count, that must match the width.
+    private val storeCount: Int = hosts.map(_.stores.length).sum
+
+    if storeCount != bootstrapIDA.width then
+      throw new FormatError(s"Number of bootstrap stores ($storeCount) must exactly match " +
+                            s"the Bootstrap IDA width (${bootstrapIDA.width})")
 
   object Config extends YObject[Config]:
     val aspenSystemId: Required[UUID]        = Required("aspen-system-id", YUUID)

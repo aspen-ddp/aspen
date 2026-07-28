@@ -28,12 +28,6 @@ Decouple AspenClient and BaseReadDriver
   - Use pluggable trait that has just the methods BaseReadDriver needs
   - Test implementation & "real" one backed by AspenClient
 
-Update bootstrap CLI to generate HostConfig and BootstrapConfig files in the host directory
-
-Remove bootstrap config file argument from the host CLI command
-  - It must exist in host directory with standard name
-  = Allows it to be updated as the bootstrap pool changes
-
 Add required IP/dns-name argument to bootstrap CLI command
   - Needed when adding hosts. They'll need to be able to connect to the boostrap-host
     for adding HostState, Devices, and handling store transfers

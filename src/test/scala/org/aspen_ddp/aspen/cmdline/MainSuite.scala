@@ -8,13 +8,36 @@ import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.server.HostConfig
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.{FileVisitResult, Files, Path, SimpleFileVisitor}
 import java.util.UUID
+import scala.collection.mutable
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.{Duration, SECONDS}
 
 class MainSuite extends AnyFunSuite with Matchers:
+
+  /** Temp trees created by the current test, removed by withTempDir. */
+  private def withTempDir[T](prefix: String)(fn: Path => T): T =
+    val dir = Files.createTempDirectory(prefix)
+    try
+      fn(dir)
+    finally
+      deleteTree(dir)
+
+  private def deleteTree(root: Path): Unit =
+    Files.walkFileTree(root, new SimpleFileVisitor[Path]:
+      override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
+        Files.deleteIfExists(file)
+        FileVisitResult.CONTINUE
+
+      override def postVisitDirectory(dir: Path, err: java.io.IOException): FileVisitResult =
+        Files.deleteIfExists(dir)
+        FileVisitResult.CONTINUE
+    )
 
   test("formatBytes renders sub-KiB values as integer bytes"):
     Main.formatBytes(0L) shouldBe "0 B"
@@ -158,3 +181,29 @@ class MainSuite extends AnyFunSuite with Matchers:
     val out = Main.formatAllocationGroupState(s)
     out should include ("Members: none")
     out should include ("Parent Groups: none")
+
+  // The host command reads both files out of the host directory rather than taking the
+  // bootstrap config on the command line, so bootstrap must leave both of them behind.
+  test("bootstrap writes host and bootstrap config files into the host directory"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      Main.bootstrap(Replication(3, 2), tmp, 4750, 4751, 4752) shouldBe 0
+
+      val hostDir = tmp.resolve("bootstrap-host")
+
+      val hostCfg = HostConfig.loadHostConfig(
+        hostDir.resolve(HostConfig.configFilename).toFile)
+
+      val bsCfg = BootstrapConfig.loadBootstrapConfig(
+        hostDir.resolve(BootstrapConfig.configFilename).toFile)
+
+      bsCfg.aspenSystemId shouldBe hostCfg.aspenSystemId
+      bsCfg.bootstrapIDA shouldBe Replication(3, 2)
+      bsCfg.hosts.map(_.hostId) shouldBe List(hostCfg.hostId)
+
+      val bsHost = bsCfg.hosts.head
+      bsHost.name shouldBe hostCfg.name
+      bsHost.address shouldBe hostCfg.address
+      bsHost.dataPort shouldBe hostCfg.dataPort
+      bsHost.cncPort shouldBe hostCfg.cncPort
+      bsHost.storeTransferPort shouldBe hostCfg.storeTransferPort
+      bsHost.stores shouldBe (0 until 3).map(i => StoreId(PoolId.BootstrapPoolId, i.toByte)).toList

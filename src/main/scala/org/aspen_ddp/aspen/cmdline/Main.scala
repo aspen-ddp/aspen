@@ -213,10 +213,8 @@ object Main {
       cmd("host").text("Starts an Amoeba Storage Host").
         action( (_,c) => c.copy(mode="host")).
         children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action( (x, c) => c.copy(bootstrapConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x")),
-
+          // No bootstrap config argument: the host reads it from its own directory so that
+          // MetadataManager can keep the file up to date as the bootstrap pool moves.
           arg[File]("<host-directory>").text("Host Directory").
             action( (x, c) => c.copy(hostDirectory=x)).
             validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
@@ -582,7 +580,7 @@ object Main {
           cfg.mode match
             case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory.toPath, cfg.dataPort,
                                           cfg.cncPort, cfg.storeTransferPort)
-            case "host" => host(bootstrapConfig, bootstrapConfigPath, cfg.hostDirectory.toPath)
+            case "host" => host(cfg.hostDirectory.toPath)
             case "amoeba" => amoeba_server(bootstrapConfigPath)
             // OBSOLETE: see the commented-out "debug" and "rebuild" parser entries above.
             //case "debug" => run_debug_code(bootstrapConfigPath)
@@ -890,25 +888,35 @@ object Main {
         }
 
 
-  def host(bootstrapCfg: BootstrapConfig.Config,
-           bootstrapConfigFile: os.Path,
-           hostDir: Path): Int = {
+  def host(hostDir: Path): Int = {
 
     val sched = Executors.newScheduledThreadPool(3)
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
 
-    val cfgFile = hostDir.resolve(HostConfig.configFilename)
+    // Absolute: os.Path rejects relative paths and <host-directory> is usually given as one.
+    val absHostDir = hostDir.toAbsolutePath
+
+    val cfgFile = absHostDir.resolve(HostConfig.configFilename)
 
     if ! Files.exists(cfgFile) then
       throw Exception(s"Host config file not found: $cfgFile")
 
     val hostCfg = HostConfig.loadHostConfig(cfgFile.toFile)
+
+    val bsCfgFile = absHostDir.resolve(BootstrapConfig.configFilename)
+
+    if ! Files.exists(bsCfgFile) then
+      throw Exception(s"Bootstrap config file not found: $bsCfgFile")
+
+    val bootstrapCfg = BootstrapConfig.loadBootstrapConfig(bsCfgFile.toFile)
+    val bootstrapConfigFile = os.Path(bsCfgFile)
+
     configureLogging()
 
     val simpleCrl = hostCfg.crl match {
       case b: HostConfig.SimpleCRL =>
-        val crlRoot = hostDir.resolve("crl")
+        val crlRoot = absHostDir.resolve("crl")
         if ! Files.exists(crlRoot) then
           mkdirectory(crlRoot)
         SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024)
@@ -937,7 +945,7 @@ object Main {
       client,
       hostCfg.hostId,
       bootstrapCfg.aspenSystemId,
-      hostDir,
+      absHostDir,
       ec,
       objectCacheFactory,
       nodeNet,
@@ -1054,6 +1062,19 @@ object Main {
       hostConfig.cncPort,
       hostConfig.storeTransferPort,
       Set(storageDevConfig.storageDeviceId)
+    )
+
+    // The bootstrap config lives with the host it describes rather than being handed to the
+    // host process on the command line: MetadataManager rewrites this file in place as the
+    // bootstrap pool moves.
+    Files.write(
+      hostDirectory.resolve(BootstrapConfig.configFilename),
+      BootstrapConfig.generateBootstrapConfig(
+        aspenSystemId = aspenSystemId,
+        ida = bootstrapIda,
+        hostStates = List(bootstrapHost),
+        storeMap = bootstrapStores.map(backend => backend.storeId -> hostConfig.hostId).toList
+      ).getBytes(StandardCharsets.UTF_8)
     )
 
     val radicle = Bootstrap.initialize(

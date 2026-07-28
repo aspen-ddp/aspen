@@ -87,33 +87,31 @@ its section of the [Project Homepage](https://aspen-ddp.org)
 ## How to run the AmoebaFS NFS server demo
 
 ### Setup
-1. Run `sbt compile`
-2. Copy t.template to t
-3. Run sbt without any options to enter its cli
-4. Run `export runtime:fullClasspath` to generate the full classpath needed to run the compiled code
-5. exit sbt
-5. Update the 't' file with the generated CLASSPATH and set the JAVA_HOME directory to your installed JDK location
+1. Ensure JAVA_HOME is set correctly
+2. Run `sbt compile`
 
 ### Execution
-Run the following command to generate and initialize 3 nodes. This will create and
-populate a state folder in the `demo` directory for each node.
+Run the following command to create a new Aspen system under `/tmp/aspen-test`. The
+arguments after the target directory are the bootstrap pool's IDA: type, read threshold,
+write threshold, and width. This creates `/tmp/aspen-test/bootstrap-host`, containing the
+host's configuration, its storage devices, and the three bootstrap data stores.
 ```
-./t bootstrap demo/bootstrap_config.yaml
-```
-
-In three separate terminals, execute each of the node server processes:
-```
-./t node demo/bootstrap_config.yaml demo/node_a.yaml
-./t node demo/bootstrap_config.yaml demo/node_b.yaml
-./t node demo/bootstrap_config.yaml demo/node_c.yaml
+./t bootstrap /tmp/aspen-test replication 2 3 3
 ```
 
-In a fourth terminal, run the following command to launch the AmoebaFS NFS server process.
+The host directory is self-describing: bootstrap writes both `aspen-host-config.yaml` and
+`aspen-bootstrap-config.yaml` into it, so starting the storage host needs nothing more than
+the directory itself.
+```
+./t host /tmp/aspen-test/bootstrap-host
+```
+
+In a second terminal, run the following command to launch the AmoebaFS NFS server process.
 Note that on MacOS you need to first run `sudo launchctl start com.apple.rpcbind` to allow 
 the NFS server to register with the local RPC daemon. On Linux, ensure you have the 
 rpcbind service running.
 ```
-./t nfs demo/bootstrap_config.yaml demo/log4j-conf.xml
+./t nfs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml
 ```
 
 To attach a client to the NFS server, run the following on the client machine:

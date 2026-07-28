@@ -569,7 +569,12 @@ object Main {
     val sched = Executors.newScheduledThreadPool(3)
     val ec: ExecutionContext = ExecutionContext.fromExecutorService(sched)
 
+    // Supplied offline because the bootstrap pool's own configuration object cannot be read
+    // without it. See SimpleAspenClient.resolveIda.
+    val bootstrapIda = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).bootstrapIDA
+
     val ret = (new SimpleAspenClient(nnet.clientMessenger, nnet.clientId, ec, Radicle.pointer,
+      bootstrapIda,
       txStatusCacheDuration,
       initialReadDelay,
       maxReadDelay,

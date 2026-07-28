@@ -257,8 +257,11 @@ abstract class BaseAspenClient(
         setPtr   <- getStorageDeviceSetPointer(deviceSetId)
         setDos   <- read(setPtr)
       yield
-        // Validate before staging any object updates, so a rejected request leaves the
-        // transaction empty rather than relying on invalidation to unwind partial staging.
+        // Updates are already staged by the time this runs: allocateKeyValueObject issued
+        // the new object's update and setRefcount, and preparePut staged its tree insert.
+        // Throwing below therefore rejects a partially staged transaction, which is safe
+        // because the throw fails this future before the yield completes and transact
+        // invalidates the transaction on failure, discarding everything staged.
         val setState = StorageDeviceSetState(setDos)
 
         if setState.level != 0 then

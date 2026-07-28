@@ -11,11 +11,16 @@ import java.util.UUID
 
 /*
 host-id: 00000000-0000-0000-0000-000000000000
-name: bootstrap-host
 aspen-system-id: 00000000-0000-0000-0000-000000000000
+name: bootstrap-host
+address: 127.0.0.1
 data-port: 4750
 cnc-port: 4751
 store-transfer-port: 4752
+crl:
+  storage-engine: simple-crl
+  num-streams: 3
+  max-file-size-mb: 300
 */
 case class HostConfig(hostId: HostId,
                       aspenSystemId: UUID,

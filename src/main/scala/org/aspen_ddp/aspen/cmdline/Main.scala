@@ -1322,6 +1322,11 @@ object Main {
       f.onComplete:
         case scala.util.Success(deviceId) =>
           println(s"Created storage device ${deviceId.uuid} at $deviceDirectory")
+          // StoreManager scans storage-devices/ only in its constructor; the periodic
+          // CheckAllDevices event iterates already-loaded devices and never rescans. A
+          // running host therefore ignores the new device, and any pool created on it
+          // before the restart has its stores marked offline rather than instantiated.
+          println(s"Restart host '${hostCfg.name}' to bring the device online -- a running host does not detect new storage devices.")
         case scala.util.Failure(err) => reportError(err)
 
       Await.ready(f, Duration(30, SECONDS))

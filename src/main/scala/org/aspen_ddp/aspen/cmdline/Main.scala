@@ -36,12 +36,13 @@ import org.dcache.nfs.v4.xdr.nfs4_prot
 import org.dcache.nfs.v4.{MDSOperationExecutor, NFSServerV41}
 import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
+import scopt.OptionDef
 import scribe.Logging
 import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, mdc, messages, methodName}
 
 import java.io.{File, StringReader}
 import java.nio.charset.StandardCharsets
-import java.nio.file.{FileAlreadyExistsException, Files, Path, Paths}
+import java.nio.file.{FileAlreadyExistsException, Files, Path}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeoutException}
@@ -56,8 +57,15 @@ object Main {
 
   val AmoebafsKey: Key = Key("amoeba")
 
+  // Default listening ports for a newly created host. Shared by every subcommand that
+  // creates one so the ports a host is given do not depend on which command created it.
+  val DefaultDataPort: Int = 4750
+  val DefaultCnCPort: Int = 4751
+  val DefaultStoreTransferPort: Int = 4752
+
   case class Args(mode:String="",
                   hostDirectory:File=null,
+                  targetDirectory:File=null,
                   bootstrapConfigFile:File=null,
                   hostName:String="",
                   storeName:String="",
@@ -65,6 +73,9 @@ object Main {
                   deviceName:String="",
                   host:String="",
                   port:Int=0,
+                  dataPort:Int=DefaultDataPort,
+                  cncPort:Int=DefaultCnCPort,
+                  storeTransferPort:Int=DefaultStoreTransferPort,
                   newPoolName: String="",
                   idaType: String="",
                   width:Int=0,
@@ -130,9 +141,44 @@ object Main {
     val parser = new scopt.OptionParser[Args]("demo") {
       head("demo", "0.1")
 
+      val validPort = (p: Int) =>
+        if p >= 1 && p <= 65535 then success else failure(s"Port must be between 1 and 65535: $p")
+
+      // The listening ports of a host being created. Shared by every subcommand that creates
+      // one. This must be a def rather than a val: scopt records the owning command on each
+      // OptionDef, so every subcommand needs its own instances.
+      def portOptions: List[OptionDef[?, Args]] = List(
+        opt[Int]("data-port").valueName("<port>").
+          text(s"Port for client/store data traffic (default: $DefaultDataPort)").
+          validate(validPort).
+          action((x, c) => c.copy(dataPort = x)),
+
+        opt[Int]("cnc-port").valueName("<port>").
+          text(s"Port for command-and-control messages (default: $DefaultCnCPort)").
+          validate(validPort).
+          action((x, c) => c.copy(cncPort = x)),
+
+        opt[Int]("store-transfer-port").valueName("<port>").
+          text(s"Port for store transfers (default: $DefaultStoreTransferPort)").
+          validate(validPort).
+          action((x, c) => c.copy(storeTransferPort = x)),
+      )
+
       cmd("bootstrap").text("Bootstrap a new Amoeba system").
         action( (_,c) => c.copy(mode="bootstrap")).
         children(
+          // Unlike every other directory argument in this parser, the target is not required
+          // to exist: bootstrap creates it. Bootstrapping over an existing system is caught
+          // later by the bootstrap-host check in bootstrap() itself.
+          arg[File]("<target-directory>").text("Directory the bootstrap host and its stores are created under").
+            action((x, c) => c.copy(targetDirectory = x)).
+            validate { x =>
+              if !x.exists() || x.isDirectory then
+                success
+              else
+                failure(s"Not a directory: $x")
+            },
+
           arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
             action((x, c) => c.copy(idaType = x.toLowerCase())).
             validate { x =>
@@ -151,7 +197,8 @@ object Main {
 
           arg[Int]("<width>").text("Number of hosts holding slices/replicas").
             action((x, c) => c.copy(width = x)),
-        )
+        ).
+        children(portOptions*)
 
       // OBSOLETE: the "debug" command is defunct and needs rework before it can be
       // re-enabled. run_debug_code is retained for reference but is not reachable.
@@ -511,7 +558,14 @@ object Main {
             action((x, c) => c.copy(entityRef = x)),
         )
 
-      checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
+      checkConfig { c =>
+        if c.mode == "" then
+          failure("Invalid command")
+        else if Set(c.dataPort, c.cncPort, c.storeTransferPort).size != 3 then
+          failure("data-port, cnc-port, and store-transfer-port must all be different")
+        else
+          success
+      }
     }
 
     val exitCode = parser.parse(args, Args()) match
@@ -526,7 +580,8 @@ object Main {
         try
           //println(s"Config file: $config")
           cfg.mode match
-            case "bootstrap" => bootstrap(createIDA(cfg), Paths.get("demo"), 4750, 4751, 4752)
+            case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory.toPath, cfg.dataPort,
+                                          cfg.cncPort, cfg.storeTransferPort)
             case "host" => host(bootstrapConfig, bootstrapConfigPath, cfg.hostDirectory.toPath)
             case "amoeba" => amoeba_server(bootstrapConfigPath)
             // OBSOLETE: see the commented-out "debug" and "rebuild" parser entries above.
@@ -917,7 +972,7 @@ object Main {
   }
 
   def bootstrap(bootstrapIda: IDA,
-                baseDirectory: Path, // "demo" directory
+                baseDirectory: Path, // created if it does not already exist
                 dataPort: Int,
                 cncPort: Int,
                 storeTransferPort: Int): Int = {

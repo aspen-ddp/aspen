@@ -27,6 +27,8 @@ bootstrap-hosts:
 
 object BootstrapConfig:
 
+  val configFilename = "aspen-bootstrap-config.yaml"
+
   object ReplicationFormat extends YObject[IDA]:
     val readThreshold: Optional[Int]  = Optional("read-threshold", YInt)
     val writeThreshold: Required[Int] = Required("write-threshold", YInt)

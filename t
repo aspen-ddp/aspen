@@ -82,31 +82,9 @@ then
   sbt compile || exit 1
 fi
 
-if [[ ${1:-} == "bootstrap" ]]
-then
-  sbt compile || exit 1
-
-  rm -rf demo/node_a
-  rm -rf demo/node_b
-  rm -rf demo/node_c
-fi
-
 "$JAVA_BIN" -cp "$CLASSPATH" org.aspen_ddp.aspen.cmdline.Main "$@"
 
 rc=$?
-
-if [[ ${1:-} == "bootstrap" && $rc -eq 0 ]]
-then
-
-  mkdir -p demo/node_a/stores
-  mkdir -p demo/node_b/stores
-  mkdir -p demo/node_c/stores
-
-  mv demo/bootstrap/00000000-0000-0000-0000-000000000000:0 demo/node_a/stores
-  mv demo/bootstrap/00000000-0000-0000-0000-000000000000:1 demo/node_b/stores
-  mv demo/bootstrap/00000000-0000-0000-0000-000000000000:2 demo/node_c/stores
-
-fi
 
 # Propagate the CLI's exit status. Without this the script's status is that of the trailing
 # "if", which is 0 whenever the condition is false -- masking every command failure.

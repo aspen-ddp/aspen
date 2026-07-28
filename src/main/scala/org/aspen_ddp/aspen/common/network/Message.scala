@@ -153,7 +153,7 @@ final case class TransactionFinalized(
   override def toString: String = f"TransactionFinalized to $toClient from $fromStore tx $transactionId committed $committed"
 
 /**
- * Sent in response to a transaction message if the recipient does not hostState the
+ * Sent in response to a transaction message if the recipient does not host the
  * store. Usually this will be due to the store having been transferred to a new
  * machine and the TransactionDriver is using the old, cached value.
  *

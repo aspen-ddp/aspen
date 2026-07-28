@@ -21,7 +21,7 @@ import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, YamlFormat}
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, DaemonThreads, YamlFormat}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
@@ -44,10 +44,11 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{FileAlreadyExistsException, Files, Path, Paths}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import java.util.concurrent.Executors
+import java.util.concurrent.{Executors, TimeoutException}
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.{Duration, HOURS, MILLISECONDS, SECONDS}
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
+import scala.util.{Failure, Success, Try}
 import scala.language.implicitConversions
 
 
@@ -111,6 +112,20 @@ object Main {
       .withHandler(formatter = logFormat, minimumLevel = Some(scribe.Level.Trace))
       .replace()
 
+  /** Awaits `f` and then runs `report` on the calling thread.
+   *
+   * Reporting on this thread rather than in an onComplete callback matters because all of
+   * Aspen's worker threads are daemon threads: as soon as a command returns, the process
+   * exits and anything still queued on the client's ExecutionContext is lost.
+   *
+   * Returns the process exit code: 0 if the future succeeded, 1 if it failed.
+   */
+  private def awaitAndReport[T](f: Future[T], timeout: Duration = Duration(30, SECONDS))
+                               (report: Try[T] => Unit): Int =
+    val result = Await.ready(f, timeout).value.get
+    report(result)
+    if result.isSuccess then 0 else 1
+
   def main(args: Array[String]): Unit = {
     val parser = new scopt.OptionParser[Args]("demo") {
       head("demo", "0.1")
@@ -138,13 +153,15 @@ object Main {
             action((x, c) => c.copy(width = x)),
         )
 
-      cmd("debug").text("Runs debugging code").
-        action((_, c) => c.copy(mode = "debug")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
-        )
+      // OBSOLETE: the "debug" command is defunct and needs rework before it can be
+      // re-enabled. run_debug_code is retained for reference but is not reachable.
+      //cmd("debug").text("Runs debugging code").
+      //  action((_, c) => c.copy(mode = "debug")).
+      //  children(
+      //    arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+      //      action((x, c) => c.copy(bootstrapConfigFile = x)).
+      //      validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
+      //  )
 
       cmd("host").text("Starts an Amoeba Storage Host").
         action( (_,c) => c.copy(mode="host")).
@@ -166,28 +183,31 @@ object Main {
             validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x"))
         )
 
-      cmd("rebuild").text("Rebuilds a store").
-        action( (_,c) => c.copy(mode="rebuild")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action( (x, c) => c.copy(bootstrapConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<store-identifier>").text("Data Store Identifier. Format is \"pool-uuid:storeNumber\"").
-            action((x,c) => c.copy(storeName=x)).
-            validate { x =>
-              val arr = x.split(":")
-              if (arr.length == 2) {
-                try {
-                  Integer.parseInt(arr(1))
-                  success
-                } catch {
-                  case _: Throwable => failure("Store name must match the format \"pool-name:storeNumber\"")
-                }
-              }
-              else failure("Store name must match the format \"pool-name:storeNumber\"")
-            }
-        )
+      // OBSOLETE: the "rebuild" command is defunct -- it hardcodes the demo bootstrap-host
+      // device path and needs rework before it can be re-enabled. The rebuild function is
+      // retained for reference but is not reachable.
+      //cmd("rebuild").text("Rebuilds a store").
+      //  action( (_,c) => c.copy(mode="rebuild")).
+      //  children(
+      //    arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+      //      action( (x, c) => c.copy(bootstrapConfigFile=x)).
+      //      validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+      //
+      //    arg[String]("<store-identifier>").text("Data Store Identifier. Format is \"pool-uuid:storeNumber\"").
+      //      action((x,c) => c.copy(storeName=x)).
+      //      validate { x =>
+      //        val arr = x.split(":")
+      //        if (arr.length == 2) {
+      //          try {
+      //            Integer.parseInt(arr(1))
+      //            success
+      //          } catch {
+      //            case _: Throwable => failure("Store name must match the format \"pool-name:storeNumber\"")
+      //          }
+      //        }
+      //        else failure("Store name must match the format \"pool-name:storeNumber\"")
+      //      }
+      //  )
 
       cmd("create-pool").text("Creates a new storage pool").
         action((_, c) => c.copy(mode = "create-pool")).
@@ -494,7 +514,7 @@ object Main {
       checkConfig( c => if (c.mode == "") failure("Invalid command") else success )
     }
 
-    parser.parse(args, Args()) match
+    val exitCode = parser.parse(args, Args()) match
       case Some(cfg) =>
         def bootstrapConfig: BootstrapConfig.Config =
           println(s"Loading BootstrapConfig ${cfg.bootstrapConfigFile}")
@@ -509,8 +529,9 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), Paths.get("demo"), 4750, 4751, 4752)
             case "host" => host(bootstrapConfig, bootstrapConfigPath, cfg.hostDirectory.toPath)
             case "amoeba" => amoeba_server(bootstrapConfigPath)
-            case "debug" => run_debug_code(bootstrapConfigPath)
-            case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
+            // OBSOLETE: see the commented-out "debug" and "rebuild" parser entries above.
+            //case "debug" => run_debug_code(bootstrapConfigPath)
+            //case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
             case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
             case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
@@ -533,9 +554,25 @@ object Main {
             case "show-device-set"        => show_device_set(bootstrapConfigPath, cfg.entityRef)
             case "show-allocation-group"  => show_allocation_group(bootstrapConfigPath, cfg.entityRef)
         catch
-          case e: YamlFormat.FormatError => println(s"Error loading config file: $e")
-          case e: ConfigError => println(s"Error: $e")
-      case None =>
+          case e: YamlFormat.FormatError =>
+            println(s"Error loading config file: $e")
+            1
+          case e: ConfigError =>
+            println(s"Error: $e")
+            1
+          case e: TimeoutException =>
+            println(s"Error: operation timed out waiting for the storage system to respond")
+            1
+          case e: IllegalArgumentException =>
+            println(s"Error: ${e.getMessage}")
+            1
+
+      // scopt has already printed the usage message
+      case None => 1
+
+    // All of Aspen's threads are daemon threads, so the process would exit here anyway.
+    // The explicit exit is what carries the status code out to the shell.
+    System.exit(exitCode)
   }
 
   def createIDA(args: Args): IDA =
@@ -566,7 +603,7 @@ object Main {
     val txRetransmitDelay = Duration(1, SECONDS)
     val allocationRetransmitDelay = Duration(5, SECONDS)
 
-    val sched = Executors.newScheduledThreadPool(3)
+    val sched = Executors.newScheduledThreadPool(3, DaemonThreads.factory("aspen-client"))
     val ec: ExecutionContext = ExecutionContext.fromExecutorService(sched)
 
     // Supplied offline because the bootstrap pool's own configuration object cannot be read
@@ -609,6 +646,7 @@ object Main {
     client.read(radicle).flatMap(loadFileSystem)
   }
 
+  /** OBSOLETE: not reachable from the CLI. Retained for reference; needs rework. */
   def run_debug_code(bootstrapConfigFile: os.Path): Unit = {
     configureLogging()
 
@@ -666,7 +704,7 @@ object Main {
       ()
   }
 
-  def amoeba_server(bootstrapConfigFile: os.Path): Unit = {
+  def amoeba_server(bootstrapConfigFile: os.Path): Int = {
     configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
@@ -712,7 +750,11 @@ object Main {
 
     println("Amoeba NFS server started...")
 
+    // The NFS server is meant to run indefinitely. Blocking the main thread is what keeps
+    // the process alive; every worker thread in the system is a daemon thread.
     Thread.currentThread.join()
+
+    0 // unreachable
   }
 
 
@@ -795,7 +837,7 @@ object Main {
 
   def host(bootstrapCfg: BootstrapConfig.Config,
            bootstrapConfigFile: os.Path,
-           hostDir: Path): Unit = {
+           hostDir: Path): Int = {
 
     val sched = Executors.newScheduledThreadPool(3)
     val ec = ExecutionContext.fromExecutorService(sched)
@@ -863,7 +905,11 @@ object Main {
       hostCfg.cncPort,
       CnCMessageReceiver.Unhandled)*/
 
+    // The storage host is meant to run indefinitely. Blocking the main thread on the IO
+    // thread is what keeps the process alive; the IO thread itself is a daemon thread.
     network.joinIoThread()
+
+    0 // unreachable
   }
 
   def mkdirectory(p: Path): Unit = {
@@ -874,7 +920,7 @@ object Main {
                 baseDirectory: Path, // "demo" directory
                 dataPort: Int,
                 cncPort: Int,
-                storeTransferPort: Int): Unit = {
+                storeTransferPort: Int): Int = {
 
     val hostDirectory = baseDirectory.resolve("bootstrap-host")
 
@@ -968,8 +1014,12 @@ object Main {
     println(s"    uuid:      ${radicle.id}")
     println(s"    pool-uuid: ${radicle.poolId}")
     sched.shutdownNow()
+
+    0
   }
 
+  /** OBSOLETE: not reachable from the CLI. Hardcodes the demo bootstrap-host device path.
+   *  Retained for reference; needs rework. */
   def rebuild(storeName: String, bootstrapConfigFile: os.Path): Unit = {
 
     configureLogging()
@@ -1044,7 +1094,7 @@ object Main {
                   poolName: String,
                   ida: IDA,
                   deviceSetName: String,
-                  maximumStoreSize: Long): Unit = {
+                  maximumStoreSize: Long): Int = {
 
     configureLogging()
 
@@ -1059,17 +1109,19 @@ object Main {
       poolId <- client.createNewStoragePool(poolName, ida, None, RocksDBConfig(), setId, maximumStoreSize)
     yield poolId
 
-    val poolId = Await.result(f, Duration(30, SECONDS))
-
-    println("******************************************")
-    println(s"* New Pool Created: ${poolId.uuid}")
-    println("******************************************")
+    awaitAndReport(f):
+      case Success(poolId) =>
+        println("******************************************")
+        println(s"* New Pool Created: ${poolId.uuid}")
+        println("******************************************")
+      case Failure(err) =>
+        println(s"Error creating storage pool: ${err.getMessage}")
   }
 
   def create_device_set(bootstrapConfigFile: os.Path,
                         name: String,
                         level: Int,
-                        parentSetName: String): Unit = {
+                        parentSetName: String): Int = {
 
     configureLogging()
 
@@ -1104,19 +1156,17 @@ object Main {
       case e =>
         println(s"Error creating device set: ${e.getMessage}")
 
-    f.onComplete:
-      case scala.util.Success(setId) =>
+    awaitAndReport(f):
+      case Success(setId) =>
         println("******************************************")
         println(s"* New Device Set Created: ${setId.uuid}")
         println("******************************************")
-      case scala.util.Failure(err) => reportError(err)
-
-    Await.ready(f, Duration(30, SECONDS))
+      case Failure(err) => reportError(err)
   }
 
   def create_allocation_group(bootstrapConfigFile: os.Path,
                               name: String,
-                              level: Int): Unit = {
+                              level: Int): Int = {
 
     configureLogging()
 
@@ -1136,19 +1186,17 @@ object Main {
       case e =>
         println(s"Error creating allocation group: ${e.getMessage}")
 
-    f.onComplete:
-      case scala.util.Success(groupId) =>
+    awaitAndReport(f):
+      case Success(groupId) =>
         println("******************************************")
         println(s"* New Allocation Group Created: ${groupId.uuid}")
         println("******************************************")
-      case scala.util.Failure(err) => reportError(err)
-
-    Await.ready(f, Duration(30, SECONDS))
+      case Failure(err) => reportError(err)
   }
 
   def add_pool_to_group(bootstrapConfigFile: os.Path,
                         poolName: String,
-                        groupName: String): Unit = {
+                        groupName: String): Int = {
 
     configureLogging()
 
@@ -1168,17 +1216,15 @@ object Main {
       case e =>
         println(s"Error adding pool to group: ${e.getMessage}")
 
-    f.onComplete:
-      case scala.util.Success(_) =>
+    awaitAndReport(f):
+      case Success(_) =>
         println(s"Pool '$poolName' added to allocation group '$groupName'")
-      case scala.util.Failure(err) => reportError(err)
-
-    Await.ready(f, Duration(30, SECONDS))
+      case Failure(err) => reportError(err)
   }
 
   def add_group_to_group(bootstrapConfigFile: os.Path,
                          sourceGroupName: String,
-                         destGroupName: String): Unit = {
+                         destGroupName: String): Int = {
 
     configureLogging()
 
@@ -1201,17 +1247,15 @@ object Main {
       case e =>
         println(s"Error adding group to group: ${e.getMessage}")
 
-    f.onComplete:
-      case scala.util.Success(_) =>
+    awaitAndReport(f):
+      case Success(_) =>
         println(s"Allocation group '$sourceGroupName' added to allocation group '$destGroupName'")
-      case scala.util.Failure(err) => reportError(err)
-
-    Await.ready(f, Duration(30, SECONDS))
+      case Failure(err) => reportError(err)
   }
 
   def move_device_to_set(bootstrapConfigFile: os.Path,
                          deviceIdStr: String,
-                         setRef: String): Unit = {
+                         setRef: String): Int = {
 
     configureLogging()
 
@@ -1239,19 +1283,17 @@ object Main {
       case e =>
         println(s"Error moving device to set: ${e.getMessage}")
 
-    f.onComplete:
-      case scala.util.Success(_) =>
+    awaitAndReport(f):
+      case Success(_) =>
         println(s"Device '$deviceIdStr' moved to set '$setRef'")
-      case scala.util.Failure(err) => reportError(err)
-
-    Await.ready(f, Duration(30, SECONDS))
+      case Failure(err) => reportError(err)
   }
 
   def create_storage_device(bootstrapCfg: BootstrapConfig.Config,
                             bootstrapConfigFile: os.Path,
                             hostDirectory: Path,
                             deviceName: String,
-                            setRef: String): Unit = {
+                            setRef: String): Int = {
 
     configureLogging()
 
@@ -1259,6 +1301,7 @@ object Main {
 
     if !Files.isRegularFile(hostConfigFile) then
       println(s"Error: host configuration file not found: $hostConfigFile")
+      1
     else
       val hostCfg = HostConfig.loadHostConfig(hostConfigFile.toFile)
 
@@ -1324,22 +1367,20 @@ object Main {
         case e =>
           println(s"Error creating storage device: ${e.getMessage}")
 
-      f.onComplete:
-        case scala.util.Success(deviceId) =>
+      awaitAndReport(f):
+        case Success(deviceId) =>
           println(s"Created storage device ${deviceId.uuid} at $deviceDirectory")
           // StoreManager scans storage-devices/ only in its constructor; the periodic
           // CheckAllDevices event iterates already-loaded devices and never rescans. A
           // running host therefore ignores the new device, and any pool created on it
           // before the restart has its stores marked offline rather than instantiated.
           println(s"Restart host '${hostCfg.name}' to bring the device online -- a running host does not detect new storage devices.")
-        case scala.util.Failure(err) => reportError(err)
-
-      Await.ready(f, Duration(30, SECONDS))
+        case Failure(err) => reportError(err)
   }
 
   def transfer_store(bootstrapConfigFile: os.Path,
                      storeName: String,
-                     targetDeviceIdStr: String): Unit = {
+                     targetDeviceIdStr: String): Int = {
 
     configureLogging()
 
@@ -1371,36 +1412,45 @@ object Main {
     // device and transferring-in on the target device, then nudges the destination
     // host with a CheckStorageDevice message so it begins the transfer immediately
     // rather than waiting for its next device-state poll.
-    def initiateTransfer(): Unit =
-      val f = client.transferStore(storeId, targetDeviceId)
-
-      f.foreach: _ =>
-        println(f"Store Transfer Initiated: Store: ${storeName} -> Device: ${targetDeviceIdStr}")
-
-      f.failed.foreach: err =>
-        println(f"Store Transfer Failed: ${err.getMessage}")
-
-    for
-      ePoolState <- lookupPoolState
+    //
+    // Left carries a pre-flight validation failure; Right means the transfer was
+    // successfully initiated. The whole chain is a single future so it can be awaited --
+    // returning before it completes would let the process exit before the transfer is
+    // ever requested.
+    val f: Future[Either[String, Unit]] = for
+      ePoolState   <- lookupPoolState
       eDeviceState <- lookupTargetDevice
-    yield
-      (ePoolState, eDeviceState) match
-        case (Left(msg), _) => println(f"Store Transfer Failed: $msg")
-        case (_, Left(msg)) => println(f"Store Transfer Failed: $msg")
-        case (Right(poolState), Right(_)) =>
-          if storeId.poolIndex < 0 || storeId.poolIndex >= poolState.stores.length then
-            println(f"Store Transfer Failed: Invalid store index ${storeId.poolIndex} for pool " +
-                    f"${storeId.poolId.uuid} (pool has ${poolState.stores.length} stores)")
-          else
-            val sourceDeviceId = poolState.stores(storeId.poolIndex).storageDeviceId
-            if sourceDeviceId == targetDeviceId then
-              println(f"Store Transfer Failed: Source and destination devices are the same " +
-                      f"(${targetDeviceIdStr}); nothing to transfer")
-            else
-              initiateTransfer()
+      result       <- (ePoolState, eDeviceState) match
+                        case (Left(msg), _) => Future.successful(Left(msg))
+                        case (_, Left(msg)) => Future.successful(Left(msg))
+                        case (Right(poolState), Right(_)) =>
+                          if storeId.poolIndex < 0 || storeId.poolIndex >= poolState.stores.length then
+                            Future.successful(Left(
+                              f"Invalid store index ${storeId.poolIndex} for pool " +
+                              f"${storeId.poolId.uuid} (pool has ${poolState.stores.length} stores)"))
+                          else
+                            val sourceDeviceId = poolState.stores(storeId.poolIndex).storageDeviceId
+                            if sourceDeviceId == targetDeviceId then
+                              Future.successful(Left(
+                                f"Source and destination devices are the same " +
+                                f"(${targetDeviceIdStr}); nothing to transfer"))
+                            else
+                              client.transferStore(storeId, targetDeviceId).map(Right(_))
+    yield result
+
+    Await.ready(f, Duration(30, SECONDS)).value.get match
+      case Success(Right(_)) =>
+        println(f"Store Transfer Initiated: Store: ${storeName} -> Device: ${targetDeviceIdStr}")
+        0
+      case Success(Left(msg)) =>
+        println(f"Store Transfer Failed: $msg")
+        1
+      case Failure(err) =>
+        println(f"Store Transfer Failed: ${err.getMessage}")
+        1
   }
 
-  def rebalance(bootstrapConfigFile: os.Path, setIdStr: String): Unit =
+  def rebalance(bootstrapConfigFile: os.Path, setIdStr: String): Int =
     configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
@@ -1411,13 +1461,12 @@ object Main {
     val setId = StorageDeviceSetId(UUID.fromString(setIdStr))
 
     val f = RebalancingDurableService.rebalanceStorageDeviceSet(client, setId)
-    f.onComplete:
-      case scala.util.Success(_) =>
-        println(s"Rebalance enrolled for storage device set $setIdStr")
-      case scala.util.Failure(err) =>
-        println(s"Rebalance failed to enroll: ${err.getMessage}")
 
-    scala.concurrent.Await.ready(f, scala.concurrent.duration.Duration(30, scala.concurrent.duration.SECONDS))
+    awaitAndReport(f):
+      case Success(_) =>
+        println(s"Rebalance enrolled for storage device set $setIdStr")
+      case Failure(err) =>
+        println(s"Rebalance failed to enroll: ${err.getMessage}")
 
   /** Resolve a user-supplied entity reference that may be either a UUID or a name.
    *  If `ref` parses as a UUID it is wrapped via `byUuid`; otherwise it is looked up
@@ -1560,7 +1609,7 @@ object Main {
       s.parentGroups.foreach(p => lines += s"    ${p.uuid}")
     lines.mkString("\n")
 
-  def list_devices(bootstrapConfigFile: os.Path, hostname: String): Unit =
+  def list_devices(bootstrapConfigFile: os.Path, hostname: String): Int =
 
     configureLogging()
 
@@ -1595,8 +1644,8 @@ object Main {
         (ds.storageDeviceId.uuid.toString, setName, capacity, pct)
       }.sortBy(_._1)
 
-    f.onComplete:
-      case scala.util.Success(devices) =>
+    awaitAndReport(f):
+      case Success(devices) =>
         if devices.isEmpty then
           println(s"No devices found for host '$hostname'")
         else
@@ -1607,14 +1656,12 @@ object Main {
             val paddedCap = " " * (capWidth - capacity.length) + capacity
             println(f"  $uuid  ${setName.padTo(setWidth, ' ')}  $paddedCap  $pct%5.1f%%")
           }
-      case scala.util.Failure(_: HostNotFound) =>
+      case Failure(_: HostNotFound) =>
         println(s"Error: host '$hostname' not found")
-      case scala.util.Failure(err) =>
+      case Failure(err) =>
         println(s"Error listing devices: ${err.getMessage}")
 
-    Await.ready(f, Duration(30, SECONDS))
-
-  def show_host(bootstrapConfigFile: os.Path, ref: String): Unit =
+  def show_host(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
     val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
     network.startIoThread(client)
@@ -1627,14 +1674,12 @@ object Main {
       yield formatHostState(hostState)).recoverWith:
         case _: NoSuchElementException => Future.failed(EntityNotFound("host", ref))
 
-    f.onComplete:
-      case scala.util.Success(text)                => println(text)
-      case scala.util.Failure(e: EntityNotFound)   => println(s"Error: ${e.getMessage}")
-      case scala.util.Failure(err)                 => println(s"Error showing host: ${err.getMessage}")
+    awaitAndReport(f):
+      case Success(text)                => println(text)
+      case Failure(e: EntityNotFound)   => println(s"Error: ${e.getMessage}")
+      case Failure(err)                 => println(s"Error showing host: ${err.getMessage}")
 
-    Await.ready(f, Duration(30, SECONDS))
-
-  def show_device(bootstrapConfigFile: os.Path, uuidStr: String): Unit =
+  def show_device(bootstrapConfigFile: os.Path, uuidStr: String): Int =
     configureLogging()
     val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
     network.startIoThread(client)
@@ -1650,14 +1695,12 @@ object Main {
       yield formatDeviceState(dev, hostName, setName)).recoverWith:
         case _: NoSuchElementException => Future.failed(EntityNotFound("storage device", uuidStr))
 
-    f.onComplete:
-      case scala.util.Success(text)              => println(text)
-      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
-      case scala.util.Failure(err)               => println(s"Error showing storage device: ${err.getMessage}")
+    awaitAndReport(f):
+      case Success(text)              => println(text)
+      case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case Failure(err)               => println(s"Error showing storage device: ${err.getMessage}")
 
-    Await.ready(f, Duration(30, SECONDS))
-
-  def show_pool(bootstrapConfigFile: os.Path, ref: String): Unit =
+  def show_pool(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
     val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
     network.startIoThread(client)
@@ -1671,14 +1714,12 @@ object Main {
       yield formatPoolState(pool, setName)).recoverWith:
         case _: NoSuchElementException => Future.failed(EntityNotFound("pool", ref))
 
-    f.onComplete:
-      case scala.util.Success(text)              => println(text)
-      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
-      case scala.util.Failure(err)               => println(s"Error showing pool: ${err.getMessage}")
+    awaitAndReport(f):
+      case Success(text)              => println(text)
+      case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case Failure(err)               => println(s"Error showing pool: ${err.getMessage}")
 
-    Await.ready(f, Duration(30, SECONDS))
-
-  def show_device_set(bootstrapConfigFile: os.Path, ref: String): Unit =
+  def show_device_set(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
     val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
     network.startIoThread(client)
@@ -1694,14 +1735,12 @@ object Main {
       yield formatDeviceSetState(set, parentName)).recoverWith:
         case _: NoSuchElementException => Future.failed(EntityNotFound("device set", ref))
 
-    f.onComplete:
-      case scala.util.Success(text)              => println(text)
-      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
-      case scala.util.Failure(err)               => println(s"Error showing device set: ${err.getMessage}")
+    awaitAndReport(f):
+      case Success(text)              => println(text)
+      case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case Failure(err)               => println(s"Error showing device set: ${err.getMessage}")
 
-    Await.ready(f, Duration(30, SECONDS))
-
-  def show_allocation_group(bootstrapConfigFile: os.Path, ref: String): Unit =
+  def show_allocation_group(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
     val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
     network.startIoThread(client)
@@ -1714,17 +1753,15 @@ object Main {
       yield formatAllocationGroupState(group)).recoverWith:
         case _: NoSuchElementException => Future.failed(EntityNotFound("allocation group", ref))
 
-    f.onComplete:
-      case scala.util.Success(text)              => println(text)
-      case scala.util.Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
-      case scala.util.Failure(err)               => println(s"Error showing allocation group: ${err.getMessage}")
-
-    Await.ready(f, Duration(30, SECONDS))
+    awaitAndReport(f):
+      case Success(text)              => println(text)
+      case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
+      case Failure(err)               => println(s"Error showing allocation group: ${err.getMessage}")
 
   def list_entries[A](bootstrapConfigFile: os.Path,
                       title: String,
                       fetch: AspenClient => Future[List[(String, A)]],
-                      idToUuid: A => UUID): Unit =
+                      idToUuid: A => UUID): Int =
 
     configureLogging()
 
@@ -1736,8 +1773,8 @@ object Main {
 
     val f = fetch(client)
 
-    f.onComplete:
-      case scala.util.Success(entries) =>
+    awaitAndReport(f):
+      case Success(entries) =>
         if entries.isEmpty then
           println(s"No $title found")
         else
@@ -1747,9 +1784,7 @@ object Main {
           val width = sorted.map(_._1.length).max
           println(title)
           sorted.foreach { (name, id) => println(s"  ${name.padTo(width, ' ')}  ${idToUuid(id)}") }
-      case scala.util.Failure(err) =>
+      case Failure(err) =>
         println(s"Error listing ${title.toLowerCase}: ${err.getMessage}")
-
-    Await.ready(f, Duration(30, SECONDS))
 
 }

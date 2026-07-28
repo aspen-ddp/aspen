@@ -19,6 +19,10 @@ Rebalancing as a passive background task
       - needs to be configurable
     - If it results in a non-empty plan, kick off a rebalancing task
 
+Add a CnC message to instruct a host to call checkStorageDevices
+  - Send this message when a new device is created so we don't have to wait
+    for a polling period to elapse before the host notices
+
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying
   - Use pluggable trait that has just the methods BaseReadDriver needs

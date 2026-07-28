@@ -584,12 +584,12 @@ object Main {
       case _ => throw new Exception(s"Invalid IDA type: ${args.idaType}")
 
   def createNetwork(bootstrapConfigFile: os.Path,
-                    ohostNode: Option[(HostId, Int)],
+                    ohost: Option[(HostId, Int)],
                     oclientId: Option[ClientId]): (NetworkBridge, ZMQNet) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    (b, new ZMQNet(bootstrapConfigFile, oclientId, ohostNode, heartbeatPeriod, b))
+    (b, new ZMQNet(bootstrapConfigFile, oclientId, ohost, heartbeatPeriod, b))
   }
 
   def createAmoebaClient(bootstrapConfigFile: os.Path,

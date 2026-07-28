@@ -71,18 +71,18 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
-      // Read the original hostState (should now contain only keys < splitAtKey)
+      // Read the original node (should now contain only keys < splitAtKey)
       originalState <- client.read(node.pointer)
 
-      // Read the new left hostState
+      // Read the new left node
       leftState <- client.read(newLeftPtr.pointer)
 
-      // Read the new right hostState by reading the left hostState's right pointer
+      // Read the new right node by reading the left node's right pointer
       rightPtr = KeyValueListPointer(leftState.right.get.bytes)
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Original hostState should have keys 1, 2 and maximum set to splitAtKey
+      // Original node should have keys 1, 2 and maximum set to splitAtKey
       originalState.contents.size should be (2)
       originalState.contents should contain key (key1)
       originalState.contents should contain key (key2)
@@ -91,13 +91,13 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       originalState.maximum should be (Some(splitAtKey))
       originalState.right should be (None)
 
-      // Right hostState should have keys 3, 4
+      // Right node should have keys 3, 4
       rightState.contents.size should be (2)
       rightState.contents should contain key (key3)
       rightState.contents should contain key (key4)
       rightState.minimum should be (Some(splitAtKey))
 
-      // Left hostState should be empty in this case
+      // Left node should be empty in this case
       leftState.contents.size should be (0)
       leftState.minimum should be (None)
       leftState.maximum should be (Some(splitAtKey))
@@ -135,18 +135,18 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
 
-      // Read the original hostState (should now contain only keys < splitAtKey)
+      // Read the original node (should now contain only keys < splitAtKey)
       originalState <- client.read(node.pointer)
 
-      // Read the new left hostState
+      // Read the new left node
       leftState <- client.read(newLeftPtr.pointer)
 
-      // Read the new right hostState by reading the left hostState's right pointer
+      // Read the new right node by reading the left node's right pointer
       rightPtr = KeyValueListPointer(leftState.right.get.bytes)
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Original hostState should have keys 1, 2 and maximum set to splitAtKey
+      // Original node should have keys 1, 2 and maximum set to splitAtKey
       originalState.contents.size should be(3)
       originalState.contents should contain key (key1)
       originalState.contents should contain key (key2)
@@ -155,12 +155,12 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       originalState.maximum should be(Some(splitAtKey))
       originalState.right should be(None)
 
-      // Right hostState should have keys 3, 4
+      // Right node should have keys 3, 4
       rightState.contents.size should be(1)
       rightState.contents should contain key (key4)
       rightState.minimum should be(Some(splitAtKey))
 
-      // Left hostState should be empty in this case
+      // Left node should be empty in this case
       leftState.contents.size should be(0)
       leftState.minimum should be(None)
       leftState.maximum should be(Some(splitAtKey))
@@ -202,18 +202,18 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Original hostState should be empty
+      // Original node should be empty
       originalState.contents.size should be (0)
       originalState.maximum should be (Some(splitAtKey))
       originalState.right should be (None)
 
-      // Right hostState should have all keys
+      // Right node should have all keys
       rightState.contents.size should be (3)
       rightState.contents should contain key (key3)
       rightState.contents should contain key (key4)
       rightState.contents should contain key (key5)
 
-      // Left hostState should be empty
+      // Left node should be empty
       leftState.contents.size should be (0)
     }
   }
@@ -252,18 +252,18 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Original hostState should have all keys
+      // Original node should have all keys
       originalState.contents.size should be (3)
       originalState.contents should contain key (key1)
       originalState.contents should contain key (key2)
       originalState.contents should contain key (key3)
       originalState.maximum should be (Some(splitAtKey))
 
-      // Right hostState should be empty
+      // Right node should be empty
       rightState.contents.size should be (0)
       rightState.minimum should be (Some(splitAtKey))
 
-      // Left hostState should be empty
+      // Left node should be empty
       leftState.contents.size should be (0)
     }
   }
@@ -304,23 +304,23 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Original hostState should have key2 only
+      // Original node should have key2 only
       originalState.contents.size should be (1)
       originalState.contents should contain key (key2)
       originalState.maximum should be (Some(splitAtKey))
 
-      // Right hostState should have key4
+      // Right node should have key4
       rightState.contents.size should be (1)
       rightState.contents should contain key (key4)
 
-      // Left hostState should have the down pointer as AbsoluteMinimum key
+      // Left node should have the down pointer as AbsoluteMinimum key
       leftState.contents.size should be (1)
       leftState.contents should contain key (Key.AbsoluteMinimum)
       leftState.contents(Key.AbsoluteMinimum).value.bytes should equal (downPtr.toArray)
     }
   }
 
-  atest("splitAt - empty hostState") {
+  atest("splitAt - empty node") {
     val contents = Map.empty[Key, Value]
     val splitAtKey = createKey(3)
 
@@ -346,7 +346,7 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // All hostStates should be empty
+      // All nodes should be empty
       originalState.contents.size should be (0)
       rightState.contents.size should be (0)
       leftState.contents.size should be (0)
@@ -385,20 +385,20 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Original hostState should be empty (key3 >= splitAtKey)
+      // Original node should be empty (key3 >= splitAtKey)
       originalState.contents.size should be (0)
       originalState.maximum should be (Some(splitAtKey))
 
-      // Right hostState should have the single key
+      // Right node should have the single key
       rightState.contents.size should be (1)
       rightState.contents should contain key (key3)
 
-      // Left hostState should be empty
+      // Left node should be empty
       leftState.contents.size should be (0)
     }
   }
 
-  atest("splitAt - hostState with existing tail pointer") {
+  atest("splitAt - node with existing tail pointer") {
     val key1 = createKey(1)
     val key2 = createKey(2)
     val value1 = createValue(10)
@@ -437,19 +437,19 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Original hostState should have key1 only
+      // Original node should have key1 only
       originalState.contents.size should be (1)
       originalState.contents should contain key (key1)
       originalState.maximum should be (Some(splitAtKey))
       originalState.right should be (None)
 
-      // Right hostState should have key2 and preserve the tail pointer
+      // Right node should have key2 and preserve the tail pointer
       rightState.contents.size should be (1)
       rightState.contents should contain key (key2)
       rightState.right.isDefined should be (true)
       rightState.right.get.bytes should equal (tailPtr.toArray)
 
-      // Left hostState should point to right hostState
+      // Left node should point to right node
       leftState.right.isDefined should be (true)
     }
   }
@@ -515,12 +515,12 @@ class KeyValueListNodeSplitAtSuite extends IntegrationTestSuite {
       rightState <- client.read(rightPtr.pointer)
 
     } yield {
-      // Verify original hostState has correct values
+      // Verify original node has correct values
       originalState.contents.size should be (2)
       originalState.contents(key1).value.bytes should equal (value1.bytes)
       originalState.contents(key3).value.bytes should equal (value3.bytes)
 
-      // Verify right hostState has correct values
+      // Verify right node has correct values
       rightState.contents.size should be (1)
       rightState.contents(key5).value.bytes should equal (value5.bytes)
     }

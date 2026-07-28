@@ -89,7 +89,7 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
 
   def receiveReadResponse(response:ReadResponse): Option[Either[ClientReadError, ObjectState]] = {
     if endResult.isEmpty then
-      knownBehind -= response.fromStore // Start fresh for this hostState
+      knownBehind -= response.fromStore // Start fresh for this host
 
       response.result match {
         case Left(err) => responses += response.fromStore -> Left(err)

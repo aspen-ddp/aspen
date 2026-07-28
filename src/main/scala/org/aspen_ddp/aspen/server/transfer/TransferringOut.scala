@@ -33,7 +33,7 @@ class TransferringOut( val client: AspenClient,
   // Create marker file so the server knows not to load this store
   os.write.over(storePath / MarkerFile, "")
 
-  logger.info(s"Beginning transfer of store $storeId on storage device $fromDevice to storage device $toDevice on hostState $toHost")
+  logger.info(s"Beginning transfer of store $storeId on storage device $fromDevice to storage device $toDevice on host $toHost")
 
   private val creationProcess = os.spawn(
     cmd = ("jar", "--create"),

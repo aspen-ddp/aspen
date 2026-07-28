@@ -38,7 +38,7 @@ class KVObjectRootManager(val client: AspenClient,
             root.orootObject match {
               case None => p.success(RData(root, v.revision, None))
               case Some(rootObject) =>
-                client.read(rootObject, s"Root hostState for TKVL tree $treeKey").onComplete {
+                client.read(rootObject, s"Root node for TKVL tree $treeKey").onComplete {
                   case Failure(err) =>
                     // Tree has been deleted but the root has not yet been updated
                     // Return an empty tree root
@@ -101,7 +101,7 @@ class KVObjectRootManager(val client: AspenClient,
     for {
       RData(root, _, _) <- getRData()
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
-      kvos <- client.read(pointer, s"Reading root hostState of TKVL tree $treeKey for createInitialNode")
+      kvos <- client.read(pointer, s"Reading root node of TKVL tree $treeKey for createInitialNode")
       rptr <- alloc.allocateKeyValueObject(contents)
     } yield {
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator)
@@ -168,12 +168,12 @@ object KVObjectRootManager extends RootManagerFactory {
 
     given ExecutionContext = client.clientContext
 
-    // TODO: Re-evaluate this. Unconditionally create the root hostState due to errors
+    // TODO: Re-evaluate this. Unconditionally create the root node due to errors
     //       in unit tests complaining about transactions having no requirements
     //       if this method doesn't do anything.
     for
       alloc <- nodeAllocator.getAllocatorForTier(0)
-      kvos <- client.read(pointer, s"Reading hostState hosting new TKVL tree $key")
+      kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
       rptr <- alloc.allocateKeyValueObject(initialContent)
     yield
       setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
@@ -183,7 +183,7 @@ object KVObjectRootManager extends RootManagerFactory {
     else
       for
         alloc <- nodeAllocator.getAllocatorForTier(0)
-        kvos <- client.read(pointer, s"Reading hostState hosting new TKVL tree $key")
+        kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
         rptr <- alloc.allocateKeyValueObject(initialContent)
       yield
         setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)

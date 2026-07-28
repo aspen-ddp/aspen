@@ -353,7 +353,7 @@ class StoreManager(val client: AspenClient,
           tx.update(toDevPtr, None, None, toDevReqs, toDevOps)
 
           // If state update transaction is successful, send a CheckStorageDevice
-          // message to the hostState of the old storage device so they can delete
+          // message to the host of the old storage device so they can delete
           // the store content
           tx.result.foreach: _ =>
             val msg = CheckStorageDevice(

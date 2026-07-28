@@ -4,10 +4,8 @@ import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
-import org.yaml.snakeyaml.Yaml
-import org.yaml.snakeyaml.constructor.SafeConstructor
 
-import java.io.{File, FileInputStream}
+import java.io.File
 import java.util.UUID
 
 /*
@@ -107,9 +105,7 @@ object BootstrapConfig:
 
 
   def loadBootstrapConfig(file: File): Config =
-    val yaml = new Yaml(new SafeConstructor)
-    val y = yaml.load[java.util.AbstractMap[Object,Object]](new FileInputStream(file))
-    Config.create(y)
+    Config.create(loadYamlFile(file))
 
 
   def generateBootstrapConfig(aspenSystemId: UUID,

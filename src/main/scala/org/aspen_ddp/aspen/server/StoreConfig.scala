@@ -2,10 +2,8 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
-import org.yaml.snakeyaml.Yaml
-import org.yaml.snakeyaml.constructor.SafeConstructor
 
-import java.io.{File, FileInputStream}
+import java.io.File
 import java.util.UUID
 
 /*
@@ -45,7 +43,5 @@ object StoreConfig extends YObject[StoreConfig]:
   def create(o: Object): StoreConfig = StoreConfig(storeId.get(o), backend.get(o))
   
   def loadStoreConfig(file: File): StoreConfig =
-    val yaml = new Yaml(new SafeConstructor)
-    val y = yaml.load[java.util.AbstractMap[Object, Object]](new FileInputStream(file))
-    create(y)
+    create(loadYamlFile(file))
 

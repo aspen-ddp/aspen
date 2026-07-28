@@ -2,10 +2,8 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
-import org.yaml.snakeyaml.Yaml
-import org.yaml.snakeyaml.constructor.SafeConstructor
 
-import java.io.{File, FileInputStream}
+import java.io.File
 import java.util.UUID
 
 /*
@@ -35,6 +33,4 @@ object StorageDeviceConfig extends YObject[StorageDeviceConfig]:
   )
 
   def loadHostConfig(file: File): StorageDeviceConfig =
-    val yaml = new Yaml(new SafeConstructor)
-    val y = yaml.load[java.util.AbstractMap[Object, Object]](new FileInputStream(file))
-    create(y)
+    create(loadYamlFile(file))

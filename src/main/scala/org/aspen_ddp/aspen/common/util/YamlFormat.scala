@@ -1,13 +1,33 @@
 package org.aspen_ddp.aspen.common.util
 
-import java.io.File
+import java.io.{File, FileInputStream}
 import java.util.UUID
 
+import scala.util.Using
+
 import org.aspen_ddp.aspen.AmoebaError
+import org.yaml.snakeyaml.Yaml
+import org.yaml.snakeyaml.constructor.SafeConstructor
 
 object YamlFormat {
 
   class FormatError(val msg: String) extends AmoebaError(msg)
+
+  /** Loads and parses the YAML document contained in the given file.
+    *
+    * The document is fully parsed before the underlying stream is closed, and the stream is
+    * closed whether parsing succeeds or fails.
+    */
+  def loadYamlFile(file: File): Object = {
+    val doc = Using.resource(new FileInputStream(file)) { in =>
+      new Yaml(new SafeConstructor).load[java.util.AbstractMap[Object, Object]](in)
+    }
+
+    if (doc == null)
+      throw new FormatError(s"Empty YAML document: $file")
+
+    doc
+  }
 
   trait Format[T] {
     def format(o: Object): T

@@ -42,7 +42,9 @@ Validate/fix ./t script running in script directory
   - Probably as easy as saving the original path and switching back to it before
     invoking the wrapped command line process
 
-OBSOLETE: demo/bootstrap_config.yaml and demo/node_*.yaml
+Update add-storage-device to send a new NewDeviceAdded HostMessage
+  - Send to host after new device successfully created
+  - Host immediately invokes checkForNewDevices() upon reception
 
 ---------
 

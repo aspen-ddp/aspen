@@ -388,12 +388,12 @@ object Main {
             action((x, c) => c.copy(hostDirectory = x)).
             validate(x => if (x.exists()) success else failure(s"Host directory does not exist: $x")),
 
-          arg[String]("<device-name>").text("Name of the already-provisioned device directory under <host-directory>/storage-devices").
+          arg[String]("<device-name>").text(s"Name of the already-provisioned device directory under <host-directory>/${StorageDeviceManager.StorageDevicesDirName}").
             action((x, c) => c.copy(deviceName = stripTrailingSlash(x))).
             validate { x =>
               val n = stripTrailingSlash(x)
               if n.nonEmpty && !n.contains("/") && n != "." && n != ".." then success
-              else failure("Device name must be the bare name of a directory under <host-directory>/storage-devices")
+              else failure(s"Device name must be the bare name of a directory under <host-directory>/${StorageDeviceManager.StorageDevicesDirName}")
             },
 
           arg[String]("<set-name-or-uuid>").text("Name or UUID of the target level-0 device set").
@@ -1115,7 +1115,7 @@ object Main {
     var storeId: StoreId = null
 
     cfg.hosts.zipWithIndex.foreach: (node, index) =>
-      Path.of(s"demo/bootstrap-host/storage-devices/bootstrap-device").toFile.listFiles.toList.foreach: storeFn =>
+      Path.of("demo", "bootstrap-host", StorageDeviceManager.StorageDevicesDirName, "bootstrap-device").toFile.listFiles.toList.foreach: storeFn =>
         val cfg = StoreConfig.loadStoreConfig(storeFn.toPath.resolve(StoreConfig.configFilename).toFile)
         if poolUuid == cfg.storeId.poolId && storeIndex == cfg.storeId.poolIndex then
           cfg.backend match {

@@ -47,4 +47,4 @@ case class HostState(hostId: HostId,
     this.copy(storageDevices = storageDevices + deviceId)
 
   def removeStorageDevice(deviceId: StorageDeviceId): HostState =
-    this.copy(storageDevices = storageDevices + deviceId)
+    this.copy(storageDevices = storageDevices - deviceId)

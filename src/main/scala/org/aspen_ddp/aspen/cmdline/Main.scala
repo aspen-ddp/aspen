@@ -990,7 +990,7 @@ object Main {
 
     cfg.hosts.zipWithIndex.foreach: (node, index) =>
       Path.of(s"demo/bootstrap-host/storage-devices/bootstrap-device").toFile.listFiles.toList.foreach: storeFn =>
-        val cfg = StoreConfig.loadStoreConfig(storeFn.toPath.resolve("store-config.yaml").toFile)
+        val cfg = StoreConfig.loadStoreConfig(storeFn.toPath.resolve(StoreConfig.configFilename).toFile)
         if poolUuid == cfg.storeId.poolId && storeIndex == cfg.storeId.poolIndex then
           cfg.backend match {
             case b: StoreConfig.RocksDB =>

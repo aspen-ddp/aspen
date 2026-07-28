@@ -153,7 +153,7 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     yield
       val written = dir.resolve(StorageDeviceConfig.configFilename)
       Files.isRegularFile(written) should be(true)
-      val cfg = StorageDeviceConfig.loadHostConfig(written.toFile)
+      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(written.toFile)
       cfg.storageDeviceId should be(deviceId)
       cfg.aspenSystemId should be(systemId)
       ds.hostId should be(HostId.BootstrapHostId)
@@ -172,7 +172,7 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     yield
       val written = elsewhere.resolve(StorageDeviceConfig.configFilename)
       Files.isRegularFile(written) should be(true)
-      StorageDeviceConfig.loadHostConfig(written.toFile).storageDeviceId should be(deviceId)
+      StorageDeviceConfig.loadStorageDeviceConfig(written.toFile).storageDeviceId should be(deviceId)
 
   atest("reports ConfigWriteFailed, naming the device, when the write fails"):
     given ExecutionContext = executionContext

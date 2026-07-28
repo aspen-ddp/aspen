@@ -24,11 +24,11 @@ class StorageDeviceConfigSuite extends AnyFunSuite with Matchers:
       "storage-device-id: 33333333-3333-3333-3333-333333333333")
     sample.yamlConfig should not include "StorageDeviceId("
 
-  test("loadHostConfig round-trips yamlConfig"):
+  test("loadStorageDeviceConfig round-trips yamlConfig"):
     val f = Files.createTempFile("aspen-storage-device-config", ".yaml")
     try
       Files.write(f, sample.yamlConfig.getBytes(StandardCharsets.UTF_8))
-      StorageDeviceConfig.loadHostConfig(f.toFile) should be(sample)
+      StorageDeviceConfig.loadStorageDeviceConfig(f.toFile) should be(sample)
     finally
       Files.deleteIfExists(f)
 
@@ -40,7 +40,7 @@ aspen-system-id: 00000000-0000-0000-0000-000000000000
     val f = Files.createTempFile("aspen-storage-device-docexample", ".yaml")
     try
       Files.write(f, docExampleYaml.getBytes(StandardCharsets.UTF_8))
-      val cfg = StorageDeviceConfig.loadHostConfig(f.toFile)
+      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(f.toFile)
 
       cfg.storageDeviceId should be(StorageDeviceId(zero))
       cfg.aspenSystemId should be(zero)

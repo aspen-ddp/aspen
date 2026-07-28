@@ -32,5 +32,5 @@ object StorageDeviceConfig extends YObject[StorageDeviceConfig]:
     aspenSystemId.get(o)
   )
 
-  def loadHostConfig(file: File): StorageDeviceConfig =
+  def loadStorageDeviceConfig(file: File): StorageDeviceConfig =
     create(loadYamlFile(file))

@@ -239,7 +239,7 @@ class StoreManager(val client: AspenClient,
     if Files.isDirectory(sdFile.toPath) && Files.exists(sdCfgPath) then
       try
         val configFile = sdCfgPath.toFile
-        val sdCfg = StorageDeviceConfig.loadHostConfig(configFile)
+        val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(configFile)
         if sdCfg.aspenSystemId != aspenSystemId then
           logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
         else

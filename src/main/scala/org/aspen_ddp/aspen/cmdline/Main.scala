@@ -41,7 +41,7 @@ import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, md
 
 import java.io.{File, StringReader}
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{FileAlreadyExistsException, Files, Path, Paths}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -61,6 +61,7 @@ object Main {
                   hostName:String="",
                   storeName:String="",
                   deviceId:String="",
+                  deviceName:String="",
                   host:String="",
                   port:Int=0,
                   newPoolName: String="",
@@ -306,6 +307,34 @@ object Main {
             action((x, c) => c.copy(deviceSetName = x)),
         )
 
+      // A single trailing slash on <device-name> is tolerated and stripped: tab-completing
+      // inside storage-devices/ yields "dev0/". Shared by that argument's action and
+      // validate so the stored name cannot drift from the one that was validated.
+      val stripTrailingSlash = (s: String) => s.stripSuffix("/")
+
+      cmd("create-storage-device").text("Registers a new storage device on a host").
+        action((_, c) => c.copy(mode = "create-storage-device")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[File]("<host-directory>").text("Host Directory").
+            action((x, c) => c.copy(hostDirectory = x)).
+            validate(x => if (x.exists()) success else failure(s"Host directory does not exist: $x")),
+
+          arg[String]("<device-name>").text("Name of the already-provisioned device directory under <host-directory>/storage-devices").
+            action((x, c) => c.copy(deviceName = stripTrailingSlash(x))).
+            validate { x =>
+              val n = stripTrailingSlash(x)
+              if n.nonEmpty && !n.contains("/") && n != "." && n != ".." then success
+              else failure("Device name must be the bare name of a directory under <host-directory>/storage-devices")
+            },
+
+          arg[String]("<set-name-or-uuid>").text("Name or UUID of the target level-0 device set").
+            action((x, c) => c.copy(deviceSetName = x)),
+        )
+
       cmd("transfer-store").text("Transfers a store to a different storage device").
         action((_, c) => c.copy(mode = "transfer-store")).
         children(
@@ -488,6 +517,9 @@ object Main {
             case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
             case "move-device-to-set" => move_device_to_set(bootstrapConfigPath, cfg.deviceId, cfg.deviceSetName)
+            case "create-storage-device" => create_storage_device(bootstrapConfig, bootstrapConfigPath,
+                                                                  cfg.hostDirectory.toPath, cfg.deviceName,
+                                                                  cfg.deviceSetName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
             case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
@@ -1208,6 +1240,91 @@ object Main {
       case scala.util.Failure(err) => reportError(err)
 
     Await.ready(f, Duration(30, SECONDS))
+  }
+
+  def create_storage_device(bootstrapCfg: BootstrapConfig.Config,
+                            bootstrapConfigFile: os.Path,
+                            hostDirectory: Path,
+                            deviceName: String,
+                            setRef: String): Unit = {
+
+    configureLogging()
+
+    val hostConfigFile = hostDirectory.resolve(HostConfig.configFilename)
+
+    if !Files.isRegularFile(hostConfigFile) then
+      println(s"Error: host configuration file not found: $hostConfigFile")
+    else
+      val hostCfg = HostConfig.loadHostConfig(hostConfigFile.toFile)
+
+      // The device directory is required to sit at a fixed location, so the CLI takes the
+      // bare name. The <device-name> validator already rejects everything path-shaped, so
+      // this always resolves to a direct child; StorageDeviceManager's containment check is
+      // a second line of defence for its non-CLI callers rather than the mechanism here.
+      val deviceDirectory = StorageDeviceManager.deviceDirectory(hostDirectory, deviceName)
+
+      val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+
+      network.startIoThread(client)
+
+      given ExecutionContext = client.clientContext
+
+      val f = for
+        setId    <- resolveRef(setRef, StorageDeviceSetId(_), client.getStorageDeviceSetId)
+        deviceId <- StorageDeviceManager.createStorageDevice(
+                      client, hostCfg, hostDirectory, deviceDirectory,
+                      setId, bootstrapCfg.aspenSystemId)
+      yield deviceId
+
+      def reportError(cause: Throwable): Unit = cause match
+        case e: StorageDeviceManager.WrongAspenSystem =>
+          println(s"Error: host config belongs to Aspen system ${e.found}, not ${e.expected}")
+        case e: StorageDeviceManager.DeviceDirectoryNotUnderHost =>
+          println(s"Error: ${e.directory} must be a direct child of ${e.expectedParent}")
+        case e: StorageDeviceManager.DeviceDirectoryNotFound =>
+          println(s"Error: storage device directory does not exist: ${e.directory}")
+          println("The directory must be provisioned before this command is run.")
+        case e: StorageDeviceManager.DeviceAlreadyConfigured =>
+          println(s"Error: ${e.directory} already contains ${StorageDeviceConfig.configFilename}")
+        // Both ConfigWriteFailed arms leave a committed registration with no directory behind
+        // it. There is no device-removal command or client API, so the only executable remedy
+        // is to move the orphan out of the set: while it remains in the set's memberDevices,
+        // StorageDeviceSetState.selectFromDevices may hand it to createNewStoragePool, placing
+        // a store on a device no host will load (StoreManager.tryLoadDevice needs the config
+        // file). move-device-to-set removes it from the source set, so a level-0 quarantine set
+        // that is assigned no pools takes it out of circulation.
+        case e: StorageDeviceManager.ConfigWriteFailed if e.getCause.isInstanceOf[FileAlreadyExistsException] =>
+          println(s"Error: ${e.configFile} was created by another caller while device ${e.storageDeviceId.uuid} was being registered.")
+          println("Do NOT write that file by hand -- it belongs to another device.")
+          println(s"Device ${e.storageDeviceId.uuid} owns no directory and cannot be used, but remains a member of set '$setRef'")
+          println("and may be selected for pool placement. Quarantine it with:")
+          println(s"  move-device-to-set ${e.storageDeviceId.uuid} <quarantine-level-0-set>")
+        case e: StorageDeviceManager.ConfigWriteFailed =>
+          println(s"Error: device ${e.storageDeviceId.uuid} was registered but writing ${e.configFile} failed: ${e.getCause.getMessage}")
+          // The rollback at StorageDeviceManager's write site is best-effort (a failed delete
+          // is swallowed), so a surviving file may be either ours -- partial or empty, and
+          // safe to replace -- or a newer registration's, if the delete succeeded and another
+          // caller then claimed the directory. The device id inside it is the discriminator.
+          println(s"Check whether ${e.configFile} exists. If it exists and does not name device")
+          println(s"${e.storageDeviceId.uuid}, it belongs to another device: leave it alone.")
+          println("Otherwise create or replace it with exactly these contents:")
+          print(StorageDeviceConfig(e.storageDeviceId, bootstrapCfg.aspenSystemId).yamlConfig)
+          println(s"If you do not, device ${e.storageDeviceId.uuid} remains a member of set '$setRef' with no")
+          println("directory and may be selected for pool placement. Quarantine it with:")
+          println(s"  move-device-to-set ${e.storageDeviceId.uuid} <quarantine-level-0-set>")
+        case _: StorageDeviceSetState.NotLevelZero =>
+          println(s"Error: device set '$setRef' must be a level-0 (tier-0) set")
+        case _: NoSuchElementException =>
+          println(s"Error: host '${hostCfg.name}' (${hostCfg.hostId.uuid}) or device set '$setRef' not found")
+        case e =>
+          println(s"Error creating storage device: ${e.getMessage}")
+
+      f.onComplete:
+        case scala.util.Success(deviceId) =>
+          println(s"Created storage device ${deviceId.uuid} at $deviceDirectory")
+        case scala.util.Failure(err) => reportError(err)
+
+      Await.ready(f, Duration(30, SECONDS))
   }
 
   def transfer_store(bootstrapConfigFile: os.Path,

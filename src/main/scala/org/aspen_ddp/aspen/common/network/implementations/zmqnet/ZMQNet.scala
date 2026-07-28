@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.util.EvictingQueue
+import org.aspen_ddp.aspen.common.util.{DaemonThreads, EvictingQueue}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.zeromq.ZMQ.{DONTWAIT, PollItem}
 import org.zeromq.{SocketType, ZContext, ZMQ}
@@ -152,8 +152,9 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)
 
-  private val networkThread = new Thread:
-    override def run(): Unit = ioThread()
+  // Daemon thread so that client processes exit once their work is done. Long-running
+  // processes keep themselves alive by blocking the main thread in joinIoThread().
+  private val networkThread = DaemonThreads.thread("zmq-io") { ioThread() }
 
   def startIoThread(client: AspenClient): Unit =
     metadataManager.setAspenClient(client)

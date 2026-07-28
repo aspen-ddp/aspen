@@ -17,7 +17,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
 class BackgroundTaskManager(protected val executionContext: ExecutionContext) {
   import BackgroundTaskManager.*
 
-  private  val sched = Executors.newScheduledThreadPool(1)
+  private  val sched = Executors.newScheduledThreadPool(1, DaemonThreads.factory("aspen-bgtask"))
   private  val rand = new java.util.Random
 
   given ExecutionContext = executionContext

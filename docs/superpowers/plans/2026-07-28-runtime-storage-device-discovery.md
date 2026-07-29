@@ -942,6 +942,124 @@ path so the short-lived CLI process does not abandon it on exit."
 
 ---
 
+## Task 9b: Event-loop hardening
+
+**Added during the Task 2 code review, not present in the original spec.** Two pre-existing
+defects that this feature makes load-bearing. Neither is caused by the discovery work; both are
+reached by it.
+
+**Files:**
+- Modify: `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala` — `checkStorageDevice`'s
+  future completion, and `start()`'s event loop
+
+**Defect 1: `checkStorageDevice` leaks `activeDeviceChecks` on failure.**
+`client.getStorageDeviceState` returns a *failed* future for a device that has no registered
+`StorageDeviceState` (`MetadataTree` throws `NoSuchElementException` on a missing key).
+`checkStorageDevice` consumes that future with `.foreach`, so on failure
+`activeDeviceChecks -= storageDeviceId` never runs and the id is stuck for the lifetime of the
+process — every subsequent check of that device is silently a no-op.
+
+Before this feature, every entry in `storageDevices` was present from construction, so this was
+mostly a startup-only edge. Now a device directory can be discovered *before* its
+`StorageDeviceState` is registered — exactly the race this feature targets — and both the
+`CheckAllDevices` and `CheckStorageDevice` handlers call `checkStorageDevice` on it immediately.
+The intended benefit ("stores are created now rather than a period from now") inverts to *never*.
+
+Fix: complete the future with `onComplete` (or `andThen`) so the `activeDeviceChecks -=` cleanup
+runs on the failure path too. Log the failure rather than swallowing it.
+
+**Defect 2: an exception escaping `handleEvent` silently kills the event loop.**
+`start()`'s loop has no `try`/`catch` around `handleEvent(event)`, and the `Future` returned by
+`threadPool.submit` is discarded — so any escape terminates the storage host's event loop with no
+log line at all. The host then appears alive while processing nothing.
+
+Fix: wrap the `handleEvent(event)` call in a `try`/`catch` that logs the throwable and continues
+the loop. This is the durable version of the narrower `listFiles`-null guard added in Task 2.
+
+- [ ] **Step 1: Write the failing test for defect 1**
+
+Append to `StoreManagerDeviceDiscoverySuite`:
+
+```scala
+  atest("a device check that fails does not wedge later checks of the same device"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
+    mgr.loadedDevices.keySet should be(Set(deviceA))
+
+    // deviceA has no StorageDeviceState registered in the TestNetwork, so getStorageDeviceState
+    // fails. The failure must still release the activeDeviceChecks entry.
+    mgr.testingOnlyCheckAllDevices()
+    mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.testingOnlyActiveDeviceChecks should be(empty))
+```
+
+This needs a `private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId]` accessor on
+`StoreManager` exposing the `activeDeviceChecks` set, placed with the other testing hooks.
+
+The future completes asynchronously, so the accessor may need to be polled with a short bounded
+wait rather than read once. Use the same bounded-poll idiom as elsewhere in the test suite; if no
+such idiom exists, a loop with a deadline and a 25 ms sleep is acceptable in a test.
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite -- -z "wedge"'`
+
+Expected: FAIL — the set still contains `deviceA` because the failed future never ran the cleanup.
+
+- [ ] **Step 3: Fix defect 1**
+
+In `checkStorageDevice`, change the `.foreach` that consumes the `getStorageDeviceState` future so
+that the `activeDeviceChecks -= storageDeviceId` cleanup runs on both success and failure, and the
+failure is logged. Keep the success path's behaviour exactly as it is.
+
+- [ ] **Step 4: Run the test to verify it passes**
+
+Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
+
+Expected: PASS.
+
+- [ ] **Step 5: Fix defect 2**
+
+In `start()`, wrap the `handleEvent(event)` call so a throwable is logged at error and the loop
+continues:
+
+```scala
+        try
+          handleEvent(event)
+        catch
+          case t: Throwable =>
+            // Without this, any escape from handleEvent terminates the event loop and the host
+            // goes silently deaf while still appearing to run.
+            logger.error(s"Unhandled exception processing event $event: $t", t)
+```
+
+Match the surrounding code's exact loop structure and variable names; the snippet above shows the
+intent, not necessarily the literal surrounding lines.
+
+- [ ] **Step 6: Run the full suite**
+
+Run: `sbt test`
+
+Expected: no new failures.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala \
+        src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala
+git commit -m "Harden the StoreManager event loop
+
+checkStorageDevice leaked its activeDeviceChecks entry when the device state
+lookup failed, permanently wedging later checks of that device -- reachable now
+that a device directory can be discovered before its state is registered. An
+exception escaping handleEvent also killed the event loop with no log line."
+```
+
+---
+
 ## Task 10: Manual verification and TODO cleanup
 
 **Files:**
@@ -1050,7 +1168,8 @@ git commit -m "Remove TODO items completed by runtime storage device discovery"
 
 ## Verification checklist
 
-- [ ] `sbt test` passes with 10 new tests in `StoreManagerDeviceDiscoverySuite`
+- [ ] `sbt test` passes with 11 new tests in `StoreManagerDeviceDiscoverySuite` (10 from the
+      original plan plus the one added by Task 9b)
 - [ ] Device loading logic exists in exactly one place (`tryLoadDevice`, reached only through
       `checkForNewDevices`); `grep -n "listFiles" src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala`
       shows the directory scan only inside `checkForNewDevices` and the per-device child scan

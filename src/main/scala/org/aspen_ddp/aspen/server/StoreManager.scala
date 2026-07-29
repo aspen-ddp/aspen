@@ -335,11 +335,12 @@ class StoreManager(val client: AspenClient,
                 //
                 // The trade is that a throw part-way through a handler leaves whatever that
                 // handler had already mutated half-updated, and LoadStore, Repair and
-                // ShutdownStore each carry a Promise their handler completes, so that promise
-                // stays uncompleted and its awaiter hangs forever. Neither is new -- a dead
-                // loop left both too -- but a dead loop hung everything at once and so was
-                // obvious, whereas now one caller hangs inside a host that still looks
-                // healthy. This log line is the only signal that it happened.
+                // ShutdownStore each carry a Promise completed by the handler or by work the
+                // handler starts, so that promise stays uncompleted and its awaiter hangs
+                // forever. Neither is new -- a dead loop left both too -- but a dead loop hung
+                // everything at once and so was obvious, whereas now one caller hangs inside
+                // a host that still looks healthy. This log line is the only signal that it
+                // happened.
                 //
                 // Only the event class is interpolated: this call is inside the catch, so a
                 // throwing toString on the event's payload would escape and kill the loop
@@ -725,15 +726,26 @@ class StoreManager(val client: AspenClient,
       if ! activeDeviceChecks.contains(storageDeviceId) then
         activeDeviceChecks += storageDeviceId
 
-        // onComplete, and a finally, in both branches below. The entry must be released on
-        // every outcome: a failed lookup, and a throw out of the callback body itself. Both
-        // are reachable -- getStorageDeviceState fails whenever the device has no entry in
-        // the storage-devices tree, which is the state of a config file placed on disk by
-        // hand, copied from another host, or belonging to a device directory moved between
-        // hosts, and it also fails on any transient failure of the metadata read; and check
-        // below touches the filesystem and issues transactions. Releasing the entry only on
-        // success would leave it set forever and skip every later check of that device for
-        // the life of the process.
+        // onComplete, and a finally, in both branches below: the entry must be released on
+        // both outcomes of the lookup, and on a throw out of the callback body itself.
+        // (A synchronous throw from getStorageDeviceState, before the Future exists, would
+        // still leak it. Known, and tracked separately.) Releasing only on success would
+        // leave the entry set forever and skip every later check of that device for the life
+        // of the process.
+        //
+        // Both outcomes are reachable. check above touches the filesystem and issues
+        // transactions, so it can throw. And getStorageDeviceState fails whenever the device
+        // has no entry in the storage-devices tree: a config written out-of-band naming an id
+        // that was never registered -- the supported path cannot produce this, since
+        // StorageDeviceManager.createStorageDevice commits the registration before writing
+        // the config file, so its orphan is the reverse one, a registration with no directory
+        // (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree entry removed
+        // after the fact, which no command does today. It also fails on any failure of the
+        // metadata read itself, transient or not, which is the only routinely reachable case.
+        //
+        // A copied or moved config is NOT one of these: its device is registered, so the
+        // lookup succeeds. A config carried to another host then takes check's hostId
+        // mismatch branch above, which is the designed host-migration path, not a warn.
         storageDevices.get(storageDeviceId) match
           case Some(local) =>
             client.getStorageDeviceState(storageDeviceId).onComplete: result =>
@@ -757,8 +769,8 @@ class StoreManager(val client: AspenClient,
                       remote.stores.keysIterator.foreach: storeId =>
                         offlineStores += storeId
                     case Failure(err) =>
-                      logger.warn(s"Failed to read state for unloaded storage device $storageDeviceId. It may " +
-                                  s"not be registered in the storage-devices tree. Error: $err")
+                      logger.warn(s"Failed to read state for unloaded storage device $storageDeviceId. It may not " +
+                                  s"be registered in the storage-devices tree. Error: $err")
                 finally
                   activeDeviceChecks -= storageDeviceId
 

@@ -372,12 +372,13 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     mgr.loadedDevices.keySet should be(Set(deviceA))
 
     // deviceA is on disk but absent from the StorageDevicesTree the TestNetwork bootstrapped,
-    // so getStorageDeviceState fails with NoSuchElementException. That is the state of a
-    // device config on disk with no entry in the storage-devices tree, which arrives by
-    // several routes -- a config placed by hand or copied from another host, as in the
-    // second-directory test above, or a device directory moved between hosts -- and it is
-    // also what any transient failure of the metadata read looks like from here. The failure
-    // must still release the activeDeviceChecks entry.
+    // so getStorageDeviceState fails with NoSuchElementException. In production that exact
+    // state -- a device on disk with no entry in the storage-devices tree -- means a config
+    // written out-of-band naming an id that was never registered, or a tree entry removed
+    // after the fact; neither is something a command produces. What is routinely reachable
+    // is not that state at all but a failed metadata read, which arrives here identically.
+    // (A copied or moved config is not one of these: its device is registered, so the lookup
+    // succeeds.) The failure must still release the activeDeviceChecks entry.
     mgr.testingOnlyCheckAllDevices()
 
     yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>

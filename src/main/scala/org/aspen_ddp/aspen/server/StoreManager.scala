@@ -251,7 +251,9 @@ class StoreManager(val client: AspenClient,
       catch
         case t: Throwable => logger.warn(s"Failed to load storage device found at path $sdFile. Error: $t")
 
-  private def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: File): Unit =
+  // protected so tests can subclass with a recording implementation instead of opening a
+  // real RocksDB backend. `stores` and `storageDevices` are already protected.
+  protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: File): Unit =
     val storeCfgPath = potentialStoreFile.toPath.resolve(StoreConfig.configFilename)
     if Files.exists(storeCfgPath) then
       try

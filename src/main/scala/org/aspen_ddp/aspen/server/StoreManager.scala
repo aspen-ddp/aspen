@@ -281,9 +281,12 @@ class StoreManager(val client: AspenClient,
                   logger.info(s"Loading storage device $sdFile. StorageDeviceId ${sds.storageDeviceId}")
                   storeFiles.foreach: potentialStoreFile =>
                     tryLoadStore(sds, potentialStoreFile)
-                  // Registered only once the stores are loaded. If anything above throws, the
-                  // catch below logs it and the device stays unregistered, so the next scan
-                  // retries the whole device rather than skipping it as already loaded.
+                  // Registered only after every child has been offered to tryLoadStore. If
+                  // anything above throws, the catch below logs it and the device stays
+                  // unregistered, so the next scan retries the whole device rather than
+                  // skipping it as already loaded. That retry re-offers children whose
+                  // LoadStore events are already queued; tryLoadStore's own catch absorbs the
+                  // resulting duplicate-backend failures.
                   storageDevices += sdCfg.storageDeviceId -> sds
       catch
         case t: Throwable => logger.warn(s"Failed to load storage device found at path $sdFile. Error: $t")

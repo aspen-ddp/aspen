@@ -72,8 +72,11 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    *  see it set clears it and throws, modelling a device that dies part-way through loading
    *  its stores (a yanked hot-plug disk, an IO error).
    *
-   *  Boxed and lazy for the same initialization-order reason as storeLoadAttempts: a plain
-   *  `var` in this body would still hold its default when StoreManager's constructor scan runs.
+   *  Boxed and lazy for the same initialization-order reason as storeLoadAttempts. A plain
+   *  `var` in this body would still hold `false` during StoreManager's constructor scan and
+   *  would then be assigned after it, arming the failure for the first rescan instead. The
+   *  constructor parameter it reads is safe: parameters are assigned before the superclass
+   *  constructor runs.
    */
   private lazy val storeLoadFailureOwed = new AtomicBoolean(failFirstStoreLoad)
 

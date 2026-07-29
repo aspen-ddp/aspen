@@ -319,3 +319,22 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     mgr.testingOnlyCheckAllDevices()
 
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+
+  atest("stores on a newly discovered device are loaded"):
+    val hostRoot = newHostDir()
+    val mgr = newManager(hostRoot)
+
+    mgr.storeLoadAttempts should be(empty)
+
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val storeDir = deviceDir.resolve("11111111-1111-1111-1111-111111111111:0")
+    Files.createDirectories(storeDir)
+
+    mgr.testingOnlyCheckAllDevices()
+
+    mgr.loadedDevices.keySet should be(Set(deviceA))
+    // tryLoadDevice offers every child of the device directory to tryLoadStore: here the
+    // device config file and the store directory. The real tryLoadStore would load neither --
+    // it requires a store config file inside the candidate, and the config file is not a
+    // directory while the store directory is empty -- but the recording override takes both.
+    Future.successful(mgr.storeLoadAttempts.toList should contain((deviceA, storeDir)))

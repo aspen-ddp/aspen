@@ -154,6 +154,20 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     Files.createDirectories(dir)
     dir
 
+  /** Returns a Future that completes once `condition` holds, re-testing it after every yield
+   *  back to the test's ExecutionContext, and giving up after `maxYields` of them.
+   *
+   *  ScalaTest's async ExecutionContext is single threaded and is the same thread that runs the
+   *  test body: queued work only runs while the test is waiting on the Future it returned. A
+   *  sleeping wait here would therefore starve the very callback being waited for; yielding
+   *  lets everything queued ahead of us run instead.
+   */
+  private def yieldUntil(maxYields: Int = 100)(condition: => Boolean): Future[Unit] =
+    if condition || maxYields == 0 then
+      Future.unit
+    else
+      Future(()).flatMap(_ => yieldUntil(maxYields - 1)(condition))
+
   private def newManager(hostRoot: Path, failFirstStoreLoad: Boolean = false): RecordingStoreManager =
     new RecordingStoreManager(client, systemId, hostRoot, executionContext,
                               net.objectCacheFactory, net, net.FinalizerFactory,
@@ -344,3 +358,24 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     // it requires a store config file inside the candidate, and the config file is not a
     // directory while the store directory is empty -- but the recording override takes both.
     Future.successful(mgr.storeLoadAttempts.toList should contain((deviceA, storeDir)))
+
+  atest("a device check that fails does not wedge later checks of the same device"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
+    mgr.loadedDevices.keySet should be(Set(deviceA))
+
+    // deviceA is on disk but absent from the StorageDevicesTree the TestNetwork bootstrapped,
+    // so getStorageDeviceState fails with NoSuchElementException -- exactly the state of a
+    // device directory discovered before its StorageDeviceState is registered. The failure
+    // must still release the activeDeviceChecks entry.
+    mgr.testingOnlyCheckAllDevices()
+
+    yieldUntil()(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      mgr.testingOnlyActiveDeviceChecks should be(empty)
+
+      // And the release lets a later check of the same device start rather than being skipped
+      // forever by the in-progress guard.
+      mgr.testingOnlyCheckAllDevices()
+      mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))

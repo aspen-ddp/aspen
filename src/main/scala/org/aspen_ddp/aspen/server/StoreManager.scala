@@ -320,7 +320,14 @@ class StoreManager(val client: AspenClient,
         while !shutdownCalled do
           var event = events.poll(3, TimeUnit.SECONDS)
           while (event != null)
-            handleEvent(event)
+            try
+              handleEvent(event)
+            catch
+              case t: Throwable =>
+                // Nothing consumes the Future this Runnable was submitted with, so without
+                // this the escape would terminate the event loop with no log line at all and
+                // the host would go silently deaf while still appearing to run.
+                logger.error(s"Unhandled exception processing event $event: $t", t)
             event = events.poll(0, TimeUnit.SECONDS)
     })
 
@@ -701,19 +708,29 @@ class StoreManager(val client: AspenClient,
       if ! activeDeviceChecks.contains(storageDeviceId) then
         activeDeviceChecks += storageDeviceId
 
+        // onComplete rather than foreach in both branches below: the lookup fails for a device
+        // that has no StorageDeviceState registered yet, and dropping the entry from
+        // activeDeviceChecks only on success would skip every later check of that device.
         storageDevices.get(storageDeviceId) match
           case Some(local) =>
-            client.getStorageDeviceState(storageDeviceId).foreach: remote =>
+            client.getStorageDeviceState(storageDeviceId).onComplete: result =>
               synchronized:
-                check(local, remote)
+                result match
+                  case Success(remote) => check(local, remote)
+                  case Failure(err) =>
+                    logger.warn(s"Failed to read state for storage device $storageDeviceId. Error: $err")
                 activeDeviceChecks -= storageDeviceId
           case None =>
             // Find out what stores are on the offline/failed store and add them to our offlineStores
             // set. We don't want to send "UnknownStore" responses while the device is down
-            client.getStorageDeviceState(storageDeviceId).foreach: remote =>
+            client.getStorageDeviceState(storageDeviceId).onComplete: result =>
               synchronized:
-                remote.stores.keysIterator.foreach: storeId =>
-                  offlineStores += storeId
+                result match
+                  case Success(remote) =>
+                    remote.stores.keysIterator.foreach: storeId =>
+                      offlineStores += storeId
+                  case Failure(err) =>
+                    logger.warn(s"Failed to read state for unloaded storage device $storageDeviceId. Error: $err")
                 activeDeviceChecks -= storageDeviceId
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
@@ -803,6 +820,10 @@ class StoreManager(val client: AspenClient,
    *  testingOnlyCheckAllDevices for why this bypasses the event queue. */
   private[aspen] def testingOnlyHandleHostMessage(msg: HostMessage): Unit =
     handleEvent(HostMsg(msg))
+
+  /** Testing hook: the devices whose checks checkStorageDevice currently considers in flight. */
+  private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =
+    synchronized(activeDeviceChecks)
 
   private def handleEvent(event: Event): Unit = synchronized {
     event match {

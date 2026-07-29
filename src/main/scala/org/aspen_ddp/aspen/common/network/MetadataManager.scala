@@ -217,7 +217,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
         client.getHostState(hostId).onComplete:
           case Failure(err) =>
             logger.error(s"HostState lookup failed for hostId $hostId. Error: $err")
-            hosts -= hostId
+            synchronized:
+              hosts -= hostId
           case Success(hostState) =>
             synchronized:
               hosts += hostId -> Right(networkImplInterface.createHostEntry(
@@ -242,7 +243,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
         client.getStoragePoolState(storeId.poolId).onComplete:
           case Failure(err) =>
             logger.error(s"StoragePool lookup failed for poolId ${storeId.poolId}. Error: $err")
-            pendingPoolLookups -= storeId.poolId
+            synchronized:
+              pendingPoolLookups -= storeId.poolId
           case Success(poolState) =>
             synchronized:
               pendingPoolLookups -= storeId.poolId

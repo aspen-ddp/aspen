@@ -63,6 +63,11 @@ object Main {
   val DefaultCnCPort: Int = 4751
   val DefaultStoreTransferPort: Int = 4752
 
+  // How often a running host rescans for storage devices it has not yet loaded. host() gives
+  // this to its StoreManager, and create-storage-device quotes it when telling the user how
+  // long an un-notified host may take to pick up a new device, so the two cannot drift.
+  val CheckStorageDevicesPeriod: Duration = Duration(1, HOURS)
+
   case class Args(mode:String="",
                   hostDirectory:File=null,
                   targetDirectory:File=null,
@@ -934,7 +939,6 @@ object Main {
     val txHeartbeatPeriod = Duration(5, SECONDS)
     val txRetryDelay = Duration(100, MILLISECONDS) //
     val txRetryCap = Duration(3, SECONDS)
-    val checkStorageDevicesPeriod = Duration(1, HOURS)
     //val allocHeartbeatPeriod   = Duration(3, SECONDS)
     //val allocTimeout           = Duration(4, SECONDS)
     //val allocStatusQueryPeriod = Duration(1, SECONDS)
@@ -954,7 +958,7 @@ object Main {
       txFinalizerFactory,
       SimpleTransactionDriver.factory(txRetryDelay, txRetryCap),
       txHeartbeatPeriod,
-      checkStorageDevicesPeriod
+      CheckStorageDevicesPeriod
     ) with SimpleDriverRecoveryMixin
 
     networkBridge.onode = Some(storeManager)
@@ -1443,24 +1447,28 @@ object Main {
         case e =>
           println(s"Error creating storage device: ${e.getMessage}")
 
+      // How long the user waits for the notification below to leave this process, and how long
+      // ZMQ is then given to put it on the wire before the process exits.
+      val notificationDrainTimeout = Duration(5, SECONDS)
+      val notificationSendLinger = Duration(1, SECONDS)
+
       awaitAndReport(f):
         case Success(deviceId) =>
           println(s"Created storage device ${deviceId.uuid} at $deviceDirectory")
-          // Best-effort nudge so the host loads the device now rather than on its next
-          // periodic storage-device check. StoreManager rescans storage-devices/ when a
-          // CheckStorageDevice names a device it has not loaded, so no new message type is
-          // needed. Losing this costs at most one check period (an hour, as host() configures
-          // it); it is never a requirement. The drain matters because sendHostMessage only
-          // enqueues -- see ZMQNet.
+          // Best-effort nudge so the host loads the device now rather than on its next periodic
+          // storage-device check. Losing it costs at most one check period and is never a
+          // requirement, so nothing here may fail the command. See
+          // ZMQNet.awaitHostMessagesSent for why the drain and linger are needed.
           client.sendHostMessage(CheckStorageDevice(hostCfg.hostId, client.clientId, deviceId))
-          val flushed = network.awaitHostMessagesSent(hostCfg.hostId, Duration(5, SECONDS))
-          network.shutdown(Duration(1, SECONDS))
+          val flushed = network.awaitHostMessagesSent(hostCfg.hostId, notificationDrainTimeout)
           if flushed then
-            println(s"Sent a device-check notification to host '${hostCfg.name}'. If it does not " +
-                    "arrive, the host will load the device on its next periodic storage-device check.")
+            println(s"Sent a device-check notification to host '${hostCfg.name}'; it should load " +
+                    "the device shortly.")
           else
-            println(s"Could not reach host '${hostCfg.name}'. It will load the device on its next " +
-                    "periodic storage-device check.")
+            println(s"Could not confirm the notification reached host '${hostCfg.name}'. A running " +
+                    s"host loads the device within $CheckStorageDevicesPeriod; restarting it loads " +
+                    "the device immediately.")
+          network.shutdown(notificationSendLinger)
         case Failure(err) => reportError(err)
   }
 

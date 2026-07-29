@@ -24,6 +24,11 @@ object ZMQNet:
                      dataPort: Int,
                      cncPort: Int,
                      storeTransferPort: Int) extends MetadataManager.HostEntry(hostId, name, address, dataPort, cncPort, storeTransferPort) with Logging:
+    // Unless noted otherwise, the state below is read and written only by the zmq-io thread and
+    // is published without synchronization. Reading one of these fields from another thread
+    // requires making it volatile first -- see odealer. pendingMessages is the exception: it is
+    // a concurrent queue and is deliberately added to from other threads.
+    //
     // Written by the zmq-io thread outside of any lock. Volatile because awaitHostMessagesSent
     // reads it from the caller's thread and would otherwise have no happens-before edge with
     // that write. The referenced Option is immutable, so publishing the reference is enough.
@@ -103,6 +108,10 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
   // Appended to and never drained: one entry per dealer created, normally one per host this
   // process talks to.
   private val connectedDealers = new ConcurrentLinkedQueue[ZMQ.Socket]()
+
+  // Set by shutdown() so the IO thread can tell deliberate context teardown from a real network
+  // failure and exit quietly instead of logging and trying to recover on a dead context.
+  @volatile private var shuttingDown = false
 
   private val sendQueueSocket = context.createSocket(SocketType.DEALER)
   sendQueueSocket.bind("inproc://send-message-queued")
@@ -190,6 +199,14 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
    *  establishes only that ZMQNet is no longer holding the message, which is exactly what a
    *  short-lived process would otherwise abandon on exit. Note also that a host whose lookup
    *  was never started, or whose lookup failed, never resolves, so this simply times out.
+   *
+   *  A false return is not a command failure. It means only that the message may not have left
+   *  this process; the caller should report degraded latency rather than an error, since the
+   *  receiving host's periodic polling remains the correctness guarantee.
+   *
+   *  A short-lived process should follow this with shutdown() before exiting: draining ZMQNet's
+   *  own queues only hands the message to ZMQ, and shutdown() is what gives ZMQ a window to put
+   *  it on the wire.
    */
   def awaitHostMessagesSent(hostId: HostId, timeout: Duration): Boolean =
     val deadline = System.nanoTime() + timeout.toNanos
@@ -208,7 +225,9 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
   /** Closes the ZMQ context, allowing buffered outbound data up to `linger` to flush.
    *
    *  Intended for short-lived processes on their way out; a long-running host keeps its network
-   *  up for the life of the process.
+   *  up for the life of the process. Call awaitHostMessagesSent() first: this only bounds how
+   *  long ZMQ may spend flushing what it already holds, so anything still sitting in ZMQNet's
+   *  own queues when this is called is discarded rather than flushed.
    *
    *  Linger is set on each dealer individually because ZContext propagates its own linger
    *  setting to sockets only as it creates them and closes them without re-applying it, so
@@ -217,10 +236,15 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
    *  process is terminating.
    */
   def shutdown(linger: Duration): Unit =
+    shuttingDown = true
     val lingerMillis = linger.toMillis.toInt
     connectedDealers.forEach: dealer =>
       try
-        dealer.setLinger(lingerMillis)
+        // jeromq reports an already-terminated context by returning false rather than throwing.
+        // The socket then keeps the linger ZContext gave it at creation, which is zero, so the
+        // flush window this method exists to provide is silently lost.
+        if !dealer.setLinger(lingerMillis) then
+          logger.debug("setLinger returned false during shutdown; dealer will not linger")
       catch
         case t: Throwable => logger.debug(s"Failed to set linger during shutdown: $t")
     context.close()
@@ -297,112 +321,123 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
     val heartBeatPeriodMillis = heartbeatPeriod.toMillis.toInt
     var nextHeartbeat = System.currentTimeMillis() + heartBeatPeriodMillis
 
-    while !Thread.currentThread().isInterrupted do
-      val now = System.currentTimeMillis()
+    // Once the context has been terminated the poll, recv and send calls below can all throw.
+    // When shutdown() did the terminating that is expected rather than a failure, so unwind to
+    // here and let the thread run off its normal end instead of dying with a stack trace on
+    // stderr. Anything thrown while not shutting down propagates exactly as it did before.
+    try
+      while !Thread.currentThread().isInterrupted do
+        val now = System.currentTimeMillis()
 
-      if now >= nextHeartbeat then
-        nextHeartbeat = now + heartBeatPeriodMillis
-        heartbeat(hostsArray)
+        if now >= nextHeartbeat then
+          nextHeartbeat = now + heartBeatPeriodMillis
+          heartbeat(hostsArray)
 
-      try
-        val timeToNextHB = nextHeartbeat - now
-        if timeToNextHB > 0 then
-          poller.poll(timeToNextHB)
-      catch
-        case e: Throwable =>
-          logger.warn(s"Poll method threw an exception. Creating a new poller. Error: $e")
-          rebuildPoller()
-
-      // Process messages from dealer sockets (connected hosts)
-      for i <- hostsArray.indices do
-        if poller.pollin(i) then
-          hostsArray(i).odealer.foreach: dealer =>
-            var msg = dealer.recv(ZMQ.DONTWAIT)
-            while msg != null do
-              try
-                decodeAndDispatch(msg, None)
-              catch
-                case t: Throwable => logger.error(s"Error in decodeAndDispatch (dealer): $t", t)
-              msg = dealer.recv(ZMQ.DONTWAIT)
-
-      // Drain send queue wake signals
-      if poller.pollin(hostsArray.length) then
-        var msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
-        while msg != null do
-          msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
-
-      // Process router messages (if server node)
-      orouterSocket.foreach: router =>
-        if poller.pollin(hostsArray.length + 1) then
-          var from = router.recv(ZMQ.DONTWAIT)
-          var msg = router.recv(ZMQ.DONTWAIT)
-          while from != null && msg != null do
-            try
-              decodeAndDispatch(msg, Some(from))
-            catch
-              case t: Throwable => logger.error(s"Error in decodeAndDispatch (router): $t", t)
-            from = router.recv(ZMQ.DONTWAIT)
-            msg = router.recv(ZMQ.DONTWAIT)
-
-      // Process send queue items
-      var qmsg = sendQueue.poll()
-      while qmsg != null do
-        qmsg match
-          case SendToStore(storeId, msg) =>
-            metadataManager.getHostEntryOrQueueMessage(storeId, msg) match
-              case Some(hostEntry) =>
-                hostEntry.odealer match
-                  case Some(dealer) =>
-                    dealer.send(ProtobufMessageCodec.encodeMessage(msg))
-                  case None =>
-                    hostEntry.pendingMessages.add(msg)
-              case None =>
-                // MetadataManager queued the message for later delivery
-
-          case SendToHost(hostId, msg) =>
-            metadataManager.getHostEntryOrQueueMessage(hostId, msg) match
-              case Some(hostEntry) =>
-                hostEntry.odealer match
-                  case Some(dealer) =>
-                    dealer.send(ProtobufMessageCodec.encodeMessage(msg))
-                  case None =>
-                    hostEntry.pendingMessages.add(msg)
-              case None =>
-                // MetadataManager queued the message for later delivery
-
-          case SendToClient(msg) =>
-            clients.get(msg.toClient).foreach: zmqIdentity =>
-              orouterSocket.foreach: router =>
-                router.send(zmqIdentity, ZMQ.SNDMORE)
-                router.send(ProtobufMessageCodec.encodeMessage(msg))
-
-          case NewHostAvailable(entry) =>
-            val dealer = context.createSocket(SocketType.DEALER)
-            dealer.setIdentity(clientId.toBytes)
-            dealer.connect(s"tcp://${entry.address}:${entry.dataPort}")
-            entry.odealer = Some(dealer)
-            entry.opollItem = Some(new PollItem(dealer, ZMQ.Poller.POLLIN))
-            connectedDealers.add(dealer)
-
-            // Send initial heartbeat if we are a server node
-            oheartbeatMessage.foreach(dealer.send(_))
-
-            // Drain any pending messages
-            var pending = entry.pendingMessages.poll()
-            while pending != null do
-              dealer.send(ProtobufMessageCodec.encodeMessage(pending))
-              pending = entry.pendingMessages.poll()
-
-            connectedHosts += entry
+        try
+          val timeToNextHB = nextHeartbeat - now
+          if timeToNextHB > 0 then
+            poller.poll(timeToNextHB)
+        catch
+          // Guarded because shutdown() closing the context also makes poll() fail. That is not
+          // a fault worth reporting, and a poller rebuilt on a dead context could not work
+          // anyway, so leave that case to the handler below.
+          case e: Throwable if !shuttingDown =>
+            logger.warn(s"Poll method threw an exception. Creating a new poller. Error: $e")
             rebuildPoller()
 
-          case ProcessPendingMessages(entry) =>
-            entry.odealer.foreach: dealer =>
+        // Process messages from dealer sockets (connected hosts)
+        for i <- hostsArray.indices do
+          if poller.pollin(i) then
+            hostsArray(i).odealer.foreach: dealer =>
+              var msg = dealer.recv(ZMQ.DONTWAIT)
+              while msg != null do
+                try
+                  decodeAndDispatch(msg, None)
+                catch
+                  case t: Throwable => logger.error(s"Error in decodeAndDispatch (dealer): $t", t)
+                msg = dealer.recv(ZMQ.DONTWAIT)
+
+        // Drain send queue wake signals
+        if poller.pollin(hostsArray.length) then
+          var msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
+          while msg != null do
+            msg = sendQueueSocket.recv(ZMQ.DONTWAIT)
+
+        // Process router messages (if server node)
+        orouterSocket.foreach: router =>
+          if poller.pollin(hostsArray.length + 1) then
+            var from = router.recv(ZMQ.DONTWAIT)
+            var msg = router.recv(ZMQ.DONTWAIT)
+            while from != null && msg != null do
+              try
+                decodeAndDispatch(msg, Some(from))
+              catch
+                case t: Throwable => logger.error(s"Error in decodeAndDispatch (router): $t", t)
+              from = router.recv(ZMQ.DONTWAIT)
+              msg = router.recv(ZMQ.DONTWAIT)
+
+        // Process send queue items
+        var qmsg = sendQueue.poll()
+        while qmsg != null do
+          qmsg match
+            case SendToStore(storeId, msg) =>
+              metadataManager.getHostEntryOrQueueMessage(storeId, msg) match
+                case Some(hostEntry) =>
+                  hostEntry.odealer match
+                    case Some(dealer) =>
+                      dealer.send(ProtobufMessageCodec.encodeMessage(msg))
+                    case None =>
+                      hostEntry.pendingMessages.add(msg)
+                case None =>
+                  // MetadataManager queued the message for later delivery
+
+            case SendToHost(hostId, msg) =>
+              metadataManager.getHostEntryOrQueueMessage(hostId, msg) match
+                case Some(hostEntry) =>
+                  hostEntry.odealer match
+                    case Some(dealer) =>
+                      dealer.send(ProtobufMessageCodec.encodeMessage(msg))
+                    case None =>
+                      hostEntry.pendingMessages.add(msg)
+                case None =>
+                  // MetadataManager queued the message for later delivery
+
+            case SendToClient(msg) =>
+              clients.get(msg.toClient).foreach: zmqIdentity =>
+                orouterSocket.foreach: router =>
+                  router.send(zmqIdentity, ZMQ.SNDMORE)
+                  router.send(ProtobufMessageCodec.encodeMessage(msg))
+
+            case NewHostAvailable(entry) =>
+              val dealer = context.createSocket(SocketType.DEALER)
+              dealer.setIdentity(clientId.toBytes)
+              dealer.connect(s"tcp://${entry.address}:${entry.dataPort}")
+              entry.odealer = Some(dealer)
+              entry.opollItem = Some(new PollItem(dealer, ZMQ.Poller.POLLIN))
+              connectedDealers.add(dealer)
+
+              // Send initial heartbeat if we are a server node
+              oheartbeatMessage.foreach(dealer.send(_))
+
+              // Drain any pending messages
               var pending = entry.pendingMessages.poll()
               while pending != null do
                 dealer.send(ProtobufMessageCodec.encodeMessage(pending))
                 pending = entry.pendingMessages.poll()
 
-        qmsg = sendQueue.poll()
+              connectedHosts += entry
+              rebuildPoller()
+
+            case ProcessPendingMessages(entry) =>
+              entry.odealer.foreach: dealer =>
+                var pending = entry.pendingMessages.poll()
+                while pending != null do
+                  dealer.send(ProtobufMessageCodec.encodeMessage(pending))
+                  pending = entry.pendingMessages.poll()
+
+          qmsg = sendQueue.poll()
+    catch
+      case t: Throwable if shuttingDown =>
+        logger.trace(s"ZMQNet.ioThread exiting during shutdown(): $t")
 
     logger.trace("ZMQNet.ioThread EXITING")

@@ -28,10 +28,6 @@ synchronous throw
   - Low probability; not guarded because the fix wants a seam that lets a test
     make the call throw
 
-Add a CnC message to instruct a host to call checkStorageDevices
-  - Send this message when a new device is created so we don't have to wait
-    for a polling period to elapse before the host notices
-
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying
   - Use pluggable trait that has just the methods BaseReadDriver needs
@@ -50,10 +46,6 @@ Validate/fix ./t script running in script directory
   - This could break usage of relative paths given to sub commands
   - Probably as easy as saving the original path and switching back to it before
     invoking the wrapped command line process
-
-Update add-storage-device to send a new NewDeviceAdded HostMessage
-  - Send to host after new device successfully created
-  - Host immediately invokes checkForNewDevices() upon reception
 
 ---------
 

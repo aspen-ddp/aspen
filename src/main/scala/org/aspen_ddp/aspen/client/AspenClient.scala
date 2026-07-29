@@ -15,6 +15,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, uuid2byte}
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
+import scribe.Logging
 
 import java.nio.charset.StandardCharsets
 import java.util.UUID
@@ -26,7 +27,7 @@ object AspenClient:
   class InvalidDeviceSetLevel(childLevel: Int, parentLevel: Int)
     extends Exception(s"Device set level $childLevel must be less than parent level $parentLevel")
 
-trait AspenClient extends ObjectReader:
+trait AspenClient extends ObjectReader with Logging:
   
   import AspenClient.*
   
@@ -301,6 +302,15 @@ trait AspenClient extends ObjectReader:
 
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
   private[aspen] def sendHostMessage(msg: HostMessage): Unit
+
+  /** Sends a message that is purely a latency optimization: the receiving host reaches the
+   *  same state on its own through its periodic polling, just later. A failure to send one
+   *  must therefore never fail the operation that produced it.
+   */
+  private[aspen] def sendBestEffortHostMessage(msg: HostMessage): Unit =
+    try sendHostMessage(msg)
+    catch
+      case t: Throwable => logger.warn(s"Failed to send best-effort host message $msg: $t")
 
   def sendServiceMessage(serviceUUID: UUID, encodedContent: Array[Byte]): Future[Unit] =
     given ExecutionContext = clientContext

@@ -286,7 +286,7 @@ abstract class BaseAspenClient(
     // Pool creation has no special recovery handling, so onFail is a no-op. For the production
     // client this is equivalent to the previous transactUntilSuccessful (retry, no recovery);
     // for the test client runCreate performs a single attempt.
-    runCreate(_ => Future.unit): tx =>
+    val f = runCreate(_ => Future.unit): tx =>
       given Transaction = tx
 
       def createPoolObj(alloc: ObjectAllocator): Future[KeyValueObjectPointer] =
@@ -331,7 +331,7 @@ abstract class BaseAspenClient(
             DeviceUpdate(storageDeviceId, devPtr, devKvos, stores, StorageDeviceState(devKvos))
         }.toList
 
-      def updateDevice(du: DeviceUpdate): Unit =
+      def updateDevice(du: DeviceUpdate): CheckStorageDevice =
         val updates = du.stores.map { storeId =>
           storeId -> StorageDeviceState.StoreEntry(
             StorageDeviceState.StoreStatus.Initializing,
@@ -346,13 +346,15 @@ abstract class BaseAspenClient(
 
         tx.update(du.pointer, None, None, reqs, ops)
 
-        tx.result.foreach: _ =>
-          val msg = CheckStorageDevice(
-            du.state.hostId,
-            clientId,
-            du.storageDeviceId
-          )
-          sendHostMessage(msg)
+        // Built here, sent by the map below once the transaction has committed. Registering
+        // this on tx.result instead would send it from a task the returned future does not
+        // wait on: tx.commit() hands back the same promise as tx.result, so a caller that
+        // exits the moment this future completes could lose the message.
+        CheckStorageDevice(
+          du.state.hostId,
+          clientId,
+          du.storageDeviceId
+        )
 
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
@@ -363,7 +365,7 @@ abstract class BaseAspenClient(
         setPtr <- getStorageDeviceSetPointer(config.storageDeviceSet)
         setDos <- read(setPtr)
       yield
-        devUpdates.foreach(updateDevice)
+        val nudges = devUpdates.map(updateDevice)
 
         // Record the pool in the device set's assignedPools (reverse of the pool's
         // storageDeviceSet reference). Idempotent so transaction retries are safe.
@@ -372,7 +374,13 @@ abstract class BaseAspenClient(
           val updatedSet = setState.copy(assignedPools = config.poolId :: setState.assignedPools)
           tx.overwrite(setPtr, setDos.revision, DataBuffer(updatedSet.toBytes))
 
-        config.poolId
+        // Each retry attempt builds its own list and only the successful attempt's value
+        // reaches the map below, so a retried transaction cannot double-send.
+        (config.poolId, nudges)
+
+    f.map: (poolId, nudges) =>
+      nudges.foreach(sendBestEffortHostMessage)
+      poolId
 
   // ---- Misc plumbing ----
 

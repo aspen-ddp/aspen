@@ -184,28 +184,36 @@ periodic check. Commands that sent no nudges normally never see it.
 
 ## Testing
 
-**The ordering property is the part worth testing, and `TestNetwork` already
-captures it.** `TestNetwork`'s client messenger records every `sendHostMessage`
-into `capturedHostMessages` (`TestNetwork.scala:162`). An integration test
-asserts the nudges are present as soon as the `createNewStoragePool` and
-`transferStore` futures complete.
+**The ordering property cannot be tested here, and the tests do not claim to.**
+`TestNetwork`'s client messenger records every `sendHostMessage` into
+`capturedHostMessages` (`TestNetwork.scala:162`), so an integration test can
+assert the nudges are present as soon as the `createNewStoragePool` and
+`transferStore` futures complete. But that assertion holds whether or not the
+fix is in place, and this was confirmed empirically: reverting both client
+methods to the detached `tx.result.foreach` and re-running the suite leaves
+both tests passing.
 
-**This test is a regression guard, not a red-green demonstration of the bug.**
-It passes both before and after section 1, and the reason is worth recording.
 `IntegrationTestSuite` extends `AsyncFunSuite`, whose `executionContext` is
-serial. The detached `tx.result.foreach` callback is submitted to that queue
-when the commit promise completes, and the test's own assertion continuation
-can only be enqueued afterwards — it is reached by resolving the outer future,
-which is itself a continuation behind the same queue. So the callback has
-always run by the time the assertions execute, whichever order the promise
-dispatches its two listeners in.
+serial. The detached callback is submitted to that queue when the commit
+promise completes, and the test's own assertion continuation can only be
+enqueued afterwards — it is reached by resolving the outer future, which is
+itself a continuation behind the same queue. So the callback has always run by
+the time the assertions execute, whichever order the promise dispatches its two
+listeners in. The queue erases the very distinction the test would need to see.
 
 The bug needs a genuinely concurrent `clientContext` to observe, which is what
 the CLI has (`Main.createAmoebaClient`, a three-thread pool) and what
 `TestNetwork` deliberately is not — it asserts single-threaded use in
 `handleEvents`. Building a multi-threaded harness to turn this red is out of
-proportion to the change. The test earns its place by failing if the sends ever
-drift back out of the awaited chain, which is the regression that matters.
+proportion to the change.
+
+So the ordering property is guarded by the comment at `updateDevice` and by
+review, not by a test. That is a real gap and is recorded here rather than
+papered over.
+
+What the tests are still worth keeping for is coverage that did not previously
+exist: that a nudge is sent at all, exactly one per distinct device, addressed
+to the right host with the right device id. They are named for that.
 
 **The `MetadataManager` additions** are unit-testable in the style of the
 existing `peekHostEntry` coverage: park a message behind a pending lookup and

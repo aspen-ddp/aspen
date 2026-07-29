@@ -24,7 +24,7 @@
 | `src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerTestFixture.scala` | Create | Shared test fixture: the recording client and the temp bootstrap config that two `MetadataManager` suites both need. |
 | `src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerPeekHostEntrySuite.scala` | Modify | Loses its private copy of the fixture; keeps its tests unchanged. |
 | `src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerDrainSuite.scala` | Create | Unit coverage for the two new accessors, including the failure paths that drop parked messages. |
-| `src/test/scala/org/aspen_ddp/aspen/client/DeviceCheckNudgeSuite.scala` | Create | Integration regression guard: both client methods have sent their nudges by the time their futures complete. |
+| `src/test/scala/org/aspen_ddp/aspen/client/DeviceCheckNudgeSuite.scala` | Create | Integration coverage that each client method sends exactly one correctly-addressed nudge per device. Does not, and cannot, test send ordering — see Task 1. |
 | `TODO.txt` | Modify | The completed item is removed. |
 
 **Ordering:** Tasks 1 and 2 (the client restructure) come first because nothing downstream is meaningful without them — a drain added to a process that has not yet enqueued its nudge observes an empty queue and reports success. Task 3 is a pure test refactor that Task 4 depends on. Task 5 changes `ZMQNet` and `Main` together because deleting `awaitHostMessagesSent` breaks `Main`'s compile until its call site is updated.
@@ -42,7 +42,9 @@
 
 **Background:** `TransactionImpl.commit()` returns the *same* promise as `TransactionImpl.result` (documented at `TransactionImpl.scala:131-136`). So today's `tx.result.foreach { ... sendHostMessage(msg) }` is a second, independent listener on that promise. On the CLI's three-thread `clientContext` there is no ordering between it and the continuation that resolves the future the CLI awaits. This task removes the second listener.
 
-This test is a **regression guard, not a red-green test.** `IntegrationTestSuite` extends `AsyncFunSuite`, whose `executionContext` is serial, so the detached callback is always queued ahead of the test's own assertion continuation and the test passes before the fix as well as after. The spec records why (`Testing` section). Do not expect a red run in Step 2 below — the step verifies the *suite compiles and runs*, which is what it can honestly verify.
+**These tests do not test the ordering property, and must not claim to.** `IntegrationTestSuite` extends `AsyncFunSuite`, whose `executionContext` is serial, so the detached callback is always queued ahead of the test's own assertion continuation. The tests pass before the fix as well as after — confirmed empirically by reverting both client methods and re-running — and they cannot detect a return to the detached callback either. The spec records why (`Testing` section). Do not expect a red run in Step 2 below; the step verifies the *suite compiles and runs*.
+
+What the tests are worth keeping for is coverage that did not previously exist: a nudge is sent at all, exactly one per distinct device, addressed to the right host with the right device id. They are named for that. The ordering property is guarded by the comment at `stageDeviceUpdate` and by review, not by a test.
 
 - [ ] **Step 1: Write the regression test**
 
@@ -65,16 +67,20 @@ import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext
 
-/** Both of these are regression guards rather than demonstrations of the bug they exist for.
+/** These tests do NOT verify the send-ordering property, and cannot.
  *
- *  The bug is a race: a nudge sent from a detached tx.result callback may not have been sent
- *  when the future the caller awaits completes, so a CLI command that exits at that moment
- *  loses it. Observing the race needs a genuinely concurrent clientContext, which the CLI has
- *  and TestNetwork deliberately does not -- AsyncFunSuite's ExecutionContext is serial, so the
- *  detached callback is always queued ahead of the assertions below.
+ *  The bug they were written alongside is a race: a nudge sent from a detached tx.result
+ *  callback may not have been sent when the future the caller awaits completes, so a CLI
+ *  command that exits at that moment loses it. Observing the race needs a genuinely
+ *  concurrent clientContext, which the CLI has and TestNetwork deliberately does not --
+ *  AsyncFunSuite's ExecutionContext is serial, so a detached callback always runs before the
+ *  assertions below regardless of where the send lives. Verified by reverting the fix and
+ *  re-running: both tests still pass. They cannot detect a return to the detached callback
+ *  either. The ordering property is guarded by the comment at stageDeviceUpdate
+ *  and by review, not by these tests.
  *
- *  What these tests do catch is the sends drifting back out of the chain the returned future
- *  waits on, which is the regression that would silently reintroduce the race.
+ *  What they do verify, which nothing did before: a nudge is sent at all, exactly one per
+ *  distinct device, addressed to the right host with the right device id.
  */
 class DeviceCheckNudgeSuite extends IntegrationTestSuite:
 
@@ -114,20 +120,20 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
     net.takeCapturedHostMessages().collect:
       case m: CheckStorageDevice => m
 
-  atest("createNewStoragePool has sent its device-check nudges when its future completes"):
+  atest("createNewStoragePool sends one device-check nudge per device"):
     given ExecutionContext = executionContext
     // Discard anything bootstrap left behind so the assertions see only this pool's nudges.
     takeNudges()
     for
-      poolId <- client.createNewStoragePool(
+      _ <- client.createNewStoragePool(
                   "nudge-pool",
                   Replication(1, 1),
                   None,
                   RocksDBConfig(),
                   bootstrapSet,
                   0L)
-      // Captured with no intervening await: anything not yet sent at this point is exactly
-      // what a CLI command exiting here would lose.
+      // Bound with no intervening await, so the capture reflects what has been sent at the
+      // moment the future completes.
       nudges =  takeNudges()
       devState <- client.getStorageDeviceState(StorageDeviceId.BootstrapStorageDeviceId)
     yield
@@ -135,7 +141,7 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
       nudges.map(_.toHost) should be(List(devState.hostId))
       nudges.map(_.fromClient) should be(List(client.clientId))
 
-  atest("transferStore has sent its device-check nudge when its future completes"):
+  atest("transferStore sends a device-check nudge to the destination device's host"):
     given ExecutionContext = executionContext
     // TestNetwork ships with a single storage device, so the destination has to be made.
     val hostDir = newHostDir()
@@ -226,7 +232,7 @@ In `src/main/scala/org/aspen_ddp/aspen/client/internal/BaseAspenClient.scala`, r
     // Pool creation has no special recovery handling, so onFail is a no-op. For the production
     // client this is equivalent to the previous transactUntilSuccessful (retry, no recovery);
     // for the test client runCreate performs a single attempt.
-    val f = runCreate(_ => Future.unit): tx =>
+    val fStaged = runCreate(_ => Future.unit): tx =>
       given Transaction = tx
 
       def createPoolObj(alloc: ObjectAllocator): Future[KeyValueObjectPointer] =
@@ -271,7 +277,7 @@ In `src/main/scala/org/aspen_ddp/aspen/client/internal/BaseAspenClient.scala`, r
             DeviceUpdate(storageDeviceId, devPtr, devKvos, stores, StorageDeviceState(devKvos))
         }.toList
 
-      def updateDevice(du: DeviceUpdate): CheckStorageDevice =
+      def stageDeviceUpdate(du: DeviceUpdate): CheckStorageDevice =
         val updates = du.stores.map { storeId =>
           storeId -> StorageDeviceState.StoreEntry(
             StorageDeviceState.StoreStatus.Initializing,
@@ -305,7 +311,7 @@ In `src/main/scala/org/aspen_ddp/aspen/client/internal/BaseAspenClient.scala`, r
         setPtr <- getStorageDeviceSetPointer(config.storageDeviceSet)
         setDos <- read(setPtr)
       yield
-        val nudges = devUpdates.map(updateDevice)
+        val nudges = devUpdates.map(stageDeviceUpdate)
 
         // Record the pool in the device set's assignedPools (reverse of the pool's
         // storageDeviceSet reference). Idempotent so transaction retries are safe.
@@ -316,11 +322,11 @@ In `src/main/scala/org/aspen_ddp/aspen/client/internal/BaseAspenClient.scala`, r
 
         // Each retry attempt builds its own list and only the successful attempt's value
         // reaches the map below, so a retried transaction cannot double-send.
-        (config.poolId, nudges)
+        nudges
 
-    f.map: (poolId, nudges) =>
+    fStaged.map: nudges =>
       nudges.foreach(sendBestEffortHostMessage)
-      poolId
+      config.poolId
 ```
 
 - [ ] **Step 6: Run the suite**
@@ -374,7 +380,7 @@ In `src/main/scala/org/aspen_ddp/aspen/client/AspenClient.scala`, replace the wh
       case e: InvalidDestination => throw StopRetrying(e)
       case e: StoreNotActive => throw StopRetrying(e)
 
-    val f = transactUntilSuccessfulWithRecovery(onFail): tx =>
+    val fStaged = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
 
       for
@@ -433,10 +439,10 @@ In `src/main/scala/org/aspen_ddp/aspen/client/AspenClient.scala`, replace the wh
               destinationId
             )
 
-    f.map(sendBestEffortHostMessage)
+    fStaged.map(sendBestEffortHostMessage)
 ```
 
-Note the yield block's type: the `None` branch throws, so the match — and therefore the block — is a `CheckStorageDevice`, and `f` is a `Future[CheckStorageDevice]`. `f.map(sendBestEffortHostMessage)` gives back the `Future[Unit]` the signature promises.
+Note the yield block's type: the `None` branch throws, so the match — and therefore the block — is a `CheckStorageDevice`, and `fStaged` is a `Future[CheckStorageDevice]`. `fStaged.map(sendBestEffortHostMessage)` gives back the `Future[Unit]` the signature promises.
 
 - [ ] **Step 2: Run the suite**
 

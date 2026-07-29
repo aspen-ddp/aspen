@@ -219,10 +219,10 @@ trait AspenClient extends ObjectReader with Logging:
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: InvalidDestination => throw StopRetrying(e)
       case e: StoreNotActive => throw StopRetrying(e)
-      
-    transactUntilSuccessfulWithRecovery(onFail): tx =>
+
+    val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
-      
+
       for
         pool <- getStoragePool(storeId.poolId)
         poolState <- pool.getState()
@@ -236,13 +236,13 @@ trait AspenClient extends ObjectReader with Logging:
       yield
         if sourceId == destinationId then
           throw InvalidDestination()
-          
+
         srcState.stores.get(storeId) match
           case None => throw StoreNotActive(storeId)
           case Some(entry) =>
             if entry.status != StorageDeviceState.StoreStatus.Active then
               throw StoreNotActive(storeId)
-            
+
             // Update Source Device
             val newSrcEntry = StorageDeviceState.StoreEntry(
               StorageDeviceState.StoreStatus.TransferringOut,
@@ -253,9 +253,9 @@ trait AspenClient extends ObjectReader with Logging:
 
             val srcReqs = List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision))
             val srcOps = List(Insert(StorageDeviceState.StateKey, newSrcState.encode()))
-            
+
             tx.update(srcPtr, None, None, srcReqs, srcOps)
-            
+
             // Update Destination Device
             val newDstEntry = StorageDeviceState.StoreEntry(
               StorageDeviceState.StoreStatus.TransferringIn,
@@ -268,14 +268,20 @@ trait AspenClient extends ObjectReader with Logging:
             val dstOps = List(Insert(StorageDeviceState.StateKey, newDstState.encode()))
 
             tx.update(dstPtr, None, None, dstReqs, dstOps)
-            
-            tx.result.foreach: _ =>
-              val msg = CheckStorageDevice(
-                dstState.hostId,
-                clientId,
-                destinationId
-              )
-              sendHostMessage(msg)
+
+            // Built here, sent by the map below once the transaction has committed.
+            // Registering this on tx.result instead would send it from a task the returned
+            // future does not wait on: tx.commit() hands back the same promise as tx.result,
+            // so a caller that exits the moment this future completes could lose the message.
+            // Each retry attempt builds its own, and only the successful attempt's value
+            // reaches the map below, so a retried transaction cannot double-send.
+            CheckStorageDevice(
+              dstState.hostId,
+              clientId,
+              destinationId
+            )
+
+    fStaged.map(sendBestEffortHostMessage)
 
   def getBootstrapConfig(): Future[String] =
     given ExecutionContext = this.clientContext

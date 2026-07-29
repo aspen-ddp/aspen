@@ -109,6 +109,36 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
         case Some(Right(hostEntry)) => Some(hostEntry)
         case _ => None
 
+  /** Every host entry that has resolved, in no particular order. Excludes hosts whose lookup
+   *  is still pending and hosts never looked up at all.
+   *
+   *  Exists for ZMQNet.awaitPendingMessagesSent, which has to inspect every host rather than
+   *  one named host: its callers cannot name the hosts a message was addressed to. */
+  def resolvedHostEntries: List[T] =
+    synchronized:
+      hosts.values.collect { case Right(hostEntry) => hostEntry }.toList
+
+  /** True if any message is parked behind an unresolved host or pool lookup.
+   *
+   *  A parked message is invisible to a caller inspecting host entries: the host it is
+   *  addressed to has no entry yet, so there is nothing to look at. A drain that ignored this
+   *  would report success while still holding the message -- which is the common case for a
+   *  nudge sent to a host the process has not talked to before.
+   *
+   *  Note that a failed host or pool lookup drops the entry and everything parked on it (see
+   *  peekHostEntry's scaladoc for the host case), so this can go false because the message was
+   *  discarded rather than sent. Nothing at this layer can tell the two apart. */
+  def hasParkedMessages: Boolean =
+    synchronized:
+      val parkedOnHost = hosts.values.exists:
+        case Left(pendingHostLookup) => !pendingHostLookup.messageQueue.isEmpty
+        case Right(_) => false
+
+      val parkedOnPool = pendingPoolLookups.values.exists: ppl =>
+        ppl.storeQueues.values.exists(q => !q.isEmpty)
+
+      parkedOnHost || parkedOnPool
+
   def getHostEntry(hostId: HostId): Option[T] =
     synchronized:
       hosts.get(hostId) match

@@ -698,6 +698,8 @@ class MetadataManagerDrainSuite extends AnyFunSuite
     mgr.resolvedHostEntries.map(_.hostId) should be(List(bootstrapHostId))
 
     mgr.getHostEntry(remoteHostId) should be(None)
+    // A lookup with no message parked on it must not hold the drain open.
+    mgr.hasParkedMessages should be(false)
     mgr.resolvedHostEntries.map(_.hostId) should be(List(bootstrapHostId))
 
     client.lookupPromise(remoteHostId).success(remoteHostState)
@@ -765,9 +767,9 @@ In `src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala`, in
    *  would report success while still holding the message -- which is the common case for a
    *  nudge sent to a host the process has not talked to before.
    *
-   *  Note that a failed lookup drops the entry and everything parked on it (see
-   *  peekHostEntry's scaladoc), so this can go false because the message was discarded rather
-   *  than sent. Nothing at this layer can tell the two apart. */
+   *  Note that a failed host or pool lookup drops the entry and everything parked on it (see
+   *  peekHostEntry's scaladoc for the host case), so this can go false because the message was
+   *  discarded rather than sent. Nothing at this layer can tell the two apart. */
   def hasParkedMessages: Boolean =
     synchronized:
       val parkedOnHost = hosts.values.exists:

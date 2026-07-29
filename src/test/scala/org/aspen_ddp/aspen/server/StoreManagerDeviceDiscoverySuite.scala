@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
+import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -258,6 +259,18 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     // Every scan has to tolerate it and pick the device up whenever the config does appear.
     writeDeviceConfig(deviceDir, deviceA)
     mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+
+  atest("CheckStorageDevice for an unknown but on-disk device triggers discovery"):
+    val hostRoot = newHostDir()
+    val mgr = newManager(hostRoot)
+
+    mgr.loadedDevices.keySet should be(empty)
+
+    writeDevice(hostRoot, "dev0", deviceA)
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 

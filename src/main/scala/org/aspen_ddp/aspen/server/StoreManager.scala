@@ -230,12 +230,13 @@ class StoreManager(val client: AspenClient,
 
   /** Scans storage-devices/ and loads any device found there.
    *
-   *  Called at construction and from the event loop on every CheckAllDevices. Repeated scans
-   *  are safe: tryLoadDevice skips any device already present in storageDevices, so a device's
+   *  Called at construction and from the event loop, both on every CheckAllDevices and on a
+   *  CheckStorageDevice naming a device we have not loaded. Repeated scans are safe:
+   *  tryLoadDevice skips any device already present in storageDevices, so a device's
    *  LocalStorageDeviceState -- and with it its loadedStores and offlineStores -- survives, and
    *  its children are not re-offered to tryLoadStore over already-open backends.
    *
-   *  Mutual exclusion: the handleEvent call holds the instance lock; the constructor call
+   *  Mutual exclusion: the handleEvent calls hold the instance lock; the constructor call
    *  precedes start(), so no event-loop thread exists yet.
    */
   private def checkForNewDevices(): Unit =
@@ -856,7 +857,12 @@ class StoreManager(val client: AspenClient,
       case HostMsg(msg) => msg match
         case m: StartStoreTransfer => startStoreTransferOut(m)
         case m: StoreTransferData => transferDataReceived(m)
-        case m: CheckStorageDevice => checkStorageDevice(m.deviceId)
+        case m: CheckStorageDevice =>
+          // create-storage-device sends this after registering a device, so a name we do
+          // not recognise may simply be one we have not scanned for yet.
+          if ! storageDevices.contains(m.deviceId) then
+            checkForNewDevices()
+          checkStorageDevice(m.deviceId)
         case m: ServiceMessage =>
           serviceExecutorPromise.future.foreach(_.deliverMessage(m))
         case m: ExecuteSystemTask =>

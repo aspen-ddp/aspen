@@ -140,12 +140,8 @@ class StoreManager(val client: AspenClient,
     events.put(CheckAllDevices())
   }
   
-  if ! Files.isDirectory(storageDevicesDir) then
-    logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
-  else
-    storageDevicesDir.toFile.listFiles().foreach: sdFile =>
-      tryLoadDevice(sdFile)
-      
+  checkForNewDevices()
+
   // After we've loaded all the stores, initiate an initial check of all our
   // devices in case operations were preformed while we were down and missed
   // the CheckDeviceState messages
@@ -231,6 +227,22 @@ class StoreManager(val client: AspenClient,
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
 
   def getServiceExecutor(): Future[DurableServiceExecutor] = serviceExecutorPromise.future
+
+  /** Scans storage-devices/ and loads any device not already loaded.
+   *
+   *  Called at construction and from the event loop on every CheckAllDevices, so it must be
+   *  idempotent -- tryLoadDevice skips devices already in storageDevices. Callers hold the
+   *  instance lock: handleEvent is synchronized, and the constructor runs before start().
+   */
+  private def checkForNewDevices(): Unit =
+    if ! Files.isDirectory(storageDevicesDir) then
+      logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
+    else
+      // listFiles returns null on an IO error even when isDirectory just succeeded. Left
+      // unguarded, the NPE escapes handleEvent and silently kills the event loop thread.
+      storageDevicesDir.toFile.listFiles() match
+        case null  => logger.warn(s"Failed to list storage devices directory: $storageDevicesDir")
+        case files => files.foreach(tryLoadDevice)
 
   private def tryLoadDevice(sdFile: File): Unit =
     val storageDevicePath = sdFile.toPath
@@ -750,6 +762,19 @@ class StoreManager(val client: AspenClient,
     }
   }
 
+  /** Testing hook: runs a CheckAllDevices event synchronously.
+   *
+   *  Direct rather than events.put + testingOnlyHandleEvents so a test does not also drain
+   *  the InitializeTaskExecutor event queued by the constructor, which would attempt a real
+   *  task-executor bootstrap transaction.
+   */
+  private[aspen] def testingOnlyCheckAllDevices(): Unit = handleEvent(CheckAllDevices())
+
+  /** Testing hook: runs receiveHostMessage's handler synchronously. See
+   *  testingOnlyCheckAllDevices for why this bypasses the event queue. */
+  private[aspen] def testingOnlyHandleHostMessage(msg: HostMessage): Unit =
+    handleEvent(HostMsg(msg))
+
   private def handleEvent(event: Event): Unit = synchronized {
     event match {
 
@@ -841,6 +866,9 @@ class StoreManager(val client: AspenClient,
           systemTaskRunnerPromise.future.foreach(_.heartbeat())
 
       case CheckAllDevices() =>
+        // Discover first so a device found by this scan is checked within the same event
+        // and its Initializing stores are created now rather than a period from now.
+        checkForNewDevices()
         storageDevices.valuesIterator.foreach: sds =>
           checkStorageDevice(sds.storageDeviceId)
 

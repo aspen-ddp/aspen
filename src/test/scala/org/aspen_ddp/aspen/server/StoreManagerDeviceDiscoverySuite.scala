@@ -146,3 +146,25 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       // device directory, and dev0's only child is the device config file.
       mgr.storeLoadAttempts.toList should be(
         List((deviceA, deviceDir.resolve(StorageDeviceConfig.configFilename))))
+
+  atest("a device created after construction is discovered on the next CheckAllDevices"):
+    val hostRoot = newHostDir()
+    val mgr = newManager(hostRoot)
+
+    mgr.loadedDevices should be(empty)
+
+    writeDevice(hostRoot, "dev0", deviceA)
+    mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+
+  atest("a missing storage-devices directory does not throw"):
+    val base = Files.createTempDirectory("aspen-device-discovery")
+    tempRoots += base
+    val hostRoot = base.resolve("host-with-no-storage-devices-dir")
+    Files.createDirectories(hostRoot)
+
+    val mgr = newManager(hostRoot)
+    mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.loadedDevices should be(empty))

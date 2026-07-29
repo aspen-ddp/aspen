@@ -1,3 +1,41 @@
+Two other CheckStorageDevice nudges can be lost to process exit
+  - BaseAspenClient.createNewStoragePool and AspenClient.transferStore each send
+    one from tx.result.foreach once the transaction commits
+  - The create-pool and transfer-store CLI commands return their exit code to
+    main, which calls System.exit, without the awaitHostMessagesSent/shutdown
+    drain that create-storage-device does. The nudge can die with the process and
+    the affected stores then wait up to the full check period (one hour)
+  - transfer-store is roughly two lines, reusing the existing ZMQNet helpers:
+    one host, and network is already in scope
+  - create-pool is more work. BaseAspenClient.createNewStoragePool sends one
+    nudge per device, and those host ids are not visible to the CLI layer, while
+    awaitHostMessagesSent takes a single hostId
+  - Consider modifying awaitHostMessagesSent to wait for all pending host messages
+    to be sent. Or, even more generally, rename it to awaitPendingMessagesSent()
+    that simply drains and sends all pending messages in the concurrent linked
+    list.
+      - This would only ever be used by the CLI.
+      - Simplicity is attractive
+      - Background tasks/retries or latent Futures could result in additional
+        messages. That could block shutdown
+          - Perhaps a special object could be placed in the queue to signal the
+            I/O thread to flush all messages up to that point then use that
+            object to signal back to the main thread that the flush was complete
+            and that it's safe to exit?
+
+StoreManager.activeDeviceChecks is keyed by device id only, and load state can
+now change while a check is in flight
+  - A CheckStorageDevice for a device not yet on disk takes checkStorageDevice's
+    None branch and leaves a lookup in flight. If the config then appears and a
+    later event loads the device before that lookup completes, the later event's
+    checkStorageDevice is skipped by the guard, so the device is not checked
+    until the next periodic CheckAllDevices
+  - The stale None-branch callback also adds the now-loaded device's stores to
+    offlineStores. Benign today because handleEvent matches stores.get first, but
+    newly possible: before runtime device discovery a device could not go
+    unloaded -> loaded with a check in flight
+  - Candidate fix: re-read storageDevices.get(storageDeviceId) inside the
+    callback rather than branching on it before starting the lookup
 
 Reassignment of a pool to a new set:
   - MigratePoolToSetDurableTask
@@ -27,40 +65,6 @@ synchronous throw
     exists) leaves the device wedged for the life of the process
   - Low probability; not guarded because the fix wants a seam that lets a test
     make the call throw
-
-Two other CheckStorageDevice nudges can be lost to process exit
-  - BaseAspenClient.createNewStoragePool and AspenClient.transferStore each send
-    one from tx.result.foreach once the transaction commits
-  - The create-pool and transfer-store CLI commands return their exit code to
-    main, which calls System.exit, without the awaitHostMessagesSent/shutdown
-    drain that create-storage-device does. The nudge can die with the process and
-    the affected stores then wait up to the full check period (one hour)
-  - transfer-store is roughly two lines, reusing the existing ZMQNet helpers:
-    one host, and network is already in scope
-  - create-pool is more work. BaseAspenClient.createNewStoragePool sends one
-    nudge per device, and those host ids are not visible to the CLI layer, while
-    awaitHostMessagesSent takes a single hostId
-  - Consider modifying awaitHostMessagesSent to wait for all pending host messages
-    to be sent. Or, even more generally, rename it to awaitPendingMessagesSent()
-    that simply drains and sends all pending messages in the concurrent linked
-    list.
-      - This would only ever be used by the CLI.
-      - Simplicity is attractive
-      - Could this approach cause trouble?
-
-StoreManager.activeDeviceChecks is keyed by device id only, and load state can
-now change while a check is in flight
-  - A CheckStorageDevice for a device not yet on disk takes checkStorageDevice's
-    None branch and leaves a lookup in flight. If the config then appears and a
-    later event loads the device before that lookup completes, the later event's
-    checkStorageDevice is skipped by the guard, so the device is not checked
-    until the next periodic CheckAllDevices
-  - The stale None-branch callback also adds the now-loaded device's stores to
-    offlineStores. Benign today because handleEvent matches stores.get first, but
-    newly possible: before runtime device discovery a device could not go
-    unloaded -> loaded with a check in flight
-  - Candidate fix: re-read storageDevices.get(storageDeviceId) inside the
-    callback rather than branching on it before starting the lookup
 
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying

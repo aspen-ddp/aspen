@@ -858,8 +858,9 @@ class StoreManager(val client: AspenClient,
         case m: StartStoreTransfer => startStoreTransferOut(m)
         case m: StoreTransferData => transferDataReceived(m)
         case m: CheckStorageDevice =>
-          // create-storage-device sends this after registering a device, so a name we do
-          // not recognise may simply be one we have not scanned for yet.
+          // A device id we do not know may simply be one that has appeared on disk since
+          // our last scan -- create-storage-device sends this message as a discovery nudge
+          // for exactly that case -- so rescan before concluding the device is not ours.
           if ! storageDevices.contains(m.deviceId) then
             checkForNewDevices()
           checkStorageDevice(m.deviceId)

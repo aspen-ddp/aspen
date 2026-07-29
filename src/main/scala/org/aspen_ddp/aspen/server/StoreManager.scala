@@ -261,18 +261,30 @@ class StoreManager(val client: AspenClient,
         else
           storageDevices.get(sdCfg.storageDeviceId) match
             case Some(existing) =>
-              // Already loaded. A second directory claiming the same device id means a
-              // duplicate mount or a copied config file -- loading it would open a second
-              // backend on live store directories, so report it and keep the original.
+              // Already loaded. Usually this is just a rescan finding the same directory
+              // again, which must be a no-op so the device's state and open backends
+              // survive. A different directory claiming the same id -- a duplicate mount or
+              // a copied config file -- would otherwise replace the map entry and orphan the
+              // original's already-open stores, so report it and keep the original.
               if existing.devicePath != storageDevicePath then
                 logger.warn(s"Storage device ${sdCfg.storageDeviceId} is already loaded from " +
                             s"${existing.devicePath}; ignoring duplicate at $storageDevicePath")
             case None =>
-              val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, configFile)
-              storageDevices += sdCfg.storageDeviceId -> sds
-              logger.info(s"Loading storage device $sdFile. StorageDeviceId ${sds.storageDeviceId}")
-              sdFile.listFiles.foreach: potentialStoreFile =>
-                tryLoadStore(sds, potentialStoreFile)
+              sdFile.listFiles match
+                case null =>
+                  // Same hazard as the scan in checkForNewDevices: listFiles returns null on
+                  // an IO error even when isDirectory just succeeded. Leave the device
+                  // unregistered so a later scan retries it.
+                  logger.warn(s"Failed to list storage device directory $sdFile. Will retry on the next scan")
+                case storeFiles =>
+                  val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, configFile)
+                  logger.info(s"Loading storage device $sdFile. StorageDeviceId ${sds.storageDeviceId}")
+                  storeFiles.foreach: potentialStoreFile =>
+                    tryLoadStore(sds, potentialStoreFile)
+                  // Registered only once the stores are loaded. If anything above throws, the
+                  // catch below logs it and the device stays unregistered, so the next scan
+                  // retries the whole device rather than skipping it as already loaded.
+                  storageDevices += sdCfg.storageDeviceId -> sds
       catch
         case t: Throwable => logger.warn(s"Failed to load storage device found at path $sdFile. Error: $t")
 

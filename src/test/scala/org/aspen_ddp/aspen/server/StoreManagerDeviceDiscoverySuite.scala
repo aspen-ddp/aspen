@@ -12,6 +12,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, SECONDS}
@@ -19,7 +20,8 @@ import scala.concurrent.duration.{Duration, SECONDS}
 /** A StoreManager that records tryLoadStore calls instead of opening RocksDB backends, and
  *  exposes the protected device map to assertions.
  *
- *  The override records and does nothing else. In particular it does not replicate the real
+ *  The override records and, when `failFirstStoreLoad` is set, throws once before recording
+ *  anything. It does nothing else. In particular it does not replicate the real
  *  tryLoadStore's bookkeeping: it never filters on `StoreConfig.configFilename`, never
  *  honours a TransferringOut marker, and never updates `sds.loadedStores`, `sds.offlineStores`
  *  or the manager's `offlineStores`. Those sets therefore stay empty here, so a test asserting
@@ -35,7 +37,8 @@ private class RecordingStoreManager(mgrClient: AspenClient,
                             execCtx: ExecutionContext,
                             cacheFactory: () => ObjectCache,
                             messenger: ServerMessenger,
-                            finalizers: TransactionFinalizer.Factory)
+                            finalizers: TransactionFinalizer.Factory,
+                            failFirstStoreLoad: Boolean = false)
   extends StoreManager(
     mgrClient,
     HostId.BootstrapHostId,
@@ -65,9 +68,20 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   lazy val storeLoadAttempts: mutable.ListBuffer[(StorageDeviceId, Path)] =
     mutable.ListBuffer[(StorageDeviceId, Path)]()
 
+  /** True while a simulated store-load failure is still owed. The first tryLoadStore call to
+   *  see it set clears it and throws, modelling a device that dies part-way through loading
+   *  its stores (a yanked hot-plug disk, an IO error).
+   *
+   *  Boxed and lazy for the same initialization-order reason as storeLoadAttempts: a plain
+   *  `var` in this body would still hold its default when StoreManager's constructor scan runs.
+   */
+  private lazy val storeLoadFailureOwed = new AtomicBoolean(failFirstStoreLoad)
+
   override protected def tryLoadStore(sds: StoreManager.LocalStorageDeviceState,
                                       potentialStoreFile: File): Unit =
     synchronized:
+      if storeLoadFailureOwed.getAndSet(false) then
+        throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")
       storeLoadAttempts += ((sds.storageDeviceId, potentialStoreFile.toPath))
 
   def loadedDevices: Map[StorageDeviceId, StoreManager.LocalStorageDeviceState] =
@@ -129,9 +143,10 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     Files.createDirectories(dir)
     dir
 
-  private def newManager(hostRoot: Path): RecordingStoreManager =
+  private def newManager(hostRoot: Path, failFirstStoreLoad: Boolean = false): RecordingStoreManager =
     new RecordingStoreManager(client, systemId, hostRoot, executionContext,
-                              net.objectCacheFactory, net, net.FinalizerFactory)
+                              net.objectCacheFactory, net, net.FinalizerFactory,
+                              failFirstStoreLoad)
 
   private val deviceA = StorageDeviceId(UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001"))
   private val deviceB = StorageDeviceId(UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002"))
@@ -178,9 +193,14 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     val firstState = mgr.loadedDevices(deviceA)
     val attemptsAfterConstruction = mgr.storeLoadAttempts.toList
 
-    // tryLoadDevice offers every child of the device directory to tryLoadStore: the store
-    // directory and the device config file. The real implementation rejects the latter.
-    attemptsAfterConstruction.size should be(2)
+    // tryLoadDevice offers every child of the device directory to tryLoadStore: here the
+    // device config file and some-store-dir. The real tryLoadStore would load neither -- it
+    // requires a store config file inside the candidate, and the config file is not a
+    // directory while some-store-dir is empty -- but the recording override takes both.
+    // Compared as a set because listFiles() ordering is unspecified.
+    attemptsAfterConstruction.map(_._2).toSet should be(Set(
+      deviceDir.resolve(StorageDeviceConfig.configFilename),
+      deviceDir.resolve("some-store-dir")))
 
     mgr.testingOnlyCheckAllDevices()
     mgr.testingOnlyCheckAllDevices()
@@ -188,6 +208,20 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     // Same instance: the device's loadedStores/offlineStores tracking survives a rescan.
     mgr.loadedDevices(deviceA) should be theSameInstanceAs firstState
     Future.successful(mgr.storeLoadAttempts.toList should be(attemptsAfterConstruction))
+
+  atest("a device whose stores fail to load is retried on a later scan"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot, failFirstStoreLoad = true)
+
+    // The load threw part-way through, so the device must not be recorded as loaded. Were it
+    // recorded, the idempotency guard would skip it forever and its stores would never load.
+    mgr.loadedDevices.keySet should be(empty)
+
+    // A later scan retries it from scratch and succeeds.
+    mgr.testingOnlyCheckAllDevices()
+    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("a second directory claiming a loaded device id is ignored"):
     val hostRoot = newHostDir()

@@ -14,16 +14,20 @@ import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext
 
-/** Both of these are regression guards rather than demonstrations of the bug they exist for.
+/** These tests do NOT verify the send-ordering property, and cannot.
  *
- *  The bug is a race: a nudge sent from a detached tx.result callback may not have been sent
- *  when the future the caller awaits completes, so a CLI command that exits at that moment
- *  loses it. Observing the race needs a genuinely concurrent clientContext, which the CLI has
- *  and TestNetwork deliberately does not -- AsyncFunSuite's ExecutionContext is serial, so the
- *  detached callback is always queued ahead of the assertions below.
+ *  The bug they were written alongside is a race: a nudge sent from a detached tx.result
+ *  callback may not have been sent when the future the caller awaits completes, so a CLI
+ *  command that exits at that moment loses it. Observing the race needs a genuinely
+ *  concurrent clientContext, which the CLI has and TestNetwork deliberately does not --
+ *  AsyncFunSuite's ExecutionContext is serial, so a detached callback always runs before the
+ *  assertions below regardless of where the send lives. Verified by reverting the fix and
+ *  re-running: both tests still pass. They cannot detect a return to the detached callback
+ *  either. The ordering property is guarded by the comment at stageDeviceUpdate and by
+ *  review, not by these tests.
  *
- *  What these tests do catch is the sends drifting back out of the chain the returned future
- *  waits on, which is the regression that would silently reintroduce the race.
+ *  What they do verify, which nothing did before: a nudge is sent at all, exactly one per
+ *  distinct device, addressed to the right host with the right device id.
  */
 class DeviceCheckNudgeSuite extends IntegrationTestSuite:
 
@@ -63,20 +67,20 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
     net.takeCapturedHostMessages().collect:
       case m: CheckStorageDevice => m
 
-  atest("createNewStoragePool has sent its device-check nudges when its future completes"):
+  atest("createNewStoragePool sends one device-check nudge per device"):
     given ExecutionContext = executionContext
     // Discard anything bootstrap left behind so the assertions see only this pool's nudges.
     takeNudges()
     for
-      poolId <- client.createNewStoragePool(
+      _ <- client.createNewStoragePool(
                   "nudge-pool",
                   Replication(1, 1),
                   None,
                   RocksDBConfig(),
                   bootstrapSet,
                   0L)
-      // Captured with no intervening await: anything not yet sent at this point is exactly
-      // what a CLI command exiting here would lose.
+      // Bound with no intervening await, so the capture reflects what has been sent at the
+      // moment the future completes.
       nudges =  takeNudges()
       devState <- client.getStorageDeviceState(StorageDeviceId.BootstrapStorageDeviceId)
     yield
@@ -84,7 +88,7 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
       nudges.map(_.toHost) should be(List(devState.hostId))
       nudges.map(_.fromClient) should be(List(client.clientId))
 
-  atest("transferStore has sent its device-check nudge when its future completes"):
+  atest("transferStore sends a device-check nudge to the destination device's host"):
     given ExecutionContext = executionContext
     // TestNetwork ships with a single storage device, so the destination has to be made.
     val hostDir = newHostDir()

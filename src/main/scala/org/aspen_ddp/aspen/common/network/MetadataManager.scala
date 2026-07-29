@@ -98,7 +98,11 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
               stores -= storeId
 
   /** Returns the host entry only if it is already resolved. Unlike getHostEntry, this never
-   *  starts a host lookup, so it is safe to call from a polling loop. */
+   *  starts a host lookup, so it is side-effect free and safe to call from a polling loop.
+   *
+   *  Because of that, it cannot drive resolution forward on its own: some earlier get*HostEntry
+   *  call must have started the lookup. A failed lookup drops the entry entirely, returning the
+   *  host to the never-looked-up state, so a poll-only caller will spin until its own timeout. */
   def peekHostEntry(hostId: HostId): Option[T] =
     synchronized:
       hosts.get(hostId) match

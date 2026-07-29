@@ -35,7 +35,11 @@ Two other CheckStorageDevice nudges can be lost to process exit
     main, which calls System.exit, without the awaitHostMessagesSent/shutdown
     drain that create-storage-device does. The nudge can die with the process and
     the affected stores then wait up to the full check period (one hour)
-  - Roughly two lines per site, reusing the existing ZMQNet helpers
+  - transfer-store is roughly two lines, reusing the existing ZMQNet helpers:
+    one host, and network is already in scope
+  - create-pool is more work. BaseAspenClient.createNewStoragePool sends one
+    nudge per device, and those host ids are not visible to the CLI layer, while
+    awaitHostMessagesSent takes a single hostId
 
 No automated coverage for ZMQNet.awaitHostMessagesSent and shutdown
   - The "drained" predicate -- empty send queue, resolved host entry, dealer

@@ -21,7 +21,8 @@
 | `src/main/scala/org/aspen_ddp/aspen/common/network/implementations/zmqnet/ZMQNet.scala` | Modify | Tracks connected dealer sockets; adds `awaitHostMessagesSent` and `shutdown` |
 | `src/main/scala/org/aspen_ddp/aspen/cmdline/Main.scala` | Modify | `create_storage_device` sends `CheckStorageDevice`, drains, and reports honestly instead of telling the operator to restart the host |
 | `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` | Create | All device-discovery tests plus the recording `StoreManager` subclass they share |
-| `TODO.txt` | Modify | Removes the two items this work completes |
+| `src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerPeekHostEntrySuite.scala` | Create | `peekHostEntry` tests (added during execution; see Task 8) |
+| `TODO.txt` | Modify | Removes the two items this work completes; records the known gaps execution deliberately left open |
 
 ---
 
@@ -724,9 +725,12 @@ polling caller would kick off repeated lookups.
 **Files:**
 - Modify: `src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala:100`
 
-No test: there is no `MetadataManagerSuite`, and constructing one requires a bootstrap config
-file plus a `NetworkImplInterface`. The method is three lines and is exercised by the manual
-verification in Task 10.
+The plan originally called for no test here, on the grounds that there is no
+`MetadataManagerSuite` and constructing one requires a bootstrap config file plus a
+`NetworkImplInterface`. That turned out to be affordable, and the "starts no lookup" property is
+the whole reason the method exists, so execution added
+`src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerPeekHostEntrySuite.scala`
+(5 tests) rather than leaving it to the manual verification in Task 10.
 
 - [x] **Step 1: Add the method**
 
@@ -1169,10 +1173,11 @@ git commit -m "Remove TODO items completed by runtime storage device discovery"
 
 ## Verification checklist
 
-- [x] `sbt test` passes with 13 new tests in `StoreManagerDeviceDiscoverySuite` (10 from the
-      original plan, the one added by Task 9b, and two more added during execution: a
-      partially-failed device load being retried, and an unusable entry under
-      `storage-devices/` not stopping its siblings)
+- [x] `sbt test` passes with 18 new tests across two new suites. 13 in
+      `StoreManagerDeviceDiscoverySuite` (10 from the original plan, the one added by Task 9b,
+      and two more added during execution: a partially-failed device load being retried, and an
+      unusable entry under `storage-devices/` not stopping its siblings), plus 5 in
+      `MetadataManagerPeekHostEntrySuite`, which the original plan did not call for (see Task 8)
 - [x] Device loading logic exists in exactly one place (`tryLoadDevice`, reached only through
       `checkForNewDevices`); `grep -n "listFiles" src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala`
       shows the directory scan only inside `checkForNewDevices` and the per-device child scan

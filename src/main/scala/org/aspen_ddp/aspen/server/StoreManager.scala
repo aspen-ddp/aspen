@@ -245,10 +245,10 @@ class StoreManager(val client: AspenClient,
       logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
     else
       // listFiles returns null on an IO error even when isDirectory just succeeded. Unguarded
-      // that is an NPE, and the two call sites fare differently: from the constructor it would
-      // abort StoreManager construction outright, while from the event loop start()'s catch-all
-      // would keep the loop running but report only a bare NPE. Warn here so both name the
-      // directory that could not be listed.
+      // that is an NPE, and the constructor and the event loop fare differently: from the
+      // constructor it would abort StoreManager construction outright, while from the event loop
+      // start()'s catch-all would keep the loop running but report only the event class and the
+      // NPE. Warn here so both name the directory that could not be listed.
       storageDevicesDir.toFile.listFiles() match
         case null  => logger.warn(s"Failed to list storage devices directory: $storageDevicesDir")
         case files => files.foreach(tryLoadDevice)

@@ -200,8 +200,8 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
    *  short-lived process would otherwise abandon on exit. Note also that a host whose lookup
    *  was never started, or whose lookup failed, never resolves, so this simply times out.
    *
-   *  A false return is not a command failure. It means only that the message may not have left
-   *  this process; the caller should report degraded latency rather than an error, since the
+   *  A false return is not a command failure. It means only that ZMQNet may still be holding the
+   *  message; the caller should report degraded latency rather than an error, since the
    *  receiving host's periodic polling remains the correctness guarantee.
    *
    *  A short-lived process should follow this with shutdown() before exiting: draining ZMQNet's

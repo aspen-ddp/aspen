@@ -25,9 +25,10 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
  *  into MetadataManager's private state -- getHostState is the only thing startHostLookup does
  *  that a caller can see.
  *
- *  ExecutionContext.parasitic runs every continuation on the thread that completes the Promise,
- *  so the MetadataManager callback that installs (or, on failure, drops) the host entry has
- *  finished by the time success()/failure() returns. That removes all waiting from these tests.
+ *  ExecutionContext.parasitic runs the continuation inline rather than on a pool thread: on the
+ *  thread that completes the Promise, or on the registering thread if the Promise is already
+ *  complete. Either way the MetadataManager callback that installs (or, on failure, drops) the
+ *  host entry has finished by the time the test's next line runs, which removes all waiting.
  *
  *  Everything else is inherited from TestNetwork.TClient purely so this file does not have to
  *  stub the whole AspenClient surface. No read, transaction or message ever leaves it: the

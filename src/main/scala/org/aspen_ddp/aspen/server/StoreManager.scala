@@ -729,11 +729,11 @@ class StoreManager(val client: AspenClient,
         // onComplete, and a finally, in both branches below: the entry must be released on
         // both outcomes of the lookup, and on a throw out of the callback body itself.
         // (A synchronous throw from getStorageDeviceState, before the Future exists, would
-        // still leak it. Known, and tracked separately.) Releasing only on success would
-        // leave the entry set forever and skip every later check of that device for the life
-        // of the process.
+        // still leak it. Known, and deliberately not guarded here.) Releasing only on success
+        // would leave the entry set forever and skip every later check of that device for the
+        // life of the process.
         //
-        // Both outcomes are reachable. check above touches the filesystem and issues
+        // Both failure modes are reachable. check above touches the filesystem and issues
         // transactions, so it can throw. And getStorageDeviceState fails whenever the device
         // has no entry in the storage-devices tree: a config written out-of-band naming an id
         // that was never registered -- the supported path cannot produce this, since

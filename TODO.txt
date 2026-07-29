@@ -19,6 +19,15 @@ Rebalancing as a passive background task
       - needs to be configurable
     - If it results in a non-empty plan, kick off a rebalancing task
 
+StoreManager.checkStorageDevice leaks its activeDeviceChecks guard on a
+synchronous throw
+  - The entry is added before client.getStorageDeviceState is called. Both
+    outcomes of the returned Future release it, and so does a throw out of the
+    callback, but a throw from getStorageDeviceState itself (before the Future
+    exists) leaves the device wedged for the life of the process
+  - Low probability; not guarded because the fix wants a seam that lets a test
+    make the call throw
+
 Add a CnC message to instruct a host to call checkStorageDevices
   - Send this message when a new device is created so we don't have to wait
     for a polling period to elapse before the host notices

@@ -168,3 +168,38 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     noException should be thrownBy mgr.testingOnlyCheckAllDevices()
 
     Future.successful(mgr.loadedDevices should be(empty))
+
+  atest("an already-loaded device is not reloaded"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    Files.createDirectories(deviceDir.resolve("some-store-dir"))
+
+    val mgr = newManager(hostRoot)
+    val firstState = mgr.loadedDevices(deviceA)
+    val attemptsAfterConstruction = mgr.storeLoadAttempts.toList
+
+    // tryLoadDevice offers every child of the device directory to tryLoadStore: the store
+    // directory and the device config file. The real implementation rejects the latter.
+    attemptsAfterConstruction.size should be(2)
+
+    mgr.testingOnlyCheckAllDevices()
+    mgr.testingOnlyCheckAllDevices()
+
+    // Same instance: the device's loadedStores/offlineStores tracking survives a rescan.
+    mgr.loadedDevices(deviceA) should be theSameInstanceAs firstState
+    Future.successful(mgr.storeLoadAttempts.toList should be(attemptsAfterConstruction))
+
+  atest("a second directory claiming a loaded device id is ignored"):
+    val hostRoot = newHostDir()
+    val originalDir = writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
+    val originalState = mgr.loadedDevices(deviceA)
+    originalState.devicePath should be(originalDir)
+
+    // A duplicate mount or a copied config file: same device id, different directory.
+    writeDevice(hostRoot, "dev0-copy", deviceA)
+    mgr.testingOnlyCheckAllDevices()
+
+    mgr.loadedDevices.keySet should be(Set(deviceA))
+    Future.successful(mgr.loadedDevices(deviceA) should be theSameInstanceAs originalState)

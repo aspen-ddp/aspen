@@ -1462,8 +1462,14 @@ object Main {
           client.sendHostMessage(CheckStorageDevice(hostCfg.hostId, client.clientId, deviceId))
           val flushed = network.awaitHostMessagesSent(hostCfg.hostId, notificationDrainTimeout)
           if flushed then
-            println(s"Sent a device-check notification to host '${hostCfg.name}'; it should load " +
-                    "the device shortly.")
+            // The drain proves only that the message left this process. A dealer socket accepts
+            // a send whether or not the peer is up, so a registered but unreachable host also
+            // gets here; promise nothing beyond the handoff and name both fallbacks.
+            println(s"Handed a device-check notification to the network for host " +
+                    s"'${hostCfg.name}'; delivery is not confirmed.")
+            println(s"A running host should load the device shortly, or within " +
+                    s"$CheckStorageDevicesPeriod if the notification is lost. A host that is " +
+                    "down loads the device when it next starts.")
           else
             println(s"Could not confirm the notification reached host '${hostCfg.name}'. A running " +
                     s"host loads the device within $CheckStorageDevicesPeriod; restarting it loads " +

@@ -97,6 +97,14 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
             if oldHostId == hostId then
               stores -= storeId
 
+  /** Returns the host entry only if it is already resolved. Unlike getHostEntry, this never
+   *  starts a host lookup, so it is safe to call from a polling loop. */
+  def peekHostEntry(hostId: HostId): Option[T] =
+    synchronized:
+      hosts.get(hostId) match
+        case Some(Right(hostEntry)) => Some(hostEntry)
+        case _ => None
+
   def getHostEntry(hostId: HostId): Option[T] =
     synchronized:
       hosts.get(hostId) match

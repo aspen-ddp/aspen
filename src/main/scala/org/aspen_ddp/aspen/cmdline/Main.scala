@@ -1446,11 +1446,21 @@ object Main {
       awaitAndReport(f):
         case Success(deviceId) =>
           println(s"Created storage device ${deviceId.uuid} at $deviceDirectory")
-          // StoreManager scans storage-devices/ only in its constructor; the periodic
-          // CheckAllDevices event iterates already-loaded devices and never rescans. A
-          // running host therefore ignores the new device, and any pool created on it
-          // before the restart has its stores marked offline rather than instantiated.
-          println(s"Restart host '${hostCfg.name}' to bring the device online -- a running host does not detect new storage devices.")
+          // Best-effort nudge so the host loads the device now rather than on its next
+          // periodic storage-device check. StoreManager rescans storage-devices/ when a
+          // CheckStorageDevice names a device it has not loaded, so no new message type is
+          // needed. Losing this costs at most one check period (an hour, as host() configures
+          // it); it is never a requirement. The drain matters because sendHostMessage only
+          // enqueues -- see ZMQNet.
+          client.sendHostMessage(CheckStorageDevice(hostCfg.hostId, client.clientId, deviceId))
+          val flushed = network.awaitHostMessagesSent(hostCfg.hostId, Duration(5, SECONDS))
+          network.shutdown(Duration(1, SECONDS))
+          if flushed then
+            println(s"Sent a device-check notification to host '${hostCfg.name}'. If it does not " +
+                    "arrive, the host will load the device on its next periodic storage-device check.")
+          else
+            println(s"Could not reach host '${hostCfg.name}'. It will load the device on its next " +
+                    "periodic storage-device check.")
         case Failure(err) => reportError(err)
   }
 

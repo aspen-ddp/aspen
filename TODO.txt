@@ -28,6 +28,36 @@ synchronous throw
   - Low probability; not guarded because the fix wants a seam that lets a test
     make the call throw
 
+Two other CheckStorageDevice nudges can be lost to process exit
+  - BaseAspenClient.createNewStoragePool and AspenClient.transferStore each send
+    one from tx.result.foreach once the transaction commits
+  - The create-pool and transfer-store CLI commands return their exit code to
+    main, which calls System.exit, without the awaitHostMessagesSent/shutdown
+    drain that create-storage-device does. The nudge can die with the process and
+    the affected stores then wait up to the full check period (one hour)
+  - Roughly two lines per site, reusing the existing ZMQNet helpers
+
+No automated coverage for ZMQNet.awaitHostMessagesSent and shutdown
+  - The "drained" predicate -- empty send queue, resolved host entry, dealer
+    socket present, empty pendingMessages -- is the subtlest logic in that area
+    and is verified only by a manual end-to-end run
+  - Skipped because exercising it means binding real sockets; there is no ZMQNet
+    test harness today
+
+StoreManager.activeDeviceChecks is keyed by device id only, and load state can
+now change while a check is in flight
+  - A CheckStorageDevice for a device not yet on disk takes checkStorageDevice's
+    None branch and leaves a lookup in flight. If the config then appears and a
+    later event loads the device before that lookup completes, the later event's
+    checkStorageDevice is skipped by the guard, so the device is not checked
+    until the next periodic CheckAllDevices
+  - The stale None-branch callback also adds the now-loaded device's stores to
+    offlineStores. Benign today because handleEvent matches stores.get first, but
+    newly possible: before runtime device discovery a device could not go
+    unloaded -> loaded with a check in flight
+  - Candidate fix: re-read storageDevices.get(storageDeviceId) inside the
+    callback rather than branching on it before starting the lookup
+
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying
   - Use pluggable trait that has just the methods BaseReadDriver needs

@@ -4,6 +4,8 @@ import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -159,6 +161,10 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
   private val deviceA = StorageDeviceId(UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001"))
   private val deviceB = StorageDeviceId(UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002"))
+
+  /** A store of pool 1111...:index 0. Used for its `directoryName`, which is the on-disk name of
+   *  a store directory within a device directory. */
+  private val storeId = StoreId(PoolId(UUID.fromString("11111111-1111-1111-1111-111111111111")), 0.toByte)
 
   atest("constructor loads a device that already exists on disk"):
     val hostRoot = newHostDir()
@@ -320,14 +326,14 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 
-  atest("stores on a newly discovered device are loaded"):
+  atest("stores on a newly discovered device are offered to tryLoadStore"):
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
 
     mgr.storeLoadAttempts should be(empty)
 
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val storeDir = deviceDir.resolve("11111111-1111-1111-1111-111111111111:0")
+    val storeDir = deviceDir.resolve(storeId.directoryName)
     Files.createDirectories(storeDir)
 
     mgr.testingOnlyCheckAllDevices()

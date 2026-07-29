@@ -835,10 +835,11 @@ In `src/main/scala/org/aspen_ddp/aspen/common/network/implementations/zmqnet/ZMQ
    *    - every resolved host entry's own pending queue, each of which needs a dealer socket
    *      before anything can leave it
    *
-   *  Two limits, neither fixable at this layer:
+   *  Known limits, none fixable at this layer:
    *
-   *    - The IO thread removes an item from a queue just before handing it to a socket, so a
-   *      return of true can beat the final send by a few instructions.
+   *    - The IO thread removes an item from the send queue just before handing it to a socket
+   *      or to MetadataManager, so a return of true can beat the final send, or briefly miss a
+   *      message on its way into a lookup queue.
    *    - A failed host or pool lookup drops the entry and the messages parked on it (see
    *      MetadataManager.peekHostEntry). The predicate then goes quiet because the message is
    *      gone rather than sent.
@@ -906,9 +907,10 @@ In `src/main/scala/org/aspen_ddp/aspen/cmdline/Main.scala`, directly below `val 
   val NotificationDrainTimeout: Duration = Duration(5, SECONDS)
   val NotificationSendLinger: Duration = Duration(1, SECONDS)
 
-  // Set by createNetwork so main can drain outbound messages before System.exit. There is at
-  // most one network per process and every command that builds one goes through createNetwork,
-  // so a plain field is enough.
+  // Set by createNetwork so main can drain outbound messages before System.exit. Plain rather
+  // than volatile because it is thread-confined: every command builds its network by a direct
+  // call on the main thread, and main reads it back on that same thread. A command that built
+  // one from a callback would need this made volatile, or the drain would see None and skip.
   private var onetwork: Option[ZMQNet] = None
 ```
 
@@ -938,21 +940,28 @@ Add the following method directly above `def main(args: Array[String]): Unit = {
    *
    *  CheckStorageDevice nudges are why this exists: a command that sends one and then exits
    *  would otherwise abandon it, costing the receiving host up to CheckStorageDevicesPeriod.
-   *  Commands that sent nothing pass through in a single poll interval, and bootstrap -- which
+   *  Commands that sent nothing pass through without waiting, and bootstrap -- which
    *  builds no network at all -- skips it entirely.
    *
    *  Never affects the exit code. A timeout means messages may still be held, which is a
    *  latency report rather than a command failure: the receiving host's periodic check remains
    *  the correctness guarantee.
    *
-   *  host() and amoeba() block in joinIoThread and never reach here.
+   *  host() blocks in joinIoThread and amoeba_server() in Thread.currentThread.join(); neither
+   *  reaches here.
    */
   private def drainAndShutdown(): Unit =
     onetwork.foreach: net =>
-      if !net.awaitPendingMessagesSent(NotificationDrainTimeout) then
-        println("Could not confirm all notifications left this process. Affected hosts will " +
-                s"act on their next periodic check, within $CheckStorageDevicesPeriod.")
-      net.shutdown(NotificationSendLinger)
+      // Nothing here may change the exit code, and shutdown() deliberately races the IO
+      // thread's use of the sockets it closes, so swallow whatever comes back: the command's
+      // result is already decided and the process is on its way out.
+      try
+        if !net.awaitPendingMessagesSent(NotificationDrainTimeout) then
+          println("Could not confirm all notifications left this process. Affected hosts will " +
+                  s"act on their next periodic check, within $CheckStorageDevicesPeriod.")
+        net.shutdown(NotificationSendLinger)
+      catch
+        case _: Throwable => ()
 ```
 
 Then replace the exit at line 631-633:

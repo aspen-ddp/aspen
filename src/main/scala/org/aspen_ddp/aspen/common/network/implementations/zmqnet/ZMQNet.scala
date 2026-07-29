@@ -29,7 +29,7 @@ object ZMQNet:
     // requires making it volatile first -- see odealer. pendingMessages is the exception: it is
     // a concurrent queue and is deliberately added to from other threads.
     //
-    // Written by the zmq-io thread outside of any lock. Volatile because awaitHostMessagesSent
+    // Written by the zmq-io thread outside of any lock. Volatile because awaitPendingMessagesSent
     // reads it from the caller's thread and would otherwise have no happens-before edge with
     // that write. The referenced Option is immutable, so publishing the reference is enough.
     @volatile var odealer: Option[ZMQ.Socket] = None
@@ -186,36 +186,53 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
   private def wakeIoThread(): Unit =
     sendQueueClientSocket.get().send("")
 
-  /** Blocks until nothing is left waiting inside ZMQNet for `hostId`, or `timeout` elapses.
-   *  Returns true if it drained.
+  /** Blocks until ZMQNet is holding no outbound messages, or `timeout` elapses, polling every
+   *  25ms. Returns true if it drained.
    *
-   *  Specifically, it polls until the shared send queue is empty -- it holds messages for every
-   *  host, so this is stricter than the name implies -- and `hostId` has a resolved host entry
-   *  with a dealer socket and an empty pending-message queue. It is best effort in one
-   *  direction: the IO thread removes an item from a queue just before handing it to a socket,
-   *  so a return of true can beat the final send by a few instructions.
+   *  Takes no host id because its callers cannot name the hosts involved: a command may nudge
+   *  hosts it never looked up itself. The predicate therefore covers all three places a
+   *  message can be waiting:
    *
-   *  This is not a delivery guarantee. ZMQ buffers internally and the peer may be down. It
-   *  establishes only that ZMQNet is no longer holding the message, which is exactly what a
-   *  short-lived process would otherwise abandon on exit. Note also that a host whose lookup
-   *  was never started, or whose lookup failed, never resolves, so this simply times out.
+   *    - the shared send queue, which holds messages for every host
+   *    - MetadataManager's lookup queues, where a message sits while the host or pool it is
+   *      addressed to is resolved -- the common case for a nudge to a host this process has
+   *      not talked to before
+   *    - every resolved host entry's own pending queue, each of which needs a dealer socket
+   *      before anything can leave it
    *
-   *  A false return is not a command failure. It means only that ZMQNet may still be holding the
-   *  message; the caller should report degraded latency rather than an error, since the
+   *  Known limits, none fixable at this layer:
+   *
+   *    - The IO thread removes an item from the send queue just before handing it to a socket
+   *      or to MetadataManager, so a return of true can beat the final send, or briefly miss a
+   *      message on its way into a lookup queue.
+   *    - A failed host or pool lookup drops the entry and the messages parked on it (see
+   *      MetadataManager.peekHostEntry). The predicate then goes quiet because the message is
+   *      gone rather than sent.
+   *
+   *  This is not a delivery guarantee in any case. ZMQ buffers internally and the peer may be
+   *  down. It establishes only that ZMQNet is no longer holding the message, which is exactly
+   *  what a short-lived process would otherwise abandon on exit.
+   *
+   *  A false return is not a command failure. It means only that ZMQNet may still be holding
+   *  something; the caller should report degraded latency rather than an error, since the
    *  receiving host's periodic polling remains the correctness guarantee.
    *
-   *  A short-lived process should follow this with shutdown() before exiting: draining ZMQNet's
-   *  own queues only hands the message to ZMQ, and shutdown() is what gives ZMQ a window to put
-   *  it on the wire.
+   *  A short-lived process should follow this with shutdown() before exiting: draining
+   *  ZMQNet's own queues only hands the message to ZMQ, and shutdown() is what gives ZMQ a
+   *  window to put it on the wire.
    */
-  def awaitHostMessagesSent(hostId: HostId, timeout: Duration): Boolean =
+  def awaitPendingMessagesSent(timeout: Duration): Boolean =
     val deadline = System.nanoTime() + timeout.toNanos
     val pollIntervalMillis = 25L
 
+    // hasParkedMessages is checked before resolvedHostEntries so the handoff from a pending
+    // lookup to the newly created host entry cannot slip between the two reads unseen: if it
+    // happens in between, the first read has already returned true.
     def drained: Boolean =
-      sendQueue.isEmpty && (metadataManager.peekHostEntry(hostId) match
-        case Some(entry) => entry.odealer.isDefined && entry.pendingMessages.isEmpty
-        case None => false)
+      sendQueue.isEmpty &&
+        !metadataManager.hasParkedMessages &&
+        metadataManager.resolvedHostEntries.forall: entry =>
+          entry.odealer.isDefined && entry.pendingMessages.isEmpty
 
     while !drained && System.nanoTime() - deadline < 0 do
       Thread.sleep(pollIntervalMillis)
@@ -225,7 +242,7 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
   /** Closes the ZMQ context, allowing buffered outbound data up to `linger` to flush.
    *
    *  Intended for short-lived processes on their way out; a long-running host keeps its network
-   *  up for the life of the process. Call awaitHostMessagesSent() first: this only bounds how
+   *  up for the life of the process. Call awaitPendingMessagesSent() first: this only bounds how
    *  long ZMQ may spend flushing what it already holds, so anything still sitting in ZMQNet's
    *  own queues when this is called is discarded rather than flushed.
    *

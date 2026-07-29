@@ -68,6 +68,17 @@ object Main {
   // long an un-notified host may take to pick up a new device, so the two cannot drift.
   val CheckStorageDevicesPeriod: Duration = Duration(1, HOURS)
 
+  // How long a terminating command waits for outbound messages to leave ZMQNet, and how long
+  // ZMQ is then given to put them on the wire before the process exits.
+  val NotificationDrainTimeout: Duration = Duration(5, SECONDS)
+  val NotificationSendLinger: Duration = Duration(1, SECONDS)
+
+  // Set by createNetwork so main can drain outbound messages before System.exit. Plain rather
+  // than volatile because it is thread-confined: every command builds its network by a direct
+  // call on the main thread, and main reads it back on that same thread. A command that built
+  // one from a callback would need this made volatile, or the drain would see None and skip.
+  private var onetwork: Option[ZMQNet] = None
+
   case class Args(mode:String="",
                   hostDirectory:File=null,
                   targetDirectory:File=null,
@@ -141,6 +152,33 @@ object Main {
     val result = Await.ready(f, timeout).value.get
     report(result)
     if result.isSuccess then 0 else 1
+
+  /** Gives outbound messages a chance to leave the process before it exits.
+   *
+   *  CheckStorageDevice nudges are why this exists: a command that sends one and then exits
+   *  would otherwise abandon it, costing the receiving host up to CheckStorageDevicesPeriod.
+   *  Commands that sent nothing pass through without waiting, and bootstrap -- which
+   *  builds no network at all -- skips it entirely.
+   *
+   *  Never affects the exit code. A timeout means messages may still be held, which is a
+   *  latency report rather than a command failure: the receiving host's periodic check remains
+   *  the correctness guarantee.
+   *
+   *  host() blocks in joinIoThread and amoeba_server() in Thread.currentThread.join(); neither
+   *  reaches here.
+   */
+  private def drainAndShutdown(): Unit =
+    onetwork.foreach: net =>
+      // Nothing here may change the exit code, and shutdown() deliberately races the IO
+      // thread's use of the sockets it closes, so swallow whatever comes back: the command's
+      // result is already decided and the process is on its way out.
+      try
+        if !net.awaitPendingMessagesSent(NotificationDrainTimeout) then
+          println("Could not confirm all notifications left this process. Affected hosts will " +
+                  s"act on their next periodic check, within $CheckStorageDevicesPeriod.")
+        net.shutdown(NotificationSendLinger)
+      catch
+        case _: Throwable => ()
 
   def main(args: Array[String]): Unit = {
     val parser = new scopt.OptionParser[Args]("demo") {
@@ -629,7 +667,9 @@ object Main {
       case None => 1
 
     // All of Aspen's threads are daemon threads, so the process would exit here anyway.
-    // The explicit exit is what carries the status code out to the shell.
+    // The explicit exit is what carries the status code out to the shell. The drain first is
+    // what keeps a nudge sent moments ago from dying with the process.
+    drainAndShutdown()
     System.exit(exitCode)
   }
 
@@ -647,7 +687,9 @@ object Main {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    (b, new ZMQNet(bootstrapConfigFile, oclientId, ohost, heartbeatPeriod, b))
+    val net = new ZMQNet(bootstrapConfigFile, oclientId, ohost, heartbeatPeriod, b)
+    onetwork = Some(net)
+    (b, net)
   }
 
   def createAmoebaClient(bootstrapConfigFile: os.Path,
@@ -1447,35 +1489,20 @@ object Main {
         case e =>
           println(s"Error creating storage device: ${e.getMessage}")
 
-      // How long the user waits for the notification below to leave this process, and how long
-      // ZMQ is then given to put it on the wire before the process exits.
-      val notificationDrainTimeout = Duration(5, SECONDS)
-      val notificationSendLinger = Duration(1, SECONDS)
-
       awaitAndReport(f):
         case Success(deviceId) =>
           println(s"Created storage device ${deviceId.uuid} at $deviceDirectory")
           // Best-effort nudge so the host loads the device now rather than on its next periodic
           // storage-device check. Losing it costs at most one check period and is never a
-          // requirement, so nothing here may fail the command. See
-          // ZMQNet.awaitHostMessagesSent for why the drain and linger are needed.
+          // requirement, so nothing here may fail the command. main's drainAndShutdown is what
+          // gives the message its chance to leave the process.
           client.sendHostMessage(CheckStorageDevice(hostCfg.hostId, client.clientId, deviceId))
-          val flushed = network.awaitHostMessagesSent(hostCfg.hostId, notificationDrainTimeout)
-          if flushed then
-            // The drain proves only that ZMQNet is no longer holding the message; the shutdown
-            // below is what gives ZMQ its window to put it on the wire. A dealer socket also
-            // accepts a send whether or not the peer is up, so a registered but unreachable host
-            // reaches here too; promise nothing beyond the handoff and name both fallbacks.
-            println(s"Handed a device-check notification to the network for host " +
-                    s"'${hostCfg.name}'; delivery is not confirmed.")
-            println(s"A running host should load the device shortly, or within " +
-                    s"$CheckStorageDevicesPeriod if the notification is lost. A host that is " +
-                    "down loads the device when it next starts.")
-          else
-            println(s"Could not confirm the notification reached host '${hostCfg.name}'. A running " +
-                    s"host loads the device within $CheckStorageDevicesPeriod; restarting it loads " +
-                    "the device immediately.")
-          network.shutdown(notificationSendLinger)
+          // A dealer socket accepts a send whether or not the peer is up, so a registered but
+          // unreachable host reaches here too. Promise nothing beyond the handoff and name
+          // both fallbacks.
+          println(s"A running host should load the device shortly, or within " +
+                  s"$CheckStorageDevicesPeriod if the notification is lost. A host that is " +
+                  "down loads the device when it next starts.")
         case Failure(err) => reportError(err)
   }
 

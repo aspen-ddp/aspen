@@ -24,7 +24,10 @@ object ZMQNet:
                      dataPort: Int,
                      cncPort: Int,
                      storeTransferPort: Int) extends MetadataManager.HostEntry(hostId, name, address, dataPort, cncPort, storeTransferPort) with Logging:
-    var odealer: Option[ZMQ.Socket] = None
+    // Written by the zmq-io thread outside of any lock. Volatile because awaitHostMessagesSent
+    // reads it from the caller's thread and would otherwise have no happens-before edge with
+    // that write. The referenced Option is immutable, so publishing the reference is enough.
+    @volatile var odealer: Option[ZMQ.Socket] = None
     var opollItem: Option[PollItem] = None
     val pendingMessages: ConcurrentLinkedQueue[Message] = new ConcurrentLinkedQueue[Message]()
     var lastHeartbeatTime: Long = 0
@@ -95,6 +98,11 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
   private var clients: Map[ClientId, Array[Byte]] = Map()
 
   private val sendQueue = new ConcurrentLinkedQueue[SendQueueMsg]()
+
+  // Dealer sockets created by the IO thread, recorded here so shutdown() can set their linger.
+  // Appended to and never drained: one entry per dealer created, normally one per host this
+  // process talks to.
+  private val connectedDealers = new ConcurrentLinkedQueue[ZMQ.Socket]()
 
   private val sendQueueSocket = context.createSocket(SocketType.DEALER)
   sendQueueSocket.bind("inproc://send-message-queued")
@@ -168,6 +176,54 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
 
   private def wakeIoThread(): Unit =
     sendQueueClientSocket.get().send("")
+
+  /** Blocks until nothing is left waiting inside ZMQNet for `hostId`, or `timeout` elapses.
+   *  Returns true if it drained.
+   *
+   *  Specifically, it polls until the shared send queue is empty -- it holds messages for every
+   *  host, so this is stricter than the name implies -- and `hostId` has a resolved host entry
+   *  with a dealer socket and an empty pending-message queue. It is best effort in one
+   *  direction: the IO thread removes an item from a queue just before handing it to a socket,
+   *  so a return of true can beat the final send by a few instructions.
+   *
+   *  This is not a delivery guarantee. ZMQ buffers internally and the peer may be down. It
+   *  establishes only that ZMQNet is no longer holding the message, which is exactly what a
+   *  short-lived process would otherwise abandon on exit. Note also that a host whose lookup
+   *  was never started, or whose lookup failed, never resolves, so this simply times out.
+   */
+  def awaitHostMessagesSent(hostId: HostId, timeout: Duration): Boolean =
+    val deadline = System.nanoTime() + timeout.toNanos
+    val pollIntervalMillis = 25L
+
+    def drained: Boolean =
+      sendQueue.isEmpty && (metadataManager.peekHostEntry(hostId) match
+        case Some(entry) => entry.odealer.isDefined && entry.pendingMessages.isEmpty
+        case None => false)
+
+    while !drained && System.nanoTime() - deadline < 0 do
+      Thread.sleep(pollIntervalMillis)
+
+    drained
+
+  /** Closes the ZMQ context, allowing buffered outbound data up to `linger` to flush.
+   *
+   *  Intended for short-lived processes on their way out; a long-running host keeps its network
+   *  up for the life of the process.
+   *
+   *  Linger is set on each dealer individually because ZContext propagates its own linger
+   *  setting to sockets only as it creates them and closes them without re-applying it, so
+   *  context.setLinger() here would have no effect. Touching the sockets from the caller's
+   *  thread races with the IO thread's use of them, which is acceptable only because the
+   *  process is terminating.
+   */
+  def shutdown(linger: Duration): Unit =
+    val lingerMillis = linger.toMillis.toInt
+    connectedDealers.forEach: dealer =>
+      try
+        dealer.setLinger(lingerMillis)
+      catch
+        case t: Throwable => logger.debug(s"Failed to set linger during shutdown: $t")
+    context.close()
 
   private def updateClientId(cid: ClientId, routerAddress: Array[Byte]): Unit =
     clients.get(cid) match
@@ -326,6 +382,7 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
             dealer.connect(s"tcp://${entry.address}:${entry.dataPort}")
             entry.odealer = Some(dealer)
             entry.opollItem = Some(new PollItem(dealer, ZMQ.Poller.POLLIN))
+            connectedDealers.add(dealer)
 
             // Send initial heartbeat if we are a server node
             oheartbeatMessage.foreach(dealer.send(_))

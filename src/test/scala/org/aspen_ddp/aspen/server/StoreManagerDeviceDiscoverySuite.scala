@@ -93,12 +93,16 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     try os.remove.all(os.Path(root))
     catch case _: Throwable => ()
 
-  /** Creates `<tmp>/host/storage-devices` and returns the host root directory. */
-  private def newHostDir(): Path =
+  /** Creates `<tmp>/host/storage-devices` and returns the host root directory. Pass
+   *  `withStorageDevicesDir = false` to leave the `storage-devices` child absent. */
+  private def newHostDir(withStorageDevicesDir: Boolean = true): Path =
     val base = Files.createTempDirectory("aspen-device-discovery")
     tempRoots += base
     val hostDir = base.resolve("host")
-    Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
+    if withStorageDevicesDir then
+      Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
+    else
+      Files.createDirectories(hostDir)
     hostDir
 
   /** Creates `<hostRoot>/storage-devices/<name>` with a device config naming `deviceId`. */
@@ -159,12 +163,8 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("a missing storage-devices directory does not throw"):
-    val base = Files.createTempDirectory("aspen-device-discovery")
-    tempRoots += base
-    val hostRoot = base.resolve("host-with-no-storage-devices-dir")
-    Files.createDirectories(hostRoot)
+    val mgr = newManager(newHostDir(withStorageDevicesDir = false))
 
-    val mgr = newManager(hostRoot)
-    mgr.testingOnlyCheckAllDevices()
+    noException should be thrownBy mgr.testingOnlyCheckAllDevices()
 
     Future.successful(mgr.loadedDevices should be(empty))

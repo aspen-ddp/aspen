@@ -228,11 +228,20 @@ class StoreManager(val client: AspenClient,
 
   def getServiceExecutor(): Future[DurableServiceExecutor] = serviceExecutorPromise.future
 
-  /** Scans storage-devices/ and loads any device not already loaded.
+  /** Scans storage-devices/ and loads any device found there.
    *
-   *  Called at construction and from the event loop on every CheckAllDevices, so it must be
-   *  idempotent -- tryLoadDevice skips devices already in storageDevices. Callers hold the
-   *  instance lock: handleEvent is synchronized, and the constructor runs before start().
+   *  Called at construction and from the event loop on every CheckAllDevices, so it needs to
+   *  be idempotent.
+   *
+   *  TODO: it is not idempotent yet. tryLoadDevice does not skip devices already present in
+   *  storageDevices, so a rescan replaces a device's LocalStorageDeviceState -- discarding its
+   *  loadedStores and offlineStores -- and re-offers every child to tryLoadStore, which then
+   *  fails to open the already-open RocksDB directory. This happens on every host start, since
+   *  the constructor scans and then queues a CheckAllDevices. tryLoadDevice needs a guard on
+   *  storageDevices before repeated scanning is safe.
+   *
+   *  Mutual exclusion: the handleEvent call holds the instance lock; the constructor call
+   *  precedes start(), so no event-loop thread exists yet.
    */
   private def checkForNewDevices(): Unit =
     if ! Files.isDirectory(storageDevicesDir) then

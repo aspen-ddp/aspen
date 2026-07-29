@@ -10,7 +10,7 @@ process restarts. `StoreManager` scans `<hostRoot>/storage-devices/` only in its
 constructor, and the periodic `CheckAllDevices` event iterates the already-loaded
 `storageDevices` map without ever rescanning the directory. Any pool created on
 the new device before the restart has its stores marked offline rather than
-instantiated, and `add-storage-device` currently tells the operator to restart
+instantiated, and `create-storage-device` currently tells the operator to restart
 the host.
 
 Two changes fix this:
@@ -20,7 +20,7 @@ Two changes fix this:
    inline scan, so the loading logic exists in exactly one place) and from the
    event loop on every `CheckAllDevices`, before the existing per-device
    iteration.
-2. **`add-storage-device` sends a `CheckStorageDevice` message** to the owning
+2. **`create-storage-device` sends a `CheckStorageDevice` message** to the owning
    host after registration succeeds, so detection is near-immediate.
 
 Polling is the correctness guarantee; the message is a latency optimization.
@@ -117,6 +117,15 @@ The `null` guard is a real fix rather than defensive noise. Today the equivalent
 NPE could only fail construction; from `handleEvent` — which `start()`'s loop
 calls with no `try`/`catch` — it would kill the manager thread outright.
 
+> **Correction (added after implementation).** The second half of that sentence
+> was true when this spec was written but is no longer. Task 9b wrapped
+> `handleEvent(event)` in `start()`'s loop in a `try`/`catch case t: Throwable`
+> that logs at ERROR and continues, so an escaping NPE no longer kills the
+> manager thread. The guard was kept for the two reasons that survive: it names
+> the directory that could not be listed instead of surfacing a bare NPE, and it
+> still covers the constructor call site, which runs outside the event loop and
+> is therefore not protected by that catch.
+
 ### 2. `tryLoadDevice` gains an idempotency guard
 
 All loading logic stays in `tryLoadDevice`. Only the already-loaded check is
@@ -211,7 +220,7 @@ repeatedly.
 `shutdown` sets `linger` on every connected dealer socket — the per-socket
 `setLinger` is always available — and then closes the `ZContext`.
 
-### 7. `add-storage-device` CLI
+### 7. `create-storage-device` CLI
 
 `Main.scala:1446-1454`. On success, notify the host instead of instructing a
 restart:
@@ -243,7 +252,7 @@ removed.
 | Situation | Behavior |
 |---|---|
 | `storage-devices/` missing or not a directory | Warn, return. Now recurs once per check period rather than once at startup — a real misconfiguration worth repeating hourly. |
-| `listFiles()` returns `null` | Warn, return. New guard; without it the NPE escapes `handleEvent` and kills the event loop thread. |
+| `listFiles()` returns `null` | Warn, return. New guard; without it the NPE escapes `handleEvent` and kills the event loop thread (see the correction under Components §1 — the loop later gained a catch-all, so the escape is now logged rather than fatal). |
 | Device dir exists, no config file yet | Skipped by the existing `Files.exists(sdCfgPath)` guard; picked up on a later scan once the config appears. Covers both the operator-provisioned-but-unregistered case and `createStorageDevice` crashing between commit and write. |
 | Unparseable or partial config | Existing `catch Throwable` warns; the device is not added and is retried on the next scan. Self-healing. |
 | Foreign `aspenSystemId` | Warn and ignore (unchanged), now once per period. |
@@ -303,6 +312,6 @@ does not affect the assertions.
 There is no ZMQNet test harness — the only suite under `zmqnet/` is
 `ProtobufMessageCodecSuite` — and exercising the drain requires binding real
 sockets, a poor trade in CI. `awaitHostMessagesSent` and `shutdown` are verified
-manually through the `./t bootstrap` -> `./t host` -> `./t add-storage-device`
+manually through the `./t bootstrap` -> `./t host` -> `./t create-storage-device`
 workflow, confirming that the device comes online within seconds rather than
 after the hour-long poll.

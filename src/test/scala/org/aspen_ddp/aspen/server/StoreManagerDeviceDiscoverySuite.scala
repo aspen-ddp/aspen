@@ -239,7 +239,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     mgr.testingOnlyCheckAllDevices()
     mgr.testingOnlyCheckAllDevices()
 
-    // Same instance: the device's loadedStores/offlineStores tracking survives a rescan.
+    // Same instance: the device's offlineStores tracking survives a rescan.
     mgr.loadedDevices(deviceA) should be theSameInstanceAs firstState
     Future.successful(mgr.storeLoadAttempts.toList should be(attemptsAfterConstruction))
 

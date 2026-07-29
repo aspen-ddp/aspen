@@ -233,8 +233,9 @@ class StoreManager(val client: AspenClient,
    *  Called at construction and from the event loop, both on every CheckAllDevices and on a
    *  CheckStorageDevice naming a device we have not loaded. Repeated scans are safe:
    *  tryLoadDevice skips any device already present in storageDevices, so a device's
-   *  LocalStorageDeviceState -- and with it its loadedStores and offlineStores -- survives, and
-   *  its children are not re-offered to tryLoadStore over already-open backends.
+   *  LocalStorageDeviceState -- and with it the offlineStores set that checkStorageDevice's
+   *  check() reads -- survives, and its children are not re-offered to tryLoadStore over
+   *  already-open backends.
    *
    *  Mutual exclusion: the handleEvent calls hold the instance lock; the constructor call
    *  precedes start(), so no event-loop thread exists yet.
@@ -243,8 +244,11 @@ class StoreManager(val client: AspenClient,
     if ! Files.isDirectory(storageDevicesDir) then
       logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
     else
-      // listFiles returns null on an IO error even when isDirectory just succeeded. Left
-      // unguarded, the NPE escapes handleEvent and silently kills the event loop thread.
+      // listFiles returns null on an IO error even when isDirectory just succeeded. Unguarded
+      // that is an NPE, and the two call sites fare differently: from the constructor it would
+      // abort StoreManager construction outright, while from the event loop start()'s catch-all
+      // would keep the loop running but report only a bare NPE. Warn here so both name the
+      // directory that could not be listed.
       storageDevicesDir.toFile.listFiles() match
         case null  => logger.warn(s"Failed to list storage devices directory: $storageDevicesDir")
         case files => files.foreach(tryLoadDevice)
@@ -274,8 +278,9 @@ class StoreManager(val client: AspenClient,
               sdFile.listFiles match
                 case null =>
                   // Same hazard as the scan in checkForNewDevices: listFiles returns null on
-                  // an IO error even when isDirectory just succeeded. Leave the device
-                  // unregistered so a later scan retries it.
+                  // an IO error even when isDirectory just succeeded. The catch below would
+                  // absorb the resulting NPE and leave the device unregistered and retryable
+                  // just the same; this guard exists to name the directory instead.
                   logger.warn(s"Failed to list storage device directory $sdFile. Will retry on the next scan")
                 case storeFiles =>
                   val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, configFile)

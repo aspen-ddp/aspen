@@ -59,7 +59,7 @@ as soon as it compiles — it is the baseline that later tasks must not break.
 - Modify: `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala:254`
 - Create: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala`
 
-- [ ] **Step 1: Make `tryLoadStore` overridable**
+- [x] **Step 1: Make `tryLoadStore` overridable**
 
 In `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala`, change line 254 from:
 
@@ -75,7 +75,7 @@ to:
   protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: File): Unit =
 ```
 
-- [ ] **Step 2: Write the harness and the characterization test**
+- [x] **Step 2: Write the harness and the characterization test**
 
 Create `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala`:
 
@@ -219,14 +219,14 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 ```
 
-- [ ] **Step 3: Run the test**
+- [x] **Step 3: Run the test**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
 Expected: PASS, 1 test. This is a characterization test — the constructor scan already works.
 If it fails to compile, the harness is wrong; fix that before continuing.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala \
@@ -245,7 +245,7 @@ opening real RocksDB backends."
 - Modify: `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala:143-147` (constructor scan), `:235` (new method above `tryLoadDevice`), `:743-749` (testing hooks), `:841-843` (`CheckAllDevices` handler)
 - Test: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `StoreManagerDeviceDiscoverySuite`:
 
@@ -273,13 +273,13 @@ Append to `StoreManagerDeviceDiscoverySuite`:
     Future.successful(mgr.loadedDevices should be(empty))
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
 Expected: compile error — `value testingOnlyCheckAllDevices is not a member of RecordingStoreManager`.
 
-- [ ] **Step 3: Add `checkForNewDevices()`**
+- [x] **Step 3: Add `checkForNewDevices()`**
 
 In `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala`, insert immediately above
 `private def tryLoadDevice` (currently line 235):
@@ -302,7 +302,7 @@ In `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala`, insert immedi
         case files => files.foreach(tryLoadDevice)
 ```
 
-- [ ] **Step 4: Replace the constructor scan**
+- [x] **Step 4: Replace the constructor scan**
 
 Replace lines 143-147 of `StoreManager.scala`:
 
@@ -322,7 +322,7 @@ with:
 
 The two `events.put(...)` lines that follow are unchanged.
 
-- [ ] **Step 5: Discover before iterating in the `CheckAllDevices` handler**
+- [x] **Step 5: Discover before iterating in the `CheckAllDevices` handler**
 
 Replace lines 841-843 of `StoreManager.scala`:
 
@@ -343,7 +343,7 @@ with:
           checkStorageDevice(sds.storageDeviceId)
 ```
 
-- [ ] **Step 6: Add the testing hooks**
+- [x] **Step 6: Add the testing hooks**
 
 In `StoreManager.scala`, immediately after `testingOnlyHandleEvents()` (which currently ends at
 line 749), add:
@@ -363,13 +363,13 @@ line 749), add:
     handleEvent(HostMsg(msg))
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
 Expected: PASS, 3 tests.
 
-- [ ] **Step 8: Run the full suite for regressions**
+- [x] **Step 8: Run the full suite for regressions**
 
 Run: `sbt test`
 
@@ -377,7 +377,7 @@ Expected: no new failures. The constructor path now goes through `checkForNewDev
 `TestNetwork` constructs its `StoreManager` with `rootDir = Path.of("/")`, so the
 "Invalid storage devices directory" warning is expected and harmless.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala \
@@ -401,7 +401,7 @@ production constructs a second `RocksDBBackend` over a live RocksDB directory.
 - Modify: `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala:243-250`
 - Test: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `StoreManagerDeviceDiscoverySuite`:
 
@@ -442,7 +442,7 @@ Append to `StoreManagerDeviceDiscoverySuite`:
     Future.successful(mgr.loadedDevices(deviceA) should be theSameInstanceAs originalState)
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
@@ -451,7 +451,7 @@ Expected: both new tests FAIL. "an already-loaded device is not reloaded" fails 
 directory claiming a loaded device id is ignored" fails the same way, because the copy
 overwrites the map entry.
 
-- [ ] **Step 3: Add the guard**
+- [x] **Step 3: Add the guard**
 
 In `StoreManager.scala`, replace lines 243-250 (the `else` body of the system-id check inside
 `tryLoadDevice`):
@@ -491,13 +491,13 @@ with:
 
 Note the drive-by wording fix in the `logger.info` line: it logs a *device*, not a store.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
 Expected: PASS, 5 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala \
@@ -519,7 +519,7 @@ constructor scan to a repeated one.
 **Files:**
 - Test: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala`
 
-- [ ] **Step 1: Write the tests**
+- [x] **Step 1: Write the tests**
 
 Append to `StoreManagerDeviceDiscoverySuite`:
 
@@ -567,7 +567,7 @@ Append to `StoreManagerDeviceDiscoverySuite`:
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 ```
 
-- [ ] **Step 2: Run the tests to verify they pass**
+- [x] **Step 2: Run the tests to verify they pass**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
@@ -578,7 +578,7 @@ string, replace the bad-config bytes with something that parses as YAML but lack
 keys — `"unrelated-key: 1\n".getBytes(StandardCharsets.UTF_8)` — which `StorageDeviceConfig`'s
 `Required` attrs reject.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala
@@ -597,7 +597,7 @@ marks that device's stores offline.
 - Modify: `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala:804`
 - Test: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to `StoreManagerDeviceDiscoverySuite` (and add
 `import org.aspen_ddp.aspen.common.network.CheckStorageDevice` to the file's imports):
@@ -616,14 +616,14 @@ Append to `StoreManagerDeviceDiscoverySuite` (and add
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite -- -z "triggers discovery"'`
 
 Expected: FAIL — `Set() was not equal to Set(StorageDeviceId(aaaaaaaa-...))`. The handler calls
 `checkStorageDevice` directly, which takes the `None` branch and never rescans.
 
-- [ ] **Step 3: Rescan when the named device is unknown**
+- [x] **Step 3: Rescan when the named device is unknown**
 
 In `StoreManager.scala`, replace line 804:
 
@@ -642,13 +642,13 @@ with:
           checkStorageDevice(m.deviceId)
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
 Expected: PASS, 9 tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala \
@@ -671,7 +671,7 @@ No production change is expected — `tryLoadDevice` already iterates the device
 children. This test pins that discovery reaches store loading, which is the whole point of the
 feature.
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 Append to `StoreManagerDeviceDiscoverySuite`:
 
@@ -694,19 +694,19 @@ Append to `StoreManagerDeviceDiscoverySuite`:
     Future.successful(mgr.storeLoadAttempts.toList should contain((deviceA, storeDir)))
 ```
 
-- [ ] **Step 2: Run the test to verify it passes**
+- [x] **Step 2: Run the test to verify it passes**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
 Expected: PASS, 10 tests.
 
-- [ ] **Step 3: Run the full suite**
+- [x] **Step 3: Run the full suite**
 
 Run: `sbt test`
 
 Expected: no new failures.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala
@@ -728,7 +728,7 @@ No test: there is no `MetadataManagerSuite`, and constructing one requires a boo
 file plus a `NetworkImplInterface`. The method is three lines and is exercised by the manual
 verification in Task 10.
 
-- [ ] **Step 1: Add the method**
+- [x] **Step 1: Add the method**
 
 In `src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala`, insert
 immediately above `def getHostEntry` (currently line 100):
@@ -744,13 +744,13 @@ immediately above `def getHostEntry` (currently line 100):
 
 ```
 
-- [ ] **Step 2: Verify it compiles**
+- [x] **Step 2: Verify it compiles**
 
 Run: `sbt compile`
 
 Expected: success.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala
@@ -775,7 +775,7 @@ before exit is very likely dropped — and the fallback is a one-hour poll.
 No automated test: the only suite under `zmqnet/` is `ProtobufMessageCodecSuite`, and
 exercising the drain requires binding real sockets. Verified manually in Task 10.
 
-- [ ] **Step 1: Track connected dealer sockets**
+- [x] **Step 1: Track connected dealer sockets**
 
 In `ZMQNet.scala`, immediately after the `sendQueue` declaration (line 97):
 
@@ -791,7 +791,7 @@ add:
   private val connectedDealers = new ConcurrentLinkedQueue[ZMQ.Socket]()
 ```
 
-- [ ] **Step 2: Record each dealer as it is created**
+- [x] **Step 2: Record each dealer as it is created**
 
 In the `NewHostAvailable` case of `ioThread` (lines 323-328), after
 `entry.opollItem = Some(new PollItem(dealer, ZMQ.Poller.POLLIN))`, add
@@ -810,7 +810,7 @@ In the `NewHostAvailable` case of `ioThread` (lines 323-328), after
 The rest of the `NewHostAvailable` block (initial heartbeat, pending drain,
 `connectedHosts += entry`, `rebuildPoller()`) is unchanged.
 
-- [ ] **Step 3: Add the drain and shutdown methods**
+- [x] **Step 3: Add the drain and shutdown methods**
 
 In `ZMQNet.scala`, immediately after `private def wakeIoThread()` (line 169-170), add:
 
@@ -852,14 +852,14 @@ In `ZMQNet.scala`, immediately after `private def wakeIoThread()` (line 169-170)
     context.close()
 ```
 
-- [ ] **Step 4: Verify it compiles**
+- [x] **Step 4: Verify it compiles**
 
 Run: `sbt compile`
 
 Expected: success. `HostId` and `Duration` are already imported in this file
 (`org.aspen_ddp.aspen.common.metadata.HostId`, `scala.concurrent.duration.Duration`).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/common/network/implementations/zmqnet/ZMQNet.scala
@@ -881,7 +881,7 @@ processes a bounded flush window before exit."
 No automated test: the command builds a real `ZMQNet` and an `AspenClient` against a bootstrap
 config file. Verified manually in Task 10.
 
-- [ ] **Step 1: Replace the success branch**
+- [x] **Step 1: Replace the success branch**
 
 In `src/main/scala/org/aspen_ddp/aspen/cmdline/Main.scala`, replace lines 1446-1454:
 
@@ -923,13 +923,13 @@ with:
 `CheckStorageDevice` is already in scope via `import org.aspen_ddp.aspen.common.network.*`
 (Main.scala:17); `Duration` and `SECONDS` via Main.scala:50.
 
-- [ ] **Step 2: Verify it compiles**
+- [x] **Step 2: Verify it compiles**
 
 Run: `sbt compile`
 
 Expected: success.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/cmdline/Main.scala
@@ -976,7 +976,7 @@ log line at all. The host then appears alive while processing nothing.
 Fix: wrap the `handleEvent(event)` call in a `try`/`catch` that logs the throwable and continues
 the loop. This is the durable version of the narrower `listFiles`-null guard added in Task 2.
 
-- [ ] **Step 1: Write the failing test for defect 1**
+- [x] **Step 1: Write the failing test for defect 1**
 
 Append to `StoreManagerDeviceDiscoverySuite`:
 
@@ -1003,25 +1003,25 @@ The future completes asynchronously, so the accessor may need to be polled with 
 wait rather than read once. Use the same bounded-poll idiom as elsewhere in the test suite; if no
 such idiom exists, a loop with a deadline and a 25 ms sleep is acceptable in a test.
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite -- -z "wedge"'`
 
 Expected: FAIL — the set still contains `deviceA` because the failed future never ran the cleanup.
 
-- [ ] **Step 3: Fix defect 1**
+- [x] **Step 3: Fix defect 1**
 
 In `checkStorageDevice`, change the `.foreach` that consumes the `getStorageDeviceState` future so
 that the `activeDeviceChecks -= storageDeviceId` cleanup runs on both success and failure, and the
 failure is logged. Keep the success path's behaviour exactly as it is.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 Run: `sbt 'testOnly org.aspen_ddp.aspen.server.StoreManagerDeviceDiscoverySuite'`
 
 Expected: PASS.
 
-- [ ] **Step 5: Fix defect 2**
+- [x] **Step 5: Fix defect 2**
 
 In `start()`, wrap the `handleEvent(event)` call so a throwable is logged at error and the loop
 continues:
@@ -1039,13 +1039,13 @@ continues:
 Match the surrounding code's exact loop structure and variable names; the snippet above shows the
 intent, not necessarily the literal surrounding lines.
 
-- [ ] **Step 6: Run the full suite**
+- [x] **Step 6: Run the full suite**
 
 Run: `sbt test`
 
 Expected: no new failures.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala \
@@ -1065,13 +1065,13 @@ exception escaping handleEvent also killed the event loop with no log line."
 **Files:**
 - Modify: `TODO.txt:22-24`, `TODO.txt:45-47`
 
-- [ ] **Step 1: Run the full test suite**
+- [x] **Step 1: Run the full test suite**
 
 Run: `sbt test`
 
 Expected: no failures.
 
-- [ ] **Step 2: Verify end-to-end against a running host**
+- [x] **Step 2: Verify end-to-end against a running host**
 
 `bootstrap` creates `<target>/bootstrap-host/` holding `aspen-host-config.yaml`,
 `aspen-bootstrap-config.yaml`, and `storage-devices/bootstrap-device/`
@@ -1094,7 +1094,8 @@ mkdir -p /tmp/aspen-test/bootstrap-host/storage-devices/dev1
    /tmp/aspen-test/bootstrap-host dev1 bootstrap
 ```
 
-Expected:
+Expected (the exact notification wording quoted in this step and the next was revised during
+and after execution to stop over-claiming delivery; `Main.scala` is authoritative):
 - The CLI prints `Created storage device <uuid> at /tmp/aspen-test/bootstrap-host/storage-devices/dev1`
   followed by `Sent a device-check notification to host 'bootstrap-host'. ...`
 - Within a few seconds — not an hour — terminal 1 logs
@@ -1107,7 +1108,7 @@ Confirm the device is registered:
 ./t list-devices /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml bootstrap-host
 ```
 
-- [ ] **Step 3: Verify the polling fallback and the constructor path**
+- [x] **Step 3: Verify the polling fallback and the constructor path**
 
 Stop the host in terminal 1 (Ctrl-C). Then, with the host down:
 
@@ -1136,7 +1137,7 @@ the next `CheckAllDevices`, up to one hour later. That is the intended fallback 
 practical to sit through here; step 2 covers the notification path and this step covers the scan
 itself.
 
-- [ ] **Step 4: Remove the completed TODO items**
+- [x] **Step 4: Remove the completed TODO items**
 
 In `TODO.txt`, delete lines 22-24:
 
@@ -1157,7 +1158,7 @@ Update add-storage-device to send a new NewDeviceAdded HostMessage
 Remove the blank line each leaves behind so the file keeps its one-blank-line-between-items
 shape.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add TODO.txt
@@ -1168,13 +1169,15 @@ git commit -m "Remove TODO items completed by runtime storage device discovery"
 
 ## Verification checklist
 
-- [ ] `sbt test` passes with 11 new tests in `StoreManagerDeviceDiscoverySuite` (10 from the
-      original plan plus the one added by Task 9b)
-- [ ] Device loading logic exists in exactly one place (`tryLoadDevice`, reached only through
+- [x] `sbt test` passes with 13 new tests in `StoreManagerDeviceDiscoverySuite` (10 from the
+      original plan, the one added by Task 9b, and two more added during execution: a
+      partially-failed device load being retried, and an unusable entry under
+      `storage-devices/` not stopping its siblings)
+- [x] Device loading logic exists in exactly one place (`tryLoadDevice`, reached only through
       `checkForNewDevices`); `grep -n "listFiles" src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala`
       shows the directory scan only inside `checkForNewDevices` and the per-device child scan
       inside `tryLoadDevice`
-- [ ] `codec.proto`, `Codec.scala`, and `Message.scala` are untouched — the whole point of
+- [x] `codec.proto`, `Codec.scala`, and `Message.scala` are untouched — the whole point of
       reusing `CheckStorageDevice`. Against the pre-work commit `e2b6ebd`:
       ```bash
       git diff --stat e2b6ebd -- src/main/protobuf/codec.proto \
@@ -1182,6 +1185,6 @@ git commit -m "Remove TODO items completed by runtime storage device discovery"
         src/main/scala/org/aspen_ddp/aspen/common/network/Codec.scala
       ```
       must print nothing
-- [ ] A device added under a running host comes online in seconds (Task 10, step 2)
-- [ ] The `create-storage-device` CLI still exits rather than hanging, both when the host is up
+- [x] A device added under a running host comes online in seconds (Task 10, step 2)
+- [x] The `create-storage-device` CLI still exits rather than hanging, both when the host is up
       and when it is down (Task 10, steps 2 and 3)

@@ -187,10 +187,25 @@ periodic check. Commands that sent no nudges normally never see it.
 **The ordering property is the part worth testing, and `TestNetwork` already
 captures it.** `TestNetwork`'s client messenger records every `sendHostMessage`
 into `capturedHostMessages` (`TestNetwork.scala:162`). An integration test
-asserting the nudges are present *as soon as* the `createNewStoragePool` and
-`transferStore` futures complete fails against today's `tx.result.foreach` and
-passes after section 1. That is the regression guard for the whole design: if
-the sends drift back out of the chain, no drain downstream can help.
+asserts the nudges are present as soon as the `createNewStoragePool` and
+`transferStore` futures complete.
+
+**This test is a regression guard, not a red-green demonstration of the bug.**
+It passes both before and after section 1, and the reason is worth recording.
+`IntegrationTestSuite` extends `AsyncFunSuite`, whose `executionContext` is
+serial. The detached `tx.result.foreach` callback is submitted to that queue
+when the commit promise completes, and the test's own assertion continuation
+can only be enqueued afterwards — it is reached by resolving the outer future,
+which is itself a continuation behind the same queue. So the callback has
+always run by the time the assertions execute, whichever order the promise
+dispatches its two listeners in.
+
+The bug needs a genuinely concurrent `clientContext` to observe, which is what
+the CLI has (`Main.createAmoebaClient`, a three-thread pool) and what
+`TestNetwork` deliberately is not — it asserts single-threaded use in
+`handleEvents`. Building a multi-threaded harness to turn this red is out of
+proportion to the change. The test earns its place by failing if the sends ever
+drift back out of the awaited chain, which is the regression that matters.
 
 **The `MetadataManager` additions** are unit-testable in the style of the
 existing `peekHostEntry` coverage: park a message behind a pending lookup and

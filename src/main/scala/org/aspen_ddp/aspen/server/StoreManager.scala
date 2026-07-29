@@ -327,7 +327,24 @@ class StoreManager(val client: AspenClient,
                 // Nothing consumes the Future this Runnable was submitted with, so without
                 // this the escape would terminate the event loop with no log line at all and
                 // the host would go silently deaf while still appearing to run.
-                logger.error(s"Unhandled exception processing event $event: $t", t)
+                //
+                // Swallowing and continuing is deliberate even though Aspen is crash-only: a
+                // single poisoned event must not take down an otherwise-healthy host, and
+                // handleEvent dispatches one event at a time with no loop state carried
+                // between them.
+                //
+                // The trade is that a throw part-way through a handler leaves whatever that
+                // handler had already mutated half-updated, and LoadStore, Repair and
+                // ShutdownStore each carry a Promise their handler completes, so that promise
+                // stays uncompleted and its awaiter hangs forever. Neither is new -- a dead
+                // loop left both too -- but a dead loop hung everything at once and so was
+                // obvious, whereas now one caller hangs inside a host that still looks
+                // healthy. This log line is the only signal that it happened.
+                //
+                // Only the event class is interpolated: this call is inside the catch, so a
+                // throwing toString on the event's payload would escape and kill the loop
+                // anyway. The stack trace below names the handler.
+                logger.error(s"Unhandled exception processing event ${event.getClass.getSimpleName}", t)
             event = events.poll(0, TimeUnit.SECONDS)
     })
 
@@ -708,30 +725,42 @@ class StoreManager(val client: AspenClient,
       if ! activeDeviceChecks.contains(storageDeviceId) then
         activeDeviceChecks += storageDeviceId
 
-        // onComplete rather than foreach in both branches below: the lookup fails for a device
-        // that has no StorageDeviceState registered yet, and dropping the entry from
-        // activeDeviceChecks only on success would skip every later check of that device.
+        // onComplete, and a finally, in both branches below. The entry must be released on
+        // every outcome: a failed lookup, and a throw out of the callback body itself. Both
+        // are reachable -- getStorageDeviceState fails whenever the device has no entry in
+        // the storage-devices tree, which is the state of a config file placed on disk by
+        // hand, copied from another host, or belonging to a device directory moved between
+        // hosts, and it also fails on any transient failure of the metadata read; and check
+        // below touches the filesystem and issues transactions. Releasing the entry only on
+        // success would leave it set forever and skip every later check of that device for
+        // the life of the process.
         storageDevices.get(storageDeviceId) match
           case Some(local) =>
             client.getStorageDeviceState(storageDeviceId).onComplete: result =>
               synchronized:
-                result match
-                  case Success(remote) => check(local, remote)
-                  case Failure(err) =>
-                    logger.warn(s"Failed to read state for storage device $storageDeviceId. Error: $err")
-                activeDeviceChecks -= storageDeviceId
+                try
+                  result match
+                    case Success(remote) => check(local, remote)
+                    case Failure(err) =>
+                      logger.warn(s"Failed to read state for storage device $storageDeviceId. It may not " +
+                                  s"be registered in the storage-devices tree. Error: $err")
+                finally
+                  activeDeviceChecks -= storageDeviceId
           case None =>
             // Find out what stores are on the offline/failed store and add them to our offlineStores
             // set. We don't want to send "UnknownStore" responses while the device is down
             client.getStorageDeviceState(storageDeviceId).onComplete: result =>
               synchronized:
-                result match
-                  case Success(remote) =>
-                    remote.stores.keysIterator.foreach: storeId =>
-                      offlineStores += storeId
-                  case Failure(err) =>
-                    logger.warn(s"Failed to read state for unloaded storage device $storageDeviceId. Error: $err")
-                activeDeviceChecks -= storageDeviceId
+                try
+                  result match
+                    case Success(remote) =>
+                      remote.stores.keysIterator.foreach: storeId =>
+                        offlineStores += storeId
+                    case Failure(err) =>
+                      logger.warn(s"Failed to read state for unloaded storage device $storageDeviceId. It may " +
+                                  s"not be registered in the storage-devices tree. Error: $err")
+                finally
+                  activeDeviceChecks -= storageDeviceId
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
@@ -821,7 +850,7 @@ class StoreManager(val client: AspenClient,
   private[aspen] def testingOnlyHandleHostMessage(msg: HostMessage): Unit =
     handleEvent(HostMsg(msg))
 
-  /** Testing hook: the devices whose checks checkStorageDevice currently considers in flight. */
+  /** Testing hook: the storage devices with a state lookup currently in flight. */
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =
     synchronized(activeDeviceChecks)
 

@@ -113,6 +113,25 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     try os.remove.all(os.Path(root))
     catch case _: Throwable => ()
 
+  /** Returns a Future that completes once `condition` holds, re-testing it after every yield
+   *  back to the test's ExecutionContext, and giving up after `maxYields` of them.
+   *
+   *  ScalaTest's async ExecutionContext is single threaded and is the same thread that runs the
+   *  test body: queued work only runs while the test is waiting on the Future it returned. A
+   *  sleeping wait here would therefore starve the very callback being waited for; yielding
+   *  lets everything queued ahead of us run instead.
+   *
+   *  Giving up is silent: the returned Future completes with unit either way, so an exhausted
+   *  wait is indistinguishable from a satisfied one. That is intentional -- asserting the
+   *  condition afterwards reports what was actually wrong far better than a timeout would --
+   *  but it means callers MUST assert the condition themselves or they get a false pass.
+   */
+  private def yieldUntil(condition: => Boolean, maxYields: Int = 100): Future[Unit] =
+    if condition || maxYields == 0 then
+      Future.unit
+    else
+      Future(()).flatMap(_ => yieldUntil(condition, maxYields - 1))
+
   /** Creates `<tmp>/host/storage-devices` and returns the host root directory. Pass
    *  `withStorageDevicesDir = false` to leave the `storage-devices` child absent. */
   private def newHostDir(withStorageDevicesDir: Boolean = true): Path =
@@ -153,20 +172,6 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     val dir = StorageDeviceManager.deviceDirectory(hostRoot, name)
     Files.createDirectories(dir)
     dir
-
-  /** Returns a Future that completes once `condition` holds, re-testing it after every yield
-   *  back to the test's ExecutionContext, and giving up after `maxYields` of them.
-   *
-   *  ScalaTest's async ExecutionContext is single threaded and is the same thread that runs the
-   *  test body: queued work only runs while the test is waiting on the Future it returned. A
-   *  sleeping wait here would therefore starve the very callback being waited for; yielding
-   *  lets everything queued ahead of us run instead.
-   */
-  private def yieldUntil(maxYields: Int = 100)(condition: => Boolean): Future[Unit] =
-    if condition || maxYields == 0 then
-      Future.unit
-    else
-      Future(()).flatMap(_ => yieldUntil(maxYields - 1)(condition))
 
   private def newManager(hostRoot: Path, failFirstStoreLoad: Boolean = false): RecordingStoreManager =
     new RecordingStoreManager(client, systemId, hostRoot, executionContext,
@@ -367,12 +372,17 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     mgr.loadedDevices.keySet should be(Set(deviceA))
 
     // deviceA is on disk but absent from the StorageDevicesTree the TestNetwork bootstrapped,
-    // so getStorageDeviceState fails with NoSuchElementException -- exactly the state of a
-    // device directory discovered before its StorageDeviceState is registered. The failure
+    // so getStorageDeviceState fails with NoSuchElementException. That is the state of a
+    // device config on disk with no entry in the storage-devices tree, which arrives by
+    // several routes -- a config placed by hand or copied from another host, as in the
+    // second-directory test above, or a device directory moved between hosts -- and it is
+    // also what any transient failure of the metadata read looks like from here. The failure
     // must still release the activeDeviceChecks entry.
     mgr.testingOnlyCheckAllDevices()
 
-    yieldUntil()(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
+      // into a failure rather than a pass.
       mgr.testingOnlyActiveDeviceChecks should be(empty)
 
       // And the release lets a later check of the same device start rather than being skipped

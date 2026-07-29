@@ -140,6 +140,11 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       deviceDir.resolve(StorageDeviceConfig.configFilename),
       StorageDeviceConfig(deviceId, sysId).yamlConfig.getBytes(StandardCharsets.UTF_8))
 
+  /** Overwrites the config file with bytes SnakeYAML cannot parse. */
+  private def writeUnparseableDeviceConfig(deviceDir: Path): Unit =
+    Files.write(deviceDir.resolve(StorageDeviceConfig.configFilename),
+                "this is not: valid: device config yaml".getBytes(StandardCharsets.UTF_8))
+
   /** Creates an empty device directory with no config file. */
   private def newDeviceDirWithoutConfig(hostRoot: Path, name: String): Path =
     val dir = StorageDeviceManager.deviceDirectory(hostRoot, name)
@@ -173,7 +178,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
 
-    mgr.loadedDevices should be(empty)
+    mgr.loadedDevices.keySet should be(empty)
 
     writeDevice(hostRoot, "dev0", deviceA)
     mgr.testingOnlyCheckAllDevices()
@@ -185,7 +190,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
     noException should be thrownBy mgr.testingOnlyCheckAllDevices()
 
-    Future.successful(mgr.loadedDevices should be(empty))
+    Future.successful(mgr.loadedDevices.keySet should be(empty))
 
   atest("an already-loaded device is not reloaded"):
     val hostRoot = newHostDir()
@@ -246,12 +251,25 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     val deviceDir = newDeviceDirWithoutConfig(hostRoot, "dev0")
 
     val mgr = newManager(hostRoot)
-    mgr.loadedDevices should be(empty)
+    mgr.loadedDevices.keySet should be(empty)
 
-    // createStorageDevice writes the config only after its transaction commits, so a
-    // provisioned-but-unregistered directory is a normal transient state.
+    // createStorageDevice requires the directory to already exist and never creates one, so a
+    // mounted-but-not-yet-registered directory is a normal steady state, not a brief window.
+    // Every scan has to tolerate it and pick the device up whenever the config does appear.
     writeDeviceConfig(deviceDir, deviceA)
     mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+
+  atest("an unusable entry under storage-devices does not stop its siblings from loading"):
+    val hostRoot = newHostDir()
+    // .DS_Store and friends: a plain file where the scan expects a device directory.
+    Files.write(StorageDeviceManager.deviceDirectory(hostRoot, ".DS_Store"),
+                "not a device".getBytes(StandardCharsets.UTF_8))
+    newDeviceDirWithoutConfig(hostRoot, "unconfigured")
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
 
     Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
 
@@ -271,13 +289,19 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
   atest("an unparseable device config is skipped and retried on the next scan"):
     val hostRoot = newHostDir()
     val deviceDir = newDeviceDirWithoutConfig(hostRoot, "dev0")
-    Files.write(deviceDir.resolve(StorageDeviceConfig.configFilename),
-                "this is not: valid: device config yaml".getBytes(StandardCharsets.UTF_8))
+    // Two ':' separators in one flow scalar, so SnakeYAML throws rather than returning a
+    // config missing its required keys. This is the only test covering tryLoadDevice's
+    // catch-all; keep the string genuinely unparseable or it silently becomes a duplicate of
+    // the missing-config test above.
+    writeUnparseableDeviceConfig(deviceDir)
 
     val mgr = newManager(hostRoot)
-    mgr.loadedDevices should be(empty)
+    mgr.loadedDevices.keySet should be(empty)
 
-    Files.delete(deviceDir.resolve(StorageDeviceConfig.configFilename))
+    // A config that stays broken must not poison later scans or half-register the device.
+    mgr.testingOnlyCheckAllDevices()
+    mgr.loadedDevices.keySet should be(empty)
+
     writeDeviceConfig(deviceDir, deviceA)
     mgr.testingOnlyCheckAllDevices()
 

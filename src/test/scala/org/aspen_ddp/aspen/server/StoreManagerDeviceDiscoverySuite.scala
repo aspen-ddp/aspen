@@ -240,3 +240,45 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
     mgr.loadedDevices.keySet should be(Set(deviceA))
     Future.successful(mgr.loadedDevices(deviceA) should be theSameInstanceAs originalState)
+
+  atest("a device directory with no config is skipped, then loaded once the config appears"):
+    val hostRoot = newHostDir()
+    val deviceDir = newDeviceDirWithoutConfig(hostRoot, "dev0")
+
+    val mgr = newManager(hostRoot)
+    mgr.loadedDevices should be(empty)
+
+    // createStorageDevice writes the config only after its transaction commits, so a
+    // provisioned-but-unregistered directory is a normal transient state.
+    writeDeviceConfig(deviceDir, deviceA)
+    mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+
+  atest("a device belonging to another Aspen system is ignored"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA, foreignSystemId)
+    writeDevice(hostRoot, "dev1", deviceB)
+
+    val mgr = newManager(hostRoot)
+
+    mgr.loadedDevices.keySet should be(Set(deviceB))
+
+    mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceB)))
+
+  atest("an unparseable device config is skipped and retried on the next scan"):
+    val hostRoot = newHostDir()
+    val deviceDir = newDeviceDirWithoutConfig(hostRoot, "dev0")
+    Files.write(deviceDir.resolve(StorageDeviceConfig.configFilename),
+                "this is not: valid: device config yaml".getBytes(StandardCharsets.UTF_8))
+
+    val mgr = newManager(hostRoot)
+    mgr.loadedDevices should be(empty)
+
+    Files.delete(deviceDir.resolve(StorageDeviceConfig.configFilename))
+    writeDeviceConfig(deviceDir, deviceA)
+    mgr.testingOnlyCheckAllDevices()
+
+    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))

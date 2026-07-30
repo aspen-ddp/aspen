@@ -335,9 +335,10 @@ In `MetadataManager.scala`, replace the `Success` branch of `startHostLookup` wi
                   case NonFatal(t) =>
                     // Same rule as a failed lookup: drop back to never-looked-up so a later call
                     // retries. Without this the entry stays at Left forever -- the lookup did
-                    // resolve, so nothing will ever run again to advance or remove it.
-                    logger.error(s"Failed to create the host entry for hostId $hostId. Error: $t", t)
+                    // resolve, so nothing will ever run again to advance or remove it. Repair
+                    // first and log second, so a logger that throws cannot leave the wedge behind.
                     hosts -= hostId
+                    logger.error(s"Failed to create the host entry for hostId $hostId. Error: $t", t)
 ```
 
 - [ ] **Step 5: Run the test to verify it passes**
@@ -479,9 +480,10 @@ In `MetadataManager.scala`, in `startPoolLookup`'s `Some(client)` branch, wrap t
           case NonFatal(t) =>
             // Same rule as startHostLookup: a lookup that fails by throwing is a failed lookup, so
             // undo the pending entry and let a later call retry. Left in place it wedges the whole
-            // pool -- every store in it, not just the one addressed here.
-            logger.error(s"StoragePool lookup call threw for poolId ${storeId.poolId}. Error: $t", t)
+            // pool -- every store in it, not just the one addressed here. Repair first and log
+            // second, so a logger that throws cannot leave the wedge behind.
             pendingPoolLookups -= storeId.poolId
+            logger.error(s"StoragePool lookup call threw for poolId ${storeId.poolId}. Error: $t", t)
 ```
 
 - [ ] **Step 5: Run the test to verify it passes**

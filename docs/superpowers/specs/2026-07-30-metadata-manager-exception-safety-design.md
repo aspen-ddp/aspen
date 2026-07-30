@@ -285,3 +285,10 @@ accepted and stated rather than papered over.
 - **Distinguishing "lookup started" from "lookup failed instantly" at the call site.** Both return
   `None`, as a pending lookup already does. Giving callers a third answer would change every call
   site to gain nothing they can act on.
+- **Fatal throwables.** The guards match `NonFatal`, so a `VirtualMachineError`, `LinkageError` or
+  `InterruptedException` from a lookup call still leaves the entry wedged and still propagates.
+  The retryability rule above is therefore stated absolutely but implemented for `NonFatal` only.
+  This is deliberate: `AspenClient.getHostState` and `getStoragePoolState` are pure future
+  combinators over a read, with nothing that blocks, so `InterruptedException` is not reachable
+  through them and the rest are process-fatal anyway. Catching them to keep a map tidy would
+  suppress errors that should end the process.

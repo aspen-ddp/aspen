@@ -55,6 +55,7 @@ object MetadataManager:
 class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: os.Path,
                                                       val networkImplInterface: MetadataManager.NetworkImplInterface[T],
                                                       val pendingStoreLookupQueueSize: Int = 20,
+                                                      // pendingHostLookupQueueSize must be >= pendingStoreLookupQueueSize; see startPoolLookup's rescue of a parked store queue
                                                       val pendingHostLookupQueueSize: Int = 100) extends Logging:
   import MetadataManager.*
 
@@ -130,8 +131,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  discarded rather than sent. Nothing at this layer can tell the two apart.
    *
    *  A message parked on a pool lookup moves to a host lookup when the pool resolves onto a host
-   *  this process has not looked up yet, so that drop can happen at a later stage than the one
-   *  the message was originally parked on. */
+   *  that is not already resolved, so that drop can happen at a later stage than the one the
+   *  message was originally parked on. */
   def hasParkedMessages: Boolean =
     synchronized:
       val parkedOnHost = hosts.values.exists:
@@ -279,9 +280,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                       // above, so nothing else will ever come back for these messages. Doing it
                       // here, inside the same synchronized block, is also what keeps
                       // hasParkedMessages from dipping false while they are between queues.
-                      // The move is loss-free only while pendingHostLookupQueueSize is at least
-                      // pendingStoreLookupQueueSize; otherwise EvictingQueue silently drops the
-                      // oldest of what is being rescued.
+                      // The move is guaranteed loss-free only while pendingHostLookupQueueSize is
+                      // at least pendingStoreLookupQueueSize; otherwise EvictingQueue silently
+                      // drops the oldest of what is being rescued.
+                      // A fresh queue per store: one shared across the loop would end up
+                      // referenced by every rescued host entry, so whichever host resolved first
+                      // would drain all of them.
                       val phl = new PendingHostLookup(pendingHostLookupQueueSize)
                       phl.drainIntoQueue(storeQueue)
                       startHostLookup(se.hostId, phl)

@@ -120,3 +120,40 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
     // because the network implementation drains the queue before throwing.
     client.poolLookupPromise(unknownPoolId).success(poolStateWith(unknownPoolId, bootstrapHostId))
     impl.deliveredTo(bootstrapHostId) should be(List(msg2))
+
+  test("a throwing storeResolved costs only its own store, not the rest of the pool"):
+    val (mgr, client, impl) = newManager()
+
+    val store0 = StoreId(unknownPoolId, 0.toByte)
+    val store1 = StoreId(unknownPoolId, 1.toByte)
+    val msg0 = nudge()
+    val msg1 = nudge()
+
+    mgr.getHostEntryOrQueueMessage(store0, msg0) should be(None)
+    mgr.getHostEntryOrQueueMessage(store1, msg1) should be(None)
+
+    // bootstrapHostId is already Right(...) from the constructor, so store 0 takes the
+    // storeResolved branch -- the loop's one remaining throw site now that startHostLookup no
+    // longer throws. In ZMQNet the throw comes from wakeIoThread() sending on a socket that CLI
+    // teardown already closed.
+    impl.throwOnStoreResolved(bootstrapHostId, new RuntimeException("wakeIoThread exploded"))
+
+    // Store 0 is listed first so there is a tail to lose. Pre-fix the throw escapes foreach and
+    // store 1 gets neither its stores mapping nor its rescued queue.
+    client.poolLookupPromise(unknownPoolId).success(
+      poolStateWith(unknownPoolId, bootstrapHostId, remoteHostId))
+
+    // Store 0's own messages were consumed before the throw, as they are in ZMQNet: the queue is
+    // drained and ProcessPendingMessages enqueued before the wake fails.
+    impl.deliveredTo(bootstrapHostId) should be(List(msg0))
+
+    // Store 1's queue was still rescued onto a host lookup.
+    client.lookups.toList should be(List(remoteHostId))
+    client.lookupPromise(remoteHostId).success(remoteHostState)
+    impl.deliveredTo(remoteHostId) should be(List(msg1))
+    mgr.hasParkedMessages should be(false)
+
+    // Store 1's stores mapping survived too -- a later send resolves straight through the host
+    // path rather than starting a second pool lookup.
+    mgr.getHostEntryOrQueueMessage(store1, nudge()).map(_.hostId) should be(Some(remoteHostId))
+    client.poolLookups.toList should be(List(unknownPoolId))

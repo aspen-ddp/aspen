@@ -127,6 +127,8 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
 
   private var createFailures: Map[HostId, Throwable] = Map()
 
+  private var storeResolvedFailures: Map[HostId, Throwable] = Map()
+
   /** Every (hostId, storeId) pair storeResolved was called with, in call order. */
   def resolutions: List[(HostId, StoreId)] = synchronized:
     storeResolutionsBuffer.toList
@@ -142,6 +144,12 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
    *  that threw before draining would model a failure that cannot happen. */
   def throwOnCreateHostEntry(hostId: HostId, err: Throwable): Unit = synchronized:
     createFailures += hostId -> err
+
+  /** Makes storeResolved throw for `hostId`, after draining and recording. ZMQNet's storeResolved
+   *  empties the queue and enqueues ProcessPendingMessages before its wakeIoThread() call, which
+   *  is the one that can fail -- on a socket closed by CLI teardown. */
+  def throwOnStoreResolved(hostId: HostId, err: Throwable): Unit = synchronized:
+    storeResolvedFailures += hostId -> err
 
   /** Caller holds this object's monitor. */
   private def drain(hostId: HostId, queuedMessages: EvictingQueue[Message]): Unit =
@@ -176,6 +184,9 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
     synchronized:
       storeResolutionsBuffer += hostEntry.hostId -> storeId
       drain(hostEntry.hostId, queuedMessages)
+      storeResolvedFailures.get(hostEntry.hostId) match
+        case Some(err) => throw err
+        case None => ()
 
 
 /** A MetadataManager over a temp bootstrap config naming exactly one host, plus the ids of a

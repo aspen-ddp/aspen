@@ -313,27 +313,43 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                 pendingPoolLookups -= storeId.poolId
                 poolState.stores.zipWithIndex.foreach: (se, index) =>
                   val sid = StoreId(storeId.poolId, index.toByte)
+                  // Outside the try on purpose. Nothing here can throw, so this is legibility
+                  // rather than mechanism: the mapping is the part that must land for every store
+                  // regardless of what the handoff does, and its position says so.
                   stores += sid -> se.hostId
-                  ppl.storeQueues.get(sid).foreach: storeQueue =>
-                    hosts.get(se.hostId) match
-                      case None =>
-                        // The pool named a host this process has never looked up. Move the queue
-                        // onto a host lookup instead of dropping it: pendingPoolLookups was cleared
-                        // above, so nothing else will ever come back for these messages. Doing it
-                        // here, inside the same synchronized block, is also what keeps
-                        // hasParkedMessages from dipping false while they are between queues.
-                        // The move is guaranteed loss-free only while pendingHostLookupQueueSize is
-                        // at least pendingStoreLookupQueueSize; otherwise EvictingQueue silently
-                        // drops the oldest of what is being rescued.
-                        // A fresh queue per store: one shared across the loop would end up
-                        // referenced by every rescued host entry, so whichever host resolved first
-                        // would drain all of them.
-                        val phl = new PendingHostLookup(pendingHostLookupQueueSize)
-                        phl.drainIntoQueue(storeQueue)
-                        startHostLookup(se.hostId, phl)
-                      case Some(e) => e match
-                        case Left(phl) => phl.drainIntoQueue(storeQueue)
-                        case Right(hostEntry) => networkImplInterface.storeResolved(hostEntry, sid, storeQueue)
+                  try
+                    ppl.storeQueues.get(sid).foreach: storeQueue =>
+                      hosts.get(se.hostId) match
+                        case None =>
+                          // The pool named a host this process has never looked up. Move the queue
+                          // onto a host lookup instead of dropping it: pendingPoolLookups was cleared
+                          // above, so nothing else will ever come back for these messages. Doing it
+                          // here, inside the same synchronized block, is also what keeps
+                          // hasParkedMessages from dipping false while they are between queues.
+                          // The move is guaranteed loss-free only while pendingHostLookupQueueSize is
+                          // at least pendingStoreLookupQueueSize; otherwise EvictingQueue silently
+                          // drops the oldest of what is being rescued.
+                          // A fresh queue per store: one shared across the loop would end up
+                          // referenced by every rescued host entry, so whichever host resolved first
+                          // would drain all of them.
+                          val phl = new PendingHostLookup(pendingHostLookupQueueSize)
+                          phl.drainIntoQueue(storeQueue)
+                          startHostLookup(se.hostId, phl)
+                        case Some(e) => e match
+                          case Left(phl) => phl.drainIntoQueue(storeQueue)
+                          case Right(hostEntry) => networkImplInterface.storeResolved(hostEntry, sid, storeQueue)
+                  catch
+                    case NonFatal(t) =>
+                      // Contain the throw to this store. Uncaught it escapes foreach, and since
+                      // pendingPoolLookups was cleared above, every later store's queue becomes
+                      // unreachable -- the tail of the pool lost to one store's failure.
+                      //
+                      // Now that startHostLookup swallows, the None and Left branches cannot throw
+                      // and storeResolved is the only live throw site here. It stays a guard over
+                      // the whole body so the next call added to it does not have to re-derive
+                      // this argument.
+                      logger.error(s"Handoff failed for messages parked on store $sid, host ${se.hostId}. " +
+                                   s"Those messages are lost; the rest of the pool is unaffected. Error: $t", t)
         catch
           case NonFatal(t) =>
             // Same rule as startHostLookup: a lookup that fails by throwing is a failed lookup, so

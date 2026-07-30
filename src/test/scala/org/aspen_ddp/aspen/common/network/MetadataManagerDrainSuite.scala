@@ -16,7 +16,7 @@ class MetadataManagerDrainSuite extends AnyFunSuite
     CheckStorageDevice(remoteHostId, ClientId.Null, StorageDeviceId(UUID.randomUUID()))
 
   test("resolvedHostEntries omits a host whose lookup is still pending"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.resolvedHostEntries.map(_.hostId) should be(List(bootstrapHostId))
 
@@ -29,7 +29,7 @@ class MetadataManagerDrainSuite extends AnyFunSuite
     mgr.resolvedHostEntries.map(_.hostId).toSet should be(Set(bootstrapHostId, remoteHostId))
 
   test("hasParkedMessages sees a message held behind a pending host lookup"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.hasParkedMessages should be(false)
 
@@ -43,7 +43,7 @@ class MetadataManagerDrainSuite extends AnyFunSuite
     mgr.hasParkedMessages should be(false)
 
   test("hasParkedMessages sees a message held behind a pending pool lookup"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     val unknownStore = StoreId(unknownPoolId, 0.toByte)
     mgr.getHostEntryOrQueueMessage(unknownStore, nudge()) should be(None)
@@ -51,7 +51,7 @@ class MetadataManagerDrainSuite extends AnyFunSuite
     mgr.hasParkedMessages should be(true)
 
   test("a failed lookup drops the parked message rather than reporting it"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.getHostEntryOrQueueMessage(remoteHostId, nudge()) should be(None)
     mgr.hasParkedMessages should be(true)

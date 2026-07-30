@@ -4,7 +4,8 @@ import org.aspen_ddp.aspen.TestNetwork
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
+import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.EvictingQueue
@@ -81,6 +82,57 @@ class LookupRecordingClient extends TestNetwork.TClient(
     poolLookupPromise(poolId).future
 
 
+/** A NetworkImplInterface that drains what MetadataManager hands it, the way ZMQNet does, and
+ *  records where each message ended up.
+ *
+ *  Draining rather than peeking is deliberate: ZMQNet's createHostEntry and storeResolved both
+ *  empty the EvictingQueue they are given before returning, so a double that left messages in
+ *  place would not model the handoff it is here to observe.
+ *
+ *  Lock-ordering note: MetadataManager calls both methods while holding its own monitor, so the
+ *  order is always manager then this object. Tests read the recordings without holding the
+ *  manager's lock, which keeps that order intact.
+ */
+class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[MetadataManager.HostEntry]:
+
+  /** Every (hostId, storeId) pair storeResolved was called with, in call order. */
+  val storeResolutions: mutable.ListBuffer[(HostId, StoreId)] = mutable.ListBuffer()
+
+  private var delivered: Map[HostId, List[Message]] = Map()
+
+  /** Messages drained on `hostId`'s behalf, in arrival order. Empty if it received none. */
+  def deliveredTo(hostId: HostId): List[Message] =
+    synchronized:
+      delivered.getOrElse(hostId, Nil)
+
+  /** Caller holds this object's monitor. */
+  private def drain(hostId: HostId, queuedMessages: EvictingQueue[Message]): Unit =
+    val buf = mutable.ListBuffer[Message]()
+    var omsg = queuedMessages.dequeue()
+    while omsg.isDefined do
+      omsg.foreach(buf.append)
+      omsg = queuedMessages.dequeue()
+    delivered += hostId -> (delivered.getOrElse(hostId, Nil) ++ buf.toList)
+
+  def createHostEntry(hostId: HostId,
+                      name: String,
+                      address: String,
+                      dataPort: Int,
+                      cncPort: Int,
+                      storeTransferPort: Int,
+                      queuedMessages: EvictingQueue[Message]): MetadataManager.HostEntry =
+    synchronized:
+      drain(hostId, queuedMessages)
+    new MetadataManager.HostEntry(hostId, name, address, dataPort, cncPort, storeTransferPort)
+
+  def storeResolved(hostEntry: MetadataManager.HostEntry,
+                    storeId: StoreId,
+                    queuedMessages: EvictingQueue[Message]): Unit =
+    synchronized:
+      storeResolutions += hostEntry.hostId -> storeId
+      drain(hostEntry.hostId, queuedMessages)
+
+
 /** A MetadataManager over a temp bootstrap config naming exactly one host, plus the ids of a
  *  host and a pool that config does not name -- reaching either requires a lookup. */
 trait MetadataManagerFixture extends BeforeAndAfterAll:
@@ -102,6 +154,23 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
   protected val remoteHostState: HostState =
     HostState(remoteHostId, "remote_host", "10.0.0.9", 6000, 6001, 6002, Set())
 
+  /** A StoragePoolState placing one store on each of `hostIds`, store index matching position.
+   *
+   *  Everything but the pool id and the store entries is filler. MetadataManager reads only
+   *  poolState.stores, and each StoreEntry only for its hostId.
+   */
+  protected def poolStateWith(poolId: PoolId, hostIds: HostId*): StoragePoolState =
+    val stores = hostIds.map: hostId =>
+      StoragePoolState.StoreEntry(hostId, StorageDeviceId(UUID.randomUUID()))
+    StoragePoolState(
+      poolId,
+      "test_pool",
+      Replication(hostIds.size, hostIds.size),
+      None,
+      stores.toArray,
+      RocksDBConfig(),
+      StorageDeviceSetId(UUID.randomUUID()))
+
   private var tempDir: Path = scala.compiletime.uninitialized
   private var bootstrapConfigFile: os.Path = scala.compiletime.uninitialized
 
@@ -122,25 +191,12 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
     catch case _: Throwable => ()
     finally super.afterAll()
 
-  /** A MetadataManager over the fixture's bootstrap config, wired to a fresh recording client.
-   *  The NetworkImplInterface is the smallest thing that satisfies the type: it builds a plain
-   *  HostEntry and ignores store resolution, neither of which the suites here touch. */
-  protected def newManager(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient) =
-    val impl = new MetadataManager.NetworkImplInterface[MetadataManager.HostEntry]:
-      def createHostEntry(hostId: HostId,
-                          name: String,
-                          address: String,
-                          dataPort: Int,
-                          cncPort: Int,
-                          storeTransferPort: Int,
-                          queuedMessages: EvictingQueue[Message]): MetadataManager.HostEntry =
-        new MetadataManager.HostEntry(hostId, name, address, dataPort, cncPort, storeTransferPort)
-
-      def storeResolved(hostEntry: MetadataManager.HostEntry,
-                        storeId: StoreId,
-                        queuedMessages: EvictingQueue[Message]): Unit = ()
-
+  /** A MetadataManager over the fixture's bootstrap config, wired to a fresh recording client and
+   *  a fresh RecordingNetworkImpl. Returning the impl is what lets a suite assert that a message
+   *  actually reached a host rather than merely that a lookup was started. */
+  protected def newManager(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl) =
+    val impl = new RecordingNetworkImpl
     val client = new LookupRecordingClient
     val mgr = new MetadataManager[MetadataManager.HostEntry](bootstrapConfigFile, impl)
     mgr.setAspenClient(client)
-    (mgr, client)
+    (mgr, client, impl)

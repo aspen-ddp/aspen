@@ -8,13 +8,13 @@ class MetadataManagerPeekHostEntrySuite extends AnyFunSuite
     with MetadataManagerFixture:
 
   test("peekHostEntry returns a bootstrap host without starting a lookup"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.peekHostEntry(bootstrapHostId).map(_.name) should be(Some("bootstrap_host"))
     client.lookups.toList should be(empty)
 
   test("peekHostEntry returns None for an unknown host and starts no lookup"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.peekHostEntry(remoteHostId) should be(None)
     mgr.peekHostEntry(remoteHostId) should be(None)
@@ -26,7 +26,7 @@ class MetadataManagerPeekHostEntrySuite extends AnyFunSuite
     client.lookups.toList should be(List(remoteHostId))
 
   test("peekHostEntry returns None while a lookup is pending"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.getHostEntry(remoteHostId) should be(None)
     // The Promise is deliberately left uncompleted, so the entry is still Left(PendingHostLookup).
@@ -36,7 +36,7 @@ class MetadataManagerPeekHostEntrySuite extends AnyFunSuite
     client.lookups.toList should be(List(remoteHostId))
 
   test("peekHostEntry returns the entry once the lookup resolves"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.getHostEntry(remoteHostId) should be(None)
     client.lookupPromise(remoteHostId).success(remoteHostState)
@@ -48,7 +48,7 @@ class MetadataManagerPeekHostEntrySuite extends AnyFunSuite
     client.lookups.toList should be(List(remoteHostId))
 
   test("a failed lookup returns the host to the never-looked-up state"):
-    val (mgr, client) = newManager()
+    val (mgr, client, _) = newManager()
 
     mgr.getHostEntry(remoteHostId) should be(None)
     client.lookupPromise(remoteHostId).failure(new NoSuchElementException("no such host"))

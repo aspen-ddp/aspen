@@ -349,7 +349,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                       // handoff anyway, because the handoff is the unit being contained -- not
                       // because of where the throw happens to come from today.
                       logger.error(s"Handoff failed for messages parked on store $sid, host ${se.hostId}. " +
-                                   s"Those messages may not have been delivered; the rest of the pool is unaffected. Error: $t", t)
+                                   s"Those messages may not have been delivered; the rest of the pool " +
+                                   s"is unaffected. Error: $t", t)
         catch
           case NonFatal(t) =>
             // Same rule as startHostLookup: a lookup that fails by throwing is a failed lookup, so

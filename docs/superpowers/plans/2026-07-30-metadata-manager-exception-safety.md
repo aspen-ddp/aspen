@@ -815,9 +815,9 @@ with:
  *  same effect here.
 ```
 
-- [ ] **Step 3: Record the ZMQNet socket leak in TODO.txt**
+- [ ] **Step 3: Record the two ZMQNet socket leaks in TODO.txt**
 
-In `TODO.txt`, insert this entry immediately after the `StoreManager.checkStorageDevice leaks its activeDeviceChecks guard` block (which currently ends at line 42), separated by a blank line:
+In `TODO.txt`, insert these two entries immediately after the `StoreManager.checkStorageDevice leaks its activeDeviceChecks guard` block (which currently ends at line 42), each separated by a blank line:
 
 ```
 ZMQNet.ioThread leaks a socket when NewHostAvailable fails partway through
@@ -827,6 +827,20 @@ ZMQNet.ioThread leaks a socket when NewHostAvailable fails partway through
     that host stays permanently unsendable
   - Fix wants the socket closed on the failure path, which in turn wants a seam that lets a test
     make connect() fail -- the same reason the checkStorageDevice leak above is unguarded
+
+A createHostEntry that throws late orphans the entry the IO thread already accepted
+  - createHostEntry enqueues NewHostAvailable before the wakeIoThread() that can throw, so a
+    throw from that wake still leaves a fully live entry behind: the IO loop drains sendQueue on
+    every iteration regardless of the wake, so the dealer is created, registered in
+    connectedDealers and connectedHosts, flushed, and heartbeated thereafter
+  - Meanwhile MetadataManager's guard has removed the host from its map, so the next send builds
+    a second entry and a second dealer for the same host. The first is unreachable from the
+    manager but still live in the IO thread
+  - This is the accepted cost of the guard -- an orphaned entry beats a permanent wedge -- and
+    reachability is low, since wakeIoThread fails on a closed socket, i.e. during teardown of a
+    process that is exiting anyway. Recorded rather than fixed
+  - Distinct from the leak above: there NewHostAvailable fails, here it succeeds for an entry the
+    manager has already forgotten
 ```
 
 - [ ] **Step 4: Verify it compiles**

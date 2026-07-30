@@ -53,6 +53,7 @@ class LookupRecordingClient extends TestNetwork.TClient(
 
   private var promises: Map[HostId, Promise[HostState]] = Map()
   private var poolPromises: Map[PoolId, Promise[StoragePoolState]] = Map()
+  private var lookupFailures: Map[HostId, Throwable] = Map()
 
   /** The Promise backing `hostId`'s lookup, created on first use. Callable before or after the
    *  lookup itself so a test can complete it either way round. */
@@ -73,9 +74,22 @@ class LookupRecordingClient extends TestNetwork.TClient(
         poolPromises += poolId -> p
         p
 
+  /** Makes getHostState throw `err` synchronously for `hostId` rather than returning a future.
+   *
+   *  The call is still recorded in `lookups` before the throw, which is what lets a test tell a
+   *  retried lookup from a wedged one: both leave the host unresolved, and only the call count
+   *  distinguishes them. */
+  def failLookupWith(hostId: HostId, err: Throwable): Unit = synchronized:
+    lookupFailures += hostId -> err
+
+  def clearLookupFailure(hostId: HostId): Unit = synchronized:
+    lookupFailures -= hostId
+
   override def getHostState(hostId: HostId): Future[HostState] = synchronized:
     lookups += hostId
-    lookupPromise(hostId).future
+    lookupFailures.get(hostId) match
+      case Some(err) => throw err
+      case None => lookupPromise(hostId).future
 
   override def getStoragePoolState(poolId: PoolId): Future[StoragePoolState] = synchronized:
     poolLookups += poolId

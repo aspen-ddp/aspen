@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.util.{EvictingQueue, atomicWrite}
 import scribe.Logging
 
 import scala.concurrent.ExecutionContext
+import scala.util.control.NonFatal
 import scala.util.{Failure, Success}
 
 object MetadataManager:
@@ -236,22 +237,35 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
       case Some(client) =>
         given ExecutionContext = client.clientContext
         hosts += hostId -> Left(phl)
-        client.getHostState(hostId).onComplete:
-          case Failure(err) =>
-            logger.error(s"HostState lookup failed for hostId $hostId. Error: $err")
-            synchronized:
-              hosts -= hostId
-          case Success(hostState) =>
-            synchronized:
-              hosts += hostId -> Right(networkImplInterface.createHostEntry(
-                hostId,
-                hostState.name,
-                hostState.address,
-                hostState.dataPort,
-                hostState.cncPort,
-                hostState.storeTransferPort,
-                phl.messageQueue
-              ))
+        try
+          client.getHostState(hostId).onComplete:
+            case Failure(err) =>
+              logger.error(s"HostState lookup failed for hostId $hostId. Error: $err")
+              synchronized:
+                hosts -= hostId
+            case Success(hostState) =>
+              synchronized:
+                hosts += hostId -> Right(networkImplInterface.createHostEntry(
+                  hostId,
+                  hostState.name,
+                  hostState.address,
+                  hostState.dataPort,
+                  hostState.cncPort,
+                  hostState.storeTransferPort,
+                  phl.messageQueue
+                ))
+        catch
+          case NonFatal(t) =>
+            // A lookup that fails by throwing is still a failed lookup, so undo the pending entry
+            // installed above and let a later call retry -- exactly what the Failure branch does.
+            // Left in place it would never resolve, because no continuation exists to resolve it:
+            // the host would be unreachable and hasParkedMessages stuck true for the life of the
+            // process. Swallowing rather than rethrowing is what keeps this out of ZMQNet's send
+            // loop, whose two calls into getHostEntryOrQueueMessage have no guard of their own.
+            // The monitor is held by the caller, per this method's contract, so the removal below
+            // needs no synchronized of its own.
+            logger.error(s"HostState lookup call threw for hostId $hostId. Error: $t", t)
+            hosts -= hostId
 
   private def startPoolLookup(storeId: StoreId, msg: Message): Unit =
     oClient match

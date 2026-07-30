@@ -791,6 +791,12 @@ and this on `startDeviceCheck`:
    *  lookupStorageDeviceState, before the Future exists, would still leak it -- known, tracked
    *  in TODO.txt, and deliberately not guarded here.
    *
+   *  The deferral flag is cleared before the re-dispatch, not after. No test can tell the two
+   *  apart, because onComplete never runs inline on the ExecutionContexts used today, so the
+   *  nested callback cannot re-enter this finally while the flag is still set. Under an inline
+   *  or parasitic EC the other order recurses without bound, and it also strands the flag if
+   *  lookupStorageDeviceState throws synchronously.
+   *
    *  Both lookup failure modes are reachable. The reconcile touches the filesystem and issues
    *  transactions, so it can throw. And the lookup fails whenever the device has no entry in
    *  the storage-devices tree: a config written out-of-band naming an id that was never

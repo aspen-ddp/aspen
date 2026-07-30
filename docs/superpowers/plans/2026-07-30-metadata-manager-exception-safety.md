@@ -815,7 +815,39 @@ with:
  *  same effect here.
 ```
 
-- [ ] **Step 3: Record the two ZMQNet socket leaks in TODO.txt**
+- [ ] **Step 3: Label each guard with the rule it implements**
+
+By this point `MetadataManager.scala` holds four superficially similar `catch NonFatal` blocks implementing *two* different rules, which is the real comprehension risk — a labelling problem, not a factoring one. Tasks 1, 2 and 3 all implement the **retryability rule**: a lookup that fails, however it fails, returns its subject to the never-looked-up state so a later call retries. Task 4 implements the **containment rule**: a throw costs only the store that threw.
+
+Add a lead-in line as the first line of each catch block's comment, above the existing text. Do not reword what is already there.
+
+In `startHostLookup`'s outer catch (the one guarding the `getHostState` call):
+
+```scala
+              // Retryability rule.
+```
+
+In `startHostLookup`'s inner catch (the one guarding `createHostEntry`):
+
+```scala
+                    // Retryability rule.
+```
+
+In `startPoolLookup`'s catch:
+
+```scala
+            // Retryability rule.
+```
+
+In the per-store handoff loop's catch:
+
+```scala
+                    // Containment rule: this one costs a store, it does not restore one.
+```
+
+Match each to the indentation of the comment line already beneath it.
+
+- [ ] **Step 4: Record the two ZMQNet socket leaks in TODO.txt**
 
 In `TODO.txt`, insert these two entries immediately after the `StoreManager.checkStorageDevice leaks its activeDeviceChecks guard` block (which currently ends at line 42), each separated by a blank line:
 
@@ -843,13 +875,13 @@ A createHostEntry that throws late orphans the entry the IO thread already accep
     manager has already forgotten
 ```
 
-- [ ] **Step 4: Verify it compiles**
+- [ ] **Step 5: Verify it compiles**
 
 Run: `sbt compile`
 
 Expected: success.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala TODO.txt

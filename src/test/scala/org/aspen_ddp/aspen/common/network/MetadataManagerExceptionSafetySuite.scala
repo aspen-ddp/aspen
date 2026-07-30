@@ -94,3 +94,21 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
     // starts a fresh lookup. This assertion is the one that separates the two states.
     mgr.getHostEntryOrQueueMessage(remoteHostId, nudge()) should be(None)
     client.lookups.toList should be(List(remoteHostId, remoteHostId))
+
+  test("a pool lookup call that throws leaves the pool retryable"):
+    val (mgr, client, impl) = newManager()
+
+    val store0 = StoreId(unknownPoolId, 0.toByte)
+    client.failPoolLookupWith(unknownPoolId, new RuntimeException("getStoragePoolState exploded"))
+
+    mgr.getHostEntryOrQueueMessage(store0, nudge()) should be(None)
+    client.poolLookups.toList should be(List(unknownPoolId))
+
+    // A pendingPoolLookups entry no continuation will remove parks every later message for every
+    // store in the pool, forever -- one wedge covering a whole pool rather than one host.
+    mgr.hasParkedMessages should be(false)
+
+    client.clearPoolLookupFailure(unknownPoolId)
+
+    mgr.getHostEntryOrQueueMessage(store0, nudge()) should be(None)
+    client.poolLookups.toList should be(List(unknownPoolId, unknownPoolId))

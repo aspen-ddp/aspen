@@ -54,6 +54,7 @@ class LookupRecordingClient extends TestNetwork.TClient(
   private var promises: Map[HostId, Promise[HostState]] = Map()
   private var poolPromises: Map[PoolId, Promise[StoragePoolState]] = Map()
   private var lookupFailures: Map[HostId, Throwable] = Map()
+  private var poolLookupFailures: Map[PoolId, Throwable] = Map()
 
   /** The Promise backing `hostId`'s lookup, created on first use. Callable before or after the
    *  lookup itself so a test can complete it either way round. */
@@ -85,6 +86,14 @@ class LookupRecordingClient extends TestNetwork.TClient(
   def clearLookupFailure(hostId: HostId): Unit = synchronized:
     lookupFailures -= hostId
 
+  /** Makes getStoragePoolState throw `err` synchronously for `poolId`. Recorded in `poolLookups`
+   *  before the throw, for the same reason failLookupWith records first. */
+  def failPoolLookupWith(poolId: PoolId, err: Throwable): Unit = synchronized:
+    poolLookupFailures += poolId -> err
+
+  def clearPoolLookupFailure(poolId: PoolId): Unit = synchronized:
+    poolLookupFailures -= poolId
+
   override def getHostState(hostId: HostId): Future[HostState] = synchronized:
     lookups += hostId
     lookupFailures.get(hostId) match
@@ -93,7 +102,9 @@ class LookupRecordingClient extends TestNetwork.TClient(
 
   override def getStoragePoolState(poolId: PoolId): Future[StoragePoolState] = synchronized:
     poolLookups += poolId
-    poolLookupPromise(poolId).future
+    poolLookupFailures.get(poolId) match
+      case Some(err) => throw err
+      case None => poolLookupPromise(poolId).future
 
 
 /** A NetworkImplInterface that drains what MetadataManager hands it, the way ZMQNet does, and

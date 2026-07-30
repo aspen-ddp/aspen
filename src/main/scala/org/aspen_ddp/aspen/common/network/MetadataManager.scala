@@ -294,34 +294,43 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
         val ppl = new PendingPoolLookup(pendingStoreLookupQueueSize)
         ppl.enqueueMessage(storeId, msg)
         pendingPoolLookups += storeId.poolId -> ppl
-        client.getStoragePoolState(storeId.poolId).onComplete:
-          case Failure(err) =>
-            logger.error(s"StoragePool lookup failed for poolId ${storeId.poolId}. Error: $err")
-            synchronized:
-              pendingPoolLookups -= storeId.poolId
-          case Success(poolState) =>
-            synchronized:
-              pendingPoolLookups -= storeId.poolId
-              poolState.stores.zipWithIndex.foreach: (se, index) =>
-                val sid = StoreId(storeId.poolId, index.toByte)
-                stores += sid -> se.hostId
-                ppl.storeQueues.get(sid).foreach: storeQueue =>
-                  hosts.get(se.hostId) match
-                    case None =>
-                      // The pool named a host this process has never looked up. Move the queue
-                      // onto a host lookup instead of dropping it: pendingPoolLookups was cleared
-                      // above, so nothing else will ever come back for these messages. Doing it
-                      // here, inside the same synchronized block, is also what keeps
-                      // hasParkedMessages from dipping false while they are between queues.
-                      // The move is guaranteed loss-free only while pendingHostLookupQueueSize is
-                      // at least pendingStoreLookupQueueSize; otherwise EvictingQueue silently
-                      // drops the oldest of what is being rescued.
-                      // A fresh queue per store: one shared across the loop would end up
-                      // referenced by every rescued host entry, so whichever host resolved first
-                      // would drain all of them.
-                      val phl = new PendingHostLookup(pendingHostLookupQueueSize)
-                      phl.drainIntoQueue(storeQueue)
-                      startHostLookup(se.hostId, phl)
-                    case Some(e) => e match
-                      case Left(phl) => phl.drainIntoQueue(storeQueue)
-                      case Right(hostEntry) => networkImplInterface.storeResolved(hostEntry, sid, storeQueue)
+        try
+          client.getStoragePoolState(storeId.poolId).onComplete:
+            case Failure(err) =>
+              logger.error(s"StoragePool lookup failed for poolId ${storeId.poolId}. Error: $err")
+              synchronized:
+                pendingPoolLookups -= storeId.poolId
+            case Success(poolState) =>
+              synchronized:
+                pendingPoolLookups -= storeId.poolId
+                poolState.stores.zipWithIndex.foreach: (se, index) =>
+                  val sid = StoreId(storeId.poolId, index.toByte)
+                  stores += sid -> se.hostId
+                  ppl.storeQueues.get(sid).foreach: storeQueue =>
+                    hosts.get(se.hostId) match
+                      case None =>
+                        // The pool named a host this process has never looked up. Move the queue
+                        // onto a host lookup instead of dropping it: pendingPoolLookups was cleared
+                        // above, so nothing else will ever come back for these messages. Doing it
+                        // here, inside the same synchronized block, is also what keeps
+                        // hasParkedMessages from dipping false while they are between queues.
+                        // The move is guaranteed loss-free only while pendingHostLookupQueueSize is
+                        // at least pendingStoreLookupQueueSize; otherwise EvictingQueue silently
+                        // drops the oldest of what is being rescued.
+                        // A fresh queue per store: one shared across the loop would end up
+                        // referenced by every rescued host entry, so whichever host resolved first
+                        // would drain all of them.
+                        val phl = new PendingHostLookup(pendingHostLookupQueueSize)
+                        phl.drainIntoQueue(storeQueue)
+                        startHostLookup(se.hostId, phl)
+                      case Some(e) => e match
+                        case Left(phl) => phl.drainIntoQueue(storeQueue)
+                        case Right(hostEntry) => networkImplInterface.storeResolved(hostEntry, sid, storeQueue)
+        catch
+          case NonFatal(t) =>
+            // Same rule as startHostLookup: a lookup that fails by throwing is a failed lookup, so
+            // undo the pending entry and let a later call retry. Left in place it wedges the whole
+            // pool -- every store in it, not just the one addressed here. Repair first and log
+            // second, so a logger that throws cannot leave the wedge behind.
+            pendingPoolLookups -= storeId.poolId
+            logger.error(s"StoragePool lookup call threw for poolId ${storeId.poolId}. Error: $t", t)

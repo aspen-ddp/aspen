@@ -182,14 +182,19 @@ Insert into the `RecordingStoreManager` body, after the `tryLoadStore` override 
 `def loadedDevices`:
 
 ```scala
-  /** Storage device ids passed to lookupStorageDeviceState, in call order. */
+  /** Storage device ids passed to lookupStorageDeviceState, in call order.
+   *
+   *  Lazy for the same reason as armedLookups below.
+   */
   lazy val lookupAttempts: mutable.ListBuffer[StorageDeviceId] =
     mutable.ListBuffer[StorageDeviceId]()
 
   /** Promises queued by armLookup, consumed one per lookup of that device.
    *
-   *  Lazy for the same initialization-order reason as storeLoadAttempts: StoreManager's
-   *  constructor runs before this subclass's fields would otherwise be initialized.
+   *  Lazy to match storeLoadAttempts. Unlike that field, nothing in StoreManager's constructor
+   *  reaches this override today: the constructor's device scan calls tryLoadStore, but a
+   *  device check only ever runs from handleEvent. The uniformity is deliberate insurance
+   *  against that changing.
    */
   private lazy val armedLookups: mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]] =
     mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]]()
@@ -248,18 +253,30 @@ Append to `StoreManagerDeviceDiscoverySuite`:
 
     mgr.testingOnlyCheckAllDevices()
 
-    // The armed promise was taken instead of the real client's read, and the guard is held
-    // for as long as it stays pending. Every later test depends on both.
     mgr.lookupAttempts.toList should be(List(deviceA))
-    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
-    p.failure(new RuntimeException("test-controlled lookup failure"))
+    // Drain everything the check queued. A real client read of deviceA fails immediately --
+    // deviceA is absent from the storage-devices tree -- so an unarmed check would have
+    // released the guard by the time this wait exhausts. Still holding it is what proves the
+    // armed promise, and not the client's read, is what the check is waiting on.
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).flatMap: _ =>
+      mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
-    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
-      // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
-      // into a failure rather than a pass.
-      mgr.testingOnlyActiveDeviceChecks should be(empty)
+      p.failure(new RuntimeException("test-controlled lookup failure"))
+
+      yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+        // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
+        // into a failure rather than a pass.
+        mgr.testingOnlyActiveDeviceChecks should be(empty)
 ```
+
+**Why the intermediate drain.** Asserting the guard is held immediately after
+`testingOnlyCheckAllDevices()` proves nothing: ScalaTest's async EC is single-threaded and is
+the test's own thread, and `Future.onComplete` always dispatches through it even for an
+already-completed Future. So no callback has run at that point regardless of which Future the
+seam returned, and the assertion is unconditionally true. Yielding first is what makes it
+discriminating. Verified by mutation — substituting `armLookup(deviceB)` makes this version
+fail and the un-yielded version pass.
 
 - [ ] **Step 6: Run the test**
 

@@ -464,3 +464,40 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
         // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
         // into a failure rather than a pass.
         mgr.testingOnlyActiveDeviceChecks should be(empty)
+
+  atest("a check started before its device loads uses the loaded branch when it completes"):
+    val hostRoot = newHostDir()
+    val mgr = newManager(hostRoot)
+
+    mgr.loadedDevices.keySet should be(empty)
+
+    // Arm the lookup this CheckStorageDevice will issue, so it stays in flight while the
+    // device loads underneath it.
+    val p = mgr.armLookup(deviceA)
+
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+
+    mgr.loadedDevices.keySet should be(empty)
+    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+
+    // The config appears and a later event loads the device while the lookup is outstanding.
+    // This is what runtime device discovery made possible and what the dispatch-time branch
+    // could not account for.
+    writeDevice(hostRoot, "dev0", deviceA)
+    mgr.testingOnlyCheckAllDevices()
+    mgr.loadedDevices.keySet should be(Set(deviceA))
+
+    // An Active store makes check() a no-op in every one of its branches, so this pins branch
+    // selection alone rather than dragging in store creation or transfers.
+    p.success(deviceState(
+      deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      mgr.testingOnlyActiveDeviceChecks should be(empty)
+
+      // The device was loaded before the lookup returned, so its stores must not be marked
+      // offline by a decision taken back when it was not. Nothing would ever clear them:
+      // tryLoadStore and the LoadStore handler are the only removers and both already ran.
+      mgr.testingOnlyOfflineStores should not contain storeId

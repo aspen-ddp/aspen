@@ -764,33 +764,32 @@ class StoreManager(val client: AspenClient,
         // A copied or moved config is NOT one of these: its device is registered, so the
         // lookup succeeds. A config carried to another host then takes check's hostId
         // mismatch branch above, which is the designed host-migration path, not a warn.
-        storageDevices.get(storageDeviceId) match
-          case Some(local) =>
-            lookupStorageDeviceState(storageDeviceId).onComplete: result =>
-              synchronized:
-                try
-                  result match
-                    case Success(remote) => check(local, remote)
-                    case Failure(err) =>
-                      logger.warn(s"Failed to read state for storage device $storageDeviceId. It may not " +
-                                  s"be registered in the storage-devices tree. Error: $err")
-                finally
-                  activeDeviceChecks -= storageDeviceId
-          case None =>
-            // Find out what stores are on the offline/failed store and add them to our offlineStores
-            // set. We don't want to send "UnknownStore" responses while the device is down
-            lookupStorageDeviceState(storageDeviceId).onComplete: result =>
-              synchronized:
-                try
-                  result match
-                    case Success(remote) =>
+        lookupStorageDeviceState(storageDeviceId).onComplete: result =>
+          synchronized:
+            try
+              result match
+                case Success(remote) =>
+                  // Read the device's load state here rather than before the lookup was
+                  // issued. Runtime device discovery can load a device while its check is in
+                  // flight, and a branch chosen at dispatch time would then mark a loaded
+                  // device's stores offline -- ids that tryLoadStore and the LoadStore handler
+                  // have just removed, and that nothing else removes again.
+                  storageDevices.get(storageDeviceId) match
+                    case Some(local) => check(local, remote)
+                    case None =>
+                      // Find out what stores are on the offline/failed store and add them to our
+                      // offlineStores set. We don't want to send "UnknownStore" responses while
+                      // the device is down
                       remote.stores.keysIterator.foreach: storeId =>
                         offlineStores += storeId
-                    case Failure(err) =>
-                      logger.warn(s"Failed to read state for unloaded storage device $storageDeviceId. It may not " +
-                                  s"be registered in the storage-devices tree. Error: $err")
-                finally
-                  activeDeviceChecks -= storageDeviceId
+
+                case Failure(err) =>
+                  val what = if storageDevices.contains(storageDeviceId) then "storage device"
+                             else "unloaded storage device"
+                  logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
+                              s"be registered in the storage-devices tree. Error: $err")
+            finally
+              activeDeviceChecks -= storageDeviceId
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")

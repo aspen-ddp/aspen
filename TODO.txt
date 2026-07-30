@@ -118,16 +118,17 @@ ZMQNet.ioThread's failure handling is untested
 MetadataManager.refreshBootstrapConfig can wedge the flag permanently true on
 several failure paths
   - refreshingBootstrapConfig is set true before client.getBootstrapConfig is
-    called. The try/catch/finally that resets it at :214 is inside the .foreach
-    callback at :202, so it does not run when the future fails
+    called. The try/catch/finally that resets it lives inside the .foreach
+    callback on the returned Future, so it does not run when that Future fails
   - A failed read or a missing BootstrapConfigKey both yield a failed future
     with no throw. A synchronous throw from client.getBootstrapConfig() or
     client.clientContext skips the callback entirely. A throw from
     loadBootstrapConfig inside the finally skips the reset that follows it
-  - Any of those leaves the flag permanently true, so :194 short-circuits
-    forever and every later dropStoreMapping for a bootstrap store (live on
-    ZMQNet's wrong-store error path at :73 and :86) silently declines to
-    correct the stores map. Same wedge class this branch exists to eliminate
+  - Any of those leaves the flag permanently true, so the guard at the top of
+    refreshBootstrapConfig short-circuits forever and every later
+    dropStoreMapping for a bootstrap store (reached from dropCacheForStore in
+    both CliMessenger and SrvMessenger) silently declines to correct the
+    stores map. Same wedge class this branch exists to eliminate
   - Not fixed here because the spec lists refreshBootstrapConfig as out of
     scope on the stated (but falsified by this finding) basis that it already
     has try/catch/finally covering its write and reload. Unlike the ZMQNet

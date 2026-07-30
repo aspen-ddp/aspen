@@ -207,12 +207,23 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
 
 
   private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =
+    val phl = new PendingHostLookup(pendingHostLookupQueueSize)
+    oMsg.foreach(phl.enqueueMessage)
+    startHostLookup(hostId, phl)
+
+  /** Starts `hostId`'s lookup, parking `phl`'s messages until it resolves.
+   *
+   *  The caller supplies the PendingHostLookup already seeded rather than adding to it
+   *  afterwards, because getHostState's continuation can run inline on this thread whenever the
+   *  future is already complete, and it builds the host entry from phl.messageQueue. Anything
+   *  enqueued after this returns would miss that handoff.
+   *
+   *  Caller must hold this object's monitor. */
+  private def startHostLookup(hostId: HostId, phl: PendingHostLookup): Unit =
     oClient match
       case None => logger.error(s"Host lookup preformed before AspenClient initialized. HostId: $hostId")
       case Some(client) =>
         given ExecutionContext = client.clientContext
-        val phl = new PendingHostLookup(pendingHostLookupQueueSize)
-        oMsg.foreach(phl.enqueueMessage)
         hosts += hostId -> Left(phl)
         client.getHostState(hostId).onComplete:
           case Failure(err) =>
@@ -254,6 +265,14 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                 ppl.storeQueues.get(sid).foreach: storeQueue =>
                   hosts.get(se.hostId) match
                     case None =>
+                      // The pool named a host this process has never looked up. Move the queue
+                      // onto a host lookup instead of dropping it: pendingPoolLookups was cleared
+                      // above, so nothing else will ever come back for these messages. Doing it
+                      // here, inside the same synchronized block, is also what keeps
+                      // hasParkedMessages from dipping false while they are between queues.
+                      val phl = new PendingHostLookup(pendingHostLookupQueueSize)
+                      phl.drainIntoQueue(storeQueue)
+                      startHostLookup(se.hostId, phl)
                     case Some(e) => e match
                       case Left(phl) => phl.drainIntoQueue(storeQueue)
                       case Right(hostEntry) => networkImplInterface.storeResolved(hostEntry, sid, storeQueue)

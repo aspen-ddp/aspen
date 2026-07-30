@@ -117,14 +117,14 @@ Replace it with a named class in the fixture:
 
 ```scala
 class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[MetadataManager.HostEntry]:
-  val delivered: mutable.Map[HostId, mutable.ListBuffer[Message]]
   val storeResolutions: mutable.ListBuffer[(HostId, StoreId)]
+  def deliveredTo(hostId: HostId): List[Message]
 ```
 
-`createHostEntry` drains `queuedMessages` into `delivered(hostId)` before building the entry;
-`storeResolved` appends `(hostEntry.hostId, storeId)` to `storeResolutions` and drains into
-`delivered(hostEntry.hostId)`. Draining rather than peeking mirrors what `ZMQNet` does with both
-callbacks.
+`createHostEntry` drains `queuedMessages` into the recorded history for `hostId` before building
+the entry; `storeResolved` appends `(hostEntry.hostId, storeId)` to `storeResolutions` and drains
+into the history for `hostEntry.hostId`. Draining rather than peeking mirrors what `ZMQNet` does
+with both callbacks.
 
 `newManager()` returns `(manager, client, impl)`. The nine existing `val (mgr, client) =
 newManager()` sites — four in `MetadataManagerDrainSuite`, five in

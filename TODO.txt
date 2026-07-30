@@ -1,17 +1,3 @@
-MetadataManager silently drops parked messages when a resolving pool lookup
-names a host it has never looked up
-  - startPoolLookup's Success branch (MetadataManager.scala:254-257) hands each
-    store's queued messages to the store's host, but only if that host is already
-    in `hosts`. The None branch does nothing, so the queue is discarded
-  - stores += sid -> se.hostId runs first, so later sends to that store recover.
-    Only the already-queued messages are lost
-  - pendingPoolLookups -= poolId also runs first, so hasParkedMessages goes false
-    and the exit drain reports success on a message that was dropped, not sent.
-    awaitPendingMessagesSent's scaladoc names the failed-lookup case but not this
-    one, because this one is a bug rather than an accepted limit
-  - Candidate fix: in the None branch, start a host lookup for se.hostId and hand
-    it the storeQueue instead of dropping it
-
 StoreManager.activeDeviceChecks is keyed by device id only, and load state can
 now change while a check is in flight
   - A CheckStorageDevice for a device not yet on disk takes checkStorageDevice's

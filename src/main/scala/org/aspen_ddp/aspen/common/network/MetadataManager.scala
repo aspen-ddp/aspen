@@ -127,7 +127,11 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *
    *  Note that a failed host or pool lookup drops the entry and everything parked on it (see
    *  peekHostEntry's scaladoc for the host case), so this can go false because the message was
-   *  discarded rather than sent. Nothing at this layer can tell the two apart. */
+   *  discarded rather than sent. Nothing at this layer can tell the two apart.
+   *
+   *  A message parked on a pool lookup moves to a host lookup when the pool resolves onto a host
+   *  this process has not looked up yet, so that drop can happen at a later stage than the one
+   *  the message was originally parked on. */
   def hasParkedMessages: Boolean =
     synchronized:
       val parkedOnHost = hosts.values.exists:
@@ -214,9 +218,14 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
   /** Starts `hostId`'s lookup, parking `phl`'s messages until it resolves.
    *
    *  The caller supplies the PendingHostLookup already seeded rather than adding to it
-   *  afterwards, because getHostState's continuation can run inline on this thread whenever the
-   *  future is already complete, and it builds the host entry from phl.messageQueue. Anything
-   *  enqueued after this returns would miss that handoff.
+   *  afterwards, because getHostState's continuation can run inline on this thread -- it does in
+   *  tests under ExecutionContext.parasitic, and would under any EC that dispatches an
+   *  already-complete future's callback directly -- and it builds the host entry out of
+   *  phl.messageQueue. Anything enqueued after this returns would miss that handoff.
+   *
+   *  If no client is set the lookup is not started and phl's messages are discarded along with
+   *  it. That is unreachable from a caller already running inside a client callback, which is
+   *  where the rescued-queue call site lives.
    *
    *  Caller must hold this object's monitor. */
   private def startHostLookup(hostId: HostId, phl: PendingHostLookup): Unit =
@@ -270,6 +279,9 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                       // above, so nothing else will ever come back for these messages. Doing it
                       // here, inside the same synchronized block, is also what keeps
                       // hasParkedMessages from dipping false while they are between queues.
+                      // The move is loss-free only while pendingHostLookupQueueSize is at least
+                      // pendingStoreLookupQueueSize; otherwise EvictingQueue silently drops the
+                      // oldest of what is being rescued.
                       val phl = new PendingHostLookup(pendingHostLookupQueueSize)
                       phl.drainIntoQueue(storeQueue)
                       startHostLookup(se.hostId, phl)

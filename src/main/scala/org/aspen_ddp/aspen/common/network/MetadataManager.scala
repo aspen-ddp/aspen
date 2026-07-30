@@ -55,7 +55,8 @@ object MetadataManager:
 class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: os.Path,
                                                       val networkImplInterface: MetadataManager.NetworkImplInterface[T],
                                                       val pendingStoreLookupQueueSize: Int = 20,
-                                                      // pendingHostLookupQueueSize must be >= pendingStoreLookupQueueSize; see startPoolLookup's rescue of a parked store queue
+                                                      // Must be >= pendingStoreLookupQueueSize; see
+                                                      // startPoolLookup's rescue of a parked store queue
                                                       val pendingHostLookupQueueSize: Int = 100) extends Logging:
   import MetadataManager.*
 

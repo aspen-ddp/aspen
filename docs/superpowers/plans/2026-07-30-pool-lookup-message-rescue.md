@@ -734,6 +734,56 @@ git add src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala 
 git commit -m "Note where a parked message can now be dropped"
 ```
 
+- [ ] **Step 7: Three corrections from Task 4's code review**
+
+Added after Task 4's code review, which accepted the three edits above but found two of them narrower
+than the thing they describe, and one omission at the point of use.
+
+**(a) The `None` branch says nothing about why the queue is allocated inside the loop.** Steps 1-3
+explain why the queue is moved and why the move happens inside the `synchronized` block, but not why
+`new PendingHostLookup(...)` sits inside `poolState.stores.zipWithIndex.foreach`. Hoisting it is a
+plausible "don't allocate in a loop" refactor, and under it every rescued store queue shares one
+object referenced by several `Left` entries — whichever host resolves first drains all of them and
+the messages go out on the wrong socket. Task 3's Step 5 test pins this; the code site should say it
+too. Append to the `None`-branch comment:
+
+```scala
+                      // A fresh queue per store: one shared across the loop would end up
+                      // referenced by every rescued host entry, so whichever host resolved first
+                      // would drain all of them.
+```
+
+**(b) The `hasParkedMessages` note names only half the stage-crossing.** The `case Left(phl) =>
+phl.drainIntoQueue(storeQueue)` branch immediately below the `None` branch — which pre-dates this
+work — moves a pool-parked message onto an *in-flight* host lookup, with the same exposure to a later
+host-lookup failure. As written a reader could conclude that case is safe. Widen the condition, which
+costs no length:
+
+```scala
+   *  A message parked on a pool lookup moves to a host lookup when the pool resolves onto a host
+   *  that is not already resolved, so that drop can happen at a later stage than the one the
+   *  message was originally parked on. */
+```
+
+**(c) Two small fixes to the queue-size sentence.** "loss-free only while A is at least B" literally
+asserts that loss occurs whenever A < B, which is false — loss depends on actual occupancy, not the
+configured sizes. Change `The move is loss-free only while` to `The move is guaranteed loss-free only
+while`. Separately, whoever can *break* the invariant is whoever overrides the two constructor
+parameters at `MetadataManager.scala:57-58`, and nothing there points at the constraint; the spec
+records the decision not to enforce it with a `require`, so a pointer is the cheap substitute. Add,
+above `pendingHostLookupQueueSize`:
+
+```scala
+                                                      // Must be >= pendingStoreLookupQueueSize; see
+                                                      // startPoolLookup's rescue of a parked store queue
+```
+
+Wrapped to two lines deliberately: as a single line it ran to 176 characters, a 54-character outlier
+over anything else in the file.
+
+Run `sbt 'testOnly *MetadataManager*'` (still 15 tests, still passing — nothing here is behavioural)
+and commit.
+
 ---
 
 ## Task 5: Full verification

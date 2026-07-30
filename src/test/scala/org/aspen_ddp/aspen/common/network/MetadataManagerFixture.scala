@@ -96,10 +96,13 @@ class LookupRecordingClient extends TestNetwork.TClient(
  */
 class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[MetadataManager.HostEntry]:
 
-  /** Every (hostId, storeId) pair storeResolved was called with, in call order. */
-  val storeResolutions: mutable.ListBuffer[(HostId, StoreId)] = mutable.ListBuffer[(HostId, StoreId)]()
+  private val storeResolutionsBuffer: mutable.ListBuffer[(HostId, StoreId)] = mutable.ListBuffer[(HostId, StoreId)]()
 
   private var delivered: Map[HostId, List[Message]] = Map()
+
+  /** Every (hostId, storeId) pair storeResolved was called with, in call order. */
+  def resolutions: List[(HostId, StoreId)] = synchronized:
+    storeResolutionsBuffer.toList
 
   /** Messages drained on `hostId`'s behalf, in arrival order. Empty if it received none. */
   def deliveredTo(hostId: HostId): List[Message] =
@@ -134,7 +137,7 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
                     storeId: StoreId,
                     queuedMessages: EvictingQueue[Message]): Unit =
     synchronized:
-      storeResolutions += hostEntry.hostId -> storeId
+      storeResolutionsBuffer += hostEntry.hostId -> storeId
       drain(hostEntry.hostId, queuedMessages)
 
 

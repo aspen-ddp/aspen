@@ -24,9 +24,14 @@ class MetadataManagerPoolLookupSuite extends AnyFunSuite
     val (mgr, client, impl) = newManager()
 
     val store0 = StoreId(unknownPoolId, 0.toByte)
-    val msg = nudge()
+    // Two messages on the same store queue — this is what pins drainIntoQueue's loop completeness
+    // and order. A single-element queue would pass even if the while loop were replaced with
+    // a one-shot dequeue().foreach, silently discarding all but the first message parked on a store.
+    val msg0 = nudge()
+    val msg1 = nudge()
 
-    mgr.getHostEntryOrQueueMessage(store0, msg) should be(None)
+    mgr.getHostEntryOrQueueMessage(store0, msg0) should be(None)
+    mgr.getHostEntryOrQueueMessage(store0, msg1) should be(None)
     client.poolLookups.toList should be(List(unknownPoolId))
 
     // remoteHostId is absent from the bootstrap config and has never been looked up, so resolving
@@ -35,14 +40,14 @@ class MetadataManagerPoolLookupSuite extends AnyFunSuite
     client.poolLookupPromise(unknownPoolId).success(poolStateWith(unknownPoolId, remoteHostId))
 
     client.lookups.toList should be(List(remoteHostId))
-    // The message moved from the pool's store queue onto the host lookup rather than vanishing,
+    // The messages moved from the pool's store queue onto the host lookup rather than vanishing,
     // so the exit drain still knows it is holding something.
     mgr.hasParkedMessages should be(true)
     impl.deliveredTo(remoteHostId) should be(empty)
 
     client.lookupPromise(remoteHostId).success(remoteHostState)
 
-    impl.deliveredTo(remoteHostId) should be(List(msg))
+    impl.deliveredTo(remoteHostId) should be(List(msg0, msg1))
     mgr.hasParkedMessages should be(false)
 
   test("a host that resolves inline still receives the rescued messages"):
@@ -65,6 +70,11 @@ class MetadataManagerPoolLookupSuite extends AnyFunSuite
     client.lookups.toList should be(List(remoteHostId))
     impl.deliveredTo(remoteHostId) should be(List(msg))
     mgr.hasParkedMessages should be(false)
+    // The entry actually reached Right: the delivery assertion alone does not pin this, because
+    // both hold if the pending entry overwrites the resolved one. Placing hosts += hostId -> Left(phl)
+    // after the onComplete registration — a plausible slip — makes the peek permanently None while
+    // awaitPendingMessagesSent never drains, and every existing test still passed before this line.
+    mgr.peekHostEntry(remoteHostId).map(_.name) should be(Some("remote_host"))
 
   test("two stores on the same unknown host share a single lookup"):
     val (mgr, client, impl) = newManager()
@@ -106,7 +116,7 @@ class MetadataManagerPoolLookupSuite extends AnyFunSuite
     client.poolLookupPromise(unknownPoolId).success(poolStateWith(unknownPoolId, bootstrapHostId))
 
     client.lookups.toList should be(empty)
-    impl.storeResolutions.toList should be(List(bootstrapHostId -> store0))
+    impl.resolutions should be(List(bootstrapHostId -> store0))
     impl.deliveredTo(bootstrapHostId) should be(List(msg))
     mgr.hasParkedMessages should be(false)
 
@@ -154,3 +164,20 @@ class MetadataManagerPoolLookupSuite extends AnyFunSuite
     impl.deliveredTo(remoteHostId) should be(List(msg0))
     impl.deliveredTo(otherHostId) should be(List(msg1))
     mgr.hasParkedMessages should be(false)
+
+  test("a failed pool lookup drops the parked message rather than reporting it"):
+    val (mgr, client, impl) = newManager()
+
+    val unknownStore = StoreId(unknownPoolId, 0.toByte)
+    mgr.getHostEntryOrQueueMessage(unknownStore, nudge()) should be(None)
+    mgr.hasParkedMessages should be(true)
+
+    // The limit the drain suite documents one stage earlier: a failed lookup drops the entry and
+    // everything parked on it. Deleting pendingPoolLookups -= storeId.poolId from the Failure
+    // branch would wedge hasParkedMessages true, making every CLI command touching an unresolvable
+    // pool time out on exit -- and no test caught it before this one.
+    client.poolLookupPromise(unknownPoolId).failure(new NoSuchElementException("no such pool"))
+
+    mgr.hasParkedMessages should be(false)
+    client.lookups.toList should be(empty)
+    impl.deliveredTo(remoteHostId) should be(empty)

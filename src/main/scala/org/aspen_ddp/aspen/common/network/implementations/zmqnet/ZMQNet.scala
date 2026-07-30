@@ -423,8 +423,9 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
               case SendToClient(msg) =>
                 clients.get(msg.toClient).foreach: zmqIdentity =>
                   orouterSocket.foreach: router =>
+                    val encoded = ProtobufMessageCodec.encodeMessage(msg)
                     router.send(zmqIdentity, ZMQ.SNDMORE)
-                    router.send(ProtobufMessageCodec.encodeMessage(msg))
+                    router.send(encoded)
 
               case NewHostAvailable(entry) =>
                 val dealer = context.createSocket(SocketType.DEALER)
@@ -457,14 +458,21 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
             // loop surviving: the rest of the queue, every other host's traffic, and all inbound
             // polling. Guarded on !shuttingDown for the same reason the poll above is -- a throw
             // from a context that shutdown() closed should unwind to the handler below and let the
-            // thread run off its normal end, not be logged as a fault and retried.
+            // thread run off its normal end, not be logged as a fault.
             //
-            // A NewHostAvailable that fails partway leaves a created socket that was never
-            // registered in connectedDealers nor assigned to entry.odealer. It leaks until the
-            // context closes and that host stays unsendable; the thread surviving is worth more.
-            // Recorded in TODO.txt.
+            // A NewHostAvailable that fails partway leaves the host in one of two broken states,
+            // both of which outlive the failure. Fail at setIdentity or connect and odealer stays
+            // None, so every later message to that host piles into entry.pendingMessages, which
+            // nothing will drain -- MetadataManager already holds Right(entry), so no second
+            // NewHostAvailable is ever enqueued. Fail at either send below and the dealer is live
+            // and registered, but connectedHosts and rebuildPoller were skipped: the host is
+            // sendable yet never polled, so its inbound traffic is discarded forever and nothing
+            // marks it offline. The thread surviving is still worth more than either. The likely
+            // fix is to move the sends after the connectedHosts/rebuildPoller registration -- the
+            // registration does not depend on them, and nothing can reorder because every send on
+            // this path runs on this one thread. Recorded in TODO.txt.
             case t: Throwable if !shuttingDown =>
-              logger.error(s"Error processing send queue item: $t", t)
+              logger.error(s"Error processing send queue item ${qmsg.getClass.getSimpleName}: $t", t)
 
           qmsg = sendQueue.poll()
     catch

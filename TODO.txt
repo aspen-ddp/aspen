@@ -1,27 +1,16 @@
-Two other CheckStorageDevice nudges can be lost to process exit
-  - BaseAspenClient.createNewStoragePool and AspenClient.transferStore each send
-    one from tx.result.foreach once the transaction commits
-  - The create-pool and transfer-store CLI commands return their exit code to
-    main, which calls System.exit, without the awaitHostMessagesSent/shutdown
-    drain that create-storage-device does. The nudge can die with the process and
-    the affected stores then wait up to the full check period (one hour)
-  - transfer-store is roughly two lines, reusing the existing ZMQNet helpers:
-    one host, and network is already in scope
-  - create-pool is more work. BaseAspenClient.createNewStoragePool sends one
-    nudge per device, and those host ids are not visible to the CLI layer, while
-    awaitHostMessagesSent takes a single hostId
-  - Consider modifying awaitHostMessagesSent to wait for all pending host messages
-    to be sent. Or, even more generally, rename it to awaitPendingMessagesSent()
-    that simply drains and sends all pending messages in the concurrent linked
-    list.
-      - This would only ever be used by the CLI.
-      - Simplicity is attractive
-      - Background tasks/retries or latent Futures could result in additional
-        messages. That could block shutdown
-          - Perhaps a special object could be placed in the queue to signal the
-            I/O thread to flush all messages up to that point then use that
-            object to signal back to the main thread that the flush was complete
-            and that it's safe to exit?
+MetadataManager silently drops parked messages when a resolving pool lookup
+names a host it has never looked up
+  - startPoolLookup's Success branch (MetadataManager.scala:254-257) hands each
+    store's queued messages to the store's host, but only if that host is already
+    in `hosts`. The None branch does nothing, so the queue is discarded
+  - stores += sid -> se.hostId runs first, so later sends to that store recover.
+    Only the already-queued messages are lost
+  - pendingPoolLookups -= poolId also runs first, so hasParkedMessages goes false
+    and the exit drain reports success on a message that was dropped, not sent.
+    awaitPendingMessagesSent's scaladoc names the failed-lookup case but not this
+    one, because this one is a bug rather than an accepted limit
+  - Candidate fix: in the None branch, start a host lookup for se.hostId and hand
+    it the storeQueue instead of dropping it
 
 StoreManager.activeDeviceChecks is keyed by device id only, and load state can
 now change while a check is in flight

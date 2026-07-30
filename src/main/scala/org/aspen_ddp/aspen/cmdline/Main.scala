@@ -157,8 +157,8 @@ object Main {
    *
    *  CheckStorageDevice nudges are why this exists: a command that sends one and then exits
    *  would otherwise abandon it, costing the receiving host up to CheckStorageDevicesPeriod.
-   *  Commands that sent nothing pass through without waiting, and bootstrap -- which
-   *  builds no network at all -- skips it entirely.
+   *  Commands that sent nothing pass through without waiting, and bootstrap -- which builds no
+   *  network at all -- skips it entirely.
    *
    *  Never affects the exit code. A timeout means messages may still be held, which is a
    *  latency report rather than a command failure: the receiving host's periodic check remains

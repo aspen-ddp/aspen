@@ -78,11 +78,14 @@ accepted
     permanent wedge -- and reachability is low, since wakeIoThread fails on a
     closed socket, i.e. during teardown of a process that is exiting anyway.
     Recorded rather than fixed
-  - Candidate fix is to swallow the wakeIoThread failure in createHostEntry
-    the same way storeResolved does: the wake is best-effort because the IO
-    loop unconditionally drains the send queue every iteration, so a missed
-    wake delays delivery by at most one heartbeat period rather than losing
-    it. That makes the orphaned entry and duplicate dealer impossible
+  - Candidate fix is for createHostEntry to swallow a wakeIoThread failure
+    rather than propagate it. The wake is best-effort: the IO loop drains the
+    send queue unconditionally every iteration, and poll() never waits longer
+    than the next heartbeat, so a missed wake delays delivery by at most one
+    heartbeat period rather than losing it. Swallowing makes the orphaned
+    entry and the duplicate dealer impossible, and needs no test seam. The
+    same change to storeResolved, whose wakeIoThread is likewise unguarded,
+    would retire the handoff residue the MetadataManager guard now absorbs
   - Distinct from the leak above: there NewHostAvailable fails, here it
     succeeds for an entry the manager has already forgotten
 

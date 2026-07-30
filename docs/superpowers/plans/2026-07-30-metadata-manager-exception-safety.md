@@ -824,7 +824,7 @@ Add a lead-in line as the first line of each catch block's comment, above the ex
 In `startHostLookup`'s outer catch (the one guarding the `getHostState` call):
 
 ```scala
-              // Retryability rule.
+            // Retryability rule.
 ```
 
 In `startHostLookup`'s inner catch (the one guarding `createHostEntry`):
@@ -842,10 +842,10 @@ In `startPoolLookup`'s catch:
 In the per-store handoff loop's catch:
 
 ```scala
-                    // Containment rule: this one costs a store, it does not restore one.
+                      // Containment rule: this one costs a store, it does not restore one.
 ```
 
-Match each to the indentation of the comment line already beneath it.
+Match each to the indentation of the comment line already beneath it. As built, those are 12, 20, 12 and 22 spaces respectively.
 
 - [ ] **Step 4: Record the two ZMQNet socket leaks in TODO.txt**
 

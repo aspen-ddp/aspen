@@ -17,9 +17,10 @@ import java.util.UUID
  *      and asserting a second lookup was started.
  *    - A throw in the pool handoff loop must cost only its own store.
  *
- *  Note that ExecutionContext.parasitic swallows a throw from an onComplete callback: a promise
- *  completion returns normally even when the continuation it ran threw. Nothing here can assert
- *  on an exception escaping a completion, and the pre-fix bugs were invisible for that reason.
+ *  Note that ExecutionContext.parasitic reports a throw from an onComplete callback rather than
+ *  rethrowing it: a promise completion returns normally even when the continuation it ran threw.
+ *  Nothing here can assert on an exception escaping a completion, and the pre-fix bugs were
+ *  invisible for that reason.
  *
  *  The message type is incidental -- MetadataManager never inspects a message, only the address
  *  it was sent to -- so these reuse the nudge the other suites use.
@@ -83,7 +84,9 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
     mgr.peekHostEntry(remoteHostId) should be(None)
 
     // Unlike a lookup that throws, this failure loses nothing: createHostEntry drained the queue
-    // before it failed, exactly as ZMQNet's does before wakeIoThread().
+    // before it failed, exactly as ZMQNet's does before wakeIoThread(). Asserted here rather than
+    // at the end because both sends share one promise, already completed above -- the retry below
+    // resolves inline and delivers its own message too, which would mask what happened to this one.
     impl.deliveredTo(remoteHostId) should be(List(msg))
 
     // ...and it did not stay at Left either. Pre-fix it did, so this send parks behind a pending

@@ -36,10 +36,11 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
 
     client.failLookupWith(remoteHostId, new RuntimeException("getHostState exploded"))
 
-    // Pre-fix this throw escapes getHostEntryOrQueueMessage, which ZMQNet's send loop calls with
-    // no per-item guard -- so the IO thread dies. Post-fix a synchronous throw is just another
-    // way for a lookup to fail: logged, entry removed, None returned.
-    mgr.getHostEntryOrQueueMessage(remoteHostId, nudge()) should be(None)
+    val msg1 = nudge()
+    // Pre-fix this throw escapes getHostEntryOrQueueMessage and can propagate into the send loop,
+    // taking down the IO thread if that loop has no guard of its own. Post-fix a synchronous
+    // throw is just another way for a lookup to fail: logged, entry removed, None returned.
+    mgr.getHostEntryOrQueueMessage(remoteHostId, msg1) should be(None)
     client.lookups.toList should be(List(remoteHostId))
 
     // The pending entry was removed rather than left behind. Left at Left(phl) it would never
@@ -49,7 +50,14 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
 
     client.clearLookupFailure(remoteHostId)
 
+    val msg2 = nudge()
     // Retryable, not merely un-wedged: the second send starts a second lookup instead of parking
     // behind the dead one.
-    mgr.getHostEntryOrQueueMessage(remoteHostId, nudge()) should be(None)
+    mgr.getHostEntryOrQueueMessage(remoteHostId, msg2) should be(None)
     client.lookups.toList should be(List(remoteHostId, remoteHostId))
+
+    client.lookupPromise(remoteHostId).success(remoteHostState)
+
+    // The failed lookup dropped its message rather than carrying it into the retry -- the same
+    // cost a lookup that fails by returning a failed Future imposes.
+    impl.deliveredTo(remoteHostId) should be(List(msg2))

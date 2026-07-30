@@ -260,12 +260,17 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
             // installed above and let a later call retry -- exactly what the Failure branch does.
             // Left in place it would never resolve, because no continuation exists to resolve it:
             // the host would be unreachable and hasParkedMessages stuck true for the life of the
-            // process. Swallowing rather than rethrowing is what keeps this out of ZMQNet's send
-            // loop, whose two calls into getHostEntryOrQueueMessage have no guard of their own.
-            // The monitor is held by the caller, per this method's contract, so the removal below
-            // needs no synchronized of its own.
-            logger.error(s"HostState lookup call threw for hostId $hostId. Error: $t", t)
+            // process. Clean up the map first, then log: if logger.error itself throws the entry
+            // is already repaired. The monitor is held by the caller, per this method's contract,
+            // so the removal needs no synchronized of its own. The entry removed is always the
+            // Left installed above -- onComplete cannot throw past the Success continuation because
+            // Promise.Transformation catches callback failures internally and routes them to
+            // reportFailure, so nothing escapes that would leave a freshly installed Right in place.
+            // Swallowing rather than rethrowing is what keeps a failed lookup from taking down the
+            // send loop -- regardless of whether that loop has its own guard, this layer must not
+            // depend on one existing.
             hosts -= hostId
+            logger.error(s"HostState lookup call threw for hostId $hostId. Error: $t", t)
 
   private def startPoolLookup(storeId: StoreId, msg: Message): Unit =
     oClient match

@@ -784,8 +784,9 @@ class StoreManager(val client: AspenClient,
                         offlineStores += storeId
 
                 case Failure(err) =>
-                  val what = if storageDevices.contains(storageDeviceId) then "storage device"
-                             else "unloaded storage device"
+                  val what =
+                    if storageDevices.contains(storageDeviceId) then "storage device"
+                    else "unloaded storage device"
                   logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                               s"be registered in the storage-devices tree. Error: $err")
             finally

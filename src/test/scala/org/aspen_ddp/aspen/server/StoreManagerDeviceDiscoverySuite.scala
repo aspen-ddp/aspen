@@ -465,7 +465,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
         // into a failure rather than a pass.
         mgr.testingOnlyActiveDeviceChecks should be(empty)
 
-  atest("a check started before its device loads uses the loaded branch when it completes"):
+  atest("a check started before its device loads does not mark the loaded device's stores offline"):
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
 
@@ -495,9 +495,14 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
     yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait into
+      // a failure. It also proves the callback ran, without which the negative assertion below
+      // would pass vacuously.
       mgr.testingOnlyActiveDeviceChecks should be(empty)
 
       // The device was loaded before the lookup returned, so its stores must not be marked
-      // offline by a decision taken back when it was not. Nothing would ever clear them:
-      // tryLoadStore and the LoadStore handler are the only removers and both already ran.
+      // offline by a decision taken back when it was not. In production nothing would clear
+      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
+      // check()'s own deleted-stores pass only removes ids recorded in the device's own
+      // offlineStores set, which ids marked by this branch never enter.
       mgr.testingOnlyOfflineStores should not contain storeId

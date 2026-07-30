@@ -61,3 +61,25 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
     // The failed lookup dropped its message rather than carrying it into the retry -- the same
     // cost a lookup that fails by returning a failed Future imposes.
     impl.deliveredTo(remoteHostId) should be(List(msg2))
+
+  test("a host entry that fails to build leaves the host retryable"):
+    val (mgr, client, impl) = newManager()
+
+    impl.throwOnCreateHostEntry(remoteHostId, new RuntimeException("createHostEntry exploded"))
+
+    mgr.getHostEntryOrQueueMessage(remoteHostId, nudge()) should be(None)
+    client.lookups.toList should be(List(remoteHostId))
+
+    // parasitic runs the continuation inline on this thread and swallows its throw, so this line
+    // returns normally either way. That silence is the whole problem: pre-fix nothing fails, the
+    // entry simply never advances from Left to Right.
+    client.lookupPromise(remoteHostId).success(remoteHostState)
+
+    // The entry did not reach Right -- createHostEntry never returned one to install.
+    mgr.peekHostEntry(remoteHostId) should be(None)
+
+    // ...and it did not stay at Left either. Pre-fix it did, so this send parks behind a pending
+    // lookup nothing will ever resolve. Post-fix the host is back to never-looked-up and the send
+    // starts a fresh lookup. This assertion is the one that separates the two states.
+    mgr.getHostEntryOrQueueMessage(remoteHostId, nudge()) should be(None)
+    client.lookups.toList should be(List(remoteHostId, remoteHostId))

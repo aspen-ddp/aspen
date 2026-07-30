@@ -245,15 +245,24 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                 hosts -= hostId
             case Success(hostState) =>
               synchronized:
-                hosts += hostId -> Right(networkImplInterface.createHostEntry(
-                  hostId,
-                  hostState.name,
-                  hostState.address,
-                  hostState.dataPort,
-                  hostState.cncPort,
-                  hostState.storeTransferPort,
-                  phl.messageQueue
-                ))
+                try
+                  hosts += hostId -> Right(networkImplInterface.createHostEntry(
+                    hostId,
+                    hostState.name,
+                    hostState.address,
+                    hostState.dataPort,
+                    hostState.cncPort,
+                    hostState.storeTransferPort,
+                    phl.messageQueue
+                  ))
+                catch
+                  case NonFatal(t) =>
+                    // Same rule as a failed lookup: drop back to never-looked-up so a later call
+                    // retries. Without this the entry stays at Left forever -- the lookup did
+                    // resolve, so nothing will ever run again to advance or remove it. Repair
+                    // first and log second, so a logger that throws cannot leave the wedge behind.
+                    hosts -= hostId
+                    logger.error(s"Failed to create the host entry for hostId $hostId. Error: $t", t)
         catch
           case NonFatal(t) =>
             // A lookup that fails by throwing is still a failed lookup, so undo the pending entry

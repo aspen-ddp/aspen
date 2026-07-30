@@ -680,6 +680,19 @@ class StoreManager(val client: AspenClient,
                   creatingStores -= storeId
   }
 
+  /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
+   *
+   *  A seam rather than a direct client call so a test can hold a lookup in flight while the
+   *  device it names is loaded underneath it. That interleaving is what a device appearing on
+   *  disk during its own check produces, and it cannot be staged through the real client,
+   *  whose reads resolve on their own schedule.
+   *
+   *  Called while holding the instance lock, so an override must return promptly rather than
+   *  block: the lock it holds is the one handleEvent takes.
+   */
+  protected def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
+    client.getStorageDeviceState(storageDeviceId)
+
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
     def check(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit = {
       if remote.hostId != hostId then
@@ -753,7 +766,7 @@ class StoreManager(val client: AspenClient,
         // mismatch branch above, which is the designed host-migration path, not a warn.
         storageDevices.get(storageDeviceId) match
           case Some(local) =>
-            client.getStorageDeviceState(storageDeviceId).onComplete: result =>
+            lookupStorageDeviceState(storageDeviceId).onComplete: result =>
               synchronized:
                 try
                   result match
@@ -766,7 +779,7 @@ class StoreManager(val client: AspenClient,
           case None =>
             // Find out what stores are on the offline/failed store and add them to our offlineStores
             // set. We don't want to send "UnknownStore" responses while the device is down
-            client.getStorageDeviceState(storageDeviceId).onComplete: result =>
+            lookupStorageDeviceState(storageDeviceId).onComplete: result =>
               synchronized:
                 try
                   result match

@@ -234,9 +234,10 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *
    *  A synchronous throw from the lookup call is treated as a lookup failure rather than
    *  propagated: the pending entry is removed and phl's messages are dropped, exactly as the
-   *  Failure branch does. The method therefore never throws -- which matters because
-   *  getHostEntryOrQueueMessage is called from ZMQNet's send loop, where an escaping throw would
-   *  end the IO thread.
+   *  Failure branch does. No NonFatal throw from that call therefore escapes -- which matters
+   *  because getHostEntryOrQueueMessage runs on ZMQNet's IO thread. That loop guards each item
+   *  too, so an escape would now cost one send rather than the thread; handling it here is what
+   *  makes the host retryable, where the send loop's guard could only drop the item.
    *
    *  Caller must hold this object's monitor. */
   private def startHostLookup(hostId: HostId, phl: PendingHostLookup): Unit =

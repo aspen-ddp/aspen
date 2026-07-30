@@ -153,7 +153,9 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
     impl.deliveredTo(remoteHostId) should be(List(msg1))
     mgr.hasParkedMessages should be(false)
 
-    // Store 1's stores mapping survived too -- a later send resolves straight through the host
-    // path rather than starting a second pool lookup.
+    // Both stores' mappings survived -- the throwing store's too, which is what "outside the try"
+    // buys. A later send to either resolves straight through the host path rather than starting a
+    // second pool lookup.
+    mgr.getHostEntryOrQueueMessage(store0, nudge()).map(_.hostId) should be(Some(bootstrapHostId))
     mgr.getHostEntryOrQueueMessage(store1, nudge()).map(_.hostId) should be(Some(remoteHostId))
     client.poolLookups.toList should be(List(unknownPoolId))

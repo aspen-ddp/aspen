@@ -884,6 +884,10 @@ class StoreManager(val client: AspenClient,
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =
     synchronized(activeDeviceChecks)
 
+  /** Testing hook: the stores currently marked offline. */
+  private[aspen] def testingOnlyOfflineStores: Set[StoreId] =
+    synchronized(offlineStores)
+
   private def handleEvent(event: Event): Unit = synchronized {
     event match {
 

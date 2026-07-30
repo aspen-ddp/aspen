@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -17,7 +17,7 @@ import java.nio.file.{Files, Path}
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
 
 /** A StoreManager that records tryLoadStore calls instead of opening RocksDB backends, and
@@ -89,6 +89,44 @@ private class RecordingStoreManager(mgrClient: AspenClient,
       if storeLoadFailureOwed.getAndSet(false) then
         throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")
       storeLoadAttempts += ((sds.storageDeviceId, potentialStoreFile.toPath))
+
+  /** Storage device ids passed to lookupStorageDeviceState, in call order.
+   *
+   *  Lazy for the same reason as armedLookups below.
+   */
+  lazy val lookupAttempts: mutable.ListBuffer[StorageDeviceId] =
+    mutable.ListBuffer[StorageDeviceId]()
+
+  /** Promises queued by armLookup, consumed one per lookup of that device.
+   *
+   *  Lazy to match storeLoadAttempts. Unlike that field, nothing in StoreManager's constructor
+   *  reaches this override today: the constructor's device scan calls tryLoadStore, but a
+   *  device check only ever runs from handleEvent. The uniformity is deliberate insurance
+   *  against that changing.
+   */
+  private lazy val armedLookups: mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]] =
+    mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]]()
+
+  /** Arms one lookup of `deviceId` to return a Future the test completes when it chooses.
+   *
+   *  Call once per lookup the test intends to control, in the order they will be issued.
+   *  Lookups beyond the armed ones fall through to the real client, which is what keeps the
+   *  tests that rely on a genuine lookup failure working unchanged.
+   */
+  def armLookup(deviceId: StorageDeviceId): Promise[StorageDeviceState] = synchronized:
+    val p = Promise[StorageDeviceState]()
+    armedLookups.getOrElseUpdate(deviceId, mutable.Queue[Promise[StorageDeviceState]]()).enqueue(p)
+    p
+
+  override protected def lookupStorageDeviceState(
+      storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
+    val armed = synchronized:
+      lookupAttempts += storageDeviceId
+      armedLookups.get(storageDeviceId).filter(_.nonEmpty).map(_.dequeue())
+
+    armed match
+      case Some(p) => p.future
+      case None    => super.lookupStorageDeviceState(storageDeviceId)
 
   def loadedDevices: Map[StorageDeviceId, StoreManager.LocalStorageDeviceState] =
     synchronized(storageDevices)
@@ -184,6 +222,17 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
   /** A store of pool 1111...:index 0. Used for its `directoryName`, which is the on-disk name of
    *  a store directory within a device directory. */
   private val storeId = StoreId(PoolId(UUID.fromString("11111111-1111-1111-1111-111111111111")), 0.toByte)
+
+  private val deviceSetId = StorageDeviceSetId(UUID.fromString("55555555-5555-5555-5555-555555555555"))
+
+  /** A StorageDeviceState for `deviceId` owned by this manager's host, carrying `stores`.
+   *
+   *  BootstrapHostId matches the manager's own hostId, which keeps check() off its
+   *  host-migration branch. The sizes are arbitrary; nothing under test reads them.
+   */
+  private def deviceState(deviceId: StorageDeviceId,
+                          stores: Map[StoreId, StorageDeviceState.StoreEntry] = Map()): StorageDeviceState =
+    StorageDeviceState(deviceId, HostId.BootstrapHostId, 0L, 1024L, stores, deviceSetId)
 
   atest("constructor loads a device that already exists on disk"):
     val hostRoot = newHostDir()
@@ -390,3 +439,28 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       // forever by the in-progress guard.
       mgr.testingOnlyCheckAllDevices()
       mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+
+  atest("an armed lookup holds the device check open until the test completes it"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
+    val p = mgr.armLookup(deviceA)
+
+    mgr.testingOnlyCheckAllDevices()
+
+    mgr.lookupAttempts.toList should be(List(deviceA))
+
+    // Drain everything the check queued. A real client read of deviceA fails immediately --
+    // deviceA is absent from the storage-devices tree -- so an unarmed check would have
+    // released the guard by the time this wait exhausts. Still holding it is what proves the
+    // armed promise, and not the client's read, is what the check is waiting on.
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).flatMap: _ =>
+      mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+
+      p.failure(new RuntimeException("test-controlled lookup failure"))
+
+      yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+        // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
+        // into a failure rather than a pass.
+        mgr.testingOnlyActiveDeviceChecks should be(empty)

@@ -618,8 +618,9 @@ cases — cannot be lost if Task 5 is interrupted.
                     offlineStores += storeId
 
             case Failure(err) =>
-              val what = if storageDevices.contains(storageDeviceId) then "storage device"
-                         else "unloaded storage device"
+              val what =
+                if storageDevices.contains(storageDeviceId) then "storage device"
+                else "unloaded storage device"
               logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                           s"be registered in the storage-devices tree. Error: $err")
         finally
@@ -690,18 +691,25 @@ body with:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
     yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
-      // The device was loaded before the lookup returned, so its stores must not be marked
-      // offline by a decision taken back when it was not. Nothing would ever clear them:
-      // tryLoadStore and the LoadStore handler are the only removers and both already ran.
-      mgr.testingOnlyOfflineStores should not contain storeId
-
-      // And the deferred request ran rather than being dropped.
+      // yieldUntil gives up silently, so assert its condition first. This also proves the
+      // first callback ran, without which the negative assertion below would pass vacuously.
       mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
       mgr.testingOnlyDeferredDeviceChecks should be(empty)
+
+      // The device was loaded before the lookup returned, so its stores must not be marked
+      // offline by a decision taken back when it was not. In production nothing would clear
+      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
+      // reconcileDeviceState's deleted-stores pass only removes ids recorded in the device's
+      // own offlineStores set, which ids marked by this branch never enter.
+      mgr.testingOnlyOfflineStores should not contain storeId
 
       p2.success(deviceState(deviceA))
       succeed
 ```
+
+Note the assertion order: `lookupAttempts` first. It is the condition `yieldUntil` waited on, and
+`yieldUntil` gives up silently — asserting the negative `offlineStores` claim first would let an
+exhausted wait pass as a success.
 
 - [ ] **Step 8: Run the whole suite**
 

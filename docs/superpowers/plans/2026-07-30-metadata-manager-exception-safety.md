@@ -789,11 +789,14 @@ In `MetadataManager.scala`, in the scaladoc above `startHostLookup(hostId: HostI
 ```scala
  *  A synchronous throw from the lookup call is treated as a lookup failure rather than
  *  propagated: the pending entry is removed and phl's messages are dropped, exactly as the
- *  Failure branch does. The method therefore never throws -- which matters because
- *  getHostEntryOrQueueMessage is called from ZMQNet's send loop, where an escaping throw would
- *  end the IO thread.
+ *  Failure branch does. No NonFatal throw from that call therefore escapes -- which matters
+ *  because getHostEntryOrQueueMessage runs on ZMQNet's IO thread. That loop guards each item
+ *  too, so an escape would now cost one send rather than the thread; handling it here is what
+ *  makes the host retryable, where the send loop's guard could only drop the item.
  *
 ```
+
+An earlier draft of this paragraph promised "the method therefore never throws". That was wrong on three paths — a fatal `Throwable` from the lookup call, a fatal one rethrown out of an inline continuation, and a throwing `logger.error` in the unguarded `oClient` `None` branch — and it contradicted the comment fifty lines below it in the same method. It also justified itself with a claim Task 5 had already invalidated. The promise is scoped to `NonFatal` above; do not widen it.
 
 - [ ] **Step 2: Extend `hasParkedMessages`' scaladoc**
 

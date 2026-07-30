@@ -287,7 +287,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
 
   /** Starts `storeId.poolId`'s lookup, parking `msg` and any later messages to the pool until it
    *  resolves. When the pool resolves, every store in it is mapped to its host, and each store's
-   *  queue is handed off to that host — either to an already-resolved host entry or onto a host
+   *  queue is handed off to that host -- either to an already-resolved host entry or onto a host
    *  lookup if that host is unknown.
    *
    *  If no client is set the lookup is not started and the message is discarded.

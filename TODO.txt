@@ -62,6 +62,12 @@ partway through
     only the narrow setIdentity/connect window, which wants the socket closed
     on the failure path -- and a seam that lets a test make connect() fail,
     the same reason the checkStorageDevice leak above is unguarded
+  - SendToClient has a narrower variant: a throw from router.send(encoded)
+    leaves an unfinished multipart message on the ROUTER, so the next
+    SendToClient appends its identity as frame 2 of the stale frame 1. One
+    client gets a garbled body, one gets nothing. The encode is hoisted above
+    the first frame so encodeClientResponse cannot cause this, but the second
+    send still can. Bounded (the next SendToClient clears it) and accepted
 
 A createHostEntry that throws late orphans the entry the IO thread already
 accepted
@@ -108,6 +114,24 @@ ZMQNet.ioThread's failure handling is untested
   - The per-item send-queue guard therefore shipped without a test. That is a
     decision rather than an oversight, and it is also why the first entry
     above is recorded rather than fixed: that fix wants the same seam
+
+MetadataManager.refreshBootstrapConfig can wedge the flag permanently true on
+several failure paths
+  - refreshingBootstrapConfig is set true before client.getBootstrapConfig is
+    called. The try/catch/finally that resets it at :214 is inside the .foreach
+    callback at :202, so it does not run when the future fails
+  - A failed read or a missing BootstrapConfigKey both yield a failed future
+    with no throw. A synchronous throw from client.getBootstrapConfig() or
+    client.clientContext skips the callback entirely. A throw from
+    loadBootstrapConfig inside the finally skips the reset that follows it
+  - Any of those leaves the flag permanently true, so :194 short-circuits
+    forever and every later dropStoreMapping for a bootstrap store (live on
+    ZMQNet's wrong-store error path at :73 and :86) silently declines to
+    correct the stores map. Same wedge class this branch exists to eliminate
+  - Not fixed here because the spec lists refreshBootstrapConfig as out of
+    scope on the stated (but falsified by this finding) basis that it already
+    has try/catch/finally covering its write and reload. Unlike the ZMQNet
+    entries no test seam is needed -- it is out of scope by spec, not by cost
 
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying

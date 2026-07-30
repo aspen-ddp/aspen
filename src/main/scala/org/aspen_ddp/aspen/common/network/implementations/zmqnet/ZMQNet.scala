@@ -423,6 +423,9 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
               case SendToClient(msg) =>
                 clients.get(msg.toClient).foreach: zmqIdentity =>
                   orouterSocket.foreach: router =>
+                    // Encode must precede the first frame -- a throw between frames leaves the
+                    // ROUTER mid-multipart, and the next SendToClient appends its identity as
+                    // frame 2 of the previous message, corrupting both.
                     val encoded = ProtobufMessageCodec.encodeMessage(msg)
                     router.send(zmqIdentity, ZMQ.SNDMORE)
                     router.send(encoded)
@@ -454,11 +457,14 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
                     dealer.send(ProtobufMessageCodec.encodeMessage(pending))
                     pending = entry.pendingMessages.poll()
           catch
-            // One bad item must not take the thread down with it. Everything else depends on this
-            // loop surviving: the rest of the queue, every other host's traffic, and all inbound
-            // polling. Guarded on !shuttingDown for the same reason the poll above is -- a throw
-            // from a context that shutdown() closed should unwind to the handler below and let the
-            // thread run off its normal end, not be logged as a fault.
+            // Containment rule: one bad item does not take the IO thread down with it.
+            //
+            // Everything else depends on this loop surviving: the rest of the queue, every other
+            // host's traffic, and all inbound polling. Guarded on !shuttingDown for the same
+            // reason the poll above is -- a throw from a context that shutdown() closed should
+            // unwind to the handler below and let the thread run off its normal end, not be logged
+            // as a fault. Throwable rather than NonFatal to partition on shutdown state, not
+            // fatality: the loop survives even a VirtualMachineError when not shutting down.
             //
             // A NewHostAvailable that fails partway leaves the host in one of two broken states,
             // both of which outlive the failure. Fail at setIdentity or connect and odealer stays

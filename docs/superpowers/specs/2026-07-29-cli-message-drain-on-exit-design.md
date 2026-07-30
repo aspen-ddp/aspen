@@ -62,7 +62,7 @@ override protected def createStoragePool(config: StoragePoolState): Future[PoolI
 
   val f = runCreate(_ => Future.unit): tx =>
     ...
-    def updateDevice(du: DeviceUpdate): CheckStorageDevice =
+    def stageDeviceUpdate(du: DeviceUpdate): CheckStorageDevice =
       ...
       tx.update(du.pointer, None, None, reqs, ops)
       CheckStorageDevice(du.state.hostId, clientId, du.storageDeviceId)  // built, not sent
@@ -70,7 +70,7 @@ override protected def createStoragePool(config: StoragePoolState): Future[PoolI
     for
       ...
     yield
-      val nudges = devUpdates.map(updateDevice)
+      val nudges = devUpdates.map(stageDeviceUpdate)
       ...
       (config.poolId, nudges)
 
@@ -207,7 +207,7 @@ the CLI has (`Main.createAmoebaClient`, a three-thread pool) and what
 `handleEvents`. Building a multi-threaded harness to turn this red is out of
 proportion to the change.
 
-So the ordering property is guarded by the comment at `updateDevice` and by
+So the ordering property is guarded by the comment at `stageDeviceUpdate` and by
 review, not by a test. That is a real gap and is recorded here rather than
 papered over.
 

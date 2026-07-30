@@ -48,7 +48,7 @@ Only two files change, plus `TODO.txt`.
 | File | Responsibility | Change |
 |---|---|---|
 | `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala` | The device check itself: seam, policy/mechanism split, re-read, deferral | Modify |
-| `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` | `RecordingStoreManager` arming seam and the three new tests | Modify |
+| `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` | `RecordingStoreManager` arming seam and the four new tests | Modify |
 | `TODO.txt` | Retire the fixed entry, amend the sync-throw entry, record two residuals | Modify |
 
 `StoreManager.scala` is 1000 lines and does far more than device checking. Splitting it is out
@@ -428,7 +428,7 @@ decision made when it was not loaded. Nothing cleared them afterwards."
 
 **Files:**
 - Modify: `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala` — add `deferredDeviceChecks` and its hook, split `checkStorageDevice`, promote `check`
-- Modify: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` — two new tests, one existing test extended
+- Modify: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` — three new tests, one existing test extended
 
 - [ ] **Step 1: Add the field and its testing hook**
 
@@ -447,6 +447,52 @@ Add the hook immediately after `testingOnlyOfflineStores`:
   private[aspen] def testingOnlyDeferredDeviceChecks: Set[StorageDeviceId] =
     synchronized(deferredDeviceChecks)
 ```
+
+- [ ] **Step 1b: Pin the unloaded branch that Task 3 rewrote**
+
+Added after Task 3's spec review. That review mutation-tested the branch Task 3 collapsed and found
+that replacing the unloaded arm with `case None => ()` — dropping the offline marking entirely —
+survives the **entire 569-test repo suite**. Correctness-table row 1 ("unloaded at dispatch, still
+unloaded, lookup succeeds → mark offline") has no coverage at all: `testingOnlyOfflineStores`
+arrived only in Task 2 and Task 3's regression test is its sole consumer, asserting the *negative*.
+The suite therefore pins the bug's absence but not the behaviour that has to survive, and a later
+refactor could delete the `None` branch and stay green.
+
+This is the positive counterpart of Task 3's test — same setup, device never loads, opposite
+assertion. Append to `StoreManagerDeviceDiscoverySuite`:
+
+```scala
+  atest("a check for a device that never loads marks its stores offline"):
+    val hostRoot = newHostDir()
+    val mgr = newManager(hostRoot)
+
+    val p = mgr.armLookup(deviceA)
+
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+
+    // Nothing was written under storage-devices/, so the check runs against a device this
+    // manager has never loaded -- the case the offline marking exists for.
+    mgr.loadedDevices.keySet should be(empty)
+
+    p.success(deviceState(
+      deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      // yieldUntil gives up silently, so assert the condition it waited on.
+      mgr.testingOnlyActiveDeviceChecks should be(empty)
+
+      // Suppresses TxUnknownStore and ReadResponse(StoreNotFound) for stores on a device that
+      // is down. Deleting this marking is silent in production and, until this test, silent in
+      // the suite too.
+      mgr.testingOnlyOfflineStores should contain(storeId)
+```
+
+Run it before making any Task 4 change: it must **pass** against `f29f063`. It is a
+characterisation test of behaviour Task 3 already shipped, not a red-green pair. Then verify it
+discriminates by applying the mutant it exists to kill — change the `case None =>` arm in
+`checkStorageDevice` to `case None => ()`, confirm this test fails, and restore.
 
 - [ ] **Step 2: Write the two failing tests**
 
@@ -654,7 +700,7 @@ body with:
 - [ ] **Step 8: Run the whole suite**
 
 Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite'`
-Expected: PASS, 17 tests.
+Expected: PASS, 18 tests.
 
 - [ ] **Step 9: Run the full test suite**
 
@@ -770,7 +816,7 @@ Replace those two lines with:
 - [ ] **Step 3: Verify nothing broke**
 
 Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite'`
-Expected: PASS, 17 tests. Comments only, so any failure means code was deleted by accident.
+Expected: PASS, 18 tests. Comments only, so any failure means code was deleted by accident.
 
 - [ ] **Step 4: Commit**
 
@@ -868,7 +914,7 @@ a test seam. Two findings from tracing the code are written down."
 
 - [ ] `sbt compile` clean
 - [ ] `sbt test` passes
-- [ ] `StoreManagerDeviceDiscoverySuite` has 17 tests, all passing
+- [ ] `StoreManagerDeviceDiscoverySuite` has 18 tests, all passing
 - [ ] `checkStorageDevice` contains no `storageDevices.get` call outside the lookup callback
 - [ ] `client.getStorageDeviceState` appears exactly twice in `StoreManager.scala`: once inside
       `lookupStorageDeviceState`, once inside `reconcileDeviceState`'s `TransferringIn` branch

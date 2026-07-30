@@ -539,6 +539,72 @@ git add src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerPoolLoo
 git commit -m "Cover shared hosts, resolved hosts, and the surviving drop in pool lookup"
 ```
 
+- [ ] **Step 5: Pin that each rescued store queue gets its own host lookup**
+
+Added after Task 3's code review, which found that the per-iteration freshness of the
+`PendingHostLookup` is unpinned by the five tests above. The same-host and different-host cases
+turn out to pin *different* invariants: the shared-host test covers "one lookup per host", but
+nothing covers "one queue per store". Hoisting the allocation above the
+`poolState.stores.zipWithIndex.foreach` loop — a plausible "don't allocate in a loop" refactor —
+passes all five, and under it two unknown hosts share one queue, so whichever resolves first
+receives the other's messages. Messages on the wrong socket is a worse failure than the drop this
+plan set out to fix.
+
+Add a second unknown host to `MetadataManagerFixture.scala`, immediately after `remoteHostState`
+and before `poolStateWith`:
+
+```scala
+  /** A second host absent from the bootstrap config. Two distinct unknown hosts are what make it
+   *  observable that each rescued store queue gets its own PendingHostLookup rather than sharing
+   *  one across the pool's stores. */
+  protected val otherHostId: HostId = HostId(UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+
+  protected val otherHostState: HostState =
+    HostState(otherHostId, "other_host", "10.0.0.10", 7000, 7001, 7002, Set())
+```
+
+Append to `MetadataManagerPoolLookupSuite.scala`:
+
+```scala
+  test("two stores on two different unknown hosts get separate lookups"):
+    val (mgr, client, impl) = newManager()
+
+    val store0 = StoreId(unknownPoolId, 0.toByte)
+    val store1 = StoreId(unknownPoolId, 1.toByte)
+    val msg0 = nudge()
+    val msg1 = nudge()
+
+    mgr.getHostEntryOrQueueMessage(store0, msg0) should be(None)
+    mgr.getHostEntryOrQueueMessage(store1, msg1) should be(None)
+
+    client.poolLookupPromise(unknownPoolId).success(
+      poolStateWith(unknownPoolId, remoteHostId, otherHostId))
+
+    // Each store's iteration builds its own PendingHostLookup. Sharing one across the loop would
+    // pass every other test in this suite and still deliver both messages to whichever host
+    // resolved first -- messages on the wrong socket, which is worse than the drop this fixed.
+    client.lookups.toList should be(List(remoteHostId, otherHostId))
+
+    client.lookupPromise(remoteHostId).success(remoteHostState)
+    client.lookupPromise(otherHostId).success(otherHostState)
+
+    impl.deliveredTo(remoteHostId) should be(List(msg0))
+    impl.deliveredTo(otherHostId) should be(List(msg1))
+    mgr.hasParkedMessages should be(false)
+```
+
+Also make the failed-lookup test name the lookup it fails, by adding this after its
+`mgr.hasParkedMessages should be(true)` line:
+
+```scala
+    client.lookups.toList should be(List(remoteHostId))
+```
+
+Verify by mutation as in Step 3: hoist the allocation above the loop, confirm the new test is the
+one that fails (both messages delivered to `remoteHostId`, none to `otherHostId`), revert, and
+re-run for 6 passing. Then `sbt 'testOnly *MetadataManager*'` for 15, and commit the two test files
+as `Pin that each rescued store queue gets its own host lookup`.
+
 ---
 
 ## Task 4: Say where a parked message can now be dropped
@@ -659,7 +725,7 @@ StoreManager.activeDeviceChecks is keyed by device id only, and load state can
 
 Run: `sbt 'testOnly *MetadataManager*'`
 
-Expected: PASS, 14 tests (4 drain + 5 peek + 5 pool lookup).
+Expected: PASS, 15 tests (4 drain + 5 peek + 6 pool lookup).
 
 - [ ] **Step 6: Commit**
 

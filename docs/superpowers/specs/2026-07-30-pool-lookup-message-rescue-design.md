@@ -207,3 +207,10 @@ New suite `MetadataManagerPoolLookupSuite`, over `MetadataManagerFixture`:
 - **Pre-warming host lookups for stores with no parked messages.** The loop touches a host only
   when a queue exists for its store. Resolving every host in the pool eagerly would be speculative
   work for a caller that may never send to those stores.
+- **Enforcing the queue-size relationship the rescue depends on.** `EvictingQueue` drops the oldest
+  entry on overflow, silently, so moving up to `pendingStoreLookupQueueSize` messages into a queue
+  sized `pendingHostLookupQueueSize` is loss-free only while the latter is at least the former. The
+  defaults (20 and 100) satisfy it and `ZMQNet` is the only production construction, taking both —
+  but they are public constructor parameters with no enforced relationship. Documented in a comment
+  on the rescue rather than guarded by a `require` or pinned by a test, because `newManager()`
+  cannot vary the sizes and no caller varies them either.

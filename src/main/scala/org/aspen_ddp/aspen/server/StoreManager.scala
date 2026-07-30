@@ -115,6 +115,7 @@ class StoreManager(val client: AspenClient,
   private var transferringInStoreIds: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
+  private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
   private val serviceExecutorPromise: Promise[SimpleDurableServiceExecutor] = Promise()
@@ -693,104 +694,114 @@ class StoreManager(val client: AspenClient,
   protected def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     client.getStorageDeviceState(storageDeviceId)
 
+  /** Reconciles a loaded device's on-disk state against the state recorded for it in the
+   *  storage-devices tree: deletes stores transferred away, creates Initializing stores, and
+   *  starts transfers in. Runs under the instance lock.
+   */
+  private def reconcileDeviceState(local: LocalStorageDeviceState,
+                                   remote: StorageDeviceState): Unit =
+    if remote.hostId != hostId then
+      updateHostId(local.storageDeviceId).foreach: _ =>
+        checkStorageDevice(local.storageDeviceId)
+    else
+      //----------------------
+      // Deleted Stores
+      //
+      local.offlineStores.filter(storeId =>
+        !remote.stores.contains(storeId)
+      ).foreach: storeId =>
+        offlineStores -= storeId
+        local.offlineStores -= storeId
+        val storePath = os.Path(local.devicePath) / storeId.directoryName
+        if os.exists(storePath) then
+          logger.info(s"Deleting successfully transferred store $storePath")
+          try
+            os.remove.all(storePath)
+          catch
+            case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
+
+      //----------------------
+      // New Stores
+      //
+      remote.stores.filter((storeId, entry) =>
+        entry.status == StorageDeviceState.StoreStatus.Initializing
+      ).map( (storeId, _) =>
+        storeId
+      ).foreach: storeId =>
+        createNewStore(local, storeId)
+
+      //----------------------
+      // Transferring In Stores
+      //
+      remote.stores.filter { (storeId, entry) =>
+        entry.status == StorageDeviceState.StoreStatus.TransferringIn
+      }.map { (storeId, status) =>
+        (storeId, status.transferDevice)
+      }.toList.foreach: (storeId, ofromDeviceId) =>
+        ofromDeviceId.foreach: fromDeviceId =>
+          client.getStorageDeviceState(fromDeviceId).foreach: fromDevice =>
+            startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
-    def check(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit = {
-      if remote.hostId != hostId then
-        updateHostId(storageDeviceId).foreach: _ =>
-          checkStorageDevice(storageDeviceId)
-      else
-        //----------------------
-        // Deleted Stores
-        //
-        local.offlineStores.filter(storeId =>
-          !remote.stores.contains(storeId)
-        ).foreach: storeId =>
-          offlineStores -= storeId
-          local.offlineStores -= storeId
-          val storePath = os.Path(local.devicePath) / storeId.directoryName
-          if os.exists(storePath) then
-            logger.info(s"Deleting successfully transferred store $storePath")
-            try
-              os.remove.all(storePath)
-            catch
-              case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
-
-        //----------------------
-        // New Stores
-        //
-        remote.stores.filter((storeId, entry) =>
-          entry.status == StorageDeviceState.StoreStatus.Initializing
-        ).map( (storeId, _) =>
-          storeId
-        ).foreach: storeId =>
-          createNewStore(local, storeId)
-
-        //----------------------
-        // Transferring In Stores
-        //
-        remote.stores.filter { (storeId, entry) =>
-          entry.status == StorageDeviceState.StoreStatus.TransferringIn
-        }.map { (storeId, status) =>
-          (storeId, status.transferDevice)
-        }.toList.foreach: (storeId, ofromDeviceId) =>
-          ofromDeviceId.foreach: fromDeviceId =>
-            client.getStorageDeviceState(fromDeviceId).foreach: fromDevice =>
-              startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
-    }
-
     synchronized:
-      // Track which devices are currently being checked and skip the device if it is already in progress
-      // this protects against backups during offline periods
-      if ! activeDeviceChecks.contains(storageDeviceId) then
-        activeDeviceChecks += storageDeviceId
+      if activeDeviceChecks.contains(storageDeviceId) then
+        deferredDeviceChecks += storageDeviceId
+      else
+        startDeviceCheck(storageDeviceId)
 
-        // onComplete, and a finally, in both branches below: the entry must be released on
-        // both outcomes of the lookup, and on a throw out of the callback body itself.
-        // (A synchronous throw from getStorageDeviceState, before the Future exists, would
-        // still leak it. Known, and deliberately not guarded here.) Releasing only on success
-        // would leave the entry set forever and skip every later check of that device for the
-        // life of the process.
-        //
-        // Both failure modes are reachable. check above touches the filesystem and issues
-        // transactions, so it can throw. And getStorageDeviceState fails whenever the device
-        // has no entry in the storage-devices tree: a config written out-of-band naming an id
-        // that was never registered -- the supported path cannot produce this, since
-        // StorageDeviceManager.createStorageDevice commits the registration before writing
-        // the config file, so its orphan is the reverse one, a registration with no directory
-        // (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree entry removed
-        // after the fact, which no command does today. It also fails on any failure of the
-        // metadata read itself, transient or not, which is the only routinely reachable case.
-        //
-        // A copied or moved config is NOT one of these: its device is registered, so the
-        // lookup succeeds. A config carried to another host then takes check's hostId
-        // mismatch branch above, which is the designed host-migration path, not a warn.
-        lookupStorageDeviceState(storageDeviceId).onComplete: result =>
-          synchronized:
-            try
-              result match
-                case Success(remote) =>
-                  // Read the device's load state here rather than before the lookup was
-                  // issued. Runtime device discovery can load a device while its check is in
-                  // flight, and a branch chosen at dispatch time would then mark a loaded
-                  // device's stores offline -- ids that tryLoadStore and the LoadStore handler
-                  // have just removed, and that nothing else removes again.
-                  storageDevices.get(storageDeviceId) match
-                    case Some(local) => check(local, remote)
-                    case None =>
-                      // Find out what stores are on the offline/failed store and add them to our
-                      // offlineStores set. We don't want to send "UnknownStore" responses while
-                      // the device is down
-                      remote.stores.keysIterator.foreach: storeId =>
-                        offlineStores += storeId
+  private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
+    activeDeviceChecks += storageDeviceId
 
-                case Failure(err) =>
-                  val what =
-                    if storageDevices.contains(storageDeviceId) then "storage device"
-                    else "unloaded storage device"
-                  logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
-                              s"be registered in the storage-devices tree. Error: $err")
-            finally
-              activeDeviceChecks -= storageDeviceId
+    // onComplete, and a finally, in both branches below: the entry must be released on
+    // both outcomes of the lookup, and on a throw out of the callback body itself.
+    // (A synchronous throw from getStorageDeviceState, before the Future exists, would
+    // still leak it. Known, and deliberately not guarded here.) Releasing only on success
+    // would leave the entry set forever and skip every later check of that device for the
+    // life of the process.
+    //
+    // Both failure modes are reachable. check above touches the filesystem and issues
+    // transactions, so it can throw. And getStorageDeviceState fails whenever the device
+    // has no entry in the storage-devices tree: a config written out-of-band naming an id
+    // that was never registered -- the supported path cannot produce this, since
+    // StorageDeviceManager.createStorageDevice commits the registration before writing
+    // the config file, so its orphan is the reverse one, a registration with no directory
+    // (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree entry removed
+    // after the fact, which no command does today. It also fails on any failure of the
+    // metadata read itself, transient or not, which is the only routinely reachable case.
+    //
+    // A copied or moved config is NOT one of these: its device is registered, so the
+    // lookup succeeds. A config carried to another host then takes check's hostId
+    // mismatch branch above, which is the designed host-migration path, not a warn.
+    lookupStorageDeviceState(storageDeviceId).onComplete: result =>
+      synchronized:
+        try
+          result match
+            case Success(remote) =>
+              // Read the device's load state here rather than before the lookup was
+              // issued. Runtime device discovery can load a device while its check is in
+              // flight, and a branch chosen at dispatch time would then mark a loaded
+              // device's stores offline -- ids that tryLoadStore and the LoadStore handler
+              // have just removed, and that nothing else removes again.
+              storageDevices.get(storageDeviceId) match
+                case Some(local) => reconcileDeviceState(local, remote)
+                case None =>
+                  // Find out what stores are on the offline/failed store and add them to our
+                  // offlineStores set. We don't want to send "UnknownStore" responses while
+                  // the device is down
+                  remote.stores.keysIterator.foreach: storeId =>
+                    offlineStores += storeId
+
+            case Failure(err) =>
+              val what =
+                if storageDevices.contains(storageDeviceId) then "storage device"
+                else "unloaded storage device"
+              logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
+                          s"be registered in the storage-devices tree. Error: $err")
+        finally
+          activeDeviceChecks -= storageDeviceId
+          if deferredDeviceChecks.contains(storageDeviceId) then
+            deferredDeviceChecks -= storageDeviceId
+            startDeviceCheck(storageDeviceId)
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
@@ -887,6 +898,10 @@ class StoreManager(val client: AspenClient,
   /** Testing hook: the stores currently marked offline. */
   private[aspen] def testingOnlyOfflineStores: Set[StoreId] =
     synchronized(offlineStores)
+
+  /** Testing hook: devices with a check request deferred behind an in-flight lookup. */
+  private[aspen] def testingOnlyDeferredDeviceChecks: Set[StorageDeviceId] =
+    synchronized(deferredDeviceChecks)
 
   private def handleEvent(event: Event): Unit = synchronized {
     event match {

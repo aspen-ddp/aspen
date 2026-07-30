@@ -471,9 +471,10 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
     mgr.loadedDevices.keySet should be(empty)
 
-    // Arm the lookup this CheckStorageDevice will issue, so it stays in flight while the
-    // device loads underneath it.
-    val p = mgr.armLookup(deviceA)
+    // Two arms: the lookup held in flight across the load, and the one the deferred request
+    // issues once it completes.
+    val p1 = mgr.armLookup(deviceA)
+    val p2 = mgr.armLookup(deviceA)
 
     mgr.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
@@ -482,27 +483,106 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
     // The config appears and a later event loads the device while the lookup is outstanding.
-    // This is what runtime device discovery made possible and what the dispatch-time branch
-    // could not account for.
     writeDevice(hostRoot, "dev0", deviceA)
     mgr.testingOnlyCheckAllDevices()
     mgr.loadedDevices.keySet should be(Set(deviceA))
 
-    // An Active store makes check() a no-op in every one of its branches, so this pins branch
-    // selection alone rather than dragging in store creation or transfers.
+    // That event's own check request collided with the outstanding lookup. It is the request
+    // the guard used to discard outright, costing a full checkStorageDevicePeriod.
+    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+
+    // An Active store makes reconcileDeviceState a no-op in every one of its branches, so this
+    // pins branch selection alone rather than dragging in store creation or transfers.
+    p1.success(deviceState(
+      deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+
+    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+      // yieldUntil gives up silently, so assert its condition first. This also proves the
+      // first callback ran, without which the negative assertion below would pass vacuously.
+      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
+      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+
+      // The device was loaded before the lookup returned, so its stores must not be marked
+      // offline by a decision taken back when it was not. In production nothing would clear
+      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
+      // reconcileDeviceState's deleted-stores pass only removes ids recorded in the device's
+      // own offlineStores set, which ids marked by this branch never enter.
+      mgr.testingOnlyOfflineStores should not contain storeId
+
+      p2.success(deviceState(deviceA))
+      succeed
+
+  atest("a check for a device that never loads marks its stores offline"):
+    val hostRoot = newHostDir()
+    val mgr = newManager(hostRoot)
+
+    val p = mgr.armLookup(deviceA)
+
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+
+    // Nothing was written under storage-devices/, so the check runs against a device this
+    // manager has never loaded -- the case the offline marking exists for.
+    mgr.loadedDevices.keySet should be(empty)
+
     p.success(deviceState(
       deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
     yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
-      // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait into
-      // a failure. It also proves the callback ran, without which the negative assertion below
-      // would pass vacuously.
+      // yieldUntil gives up silently, so assert the condition it waited on.
       mgr.testingOnlyActiveDeviceChecks should be(empty)
 
-      // The device was loaded before the lookup returned, so its stores must not be marked
-      // offline by a decision taken back when it was not. In production nothing would clear
-      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
-      // check()'s own deleted-stores pass only removes ids recorded in the device's own
-      // offlineStores set, which ids marked by this branch never enter.
-      mgr.testingOnlyOfflineStores should not contain storeId
+      // Suppresses TxUnknownStore and ReadResponse(StoreNotFound) for stores on a device that
+      // is down. Deleting this marking is silent in production and, until this test, silent in
+      // the suite too.
+      mgr.testingOnlyOfflineStores should contain(storeId)
+
+  atest("a check request arriving during an in-flight check is deferred, not dropped"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
+    val p1 = mgr.armLookup(deviceA)
+    val p2 = mgr.armLookup(deviceA)
+
+    mgr.testingOnlyCheckAllDevices()
+    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+    mgr.lookupAttempts.toList should be(List(deviceA))
+
+    // Collides with the outstanding lookup. This is the create-storage-device nudge landing
+    // during a periodic sweep, and dropping it costs a full checkStorageDevicePeriod.
+    mgr.testingOnlyCheckAllDevices()
+    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+    mgr.lookupAttempts.toList should be(List(deviceA))
+
+    p1.success(deviceState(deviceA))
+
+    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
+      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+      p2.success(deviceState(deviceA))
+      succeed
+
+  atest("a deferred check still runs when the in-flight lookup fails"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
+    val p1 = mgr.armLookup(deviceA)
+    val p2 = mgr.armLookup(deviceA)
+
+    mgr.testingOnlyCheckAllDevices()
+    mgr.testingOnlyCheckAllDevices()
+    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+
+    // A failed lookup never reaches the completion-time re-read, so the deferral is the only
+    // thing that rescues the request that collided with it.
+    p1.failure(new RuntimeException("test-controlled lookup failure"))
+
+    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
+      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+      p2.failure(new RuntimeException("test-controlled lookup failure"))
+      succeed

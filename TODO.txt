@@ -68,8 +68,9 @@ accepted
   - createHostEntry enqueues NewHostAvailable before the wakeIoThread() that
     can throw, so a throw from that wake still leaves a fully live entry
     behind: the IO loop drains sendQueue on every iteration regardless of the
-    wake, so the dealer is created, registered in connectedDealers and
-    connectedHosts, flushed, and heartbeated thereafter
+    wake, so the dealer is created and registered in connectedDealers, the
+    entry is added to connectedHosts, and both are flushed and heartbeated
+    thereafter
   - Meanwhile MetadataManager's guard has removed the host from its map, so
     the next send builds a second entry and a second dealer for the same host.
     The first is unreachable from the manager but still live in the IO thread
@@ -77,6 +78,11 @@ accepted
     permanent wedge -- and reachability is low, since wakeIoThread fails on a
     closed socket, i.e. during teardown of a process that is exiting anyway.
     Recorded rather than fixed
+  - Candidate fix is to swallow the wakeIoThread failure in createHostEntry
+    the same way storeResolved does: the wake is best-effort because the IO
+    loop unconditionally drains the send queue every iteration, so a missed
+    wake delays delivery by at most one heartbeat period rather than losing
+    it. That makes the orphaned entry and duplicate dealer impossible
   - Distinct from the leak above: there NewHostAvailable fails, here it
     succeeds for an entry the manager has already forgotten
 
@@ -86,7 +92,8 @@ ZMQNet.heartbeat can still kill the IO thread
     guard above it. A throw while not shutting down matches neither handler,
     so it propagates out of ioThread and the thread dies -- the exact failure
     the send-queue guard was added to prevent, one screen higher in the same
-    method
+    method -- and unlike the two above it runs every heartbeat period, not
+    just on host setup
   - Deliberately not fixed alongside the send loop, because the recovery
     differs: a bad queue item is dropped, whereas a host whose heartbeat
     throws needs a decision -- skip it this round, or mark it offline
@@ -96,8 +103,8 @@ ZMQNet.ioThread's failure handling is untested
     zmqnet/, and ZMQNet's constructor binds real sockets, so covering the
     guards would mean standing up a harness or extracting a seam
   - The per-item send-queue guard therefore shipped without a test. That is a
-    decision rather than an oversight, and it is also why the entries above
-    are recorded rather than fixed: each fix wants the same seam
+    decision rather than an oversight, and it is also why the first entry
+    above is recorded rather than fixed: that fix wants the same seam
 
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying

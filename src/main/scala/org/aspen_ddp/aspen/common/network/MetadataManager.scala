@@ -237,7 +237,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  Failure branch does. No NonFatal throw from that call therefore escapes -- which matters
    *  because getHostEntryOrQueueMessage runs on ZMQNet's IO thread. That loop guards each item
    *  too, so an escape would now cost one send rather than the thread; handling it here is what
-   *  makes the host retryable, where the send loop's guard could only drop the item.
+   *  makes the host retryable, whereas the send loop's guard is log-only and could not undo the
+   *  pending entry.
    *
    *  Caller must hold this object's monitor. */
   private def startHostLookup(hostId: HostId, phl: PendingHostLookup): Unit =

@@ -130,7 +130,9 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *
    *  Note that a failed host or pool lookup drops the entry and everything parked on it (see
    *  peekHostEntry's scaladoc for the host case), so this can go false because the message was
-   *  discarded rather than sent. Nothing at this layer can tell the two apart.
+   *  discarded rather than sent. Nothing at this layer can tell the two apart. A lookup call that
+   *  fails by throwing is handled the same way as one that returns a failed Future, so it has the
+   *  same effect here.
    *
    *  A message parked on a pool lookup moves to a host lookup when the pool resolves onto a host
    *  that is not already resolved, so that drop can happen at a later stage than the one the
@@ -230,6 +232,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  it. That is unreachable from a caller already running inside a client callback, which is
    *  where the rescued-queue call site lives.
    *
+   *  A synchronous throw from the lookup call is treated as a lookup failure rather than
+   *  propagated: the pending entry is removed and phl's messages are dropped, exactly as the
+   *  Failure branch does. The method therefore never throws -- which matters because
+   *  getHostEntryOrQueueMessage is called from ZMQNet's send loop, where an escaping throw would
+   *  end the IO thread.
+   *
    *  Caller must hold this object's monitor. */
   private def startHostLookup(hostId: HostId, phl: PendingHostLookup): Unit =
     oClient match
@@ -257,6 +265,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                   ))
                 catch
                   case NonFatal(t) =>
+                    // Retryability rule.
                     // Same rule as a failed lookup: drop back to never-looked-up so a later call
                     // retries. Without this the entry stays at Left forever -- the lookup did
                     // resolve, so nothing will ever run again to advance or remove it. Repair
@@ -265,6 +274,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                     logger.error(s"Failed to create the host entry for hostId $hostId. Error: $t", t)
         catch
           case NonFatal(t) =>
+            // Retryability rule.
             // A lookup that fails by throwing is still a failed lookup, so undo the pending entry
             // installed above and let a later call retry -- exactly what the Failure branch does.
             // Left in place it would never resolve, because no continuation exists to resolve it:
@@ -340,6 +350,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                           case Right(hostEntry) => networkImplInterface.storeResolved(hostEntry, sid, storeQueue)
                   catch
                     case NonFatal(t) =>
+                      // Containment rule: this one costs a store, it does not restore one.
                       // Contain the throw to this store. Uncaught it escapes foreach, and since
                       // pendingPoolLookups was cleared above, every later store's queue becomes
                       // unreachable -- the tail of the pool lost to one store's failure.
@@ -353,6 +364,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                                    s"is unaffected. Error: $t", t)
         catch
           case NonFatal(t) =>
+            // Retryability rule.
             // Same rule as startHostLookup: a lookup that fails by throwing is a failed lookup, so
             // undo the pending entry and let a later call retry. Left in place it wedges the whole
             // pool -- every store in it, not just the one addressed here. Repair first and log

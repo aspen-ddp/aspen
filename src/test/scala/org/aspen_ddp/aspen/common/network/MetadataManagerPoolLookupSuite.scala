@@ -118,6 +118,7 @@ class MetadataManagerPoolLookupSuite extends AnyFunSuite
     mgr.getHostEntryOrQueueMessage(store0, nudge()) should be(None)
     client.poolLookupPromise(unknownPoolId).success(poolStateWith(unknownPoolId, remoteHostId))
     mgr.hasParkedMessages should be(true)
+    client.lookups.toList should be(List(remoteHostId))
 
     // The limit the fix does not remove: a failed lookup drops the entry and everything parked on
     // it. What changed is only where that can happen -- a message parked on a pool lookup can now
@@ -127,3 +128,29 @@ class MetadataManagerPoolLookupSuite extends AnyFunSuite
 
     mgr.hasParkedMessages should be(false)
     impl.deliveredTo(remoteHostId) should be(empty)
+
+  test("two stores on two different unknown hosts get separate lookups"):
+    val (mgr, client, impl) = newManager()
+
+    val store0 = StoreId(unknownPoolId, 0.toByte)
+    val store1 = StoreId(unknownPoolId, 1.toByte)
+    val msg0 = nudge()
+    val msg1 = nudge()
+
+    mgr.getHostEntryOrQueueMessage(store0, msg0) should be(None)
+    mgr.getHostEntryOrQueueMessage(store1, msg1) should be(None)
+
+    client.poolLookupPromise(unknownPoolId).success(
+      poolStateWith(unknownPoolId, remoteHostId, otherHostId))
+
+    // Each store's iteration builds its own PendingHostLookup. Sharing one across the loop would
+    // pass every other test in this suite and still deliver both messages to whichever host
+    // resolved first -- messages on the wrong socket, which is worse than the drop this fixed.
+    client.lookups.toList should be(List(remoteHostId, otherHostId))
+
+    client.lookupPromise(remoteHostId).success(remoteHostState)
+    client.lookupPromise(otherHostId).success(otherHostState)
+
+    impl.deliveredTo(remoteHostId) should be(List(msg0))
+    impl.deliveredTo(otherHostId) should be(List(msg1))
+    mgr.hasParkedMessages should be(false)

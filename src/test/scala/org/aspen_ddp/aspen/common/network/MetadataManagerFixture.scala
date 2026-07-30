@@ -159,6 +159,14 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
   protected val remoteHostState: HostState =
     HostState(remoteHostId, "remote_host", "10.0.0.9", 6000, 6001, 6002, Set())
 
+  /** A second host absent from the bootstrap config. Two distinct unknown hosts are what make it
+   *  observable that each rescued store queue gets its own PendingHostLookup rather than sharing
+   *  one across the pool's stores. */
+  protected val otherHostId: HostId = HostId(UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"))
+
+  protected val otherHostState: HostState =
+    HostState(otherHostId, "other_host", "10.0.0.10", 7000, 7001, 7002, Set())
+
   /** A StoragePoolState placing one store on each of `hostIds`, store index matching position.
    *
    *  Only the store entries matter, and each only for its hostId. MetadataManager reads

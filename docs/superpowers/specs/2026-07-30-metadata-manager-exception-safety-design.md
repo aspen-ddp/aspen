@@ -290,5 +290,6 @@ accepted and stated rather than papered over.
   The retryability rule above is therefore stated absolutely but implemented for `NonFatal` only.
   This is deliberate: `AspenClient.getHostState` and `getStoragePoolState` are pure future
   combinators over a read, with nothing that blocks, so `InterruptedException` is not reachable
-  through them and the rest are process-fatal anyway. Catching them to keep a map tidy would
-  suppress errors that should end the process.
+  through them and the rest are process-fatal anyway. The alternative considered was to repair the
+  map and then rethrow, which suppresses nothing; it was rejected because it adds a second
+  exception path through a state no surviving code will observe.

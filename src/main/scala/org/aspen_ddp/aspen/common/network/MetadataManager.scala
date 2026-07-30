@@ -262,10 +262,14 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
             // the host would be unreachable and hasParkedMessages stuck true for the life of the
             // process. Clean up the map first, then log: if logger.error itself throws the entry
             // is already repaired. The monitor is held by the caller, per this method's contract,
-            // so the removal needs no synchronized of its own. The entry removed is always the
-            // Left installed above -- onComplete cannot throw past the Success continuation because
-            // Promise.Transformation catches callback failures internally and routes them to
-            // reportFailure, so nothing escapes that would leave a freshly installed Right in place.
+            // so the removal needs no synchronized of its own.
+            //
+            // The entry removed is always the Left installed above, never a freshly installed
+            // Right. A NonFatal throw from the Success continuation is caught by
+            // Promise.Transformation and routed to reportFailure rather than rethrown, and a fatal
+            // one -- which Transformation does rethrow, out through onComplete -- is not matched
+            // below. Neither can reach this removal after the Right has landed.
+            //
             // Swallowing rather than rethrowing is what keeps a failed lookup from taking down the
             // send loop -- regardless of whether that loop has its own guard, this layer must not
             // depend on one existing.

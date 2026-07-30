@@ -5,10 +5,10 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
-import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.EvictingQueue
+import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.scalatest.{BeforeAndAfterAll, Suite}
 
 import java.nio.charset.StandardCharsets
@@ -89,14 +89,15 @@ class LookupRecordingClient extends TestNetwork.TClient(
  *  empty the EvictingQueue they are given before returning, so a double that left messages in
  *  place would not model the handoff it is here to observe.
  *
- *  Lock-ordering note: MetadataManager calls both methods while holding its own monitor, so the
- *  order is always manager then this object. Tests read the recordings without holding the
- *  manager's lock, which keeps that order intact.
+ *  Lock-ordering note: MetadataManager calls both methods either from its constructor, before
+ *  any other thread can see it, or while holding its own monitor -- so the recorder's monitor is
+ *  never acquired before the manager's. Tests read the recordings without holding the manager's
+ *  lock, which keeps that order intact.
  */
 class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[MetadataManager.HostEntry]:
 
   /** Every (hostId, storeId) pair storeResolved was called with, in call order. */
-  val storeResolutions: mutable.ListBuffer[(HostId, StoreId)] = mutable.ListBuffer()
+  val storeResolutions: mutable.ListBuffer[(HostId, StoreId)] = mutable.ListBuffer[(HostId, StoreId)]()
 
   private var delivered: Map[HostId, List[Message]] = Map()
 
@@ -112,7 +113,11 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
     while omsg.isDefined do
       omsg.foreach(buf.append)
       omsg = queuedMessages.dequeue()
-    delivered += hostId -> (delivered.getOrElse(hostId, Nil) ++ buf.toList)
+    // Recording nothing for an empty queue keeps delivered's key set meaning "hosts that
+    // actually received a message". MetadataManager's constructor hands createHostEntry an
+    // empty queue for every bootstrap host, which would otherwise show up as a delivery.
+    if buf.nonEmpty then
+      delivered += hostId -> (delivered.getOrElse(hostId, Nil) ++ buf.toList)
 
   def createHostEntry(hostId: HostId,
                       name: String,
@@ -156,14 +161,16 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
 
   /** A StoragePoolState placing one store on each of `hostIds`, store index matching position.
    *
-   *  Everything but the pool id and the store entries is filler. MetadataManager reads only
-   *  poolState.stores, and each StoreEntry only for its hostId.
+   *  Only the store entries matter, and each only for its hostId. MetadataManager reads
+   *  poolState.stores and builds every StoreId from the pool id it was asked about, never from
+   *  poolState.poolId -- so even that argument is filler, supplied for readability at the call
+   *  site. Everything else is placeholder detail the manager never looks at.
    */
-  protected def poolStateWith(poolId: PoolId, hostIds: HostId*): StoragePoolState =
+  protected def poolStateWith(targetPoolId: PoolId, hostIds: HostId*): StoragePoolState =
     val stores = hostIds.map: hostId =>
       StoragePoolState.StoreEntry(hostId, StorageDeviceId(UUID.randomUUID()))
     StoragePoolState(
-      poolId,
+      targetPoolId,
       "test_pool",
       Replication(hostIds.size, hostIds.size),
       None,

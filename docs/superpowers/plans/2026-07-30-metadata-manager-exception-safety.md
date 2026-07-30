@@ -847,18 +847,29 @@ In the per-store handoff loop's catch:
 
 Match each to the indentation of the comment line already beneath it. As built, those are 12, 20, 12 and 22 spaces respectively.
 
-- [ ] **Step 4: Record the two ZMQNet socket leaks in TODO.txt**
+- [ ] **Step 4: Record the four ZMQNet gaps in TODO.txt**
 
-In `TODO.txt`, insert these two entries immediately after the `StoreManager.checkStorageDevice leaks its activeDeviceChecks guard` block (which currently ends at line 42), each separated by a blank line:
+In `TODO.txt`, insert these four entries immediately after the `StoreManager.checkStorageDevice leaks its activeDeviceChecks guard` block (which currently ends at line 42), each separated by a blank line.
+
+The first entry must stay consistent with the catch comment in `ZMQNet.scala` that Task 5 corrected — if the two ever disagree, the comment is the source of truth:
 
 ```
-ZMQNet.ioThread leaks a socket when NewHostAvailable fails partway through
-  - The send-queue loop now guards each item, so a throw from dealer.connect no longer takes the
-    IO thread down with it. What survives is a created socket that was never registered in
-    connectedDealers and never assigned to entry.odealer: it leaks until the context closes, and
-    that host stays permanently unsendable
-  - Fix wants the socket closed on the failure path, which in turn wants a seam that lets a test
-    make connect() fail -- the same reason the checkStorageDevice leak above is unguarded
+ZMQNet.ioThread leaves a half-built host behind when NewHostAvailable fails partway through
+  - The send-queue loop now guards each item, so a throw here no longer takes the IO thread down
+    with it. What survives depends on where it threw, and neither state ever heals
+  - Fail at setIdentity or connect and entry.odealer stays None. The created socket leaks until
+    the context closes, and every later message to that host piles into entry.pendingMessages,
+    which nothing will drain: MetadataManager already holds Right(entry), so no second
+    NewHostAvailable is ever enqueued
+  - Fail at either send and the dealer is live and in connectedDealers, but connectedHosts and
+    rebuildPoller were skipped. The host is sendable yet never polled, so its inbound traffic is
+    discarded forever and nothing ever marks it offline. This is the state a dealer.send failure
+    actually produces, and it is the worse of the two
+  - Likely fix is to move both sends after the connectedHosts/rebuildPoller registration, which
+    does not depend on them and cannot reorder anything because every send on this path runs on
+    the one IO thread. That leaves only the narrow setIdentity/connect window, which wants the
+    socket closed on the failure path -- and a seam that lets a test make connect() fail, the
+    same reason the checkStorageDevice leak above is unguarded
 
 A createHostEntry that throws late orphans the entry the IO thread already accepted
   - createHostEntry enqueues NewHostAvailable before the wakeIoThread() that can throw, so a
@@ -873,6 +884,23 @@ A createHostEntry that throws late orphans the entry the IO thread already accep
     process that is exiting anyway. Recorded rather than fixed
   - Distinct from the leak above: there NewHostAvailable fails, here it succeeds for an entry the
     manager has already forgotten
+
+ZMQNet.heartbeat can still kill the IO thread
+  - heartbeat() calls dealer.send on every connected host from inside ioThread's loop, outside
+    both the per-item send-queue guard and the poll guard above it. A throw while not shutting
+    down matches neither handler, so it propagates out of ioThread and the thread dies -- the
+    exact failure the send-queue guard was added to prevent, one screen higher in the same method
+  - Deliberately not fixed alongside the send loop, because the recovery differs: a bad queue
+    item is dropped, whereas a host whose heartbeat throws needs a decision -- skip it this
+    round, or mark it offline
+
+ZMQNet.ioThread's failure handling is untested
+  - There is no ZMQNet suite. ProtobufMessageCodecSuite is the only file under zmqnet/, and
+    ZMQNet's constructor binds real sockets, so covering the guards would mean standing up a
+    harness or extracting a seam
+  - The per-item send-queue guard therefore shipped without a test. That is a decision rather
+    than an oversight, and it is also why the entries above are recorded rather than fixed: each
+    fix wants the same seam
 ```
 
 - [ ] **Step 5: Verify it compiles**

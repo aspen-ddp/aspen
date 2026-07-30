@@ -285,6 +285,14 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
             hosts -= hostId
             logger.error(s"HostState lookup call threw for hostId $hostId. Error: $t", t)
 
+  /** Starts `storeId.poolId`'s lookup, parking `msg` and any later messages to the pool until it
+   *  resolves. When the pool resolves, every store in it is mapped to its host, and each store's
+   *  queue is handed off to that host — either to an already-resolved host entry or onto a host
+   *  lookup if that host is unknown.
+   *
+   *  If no client is set the lookup is not started and the message is discarded.
+   *
+   *  Caller must hold this object's monitor. */
   private def startPoolLookup(storeId: StoreId, msg: Message): Unit =
     oClient match
       case None => logger.error(s"StoragePool lookup preformed before AspenClient initialized. PoolId: ${storeId.poolId}")

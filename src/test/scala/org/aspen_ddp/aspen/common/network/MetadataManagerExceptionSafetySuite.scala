@@ -101,7 +101,8 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
     val store0 = StoreId(unknownPoolId, 0.toByte)
     client.failPoolLookupWith(unknownPoolId, new RuntimeException("getStoragePoolState exploded"))
 
-    mgr.getHostEntryOrQueueMessage(store0, nudge()) should be(None)
+    val msg1 = nudge()
+    mgr.getHostEntryOrQueueMessage(store0, msg1) should be(None)
     client.poolLookups.toList should be(List(unknownPoolId))
 
     // A pendingPoolLookups entry no continuation will remove parks every later message for every
@@ -110,5 +111,12 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
 
     client.clearPoolLookupFailure(unknownPoolId)
 
-    mgr.getHostEntryOrQueueMessage(store0, nudge()) should be(None)
+    val msg2 = nudge()
+    mgr.getHostEntryOrQueueMessage(store0, msg2) should be(None)
     client.poolLookups.toList should be(List(unknownPoolId, unknownPoolId))
+
+    // The failed lookup dropped its message: the catch discards the ppl and every store queue on
+    // it before any can be rescued. Contrasts with a failed createHostEntry, which loses nothing
+    // because the network implementation drains the queue before throwing.
+    client.poolLookupPromise(unknownPoolId).success(poolStateWith(unknownPoolId, bootstrapHostId))
+    impl.deliveredTo(bootstrapHostId) should be(List(msg2))

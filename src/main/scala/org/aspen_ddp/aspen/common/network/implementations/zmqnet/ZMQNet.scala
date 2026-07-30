@@ -396,61 +396,75 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
         // Process send queue items
         var qmsg = sendQueue.poll()
         while qmsg != null do
-          qmsg match
-            case SendToStore(storeId, msg) =>
-              metadataManager.getHostEntryOrQueueMessage(storeId, msg) match
-                case Some(hostEntry) =>
-                  hostEntry.odealer match
-                    case Some(dealer) =>
-                      dealer.send(ProtobufMessageCodec.encodeMessage(msg))
-                    case None =>
-                      hostEntry.pendingMessages.add(msg)
-                case None =>
-                  // MetadataManager queued the message for later delivery
+          try
+            qmsg match
+              case SendToStore(storeId, msg) =>
+                metadataManager.getHostEntryOrQueueMessage(storeId, msg) match
+                  case Some(hostEntry) =>
+                    hostEntry.odealer match
+                      case Some(dealer) =>
+                        dealer.send(ProtobufMessageCodec.encodeMessage(msg))
+                      case None =>
+                        hostEntry.pendingMessages.add(msg)
+                  case None =>
+                    // MetadataManager queued the message for later delivery
 
-            case SendToHost(hostId, msg) =>
-              metadataManager.getHostEntryOrQueueMessage(hostId, msg) match
-                case Some(hostEntry) =>
-                  hostEntry.odealer match
-                    case Some(dealer) =>
-                      dealer.send(ProtobufMessageCodec.encodeMessage(msg))
-                    case None =>
-                      hostEntry.pendingMessages.add(msg)
-                case None =>
-                  // MetadataManager queued the message for later delivery
+              case SendToHost(hostId, msg) =>
+                metadataManager.getHostEntryOrQueueMessage(hostId, msg) match
+                  case Some(hostEntry) =>
+                    hostEntry.odealer match
+                      case Some(dealer) =>
+                        dealer.send(ProtobufMessageCodec.encodeMessage(msg))
+                      case None =>
+                        hostEntry.pendingMessages.add(msg)
+                  case None =>
+                    // MetadataManager queued the message for later delivery
 
-            case SendToClient(msg) =>
-              clients.get(msg.toClient).foreach: zmqIdentity =>
-                orouterSocket.foreach: router =>
-                  router.send(zmqIdentity, ZMQ.SNDMORE)
-                  router.send(ProtobufMessageCodec.encodeMessage(msg))
+              case SendToClient(msg) =>
+                clients.get(msg.toClient).foreach: zmqIdentity =>
+                  orouterSocket.foreach: router =>
+                    router.send(zmqIdentity, ZMQ.SNDMORE)
+                    router.send(ProtobufMessageCodec.encodeMessage(msg))
 
-            case NewHostAvailable(entry) =>
-              val dealer = context.createSocket(SocketType.DEALER)
-              dealer.setIdentity(clientId.toBytes)
-              dealer.connect(s"tcp://${entry.address}:${entry.dataPort}")
-              entry.odealer = Some(dealer)
-              entry.opollItem = Some(new PollItem(dealer, ZMQ.Poller.POLLIN))
-              connectedDealers.add(dealer)
+              case NewHostAvailable(entry) =>
+                val dealer = context.createSocket(SocketType.DEALER)
+                dealer.setIdentity(clientId.toBytes)
+                dealer.connect(s"tcp://${entry.address}:${entry.dataPort}")
+                entry.odealer = Some(dealer)
+                entry.opollItem = Some(new PollItem(dealer, ZMQ.Poller.POLLIN))
+                connectedDealers.add(dealer)
 
-              // Send initial heartbeat if we are a server node
-              oheartbeatMessage.foreach(dealer.send(_))
+                // Send initial heartbeat if we are a server node
+                oheartbeatMessage.foreach(dealer.send(_))
 
-              // Drain any pending messages
-              var pending = entry.pendingMessages.poll()
-              while pending != null do
-                dealer.send(ProtobufMessageCodec.encodeMessage(pending))
-                pending = entry.pendingMessages.poll()
-
-              connectedHosts += entry
-              rebuildPoller()
-
-            case ProcessPendingMessages(entry) =>
-              entry.odealer.foreach: dealer =>
+                // Drain any pending messages
                 var pending = entry.pendingMessages.poll()
                 while pending != null do
                   dealer.send(ProtobufMessageCodec.encodeMessage(pending))
                   pending = entry.pendingMessages.poll()
+
+                connectedHosts += entry
+                rebuildPoller()
+
+              case ProcessPendingMessages(entry) =>
+                entry.odealer.foreach: dealer =>
+                  var pending = entry.pendingMessages.poll()
+                  while pending != null do
+                    dealer.send(ProtobufMessageCodec.encodeMessage(pending))
+                    pending = entry.pendingMessages.poll()
+          catch
+            // One bad item must not take the thread down with it. Everything else depends on this
+            // loop surviving: the rest of the queue, every other host's traffic, and all inbound
+            // polling. Guarded on !shuttingDown for the same reason the poll above is -- a throw
+            // from a context that shutdown() closed should unwind to the handler below and let the
+            // thread run off its normal end, not be logged as a fault and retried.
+            //
+            // A NewHostAvailable that fails partway leaves a created socket that was never
+            // registered in connectedDealers nor assigned to entry.odealer. It leaks until the
+            // context closes and that host stays unsendable; the thread surviving is worth more.
+            // Recorded in TODO.txt.
+            case t: Throwable if !shuttingDown =>
+              logger.error(s"Error processing send queue item: $t", t)
 
           qmsg = sendQueue.poll()
     catch

@@ -315,7 +315,7 @@ real client so the existing tests are unaffected."
 Append to `StoreManagerDeviceDiscoverySuite`:
 
 ```scala
-  atest("a check started before its device loads uses the loaded branch when it completes"):
+  atest("a check started before its device loads does not mark the loaded device's stores offline"):
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
 
@@ -345,17 +345,22 @@ Append to `StoreManagerDeviceDiscoverySuite`:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
     yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait into
+      // a failure. It also proves the callback ran, without which the negative assertion below
+      // would pass vacuously.
       mgr.testingOnlyActiveDeviceChecks should be(empty)
 
       // The device was loaded before the lookup returned, so its stores must not be marked
-      // offline by a decision taken back when it was not. Nothing would ever clear them:
-      // tryLoadStore and the LoadStore handler are the only removers and both already ran.
+      // offline by a decision taken back when it was not. In production nothing would clear
+      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
+      // check()'s own deleted-stores pass only removes ids recorded in the device's own
+      // offlineStores set, which ids marked by this branch never enter.
       mgr.testingOnlyOfflineStores should not contain storeId
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "uses the loaded branch when it completes"'`
+Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "does not mark the loaded device's stores offline"'`
 Expected: FAIL on the final assertion — `Set(StoreId(...)) contained StoreId(...)`. The
 dispatch-time `None` branch marked the loaded device's store offline.
 
@@ -385,8 +390,9 @@ through the end of the `case None =>` callback (currently lines 754-780) with:
                         offlineStores += storeId
 
                 case Failure(err) =>
-                  val what = if storageDevices.contains(storageDeviceId) then "storage device"
-                             else "unloaded storage device"
+                  val what =
+                    if storageDevices.contains(storageDeviceId) then "storage device"
+                    else "unloaded storage device"
                   logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                               s"be registered in the storage-devices tree. Error: $err")
             finally
@@ -402,7 +408,7 @@ of this step and Task 5 rewrites it.
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "uses the loaded branch when it completes"'`
+Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "does not mark the loaded device's stores offline"'`
 Expected: PASS
 
 - [ ] **Step 5: Run the whole suite**
@@ -647,11 +653,11 @@ Expected: PASS
 
 The device-loading event in that test now defers rather than being dropped, so it issues a
 second lookup that would otherwise fall through to the real client mid-assertion. Replace the
-whole `atest("a check started before its device loads uses the loaded branch when it completes")`
+whole `atest("a check started before its device loads does not mark the loaded device's stores offline")`
 body with:
 
 ```scala
-  atest("a check started before its device loads uses the loaded branch when it completes"):
+  atest("a check started before its device loads does not mark the loaded device's stores offline"):
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
 

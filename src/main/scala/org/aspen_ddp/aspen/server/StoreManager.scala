@@ -696,7 +696,12 @@ class StoreManager(val client: AspenClient,
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
    *  storage-devices tree: deletes stores transferred away, creates Initializing stores, and
-   *  starts transfers in. Runs under the instance lock.
+   *  starts transfers in.
+   *
+   *  If the tree records a different host, none of that happens: the device has migrated here,
+   *  so this claims it with updateHostId and re-requests the check once the claim commits.
+   *
+   *  Callers hold the instance lock; the continuations it registers do not.
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =

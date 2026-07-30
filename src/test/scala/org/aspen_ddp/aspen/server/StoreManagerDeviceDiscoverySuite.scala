@@ -474,6 +474,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     // Two arms: the lookup held in flight across the load, and the one the deferred request
     // issues once it completes.
     val p1 = mgr.armLookup(deviceA)
+    // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
     val p2 = mgr.armLookup(deviceA)
 
     mgr.testingOnlyHandleHostMessage(
@@ -510,9 +511,6 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       // own offlineStores set, which ids marked by this branch never enter.
       mgr.testingOnlyOfflineStores should not contain storeId
 
-      p2.success(deviceState(deviceA))
-      succeed
-
   atest("a check for a device that never loads marks its stores offline"):
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
@@ -545,6 +543,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
     val mgr = newManager(hostRoot)
     val p1 = mgr.armLookup(deviceA)
+    // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
     val p2 = mgr.armLookup(deviceA)
 
     mgr.testingOnlyCheckAllDevices()
@@ -557,13 +556,17 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
     mgr.lookupAttempts.toList should be(List(deviceA))
 
+    // A third request collapses into the same deferral. The existing lookupAttempts assertion
+    // after the drain is what pins Set semantics: a queue or counter would issue two re-checks.
+    mgr.testingOnlyCheckAllDevices()
+    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+
     p1.success(deviceState(deviceA))
 
     yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+      // yieldUntil gives up silently, so assert the condition it waited on.
       mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
       mgr.testingOnlyDeferredDeviceChecks should be(empty)
-      p2.success(deviceState(deviceA))
-      succeed
 
   atest("a deferred check still runs when the in-flight lookup fails"):
     val hostRoot = newHostDir()
@@ -571,6 +574,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
     val mgr = newManager(hostRoot)
     val p1 = mgr.armLookup(deviceA)
+    // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
     val p2 = mgr.armLookup(deviceA)
 
     mgr.testingOnlyCheckAllDevices()
@@ -582,7 +586,6 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     p1.failure(new RuntimeException("test-controlled lookup failure"))
 
     yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+      // yieldUntil gives up silently, so assert the condition it waited on.
       mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
       mgr.testingOnlyDeferredDeviceChecks should be(empty)
-      p2.failure(new RuntimeException("test-controlled lookup failure"))
-      succeed

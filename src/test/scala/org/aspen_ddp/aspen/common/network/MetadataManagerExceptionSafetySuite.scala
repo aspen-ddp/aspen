@@ -67,16 +67,24 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
 
     impl.throwOnCreateHostEntry(remoteHostId, new RuntimeException("createHostEntry exploded"))
 
-    mgr.getHostEntryOrQueueMessage(remoteHostId, nudge()) should be(None)
+    val msg = nudge()
+    mgr.getHostEntryOrQueueMessage(remoteHostId, msg) should be(None)
     client.lookups.toList should be(List(remoteHostId))
 
-    // parasitic runs the continuation inline on this thread and swallows its throw, so this line
-    // returns normally either way. That silence is the whole problem: pre-fix nothing fails, the
-    // entry simply never advances from Left to Right.
+    // parasitic runs the continuation inline on this thread and reports a throw from an onComplete
+    // callback rather than rethrowing it, so a completion returns normally even when the
+    // continuation threw -- which is why nothing here can assert on an exception. Post-fix nothing
+    // escapes to be reported: the guard consumes it. That silence is the whole problem pre-fix,
+    // where nothing fails and the entry simply never advances from Left to Right.
     client.lookupPromise(remoteHostId).success(remoteHostState)
 
-    // The entry did not reach Right -- createHostEntry never returned one to install.
+    // The entry did not reach Right -- createHostEntry never returned one to install. A Left reads
+    // as None too, so this only rules out a Right.
     mgr.peekHostEntry(remoteHostId) should be(None)
+
+    // Unlike a lookup that throws, this failure loses nothing: createHostEntry drained the queue
+    // before it failed, exactly as ZMQNet's does before wakeIoThread().
+    impl.deliveredTo(remoteHostId) should be(List(msg))
 
     // ...and it did not stay at Left either. Pre-fix it did, so this send parks behind a pending
     // lookup nothing will ever resolve. Post-fix the host is back to never-looked-up and the send

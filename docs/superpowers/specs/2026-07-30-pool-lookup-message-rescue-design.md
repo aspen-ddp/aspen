@@ -94,7 +94,10 @@ Three invariants hold, each a plausible way to get this wrong:
 - **A pool whose stores share a host starts one lookup, not several.** `startHostLookup` installs
   `hosts += hostId -> Left(phl)` synchronously before returning — or `Right(entry)`, if the
   continuation ran inline — so a later iteration for the same host matches `Some(...)` and takes
-  the existing `Left`/`Right` branch. The `None` branch is reachable at most once per host.
+  the existing `Left`/`Right` branch. The one exception is an inline *failure*: that continuation
+  does `hosts -= hostId`, so each remaining store on that host retries the lookup. The messages
+  are dropped either way — that is the accepted limit below — and the cost is a duplicate lookup
+  and a duplicate error log rather than a correctness problem.
 - **The message is never untracked.** The drain happens inside the same `synchronized` block that
   removed the pool entry, so `hasParkedMessages` does not dip false while the message is between
   the two queues. This matters to `awaitPendingMessagesSent`, whose ordering comment

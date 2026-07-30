@@ -371,7 +371,9 @@ Leave the `Some(e)` branch below it exactly as it is.
 This branch is reachable at most once per host even when a pool puts several stores on the same
 one: `startHostLookup` installs `hosts += hostId -> Left(phl)` synchronously before returning — or
 `Right(entry)`, if the continuation ran inline — so a later iteration matches `Some(...)` instead.
-Task 3's second test pins that.
+Task 3's shared-host test pins that. The one exception is an inline *failure*, whose continuation
+does `hosts -= hostId`; each remaining store on that host then retries the lookup. The messages
+are dropped either way, so the cost is a duplicate lookup and a duplicate error log.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
@@ -397,15 +399,48 @@ git commit -m "Rescue messages parked on a pool lookup that names an unknown hos
 
 ## Task 3: Pin the surrounding behaviour
 
-Three more tests. Unlike Task 2's, these pass against the code as it stands after Task 2 — they
+Four more tests. Unlike Task 2's, these pass against the code as it stands after Task 2 — they
 are regression guards, and two of them cover branches that have never had any coverage at all.
+
+The first of the four is the important one. Task 2's test does not actually pin the seeding order
+the design calls load-bearing: `lookupPromise(remoteHostId)` is still unresolved when
+`startHostLookup` registers its continuation, so that continuation always runs later, and swapping
+`phl.drainIntoQueue(storeQueue)` to *after* the `startHostLookup` call still passes. Completing the
+host promise before the pool promise is what forces `getHostState` to hand back an already-complete
+future, so `parasitic` runs the continuation inline — inside the pool loop, before a
+drain-after-start would have run.
 
 **Files:**
 - Modify: `src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerPoolLookupSuite.scala`
 
-- [ ] **Step 1: Add the shared-host, already-resolved-host, and failed-lookup tests**
+- [ ] **Step 1: Add the inline-resolution, shared-host, already-resolved-host, and failed-lookup tests**
 
-Append these three tests to `MetadataManagerPoolLookupSuite.scala`:
+Append these four tests to `MetadataManagerPoolLookupSuite.scala`:
+
+```scala
+  test("a host that resolves inline still receives the rescued messages"):
+    val (mgr, client, impl) = newManager()
+
+    val store0 = StoreId(unknownPoolId, 0.toByte)
+    val msg = nudge()
+
+    mgr.getHostEntryOrQueueMessage(store0, msg) should be(None)
+
+    // Completing the host promise up front makes getHostState hand back an already-completed
+    // future, so parasitic runs startHostLookup's continuation inline -- inside the pool loop,
+    // and inside the same synchronized block. That is the case the seed-before-start ordering
+    // exists for: the continuation builds the host entry out of phl.messageQueue, so anything
+    // drained in after the call would miss the handoff entirely.
+    client.lookupPromise(remoteHostId).success(remoteHostState)
+
+    client.poolLookupPromise(unknownPoolId).success(poolStateWith(unknownPoolId, remoteHostId))
+
+    client.lookups.toList should be(List(remoteHostId))
+    impl.deliveredTo(remoteHostId) should be(List(msg))
+    mgr.hasParkedMessages should be(false)
+```
+
+Then these three:
 
 ```scala
   test("two stores on the same unknown host share a single lookup"):
@@ -475,9 +510,29 @@ Append these three tests to `MetadataManagerPoolLookupSuite.scala`:
 
 Run: `sbt 'testOnly *MetadataManagerPoolLookupSuite'`
 
-Expected: PASS, 4 tests.
+Expected: PASS, 5 tests.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Verify the inline test actually pins the ordering**
+
+The other four tests pass whether or not the seeding order is right, so confirm this one does not.
+Temporarily reorder the `None` branch in `MetadataManager.scala` to drain *after* starting:
+
+```scala
+                      val phl = new PendingHostLookup(pendingHostLookupQueueSize)
+                      startHostLookup(se.hostId, phl)
+                      phl.drainIntoQueue(storeQueue)
+```
+
+Run: `sbt 'testOnly *MetadataManagerPoolLookupSuite'`
+
+Expected: FAIL, exactly one test — "a host that resolves inline still receives the rescued
+messages" — at `impl.deliveredTo(remoteHostId) should be(List(msg))` with `List() was not equal to
+List(CheckStorageDevice(...))`. The other four still pass, which is the point.
+
+Then revert the reorder (restore drain-then-start) and re-run to confirm 5 passing. Do **not**
+commit the mutant.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 git add src/test/scala/org/aspen_ddp/aspen/common/network/MetadataManagerPoolLookupSuite.scala
@@ -488,8 +543,12 @@ git commit -m "Cover shared hosts, resolved hosts, and the surviving drop in poo
 
 ## Task 4: Say where a parked message can now be dropped
 
+Three scaladoc corrections and the TODO removal. Two of the three came out of Task 2's code
+review, which found claims in the new comments that are true of the tests but overstated about
+production.
+
 **Files:**
-- Modify: `src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala:121-131` (`hasParkedMessages` scaladoc)
+- Modify: `src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala` (`hasParkedMessages` scaladoc, `startHostLookup`'s scaladoc, the `None` branch comment)
 - Modify: `TODO.txt:1-14`
 
 - [ ] **Step 1: Extend `hasParkedMessages`' scaladoc**
@@ -518,7 +577,75 @@ with:
 cover both stages ("a failed host or pool lookup drops the entry and the messages parked on it")
 and needs no change.
 
-- [ ] **Step 2: Remove the closed entry from `TODO.txt`**
+- [ ] **Step 2: Correct the two over-claims in `startHostLookup`'s scaladoc**
+
+Task 2's scaladoc on the `PendingHostLookup` overload says the continuation can run inline
+"whenever the future is already complete". That is not true of production: `clientContext` is an
+`ExecutionContext.fromExecutorService(...)` (`Main.scala:707`, and the same at 821, 941, 1040),
+which is a `BatchingExecutor` — a callback registered on an already-complete future from inside a
+task already running on that EC is appended to the current batch and runs after the current task,
+not inline. Seeding first is still the right posture for a pluggable EC, but the sentence asserts
+something about production that does not hold. The scaladoc also documents the seeding contract
+without saying what the `oClient == None` branch does with the caller's messages.
+
+In `MetadataManager.scala`, replace the scaladoc on the `PendingHostLookup` overload:
+
+```scala
+  /** Starts `hostId`'s lookup, parking `phl`'s messages until it resolves.
+   *
+   *  The caller supplies the PendingHostLookup already seeded rather than adding to it
+   *  afterwards, because getHostState's continuation can run inline on this thread whenever the
+   *  future is already complete, and it builds the host entry from phl.messageQueue. Anything
+   *  enqueued after this returns would miss that handoff.
+   *
+   *  Caller must hold this object's monitor. */
+```
+
+with:
+
+```scala
+  /** Starts `hostId`'s lookup, parking `phl`'s messages until it resolves.
+   *
+   *  The caller supplies the PendingHostLookup already seeded rather than adding to it
+   *  afterwards, because getHostState's continuation can run inline on this thread -- it does in
+   *  tests under ExecutionContext.parasitic, and would under any EC that dispatches an
+   *  already-complete future's callback directly -- and it builds the host entry out of
+   *  phl.messageQueue. Anything enqueued after this returns would miss that handoff.
+   *
+   *  If no client is set the lookup is not started and phl's messages are discarded along with
+   *  it. That is unreachable from a caller already running inside a client callback, which is
+   *  where the rescued-queue call site lives.
+   *
+   *  Caller must hold this object's monitor. */
+```
+
+- [ ] **Step 3: Note the queue-size assumption the rescue rests on**
+
+`EvictingQueue` drops the *oldest* entry on overflow, silently. The rescue moves up to
+`pendingStoreLookupQueueSize` messages into a queue sized `pendingHostLookupQueueSize`, so it is
+loss-free only while the latter is at least the former. The defaults (20 and 100,
+`MetadataManager.scala:57-58`) satisfy that, and `ZMQNet` is the only production construction and
+takes both defaults — but both are public constructor parameters with no enforced relationship.
+
+In `MetadataManager.scala`, extend the comment on the `None` branch by appending one sentence to
+it, so the block reads:
+
+```scala
+                    case None =>
+                      // The pool named a host this process has never looked up. Move the queue
+                      // onto a host lookup instead of dropping it: pendingPoolLookups was cleared
+                      // above, so nothing else will ever come back for these messages. Doing it
+                      // here, inside the same synchronized block, is also what keeps
+                      // hasParkedMessages from dipping false while they are between queues.
+                      // The move is loss-free only while pendingHostLookupQueueSize is at least
+                      // pendingStoreLookupQueueSize; otherwise EvictingQueue silently drops the
+                      // oldest of what is being rescued.
+                      val phl = new PendingHostLookup(pendingHostLookupQueueSize)
+                      phl.drainIntoQueue(storeQueue)
+                      startHostLookup(se.hostId, phl)
+```
+
+- [ ] **Step 4: Remove the closed entry from `TODO.txt`**
 
 Delete lines 1-14 of `TODO.txt` — the entry beginning `MetadataManager silently drops parked
 messages when a resolving pool lookup` through its final bullet (`it the storeQueue instead of
@@ -528,13 +655,13 @@ dropping it`) and the blank line that follows. The file must now begin with:
 StoreManager.activeDeviceChecks is keyed by device id only, and load state can
 ```
 
-- [ ] **Step 3: Verify the whole file still compiles and the suites pass**
+- [ ] **Step 5: Verify the whole file still compiles and the suites pass**
 
 Run: `sbt 'testOnly *MetadataManager*'`
 
-Expected: PASS, 13 tests (4 drain + 5 peek + 4 pool lookup).
+Expected: PASS, 14 tests (4 drain + 5 peek + 5 pool lookup).
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/main/scala/org/aspen_ddp/aspen/common/network/MetadataManager.scala TODO.txt

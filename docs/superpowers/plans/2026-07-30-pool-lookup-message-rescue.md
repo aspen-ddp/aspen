@@ -805,6 +805,38 @@ Expected: PASS. If anything unrelated to `common.network` fails, check whether i
 `git stash` before treating it as a regression from this work — report either outcome honestly
 rather than assuming.
 
+Outcome: `sbt compile` clean; `sbt test` passed with 562 tests across 71 suites, 0 failures.
+
+- [ ] **Step 3: Close the gaps the final review found**
+
+The whole-implementation review passed the production code — it traced the concurrency paths and
+found no defect — but named two test gaps and confirmed both by mutation. Test-only work:
+
+**(a) Nothing parks two messages on one store queue.** Every test enqueued exactly one message per
+`StoreId`, so `drainIntoQueue`, the function the rescue is built on, had no multi-element coverage
+in either branch. Replacing its `while` loop with a single
+`storeQueue.dequeue().foreach(messageQueue.enqueue)` left all 15 tests green — a regression
+discarding all but the first parked message per store, the exact silent loss this work exists to
+eliminate, would have shipped. Fixed by parking two messages on store 0 in the first pool-lookup
+test and asserting `impl.deliveredTo(remoteHostId) should be(List(msg0, msg1))`, which pins
+completeness and order together.
+
+**(b) The inline test never asserted the host reached `Right`.** Delivery plus
+`hasParkedMessages == false` both still hold if the entry is left `Left(phl)` with an emptied queue.
+Moving `hosts += hostId -> Left(phl)` below the `onComplete` registration left all 15 green, and
+under inline resolution that wedges the host pending forever: every later message to it parks
+permanently and `awaitPendingMessagesSent` never drains. The peek suite cannot catch it because its
+promises are incomplete at registration time, so statement order is invisible there. Fixed with one
+line: `mgr.peekHostEntry(remoteHostId).map(_.name) should be(Some("remote_host"))`.
+
+Two minor items taken alongside: a first test for `startPoolLookup`'s `Failure` branch, which had no
+coverage at all (the pool-stage sibling of the drain suite's host-failure test), and making the
+fixture's `storeResolutions` private behind a synchronized `resolutions` accessor, matching
+`deliveredTo`.
+
+Run: `sbt 'testOnly *MetadataManager*'` — 16 tests (4 drain + 5 peek + 7 pool lookup). Then `sbt
+test` — 563 tests, 0 failures.
+
 ---
 
 ## Out of scope
@@ -820,3 +852,12 @@ Per the spec, deliberately not addressed:
 - **Pre-warming host lookups for stores with no parked messages.** The loop touches a host only
   when a queue exists for its store; resolving every host in a pool eagerly would be speculative
   work.
+- **Exception safety inside the handoff loop.** Raised by the final review, deliberately left for a
+  separate decision. Any throw from the per-store body escapes `foreach`, so the remaining stores
+  never get their `stores += sid -> se.hostId` mapping installed and their rescued queues are
+  dropped; the exception surfaces only via the EC's `reportFailure`. The loop was already exposed
+  this way through `networkImplInterface.storeResolved` — `ZMQNet`'s version calls
+  `wakeIoThread()`, which sends on a socket that can be dead during CLI teardown — and this work
+  adds `client.getHostState` as a second throwing call site. Wrapping the body in a `try`/`catch`
+  that logs and continues would cost one store rather than the tail of the pool, but it changes
+  behaviour beyond the drop this plan scoped, so it belongs to its own change.

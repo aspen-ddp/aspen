@@ -154,8 +154,8 @@ never cleared
   - Recorded rather than fixed: every site that clears offlineStores is keyed
     to a device that loads, so clearing these wants a rule for when an absent
     device is presumed gone rather than down -- a design question, not a
-    guard. Pre-existing; the deferral work did not change what the unloaded
-    branch marks
+    guard. Pre-existing: for a device that never loads, the deferral work did
+    not change what the unloaded branch marks
 
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying

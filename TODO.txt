@@ -50,8 +50,9 @@ partway through
     registration, which does not depend on them and cannot reorder anything
     because every send on this path runs on the one IO thread. That leaves
     only the narrow setIdentity/connect window, which wants the socket closed
-    on the failure path -- and a seam that lets a test make connect() fail,
-    the same reason the checkStorageDevice leak above is unguarded
+    on the failure path -- and a seam that lets a test make connect() fail.
+    The dealer is built inline from context.createSocket on the IO thread and
+    there is no ZMQNet harness to drive it, per the untested entry below
   - SendToClient has a narrower variant: a throw from router.send(encoded)
     leaves an unfinished multipart message on the ROUTER, so the next
     SendToClient appends its identity as frame 2 of the stale frame 1. One

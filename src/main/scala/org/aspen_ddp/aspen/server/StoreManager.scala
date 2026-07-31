@@ -751,10 +751,10 @@ class StoreManager(val client: AspenClient,
    *
    *  At most one lookup per device is outstanding at a time. A request arriving while one is
    *  in flight is deferred rather than dropped: dropping it costs a full
-   *  checkStorageDevicePeriod -- Main.CheckStorageDevicesPeriod, an hour at present -- which
-   *  is the same cost as losing the notification message outright. At most one deferral is
-   *  held per device, so this still throttles the pile-up of checks that builds up over an
-   *  offline period.
+   *  checkStorageDevicePeriod -- Main.CheckStorageDevicesPeriod in production, an hour at
+   *  present -- which is the same cost as losing the notification message outright. At most
+   *  one deferral is held per device, so this still throttles the pile-up of checks that
+   *  builds up over an offline period.
    */
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
     synchronized:
@@ -769,11 +769,6 @@ class StoreManager(val client: AspenClient,
    *  failed lookup is warned about. The guard entry is then released and any request deferred
    *  behind it re-dispatched.
    *
-   *  The lookup is issued under the caller's lock and the callback re-takes it, so the whole
-   *  of reconcileDeviceState -- filesystem work included -- runs with the event loop stalled.
-   *  That same lock is what makes the load-state re-read safe: it is the one handleEvent
-   *  takes, so no device can be loading while the callback runs.
-   *
    *  Caller holds the instance lock and has established that no check is active for this
    *  device.
    *
@@ -784,6 +779,11 @@ class StoreManager(val client: AspenClient,
    *  again: the only other site that clears offlineStores is reconcileDeviceState's
    *  deleted-stores pass, which touches ids recorded in the device's own offlineStores set,
    *  which these never enter.
+   *
+   *  The lookup is issued under the caller's lock and the callback re-takes it, so the whole
+   *  of reconcileDeviceState -- filesystem work included -- runs with the event loop stalled.
+   *  That same lock is what makes the load-state re-read safe: it is the one handleEvent
+   *  takes, so no device can be loading while the callback runs.
    *
    *  The entry must be released on both outcomes of the lookup and on a throw out of the
    *  callback body, hence the finally. That last is not hypothetical: the reconcile touches
@@ -800,7 +800,7 @@ class StoreManager(val client: AspenClient,
         try
           result match
             case Success(remote) =>
-              // Load state re-read here, not at dispatch. See the scaladoc.
+              // Load state re-read here, not at dispatch. See startDeviceCheck's scaladoc.
               storageDevices.get(storageDeviceId) match
                 case Some(local) => reconcileDeviceState(local, remote)
                 case None =>
@@ -830,6 +830,8 @@ class StoreManager(val client: AspenClient,
                 else "unloaded storage device"
               logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                           s"be registered in the storage-devices tree. Error: $err")
+        // Releases the guard on every exit path; the scaladoc has why that must be a finally.
+        //
         // The deferral flag is cleared before the re-dispatch, not after. No test can tell the
         // two apart, because onComplete never runs inline on the ExecutionContexts used today,
         // so the nested callback cannot re-enter this finally while the flag is still set.

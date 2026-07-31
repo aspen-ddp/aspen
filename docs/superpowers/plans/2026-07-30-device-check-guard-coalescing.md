@@ -912,8 +912,10 @@ StoreManager.reconcileDeviceState can retry the host-migration path forever
 StoreManager.offlineStores entries for a device that never appears on disk are
 never cleared
   - startDeviceCheck's unloaded branch marks every store the storage-devices
-    tree lists for the device. tryLoadStore and the LoadStore handler are the
-    only removers, and both require the store to actually load
+    tree lists for the device. Nothing can clear those entries: of the three
+    sites that remove from offlineStores, tryLoadStore and the LoadStore handler
+    both require the store to actually load, and reconcileDeviceState's
+    deleted-stores pass runs only for a device that is already loaded
   - A device registered in the tree whose directory never shows up therefore
     suppresses TxUnknownStore and ReadError.StoreNotFound for its stores for the
     life of the process. Peers get silence where they should get an answer

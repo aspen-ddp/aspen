@@ -940,7 +940,8 @@ a test seam. Two findings from tracing the code are written down."
 - [ ] `sbt test` passes
 - [ ] `StoreManagerDeviceDiscoverySuite` has 18 tests, all passing
 - [ ] `checkStorageDevice` contains no `storageDevices.get` call outside the lookup callback
-- [ ] `client.getStorageDeviceState` appears exactly twice in `StoreManager.scala`: once inside
-      `lookupStorageDeviceState`, once inside `reconcileDeviceState`'s `TransferringIn` branch
-      for the transfer source device
+- [ ] `client.getStorageDeviceState` appears exactly twice outside `startStoreTransferOut`: once
+      inside `lookupStorageDeviceState`, once inside `reconcileDeviceState`'s `TransferringIn`
+      branch for the transfer source device. The two calls in `startStoreTransferOut`'s
+      `startTransfer` predate this branch and are untouched, so the file total is four
 - [ ] `TODO.txt` no longer contains the `activeDeviceChecks is keyed by device id only` entry

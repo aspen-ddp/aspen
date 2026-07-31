@@ -849,7 +849,7 @@ class StoreManager(val client: AspenClient,
             case Failure(err) =>
               val what =
                 if storageDevices.contains(storageDeviceId) then "storage device"
-                else "unloaded storage device"
+                else "never-loaded storage device"
               logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                           s"be registered in the storage-devices tree. Error: $err")
         // Releases the guard on every exit path; the scaladoc has why that must be a finally.

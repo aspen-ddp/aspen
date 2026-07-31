@@ -28,8 +28,8 @@ synchronous throw
     again. So a synchronous throw there does double damage: it wedges the device
     and it replaces any exception already propagating out of the try body, which
     is how an exception from reconcileDeviceState would be lost
-  - No longer blocked: lookupStorageDeviceState is the seam a test needs to make
-    the call throw
+  - Low probability, but no longer blocked: lookupStorageDeviceState is the
+    seam a test needs to make the call throw
 
 ZMQNet.ioThread leaves a half-built host behind when NewHostAvailable fails
 partway through
@@ -103,8 +103,8 @@ ZMQNet.ioThread's failure handling is untested
     zmqnet/, and ZMQNet's constructor binds real sockets, so covering the
     guards would mean standing up a harness or extracting a seam
   - The per-item send-queue guard therefore shipped without a test. That is a
-    decision rather than an oversight, and it is also why the first entry
-    above is recorded rather than fixed: that fix wants the same seam
+    decision rather than an oversight, and it is also why the half-built host
+    entry above is recorded rather than fixed: that fix wants the same seam
 
 MetadataManager.refreshBootstrapConfig can wedge the flag permanently true on
 several failure paths
@@ -129,10 +129,15 @@ StoreManager.reconcileDeviceState can retry the host-migration path forever
   - On a hostId mismatch it calls updateHostId and then checkStorageDevice
     again. If the remote hostId never converges, that reads a still-mismatched
     state and repeats, with no backoff and no attempt counter
-  - activeDeviceChecks is no brake on it. The recursion is dispatched through
-    the ExecutionContext by Future.foreach, so under every EC a StoreManager is
-    built with today it lands after the callback released the guard. An EC that
-    ran it inline would only make it a deferral the finally re-dispatches
+  - Each turn of the loop is a transactUntilSuccessful commit plus a state
+    read, so it is paced by the network rather than spinning, but it never
+    stops. The device never reaches the reconcile proper either: its
+    Initializing stores are never created and its transfers in never start
+  - activeDeviceChecks is no brake on it. Future.foreach dispatches the
+    recursive call through the ExecutionContext, so on every EC in use today
+    it runs after the callback has released the guard. An inline EC would not
+    stop it either -- the call would just be deferred, and startDeviceCheck's
+    finally re-dispatches deferrals
   - Pre-existing and unaffected by the deferral work; recorded because it was
     found while tracing that code
 
@@ -146,6 +151,11 @@ never cleared
   - A device registered in the tree whose directory never shows up therefore
     suppresses TxUnknownStore and ReadError.StoreNotFound for its stores for the
     life of the process. Peers get silence where they should get an answer
+  - Recorded rather than fixed: every site that clears offlineStores is keyed
+    to a device that loads, so clearing these wants a rule for when an absent
+    device is presumed gone rather than down -- a design question, not a
+    guard. Pre-existing; the deferral work did not change what the unloaded
+    branch marks
 
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying

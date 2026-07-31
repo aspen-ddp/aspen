@@ -1,17 +1,3 @@
-StoreManager.activeDeviceChecks is keyed by device id only, and load state can
-now change while a check is in flight
-  - A CheckStorageDevice for a device not yet on disk takes checkStorageDevice's
-    None branch and leaves a lookup in flight. If the config then appears and a
-    later event loads the device before that lookup completes, the later event's
-    checkStorageDevice is skipped by the guard, so the device is not checked
-    until the next periodic CheckAllDevices
-  - The stale None-branch callback also adds the now-loaded device's stores to
-    offlineStores. Benign today because handleEvent matches stores.get first, but
-    newly possible: before runtime device discovery a device could not go
-    unloaded -> loaded with a check in flight
-  - Candidate fix: re-read storageDevices.get(storageDeviceId) inside the
-    callback rather than branching on it before starting the lookup
-
 Reassignment of a pool to a new set:
   - MigratePoolToSetDurableTask
     - register with system task executor at time of creation
@@ -32,14 +18,18 @@ Rebalancing as a passive background task
       - needs to be configurable
     - If it results in a non-empty plan, kick off a rebalancing task
 
-StoreManager.checkStorageDevice leaks its activeDeviceChecks guard on a
+StoreManager.startDeviceCheck leaks its activeDeviceChecks guard on a
 synchronous throw
-  - The entry is added before client.getStorageDeviceState is called. Both
-    outcomes of the returned Future release it, and so does a throw out of the
-    callback, but a throw from getStorageDeviceState itself (before the Future
-    exists) leaves the device wedged for the life of the process
-  - Low probability; not guarded because the fix wants a seam that lets a test
-    make the call throw
+  - The entry is added before lookupStorageDeviceState is called. Both outcomes
+    of the returned Future release it, and so does a throw out of the callback,
+    but a throw from lookupStorageDeviceState itself (before the Future exists)
+    leaves the device wedged for the life of the process
+  - The finally also re-dispatches a deferred check, by calling startDeviceCheck
+    again. So a synchronous throw there does double damage: it wedges the device
+    and it replaces any exception already propagating out of the try body, which
+    is how an exception from reconcileDeviceState would be lost
+  - No longer blocked: lookupStorageDeviceState is the seam a test needs to make
+    the call throw
 
 ZMQNet.ioThread leaves a half-built host behind when NewHostAvailable fails
 partway through
@@ -133,6 +123,28 @@ several failure paths
     scope on the stated (but falsified by this finding) basis that it already
     has try/catch/finally covering its write and reload. Unlike the ZMQNet
     entries no test seam is needed -- it is out of scope by spec, not by cost
+
+StoreManager.reconcileDeviceState can retry the host-migration path forever
+  - On a hostId mismatch it calls updateHostId and then checkStorageDevice
+    again. If the remote hostId never converges, that reads a still-mismatched
+    state and repeats, with no backoff and no attempt counter
+  - activeDeviceChecks is no brake on it. The recursion is dispatched through
+    the ExecutionContext by Future.foreach, so under every EC a StoreManager is
+    built with today it lands after the callback released the guard. An EC that
+    ran it inline would only make it a deferral the finally re-dispatches
+  - Pre-existing and unaffected by the deferral work; recorded because it was
+    found while tracing that code
+
+StoreManager.offlineStores entries for a device that never appears on disk are
+never cleared
+  - startDeviceCheck's unloaded branch marks every store the storage-devices
+    tree lists for the device. Nothing can clear those entries: of the three
+    sites that remove from offlineStores, tryLoadStore and the LoadStore handler
+    both require the store to actually load, and reconcileDeviceState's
+    deleted-stores pass runs only for a device that is already loaded
+  - A device registered in the tree whose directory never shows up therefore
+    suppresses TxUnknownStore and ReadError.StoreNotFound for its stores for the
+    life of the process. Peers get silence where they should get an answer
 
 Decouple AspenClient and BaseReadDriver
   - Having to stub out every method added to AspenClient is annoying

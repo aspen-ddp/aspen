@@ -105,6 +105,9 @@ class StoreManager(val client: AspenClient,
 
   val storageDevicesDir: Path = rootDir.resolve(StorageDeviceManager.StorageDevicesDirName)
 
+  // Append-only for the life of the process: tryLoadDevice is the only writer and nothing
+  // anywhere removes an entry. So a device present here stays present, and a lookup miss means
+  // a device this process has never loaded rather than one that has gone away.
   protected var storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
   protected var stores: Map[StoreId, Store] = Map()
 
@@ -234,8 +237,8 @@ class StoreManager(val client: AspenClient,
    *  Called at construction and from the event loop, both on every CheckAllDevices and on a
    *  CheckStorageDevice naming a device we have not loaded. Repeated scans are safe:
    *  tryLoadDevice skips any device already present in storageDevices, so a device's
-   *  LocalStorageDeviceState -- and with it the offlineStores set that checkStorageDevice's
-   *  check() reads -- survives, and its children are not re-offered to tryLoadStore over
+   *  LocalStorageDeviceState -- and with it the offlineStores set that reconcileDeviceState
+   *  reads -- survives, and its children are not re-offered to tryLoadStore over
    *  already-open backends.
    *
    *  Mutual exclusion: the handleEvent calls hold the instance lock; the constructor call
@@ -755,6 +758,11 @@ class StoreManager(val client: AspenClient,
    *  present -- which is the same cost as losing the notification message outright. At most
    *  one deferral is held per device, so this still throttles the pile-up of checks that
    *  builds up over an offline period.
+   *
+   *  One deferral suffices because a check is a reconcile, not a delta: it re-reads the
+   *  storage-devices tree and acts on whatever that says, so a single re-run subsumes any
+   *  number of requests coalesced into it. That is what makes a Set correct here rather than
+   *  lossy.
    */
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
     synchronized:
@@ -764,33 +772,48 @@ class StoreManager(val client: AspenClient,
         startDeviceCheck(storageDeviceId)
 
   /** Issues the one outstanding lookup for a device and acts on its result: a loaded device
-   *  is reconciled against the tree, an unloaded one has its stores added to offlineStores so
-   *  they stay silent rather than answering UnknownStore while the device is down, and a
+   *  is reconciled against the tree, a device this process has not loaded -- devices are never
+   *  unloaded, so this is one that has not appeared on disk in this process -- has its stores
+   *  added to offlineStores so they stay silent rather than answering UnknownStore, and a
    *  failed lookup is warned about. The guard entry is then released and any request deferred
    *  behind it re-dispatched.
    *
    *  Caller holds the instance lock and has established that no check is active for this
    *  device.
    *
-   *  The loaded/unloaded branch is chosen when the lookup completes, not when it is issued.
-   *  Runtime device discovery can load a device while its check is in flight, and a branch
-   *  chosen at dispatch time would then mark a loaded device's stores offline -- re-adding ids
-   *  that tryLoadStore and the LoadStore handler have just removed, and that nothing removes
-   *  again: the only other site that clears offlineStores is reconcileDeviceState's
-   *  deleted-stores pass, which touches ids recorded in the device's own offlineStores set,
-   *  which these never enter.
+   *  Which of those two branches runs is decided when the lookup completes, not when it is
+   *  issued. Runtime device discovery can load a device while its check is in flight, and a
+   *  branch chosen at dispatch time would then mark a loaded device's stores offline --
+   *  re-adding ids that tryLoadStore and the LoadStore handler have just removed, and that
+   *  nothing removes again: the only other site that clears offlineStores is
+   *  reconcileDeviceState's deleted-stores pass, which touches ids recorded in the device's
+   *  own offlineStores set, which these never enter.
    *
    *  The lookup is issued under the caller's lock and the callback re-takes it, so the whole
    *  of reconcileDeviceState -- filesystem work included -- runs with the event loop stalled.
    *  That same lock is what makes the load-state re-read safe: it is the one handleEvent
    *  takes, so no device can be loading while the callback runs.
    *
+   *  It is also what keeps a deferral from being stranded. checkStorageDevice's deferral
+   *  write and this callback's release-and-read of the guard all happen under that one
+   *  instance monitor, so a colliding request either finds no active check and starts its
+   *  own, or records a deferral the in-flight check's finally is guaranteed to see.
+   *
+   *  Releasing the guard is hostage to the lookup completing. The default
+   *  lookupStorageDeviceState reads through the client, whose read driver retransmits with
+   *  exponential backoff and imposes no timeout, so an unreachable pool holds this device's
+   *  guard for the whole outage while the deferral coalesces everything arriving meanwhile
+   *  into one re-check. That is intended, and it is what "one lookup in flight" amounts to in
+   *  production.
+   *
    *  The entry must be released on both outcomes of the lookup and on a throw out of the
    *  callback body, hence the finally. That last is not hypothetical: the reconcile touches
-   *  the filesystem and issues transactions, so it can throw. Releasing only on success would
-   *  skip every later check of that device for the life of the process. A synchronous throw
-   *  from lookupStorageDeviceState, before the Future exists, would still leak it -- known,
-   *  tracked in TODO.txt, and deliberately not guarded here.
+   *  the filesystem and issues transactions, so it can throw. It is argued rather than
+   *  covered, though -- no test drives a throw out of the callback body. Releasing only on
+   *  success would skip every later check of that device for the life of the process. A
+   *  synchronous throw from lookupStorageDeviceState, before the Future exists, would still
+   *  leak it -- known, tracked in TODO.txt, and deliberately not guarded here -- as would an
+   *  ExecutionContext that never runs the callback.
    */
   private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
     activeDeviceChecks += storageDeviceId
@@ -804,9 +827,8 @@ class StoreManager(val client: AspenClient,
               storageDevices.get(storageDeviceId) match
                 case Some(local) => reconcileDeviceState(local, remote)
                 case None =>
-                  // Find out what stores are on the offline/failed store and add them to our
-                  // offlineStores set. We don't want to send "UnknownStore" responses while
-                  // the device is down
+                  // A device that has not appeared on disk in this process -- nothing ever
+                  // unloads one. Silence its stores rather than sending "UnknownStore".
                   remote.stores.keysIterator.foreach: storeId =>
                     offlineStores += storeId
 

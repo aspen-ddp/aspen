@@ -230,8 +230,8 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
   /** A StorageDeviceState for `deviceId` owned by this manager's host, carrying `stores`.
    *
-   *  BootstrapHostId matches the manager's own hostId, which keeps check() off its
-   *  host-migration branch. The sizes are arbitrary; nothing under test reads them.
+   *  BootstrapHostId matches the manager's own hostId, which keeps reconcileDeviceState off
+   *  its host-migration branch. The sizes are arbitrary; nothing under test reads them.
    */
   private def deviceState(deviceId: StorageDeviceId,
                           stores: Map[StoreId, StorageDeviceState.StoreEntry] = Map()): StorageDeviceState =
@@ -478,7 +478,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     // issues once it completes.
     val p1 = mgr.armLookup(deviceA)
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
-    val p2 = mgr.armLookup(deviceA)
+    mgr.armLookup(deviceA)
 
     mgr.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
@@ -547,7 +547,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     val mgr = newManager(hostRoot)
     val p1 = mgr.armLookup(deviceA)
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
-    val p2 = mgr.armLookup(deviceA)
+    mgr.armLookup(deviceA)
 
     mgr.testingOnlyCheckAllDevices()
     mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
@@ -559,8 +559,11 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
     mgr.lookupAttempts.toList should be(List(deviceA))
 
-    // A third request collapses into the same deferral. The existing lookupAttempts assertion
-    // after the drain is what pins Set semantics: a queue or counter would issue two re-checks.
+    // A third request collapses into the same deferral. The testingOnlyDeferredDeviceChecks
+    // assertion after the drain is what pins Set semantics: a queue or a counter would still
+    // be holding a second request for deviceA there, having only shed one on the re-dispatch.
+    // lookupAttempts cannot pin it -- the re-dispatch consumes the second armed lookup, which
+    // this test never completes, so no implementation gets as far as a second re-dispatch.
     mgr.testingOnlyCheckAllDevices()
     mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
 
@@ -578,7 +581,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     val mgr = newManager(hostRoot)
     val p1 = mgr.armLookup(deviceA)
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
-    val p2 = mgr.armLookup(deviceA)
+    mgr.armLookup(deviceA)
 
     mgr.testingOnlyCheckAllDevices()
     mgr.testingOnlyCheckAllDevices()

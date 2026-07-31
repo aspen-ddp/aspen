@@ -48,7 +48,7 @@ Only two files change, plus `TODO.txt`.
 | File | Responsibility | Change |
 |---|---|---|
 | `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala` | The device check itself: seam, policy/mechanism split, re-read, deferral | Modify |
-| `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` | `RecordingStoreManager` arming seam and the three new tests | Modify |
+| `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` | `RecordingStoreManager` arming seam and the four new tests | Modify |
 | `TODO.txt` | Retire the fixed entry, amend the sync-throw entry, record two residuals | Modify |
 
 `StoreManager.scala` is 1000 lines and does far more than device checking. Splitting it is out
@@ -182,14 +182,19 @@ Insert into the `RecordingStoreManager` body, after the `tryLoadStore` override 
 `def loadedDevices`:
 
 ```scala
-  /** Storage device ids passed to lookupStorageDeviceState, in call order. */
+  /** Storage device ids passed to lookupStorageDeviceState, in call order.
+   *
+   *  Lazy for the same reason as armedLookups below.
+   */
   lazy val lookupAttempts: mutable.ListBuffer[StorageDeviceId] =
     mutable.ListBuffer[StorageDeviceId]()
 
   /** Promises queued by armLookup, consumed one per lookup of that device.
    *
-   *  Lazy for the same initialization-order reason as storeLoadAttempts: StoreManager's
-   *  constructor runs before this subclass's fields would otherwise be initialized.
+   *  Lazy to match storeLoadAttempts. Unlike that field, nothing in StoreManager's constructor
+   *  reaches this override today: the constructor's device scan calls tryLoadStore, but a
+   *  device check only ever runs from handleEvent. The uniformity is deliberate insurance
+   *  against that changing.
    */
   private lazy val armedLookups: mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]] =
     mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]]()
@@ -248,18 +253,30 @@ Append to `StoreManagerDeviceDiscoverySuite`:
 
     mgr.testingOnlyCheckAllDevices()
 
-    // The armed promise was taken instead of the real client's read, and the guard is held
-    // for as long as it stays pending. Every later test depends on both.
     mgr.lookupAttempts.toList should be(List(deviceA))
-    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
-    p.failure(new RuntimeException("test-controlled lookup failure"))
+    // Drain everything the check queued. A real client read of deviceA fails immediately --
+    // deviceA is absent from the storage-devices tree -- so an unarmed check would have
+    // released the guard by the time this wait exhausts. Still holding it is what proves the
+    // armed promise, and not the client's read, is what the check is waiting on.
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).flatMap: _ =>
+      mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
-    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
-      // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
-      // into a failure rather than a pass.
-      mgr.testingOnlyActiveDeviceChecks should be(empty)
+      p.failure(new RuntimeException("test-controlled lookup failure"))
+
+      yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+        // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
+        // into a failure rather than a pass.
+        mgr.testingOnlyActiveDeviceChecks should be(empty)
 ```
+
+**Why the intermediate drain.** Asserting the guard is held immediately after
+`testingOnlyCheckAllDevices()` proves nothing: ScalaTest's async EC is single-threaded and is
+the test's own thread, and `Future.onComplete` always dispatches through it even for an
+already-completed Future. So no callback has run at that point regardless of which Future the
+seam returned, and the assertion is unconditionally true. Yielding first is what makes it
+discriminating. Verified by mutation — substituting `armLookup(deviceB)` makes this version
+fail and the un-yielded version pass.
 
 - [ ] **Step 6: Run the test**
 
@@ -298,7 +315,7 @@ real client so the existing tests are unaffected."
 Append to `StoreManagerDeviceDiscoverySuite`:
 
 ```scala
-  atest("a check started before its device loads uses the loaded branch when it completes"):
+  atest("a check started before its device loads does not mark the loaded device's stores offline"):
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
 
@@ -328,17 +345,22 @@ Append to `StoreManagerDeviceDiscoverySuite`:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
     yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait into
+      // a failure. It also proves the callback ran, without which the negative assertion below
+      // would pass vacuously.
       mgr.testingOnlyActiveDeviceChecks should be(empty)
 
       // The device was loaded before the lookup returned, so its stores must not be marked
-      // offline by a decision taken back when it was not. Nothing would ever clear them:
-      // tryLoadStore and the LoadStore handler are the only removers and both already ran.
+      // offline by a decision taken back when it was not. In production nothing would clear
+      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
+      // check()'s own deleted-stores pass only removes ids recorded in the device's own
+      // offlineStores set, which ids marked by this branch never enter.
       mgr.testingOnlyOfflineStores should not contain storeId
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "uses the loaded branch when it completes"'`
+Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "does not mark the loaded device's stores offline"'`
 Expected: FAIL on the final assertion — `Set(StoreId(...)) contained StoreId(...)`. The
 dispatch-time `None` branch marked the loaded device's store offline.
 
@@ -368,8 +390,9 @@ through the end of the `case None =>` callback (currently lines 754-780) with:
                         offlineStores += storeId
 
                 case Failure(err) =>
-                  val what = if storageDevices.contains(storageDeviceId) then "storage device"
-                             else "unloaded storage device"
+                  val what =
+                    if storageDevices.contains(storageDeviceId) then "storage device"
+                    else "unloaded storage device"
                   logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                               s"be registered in the storage-devices tree. Error: $err")
             finally
@@ -385,7 +408,7 @@ of this step and Task 5 rewrites it.
 
 - [ ] **Step 4: Run the test and watch it pass**
 
-Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "uses the loaded branch when it completes"'`
+Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "does not mark the loaded device's stores offline"'`
 Expected: PASS
 
 - [ ] **Step 5: Run the whole suite**
@@ -411,7 +434,7 @@ decision made when it was not loaded. Nothing cleared them afterwards."
 
 **Files:**
 - Modify: `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala` — add `deferredDeviceChecks` and its hook, split `checkStorageDevice`, promote `check`
-- Modify: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` — two new tests, one existing test extended
+- Modify: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` — three new tests, one existing test extended
 
 - [ ] **Step 1: Add the field and its testing hook**
 
@@ -430,6 +453,52 @@ Add the hook immediately after `testingOnlyOfflineStores`:
   private[aspen] def testingOnlyDeferredDeviceChecks: Set[StorageDeviceId] =
     synchronized(deferredDeviceChecks)
 ```
+
+- [ ] **Step 1b: Pin the unloaded branch that Task 3 rewrote**
+
+Added after Task 3's spec review. That review mutation-tested the branch Task 3 collapsed and found
+that replacing the unloaded arm with `case None => ()` — dropping the offline marking entirely —
+survives the **entire 569-test repo suite**. Correctness-table row 1 ("unloaded at dispatch, still
+unloaded, lookup succeeds → mark offline") has no coverage at all: `testingOnlyOfflineStores`
+arrived only in Task 2 and Task 3's regression test is its sole consumer, asserting the *negative*.
+The suite therefore pins the bug's absence but not the behaviour that has to survive, and a later
+refactor could delete the `None` branch and stay green.
+
+This is the positive counterpart of Task 3's test — same setup, device never loads, opposite
+assertion. Append to `StoreManagerDeviceDiscoverySuite`:
+
+```scala
+  atest("a check for a device that never loads marks its stores offline"):
+    val hostRoot = newHostDir()
+    val mgr = newManager(hostRoot)
+
+    val p = mgr.armLookup(deviceA)
+
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+
+    // Nothing was written under storage-devices/, so the check runs against a device this
+    // manager has never loaded -- the case the offline marking exists for.
+    mgr.loadedDevices.keySet should be(empty)
+
+    p.success(deviceState(
+      deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      // yieldUntil gives up silently, so assert the condition it waited on.
+      mgr.testingOnlyActiveDeviceChecks should be(empty)
+
+      // Suppresses TxUnknownStore and ReadResponse(StoreNotFound) for stores on a device that
+      // is down. Deleting this marking is silent in production and, until this test, silent in
+      // the suite too.
+      mgr.testingOnlyOfflineStores should contain(storeId)
+```
+
+Run it before making any Task 4 change: it must **pass** against `f29f063`. It is a
+characterisation test of behaviour Task 3 already shipped, not a red-green pair. Then verify it
+discriminates by applying the mutant it exists to kill — change the `case None =>` arm in
+`checkStorageDevice` to `case None => ()`, confirm this test fails, and restore.
 
 - [ ] **Step 2: Write the two failing tests**
 
@@ -549,8 +618,9 @@ cases — cannot be lost if Task 5 is interrupted.
                     offlineStores += storeId
 
             case Failure(err) =>
-              val what = if storageDevices.contains(storageDeviceId) then "storage device"
-                         else "unloaded storage device"
+              val what =
+                if storageDevices.contains(storageDeviceId) then "storage device"
+                else "unloaded storage device"
               logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                           s"be registered in the storage-devices tree. Error: $err")
         finally
@@ -584,11 +654,11 @@ Expected: PASS
 
 The device-loading event in that test now defers rather than being dropped, so it issues a
 second lookup that would otherwise fall through to the real client mid-assertion. Replace the
-whole `atest("a check started before its device loads uses the loaded branch when it completes")`
+whole `atest("a check started before its device loads does not mark the loaded device's stores offline")`
 body with:
 
 ```scala
-  atest("a check started before its device loads uses the loaded branch when it completes"):
+  atest("a check started before its device loads does not mark the loaded device's stores offline"):
     val hostRoot = newHostDir()
     val mgr = newManager(hostRoot)
 
@@ -621,23 +691,30 @@ body with:
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
     yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
-      // The device was loaded before the lookup returned, so its stores must not be marked
-      // offline by a decision taken back when it was not. Nothing would ever clear them:
-      // tryLoadStore and the LoadStore handler are the only removers and both already ran.
-      mgr.testingOnlyOfflineStores should not contain storeId
-
-      // And the deferred request ran rather than being dropped.
+      // yieldUntil gives up silently, so assert its condition first. This also proves the
+      // first callback ran, without which the negative assertion below would pass vacuously.
       mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
       mgr.testingOnlyDeferredDeviceChecks should be(empty)
+
+      // The device was loaded before the lookup returned, so its stores must not be marked
+      // offline by a decision taken back when it was not. In production nothing would clear
+      // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
+      // reconcileDeviceState's deleted-stores pass only removes ids recorded in the device's
+      // own offlineStores set, which ids marked by this branch never enter.
+      mgr.testingOnlyOfflineStores should not contain storeId
 
       p2.success(deviceState(deviceA))
       succeed
 ```
 
+Note the assertion order: `lookupAttempts` first. It is the condition `yieldUntil` waited on, and
+`yieldUntil` gives up silently — asserting the negative `offlineStores` claim first would let an
+exhausted wait pass as a success.
+
 - [ ] **Step 8: Run the whole suite**
 
 Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite'`
-Expected: PASS, 17 tests.
+Expected: PASS, 18 tests.
 
 - [ ] **Step 9: Run the full test suite**
 
@@ -704,8 +781,10 @@ and this on `startDeviceCheck`:
    *  The loaded/unloaded branch is chosen when the lookup completes, not when it is issued.
    *  Runtime device discovery can load a device while its check is in flight, and a branch
    *  chosen at dispatch time would then mark a loaded device's stores offline -- re-adding ids
-   *  that tryLoadStore and the LoadStore handler have just removed, which are the only two
-   *  sites that remove them. The re-read is safe because this callback holds the same instance
+   *  that tryLoadStore and the LoadStore handler have just removed, and that nothing removes
+   *  again: the only other site that clears offlineStores is reconcileDeviceState's
+   *  deleted-stores pass, which touches ids recorded in the device's own offlineStores set,
+   *  which these never enter. The re-read is safe because this callback holds the same instance
    *  lock handleEvent does, so no device can be loading while it runs.
    *
    *  The entry must be released on both outcomes of the lookup and on a throw out of the
@@ -713,6 +792,12 @@ and this on `startDeviceCheck`:
    *  of that device for the life of the process. A synchronous throw from
    *  lookupStorageDeviceState, before the Future exists, would still leak it -- known, tracked
    *  in TODO.txt, and deliberately not guarded here.
+   *
+   *  The deferral flag is cleared before the re-dispatch, not after. No test can tell the two
+   *  apart, because onComplete never runs inline on the ExecutionContexts used today, so the
+   *  nested callback cannot re-enter this finally while the flag is still set. Under an inline
+   *  or parasitic EC the other order recurses without bound, and it also strands the flag if
+   *  lookupStorageDeviceState throws synchronously.
    *
    *  Both lookup failure modes are reachable. The reconcile touches the filesystem and issues
    *  transactions, so it can throw. And the lookup fails whenever the device has no entry in
@@ -753,7 +838,7 @@ Replace those two lines with:
 - [ ] **Step 3: Verify nothing broke**
 
 Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite'`
-Expected: PASS, 17 tests. Comments only, so any failure means code was deleted by accident.
+Expected: PASS, 18 tests. Comments only, so any failure means code was deleted by accident.
 
 - [ ] **Step 4: Commit**
 
@@ -827,8 +912,10 @@ StoreManager.reconcileDeviceState can retry the host-migration path forever
 StoreManager.offlineStores entries for a device that never appears on disk are
 never cleared
   - startDeviceCheck's unloaded branch marks every store the storage-devices
-    tree lists for the device. tryLoadStore and the LoadStore handler are the
-    only removers, and both require the store to actually load
+    tree lists for the device. Nothing can clear those entries: of the three
+    sites that remove from offlineStores, tryLoadStore and the LoadStore handler
+    both require the store to actually load, and reconcileDeviceState's
+    deleted-stores pass runs only for a device that is already loaded
   - A device registered in the tree whose directory never shows up therefore
     suppresses TxUnknownStore and ReadError.StoreNotFound for its stores for the
     life of the process. Peers get silence where they should get an answer
@@ -851,9 +938,10 @@ a test seam. Two findings from tracing the code are written down."
 
 - [ ] `sbt compile` clean
 - [ ] `sbt test` passes
-- [ ] `StoreManagerDeviceDiscoverySuite` has 17 tests, all passing
+- [ ] `StoreManagerDeviceDiscoverySuite` has 18 tests, all passing
 - [ ] `checkStorageDevice` contains no `storageDevices.get` call outside the lookup callback
-- [ ] `client.getStorageDeviceState` appears exactly twice in `StoreManager.scala`: once inside
-      `lookupStorageDeviceState`, once inside `reconcileDeviceState`'s `TransferringIn` branch
-      for the transfer source device
+- [ ] `client.getStorageDeviceState` appears exactly twice outside `startStoreTransferOut`: once
+      inside `lookupStorageDeviceState`, once inside `reconcileDeviceState`'s `TransferringIn`
+      branch for the transfer source device. The two calls in `startStoreTransferOut`'s
+      `startTransfer` predate this branch and are untouched, so the file total is four
 - [ ] `TODO.txt` no longer contains the `activeDeviceChecks is keyed by device id only` entry

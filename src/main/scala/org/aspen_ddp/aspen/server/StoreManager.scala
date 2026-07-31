@@ -751,9 +751,10 @@ class StoreManager(val client: AspenClient,
    *
    *  At most one lookup per device is outstanding at a time. A request arriving while one is
    *  in flight is deferred rather than dropped: dropping it costs a full
-   *  checkStorageDevicePeriod -- an hour as Main configures it -- which is the same cost as
-   *  losing the notification message outright. At most one deferral is held per device, so
-   *  this still throttles the pile-up of checks that builds up over an offline period.
+   *  checkStorageDevicePeriod -- Main.CheckStorageDevicesPeriod, an hour at present -- which
+   *  is the same cost as losing the notification message outright. At most one deferral is
+   *  held per device, so this still throttles the pile-up of checks that builds up over an
+   *  offline period.
    */
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
     synchronized:
@@ -762,7 +763,16 @@ class StoreManager(val client: AspenClient,
       else
         startDeviceCheck(storageDeviceId)
 
-  /** Issues the one outstanding lookup for a device and acts on the result.
+  /** Issues the one outstanding lookup for a device and acts on its result: a loaded device
+   *  is reconciled against the tree, an unloaded one has its stores added to offlineStores so
+   *  they stay silent rather than answering UnknownStore while the device is down, and a
+   *  failed lookup is warned about. The guard entry is then released and any request deferred
+   *  behind it re-dispatched.
+   *
+   *  The lookup is issued under the caller's lock and the callback re-takes it, so the whole
+   *  of reconcileDeviceState -- filesystem work included -- runs with the event loop stalled.
+   *  That same lock is what makes the load-state re-read safe: it is the one handleEvent
+   *  takes, so no device can be loading while the callback runs.
    *
    *  Caller holds the instance lock and has established that no check is active for this
    *  device.
@@ -773,34 +783,14 @@ class StoreManager(val client: AspenClient,
    *  that tryLoadStore and the LoadStore handler have just removed, and that nothing removes
    *  again: the only other site that clears offlineStores is reconcileDeviceState's
    *  deleted-stores pass, which touches ids recorded in the device's own offlineStores set,
-   *  which these never enter. The re-read is safe because this callback holds the same instance
-   *  lock handleEvent does, so no device can be loading while it runs.
+   *  which these never enter.
    *
    *  The entry must be released on both outcomes of the lookup and on a throw out of the
-   *  callback body, hence the finally. Releasing only on success would skip every later check
-   *  of that device for the life of the process. A synchronous throw from
-   *  lookupStorageDeviceState, before the Future exists, would still leak it -- known, tracked
-   *  in TODO.txt, and deliberately not guarded here.
-   *
-   *  The deferral flag is cleared before the re-dispatch, not after. No test can tell the two
-   *  apart, because onComplete never runs inline on the ExecutionContexts used today, so the
-   *  nested callback cannot re-enter this finally while the flag is still set. Under an inline
-   *  or parasitic EC the other order recurses without bound, and it also strands the flag if
-   *  lookupStorageDeviceState throws synchronously.
-   *
-   *  Both lookup failure modes are reachable. The reconcile touches the filesystem and issues
-   *  transactions, so it can throw. And the lookup fails whenever the device has no entry in
-   *  the storage-devices tree: a config written out-of-band naming an id that was never
-   *  registered -- the supported path cannot produce this, since
-   *  StorageDeviceManager.createStorageDevice commits the registration before writing the
-   *  config file, so its orphan is the reverse one, a registration with no directory (see the
-   *  ConfigWriteFailed advice in the cmdline Main) -- or a tree entry removed after the fact,
-   *  which no command does today. It also fails on any failure of the metadata read itself,
-   *  transient or not, which is the only routinely reachable case.
-   *
-   *  A copied or moved config is NOT one of these: its device is registered, so the lookup
-   *  succeeds. A config carried to another host then takes reconcileDeviceState's hostId
-   *  mismatch branch, which is the designed host-migration path, not a warn.
+   *  callback body, hence the finally. That last is not hypothetical: the reconcile touches
+   *  the filesystem and issues transactions, so it can throw. Releasing only on success would
+   *  skip every later check of that device for the life of the process. A synchronous throw
+   *  from lookupStorageDeviceState, before the Future exists, would still leak it -- known,
+   *  tracked in TODO.txt, and deliberately not guarded here.
    */
   private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
     activeDeviceChecks += storageDeviceId
@@ -810,11 +800,7 @@ class StoreManager(val client: AspenClient,
         try
           result match
             case Success(remote) =>
-              // Read the device's load state here rather than before the lookup was
-              // issued. Runtime device discovery can load a device while its check is in
-              // flight, and a branch chosen at dispatch time would then mark a loaded
-              // device's stores offline -- ids that tryLoadStore and the LoadStore handler
-              // have just removed, and that nothing else removes again.
+              // Load state re-read here, not at dispatch. See the scaladoc.
               storageDevices.get(storageDeviceId) match
                 case Some(local) => reconcileDeviceState(local, remote)
                 case None =>
@@ -824,12 +810,31 @@ class StoreManager(val client: AspenClient,
                   remote.stores.keysIterator.foreach: storeId =>
                     offlineStores += storeId
 
+            // The lookup fails whenever the device has no entry in the storage-devices tree:
+            // a config written out-of-band naming an id that was never registered -- the
+            // supported path cannot produce this, since
+            // StorageDeviceManager.createStorageDevice commits the registration before
+            // writing the config file, so its orphan is the reverse one, a registration with
+            // no directory (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree
+            // entry removed after the fact, which no command does today. It also fails on any
+            // failure of the metadata read itself, transient or not, which is the only
+            // routinely reachable case.
+            //
+            // A copied or moved config is NOT one of these: its device is registered, so the
+            // lookup succeeds. A config carried to another host then takes
+            // reconcileDeviceState's hostId mismatch branch, which is the designed
+            // host-migration path, not a warn.
             case Failure(err) =>
               val what =
                 if storageDevices.contains(storageDeviceId) then "storage device"
                 else "unloaded storage device"
               logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
                           s"be registered in the storage-devices tree. Error: $err")
+        // The deferral flag is cleared before the re-dispatch, not after. No test can tell the
+        // two apart, because onComplete never runs inline on the ExecutionContexts used today,
+        // so the nested callback cannot re-enter this finally while the flag is still set.
+        // Under an inline or parasitic EC the other order recurses without bound, and it also
+        // strands the flag if lookupStorageDeviceState throws synchronously.
         finally
           activeDeviceChecks -= storageDeviceId
           if deferredDeviceChecks.contains(storageDeviceId) then

@@ -781,8 +781,10 @@ and this on `startDeviceCheck`:
    *  The loaded/unloaded branch is chosen when the lookup completes, not when it is issued.
    *  Runtime device discovery can load a device while its check is in flight, and a branch
    *  chosen at dispatch time would then mark a loaded device's stores offline -- re-adding ids
-   *  that tryLoadStore and the LoadStore handler have just removed, which are the only two
-   *  sites that remove them. The re-read is safe because this callback holds the same instance
+   *  that tryLoadStore and the LoadStore handler have just removed, and that nothing removes
+   *  again: the only other site that clears offlineStores is reconcileDeviceState's
+   *  deleted-stores pass, which touches ids recorded in the device's own offlineStores set,
+   *  which these never enter. The re-read is safe because this callback holds the same instance
    *  lock handleEvent does, so no device can be loading while it runs.
    *
    *  The entry must be released on both outcomes of the lookup and on a throw out of the

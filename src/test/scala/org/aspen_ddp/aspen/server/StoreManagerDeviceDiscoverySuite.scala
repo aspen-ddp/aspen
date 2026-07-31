@@ -27,8 +27,11 @@ import scala.concurrent.duration.{Duration, SECONDS}
  *  anything. It does nothing else. In particular it does not replicate the real
  *  tryLoadStore's bookkeeping: it never filters on `StoreConfig.configFilename`, never
  *  honours a TransferringOut marker, and never updates `sds.loadedStores`, `sds.offlineStores`
- *  or the manager's `offlineStores`. Those sets therefore stay empty here, so a test asserting
- *  on them would pass vacuously — assert on `storeLoadAttempts` instead.
+ *  or the manager's `offlineStores`. A test asserting that this override put something in them
+ *  would therefore pass vacuously — assert on `storeLoadAttempts` instead. Assertions about
+ *  what the *device check* writes to `offlineStores` are a different matter and are not
+ *  vacuous: that write comes from startDeviceCheck's callback, which this override does not
+ *  touch.
  *
  *  Constructor parameters are deliberately named differently from StoreManager's own members
  *  (`client`, `ec`, `net`, `rootDir`, ...) so the superclass constructor call cannot

@@ -747,6 +747,14 @@ class StoreManager(val client: AspenClient,
           client.getStorageDeviceState(fromDeviceId).foreach: fromDevice =>
             startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
 
+  /** Requests a check of one storage device.
+   *
+   *  At most one lookup per device is outstanding at a time. A request arriving while one is
+   *  in flight is deferred rather than dropped: dropping it costs a full
+   *  checkStorageDevicePeriod -- an hour as Main configures it -- which is the same cost as
+   *  losing the notification message outright. At most one deferral is held per device, so
+   *  this still throttles the pile-up of checks that builds up over an offline period.
+   */
   private def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
     synchronized:
       if activeDeviceChecks.contains(storageDeviceId) then
@@ -754,29 +762,49 @@ class StoreManager(val client: AspenClient,
       else
         startDeviceCheck(storageDeviceId)
 
+  /** Issues the one outstanding lookup for a device and acts on the result.
+   *
+   *  Caller holds the instance lock and has established that no check is active for this
+   *  device.
+   *
+   *  The loaded/unloaded branch is chosen when the lookup completes, not when it is issued.
+   *  Runtime device discovery can load a device while its check is in flight, and a branch
+   *  chosen at dispatch time would then mark a loaded device's stores offline -- re-adding ids
+   *  that tryLoadStore and the LoadStore handler have just removed, and that nothing removes
+   *  again: the only other site that clears offlineStores is reconcileDeviceState's
+   *  deleted-stores pass, which touches ids recorded in the device's own offlineStores set,
+   *  which these never enter. The re-read is safe because this callback holds the same instance
+   *  lock handleEvent does, so no device can be loading while it runs.
+   *
+   *  The entry must be released on both outcomes of the lookup and on a throw out of the
+   *  callback body, hence the finally. Releasing only on success would skip every later check
+   *  of that device for the life of the process. A synchronous throw from
+   *  lookupStorageDeviceState, before the Future exists, would still leak it -- known, tracked
+   *  in TODO.txt, and deliberately not guarded here.
+   *
+   *  The deferral flag is cleared before the re-dispatch, not after. No test can tell the two
+   *  apart, because onComplete never runs inline on the ExecutionContexts used today, so the
+   *  nested callback cannot re-enter this finally while the flag is still set. Under an inline
+   *  or parasitic EC the other order recurses without bound, and it also strands the flag if
+   *  lookupStorageDeviceState throws synchronously.
+   *
+   *  Both lookup failure modes are reachable. The reconcile touches the filesystem and issues
+   *  transactions, so it can throw. And the lookup fails whenever the device has no entry in
+   *  the storage-devices tree: a config written out-of-band naming an id that was never
+   *  registered -- the supported path cannot produce this, since
+   *  StorageDeviceManager.createStorageDevice commits the registration before writing the
+   *  config file, so its orphan is the reverse one, a registration with no directory (see the
+   *  ConfigWriteFailed advice in the cmdline Main) -- or a tree entry removed after the fact,
+   *  which no command does today. It also fails on any failure of the metadata read itself,
+   *  transient or not, which is the only routinely reachable case.
+   *
+   *  A copied or moved config is NOT one of these: its device is registered, so the lookup
+   *  succeeds. A config carried to another host then takes reconcileDeviceState's hostId
+   *  mismatch branch, which is the designed host-migration path, not a warn.
+   */
   private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
     activeDeviceChecks += storageDeviceId
 
-    // onComplete, and a finally, in both branches below: the entry must be released on
-    // both outcomes of the lookup, and on a throw out of the callback body itself.
-    // (A synchronous throw from getStorageDeviceState, before the Future exists, would
-    // still leak it. Known, and deliberately not guarded here.) Releasing only on success
-    // would leave the entry set forever and skip every later check of that device for the
-    // life of the process.
-    //
-    // Both failure modes are reachable. check above touches the filesystem and issues
-    // transactions, so it can throw. And getStorageDeviceState fails whenever the device
-    // has no entry in the storage-devices tree: a config written out-of-band naming an id
-    // that was never registered -- the supported path cannot produce this, since
-    // StorageDeviceManager.createStorageDevice commits the registration before writing
-    // the config file, so its orphan is the reverse one, a registration with no directory
-    // (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree entry removed
-    // after the fact, which no command does today. It also fails on any failure of the
-    // metadata read itself, transient or not, which is the only routinely reachable case.
-    //
-    // A copied or moved config is NOT one of these: its device is registered, so the
-    // lookup succeeds. A config carried to another host then takes check's hostId
-    // mismatch branch above, which is the designed host-migration path, not a warn.
     lookupStorageDeviceState(storageDeviceId).onComplete: result =>
       synchronized:
         try

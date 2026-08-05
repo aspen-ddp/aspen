@@ -140,6 +140,12 @@ Unifying the queue rather than adding a second map keeps the ordering between ar
 armed throws well defined, which test 2 depends on. It stays a `lazy val`: `StoreManager`'s
 constructor runs a device scan that reaches these fields before the subclass's own initializers.
 
+`armLookup` keeps its signature, so its eight existing call sites are untouched; only the field's
+element type and the override's `match` change.
+
+The subclass also gains a `registerDevice` method writing straight into the `protected var
+storageDevices`, which test 2 needs to install a device that was never on disk.
+
 Both tests drive checks through `testingOnlyHandleHostMessage(CheckStorageDevice(deviceId))`,
 which targets one named device rather than sweeping every loaded one. Its handler rescans
 `storageDevicesDir` only when the device is not already in `storageDevices`, and calls
@@ -175,11 +181,16 @@ Assertions:
 
 - the guard and deferral sets are both empty, and a second lookup was attempted, so the `finally`
   still released and re-dispatched
-- the recorded failures contain the reconcile's `IllegalArgumentException` and do not contain the
-  armed re-dispatch throwable
+- the recorded failures are non-empty and do not contain the armed re-dispatch throwable
 
-The second pair is what discriminates. Against current code the re-dispatch's throw replaces the
-reconcile's, so the recorder sees the armed throwable and both halves fail.
+The second pair is what discriminates, and it turns on the *identity* of the recorded failure
+rather than its class: os-lib's exact exception type for a non-absolute path is not worth pinning
+a test to. Against current code the re-dispatch's throw replaces the reconcile's, so the recorder
+holds exactly the armed throwable and that assertion fails.
+
+If it turns out `os.Path` does not throw on a relative path, the recorded failures come back empty
+and the non-empty assertion catches it. The fallback is then the protected-seam option: make
+`reconcileDeviceState` overridable and have the subclass throw directly.
 
 ### Comments and TODO
 
@@ -217,9 +228,9 @@ Three entries in `TODO.txt` sit adjacent to this code and are not addressed:
 
 ## Verification
 
-`sbt 'testOnly *StoreManagerDeviceDiscoverySuite'` for the two new tests plus the existing suite,
-whose `armLookup` call sites all change shape with the queue's element type. `sbt test` for the
-whole suite, since `StoreManager` is broadly depended upon.
+`sbt 'testOnly *StoreManagerDeviceDiscoverySuite'` for the two new tests plus the eighteen
+existing ones, which exercise the changed `lookupStorageDeviceState` override on every armed path.
+`sbt test` for the whole suite, since `StoreManager` is broadly depended upon.
 
 Both new tests must be confirmed to fail against the unmodified `startDeviceCheck` before the fix
 is applied -- test 1 on the second-lookup assertion, test 2 on the pair of `reportFailure`

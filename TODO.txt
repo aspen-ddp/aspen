@@ -1,79 +1,4 @@
 
-ZMQNet.ioThread leaves a half-built host behind when NewHostAvailable fails
-partway through
-  - The send-queue loop now guards each item, so a throw here no longer takes
-    the IO thread down with it. What survives depends on where it threw, and
-    neither state ever heals
-  - Fail at setIdentity or connect and entry.odealer stays None. The created
-    socket leaks until the context closes, and every later message to that
-    host piles into entry.pendingMessages, which nothing will drain:
-    MetadataManager already holds Right(entry), so no second NewHostAvailable
-    is ever enqueued
-  - Fail at either send and the dealer is live and in connectedDealers, but
-    connectedHosts and rebuildPoller were skipped. The host is sendable yet
-    never polled, so its inbound traffic is discarded forever and nothing
-    ever marks it offline. This is the state a dealer.send failure actually
-    produces, and it is the worse of the two
-  - Likely fix is to move both sends after the connectedHosts/rebuildPoller
-    registration, which does not depend on them and cannot reorder anything
-    because every send on this path runs on the one IO thread. That leaves
-    only the narrow setIdentity/connect window, which wants the socket closed
-    on the failure path -- and a seam that lets a test make connect() fail.
-    The dealer is built inline from context.createSocket on the IO thread and
-    there is no ZMQNet harness to drive it, per the untested entry below
-  - SendToClient has a narrower variant: a throw from router.send(encoded)
-    leaves an unfinished multipart message on the ROUTER, so the next
-    SendToClient appends its identity as frame 2 of the stale frame 1. One
-    client gets a garbled body, one gets nothing. The encode is hoisted above
-    the first frame so encodeClientResponse cannot cause this, but the second
-    send still can. Bounded (the next SendToClient clears it) and accepted
-
-A createHostEntry that throws late orphans the entry the IO thread already
-accepted
-  - createHostEntry enqueues NewHostAvailable before the wakeIoThread() that
-    can throw, so a throw from that wake still leaves a fully live entry
-    behind: the IO loop drains sendQueue on every iteration regardless of the
-    wake, so the dealer is created and registered in connectedDealers, the
-    entry is added to connectedHosts, and both are flushed and heartbeated
-    thereafter
-  - Meanwhile MetadataManager's guard has removed the host from its map, so
-    the next send builds a second entry and a second dealer for the same host.
-    The first is unreachable from the manager but still live in the IO thread
-  - This is the accepted cost of the guard -- an orphaned entry beats a
-    permanent wedge -- and reachability is low, since wakeIoThread fails on a
-    closed socket, i.e. during teardown of a process that is exiting anyway.
-    Recorded rather than fixed
-  - Candidate fix is for createHostEntry to swallow a wakeIoThread failure
-    rather than propagate it. The wake is best-effort: the IO loop drains the
-    send queue unconditionally every iteration, and poll() never waits longer
-    than the next heartbeat, so a missed wake delays delivery by at most one
-    heartbeat period rather than losing it. Swallowing makes the orphaned
-    entry and the duplicate dealer impossible, and needs no test seam. The
-    same change to storeResolved, whose wakeIoThread is likewise unguarded,
-    would retire the handoff residue the MetadataManager guard now absorbs
-  - Distinct from the leak above: there NewHostAvailable fails, here it
-    succeeds for an entry the manager has already forgotten
-
-ZMQNet.heartbeat can still kill the IO thread
-  - heartbeat() calls dealer.send on every connected host from inside
-    ioThread's loop, outside both the per-item send-queue guard and the poll
-    guard above it. A throw while not shutting down matches neither handler,
-    so it propagates out of ioThread and the thread dies -- the exact failure
-    the send-queue guard was added to prevent, one screen higher in the same
-    method -- and unlike the two above it runs every heartbeat period, not
-    just on host setup
-  - Deliberately not fixed alongside the send loop, because the recovery
-    differs: a bad queue item is dropped, whereas a host whose heartbeat
-    throws needs a decision -- skip it this round, or mark it offline
-
-ZMQNet.ioThread's failure handling is untested
-  - There is no ZMQNet suite. ProtobufMessageCodecSuite is the only file under
-    zmqnet/, and ZMQNet's constructor binds real sockets, so covering the
-    guards would mean standing up a harness or extracting a seam
-  - The per-item send-queue guard therefore shipped without a test. That is a
-    decision rather than an oversight, and it is also why the half-built host
-    entry above is recorded rather than fixed: that fix wants the same seam
-
 MetadataManager.refreshBootstrapConfig can wedge the flag permanently true on
 several failure paths
   - refreshingBootstrapConfig is set true before client.getBootstrapConfig is
@@ -304,6 +229,83 @@ On Client:
 
 ./t transfer-store demo/bootstrap_config.yaml 3f1ca5f7-74be-405d-aa48-739fc23651a4:2 <target-storage-device-uuid>
 
+-----------------
+- Backlog issues
+
+ZMQNet.ioThread leaves a half-built host behind when NewHostAvailable fails
+partway through
+  - The send-queue loop now guards each item, so a throw here no longer takes
+    the IO thread down with it. What survives depends on where it threw, and
+    neither state ever heals
+  - Fail at setIdentity or connect and entry.odealer stays None. The created
+    socket leaks until the context closes, and every later message to that
+    host piles into entry.pendingMessages, which nothing will drain:
+    MetadataManager already holds Right(entry), so no second NewHostAvailable
+    is ever enqueued
+  - Fail at either send and the dealer is live and in connectedDealers, but
+    connectedHosts and rebuildPoller were skipped. The host is sendable yet
+    never polled, so its inbound traffic is discarded forever and nothing
+    ever marks it offline. This is the state a dealer.send failure actually
+    produces, and it is the worse of the two
+  - Likely fix is to move both sends after the connectedHosts/rebuildPoller
+    registration, which does not depend on them and cannot reorder anything
+    because every send on this path runs on the one IO thread. That leaves
+    only the narrow setIdentity/connect window, which wants the socket closed
+    on the failure path -- and a seam that lets a test make connect() fail.
+    The dealer is built inline from context.createSocket on the IO thread and
+    there is no ZMQNet harness to drive it, per the untested entry below
+  - SendToClient has a narrower variant: a throw from router.send(encoded)
+    leaves an unfinished multipart message on the ROUTER, so the next
+    SendToClient appends its identity as frame 2 of the stale frame 1. One
+    client gets a garbled body, one gets nothing. The encode is hoisted above
+    the first frame so encodeClientResponse cannot cause this, but the second
+    send still can. Bounded (the next SendToClient clears it) and accepted
+
+A createHostEntry that throws late orphans the entry the IO thread already
+accepted
+  - createHostEntry enqueues NewHostAvailable before the wakeIoThread() that
+    can throw, so a throw from that wake still leaves a fully live entry
+    behind: the IO loop drains sendQueue on every iteration regardless of the
+    wake, so the dealer is created and registered in connectedDealers, the
+    entry is added to connectedHosts, and both are flushed and heartbeated
+    thereafter
+  - Meanwhile MetadataManager's guard has removed the host from its map, so
+    the next send builds a second entry and a second dealer for the same host.
+    The first is unreachable from the manager but still live in the IO thread
+  - This is the accepted cost of the guard -- an orphaned entry beats a
+    permanent wedge -- and reachability is low, since wakeIoThread fails on a
+    closed socket, i.e. during teardown of a process that is exiting anyway.
+    Recorded rather than fixed
+  - Candidate fix is for createHostEntry to swallow a wakeIoThread failure
+    rather than propagate it. The wake is best-effort: the IO loop drains the
+    send queue unconditionally every iteration, and poll() never waits longer
+    than the next heartbeat, so a missed wake delays delivery by at most one
+    heartbeat period rather than losing it. Swallowing makes the orphaned
+    entry and the duplicate dealer impossible, and needs no test seam. The
+    same change to storeResolved, whose wakeIoThread is likewise unguarded,
+    would retire the handoff residue the MetadataManager guard now absorbs
+  - Distinct from the leak above: there NewHostAvailable fails, here it
+    succeeds for an entry the manager has already forgotten
+
+ZMQNet.heartbeat can still kill the IO thread
+  - heartbeat() calls dealer.send on every connected host from inside
+    ioThread's loop, outside both the per-item send-queue guard and the poll
+    guard above it. A throw while not shutting down matches neither handler,
+    so it propagates out of ioThread and the thread dies -- the exact failure
+    the send-queue guard was added to prevent, one screen higher in the same
+    method -- and unlike the two above it runs every heartbeat period, not
+    just on host setup
+  - Deliberately not fixed alongside the send loop, because the recovery
+    differs: a bad queue item is dropped, whereas a host whose heartbeat
+    throws needs a decision -- skip it this round, or mark it offline
+
+ZMQNet.ioThread's failure handling is untested
+  - There is no ZMQNet suite. ProtobufMessageCodecSuite is the only file under
+    zmqnet/, and ZMQNet's constructor binds real sockets, so covering the
+    guards would mean standing up a harness or extracting a seam
+  - The per-item send-queue guard therefore shipped without a test. That is a
+    decision rather than an oversight, and it is also why the half-built host
+    entry above is recorded rather than fixed: that fix wants the same seam
 
 -------------------------------------------------------------------------------
 - Old Testing Commands

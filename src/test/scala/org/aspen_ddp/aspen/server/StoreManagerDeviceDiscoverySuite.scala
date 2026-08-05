@@ -659,3 +659,58 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       // yieldUntil gives up silently, so assert the condition it waited on.
       mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
       mgr.testingOnlyDeferredDeviceChecks should be(empty)
+
+  atest("a lookup that throws synchronously does not wedge the device"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+
+    val mgr = newManager(hostRoot)
+    mgr.loadedDevices.keySet should be(Set(deviceA))
+
+    // A failed Promise cannot stage this: it still yields a Future, so the callback and its
+    // finally still run. Only a throw before the Future exists skips them, and the guard entry
+    // is added before the lookup call.
+    mgr.armLookupThrow(deviceA, new RuntimeException("test-controlled synchronous lookup failure"))
+
+    // Treated as a failed lookup, not propagated. testingOnlyHandleHostMessage calls handleEvent
+    // directly rather than going through the event loop, so start()'s catch-all is not in the
+    // way and a propagating throw would surface right here.
+    noException should be thrownBy mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+
+    mgr.lookupAttempts.toList should be(List(deviceA))
+
+    // Synchronous release is required here, not merely observed, so there is no yieldUntil.
+    // Routing the throw back through the Future machinery instead -- catch it, wrap it in
+    // Future.failed, let the existing onComplete arm release the guard -- also un-wedges the
+    // device, and this assertion deliberately rejects it. That shape would report the throw with
+    // the Failure(err) arm's warning, which explains itself with a missing storage-devices
+    // registration that a call never reaching the tree does not have, and it would make the
+    // release contingent on an ExecutionContext that actually drains -- the same class of leak
+    // this test exists to close. A failure here means the release is no longer happening on the
+    // calling thread -- either moved off it, or not happening at all.
+    mgr.testingOnlyActiveDeviceChecks should be(empty)
+
+    // A sanity anchor rather than a discriminator: no deferral can exist yet. checkStorageDevice
+    // and startDeviceCheck both run under the instance monitor, so nothing can slip a deferral in
+    // between the guard entry and the lookup call that throws.
+    mgr.testingOnlyDeferredDeviceChecks should be(empty)
+
+    // The assertion that distinguishes released from wedged. A leaked entry makes every later
+    // check of this device a no-op: checkStorageDevice records a deferral instead of starting a
+    // lookup, and the only thing that would clear that deferral is the finally that never ran.
+    val p = mgr.armLookup(deviceA)
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+
+    mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
+    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+
+    // An empty store map makes reconcileDeviceState a no-op in every branch, so the check
+    // finishes cleanly rather than leaving the suite's teardown to tidy up after it.
+    p.success(deviceState(deviceA))
+
+    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      // yieldUntil gives up silently, so assert the condition it waited on.
+      mgr.testingOnlyActiveDeviceChecks should be(empty)
+      mgr.testingOnlyDeferredDeviceChecks should be(empty)

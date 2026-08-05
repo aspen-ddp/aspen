@@ -828,6 +828,12 @@ class StoreManager(val client: AspenClient,
    *  be lost. Not literally none: the onComplete registration below sits outside the wrapper and
    *  does rethrow if the ExecutionContext throws a fatal, which no real thread-pool EC does.
    *
+   *  Totality also keeps the CheckAllDevices sweep whole. That handler iterates storageDevices
+   *  and calls this method per device with nothing catching in between, so a propagating throw
+   *  would abandon every device after the throwing one until the next period -- an hour in
+   *  production. No test covers that, and a refactor reintroducing a throw here would lose it
+   *  silently.
+   *
    *  The wrapper is scoped to the lookup call and not to the onComplete registration, but not
    *  for the reason one might expect. Widening it would not catch a non-fatal throw out of the
    *  callback body even under an inline or parasitic ExecutionContext: Future's
@@ -905,11 +911,18 @@ class StoreManager(val client: AspenClient,
             finally endDeviceCheck()
 
       // A distinct message from the Failure(err) branch above, which explains itself with a
-      // missing tree registration. True of a failed read; false of a call that never reached
-      // the tree.
+      // missing tree registration. True of a failed read; not necessarily true of a throw, which
+      // an override is free to raise after reads have already gone out.
+      //
+      // The throwable is passed rather than interpolated, as the event loop's catch-all does and
+      // unlike the read failures above. A read failure is a reachable outcome that its message
+      // fully explains; a throw here is a bug on the dispatch path, where the class and message
+      // alone can amount to a bare "java.lang.NullPointerException" naming no location. Before
+      // the wrapper existed such a throw reached that catch-all and was logged with its stack,
+      // so dropping it would make this a diagnostic downgrade.
       case Failure(err) =>
-        logger.warn(s"Lookup of state for storage device $storageDeviceId threw before the " +
-                    s"read was dispatched. Error: $err")
+        logger.warn(s"Lookup of state for storage device $storageDeviceId threw instead of " +
+                    s"returning a pending read", err)
         endDeviceCheck()
 
   def containsStore(storeId: StoreId): Boolean = synchronized {

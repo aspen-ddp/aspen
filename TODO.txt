@@ -1,22 +1,3 @@
-Reassignment of a pool to a new set:
-  - MigratePoolToSetDurableTask
-    - register with system task executor at time of creation
-  - Always reassign each store to a new device and move it
-  - Keep it simple.
-    - Optimize for not moving existing stores that are already in the set later
-  - Durable task selects a device for a store, calls transferStore, polls for
-    completion then moves to next store. On complete, update PoolState to say
-    migration status is Complete
-    - protect against pileups while polling
-    - protect against case where source and destination devices are the same
-      - No-op in this case (already complete)
-
-Rebalancing as a passive background task
-  - Part of the system-level Durable Service
-  - Periodically tries to rebalance each level 0 stoarge device set
-    - Every 4 hours by default?
-      - needs to be configurable
-    - If it results in a non-empty plan, kick off a rebalancing task
 
 StoreManager.startDeviceCheck leaks its activeDeviceChecks guard on a
 synchronous throw
@@ -175,6 +156,26 @@ Validate/fix ./t script running in script directory
   - This could break usage of relative paths given to sub commands
   - Probably as easy as saving the original path and switching back to it before
     invoking the wrapped command line process
+
+Reassignment of a pool to a new set:
+  - MigratePoolToSetDurableTask
+    - register with system task executor at time of creation
+  - Always reassign each store to a new device and move it
+  - Keep it simple.
+    - Optimize for not moving existing stores that are already in the set later
+  - Durable task selects a device for a store, calls transferStore, polls for
+    completion then moves to next store. On complete, update PoolState to say
+    migration status is Complete
+    - protect against pileups while polling
+    - protect against case where source and destination devices are the same
+      - No-op in this case (already complete)
+
+Rebalancing as a passive background task
+  - Part of the system-level Durable Service
+  - Periodically tries to rebalance each level 0 stoarge device set
+    - Every 4 hours by default?
+      - needs to be configurable
+    - If it results in a non-empty plan, kick off a rebalancing task
 
 ---------
 

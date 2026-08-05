@@ -756,10 +756,11 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       // re-dispatch happened, without which the assertions below would pass vacuously.
       mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
 
-      // The discriminating pair, deliberately ahead of the release assertions below. Those two
-      // fail today with the same "was not empty" message the synchronous-throw test above
-      // already reports, so leading with them would leave this test's red output saying nothing
-      // about the defect this test is named for. Failing here instead names the wrong exception.
+      // The discriminating pair, deliberately ahead of the release assertions below. Against the
+      // pre-fix code those two failed with the same "was not empty" message the synchronous-throw
+      // test above already reported, so leading with them left this test's red output saying
+      // nothing about the defect it is named for. Ordered this way, a regression that revives the
+      // masking reports the wrong exception by name instead.
       //
       // Old code records exactly one failure and it is redispatchError, because the throw out
       // of the finally replaced the reconcile's. New code absorbs redispatchError inside the

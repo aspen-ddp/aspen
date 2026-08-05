@@ -1,17 +1,4 @@
 
-StoreManager.startDeviceCheck leaks its activeDeviceChecks guard on a
-synchronous throw
-  - The entry is added before lookupStorageDeviceState is called. Both outcomes
-    of the returned Future release it, and so does a throw out of the callback,
-    but a throw from lookupStorageDeviceState itself (before the Future exists)
-    leaves the device wedged for the life of the process
-  - The finally also re-dispatches a deferred check, by calling startDeviceCheck
-    again. So a synchronous throw there does double damage: it wedges the device
-    and it replaces any exception already propagating out of the try body, which
-    is how an exception from reconcileDeviceState would be lost
-  - Low probability, but no longer blocked: lookupStorageDeviceState is the
-    seam a test needs to make the call throw
-
 ZMQNet.ioThread leaves a half-built host behind when NewHostAvailable fails
 partway through
   - The send-queue loop now guards each item, so a throw here no longer takes

@@ -160,8 +160,9 @@ private class RecordingStoreManager(mgrClient: AspenClient,
 
   /** Installs `sds` in the protected device map without it ever having been on disk.
    *
-   *  Test 2 needs a LocalStorageDeviceState carrying values the real scan cannot produce -- a
-   *  relative devicePath -- so it cannot go through writeDevice and a rescan.
+   *  The callback-body throw test needs a LocalStorageDeviceState carrying values the real scan
+   *  cannot produce -- a relative devicePath -- so it cannot go through writeDevice and a
+   *  rescan.
    *
    *  Named for what it does to the load state, not the storage-devices tree: this registers
    *  nothing there, and a lookup of the injected device still resolves however the test arms
@@ -712,5 +713,66 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
     yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
       // yieldUntil gives up silently, so assert the condition it waited on.
+      mgr.testingOnlyActiveDeviceChecks should be(empty)
+      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+
+  atest("a throw out of the check callback is not replaced by the re-dispatch's own throw"):
+    val hostRoot = newHostDir()
+    val recordingEc = new RecordingExecutionContext(executionContext)
+    val mgr = newManager(hostRoot, ec = recordingEc)
+
+    // A device the scan could not produce: devicePath is relative, so reconcileDeviceState's
+    // deleted-stores pass throws at os.Path(local.devicePath) -- the first line on that path
+    // above the try/catch wrapping os.remove.all. local.offlineStores holds the id that makes
+    // the pass iterate at all; the armed remote state below omits it, which is what marks it
+    // deleted.
+    val local = new StoreManager.LocalStorageDeviceState(
+      deviceA, Paths.get("relative-device-dir"), hostRoot.toFile)
+    local.offlineStores = Set(storeId)
+    mgr.injectLoadedDevice(local)
+
+    val p1 = mgr.armLookup(deviceA)
+
+    // The lookup the re-dispatch issues, armed to throw. Under the old code this throw escapes
+    // the finally and replaces the reconcile's, which is the defect under test.
+    val redispatchError = new RuntimeException("test-controlled re-dispatch lookup failure")
+    mgr.armLookupThrow(deviceA, redispatchError)
+
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+
+    // Collides with the outstanding lookup, so the finally has a deferral to re-dispatch.
+    mgr.testingOnlyHandleHostMessage(
+      CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
+    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+
+    // Matching hostId keeps reconcileDeviceState off its host-migration branch; no stores means
+    // storeId counts as deleted and the pass runs.
+    p1.success(deviceState(deviceA))
+
+    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+      // yieldUntil gives up silently, so assert its condition first. It also proves the
+      // re-dispatch happened, without which the assertions below would pass vacuously.
+      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
+
+      // The discriminating pair, deliberately ahead of the release assertions below. Those two
+      // fail today with the same "was not empty" message the synchronous-throw test above
+      // already reports, so leading with them would leave this test's red output saying nothing
+      // about the defect this test is named for. Failing here instead names the wrong exception.
+      //
+      // Old code records exactly one failure and it is redispatchError, because the throw out
+      // of the finally replaced the reconcile's. New code absorbs redispatchError inside the
+      // re-dispatch and lets the reconcile's escape, so the one recorded failure is os-lib's.
+      //
+      // Size before content, because this recorder sees every callback the manager runs
+      // through its ExecutionContext: a bare non-empty check would also pass on an unrelated
+      // failure with the reconcile silently not throwing at all. Matched on the message
+      // fragment rather than IllegalArgumentException, which is too common a class to pin
+      // anything to.
+      recordingEc.failures should have size 1
+      recordingEc.failures.head.getMessage should include("is not an absolute path")
+
+      // The finally still released, even though the try body threw.
       mgr.testingOnlyActiveDeviceChecks should be(empty)
       mgr.testingOnlyDeferredDeviceChecks should be(empty)

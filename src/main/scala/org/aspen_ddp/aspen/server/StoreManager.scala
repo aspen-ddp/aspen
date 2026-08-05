@@ -798,7 +798,7 @@ class StoreManager(val client: AspenClient,
    *  It is also what keeps a deferral from being stranded. checkStorageDevice's deferral
    *  write and this callback's release-and-read of the guard all happen under that one
    *  instance monitor, so a colliding request either finds no active check and starts its
-   *  own, or records a deferral the in-flight check's finally is guaranteed to see.
+   *  own, or records a deferral the in-flight check's endDeviceCheck is guaranteed to see.
    *
    *  Releasing the guard is hostage to the lookup completing. The default
    *  lookupStorageDeviceState reads through the client, whose read driver retransmits with
@@ -807,64 +807,107 @@ class StoreManager(val client: AspenClient,
    *  into one re-check. That is intended, and it is what "one lookup in flight" amounts to in
    *  production.
    *
-   *  The entry must be released on both outcomes of the lookup and on a throw out of the
-   *  callback body, hence the finally. That last is not hypothetical: the reconcile touches
-   *  the filesystem and issues transactions, so it can throw. It is argued rather than
-   *  covered, though -- no test drives a throw out of the callback body. Releasing only on
-   *  success would skip every later check of that device for the life of the process. A
-   *  synchronous throw from lookupStorageDeviceState, before the Future exists, would still
-   *  leak it -- known, tracked in TODO.txt, and deliberately not guarded here -- as would an
-   *  ExecutionContext that never runs the callback.
+   *  The entry must be released on four exit paths: both outcomes of the lookup, a throw out of
+   *  the callback body, and a throw from lookupStorageDeviceState itself. The first three are
+   *  the finally. The fourth cannot be -- a throw before the Future exists means no callback is
+   *  ever registered and so no finally ever runs -- hence the wrapper around the lookup call,
+   *  which treats such a throw as a failed lookup. Releasing on fewer than all four would skip
+   *  every later check of that device for the life of the process.
+   *
+   *  The callback-body path is not hypothetical: the reconcile touches the filesystem and
+   *  issues transactions, so it can throw. It and the synchronous throw are both covered by
+   *  StoreManagerDeviceDiscoverySuite.
+   *
+   *  Treating a synchronous throw as a failed lookup rather than letting it propagate leaves
+   *  this method with no non-fatal synchronous throw path, and that is what makes
+   *  endDeviceCheck's re-dispatch safe: a call that cannot throw cannot replace an exception
+   *  already unwinding out of the try body, which is how a reconcileDeviceState failure used to
+   *  be lost. Not literally none: the onComplete registration below sits outside the wrapper and
+   *  does rethrow if the ExecutionContext throws a fatal, which no real thread-pool EC does.
+   *
+   *  The wrapper is scoped to the lookup call and not to the onComplete registration, but not
+   *  for the reason one might expect. Widening it would not catch a non-fatal throw out of the
+   *  callback body even under an inline or parasitic ExecutionContext: Future's
+   *  Transformation.run absorbs those and routes them to reportFailure, so onComplete returns
+   *  normally. What a wider scope would catch is a fatal throw, turning it into a logged
+   *  warning. What the narrow scope gives up is an ExecutionContext that rejects the submission
+   *  or accepts it and never runs the callback: either still leaks the entry, and neither is
+   *  guarded here.
    */
   private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
+    // Releases the guard and re-dispatches whatever was deferred behind it. Called from the
+    // callback's finally and from the synchronous-throw path below; both hold the instance
+    // lock. Nested rather than a method on the class because it has no other caller, and
+    // because closing over storageDeviceId leaves the two call sites no way to disagree about
+    // which device they are releasing.
+    //
+    // The deferral flag is cleared before the re-dispatch, not after, and the order is enforced
+    // by StoreManagerDeviceDiscoverySuite rather than argued. Clearing after recurses an extra
+    // frame whenever the re-dispatched lookup throws synchronously -- the nested call absorbs
+    // its own throw and re-enters here with the flag still set -- which needs no inline or
+    // parasitic ExecutionContext to reach. The callback-body test catches it as a third lookup
+    // attempt.
+    def endDeviceCheck(): Unit =
+      activeDeviceChecks -= storageDeviceId
+      if deferredDeviceChecks.contains(storageDeviceId) then
+        deferredDeviceChecks -= storageDeviceId
+        startDeviceCheck(storageDeviceId)
+
     activeDeviceChecks += storageDeviceId
 
-    lookupStorageDeviceState(storageDeviceId).onComplete: result =>
-      synchronized:
-        try
-          result match
-            case Success(remote) =>
-              // Load state re-read here, not at dispatch. See startDeviceCheck's scaladoc.
-              storageDevices.get(storageDeviceId) match
-                case Some(local) => reconcileDeviceState(local, remote)
-                case None =>
-                  // A device that has not appeared on disk in this process -- nothing ever
-                  // unloads one. Silence its stores rather than sending "UnknownStore".
-                  remote.stores.keysIterator.foreach: storeId =>
-                    offlineStores += storeId
+    // Deliberately around the lookup call alone and not the onComplete registration below; the
+    // scaladoc has why. Throwable rather than NonFatal is also deliberate: the re-dispatch
+    // safety argument needs this method to be total, so do not condense to Try(...), which
+    // would narrow the catch to NonFatal and reopen the leak for a fatal throw.
+    val lookup =
+      try Success(lookupStorageDeviceState(storageDeviceId))
+      catch case t: Throwable => Failure(t)
 
-            // The lookup fails whenever the device has no entry in the storage-devices tree:
-            // a config written out-of-band naming an id that was never registered -- the
-            // supported path cannot produce this, since
-            // StorageDeviceManager.createStorageDevice commits the registration before
-            // writing the config file, so its orphan is the reverse one, a registration with
-            // no directory (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree
-            // entry removed after the fact, which no command does today. It also fails on any
-            // failure of the metadata read itself, transient or not, which is the only
-            // routinely reachable case.
-            //
-            // A copied or moved config is NOT one of these: its device is registered, so the
-            // lookup succeeds. A config carried to another host then takes
-            // reconcileDeviceState's hostId mismatch branch, which is the designed
-            // host-migration path, not a warn.
-            case Failure(err) =>
-              val what =
-                if storageDevices.contains(storageDeviceId) then "storage device"
-                else "never-loaded storage device"
-              logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
-                          s"be registered in the storage-devices tree. Error: $err")
-        // Releases the guard on every exit path; the scaladoc has why that must be a finally.
-        //
-        // The deferral flag is cleared before the re-dispatch, not after. No test can tell the
-        // two apart, because onComplete never runs inline on the ExecutionContexts used today,
-        // so the nested callback cannot re-enter this finally while the flag is still set.
-        // Under an inline or parasitic EC the other order recurses without bound, and it also
-        // strands the flag if lookupStorageDeviceState throws synchronously.
-        finally
-          activeDeviceChecks -= storageDeviceId
-          if deferredDeviceChecks.contains(storageDeviceId) then
-            deferredDeviceChecks -= storageDeviceId
-            startDeviceCheck(storageDeviceId)
+    lookup match
+      case Success(pendingState) =>
+        pendingState.onComplete: result =>
+          synchronized:
+            try
+              result match
+                case Success(remote) =>
+                  // Load state re-read here, not at dispatch. See startDeviceCheck's scaladoc.
+                  storageDevices.get(storageDeviceId) match
+                    case Some(local) => reconcileDeviceState(local, remote)
+                    case None =>
+                      // A device that has not appeared on disk in this process -- nothing ever
+                      // unloads one. Silence its stores rather than sending "UnknownStore".
+                      remote.stores.keysIterator.foreach: storeId =>
+                        offlineStores += storeId
+
+                // The lookup fails whenever the device has no entry in the storage-devices tree:
+                // a config written out-of-band naming an id that was never registered -- the
+                // supported path cannot produce this, since
+                // StorageDeviceManager.createStorageDevice commits the registration before
+                // writing the config file, so its orphan is the reverse one, a registration with
+                // no directory (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree
+                // entry removed after the fact, which no command does today. It also fails on any
+                // failure of the metadata read itself, transient or not, which is the only
+                // routinely reachable case.
+                //
+                // A copied or moved config is NOT one of these: its device is registered, so the
+                // lookup succeeds. A config carried to another host then takes
+                // reconcileDeviceState's hostId mismatch branch, which is the designed
+                // host-migration path, not a warn.
+                case Failure(err) =>
+                  val what =
+                    if storageDevices.contains(storageDeviceId) then "storage device"
+                    else "never-loaded storage device"
+                  logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
+                              s"be registered in the storage-devices tree. Error: $err")
+            finally endDeviceCheck()
+
+      // A distinct message from the Failure(err) branch above, which explains itself with a
+      // missing tree registration. True of a failed read; false of a call that never reached
+      // the tree.
+      case Failure(err) =>
+        logger.warn(s"Lookup of state for storage device $storageDeviceId threw before the " +
+                    s"read was dispatched. Error: $err")
+        endDeviceCheck()
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")

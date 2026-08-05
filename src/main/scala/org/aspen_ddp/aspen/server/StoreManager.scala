@@ -694,6 +694,9 @@ class StoreManager(val client: AspenClient,
    *
    *  Called while holding the instance lock, so an override must return promptly rather than
    *  block: the lock it holds is the one handleEvent takes.
+   *
+   *  May throw rather than return a failed Future. startDeviceCheck treats the two alike, so an
+   *  override is free to do either.
    */
   protected def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     client.getStorageDeviceState(storageDeviceId)

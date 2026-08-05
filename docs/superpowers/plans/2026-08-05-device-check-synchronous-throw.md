@@ -16,7 +16,7 @@
 
 | File | Change |
 |---|---|
-| `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala` | Modify: `lookupStorageDeviceState` scaladoc (~687-698), `startDeviceCheck` scaladoc and body (~774-866) |
+| `src/main/scala/org/aspen_ddp/aspen/server/StoreManager.scala` | Modify: `storageDevices` invariant comment (~108-110), `lookupStorageDeviceState` scaladoc (~687-698), `startDeviceCheck` scaladoc and body (~774-866) |
 | `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` | Modify: `RecordingStoreManager` seam (~103-135), add `RecordingExecutionContext`, add `newManager` EC parameter (~217-220), add two tests at end of file |
 | `TODO.txt` | Modify: delete the top entry (lines 2-14) |
 
@@ -97,9 +97,12 @@ Replace it with:
   private lazy val armedLookups: mutable.Map[StorageDeviceId, mutable.Queue[ArmedLookup]] =
     mutable.Map[StorageDeviceId, mutable.Queue[ArmedLookup]]()
 
-  /** Caller holds this instance's lock. */
-  private def armedQueue(deviceId: StorageDeviceId): mutable.Queue[ArmedLookup] =
-    armedLookups.getOrElseUpdate(deviceId, mutable.Queue[ArmedLookup]())
+  /** Caller holds this instance's lock. Write path only -- the read path in
+   *  lookupStorageDeviceState must go through `armedLookups` directly, since getOrElseUpdate
+   *  there would accumulate an empty queue per device looked up.
+   */
+  private def enqueueArmed(deviceId: StorageDeviceId, armed: ArmedLookup): Unit =
+    armedLookups.getOrElseUpdate(deviceId, mutable.Queue[ArmedLookup]()).enqueue(armed)
 
   /** Arms one lookup of `deviceId` to return a Future the test completes when it chooses.
    *
@@ -109,7 +112,7 @@ Replace it with:
    */
   def armLookup(deviceId: StorageDeviceId): Promise[StorageDeviceState] = synchronized:
     val p = Promise[StorageDeviceState]()
-    armedQueue(deviceId).enqueue(Right(p))
+    enqueueArmed(deviceId, Right(p))
     p
 
   /** Arms one lookup of `deviceId` to throw `error` instead of returning a Future at all.
@@ -119,7 +122,7 @@ Replace it with:
    *  that leaks startDeviceCheck's guard entry.
    */
   def armLookupThrow(deviceId: StorageDeviceId, error: Throwable): Unit = synchronized:
-    armedQueue(deviceId).enqueue(Left(error))
+    enqueueArmed(deviceId, Left(error))
 
   override protected def lookupStorageDeviceState(
       storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
@@ -139,25 +142,40 @@ Replace it with:
    *
    *  Test 2 needs a LocalStorageDeviceState carrying values the real scan cannot produce -- a
    *  relative devicePath -- so it cannot go through writeDevice and a rescan.
+   *
+   *  Named for what it does to the load state, not the storage-devices tree: this registers
+   *  nothing there, and a lookup of the injected device still resolves however the test arms
+   *  it. Refuses to replace an existing entry, so a test that both writes a device to disk and
+   *  injects one for the same id fails here rather than in a confusing assertion later.
    */
-  def registerDevice(sds: StoreManager.LocalStorageDeviceState): Unit = synchronized:
+  def injectLoadedDevice(sds: StoreManager.LocalStorageDeviceState): Unit = synchronized:
+    require(!storageDevices.contains(sds.storageDeviceId),
+            s"${sds.storageDeviceId} is already loaded; injectLoadedDevice does not replace")
     storageDevices += (sds.storageDeviceId -> sds)
 ```
 
 Note that the recorded `lookupAttempts += storageDeviceId` happens *before* the dequeue, so an armed throw is still recorded as an attempt. Tests 1 and 2 both depend on that.
 
+`injectLoadedDevice` is deliberately not called `registerDevice`: everywhere else in `StoreManager`, *registration* means the storage-devices tree entry ("It may not be registered in the storage-devices tree", "a registration with no directory"), and this method does the opposite half.
+
 - [ ] **Step 2: Add the recording ExecutionContext**
 
 Test 2 needs to observe which exception escaped the `onComplete` callback. Scala's `Future.onComplete` wraps the callback so that a `NonFatal` throw out of it is passed to `executor.reportFailure`, and the executor is the `ExecutionContext` the `StoreManager` was constructed with.
 
-Insert this immediately after the `RecordingStoreManager` class (after the `registerDevice` method added in Step 1, before `class StoreManagerDeviceDiscoverySuite`):
+Insert this immediately after the `RecordingStoreManager` class (after the `injectLoadedDevice` method added in Step 1, before `class StoreManagerDeviceDiscoverySuite`):
 
 ```scala
-/** Delegates execution to `underlying` but records every reportFailure call.
+/** Delegates execution to `underlying`, and records every reportFailure call instead of
+ *  passing it on.
  *
- *  A throw out of a Future callback goes to the ExecutionContext's reportFailure and nowhere
- *  else, so this is the only way for a test to see which exception escaped -- which is exactly
- *  the question when a finally can replace one exception with another.
+ *  A NonFatal throw out of a Future callback goes to the ExecutionContext's reportFailure and
+ *  nowhere else, so this is the only way for a test to see which exception escaped -- which is
+ *  exactly the question when a finally can replace one exception with another. (A fatal
+ *  Throwable is rethrown instead, so it never lands here.)
+ *
+ *  Recording rather than forwarding means the underlying context never prints the throwable.
+ *  That is deliberate: a test whose passing state involves an expected throw should not print a
+ *  stack trace on every green run. The assertions on `failures` carry the diagnostic instead.
  */
 private class RecordingExecutionContext(underlying: ExecutionContext) extends ExecutionContext:
   private val recorded = mutable.ListBuffer[Throwable]()
@@ -221,7 +239,7 @@ Expected: compiles clean, all 18 existing tests PASS. This task adds no test and
 git add src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala
 git commit -m "Let the recording seam arm a synchronous lookup throw
 
-Adds armLookupThrow, a recording ExecutionContext, and registerDevice.
+Adds armLookupThrow, a recording ExecutionContext, and injectLoadedDevice.
 No test uses them yet.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
@@ -308,24 +326,19 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 **Files:**
 - Modify: `src/test/scala/org/aspen_ddp/aspen/server/StoreManagerDeviceDiscoverySuite.scala` (append at end of file)
 
-- [ ] **Step 1: Confirm os.Path throws on a relative path**
+- [ ] **Step 1: Understand the lever (no action)**
 
-This test's lever is `os.Path(local.devicePath)` at `StoreManager.scala:723`, which sits *above* the `try`/`catch` that wraps `os.remove.all` at 726, so a throw there escapes `reconcileDeviceState`. That line only throws if os-lib rejects a non-absolute `java.nio.file.Path`.
+This test's lever is `os.Path(local.devicePath)` at `StoreManager.scala:723`, which sits *above* the `try`/`catch` that wraps `os.remove.all` at 726, so a throw there escapes `reconcileDeviceState`.
 
-Confirm before writing the assertions. Add this scratch test temporarily:
+That it throws is verified, not assumed. os-lib 0.11.5's `Path.scala:574` is:
 
 ```scala
-  atest("SCRATCH os.Path rejects a relative path"):
-    Future.successful(
-      an[Exception] should be thrownBy os.Path(Paths.get("relative-device-dir")))
+require(wrapped.isAbsolute || Path.driveRelative(wrapped), s"$wrapped is not an absolute path")
 ```
 
-Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "SCRATCH"'`
-Expected: PASS.
+So a relative path yields `IllegalArgumentException("requirement failed: relative-device-dir is not an absolute path")`. Step 2's assertions pin the `is not an absolute path` fragment rather than the exception class.
 
-Then delete the scratch test before continuing.
-
-If it FAILS, os-lib accepts relative paths and this lever does not work. Stop and switch to the spec's documented fallback: make `reconcileDeviceState` `protected` and have `RecordingStoreManager` override it to throw. Everything else in this task is unchanged.
+If that assertion turns out to fail — an os-lib upgrade, say — the fallback is the spec's protected-seam option: make `reconcileDeviceState` `protected` and have `RecordingStoreManager` override it to throw. Everything else in this task is unchanged.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -345,7 +358,7 @@ Append to the end of the file:
     val local = new StoreManager.LocalStorageDeviceState(
       deviceA, Paths.get("relative-device-dir"), hostRoot.toFile)
     local.offlineStores = Set(storeId)
-    mgr.registerDevice(local)
+    mgr.injectLoadedDevice(local)
 
     val p1 = mgr.armLookup(deviceA)
 
@@ -376,12 +389,18 @@ Append to the end of the file:
       mgr.testingOnlyActiveDeviceChecks should be(empty)
       mgr.testingOnlyDeferredDeviceChecks should be(empty)
 
-      // The discriminating pair, on identity rather than class: os-lib's exception type for a
-      // relative path is not worth pinning a test to. Old code records exactly
-      // redispatchError, because the finally's throw replaced the reconcile's. New code
-      // absorbs redispatchError inside the re-dispatch and lets the reconcile's escape.
-      recordingEc.failures should not be empty
-      recordingEc.failures should not contain redispatchError
+      // The discriminating pair. Old code records exactly one failure and it is
+      // redispatchError, because the throw out of the finally replaced the reconcile's. New
+      // code absorbs redispatchError inside the re-dispatch and lets the reconcile's escape,
+      // so the one recorded failure is os-lib's.
+      //
+      // Size before content, because this recorder sees every callback the manager runs
+      // through its ExecutionContext: a bare non-empty check would also pass on an unrelated
+      // failure with the reconcile silently not throwing at all. Matched on the message
+      // fragment rather than IllegalArgumentException, which is too common a class to pin
+      // anything to.
+      recordingEc.failures should have size 1
+      recordingEc.failures.head.getMessage should include("is not an absolute path")
 ```
 
 - [ ] **Step 3: Run the test to verify it fails**
@@ -390,9 +409,9 @@ Run: `sbt 'testOnly *StoreManagerDeviceDiscoverySuite -- -z "not replaced by"'`
 
 Expected: FAIL on `mgr.testingOnlyActiveDeviceChecks should be(empty)` — against the unmodified code the re-dispatch's throw leaves `deviceA` in the guard set.
 
-The two `recordingEc.failures` assertions are also wrong against old code but are not reached, because the guard assertion fails first. That is fine; Step 4 of Task 4 is where they are confirmed to pass.
+The message assertion is also wrong against old code — it records `redispatchError`, whose message is `test-controlled re-dispatch lookup failure` — but it is not reached, because the guard assertion fails first. That is fine; Task 4 Step 3 is where it is confirmed to pass.
 
-If the failure is instead `recordingEc.failures should not be empty` with the guard assertions passing, the reconcile did not throw. Go back to Step 1.
+If the failure is instead `recordingEc.failures should have size 1` reporting size 0, with the guard assertions passing, the reconcile did not throw. Re-read Step 1 and take the fallback.
 
 - [ ] **Step 4: Commit the failing test**
 
@@ -694,7 +713,7 @@ git log --oneline -6
 
 **Why `armLookupThrow` and not a failed Promise.** A failed `Promise` still produces a `Future`, so the callback is registered and the `finally` runs. The bug is specifically the absence of the `Future`. The suite already has a test using a failed promise — `"a deferred check still runs when the in-flight lookup fails"` — and it passes against the buggy code. That is the distinction the new seam exists to draw.
 
-**Why the tests use `testingOnlyHandleHostMessage` rather than `testingOnlyCheckAllDevices`.** It targets one named device. Its handler rescans `storageDevicesDir` only when the device is absent from `storageDevices`, then calls `checkStorageDevice` either way, so it works for a registered device (Task 3) and an on-disk one (Task 2) alike. `testingOnlyCheckAllDevices` iterates every loaded device, which in Task 3 would also trip over the injected device's relative path during the scan.
+**Why the tests use `testingOnlyHandleHostMessage` rather than `testingOnlyCheckAllDevices`.** It targets one named device. Its handler rescans `storageDevicesDir` only when the device is absent from `storageDevices`, then calls `checkStorageDevice` either way, so it works for an injected device (Task 3) and an on-disk one (Task 2) alike, and each trigger issues exactly one check. `testingOnlyCheckAllDevices` sweeps every loaded device, which makes the lookup count both tests assert on depend on how many devices happen to be loaded. (It would *not* trip over Task 3's relative `devicePath`: `checkForNewDevices` iterates the storage-devices directory's children and never reads a loaded device's `devicePath`.)
 
 **Both hooks call `handleEvent` directly**, bypassing the event loop and its catch-all at `StoreManager.scala:334`. That is what lets Task 2 assert `noException should be thrownBy`.
 

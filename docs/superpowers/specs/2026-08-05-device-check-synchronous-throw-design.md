@@ -72,13 +72,13 @@ The `finally` body is extracted so both the normal and the throwing path share o
 the lookup call is wrapped:
 
 ```scala
-private def endDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
-  activeDeviceChecks -= storageDeviceId
-  if deferredDeviceChecks.contains(storageDeviceId) then
-    deferredDeviceChecks -= storageDeviceId
-    startDeviceCheck(storageDeviceId)
-
 private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
+  def endDeviceCheck(): Unit =
+    activeDeviceChecks -= storageDeviceId
+    if deferredDeviceChecks.contains(storageDeviceId) then
+      deferredDeviceChecks -= storageDeviceId
+      startDeviceCheck(storageDeviceId)
+
   activeDeviceChecks += storageDeviceId
 
   val lookup =
@@ -90,13 +90,18 @@ private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
       f.onComplete: result =>
         synchronized:
           try   ...            // unchanged
-          finally endDeviceCheck(storageDeviceId)
+          finally endDeviceCheck()
 
     case Failure(t) =>
       logger.warn(s"Lookup of state for storage device $storageDeviceId threw before " +
                   s"the read was dispatched. Error: $t")
-      endDeviceCheck(storageDeviceId)
+      endDeviceCheck()
 ```
+
+`endDeviceCheck` is a nested `def` rather than a private method on the class. It has no caller
+outside `startDeviceCheck`, and nesting lets it close over `storageDeviceId` instead of taking it
+as a parameter, which removes any way for the two halves of a check to disagree about which device
+they are releasing.
 
 `Success` and `Failure` are already imported; `scala.util.Try` is not, hence the explicit
 `try`/`catch` rather than `Try(...)`.
@@ -115,8 +120,8 @@ scaladoc already records, and it stays recorded rather than fixed.
 at-most-one deferral held per device.
 
 **The locking contract is unchanged.** `endDeviceCheck` touches only guard and deferral state and
-is called from two sites that both already hold the instance lock: the callback's `synchronized`
-block, and `startDeviceCheck`, whose callers hold it.
+has two call sites that both already hold the instance lock: the callback's `synchronized` block,
+and the throwing path in `startDeviceCheck`, whose callers hold it.
 
 The separate warn for the synchronous throw is deliberate. The existing `Failure(err)` warn
 explains itself with "It may not be registered in the storage-devices tree" -- true for the
@@ -190,8 +195,10 @@ Three passages in `startDeviceCheck`'s scaladoc state behaviour this change fals
   synchronously" loses that half. The clear-before-dispatch order it defends stays correct, on the
   unbounded-recursion grounds stated alongside it.
 
-`endDeviceCheck` gets scaladoc for the shared release-and-re-dispatch contract and the fact that
-both call sites hold the instance lock. `lookupStorageDeviceState`'s scaladoc gains a line saying
+`endDeviceCheck` gets a comment covering the shared release-and-re-dispatch contract and the fact
+that both call sites hold the instance lock. It is a nested `def`, so this is a plain comment
+rather than scaladoc, and it absorbs the existing note on the clear-before-dispatch order, which
+moves with the code it explains. `lookupStorageDeviceState`'s scaladoc gains a line saying
 a throw is treated as a failed lookup, so an override is free to throw. The entry comes off the
 top of `TODO.txt`.
 

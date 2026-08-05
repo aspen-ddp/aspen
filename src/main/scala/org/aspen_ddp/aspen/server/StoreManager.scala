@@ -105,9 +105,10 @@ class StoreManager(val client: AspenClient,
 
   val storageDevicesDir: Path = rootDir.resolve(StorageDeviceManager.StorageDevicesDirName)
 
-  // Append-only for the life of the process: tryLoadDevice is the only writer and nothing
-  // anywhere removes an entry. So a device present here stays present, and a lookup miss means
-  // a device this process has never loaded rather than one that has gone away.
+  // Append-only for the life of the process: tryLoadDevice is the only writer in production and
+  // nothing anywhere removes an entry. So a device present here stays present, and a lookup miss
+  // means a device this process has never loaded rather than one that has gone away. Tests inject
+  // entries directly via RecordingStoreManager.injectLoadedDevice.
   protected var storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
   protected var stores: Map[StoreId, Store] = Map()
 

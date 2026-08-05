@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFin
 
 import java.io.File
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
+import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
@@ -100,15 +100,29 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   lazy val lookupAttempts: mutable.ListBuffer[StorageDeviceId] =
     mutable.ListBuffer[StorageDeviceId]()
 
-  /** Promises queued by armLookup, consumed one per lookup of that device.
+  /** One armed lookup: `Right` returns a Future the test completes, `Left` throws before any
+   *  Future exists. */
+  private type ArmedLookup = Either[Throwable, Promise[StorageDeviceState]]
+
+  /** Lookups queued by armLookup and armLookupThrow, consumed one per lookup of that device.
+   *
+   *  One queue per device rather than a queue of promises plus a separate set of throws, so the
+   *  order in which a test arms a success and a throw is the order the device check sees them.
    *
    *  Lazy to match storeLoadAttempts. Unlike that field, nothing in StoreManager's constructor
    *  reaches this override today: the constructor's device scan calls tryLoadStore, but a
    *  device check only ever runs from handleEvent. The uniformity is deliberate insurance
    *  against that changing.
    */
-  private lazy val armedLookups: mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]] =
-    mutable.Map[StorageDeviceId, mutable.Queue[Promise[StorageDeviceState]]]()
+  private lazy val armedLookups: mutable.Map[StorageDeviceId, mutable.Queue[ArmedLookup]] =
+    mutable.Map[StorageDeviceId, mutable.Queue[ArmedLookup]]()
+
+  /** Caller holds this instance's lock. Write path only -- the read path in
+   *  lookupStorageDeviceState must go through `armedLookups` directly, since getOrElseUpdate
+   *  there would accumulate an empty queue per device looked up.
+   */
+  private def enqueueArmed(deviceId: StorageDeviceId, armed: ArmedLookup): Unit =
+    armedLookups.getOrElseUpdate(deviceId, mutable.Queue[ArmedLookup]()).enqueue(armed)
 
   /** Arms one lookup of `deviceId` to return a Future the test completes when it chooses.
    *
@@ -118,8 +132,17 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    */
   def armLookup(deviceId: StorageDeviceId): Promise[StorageDeviceState] = synchronized:
     val p = Promise[StorageDeviceState]()
-    armedLookups.getOrElseUpdate(deviceId, mutable.Queue[Promise[StorageDeviceState]]()).enqueue(p)
+    enqueueArmed(deviceId, Right(p))
     p
+
+  /** Arms one lookup of `deviceId` to throw `error` instead of returning a Future at all.
+   *
+   *  This is the case no Promise can stage: a failed Promise still yields a Future, and it is
+   *  the absence of the Future -- and so of the callback, and so of the callback's finally --
+   *  that leaks startDeviceCheck's guard entry.
+   */
+  def armLookupThrow(deviceId: StorageDeviceId, error: Throwable): Unit = synchronized:
+    enqueueArmed(deviceId, Left(error))
 
   override protected def lookupStorageDeviceState(
       storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
@@ -128,11 +151,50 @@ private class RecordingStoreManager(mgrClient: AspenClient,
       armedLookups.get(storageDeviceId).filter(_.nonEmpty).map(_.dequeue())
 
     armed match
-      case Some(p) => p.future
-      case None    => super.lookupStorageDeviceState(storageDeviceId)
+      case Some(Right(p))    => p.future
+      case Some(Left(error)) => throw error
+      case None              => super.lookupStorageDeviceState(storageDeviceId)
 
   def loadedDevices: Map[StorageDeviceId, StoreManager.LocalStorageDeviceState] =
     synchronized(storageDevices)
+
+  /** Installs `sds` in the protected device map without it ever having been on disk.
+   *
+   *  Test 2 needs a LocalStorageDeviceState carrying values the real scan cannot produce -- a
+   *  relative devicePath -- so it cannot go through writeDevice and a rescan.
+   *
+   *  Named for what it does to the load state, not the storage-devices tree: this registers
+   *  nothing there, and a lookup of the injected device still resolves however the test arms
+   *  it. Refuses to replace an existing entry, so a test that both writes a device to disk and
+   *  injects one for the same id fails here rather than in a confusing assertion later.
+   */
+  def injectLoadedDevice(sds: StoreManager.LocalStorageDeviceState): Unit = synchronized:
+    require(!storageDevices.contains(sds.storageDeviceId),
+            s"${sds.storageDeviceId} is already loaded; injectLoadedDevice does not replace")
+    storageDevices += (sds.storageDeviceId -> sds)
+
+
+/** Delegates execution to `underlying`, and records every reportFailure call instead of
+ *  passing it on.
+ *
+ *  A NonFatal throw out of a Future callback goes to the ExecutionContext's reportFailure and
+ *  nowhere else, so this is the only way for a test to see which exception escaped -- which is
+ *  exactly the question when a finally can replace one exception with another. (A fatal
+ *  Throwable is rethrown instead, so it never lands here.)
+ *
+ *  Recording rather than forwarding means the underlying context never prints the throwable.
+ *  That is deliberate: a test whose passing state involves an expected throw should not print a
+ *  stack trace on every green run. The assertions on `failures` carry the diagnostic instead.
+ */
+private class RecordingExecutionContext(underlying: ExecutionContext) extends ExecutionContext:
+  private val recorded = mutable.ListBuffer[Throwable]()
+
+  def execute(runnable: Runnable): Unit = underlying.execute(runnable)
+
+  def reportFailure(cause: Throwable): Unit = synchronized:
+    recorded += cause
+
+  def failures: List[Throwable] = synchronized(recorded.toList)
 
 
 class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
@@ -214,8 +276,10 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
     Files.createDirectories(dir)
     dir
 
-  private def newManager(hostRoot: Path, failFirstStoreLoad: Boolean = false): RecordingStoreManager =
-    new RecordingStoreManager(client, systemId, hostRoot, executionContext,
+  private def newManager(hostRoot: Path,
+                         failFirstStoreLoad: Boolean = false,
+                         ec: ExecutionContext = executionContext): RecordingStoreManager =
+    new RecordingStoreManager(client, systemId, hostRoot, ec,
                               net.objectCacheFactory, net, net.FinalizerFactory,
                               failFirstStoreLoad)
 

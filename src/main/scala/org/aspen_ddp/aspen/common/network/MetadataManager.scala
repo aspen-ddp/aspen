@@ -190,29 +190,88 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
       else
         stores -= storeId
 
+  /** Refetches the bootstrap config and reinstalls the store -> host mappings it names.
+   *
+   *  refreshingBootstrapConfig coalesces concurrent requests: a bootstrap store whose host has
+   *  moved is usually noticed by several sends at once, and one refetch answers all of them.
+   *  Because it is a plain Boolean rather than an entry in a map, a path that leaves it set
+   *  disables refresh permanently -- and dropStoreMapping has no fallback for a bootstrap store,
+   *  so the correction is dropped rather than degraded. Every exit therefore releases it,
+   *  including the one that rethrows a fatal rather than reporting it.
+   *
+   *  The try/catch wraps the getBootstrapConfig call and nothing else. Widening it over the
+   *  onComplete registration would not catch a NonFatal throw from the callback body even under
+   *  an inline or parasitic ExecutionContext: Promise.Transformation absorbs those and routes
+   *  them to ExecutionContext.reportFailure, so onComplete returns normally. That is the same
+   *  fact startHostLookup's catch relies on. What a wider wrapper would reach is a fatal from
+   *  the callback body, which Transformation does rethrow out through onComplete -- and nothing
+   *  here should intercept that: the callback's own finally has already released the flag, so
+   *  the only effect would be a second, redundant release on its way past. The narrow scope
+   *  leaves onComplete itself unguarded: an ExecutionContext that rejects the submission still
+   *  strands the flag.
+   *
+   *  clientContext is an abstract def, so binding it can throw. A bare `given` would not help:
+   *  an alias given compiles to a lazy val, so the call would not run until the implicit is
+   *  first needed -- at the onComplete registration, after the flag is set and outside the
+   *  wrapper, which is precisely where a throw strands it. Hence the strict val below, whose
+   *  initializer runs before the flag is set, so such a throw propagates with nothing acquired.
+   *  Unlike StoreManager.startDeviceCheck this method has no caller in a finally, so a
+   *  propagating throw masks nothing.
+   *
+   *  Caller must hold this object's monitor. */
   private def refreshBootstrapConfig(): Unit =
     if !refreshingBootstrapConfig then
       logger.info("Refreshing bootstrap config file")
       oClient match
         case None => logger.error(s"Refreshing bootstrap config before AspenClient initialized!")
         case Some(client) =>
+          // Strict, then aliased: forcing the abstract clientContext call here rather than
+          // leaving it to the lazy given keeps it ahead of the flag. See the scaladoc.
+          val ec: ExecutionContext = client.clientContext
+          given ExecutionContext = ec
           refreshingBootstrapConfig = true
-          given ExecutionContext = client.clientContext
 
-          client.getBootstrapConfig().foreach: cfg =>
-            try
-              atomicWrite(bootstrapConfigFile.toNIO, cfg)
-              logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
+          val fetch =
+            try Success(client.getBootstrapConfig())
             catch
-              case err => logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $err")
-            finally
-              synchronized:
-                // Update the stores map to match the new host ids
-                BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
-                  bsHost.stores.foreach: storeId =>
-                    stores += storeId -> bsHost.hostId
-
+              case NonFatal(t) => Failure(t)
+              case t: Throwable =>
+                // Not ours to swallow -- startHostLookup and startPoolLookup both let a fatal
+                // out of the same position -- but it must not strand the flag either.
                 refreshingBootstrapConfig = false
+                throw t
+
+          fetch match
+            case Success(fCfg) =>
+              fCfg.onComplete: result =>
+                try
+                  result match
+                    case Success(cfg) =>
+                      try
+                        atomicWrite(bootstrapConfigFile.toNIO, cfg)
+                        logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
+                      catch
+                        case NonFatal(t) =>
+                          logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $t", t)
+
+                      synchronized:
+                        BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
+                          bsHost.stores.foreach: storeId =>
+                            stores += storeId -> bsHost.hostId
+
+                    case Failure(err) =>
+                      logger.error(s"Failed to fetch the bootstrap config. Error: $err", err)
+                catch
+                  case NonFatal(t) =>
+                    logger.error(s"Failed to apply the fetched bootstrap config. Error: $t", t)
+                finally
+                  synchronized:
+                    refreshingBootstrapConfig = false
+
+            case Failure(t) =>
+              // Repair first, log second: a throwing logger must not be able to wedge the flag.
+              refreshingBootstrapConfig = false
+              logger.error(s"The getBootstrapConfig call threw. Error: $t", t)
 
 
   private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =

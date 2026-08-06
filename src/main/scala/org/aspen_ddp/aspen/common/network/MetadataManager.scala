@@ -246,19 +246,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
               fCfg.onComplete: result =>
                 try
                   result match
-                    case Success(cfg) =>
-                      try
-                        atomicWrite(bootstrapConfigFile.toNIO, cfg)
-                        logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
-                      catch
-                        case NonFatal(t) =>
-                          logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $t", t)
-
-                      synchronized:
-                        BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
-                          bsHost.stores.foreach: storeId =>
-                            stores += storeId -> bsHost.hostId
-
+                    case Success(cfg) => applyBootstrapConfig(cfg)
                     case Failure(err) =>
                       logger.error(s"Failed to fetch the bootstrap config. Error: $err", err)
                 catch
@@ -273,6 +261,42 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
               refreshingBootstrapConfig = false
               logger.error(s"The getBootstrapConfig call threw. Error: $t", t)
 
+  /** Installs a freshly fetched bootstrap config, writing it through to disk on the way.
+   *
+   *  Parse first. The config is written only once it is known to be readable, so a bad fetch
+   *  cannot replace a good file with one that fails at the next construction. A parse failure
+   *  propagates to the caller's catch, which logs it; the guard release is in that caller's
+   *  finally, so a rejected config leaves the refresh retryable.
+   *
+   *  Then map, then write. A failed write cannot stop the mapping: it has already been applied.
+   *  And the mapping comes from the parsed config rather than from a re-read of the file, so it
+   *  neither reinstates stale placements nor depends on the file being readable at all -- the
+   *  process picks up the new placements immediately and only loses them across a restart,
+   *  strictly better than discarding a good config because the disk is full or read-only.
+   *
+   *  That the mapping comes first is deliberate, not incidental, so do not reorder these two. The
+   *  mapping is the repair this whole refresh exists to deliver and it is pure in-memory work;
+   *  the write is best-effort, and its failure is logged and ignored. Writing first would delay
+   *  the routing correction by however long the disk takes -- and, because the caller releases
+   *  refreshingBootstrapConfig only once this returns, would hold every other bootstrap store's
+   *  correction behind that same disk for that same duration. Both steps consume values already
+   *  computed above, so the end state is identical either way -- a fatal from the write is the
+   *  only divergence, and it leaves the mapping applied rather than lost.
+   */
+  private def applyBootstrapConfig(cfg: String): Unit =
+    val config = BootstrapConfig.parseBootstrapConfig(cfg)
+
+    synchronized:
+      config.hosts.foreach: bsHost =>
+        bsHost.stores.foreach: storeId =>
+          stores += storeId -> bsHost.hostId
+
+    try
+      atomicWrite(bootstrapConfigFile.toNIO, cfg)
+      logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
+    catch
+      case NonFatal(t) =>
+        logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $t", t)
 
   private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =
     val phl = new PendingHostLookup(pendingHostLookupQueueSize)

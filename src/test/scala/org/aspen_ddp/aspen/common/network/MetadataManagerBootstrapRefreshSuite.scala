@@ -1,8 +1,12 @@
 package org.aspen_ddp.aspen.common.network
 
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
+
+import java.util.UUID
 
 /** What a bootstrap config refresh costs when it goes wrong.
  *
@@ -16,6 +20,11 @@ import org.scalatest.matchers.should.Matchers
  *  exception directly. Each test instead makes a second dropStoreMapping call and asserts a
  *  second fetch was attempted: a released guard permits one, a wedged guard does not.
  *
+ *  The last two tests carry a second claim beyond guard release: where the fetched config ends
+ *  up. Parsing it before writing is what keeps a rejected config off disk, and mapping from the
+ *  parsed result rather than from a re-read is what keeps a failed write from discarding a good
+ *  config.
+ *
  *  Every test drives the refresh through dropStoreMapping(bootstrapStoreId).
  *  receivedUnknownStoreFromHost is the other public path that reaches refreshBootstrapConfig for
  *  a bootstrap store; the two differ only in how they decide to call it, so dropStoreMapping
@@ -27,6 +36,12 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
 
   /** The one store the fixture's bootstrap config names. */
   private val bootstrapStoreId: StoreId = StoreId(poolId, 0.toByte)
+
+  /** Absent from the fixture's bootstrap config; a refreshed config can introduce it. */
+  private val secondStoreId: StoreId = StoreId(poolId, 1.toByte)
+
+  private def nudge(): Message =
+    CheckStorageDevice(remoteHostId, ClientId.Null, StorageDeviceId(UUID.randomUUID()))
 
   test("a bootstrap config fetch that fails leaves the refresh retryable"):
     val (mgr, client, _) = newManager()
@@ -56,19 +71,6 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
     mgr.dropStoreMapping(bootstrapStoreId)
     client.bootstrapConfigFetches should be(2)
 
-  test("a throw while applying the fetched config leaves the refresh retryable"):
-    val (mgr, client, _, path) = newManagerWithConfigFile()
-
-    mgr.dropStoreMapping(bootstrapStoreId)
-    client.bootstrapConfigFetches should be(1)
-
-    // Removes the parent directory, so atomicWrite's createTempFile and the re-read both throw.
-    os.remove.all(path / os.up)
-    client.bootstrapConfigPromise(1).success("not even valid yaml")
-
-    mgr.dropStoreMapping(bootstrapStoreId)
-    client.bootstrapConfigFetches should be(2)
-
   test("a refresh already in flight coalesces a second request"):
     val (mgr, client, _) = newManager()
 
@@ -78,3 +80,84 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
     mgr.dropStoreMapping(bootstrapStoreId)
 
     client.bootstrapConfigFetches should be(1)
+
+  test("a fetched config that does not parse leaves the file unchanged and the refresh retryable"):
+    val (mgr, client, _, configFile) = newManagerWithConfigFile()
+
+    val before = os.read(configFile)
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+
+    // Well-formed YAML that BootstrapConfig.Config rejects: two stores against an IDA of width
+    // one. A syntactically broken string would do too, but this exercises the same validation a
+    // real mis-generated config would trip.
+    val unparseable = bootstrapConfigYaml(
+      Replication(1, 1),
+      List(remoteHostState),
+      List(bootstrapStoreId -> remoteHostId, secondStoreId -> remoteHostId))
+
+    client.bootstrapConfigPromise(1).success(unparseable)
+
+    // Pre-fix the string is written before anything parses it, so the on-disk config is replaced
+    // by one the process cannot read back -- and a restart then fails at construction.
+    os.read(configFile) should be(before)
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+    client.bootstrapConfigFetches should be(2)
+
+  test("a config that cannot be written is still applied in memory"):
+    val (mgr, client, _, configFile) = newManagerWithConfigFile()
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+
+    // atomicWrite creates its temp file in the target's parent directory, so removing the
+    // directory makes the write fail with NoSuchFileException whatever the suite's privileges.
+    os.remove.all(configFile / os.up)
+
+    client.bootstrapConfigPromise(1).success(bootstrapConfigYaml(
+      Replication(1, 1),
+      List(remoteHostState),
+      List(bootstrapStoreId -> remoteHostId)))
+
+    // The store now routes to remoteHostId, which has no HostEntry, so reaching it starts a
+    // lookup and parks the message. Pre-fix the mapping came from a re-read of the file, and
+    // removing the directory takes the file with it, so that re-read raised
+    // FileNotFoundException and the apply never reached the mapping at all -- the store still
+    // mapped to bootstrapHostId and this returned Some. Mapping from the parsed config is what
+    // makes the write and the mapping independent.
+    mgr.getHostEntryOrQueueMessage(bootstrapStoreId, nudge()) should be(None)
+    client.lookups.toList should be(List(remoteHostId))
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+    client.bootstrapConfigFetches should be(2)
+
+  test("a fetched config that parses is written through to disk"):
+    val (mgr, client, _, configFile) = newManagerWithConfigFile()
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+
+    val fresh = bootstrapConfigYaml(
+      Replication(1, 1),
+      List(remoteHostState),
+      List(bootstrapStoreId -> remoteHostId))
+
+    client.bootstrapConfigPromise(1).success(fresh)
+
+    os.read(configFile) should be(fresh)
+
+  test("a fetched config that is not YAML at all leaves the file unchanged and the refresh retryable"):
+    val (mgr, client, _, configFile) = newManagerWithConfigFile()
+
+    val before = os.read(configFile)
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+
+    // Not a FormatError: SnakeYAML raises ParserException, a plain RuntimeException. This is the
+    // case loadYamlString's scaladoc warns about -- the reason applyBootstrapConfig's caller
+    // catches NonFatal rather than FormatError. Nothing else in the tree covers it.
+    client.bootstrapConfigPromise(1).success("bootstrap-hosts: [unclosed\n")
+
+    os.read(configFile) should be(before)
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+    client.bootstrapConfigFetches should be(2)

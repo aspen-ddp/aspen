@@ -28,6 +28,20 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       List(hostState),
       List(storeId -> hostId))
 
+  private def assertMatchesGenerated(cfg: BootstrapConfig.Config): Unit =
+    cfg.aspenSystemId should be(systemId)
+    cfg.bootstrapIDA should be(Replication(1, 1))
+    cfg.hosts.length should be(1)
+
+    val h = cfg.hosts.head
+    h.hostId should be(hostId)
+    h.name should be("node_a")
+    h.address should be("127.0.0.1")
+    h.dataPort should be(5000)
+    h.cncPort should be(5001)
+    h.storeTransferPort should be(5002)
+    h.stores should be(List(storeId))
+
   test("generateBootstrapConfig uses the bootstrap-hosts and host-id keys"):
     generated should include("bootstrap-hosts:")
     generated should include("- host-id: 11111111-1111-1111-1111-111111111111")
@@ -38,19 +52,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     try
       Files.write(f, generated.getBytes(StandardCharsets.UTF_8))
       val cfg = BootstrapConfig.loadBootstrapConfig(f.toFile)
-
-      cfg.aspenSystemId should be(systemId)
-      cfg.bootstrapIDA should be(Replication(1, 1))
-      cfg.hosts.length should be(1)
-
-      val h = cfg.hosts.head
-      h.hostId should be(hostId)
-      h.name should be("node_a")
-      h.address should be("127.0.0.1")
-      h.dataPort should be(5000)
-      h.cncPort should be(5001)
-      h.storeTransferPort should be(5002)
-      h.stores should be(List(storeId))
+      assertMatchesGenerated(cfg)
     finally
       Files.deleteIfExists(f)
 
@@ -222,3 +224,31 @@ bootstrap-hosts:
       ex.getMessage should include("Number of bootstrap stores (2) must exactly match the Bootstrap IDA width (3)")
     finally
       Files.deleteIfExists(f)
+
+  test("parseBootstrapConfig round-trips generateBootstrapConfig"):
+    val cfg = BootstrapConfig.parseBootstrapConfig(generated)
+    assertMatchesGenerated(cfg)
+
+  test("parseBootstrapConfig rejects an empty document"):
+    val ex = intercept[FormatError]:
+      BootstrapConfig.parseBootstrapConfig("")
+    ex.getMessage should include("Empty YAML document")
+
+  test("parseBootstrapConfig rejects a document that is not a mapping"):
+    // The shape a truncated or wrong-endpoint network response takes. It must surface as a
+    // FormatError like every other bad config, not as a ClassCastException from the parse.
+    val ex = intercept[FormatError]:
+      BootstrapConfig.parseBootstrapConfig("<html><body>404</body></html>")
+    ex.getMessage should include("Object Required")
+
+  test("parseBootstrapConfig applies the store count validation"):
+    // Config's own validation, reached through the string entry point rather than the file one.
+    val mismatched = BootstrapConfig.generateBootstrapConfig(
+      systemId,
+      Replication(1, 1),
+      List(hostState),
+      List(storeId -> hostId, StoreId(poolId, 1.toByte) -> hostId))
+
+    val ex = intercept[FormatError]:
+      BootstrapConfig.parseBootstrapConfig(mismatched)
+    ex.getMessage should include("Number of bootstrap stores (2) must exactly match")

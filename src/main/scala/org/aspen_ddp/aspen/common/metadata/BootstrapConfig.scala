@@ -115,6 +115,11 @@ object BootstrapConfig:
   def loadBootstrapConfig(file: File): Config =
     Config.create(loadYamlFile(file))
 
+  /** Parses a bootstrap config held in memory, applying exactly the validation
+   *  loadBootstrapConfig applies to a file. */
+  def parseBootstrapConfig(yaml: String): Config =
+    Config.create(loadYamlString(yaml))
+
 
   def generateBootstrapConfig(aspenSystemId: UUID,
                               ida: IDA,

@@ -68,26 +68,17 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
   private var hosts: Map[HostId, Either[PendingHostLookup, T]] = Map()
   private var refreshingBootstrapConfig: Boolean = false
 
-  BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
-    bsHost.stores.foreach: storeId =>
-      stores += storeId -> bsHost.hostId
-      bootstrapStores += storeId
-
-    hosts += bsHost.hostId -> Right(networkImplInterface.createHostEntry(
-      bsHost.hostId,
-      bsHost.name,
-      bsHost.address,
-      bsHost.dataPort,
-      bsHost.cncPort,
-      bsHost.storeTransferPort,
-      new EvictingQueue[Message](1)
-    ))
+  loadInitialBootstrapConfig()
 
   def setAspenClient(client: AspenClient): Unit =
     synchronized:
       oClient = Some(client)
 
-  def isBootstrapStore(storeId: StoreId): Boolean = bootstrapStores.contains(storeId)
+  /** Reads bootstrapStores, which a refresh rewrites; loadInitialBootstrapConfig's scaladoc has
+   *  the publication argument for both writers. */
+  def isBootstrapStore(storeId: StoreId): Boolean =
+    synchronized:
+      bootstrapStores.contains(storeId)
 
   def receivedUnknownStoreFromHost(hostId: HostId, storeId: StoreId): Unit =
     synchronized:
@@ -190,30 +181,174 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
       else
         stores -= storeId
 
+  /** Refetches the bootstrap config and reinstalls the store -> host mappings it names, along
+   *  with the set of stores that count as bootstrap stores.
+   *
+   *  refreshingBootstrapConfig coalesces concurrent requests: a bootstrap store whose host has
+   *  moved is usually noticed by several sends at once, and one refetch answers all of them.
+   *  Because it is a plain Boolean rather than an entry in a map, a path that leaves it set
+   *  disables refresh permanently -- and dropStoreMapping has no fallback for a bootstrap store,
+   *  so the correction is dropped rather than degraded. Every exit reachable by a throw
+   *  therefore releases it, including the one that rethrows a fatal rather than reporting it.
+   *  One exit is not reachable by a throw and does strand it: see the end of the next paragraph.
+   *
+   *  The try/catch wraps the getBootstrapConfig call and nothing else. Widening it over the
+   *  onComplete registration would not catch a NonFatal throw from the callback body even under
+   *  an inline or parasitic ExecutionContext: Promise.Transformation absorbs those and routes
+   *  them to ExecutionContext.reportFailure, so onComplete returns normally. That is the same
+   *  fact startHostLookup's catch relies on. What a wider wrapper would reach is a fatal from
+   *  the callback body, which Transformation does rethrow out through onComplete -- and nothing
+   *  here should intercept that: the callback's own finally has already released the flag, so
+   *  the only effect would be a second, redundant release on its way past. What the narrow
+   *  scope gives up is nothing a wider one could take back. An ExecutionContext that rejects
+   *  the submission strands the flag -- the callback never runs, so its finally never runs --
+   *  and no wrapper at this call site can reach that, because nothing throws here to catch:
+   *  Transformation absorbs the rejection into reportFailure, and for a future still pending at
+   *  registration the rejection is raised later, on the thread that completes it. See TODO.txt.
+   *
+   *  clientContext is an abstract def, so binding it can throw. A bare `given` would not help:
+   *  an alias given compiles to a lazy val, so the call would not run until the implicit is
+   *  first needed -- at the onComplete registration, after the flag is set and outside the
+   *  wrapper, which is precisely where a throw strands it. Hence the strict val below, whose
+   *  initializer runs before the flag is set, so such a throw propagates with nothing acquired.
+   *  Unlike StoreManager.startDeviceCheck this method has no caller in a finally, so a
+   *  propagating throw masks nothing.
+   *
+   *  Caller must hold this object's monitor. */
   private def refreshBootstrapConfig(): Unit =
     if !refreshingBootstrapConfig then
       logger.info("Refreshing bootstrap config file")
       oClient match
         case None => logger.error(s"Refreshing bootstrap config before AspenClient initialized!")
         case Some(client) =>
+          // Strict, then aliased: forcing the abstract clientContext call here rather than
+          // leaving it to the lazy given keeps it ahead of the flag. See the scaladoc.
+          val ec: ExecutionContext = client.clientContext
+          given ExecutionContext = ec
           refreshingBootstrapConfig = true
-          given ExecutionContext = client.clientContext
 
-          client.getBootstrapConfig().foreach: cfg =>
-            try
-              atomicWrite(bootstrapConfigFile.toNIO, cfg)
-              logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
+          val fetch =
+            try Success(client.getBootstrapConfig())
             catch
-              case err => logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $err")
-            finally
-              synchronized:
-                // Update the stores map to match the new host ids
-                BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
-                  bsHost.stores.foreach: storeId =>
-                    stores += storeId -> bsHost.hostId
-
+              case NonFatal(t) => Failure(t)
+              case t: Throwable =>
+                // Not ours to swallow -- startHostLookup and startPoolLookup both let a fatal
+                // out of the same position -- but it must not strand the flag either.
                 refreshingBootstrapConfig = false
+                throw t
 
+          fetch match
+            case Success(fCfg) =>
+              fCfg.onComplete: result =>
+                try
+                  result match
+                    case Success(cfg) => applyBootstrapConfig(cfg)
+                    case Failure(err) =>
+                      logger.error(s"Failed to fetch the bootstrap config. Error: $err", err)
+                catch
+                  case NonFatal(t) =>
+                    logger.error(s"Failed to apply the fetched bootstrap config. Error: $t", t)
+                finally
+                  synchronized:
+                    refreshingBootstrapConfig = false
+
+            case Failure(t) =>
+              // Repair first, log second: a throwing logger must not be able to wedge the flag.
+              refreshingBootstrapConfig = false
+              logger.error(s"The getBootstrapConfig call threw. Error: $t", t)
+
+  /** Installs a freshly fetched bootstrap config, writing it through to disk on the way.
+   *
+   *  Parse first. The config is written only once it is known to be readable, so a bad fetch
+   *  cannot replace a good file with one that fails at the next construction. A parse failure
+   *  propagates to the caller's catch, which logs it; the guard release is in that caller's
+   *  finally, so a rejected config leaves the refresh retryable.
+   *
+   *  Then map, then write. A failed write cannot stop the mapping: it has already been applied.
+   *  And the mapping comes from the parsed config rather than from a re-read of the file, so it
+   *  neither reinstates stale placements nor depends on the file being readable at all -- the
+   *  process picks up the new placements immediately and only loses them across a restart,
+   *  strictly better than discarding a good config because the disk is full or read-only.
+   *
+   *  Do not reorder those two. The mapping is the repair this refresh exists to deliver and it
+   *  is free; the write is best-effort, and going first it would delay the repair by however
+   *  long the disk takes.
+   */
+  private def applyBootstrapConfig(cfg: String): Unit =
+    val config = BootstrapConfig.parseBootstrapConfig(cfg)
+
+    synchronized:
+      mapBootstrapStores(config)
+
+    try
+      atomicWrite(bootstrapConfigFile.toNIO, cfg)
+      logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
+    catch
+      case NonFatal(t) =>
+        logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $t", t)
+
+  /** Installs every store -> host mapping the config names and marks each store as a bootstrap
+   *  store.
+   *
+   *  Add-only: nothing is removed here, from `stores` or from `bootstrapStores`. A store the
+   *  refreshed config omits therefore keeps both its old mapping and its bootstrap status, which
+   *  is the conservative reading. The config is the only source that can name a bootstrap store,
+   *  and forgetting one would send it down dropStoreMapping's non-bootstrap branch, which drops
+   *  its mapping and leaves the next send to start a pool lookup -- against a pool whose state
+   *  can only be read through the bootstrap stores themselves.
+   *
+   *  That is add-only along this path only, for `stores`: dropStoreMapping and
+   *  receivedUnknownStoreFromHost both remove from it elsewhere. `bootstrapStores` has no removal
+   *  site anywhere in the class.
+   *
+   *  The constructor and a refresh share this method so the two can never disagree about which
+   *  stores are bootstrap stores.
+   *
+   *  Caller must hold this object's monitor.
+   */
+  private def mapBootstrapStores(config: BootstrapConfig.Config): Unit =
+    config.hosts.foreach: bsHost =>
+      bsHost.stores.foreach: storeId =>
+        stores += storeId -> bsHost.hostId
+        bootstrapStores += storeId
+
+  /** Loads the on-disk bootstrap config at construction: the store mappings, plus a HostEntry
+   *  for each named host so those hosts are reachable before any lookup completes.
+   *
+   *  Only the mapping half is shared with a refresh. A refresh deliberately does not touch
+   *  `hosts`: an existing entry may hold parked messages and a live dealer socket -- ZMQNet's
+   *  does -- so recreating it would discard queued work. The cost is that a refresh naming a host
+   *  this process has never seen installs the mapping but not the entry, even though the config
+   *  carries that host's address -- and the resulting host lookup routes back through the
+   *  bootstrap pool it is trying to repair. See TODO.txt.
+   *
+   *  Synchronized despite running before the instance escapes, for two reasons. It keeps
+   *  mapBootstrapStores' monitor contract unconditional, so a future caller has one rule rather
+   *  than a rule and an exception. And it publishes what this method writes: `stores`,
+   *  `bootstrapStores` and `hosts` are plain vars, so it is the release of this monitor at the
+   *  end of construction that gives a later synchronized reader -- isBootstrapStore's, say -- a
+   *  happens-before edge to these writes. Uncontended and once per manager, so it costs nothing.
+   *  createHostEntry under the monitor is not a new pattern: startHostLookup's Success
+   *  continuation already calls it that way. The file read and parse are hoisted out, though,
+   *  both to keep that the only call-out under this monitor and to match applyBootstrapConfig,
+   *  which likewise parses first and takes the monitor only to install the result.
+   */
+  private def loadInitialBootstrapConfig(): Unit =
+    val config = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO)
+
+    synchronized:
+      mapBootstrapStores(config)
+
+      config.hosts.foreach: bsHost =>
+        hosts += bsHost.hostId -> Right(networkImplInterface.createHostEntry(
+          bsHost.hostId,
+          bsHost.name,
+          bsHost.address,
+          bsHost.dataPort,
+          bsHost.cncPort,
+          bsHost.storeTransferPort,
+          new EvictingQueue[Message](1)
+        ))
 
   private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =
     val phl = new PendingHostLookup(pendingHostLookupQueueSize)

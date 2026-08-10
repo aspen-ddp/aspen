@@ -29,6 +29,28 @@ object YamlFormat {
     doc
   }
 
+  /** Parses a YAML document already held in memory.
+    *
+    * Exists so a config fetched over the network can be validated before it is written to disk.
+    * Not folded into loadYamlFile: that overload wraps the stream in SnakeYAML's UnicodeReader,
+    * which strips a BOM and detects UTF-8 vs UTF-16, whereas a String has already been decoded
+    * by whoever produced it.
+    *
+    * Throws FormatError for an empty document. A document that parses to something other than a
+    * mapping is returned as-is; the FormatError for that comes later, from the YObject/Required
+    * formatters that consume it. Malformed YAML raises SnakeYAML's own YAMLException subclasses
+    * -- ScannerException, ParserException, ComposerException -- which are not FormatErrors. A
+    * caller guarding this must therefore catch NonFatal, not FormatError.
+    */
+  def loadYamlString(yaml: String): Object = {
+    val doc = new Yaml(new SafeConstructor).load[Object](yaml)
+
+    if (doc == null)
+      throw new FormatError("Empty YAML document")
+
+    doc
+  }
+
   trait Format[T] {
     def format(o: Object): T
   }

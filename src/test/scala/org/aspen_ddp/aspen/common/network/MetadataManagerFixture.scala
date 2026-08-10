@@ -29,11 +29,11 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
  *  complete. Either way the MetadataManager callback that installs (or, on failure, drops) the
  *  entry has finished by the time the test's next line runs, which removes all waiting.
  *
- *  Lock-ordering invariant: never complete a promise returned by lookupPromise or
- *  poolLookupPromise while holding this object's monitor. Because parasitic runs the
- *  MetadataManager continuation inline on the completing thread, doing so would take the
- *  manager's lock while holding the client's lock, inverting the established order
- *  (manager → client) and risking deadlock.
+ *  Lock-ordering invariant: never complete a promise this class vends -- lookupPromise,
+ *  poolLookupPromise or bootstrapConfigPromise -- while holding this object's monitor. Because
+ *  parasitic runs the MetadataManager continuation inline on the completing thread, doing so
+ *  would take the manager's lock while holding the client's lock, inverting the established
+ *  order (manager → client) and risking deadlock.
  *
  *  Everything else is inherited from TestNetwork.TClient purely so this file does not have to
  *  stub the whole AspenClient surface. No read, transaction or message ever leaves it: the
@@ -55,6 +55,10 @@ class LookupRecordingClient extends TestNetwork.TClient(
   private var poolPromises: Map[PoolId, Promise[StoragePoolState]] = Map()
   private var lookupFailures: Map[HostId, Throwable] = Map()
   private var poolLookupFailures: Map[PoolId, Throwable] = Map()
+  private var bootstrapConfigAttempts: Int = 0
+  private var bootstrapConfigPromises: Map[Int, Promise[String]] = Map()
+  private var bootstrapConfigThrownAttempts: Set[Int] = Set()
+  private var bootstrapConfigFailure: Option[Throwable] = None
 
   /** The Promise backing `hostId`'s lookup, created on first use. Callable before or after the
    *  lookup itself so a test can complete it either way round. */
@@ -106,6 +110,58 @@ class LookupRecordingClient extends TestNetwork.TClient(
       case Some(err) => throw err
       case None => poolLookupPromise(poolId).future
 
+  /** How many times getBootstrapConfig has been called.
+   *
+   *  Counting attempts rather than inspecting refreshingBootstrapConfig is what makes guard
+   *  release observable from outside the manager: a released guard lets the next
+   *  dropStoreMapping start a second fetch, a wedged one does not.
+   */
+  def bootstrapConfigFetches: Int = synchronized:
+    bootstrapConfigAttempts
+
+  /** The Promise backing the nth fetch, 1-based, created on first use. Callable before or after
+   *  the fetch itself so a test can complete it either way round.
+   *
+   *  Throws for an attempt that was answered by failBootstrapConfigWith rather than by a Future.
+   *  That attempt has no promise and never will, so handing back a fresh one would give the test
+   *  something it could complete to no effect -- a silent no-op that surfaces as an unrelated
+   *  assertion failure much later.
+   */
+  def bootstrapConfigPromise(attempt: Int): Promise[String] = synchronized:
+    if bootstrapConfigThrownAttempts.contains(attempt) then
+      throw new IllegalArgumentException(
+        s"bootstrap config fetch $attempt was armed to throw, so it has no promise")
+
+    bootstrapConfigPromises.get(attempt) match
+      case Some(p) => p
+      case None =>
+        val p = Promise[String]()
+        bootstrapConfigPromises += attempt -> p
+        p
+
+  /** Makes getBootstrapConfig throw rather than return a Future. Still counts as an attempt --
+   *  the manager did call it.
+   *
+   *  Unlike failLookupWith, whose throw startHostLookup absorbs, where this one ends up depends
+   *  on which kind it is. refreshBootstrapConfig turns a NonFatal throw into its Failure branch:
+   *  the guard is released, the throw is logged, and nothing escapes dropStoreMapping. A fatal
+   *  one is released past rather than absorbed -- it propagates out of dropStoreMapping, so a
+   *  test arming one has to intercept it.
+   */
+  def failBootstrapConfigWith(err: Throwable): Unit = synchronized:
+    bootstrapConfigFailure = Some(err)
+
+  def clearBootstrapConfigFailure(): Unit = synchronized:
+    bootstrapConfigFailure = None
+
+  override def getBootstrapConfig(): Future[String] = synchronized:
+    bootstrapConfigAttempts += 1
+    bootstrapConfigFailure match
+      case Some(err) =>
+        bootstrapConfigThrownAttempts += bootstrapConfigAttempts
+        throw err
+      case None => bootstrapConfigPromise(bootstrapConfigAttempts).future
+
 
 /** A NetworkImplInterface that drains what MetadataManager hands it, the way ZMQNet does, and
  *  records where each message ended up.
@@ -114,10 +170,10 @@ class LookupRecordingClient extends TestNetwork.TClient(
  *  empty the EvictingQueue they are given before returning, so a double that left messages in
  *  place would not model the handoff it is here to observe.
  *
- *  Lock-ordering note: MetadataManager calls both methods either from its constructor, before
- *  any other thread can see it, or while holding its own monitor -- so the recorder's monitor is
- *  never acquired before the manager's. Tests read the recordings without holding the manager's
- *  lock, which keeps that order intact.
+ *  Lock-ordering note: MetadataManager calls both methods while holding its own monitor -- the
+ *  constructor path included, since loadInitialBootstrapConfig takes it -- so the recorder's
+ *  monitor is never acquired before the manager's. Tests read the recordings without holding the
+ *  manager's lock, which keeps that order intact.
  */
 class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[MetadataManager.HostEntry]:
 
@@ -238,31 +294,55 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
       StorageDeviceSetId(UUID.randomUUID()))
 
   private var tempDir: Path = scala.compiletime.uninitialized
-  private var bootstrapConfigFile: os.Path = scala.compiletime.uninitialized
+  private var templateConfig: String = scala.compiletime.uninitialized
 
   override protected def beforeAll(): Unit =
     super.beforeAll()
     tempDir = Files.createTempDirectory("aspen-metadata-manager")
-    val f = tempDir.resolve("aspen-bootstrap-config.yaml")
-    val yaml = BootstrapConfig.generateBootstrapConfig(
-      systemId,
+    templateConfig = bootstrapConfigYaml(
       Replication(1, 1),
       List(HostState(bootstrapHostId, "bootstrap_host", "127.0.0.1", 5000, 5001, 5002, Set())),
       List(StoreId(poolId, 0.toByte) -> bootstrapHostId))
-    Files.write(f, yaml.getBytes(StandardCharsets.UTF_8))
-    bootstrapConfigFile = os.Path(f)
 
   override protected def afterAll(): Unit =
     try os.remove.all(os.Path(tempDir))
     catch case _: Throwable => ()
     finally super.afterAll()
 
-  /** A MetadataManager over the fixture's bootstrap config, wired to a fresh recording client and
-   *  a fresh RecordingNetworkImpl. Returning the impl is what lets a suite assert that a message
-   *  actually reached a host rather than merely that a lookup was started. */
-  protected def newManager(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl) =
+  /** A bootstrap config over the fixture's systemId.
+   *
+   *  BootstrapConfig.Config rejects a config whose total store count differs from the IDA width,
+   *  so callers must keep `ida.width` equal to the number of entries in `storeMap`.
+   */
+  protected def bootstrapConfigYaml(ida: Replication,
+                                    hostStates: List[HostState],
+                                    storeMap: List[(StoreId, HostId)]): String =
+    BootstrapConfig.generateBootstrapConfig(systemId, ida, hostStates, storeMap)
+
+  /** newManager, plus the path of the config file that manager was handed.
+   *
+   *  Every manager gets its own copy in its own directory. Sharing one file across managers was
+   *  harmless while nothing rewrote it, but a refresh that succeeds writes through
+   *  atomicWrite -- one test's refreshed config would then be the next test's starting state.
+   *  The private directory also gives a test a way to make the write fail: remove the directory
+   *  and atomicWrite's Files.createTempFile(parentDir, ...) raises NoSuchFileException, which
+   *  works regardless of the privileges the suite runs under.
+   */
+  protected def newManagerWithConfigFile(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl, os.Path) =
+    val dir = Files.createTempDirectory(tempDir, "manager-")
+    val f = dir.resolve(BootstrapConfig.configFilename)
+    Files.write(f, templateConfig.getBytes(StandardCharsets.UTF_8))
+    val path = os.Path(f)
+
     val impl = new RecordingNetworkImpl
     val client = new LookupRecordingClient
-    val mgr = new MetadataManager[MetadataManager.HostEntry](bootstrapConfigFile, impl)
+    val mgr = new MetadataManager[MetadataManager.HostEntry](path, impl)
     mgr.setAspenClient(client)
+    (mgr, client, impl, path)
+
+  /** A MetadataManager over a bootstrap config naming exactly one host, wired to a fresh
+   *  recording client and a fresh RecordingNetworkImpl. Returning the impl is what lets a suite
+   *  assert that a message actually reached a host rather than merely that a lookup was started. */
+  protected def newManager(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl) =
+    val (mgr, client, impl, _) = newManagerWithConfigFile()
     (mgr, client, impl)

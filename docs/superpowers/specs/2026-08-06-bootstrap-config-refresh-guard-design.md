@@ -209,6 +209,13 @@ private def applyBootstrapConfig(cfg: String): Unit =
 The write is the only step with a local `catch`, because it is the only one the method continues
 past. The parse has nothing to continue to, so it propagates.
 
+Implementation note, added after the fact: the shipped code reverses the last two steps, mapping
+before writing rather than after, and says so in its scaladoc. The end state is the same either
+way, but the mapping is the repair the refresh exists to deliver and it is free, whereas the write
+is best-effort and can block on the disk for as long as the disk takes -- with every other
+bootstrap store's correction held behind it, since the guard is not released until the callback
+returns. The sample above is left as it was written.
+
 ### `mapBootstrapStores`
 
 ```scala

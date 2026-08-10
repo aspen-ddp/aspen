@@ -115,6 +115,13 @@ object BootstrapConfig:
   def loadBootstrapConfig(file: File): Config =
     Config.create(loadYamlFile(file))
 
+  /** Parses a bootstrap config held in memory, applying the same `Config` validation
+   *  loadBootstrapConfig applies to a file. Not identical below that: a document that is not a
+   *  mapping raises FormatError here and ClassCastException there, from the checkcast
+   *  loadYamlFile's load[java.util.AbstractMap[...]] call site inserts. */
+  def parseBootstrapConfig(yaml: String): Config =
+    Config.create(loadYamlString(yaml))
+
 
   def generateBootstrapConfig(aspenSystemId: UUID,
                               ida: IDA,

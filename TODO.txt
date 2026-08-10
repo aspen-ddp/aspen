@@ -45,21 +45,25 @@ A bootstrap config refresh never creates or updates a host entry
     heard from) is explicitly scoped to non-bootstrap hosts
 
 refreshBootstrapConfig still strands its guard if onComplete cannot be submitted
-  - The try/catch covers the getBootstrapConfig call only, so the flag is
-    already true when onComplete registers. An ExecutionContext that rejects
-    the submission therefore leaves refreshingBootstrapConfig true with no
-    callback to run the finally that clears it -- the same permanent-wedge
-    class every other path in that method now closes
+  - The flag is set before onComplete registers and the finally that clears it
+    lives in the callback, so an ExecutionContext that rejects the submission
+    leaves refreshingBootstrapConfig true: the callback simply never runs, and
+    the finally never runs with it -- the same permanent-wedge class every
+    other path in that method now closes
+  - No try wrapper closes this, at any width, because nothing throws where a
+    wrapper could sit. Promise$Transformation.submitWithValue catches the
+    rejection and hands it to ExecutionContext.reportFailure, so onComplete
+    returns normally; and if the future is still pending at registration the
+    rejection is raised later, on the thread that completes the promise,
+    inside promise.success -- which also returns normally. Confirmed by
+    execution on Scala 3.3.4 and 3.7.3, in both of those shapes
   - Not reachable today. clientContext is backed by a scheduled thread pool
     that only rejects after shutdown, and Aspen is crash-only, so nothing shuts
     it down in a process that runs a MetadataManager. The one shutdownNow in
     the tree is a local scheduler in Main's bootstrap command, which builds a
     system offline and never refreshes
-  - Left as-is rather than widened because widening the wrapper has a cost the
-    narrow scope avoids: it would also catch a fatal thrown out of the callback
-    body, which Transformation rethrows through onComplete, and intercepting
-    that buys only a redundant second release. Closing this properly wants the
-    flag released by something other than the callback
+  - Closing this properly wants the flag released by something other than the
+    callback
 
 StoreManager.reconcileDeviceState can retry the host-migration path forever
   - On a hostId mismatch it calls updateHostId and then checkStorageDevice

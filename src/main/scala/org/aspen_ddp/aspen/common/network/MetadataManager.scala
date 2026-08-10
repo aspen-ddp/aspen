@@ -74,13 +74,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
     synchronized:
       oClient = Some(client)
 
-  /** Synchronized because bootstrapStores is no longer written only at construction: a refresh
-   *  adopts whatever stores the fetched config names, under this monitor. The in-class callers
-   *  below already hold it -- the monitor is reentrant, so this costs them nothing -- but this
-   *  method is public, and an unsynchronized caller has no happens-before edge to that write and
-   *  could keep reading a set the refresh has already replaced. The constructor's write needs the
-   *  same edge, which is why loadInitialBootstrapConfig takes this monitor too: without that,
-   *  acquiring here would cover only the refresh and leave a never-refreshed set unpublished. */
+  /** Reads bootstrapStores, which a refresh rewrites; loadInitialBootstrapConfig's scaladoc has
+   *  the publication argument for both writers. */
   def isBootstrapStore(storeId: StoreId): Boolean =
     synchronized:
       bootstrapStores.contains(storeId)
@@ -193,8 +188,9 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  moved is usually noticed by several sends at once, and one refetch answers all of them.
    *  Because it is a plain Boolean rather than an entry in a map, a path that leaves it set
    *  disables refresh permanently -- and dropStoreMapping has no fallback for a bootstrap store,
-   *  so the correction is dropped rather than degraded. Every exit therefore releases it,
-   *  including the one that rethrows a fatal rather than reporting it.
+   *  so the correction is dropped rather than degraded. Every exit reachable by a throw
+   *  therefore releases it, including the one that rethrows a fatal rather than reporting it.
+   *  One exit is not reachable by a throw and does strand it: see the end of the next paragraph.
    *
    *  The try/catch wraps the getBootstrapConfig call and nothing else. Widening it over the
    *  onComplete registration would not catch a NonFatal throw from the callback body even under
@@ -203,9 +199,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  fact startHostLookup's catch relies on. What a wider wrapper would reach is a fatal from
    *  the callback body, which Transformation does rethrow out through onComplete -- and nothing
    *  here should intercept that: the callback's own finally has already released the flag, so
-   *  the only effect would be a second, redundant release on its way past. The narrow scope
-   *  leaves onComplete itself unguarded: an ExecutionContext that rejects the submission still
-   *  strands the flag.
+   *  the only effect would be a second, redundant release on its way past. What the narrow
+   *  scope gives up is nothing a wider one could take back. An ExecutionContext that rejects
+   *  the submission strands the flag -- the callback never runs, so its finally never runs --
+   *  and no wrapper at this call site can reach that, because nothing throws here to catch:
+   *  Transformation absorbs the rejection into reportFailure, and for a future still pending at
+   *  registration the rejection is raised later, on the thread that completes it. See TODO.txt.
    *
    *  clientContext is an abstract def, so binding it can throw. A bare `given` would not help:
    *  an alias given compiles to a lazy val, so the call would not run until the implicit is
@@ -271,14 +270,9 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  process picks up the new placements immediately and only loses them across a restart,
    *  strictly better than discarding a good config because the disk is full or read-only.
    *
-   *  That the mapping comes first is deliberate, not incidental, so do not reorder these two. The
-   *  mapping is the repair this whole refresh exists to deliver and it is pure in-memory work;
-   *  the write is best-effort, and its failure is logged and ignored. Writing first would delay
-   *  the routing correction by however long the disk takes -- and, because the caller releases
-   *  refreshingBootstrapConfig only once this returns, would hold every other bootstrap store's
-   *  correction behind that same disk for that same duration. Both steps consume values already
-   *  computed above, so the end state is identical either way -- a fatal from the write is the
-   *  only divergence, and it leaves the mapping applied rather than lost.
+   *  Do not reorder those two. The mapping is the repair this refresh exists to deliver and it
+   *  is free; the write is best-effort, and going first it would delay the repair by however
+   *  long the disk takes.
    */
   private def applyBootstrapConfig(cfg: String): Unit =
     val config = BootstrapConfig.parseBootstrapConfig(cfg)

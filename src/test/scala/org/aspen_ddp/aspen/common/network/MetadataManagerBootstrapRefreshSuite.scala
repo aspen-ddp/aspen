@@ -19,7 +19,8 @@ import java.util.UUID
  *  rather than rethrowing it, so nothing here can observe either the flag or an escaping
  *  exception directly. A test claiming the guard was released instead makes a second
  *  dropStoreMapping call and asserts a second fetch was attempted: a released guard permits one,
- *  a wedged guard does not.
+ *  a wedged guard does not. The one throw a test does see is a fatal out of the fetch call
+ *  itself, which refreshBootstrapConfig releases past rather than absorbing.
  *
  *  Beyond guard release the tests carry two further claims. Where the fetched config ends up:
  *  parsing it before writing is what keeps a rejected config off disk, and mapping from the
@@ -29,6 +30,11 @@ import java.util.UUID
  *  not name is corrected by a later refresh rather than dropped by dropStoreMapping and left to a
  *  pool lookup that routes back through the bootstrap stores themselves. That adoption is
  *  add-only, so a store the fetched config omits keeps both its mapping and its bootstrap status.
+ *
+ *  Only one rejected config is exercised, because from here they are all the same shape: the
+ *  refresh cares that the parse threw, not what it threw. Which exception each malformed shape
+ *  raises -- FormatError from Config's own validation, SnakeYAML's YAMLException subclasses from
+ *  a document that does not parse -- belongs to BootstrapConfigSuite and is covered there.
  *
  *  Every refresh here is driven through dropStoreMapping. receivedUnknownStoreFromHost is the
  *  other public path that reaches refreshBootstrapConfig for a bootstrap store; the two differ
@@ -68,6 +74,24 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
     // Pre-fix this throw propagates straight out of dropStoreMapping -- past the guard it just
     // set -- and into whatever called it, typically the network IO thread.
     mgr.dropStoreMapping(bootstrapStoreId)
+    client.bootstrapConfigFetches should be(1)
+
+    client.clearBootstrapConfigFailure()
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+    client.bootstrapConfigFetches should be(2)
+
+  test("a getBootstrapConfig call that throws a fatal releases the guard on its way past"):
+    val (mgr, client, _) = newManager()
+
+    client.failBootstrapConfigWith(new StackOverflowError("getBootstrapConfig blew the stack"))
+
+    // A fatal is not swallowed here -- startHostLookup and startPoolLookup both let one out of
+    // the same position -- so this one propagates out of dropStoreMapping. The release happens
+    // on its way past, which is the whole claim: the branch that rethrows clears the flag first.
+    intercept[StackOverflowError]:
+      mgr.dropStoreMapping(bootstrapStoreId)
+
     client.bootstrapConfigFetches should be(1)
 
     client.clearBootstrapConfigFailure()
@@ -148,23 +172,6 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
     client.bootstrapConfigPromise(1).success(fresh)
 
     os.read(configFile) should be(fresh)
-
-  test("a fetched config that is not YAML at all leaves the file unchanged and the refresh retryable"):
-    val (mgr, client, _, configFile) = newManagerWithConfigFile()
-
-    val before = os.read(configFile)
-
-    mgr.dropStoreMapping(bootstrapStoreId)
-
-    // Not a FormatError: SnakeYAML raises ParserException, a plain RuntimeException. This is the
-    // case loadYamlString's scaladoc warns about -- the reason applyBootstrapConfig's caller
-    // catches NonFatal rather than FormatError. Nothing else in the tree covers it.
-    client.bootstrapConfigPromise(1).success("bootstrap-hosts: [unclosed\n")
-
-    os.read(configFile) should be(before)
-
-    mgr.dropStoreMapping(bootstrapStoreId)
-    client.bootstrapConfigFetches should be(2)
 
   test("a successful refresh remaps the store and adopts new bootstrap stores"):
     val (mgr, client, _) = newManager()

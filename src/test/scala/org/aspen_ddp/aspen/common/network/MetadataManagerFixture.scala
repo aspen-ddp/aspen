@@ -143,8 +143,10 @@ class LookupRecordingClient extends TestNetwork.TClient(
    *  the manager did call it.
    *
    *  Unlike failLookupWith, whose throw startHostLookup absorbs, where this one ends up depends
-   *  on what refreshBootstrapConfig does with a synchronous throw. Check that before assuming a
-   *  test needs -- or does not need -- to intercept it.
+   *  on which kind it is. refreshBootstrapConfig turns a NonFatal throw into its Failure branch:
+   *  the guard is released, the throw is logged, and nothing escapes dropStoreMapping. A fatal
+   *  one is released past rather than absorbed -- it propagates out of dropStoreMapping, so a
+   *  test arming one has to intercept it.
    */
   def failBootstrapConfigWith(err: Throwable): Unit = synchronized:
     bootstrapConfigFailure = Some(err)

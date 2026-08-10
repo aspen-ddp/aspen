@@ -35,6 +35,7 @@ project/plugins/project/
 # Claude/AI
 Prompt.txt
 .mcp.json
+.claude
 
 # Demo generated files
 demo/bootstrap

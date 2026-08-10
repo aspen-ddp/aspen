@@ -113,46 +113,6 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - If committed, FinalizationActions are then run. Once complete, the CRL content is dropped and the transaction is forgotten.
   - If the refcount of the object is set to zero, it is deleted
 
-### Client Internals
-- Largely a collection of Managers and Drivers used to overcome message loss to and from DataStores.
-  - Drivers track response state and re-issue messages to slow/offline stores until the individual operation concludes
-  - Managers track the drivers and deliver messages to them as they arrive from the network
-- There are two key Managers:
-  - ReadManager - Ensures reads complete
-  - TransactionManager - Ensures transactions complete
-- Proactively assists with object reconstruction by sending OpportunisticRebuild messages when DataStores return stale
-  object state.
-
-### Messaging & Serialization
-- Google ProtocolBuffers is used for serializstion/deserialization of both network messages and arbitrary data 
-  structures
-- Currently, all encoding and decoding is done within the Codec class and a single codec.proto file
-- A common pattern and naming scheme is used for all encode/decode functions
-- The common.network.Message module defines all non-CnC messages
-- Messages are sent between logical entities e.g. Clients and DataStores or DataStores to other DataStores.
-- Low-level networking dealing with things like network endpoints, transport protocols, and the like are mostly 
-  handled by the networking plugin.
-     
-### Crash Recovery Log
-- Similar to a write-ahead-log in traditional databases
-- Stores the state necessary for Paxos as well as the TransactionDescription, commit/abort vote, and object data
-- Only read at application startup to recover in-progress transactions
-- Takes advantage of the fact that Transactions are typically very short-lived so their state usually does not need to
-  be retained for long
-- Implemented as a series of fixed-size, write-only files that are continually recycled.
-- Functions similar to a circular buffer when the oldest "live" data is copied to the head of the buffer whenever it
-  is about to overwrite that live data.
-
-### Tiered Key Value List (TKVL)
-- Very simple B-Tree like data structure implemented in terms of a hierarchy of linked lists.
-- Trees use a KeyOrdering instance to sort keys. Current orderings include Integer, Lexical, and ByteArray
-- Every time a new node is added to a list, an the minimum value of the new node and a pointer to the new object is
-  inserted into the tier above it.
-- Tier-0 holds the data, the upper tiers consist exclusively of (minimum_key, object-pointer) pairs
-- The root of the tree is replaced every time the current root node is split into two nodes
-- FinalizationActions are used to insert/remove entries in upper tiers as nodes are split/joined
-- Left to right navigation in a tier is guaranteed to be consistent. Navigation between tiers is not
-
 ### Command and Control (CnC)
 - Mechanism to instruct a store to do something immediately
 - Generally avoided as messages can be lost and/or hosts may be unavailable when the command is issued
@@ -180,33 +140,15 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Application design and usage patterns should take this into account and reduce the potential
     for collisions whenever possible
 
-## Code Organization
-- **Client** (`org.aspen_ddp.aspen.client`): AspenClient, object readers, allocators, transactions
-- **Server** (`org.aspen_ddp.aspen.server`): Store management, transaction processing, CRL (Crash Recovery Log)
-- **Common** (`org.aspen_ddp.aspen.common`): Shared data structures, network protocols, IDA (Information Dispersal Algorithms)
-- **Compute** (`org.aspen_ddp.aspen.compute`): Implements a durable, crash-and-recover tasking model on top of Aspen objects for long-lived and/or multi-step tasks.
-- **AmoebaFS** (`org.aspen_ddp.aspen.amoebafs`): NFS server that exports a distributed filesystem implemented on top of an Aspen client.
-- **Cmdline** (`org.aspen_ddp.aspen.cmdline`): Command line utilities for launching processes with ZeroMQ based networking. Very much a work-in-progress.
-
 ## Building and Testing
-- `sbt compile` - Compile the project
-- `sbt test` - Run all tests
 - `sbt 'testOnly *TestName -- -z "test substring"'` - Run a specific test by substring
-
-## Testing and Configuration
-- ScalaTest framework with custom timeouts (`Tests.Argument(TestFrameworks.ScalaTest, "-W", "10", "5")`)
-- YAML-based configuration for bootstrap, nodes, and logging
-- Log4j2 with async logging configuration
 
 ## Key Dependencies
 - **Scaffeine**: Used for all caching operations
-- **nfs4j-core**: Provides the NFSv4 interface to export the AmoebaFS distributed file system
 - **os-lib**: Should be used for all filesystem operations. (currently a mix of native java and os-lib)
 - **jeromq**: Used for the ZeroMQ network plugin. Simple but inefficient
-- **SnakeYAML**: Used for reading configuration files
-- **rocksdbjni**: Used for the RocksDB DataStore implementation
-- **slf4j-log4j12**: Provides the interface for logging
 
 ## Development Rules
 - Prefer Scala 3 "quiet mode" syntax. Braces should still be used when they clearly enhance readability
 - Prefer indented if/then/else syntax. Avoid single lines e.g. "if a == 1 then value" unless it enhances readability
+- `cmdline` is a work-in-progress; treat its interfaces as unstable

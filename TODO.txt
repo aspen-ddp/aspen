@@ -18,6 +18,32 @@ several failure paths
     has try/catch/finally covering its write and reload. Unlike the ZMQNet
     entries no test seam is needed -- it is out of scope by spec, not by cost
 
+A bootstrap config refresh can map a store onto a host it has no entry for
+  - MetadataManager.mapBootstrapStores installs the store -> host mappings the
+    fetched config names and deliberately leaves the hosts map alone. Move a
+    bootstrap store to a host this process has never talked to and the mapping
+    lands while the host entry does not, even though the config it came from
+    carries that host's address and ports
+  - The next send to that store therefore reaches startHostLookup, which reads
+    the host's state out of the hosts tree whose root lives in the radicle
+    object -- an object in the bootstrap pool. Those reads are addressed to the
+    very bootstrap stores the refresh was correcting, and the moved store's
+    share of them parks behind the host lookup that would resolve it. Whether
+    the read still completes comes down to whether the remaining bootstrap
+    stores meet the IDA's read threshold without it
+  - Not fixed here because the obvious fix is wrong for the common case:
+    calling createHostEntry for a host already in the map replaces a live
+    entry, and ZMQNet's holds both a pending-message queue and a connected
+    dealer socket, so the queued work would be discarded. A fix has to
+    distinguish a host the process has never seen from a known one and create
+    an entry only for the former
+  - Clears at restart either way: the refresh normally writes the config
+    through to disk, so loadInitialBootstrapConfig builds the missing entry
+    from the same file the refresh came from, and if that best-effort write
+    failed the restart reverts to the old config instead. Recorded rather than
+    treated as a regression -- the pre-refresh code mapped without creating
+    entries too
+
 StoreManager.reconcileDeviceState can retry the host-migration path forever
   - On a hostId mismatch it calls updateHostId and then checkStorageDevice
     again. If the remote hostId never converges, that reads a still-mismatched

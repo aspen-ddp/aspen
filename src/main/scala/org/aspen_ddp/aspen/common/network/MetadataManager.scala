@@ -68,26 +68,22 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
   private var hosts: Map[HostId, Either[PendingHostLookup, T]] = Map()
   private var refreshingBootstrapConfig: Boolean = false
 
-  BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).hosts.foreach: bsHost =>
-    bsHost.stores.foreach: storeId =>
-      stores += storeId -> bsHost.hostId
-      bootstrapStores += storeId
-
-    hosts += bsHost.hostId -> Right(networkImplInterface.createHostEntry(
-      bsHost.hostId,
-      bsHost.name,
-      bsHost.address,
-      bsHost.dataPort,
-      bsHost.cncPort,
-      bsHost.storeTransferPort,
-      new EvictingQueue[Message](1)
-    ))
+  loadInitialBootstrapConfig()
 
   def setAspenClient(client: AspenClient): Unit =
     synchronized:
       oClient = Some(client)
 
-  def isBootstrapStore(storeId: StoreId): Boolean = bootstrapStores.contains(storeId)
+  /** Synchronized because bootstrapStores is no longer written only at construction: a refresh
+   *  adopts whatever stores the fetched config names, under this monitor. The in-class callers
+   *  below already hold it -- the monitor is reentrant, so this costs them nothing -- but this
+   *  method is public, and an unsynchronized caller has no happens-before edge to that write and
+   *  could keep reading a set the refresh has already replaced. The constructor's write needs the
+   *  same edge, which is why loadInitialBootstrapConfig takes this monitor too: without that,
+   *  acquiring here would cover only the refresh and leave a never-refreshed set unpublished. */
+  def isBootstrapStore(storeId: StoreId): Boolean =
+    synchronized:
+      bootstrapStores.contains(storeId)
 
   def receivedUnknownStoreFromHost(hostId: HostId, storeId: StoreId): Unit =
     synchronized:
@@ -190,7 +186,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
       else
         stores -= storeId
 
-  /** Refetches the bootstrap config and reinstalls the store -> host mappings it names.
+  /** Refetches the bootstrap config and reinstalls the store -> host mappings it names, along
+   *  with the set of stores that count as bootstrap stores.
    *
    *  refreshingBootstrapConfig coalesces concurrent requests: a bootstrap store whose host has
    *  moved is usually noticed by several sends at once, and one refetch answers all of them.
@@ -287,9 +284,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
     val config = BootstrapConfig.parseBootstrapConfig(cfg)
 
     synchronized:
-      config.hosts.foreach: bsHost =>
-        bsHost.stores.foreach: storeId =>
-          stores += storeId -> bsHost.hostId
+      mapBootstrapStores(config)
 
     try
       atomicWrite(bootstrapConfigFile.toNIO, cfg)
@@ -297,6 +292,69 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
     catch
       case NonFatal(t) =>
         logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $t", t)
+
+  /** Installs every store -> host mapping the config names and marks each store as a bootstrap
+   *  store.
+   *
+   *  Add-only: nothing is removed here, from `stores` or from `bootstrapStores`. A store the
+   *  refreshed config omits therefore keeps both its old mapping and its bootstrap status, which
+   *  is the conservative reading. The config is the only source that can name a bootstrap store,
+   *  and forgetting one would send it down dropStoreMapping's non-bootstrap branch, which drops
+   *  its mapping and leaves the next send to start a pool lookup -- against a pool whose state
+   *  can only be read through the bootstrap stores themselves.
+   *
+   *  That is add-only along this path only, for `stores`: dropStoreMapping and
+   *  receivedUnknownStoreFromHost both remove from it elsewhere. `bootstrapStores` has no removal
+   *  site anywhere in the class.
+   *
+   *  The constructor and a refresh share this method so the two can never disagree about which
+   *  stores are bootstrap stores.
+   *
+   *  Caller must hold this object's monitor.
+   */
+  private def mapBootstrapStores(config: BootstrapConfig.Config): Unit =
+    config.hosts.foreach: bsHost =>
+      bsHost.stores.foreach: storeId =>
+        stores += storeId -> bsHost.hostId
+        bootstrapStores += storeId
+
+  /** Loads the on-disk bootstrap config at construction: the store mappings, plus a HostEntry
+   *  for each named host so those hosts are reachable before any lookup completes.
+   *
+   *  Only the mapping half is shared with a refresh. A refresh deliberately does not touch
+   *  `hosts`: an existing entry may hold parked messages and a live dealer socket -- ZMQNet's
+   *  does -- so recreating it would discard queued work. The cost is that a refresh naming a host
+   *  this process has never seen installs the mapping but not the entry, even though the config
+   *  carries that host's address -- and the resulting host lookup routes back through the
+   *  bootstrap pool it is trying to repair. See TODO.txt.
+   *
+   *  Synchronized despite running before the instance escapes, for two reasons. It keeps
+   *  mapBootstrapStores' monitor contract unconditional, so a future caller has one rule rather
+   *  than a rule and an exception. And it publishes what this method writes: `stores`,
+   *  `bootstrapStores` and `hosts` are plain vars, so it is the release of this monitor at the
+   *  end of construction that gives a later synchronized reader -- isBootstrapStore's, say -- a
+   *  happens-before edge to these writes. Uncontended and once per manager, so it costs nothing.
+   *  createHostEntry under the monitor is not a new pattern: startHostLookup's Success
+   *  continuation already calls it that way. The file read and parse are hoisted out, though,
+   *  both to keep that the only call-out under this monitor and to match applyBootstrapConfig,
+   *  which likewise parses first and takes the monitor only to install the result.
+   */
+  private def loadInitialBootstrapConfig(): Unit =
+    val config = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO)
+
+    synchronized:
+      mapBootstrapStores(config)
+
+      config.hosts.foreach: bsHost =>
+        hosts += bsHost.hostId -> Right(networkImplInterface.createHostEntry(
+          bsHost.hostId,
+          bsHost.name,
+          bsHost.address,
+          bsHost.dataPort,
+          bsHost.cncPort,
+          bsHost.storeTransferPort,
+          new EvictingQueue[Message](1)
+        ))
 
   private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =
     val phl = new PendingHostLookup(pendingHostLookupQueueSize)

@@ -8,7 +8,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
 
-/** What a bootstrap config refresh costs when it goes wrong.
+/** What a bootstrap config refresh delivers, and what it costs when it goes wrong.
  *
  *  refreshingBootstrapConfig is a plain Boolean, so a refresh that ends without clearing it
  *  disables every later refresh for the life of the process. dropStoreMapping routes bootstrap
@@ -17,18 +17,22 @@ import java.util.UUID
  *
  *  The flag is private and ExecutionContext.parasitic reports a throw from an onComplete callback
  *  rather than rethrowing it, so nothing here can observe either the flag or an escaping
- *  exception directly. Each test instead makes a second dropStoreMapping call and asserts a
- *  second fetch was attempted: a released guard permits one, a wedged guard does not.
+ *  exception directly. A test claiming the guard was released instead makes a second
+ *  dropStoreMapping call and asserts a second fetch was attempted: a released guard permits one,
+ *  a wedged guard does not.
  *
- *  The last two tests carry a second claim beyond guard release: where the fetched config ends
- *  up. Parsing it before writing is what keeps a rejected config off disk, and mapping from the
+ *  Beyond guard release the tests carry two further claims. Where the fetched config ends up:
+ *  parsing it before writing is what keeps a rejected config off disk, and mapping from the
  *  parsed result rather than from a re-read is what keeps a failed write from discarding a good
- *  config.
+ *  config. And what a refresh does to the store maps: it installs the store -> host mappings the
+ *  config names *and* adopts those stores as bootstrap stores, so a store the original config did
+ *  not name is corrected by a later refresh rather than dropped by dropStoreMapping and left to a
+ *  pool lookup that routes back through the bootstrap stores themselves. That adoption is
+ *  add-only, so a store the fetched config omits keeps both its mapping and its bootstrap status.
  *
- *  Every test drives the refresh through dropStoreMapping(bootstrapStoreId).
- *  receivedUnknownStoreFromHost is the other public path that reaches refreshBootstrapConfig for
- *  a bootstrap store; the two differ only in how they decide to call it, so dropStoreMapping
- *  stands in for both.
+ *  Every refresh here is driven through dropStoreMapping. receivedUnknownStoreFromHost is the
+ *  other public path that reaches refreshBootstrapConfig for a bootstrap store; the two differ
+ *  only in how they decide to call it, so dropStoreMapping stands in for both.
  */
 class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
     with Matchers
@@ -161,3 +165,56 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
 
     mgr.dropStoreMapping(bootstrapStoreId)
     client.bootstrapConfigFetches should be(2)
+
+  test("a successful refresh remaps the store and adopts new bootstrap stores"):
+    val (mgr, client, _) = newManager()
+
+    mgr.isBootstrapStore(bootstrapStoreId) should be(true)
+    mgr.isBootstrapStore(secondStoreId) should be(false)
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+
+    // The refreshed config moves the existing store to remoteHostId and adds a second one there.
+    // Two stores means the IDA width must be two -- BootstrapConfig.Config rejects a mismatch.
+    client.bootstrapConfigPromise(1).success(bootstrapConfigYaml(
+      Replication(2, 2),
+      List(remoteHostState),
+      List(bootstrapStoreId -> remoteHostId, secondStoreId -> remoteHostId)))
+
+    mgr.getHostEntryOrQueueMessage(bootstrapStoreId, nudge()) should be(None)
+    client.lookups.toList should be(List(remoteHostId))
+
+    // Pre-fix bootstrapStores is written once, by the constructor, so the newly named store is
+    // treated as an ordinary store: dropStoreMapping would drop its mapping and the next send
+    // would start a pool lookup -- against the bootstrap pool, whose state is only readable
+    // through the bootstrap stores themselves.
+    mgr.isBootstrapStore(secondStoreId) should be(true)
+
+    // The consequence, driven rather than described: dropping the second store's mapping now
+    // takes the refresh branch. The first refresh released the guard, so a second fetch is
+    // permitted. Pre-fix this took `stores -= storeId` instead and the count stayed at one.
+    mgr.dropStoreMapping(secondStoreId)
+    client.bootstrapConfigFetches should be(2)
+
+  test("a refresh that omits a store leaves its mapping and its bootstrap status intact"):
+    val (mgr, client, _) = newManager()
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+
+    // A config naming only the second store. One store means an IDA of width one.
+    client.bootstrapConfigPromise(1).success(bootstrapConfigYaml(
+      Replication(1, 1),
+      List(remoteHostState),
+      List(secondStoreId -> remoteHostId)))
+
+    // mapBootstrapStores is add-only, so the omitted store keeps both halves of what the
+    // original config gave it. Lose the mapping and the next send starts a pool lookup; lose the
+    // bootstrap status and the next dropStoreMapping drops the mapping rather than refreshing,
+    // arriving at the same place -- a lookup against the pool whose state is only readable
+    // through the bootstrap stores themselves.
+    mgr.isBootstrapStore(bootstrapStoreId) should be(true)
+
+    // Still mapped to bootstrapHostId, which the constructor gave a host entry, so this
+    // resolves outright rather than parking the message behind a lookup.
+    mgr.getHostEntryOrQueueMessage(bootstrapStoreId, nudge()) should not be None
+    client.lookups.toList should be(Nil)

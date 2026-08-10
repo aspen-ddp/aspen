@@ -168,10 +168,10 @@ class LookupRecordingClient extends TestNetwork.TClient(
  *  empty the EvictingQueue they are given before returning, so a double that left messages in
  *  place would not model the handoff it is here to observe.
  *
- *  Lock-ordering note: MetadataManager calls both methods either from its constructor, before
- *  any other thread can see it, or while holding its own monitor -- so the recorder's monitor is
- *  never acquired before the manager's. Tests read the recordings without holding the manager's
- *  lock, which keeps that order intact.
+ *  Lock-ordering note: MetadataManager calls both methods while holding its own monitor -- the
+ *  constructor path included, since loadInitialBootstrapConfig takes it -- so the recorder's
+ *  monitor is never acquired before the manager's. Tests read the recordings without holding the
+ *  manager's lock, which keeps that order intact.
  */
 class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[MetadataManager.HostEntry]:
 

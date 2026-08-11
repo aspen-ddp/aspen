@@ -1,25 +1,18 @@
 package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.client.internal.network.Messenger
-import org.aspen_ddp.aspen.client.{AspenClient, CorruptedObject, DataObjectState, InvalidObject, KeyValueObjectState, ObjectAllocator, ObjectAllocatorId, ObjectCache, RetryStrategy, StoragePool, Transaction, TransactionStatusCache, TypeRegistry}
-import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, HostMessage, ReadResponse}
+import org.aspen_ddp.aspen.client.{CorruptedObject, DataObjectState, InvalidObject, ReadDriverClient}
+import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
-import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
-import org.aspen_ddp.aspen.server.store.backend.BackendConfig
-import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
 
-import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.{Await, ExecutionContext}
 import scala.concurrent.duration.*
 import scala.language.implicitConversions
 
@@ -48,81 +41,13 @@ object BaseReadDriverSuite {
 
   val client = ClientId(cliUUID)
 
-  class TClient(override val clientId: ClientId) extends AspenClient {
-
-    val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
-
-    val typeRegistry: TypeRegistry = null
-
-    def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] = Future.failed(new Exception("TODO"))
-    def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] = Future.failed(new Exception("TODO"))
-
-    def newTransaction(): Transaction = null
-
-    override def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] = ???
-    
-    protected def createStoragePool(config: StoragePoolState): Future[PoolId] = ???
-
-    def getStoragePoolId(poolName: String): Future[PoolId] = ???
-    def getHostId(hostName: String): Future[HostId] = ???
-    def getAllocationGroupId(groupName: String): Future[AllocationGroupId] = ???
-    def getStorageDeviceSetId(setName: String): Future[StorageDeviceSetId] = ???
-
-    def listStoragePools(): Future[List[(String, PoolId)]] = ???
-    def listHosts(): Future[List[(String, HostId)]] = ???
-    def listAllocationGroups(): Future[List[(String, AllocationGroupId)]] = ???
-    def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]] = ???
-
-    def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] = ???
-    def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer] = ???
-    def getStorageDevicePointer(storageDeviceId: StorageDeviceId): Future[KeyValueObjectPointer] = ???
-    def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer] = ???
-    def getStorageDeviceSetPointer(storageDeviceSetId: StorageDeviceSetId): Future[DataObjectPointer] = ???
-
-    def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] = ???
-    def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId] = ???
-    def createStorageDevice(hostId: HostId, deviceSetId: StorageDeviceSetId): Future[StorageDeviceId] = ???
-
-    val retryStrategy: RetryStrategy = null
-
-    def backgroundTaskManager: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager
-
-    def clientContext: ExecutionContext = scala.concurrent.ExecutionContext.Implicits.global
-
-    private[client] def opportunisticRebuildManager: OpportunisticRebuildManager = OpportunisticRebuildManager.None
-
-    private[client] val messenger: Messenger = Messenger.None
-
-    private[client] val objectCache: ObjectCache = ObjectCache.NoCache
-
-    val radicle: KeyValueObjectPointer = null
-
-    private[aspen] def receiveClientResponse(msg: ClientResponse): Unit = ()
-
-    override def sendHostMessage(msg: HostMessage): Unit = ()
-
-    private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]] = ???
-
-    def createSystemDurableTask(taskTypeUUID: UUID,
-                                initialState: Map[org.aspen_ddp.aspen.common.objects.Key, Array[Byte]]): Future[Unit] = ???
-
-    def prepareSystemDurableTask(taskTypeUUID: UUID,
-                                 initialState: Map[org.aspen_ddp.aspen.common.objects.Key, Array[Byte]])
-                                (using tx: org.aspen_ddp.aspen.client.Transaction): Future[Unit] = ???
-
-    private[aspen] def getSystemAttribute(key: String): Option[String] = None
-    private[aspen] def setSystemAttribute(key: String, value: String): Unit = ()
-
-    //private[aspen] def createFinalizerFor(txd: TransactionDescription): TransactionFinalizer = null
-  }
-
 }
 
 class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   import BaseReadDriverSuite._
 
 
-  def mkReader(client: AspenClient,
+  def mkReader(client: ReadDriverClient,
                objectPointer: ObjectPointer = ptr,
                readUUID:UUID = readUUID,
                comment: String = "",
@@ -133,7 +58,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   }
 
   test("Fail with invalid object") {
-    val m = new TClient(client)
+    val m = ReadDriverClient.NoOp(client)
     val r = mkReader(m)
     val nrev = ObjectRevision(TransactionId(new UUID(0,1)))
     val nrev2 = ObjectRevision(TransactionId(new UUID(0,2)))
@@ -155,7 +80,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   }
 
   test("Fail with corrupted object") {
-    val m = new TClient(client)
+    val m = ReadDriverClient.NoOp(client)
     val r = mkReader(m)
     val nrev = ObjectRevision(TransactionId(new UUID(0,1)))
     val nrev2 = ObjectRevision(TransactionId(new UUID(0,2)))
@@ -176,7 +101,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   }
 
   test("Succeed with errors") {
-    val m = new TClient(client)
+    val m = ReadDriverClient.NoOp(client)
     val r = mkReader(m)
     val nrev = ObjectRevision(TransactionId(new UUID(0,1)))
     val nrev2 = ObjectRevision(TransactionId(new UUID(0,2)))
@@ -204,7 +129,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   }
 
   test("Ignore old revisions") {
-    val m = new TClient(client)
+    val m = ReadDriverClient.NoOp(client)
     val r = mkReader(m)
     val nrev = ObjectRevision(TransactionId(new UUID(0,1)))
     val nrev2 = ObjectRevision(TransactionId(new UUID(0,2)))
@@ -224,7 +149,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
   }
 
   test("Use minimum readTime") {
-    val m = new TClient(client)
+    val m = ReadDriverClient.NoOp(client)
     val r = mkReader(m)
     val nrev = ObjectRevision(TransactionId(new UUID(0,1)))
     val nrev2 = ObjectRevision(TransactionId(new UUID(0,2)))
@@ -247,7 +172,7 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
 
 
   test("Successful read with data and locks") {
-    val m = new TClient(client)
+    val m = ReadDriverClient.NoOp(client)
     val r = mkReader(m)
     val ts = HLCTimestamp.now
 

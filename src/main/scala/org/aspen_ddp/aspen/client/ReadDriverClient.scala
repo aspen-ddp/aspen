@@ -29,6 +29,10 @@ trait ReadDriverClient:
 
   private[client] val objectCache: ObjectCache
 
+  /** Not a read concern. It is here so that BaseReadDriver.noErrorRecoveryReadDriver can
+   *  name the running test in its hung-read logs without threading a label through
+   *  ReadDriver.Factory. The matching setter stays on AspenClient.
+   */
   private[aspen] def getSystemAttribute(key: String): Option[String]
 
 object ReadDriverClient:
@@ -41,7 +45,7 @@ object ReadDriverClient:
 
     val txStatusCache: TransactionStatusCache = TransactionStatusCache.NoCache
 
-    def clientContext: ExecutionContext = scala.concurrent.ExecutionContext.Implicits.global
+    def clientContext: ExecutionContext = ExecutionContext.Implicits.global
 
     def backgroundTaskManager: BackgroundTaskManager = BackgroundTaskManager.NoBackgroundTaskManager
 

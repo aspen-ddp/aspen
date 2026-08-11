@@ -25,9 +25,11 @@ object AspenClient:
   class InvalidDeviceSetLevel(childLevel: Int, parentLevel: Int)
     extends Exception(s"Device set level $childLevel must be less than parent level $parentLevel")
 
-/** @see [[ReadDriverClient]] for clientId, txStatusCache, clientContext,
- *       backgroundTaskManager, opportunisticRebuildManager, messenger,
- *       objectCache, and getSystemAttribute, which are declared there.
+/** The primary interface for applications using Aspen object storage: object allocation,
+ *  transaction building, and object retrieval.
+ *
+ *  @see [[ReadDriverClient]], which declares the members a ReadDriver needs. They are not
+ *       repeated here.
  */
 trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   

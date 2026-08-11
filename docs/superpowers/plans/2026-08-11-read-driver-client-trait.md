@@ -653,8 +653,8 @@ git commit -m "Retire the AspenClient/BaseReadDriver decoupling entry"
 
 ## Done
 
-At this point the branch `read-driver-client-trait` holds five commits: the
-design doc, then one per task. `git diff main --stat` should show one new file
+At this point the branch `read-driver-client-trait` holds six commits: the
+design doc, this plan, then one per task. `git diff main --stat` should show one new file
 (`ReadDriverClient.scala`, ~55 lines), one new doc, and net **negative** lines
 across the Scala sources — `BaseReadDriverSuite.scala` alone loses about 80.
 

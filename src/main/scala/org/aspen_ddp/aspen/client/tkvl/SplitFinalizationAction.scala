@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.*
-import org.aspen_ddp.aspen.client.internal.read.BaseReadDriver
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, Value}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
 

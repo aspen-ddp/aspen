@@ -97,8 +97,8 @@ abstract class BaseAspenClient(
     * a single attempt so failures surface instead of being retried away. */
   protected def runCreate[T](onCommitFailure: Throwable => Future[Unit])(prepare: Transaction => Future[T]): Future[T]
 
-  // `opportunisticRebuildManager` remains abstract (declared on the AspenClient trait) and is
-  // overridden by each subclass.
+  // `opportunisticRebuildManager` remains abstract (declared on the ReadDriverClient trait) and
+  // is overridden by each subclass.
 
   // ---- Reads ----
 

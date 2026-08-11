@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadError}
+import org.aspen_ddp.aspen.client.{DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadDriverClient, ReadError}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
@@ -12,7 +12,7 @@ import scribe.Logging
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 abstract class BaseReadDriver(
-                               val client: AspenClient,
+                               val client: ReadDriverClient,
                                val objectPointer: ObjectPointer,
                                val ida: IDA,
                                val readUUID:UUID,
@@ -179,7 +179,7 @@ abstract class BaseReadDriver(
 object BaseReadDriver:
 
   def noErrorRecoveryReadDriver(
-                                 client: AspenClient,
+                                 client: ReadDriverClient,
                                  objectPointer: ObjectPointer,
                                  ida: IDA,
                                  readUUID:UUID,

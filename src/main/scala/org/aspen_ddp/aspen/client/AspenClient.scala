@@ -1,19 +1,17 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientId, ClientResponse, HostMessage, ServiceMessage}
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientResponse, HostMessage, ServiceMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, uuid2byte}
+import org.aspen_ddp.aspen.common.util.uuid2byte
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 import scribe.Logging
 
@@ -27,19 +25,19 @@ object AspenClient:
   class InvalidDeviceSetLevel(childLevel: Int, parentLevel: Int)
     extends Exception(s"Device set level $childLevel must be less than parent level $parentLevel")
 
-trait AspenClient extends ObjectReader with Logging:
+/** The primary interface for applications using Aspen object storage: object allocation,
+ *  transaction building, and object retrieval.
+ *
+ *  @see [[ReadDriverClient]], which declares the members a ReadDriver needs. They are not
+ *       repeated here.
+ */
+trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   
   import AspenClient.*
-  
-  val clientId: ClientId
-
-  val txStatusCache: TransactionStatusCache
 
   val typeRegistry: TypeRegistry
 
   protected var storagePoolCache: Map[PoolId, StoragePool] = Map.empty
-
-  def clientContext: ExecutionContext
 
   def client: AspenClient = this
 
@@ -291,19 +289,11 @@ trait AspenClient extends ObjectReader with Logging:
 
   def retryStrategy: RetryStrategy
 
-  def backgroundTaskManager: BackgroundTaskManager
-
   /** Hosts currently believed to be offline. Stub returns empty until host
    *  liveness tracking exists; used by rebalancing to avoid moving stores onto,
    *  or counting availability from, offline hosts. */
   def offlineHosts(): Set[HostId] = Set()
 
-  private[client] def opportunisticRebuildManager: OpportunisticRebuildManager
-
-  private[client] val messenger: Messenger
-
-  private[client] val objectCache: ObjectCache
-  
   private[aspen] val radicle: KeyValueObjectPointer
 
   private[aspen] def receiveClientResponse(msg: ClientResponse): Unit
@@ -345,7 +335,6 @@ trait AspenClient extends ObjectReader with Logging:
 
   private[aspen] def getServiceHost(serviceUUID: UUID): Future[Option[HostId]]
 
-  private[aspen] def getSystemAttribute(key: String): Option[String]
   private[aspen] def setSystemAttribute(key: String, value: String): Unit
 
   private[aspen] def getCachedAllocator(allocatorId: ObjectAllocatorId): Option[ObjectAllocator] = None

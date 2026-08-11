@@ -1,9 +1,4 @@
 
-Decouple AspenClient and BaseReadDriver
-  - Having to stub out every method added to AspenClient is annoying
-  - Use pluggable trait that has just the methods BaseReadDriver needs
-  - Test implementation & "real" one backed by AspenClient
-
 Add required IP/dns-name argument to bootstrap CLI command
   - Needed when adding hosts. They'll need to be able to connect to the boostrap-host
     for adding HostState, Devices, and handling store transfers

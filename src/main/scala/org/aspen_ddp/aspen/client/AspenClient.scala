@@ -116,6 +116,21 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId]
 
+  /** Register a new host, in a single atomic transaction: a new HostState object is allocated
+   *  and registered in the hosts tree, and `name` is registered in the host namespace.
+   *
+   *  Fails with KeyAlreadyExists if `name` is already registered, and does not retry: a name
+   *  collision is an operator error rather than a transient one.
+   *
+   *  The host is created with no storage devices. Devices are added afterwards by
+   *  createStorageDevice, which is also what makes the host useful for anything. Nothing here
+   *  touches the new machine's filesystem -- see server.HostManager.createHost for that. */
+  def createHost(name: String,
+                 address: String,
+                 dataPort: Int,
+                 cncPort: Int,
+                 storeTransferPort: Int): Future[HostId]
+
   /** Register a new storage device on `hostId` and place it in the level-0 device set
    *  `deviceSetId`, in a single atomic transaction: a new StorageDeviceState object is
    *  allocated and registered in the storage devices tree, the owning HostState gains the

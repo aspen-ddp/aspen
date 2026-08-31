@@ -426,6 +426,38 @@ object Main {
       // validate so the stored name cannot drift from the one that was validated.
       val stripTrailingSlash = (s: String) => s.stripSuffix("/")
 
+      cmd("add-host").text("Registers a new host and initializes its root directory").
+        action((_, c) => c.copy(mode = "add-host")).
+        children(
+          // Copied from an existing host by the operator. add-host needs it to reach the
+          // running system, and leaves a copy in <host-directory> for the host command.
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          // Unlike the <host-directory> of host and create-storage-device, this one is not
+          // required to exist: add-host creates it. An already-initialized directory is
+          // caught by the host-config check in HostManager.createHost.
+          arg[File]("<host-directory>").text("Directory to initialize as the new host's root").
+            action((x, c) => c.copy(hostDirectory = x)).
+            validate { x =>
+              if !x.exists() || x.isDirectory then
+                success
+              else
+                failure(s"Not a directory: $x")
+            },
+
+          arg[String]("<hostname>").text("Name for the new host. Must not already be in use").
+            action((x, c) => c.copy(hostName = x)).
+            validate(x => if x.trim.nonEmpty then success else failure("Host name must not be empty")),
+
+          arg[String]("<address>").
+            text("IP address or DNS name other hosts use to reach this host").
+            action((x, c) => c.copy(address = x)).
+            validate(x => validateHostAddress(x).fold(success)(failure)),
+        ).
+        children(portOptions*)
+
       cmd("create-storage-device").text("Registers a new storage device on a host").
         action((_, c) => c.copy(mode = "create-storage-device")).
         children(
@@ -640,6 +672,9 @@ object Main {
             case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
             case "move-device-to-set" => move_device_to_set(bootstrapConfigPath, cfg.deviceId, cfg.deviceSetName)
+            case "add-host" => add_host(bootstrapConfig, bootstrapConfigPath,
+                                        cfg.hostDirectory.toPath, cfg.hostName, cfg.address,
+                                        cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
             case "create-storage-device" => create_storage_device(bootstrapConfig, bootstrapConfigPath,
                                                                   cfg.hostDirectory.toPath, cfg.deviceName,
                                                                   cfg.deviceSetName)
@@ -1419,6 +1454,65 @@ object Main {
     awaitAndReport(f):
       case Success(_) =>
         println(s"Device '$deviceIdStr' moved to set '$setRef'")
+      case Failure(err) => reportError(err)
+  }
+
+  def add_host(bootstrapCfg: BootstrapConfig.Config,
+               bootstrapConfigFile: os.Path,
+               hostDirectory: Path,
+               hostName: String,
+               address: String,
+               dataPort: Int,
+               cncPort: Int,
+               storeTransferPort: Int): Int = {
+
+    configureLogging()
+
+    if isUnreachableAddress(address) then
+      println(s"Warning: '$address' is not reachable from other machines. Other hosts in this " +
+              "system will not be able to connect to this one.")
+
+    val hostDir = hostDirectory.toAbsolutePath.normalize
+
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val f = HostManager.createHost(
+      client, hostDir, bootstrapConfigFile.toNIO, bootstrapCfg.aspenSystemId,
+      hostName, address, dataPort, cncPort, storeTransferPort)
+
+    def reportError(cause: Throwable): Unit = cause match
+      case e: HostManager.HostAlreadyConfigured =>
+        println(s"Error: ${e.directory} already contains ${HostConfig.configFilename}")
+        println("It has already been initialized as a host root directory.")
+      case e: HostManager.DirectorySetupFailed =>
+        println(s"Error: could not prepare host directory ${e.directory}: ${e.getCause.getMessage}")
+        println("No host was registered.")
+      // KeyAlreadyExists is how a taken name arrives from the registry's transactional
+      // registration path; DuplicateRegistration comes only from Registry.register.
+      case _: KeyAlreadyExists =>
+        println(s"Error: a host named '$hostName' is already registered")
+        println(s"$hostDir was prepared but no host was registered. Re-run with an unused name.")
+      case e: HostManager.ConfigWriteFailed =>
+        println(s"Error: host ${e.hostId.uuid} was registered but writing ${e.configFile} failed: ${e.getCause.getMessage}")
+        println(s"Host '$hostName' exists in the system, but $hostDir is incomplete and the host")
+        println("cannot be started until it is finished. Re-running this command will not fix it:")
+        println(s"the name '$hostName' is now taken, so a second run fails. Instead, create")
+        println(s"${e.configFile} with exactly these contents:")
+        print(e.hostConfig.yamlConfig)
+      case e =>
+        println(s"Error adding host: ${e.getMessage}")
+
+    awaitAndReport(f):
+      case Success(hostId) =>
+        println(s"Created host '$hostName' (${hostId.uuid}) at $hostDir")
+        // A host with no storage devices is registered but has nothing to serve, so name the
+        // next step rather than leaving the operator with a host that silently does nothing.
+        println("It owns no storage devices yet. Add one with create-storage-device, then start")
+        println(s"the host with:  host $hostDir")
       case Failure(err) => reportError(err)
   }
 

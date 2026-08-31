@@ -229,6 +229,36 @@ abstract class BaseAspenClient(
       yield
         sds.setId
 
+  override def createHost(name: String,
+                          address: String,
+                          dataPort: Int,
+                          cncPort: Int,
+                          storeTransferPort: Int): Future[HostId] =
+    // Minted outside runCreate for the same reason createStorageDevice mints its device id
+    // there: a retried attempt must reuse the id rather than leak a fresh UUID per attempt.
+    val hostId = HostId(UUID.randomUUID())
+    val state = HostState(hostId, name, address, dataPort, cncPort, storeTransferPort, Set())
+
+    // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
+    // name registration through Registry.prepareRegister, which reports a taken name that way.
+    // DuplicateRegistration comes only from Registry.register, the non-transactional path.
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: KeyAlreadyExists => throw StopRetrying(e)
+      case _ => Future.unit
+
+    // No TaskExecutorRootKey is written. StoreManager inserts it on first start under a
+    // DoesNotExist requirement, so seeding it here would only duplicate that.
+    runCreate(onFail): tx =>
+      given Transaction = tx
+      for
+        bsPool <- getStoragePool(PoolId.BootstrapPoolId)
+        ptr    <- bsPool.allocator.allocateKeyValueObject(
+                    Map(HostState.StateKey -> Value(state.encode())))
+        _      <- hostsTree.preparePut(hostId.uuid, ptr)
+        _      <- namespacedRegistry.prepareRegisterObject(Namespaces.Host, name, hostId.uuid)
+      yield
+        hostId
+
   override def createStorageDevice(hostId: HostId,
                                    deviceSetId: StorageDeviceSetId): Future[StorageDeviceId] =
     // The device id is generated once, outside runCreate, so a retried attempt reuses the

@@ -8,7 +8,6 @@ import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
-import org.aspen_ddp.aspen.client.registries.Registry.DuplicateRegistration
 import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
@@ -1283,13 +1282,25 @@ object Main {
       poolId <- client.createNewStoragePool(poolName, ida, None, RocksDBConfig(), setId, maximumStoreSize)
     yield poolId
 
+    // Translate the known failure modes into human-readable messages. The client's retry
+    // strategy unwraps StopRetrying, so the future fails with the underlying cause.
+    def reportError(cause: Throwable): Unit = cause match
+      // KeyAlreadyExists is how a taken name arrives from the registry's transactional
+      // registration path; DuplicateRegistration comes only from Registry.register.
+      case _: KeyAlreadyExists =>
+        println(s"Error: a storage pool named '$poolName' already exists")
+      // getStorageDeviceSetId throws this when the name is not registered.
+      case _: NoSuchElementException =>
+        println(s"Error: device set '$deviceSetName' not found")
+      case e =>
+        println(s"Error creating storage pool: ${e.getMessage}")
+
     awaitAndReport(f):
       case Success(poolId) =>
         println("******************************************")
         println(s"* New Pool Created: ${poolId.uuid}")
         println("******************************************")
-      case Failure(err) =>
-        println(s"Error creating storage pool: ${err.getMessage}")
+      case Failure(err) => reportError(err)
   }
 
   def create_device_set(bootstrapConfigFile: os.Path,
@@ -1321,7 +1332,9 @@ object Main {
     // Translate the known failure modes into human-readable messages. The client's retry
     // strategy unwraps StopRetrying, so the future fails with the underlying cause.
     def reportError(cause: Throwable): Unit = cause match
-      case _: DuplicateRegistration =>
+      // KeyAlreadyExists is how a taken name arrives from the registry's transactional
+      // registration path; DuplicateRegistration comes only from Registry.register.
+      case _: KeyAlreadyExists =>
         println(s"Error: a device set named '$name' already exists")
       case _: NoSuchElementException =>
         println(s"Error: parent device set '$parentSetName' not found")
@@ -1355,7 +1368,9 @@ object Main {
     // Translate the known failure mode into human-readable messages. The client's retry
     // strategy unwraps StopRetrying, so the future fails with the underlying cause.
     def reportError(cause: Throwable): Unit = cause match
-      case _: DuplicateRegistration =>
+      // KeyAlreadyExists is how a taken name arrives from the registry's transactional
+      // registration path; DuplicateRegistration comes only from Registry.register.
+      case _: KeyAlreadyExists =>
         println(s"Error: an allocation group named '$name' already exists")
       case e =>
         println(s"Error creating allocation group: ${e.getMessage}")

@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.MetadataTree
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.DataObjectPointer
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyAlreadyExists}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
@@ -103,6 +103,29 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       setState.assignedPools should contain(poolId)
       setState.assignedPools should contain(PoolId.BootstrapPoolId)
 
+  atest("createNewStoragePool fails with KeyAlreadyExists when the name is taken"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+
+    def create(): Future[PoolId] =
+      client.createNewStoragePool("dup-pool", Replication(1, 1), None, RocksDBConfig(), setId, 0L)
+
+    for
+      _      <- create()
+      _      <- waitForTransactionsToComplete()
+
+      before <- client.listStoragePools()
+      err    <- create().failed
+      _      <- waitForTransactionsToComplete()
+      after  <- client.listStoragePools()
+    yield
+      // The type matters beyond the message: createStoragePool's onFail matches on it to stop
+      // the retry loop, and new-pool's reportError matches on it to print "already exists". It
+      // is KeyAlreadyExists because the registration goes through Registry.prepareRegister --
+      // Registry.DuplicateRegistration belongs to the non-transactional register() path.
+      err shouldBe a[KeyAlreadyExists]
+      after should be(before)
+
   atest("createStorageDeviceSet rejects a parent at an equal or lower level"):
     given ExecutionContext = executionContext
     for
@@ -115,6 +138,27 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
              client.createStorageDeviceSet("bad-child-higher", level = 1, parent = Some(parentId))
            )
     yield succeed
+
+  atest("createStorageDeviceSet fails with KeyAlreadyExists when the name is taken"):
+    given ExecutionContext = executionContext
+    for
+      _      <- client.createStorageDeviceSet("dup-set", level = 0, parent = None)
+      _      <- waitForTransactionsToComplete()
+
+      before <- client.listStorageDeviceSets()
+      err    <- client.createStorageDeviceSet("dup-set", level = 1, parent = None).failed
+      _      <- waitForTransactionsToComplete()
+      after  <- client.listStorageDeviceSets()
+    yield
+      // The type matters beyond the message: createStorageDeviceSet's onFail matches on it to
+      // stop the retry loop, and create-device-set's reportError matches on it to print
+      // "already exists". It is KeyAlreadyExists because the registration goes through
+      // Registry.prepareRegister -- Registry.DuplicateRegistration belongs to the
+      // non-transactional register() path.
+      err shouldBe a[KeyAlreadyExists]
+      // The allocation and the sets-tree insert are already staged when the registration
+      // rejects, so this holds because the failed transaction is invalidated wholesale.
+      after should be(before)
 
   atest("moveDeviceToSet moves the device and updates both sets"):
     given ExecutionContext = executionContext

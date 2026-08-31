@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
-import org.aspen_ddp.aspen.common.objects.Key
+import org.aspen_ddp.aspen.common.objects.{Key, KeyAlreadyExists}
 import org.aspen_ddp.aspen.common.util.byte2uuid
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskServiceState}
@@ -401,3 +401,24 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       err <- client.addGroupToGroup("src-same", "dst-same").failed
     yield
       err shouldBe a[AllocationGroupState.InvalidLevel]
+
+  atest("createAllocationGroup fails with KeyAlreadyExists when the name is taken"):
+    given ExecutionContext = executionContext
+    for
+      _      <- client.createAllocationGroup("dup-group", level = 0)
+      _      <- waitForTransactionsToComplete()
+
+      before <- client.listAllocationGroups()
+      err    <- client.createAllocationGroup("dup-group", level = 1).failed
+      _      <- waitForTransactionsToComplete()
+      after  <- client.listAllocationGroups()
+    yield
+      // The type matters beyond the message: createAllocationGroup's onFail matches on it to
+      // stop the retry loop, and create-allocation-group's reportError matches on it to print
+      // "already exists". It is KeyAlreadyExists because the registration goes through
+      // Registry.prepareRegister -- Registry.DuplicateRegistration belongs to the
+      // non-transactional register() path.
+      err shouldBe a[KeyAlreadyExists]
+      // The allocation and the groups-tree insert are already staged when the registration
+      // rejects, so this holds because the failed transaction is invalidated wholesale.
+      after should be(before)

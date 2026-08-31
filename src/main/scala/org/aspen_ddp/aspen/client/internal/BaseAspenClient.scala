@@ -4,7 +4,6 @@ import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.{ReadDriver, ReadManager}
 import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, TransactionImpl, TransactionManager}
-import org.aspen_ddp.aspen.client.registries.Registry.DuplicateRegistration
 import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 // Explicit: common.objects also defines a ReadError (an Enumeration object). Only the client
@@ -174,8 +173,12 @@ abstract class BaseAspenClient(
       Nil
     )
 
+    // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
+    // name registration through Registry.prepareRegister, which reports a taken name that way.
+    // DuplicateRegistration comes only from Registry.register, the non-transactional path.
     def onFail(err: Throwable): Future[Unit] = err match
-      case e: DuplicateRegistration => throw StopRetrying(e)
+      case e: KeyAlreadyExists => throw StopRetrying(e)
+      case _ => Future.unit
 
     runCreate(onFail): tx =>
       given Transaction = tx
@@ -211,10 +214,14 @@ abstract class BaseAspenClient(
         val updated = parentState.copy(memberSets = sds.setId :: parentState.memberSets)
         tx.overwrite(parentPtr, parentDos.revision, DataBuffer(updated.toBytes))
 
+    // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
+    // name registration through Registry.prepareRegister, which reports a taken name that way.
+    // DuplicateRegistration comes only from Registry.register, the non-transactional path.
     def onFail(err: Throwable): Future[Unit] = err match
-      case e: DuplicateRegistration => throw StopRetrying(e)
+      case e: KeyAlreadyExists => throw StopRetrying(e)
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: AspenClient.InvalidDeviceSetLevel => throw StopRetrying(e)
+      case _ => Future.unit
 
     runCreate(onFail): tx =>
       given Transaction = tx
@@ -313,10 +320,18 @@ abstract class BaseAspenClient(
         deviceId
 
   override protected def createStoragePool(config: StoragePoolState): Future[PoolId] =
-    // Pool creation has no special recovery handling, so onFail is a no-op. For the production
-    // client this is equivalent to the previous transactUntilSuccessful (retry, no recovery);
-    // for the test client runCreate performs a single attempt.
-    val fStaged = runCreate(_ => Future.unit): tx =>
+    // A taken pool name is permanent, so it must stop the retry loop rather than be treated as
+    // a transient commit failure. KeyAlreadyExists, not Registry.DuplicateRegistration:
+    // prepareRegisterObject reaches the name registration through Registry.prepareRegister,
+    // which reports a taken name that way. DuplicateRegistration comes only from
+    // Registry.register, the non-transactional path. Everything else retries, which for the
+    // production client matches the previous transactUntilSuccessful (retry, no recovery); for
+    // the test client runCreate performs a single attempt regardless.
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: KeyAlreadyExists => throw StopRetrying(e)
+      case _ => Future.unit
+
+    val fStaged = runCreate(onFail): tx =>
       given Transaction = tx
 
       def createPoolObj(alloc: ObjectAllocator): Future[KeyValueObjectPointer] =

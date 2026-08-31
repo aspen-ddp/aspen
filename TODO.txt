@@ -1,20 +1,4 @@
 
-Fix duplicate-name error handling in create-allocation-group and create-device-set
-  - Both match Registry.DuplicateRegistration, which the transactional path never throws
-    - Registry.prepareRegister reports a taken name as KeyAlreadyExists
-    - DuplicateRegistration comes only from Registry.register, the non-transactional path
-  - Consequence is worse than a bad message. In BaseAspenClient, createAllocationGroup's
-    onFail matches DuplicateRegistration and nothing else, so KeyAlreadyExists raises a
-    MatchError, which ExponentialBackoffRetryStrategy treats as transient and retries
-    forever. createStorageDeviceSet has the same gap
-    - The CLI therefore hangs on a duplicate name instead of printing "already exists"
-  - Fix is to match KeyAlreadyExists in both onFail handlers and in the two reportError
-    blocks in Main.scala. See createHost/add_host for the corrected form
-  - Consider instead having Registry.prepareRegister throw DuplicateRegistration so the
-    two registration paths agree. Needs the existing Value, which prepareRegister does
-    not have on hand, and touches every caller of the shared machinery
-  - No test covers either command's duplicate-name path today
-
 Malformed YAML escapes Main's catch block as a raw SnakeYAML stack trace
   - The catch around the cfg.mode dispatch matches YamlFormat.FormatError, ConfigError,
     TimeoutException, and IllegalArgumentException. A syntactically broken config raises

@@ -186,7 +186,7 @@ class MainSuite extends AnyFunSuite with Matchers:
   // bootstrap config on the command line, so bootstrap must leave both of them behind.
   test("bootstrap writes host and bootstrap config files into the host directory"):
     withTempDir("aspen-bootstrap"): tmp =>
-      Main.bootstrap(Replication(3, 2), tmp, 4750, 4751, 4752) shouldBe 0
+      Main.bootstrap(Replication(3, 2), tmp, "10.0.0.5", 4750, 4751, 4752) shouldBe 0
 
       val hostDir = tmp.resolve("bootstrap-host")
 
@@ -202,8 +202,50 @@ class MainSuite extends AnyFunSuite with Matchers:
 
       val bsHost = bsCfg.hosts.head
       bsHost.name shouldBe hostCfg.name
-      bsHost.address shouldBe hostCfg.address
       bsHost.dataPort shouldBe hostCfg.dataPort
       bsHost.cncPort shouldBe hostCfg.cncPort
       bsHost.storeTransferPort shouldBe hostCfg.storeTransferPort
       bsHost.stores shouldBe (0 until 3).map(i => StoreId(PoolId.BootstrapPoolId, i.toByte)).toList
+
+      // The supplied address is written into both files from separate literals. Asserting the
+      // value rather than just that the two agree is what catches only one of them being wired up.
+      hostCfg.address shouldBe "10.0.0.5"
+      bsHost.address shouldBe "10.0.0.5"
+
+  test("validateHostAddress accepts IPv4, DNS names, and bracketed IPv6"):
+    Main.validateHostAddress("10.0.0.5") shouldBe None
+    Main.validateHostAddress("node-a.example.com") shouldBe None
+    Main.validateHostAddress("[fd00::5]") shouldBe None
+    Main.validateHostAddress("127.0.0.1") shouldBe None
+
+  test("validateHostAddress rejects empty and whitespace-bearing addresses"):
+    Main.validateHostAddress("") shouldBe Some("Address must not be empty")
+    Main.validateHostAddress("   ") shouldBe Some("Address must not be empty")
+    Main.validateHostAddress("node a") shouldBe Some("Address must not contain whitespace")
+
+  test("validateHostAddress rejects a URI scheme"):
+    Main.validateHostAddress("tcp://10.0.0.5") shouldBe
+      Some("Address must not include a URI scheme; pass just the host (e.g. 10.0.0.5)")
+
+  test("validateHostAddress rejects an embedded port"):
+    Main.validateHostAddress("10.0.0.5:4750") shouldBe
+      Some("Address must not include a port; use --data-port/--cnc-port/--store-transfer-port")
+
+  test("validateHostAddress rejects an unbracketed IPv6 literal"):
+    Main.validateHostAddress("fd00::5") shouldBe
+      Some("IPv6 literals must be bracketed, e.g. [fd00::5]")
+
+  test("isUnreachableAddress flags loopback and the bind wildcard"):
+    Main.isUnreachableAddress("localhost") shouldBe true
+    Main.isUnreachableAddress("LocalHost") shouldBe true
+    Main.isUnreachableAddress("127.0.0.1") shouldBe true
+    Main.isUnreachableAddress("127.1.2.3") shouldBe true
+    Main.isUnreachableAddress("[::1]") shouldBe true
+    Main.isUnreachableAddress("::1") shouldBe true
+    Main.isUnreachableAddress("0.0.0.0") shouldBe true
+    Main.isUnreachableAddress("[::]") shouldBe true
+
+  test("isUnreachableAddress passes routable addresses"):
+    Main.isUnreachableAddress("10.0.0.5") shouldBe false
+    Main.isUnreachableAddress("node-a.example.com") shouldBe false
+    Main.isUnreachableAddress("[fd00::5]") shouldBe false

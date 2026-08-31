@@ -91,13 +91,19 @@ its section of the [Project Homepage](https://aspen-ddp.org)
 2. Run `sbt compile`
 
 ### Execution
-Run the following command to create a new Aspen system under `/tmp/aspen-test`. The
-arguments after the target directory are the bootstrap pool's IDA: type, read threshold,
-write threshold, and width. This creates `/tmp/aspen-test/bootstrap-host`, containing the
-host's configuration, its storage devices, and the three bootstrap data stores.
+Run the following command to create a new Aspen system under `/tmp/aspen-test`. The first
+argument after the target directory is the address other hosts use to reach this one; the
+remaining four are the bootstrap pool's IDA: type, read threshold, write threshold, and
+width. This creates `/tmp/aspen-test/bootstrap-host`, containing the host's configuration,
+its storage devices, and the three bootstrap data stores.
 ```
-./t bootstrap /tmp/aspen-test replication 2 3 3
+./t bootstrap /tmp/aspen-test 127.0.0.1 replication 2 3 3
 ```
+
+This walkthrough runs everything on one machine, so `127.0.0.1` is the right address here
+and the "not reachable from other machines" warning it prints is expected. A system that
+will have hosts added to it later needs an address those hosts can route to — an external
+IP or a DNS name — since the value given here is what they will dial.
 
 The host directory is self-describing: bootstrap writes both `aspen-host-config.yaml` and
 `aspen-bootstrap-config.yaml` into it, so starting the storage host needs nothing more than

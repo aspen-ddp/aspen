@@ -1,9 +1,4 @@
 
-Add required IP/dns-name to bootstrap CLI command
-  - Needed when adding hosts. Remote processes need to be able to connect to the boostrap-host
-    via externally resolvable ip/hostname for real-world use cases.
-  - Update bootstrap logic to use provided IP/hostname instead of hardcoded value
-
 Add CLI command "add-host"
   - Intended to run on a new machine being added to an existing Aspen system
     - Initializes the current working directory to be the root directory for the new host
@@ -168,7 +163,7 @@ sbt 'testOnly *KeyValueObjectReaderSuite -- -z min/max'
 
 # Testing commands
 
-./t bootstrap /tmp/aspen-test replication 2 3 3
+./t bootstrap /tmp/aspen-test 127.0.0.1 replication 2 3 3
 
 ./t host /tmp/aspen-test/bootstrap-host
 

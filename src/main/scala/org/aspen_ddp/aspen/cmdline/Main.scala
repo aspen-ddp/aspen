@@ -87,6 +87,7 @@ object Main {
                   storeName:String="",
                   deviceId:String="",
                   deviceName:String="",
+                  address:String="",
                   host:String="",
                   port:Int=0,
                   dataPort:Int=DefaultDataPort,
@@ -221,6 +222,11 @@ object Main {
               else
                 failure(s"Not a directory: $x")
             },
+
+          arg[String]("<address>").
+            text("IP address or DNS name other hosts use to reach this bootstrap host").
+            action((x, c) => c.copy(address = x)).
+            validate(x => validateHostAddress(x).fold(success)(failure)),
 
           arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
             action((x, c) => c.copy(idaType = x.toLowerCase())).
@@ -621,8 +627,8 @@ object Main {
         try
           //println(s"Config file: $config")
           cfg.mode match
-            case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory.toPath, cfg.dataPort,
-                                          cfg.cncPort, cfg.storeTransferPort)
+            case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory.toPath, cfg.address,
+                                          cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
             case "host" => host(cfg.hostDirectory.toPath)
             case "amoeba" => amoeba_server(bootstrapConfigPath)
             // OBSOLETE: see the commented-out "debug" and "rebuild" parser entries above.
@@ -1027,9 +1033,14 @@ object Main {
 
   def bootstrap(bootstrapIda: IDA,
                 baseDirectory: Path, // created if it does not already exist
+                address: String, // advertised to other hosts; never bound to
                 dataPort: Int,
                 cncPort: Int,
                 storeTransferPort: Int): Int = {
+
+    if isUnreachableAddress(address) then
+      println(s"Warning: '$address' is not reachable from other machines. Hosts added to this " +
+              "system later will not be able to connect to the bootstrap host.")
 
     val hostDirectory = baseDirectory.resolve("bootstrap-host")
 
@@ -1053,7 +1064,7 @@ object Main {
       HostId(UUID.randomUUID()),
       aspenSystemId,
       "bootstrap-host",
-      "127.0.0.1",
+      address,
       dataPort,
       cncPort,
       storeTransferPort,
@@ -1103,7 +1114,7 @@ object Main {
     val bootstrapHost = HostState(
       hostConfig.hostId,
       "bootstrap-host",
-      "127.0.0.1",
+      address,
       hostConfig.dataPort,
       hostConfig.cncPort,
       hostConfig.storeTransferPort,
@@ -1630,6 +1641,41 @@ object Main {
       s.storageDevices.toList.map(_.uuid.toString).sorted.foreach: d =>
         lines += s"    $d"
     lines.mkString("\n")
+
+  /** Validates the advertised address of a host being created. Returns None if the address is
+   *  usable, or Some(message) explaining why it is not.
+   *
+   *  This is the host component of the `tcp://<address>:<port>` endpoints ZMQNet and
+   *  ZCnCFrontend build, so anything that would corrupt that string is rejected here rather
+   *  than surfacing later as an unexplained connect failure. Nothing is resolved: a system may
+   *  well be bootstrapped before its DNS entry exists.
+   */
+  private[cmdline] def validateHostAddress(address: String): Option[String] =
+    val colons = address.count(_ == ':')
+    if address.trim.isEmpty then
+      Some("Address must not be empty")
+    else if address.exists(_.isWhitespace) then
+      Some("Address must not contain whitespace")
+    else if address.contains("://") then
+      Some("Address must not include a URI scheme; pass just the host (e.g. 10.0.0.5)")
+    else if address.startsWith("[") && address.endsWith("]") && colons > 0 then
+      None // bracketed IPv6 literal
+    else if colons == 1 then
+      Some("Address must not include a port; use --data-port/--cnc-port/--store-transfer-port")
+    else if colons > 1 then
+      Some("IPv6 literals must be bracketed, e.g. [fd00::5]")
+    else
+      None
+
+  /** True for addresses no other machine can reach: loopback and the bind wildcard.
+   *
+   *  Not an error -- a single-machine demo system is a legitimate use -- but worth saying out
+   *  loud, since an unreachable address is invisible until the second host fails to connect.
+   */
+  private[cmdline] def isUnreachableAddress(address: String): Boolean =
+    val a = address.toLowerCase
+    a == "localhost" || a.startsWith("127.") || a == "::1" || a == "[::1]" ||
+      a == "0.0.0.0" || a == "[::]"
 
   /** Format a byte count using binary units (powers of 1024). Sub-KiB values are
    *  rendered as whole bytes; larger values use one decimal place and the largest

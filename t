@@ -15,7 +15,27 @@ set -u
 #
 # So: run setup from the repo root, then return to the invocation directory before exec'ing.
 invocation_dir="$PWD"
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+
+# Finding the repo root means resolving this script's own path, which may be a symlink --
+# t linked onto the PATH, say. dirname on the link would name the directory holding it
+# rather than the checkout. macOS ships no "readlink -f" and its BSD readlink follows only
+# one level, so walk the chain by hand.
+#
+# The loop needs no cycle guard. Reaching it means the kernel already resolved this same
+# chain to exec the script, so the chain is finite and acyclic; a cycle fails at exec with
+# ELOOP and never gets here.
+src="${BASH_SOURCE[0]}"
+
+while [[ -L $src ]]
+do
+  link_dir="$(cd -P "$(dirname "$src")" && pwd)" || exit 1
+  src="$(readlink "$src")"
+
+  # A relative link target resolves against the directory holding the link, not the cwd.
+  [[ $src == /* ]] || src="$link_dir/$src"
+done
+
+repo_root="$(cd -P "$(dirname "$src")" && pwd)" || exit 1
 cd "$repo_root" || exit 1
 
 # Absolute, so reading the cache does not depend on the cwd at the time of the read.

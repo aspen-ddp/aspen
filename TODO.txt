@@ -1,14 +1,4 @@
 
-./t does not resolve its own location through a symlink
-  - repo_root comes from dirname "${BASH_SOURCE[0]}", which is the directory of the
-    symlink, not of the file it points at. Linking t into ~/bin therefore looks for
-    build.sbt and target/t-classpath under ~/bin and fails
-  - Not reachable today: t is only ever run as ./t or by its real path. Recorded when
-    the cwd fix landed, since that fix made the invocation directory meaningful and so
-    made linking t onto the PATH an obvious next thing to want
-  - Fix needs a resolution loop. macOS has no readlink -f, and the BSD readlink resolves
-    only one level, so a while loop over [[ -L ]] is the portable form
-
 Fix duplicate-name error handling in create-allocation-group and create-device-set
   - Both match Registry.DuplicateRegistration, which the transactional path never throws
     - Registry.prepareRegister reports a taken name as KeyAlreadyExists
@@ -24,6 +14,29 @@ Fix duplicate-name error handling in create-allocation-group and create-device-s
     two registration paths agree. Needs the existing Value, which prepareRegister does
     not have on hand, and touches every caller of the shared machinery
   - No test covers either command's duplicate-name path today
+
+Malformed YAML escapes Main's catch block as a raw SnakeYAML stack trace
+  - The catch around the cfg.mode dispatch matches YamlFormat.FormatError, ConfigError,
+    TimeoutException, and IllegalArgumentException. A syntactically broken config raises
+    none of them: SnakeYAML throws YAMLException subclasses -- ScannerException,
+    ParserException, ComposerException -- and FormatError covers only Aspen's own
+    validation, i.e. an empty document or a missing/misshapen field
+  - loadYamlString's scaladoc in YamlFormat already documents this exact trap. Main is
+    the caller it warns about, and it catches the wrong thing. loadYamlFile, which is
+    the overload the CLI actually reaches via BootstrapConfig.loadBootstrapConfig,
+    behaves the same way but carries no such warning -- worth copying the note over
+  - Costs more than a stack trace. The exception unwinds out of main, so neither
+    drainAndShutdown() nor System.exit(exitCode) runs, and the drain is what lets a
+    nudge sent moments earlier survive process exit. Shell status is still nonzero
+    because the JVM exits 1 on an uncaught exception, so this is lost cleanup and bad
+    diagnostics rather than a wrong exit code
+  - Ordinary to hit: a truncated or half-edited bootstrap config does it. scopt's
+    validate only checks that the file exists, not that it parses
+  - Fix is a narrow "case e: YAMLException" clause alongside the existing four.
+    Deliberately not NonFatal: that would swallow genuine bugs into a one-line message,
+    and an unexpected exception should stay loud
+  - Affects every command taking a <bootstrap-config-file>, plus host, which loads both
+    the host and bootstrap configs inside host()
 
 Reassignment of a pool to a new set:
   - Safety check reassignment to same set. No-op in this case

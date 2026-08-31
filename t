@@ -7,10 +7,19 @@
 #
 set -u
 
-# Always operate from the repo root, regardless of where t is invoked from.
-cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
+# Setup and launch want different working directories. The classpath cache, the build-file
+# staleness checks, and "sbt compile" all have to run from the repo root. The CLI, on the
+# other hand, resolves its file arguments against the process cwd, so it must see the
+# directory the user actually invoked t from -- otherwise a relative path either fails
+# validation or, worse, silently resolves to a same-named file under the repo root.
+#
+# So: run setup from the repo root, then return to the invocation directory before exec'ing.
+invocation_dir="$PWD"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
+cd "$repo_root" || exit 1
 
-CP_CACHE="target/t-classpath"
+# Absolute, so reading the cache does not depend on the cwd at the time of the read.
+CP_CACHE="$repo_root/target/t-classpath"
 
 #--- JDK selection ---------------------------------------------------------------------
 
@@ -81,6 +90,11 @@ if [[ -n ${T_COMPILE:-} ]]
 then
   sbt compile || exit 1
 fi
+
+# Back to where the user ran t from, so relative path arguments mean what they typed. The
+# classpath is absolute (enforced by the "/*" guard on the sbt export above), so it keeps
+# working from here.
+cd "$invocation_dir" || exit 1
 
 "$JAVA_BIN" -cp "$CLASSPATH" org.aspen_ddp.aspen.cmdline.Main "$@"
 

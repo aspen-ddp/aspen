@@ -653,15 +653,21 @@ object Main {
           println(s"Loading BootstrapConfig ${cfg.bootstrapConfigFile}")
           BootstrapConfig.loadBootstrapConfig(cfg.bootstrapConfigFile)
 
+        // Path arguments are resolved by the JVM against the process cwd, which is the
+        // directory the user invoked the CLI from, so they arrive here still relative.
+        // os.Path rejects relative paths outright, and the commands taking a directory
+        // resolve further paths beneath it. Normalize once here rather than at each use.
+        def absPath(f: File): Path = f.toPath.toAbsolutePath.normalize
+
         def bootstrapConfigPath: os.Path =
-          os.Path(cfg.bootstrapConfigFile.toPath)
+          os.Path(absPath(cfg.bootstrapConfigFile))
 
         try
           //println(s"Config file: $config")
           cfg.mode match
-            case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory.toPath, cfg.address,
+            case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
                                           cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
-            case "host" => host(cfg.hostDirectory.toPath)
+            case "host" => host(absPath(cfg.hostDirectory))
             case "amoeba" => amoeba_server(bootstrapConfigPath)
             // OBSOLETE: see the commented-out "debug" and "rebuild" parser entries above.
             //case "debug" => run_debug_code(bootstrapConfigPath)
@@ -673,10 +679,10 @@ object Main {
             case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
             case "move-device-to-set" => move_device_to_set(bootstrapConfigPath, cfg.deviceId, cfg.deviceSetName)
             case "add-host" => add_host(bootstrapConfig, bootstrapConfigPath,
-                                        cfg.hostDirectory.toPath, cfg.hostName, cfg.address,
+                                        absPath(cfg.hostDirectory), cfg.hostName, cfg.address,
                                         cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
             case "create-storage-device" => create_storage_device(bootstrapConfig, bootstrapConfigPath,
-                                                                  cfg.hostDirectory.toPath, cfg.deviceName,
+                                                                  absPath(cfg.hostDirectory), cfg.deviceName,
                                                                   cfg.deviceSetName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)

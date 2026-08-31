@@ -1,8 +1,13 @@
 
-Validate/fix ./t script unconditionally changing directory to the script's source directory
-  - This could break the use of relative paths given to sub commands
-  - Probably as easy as saving the original path and switching back to it before
-    invoking the wrapped command line process
+./t does not resolve its own location through a symlink
+  - repo_root comes from dirname "${BASH_SOURCE[0]}", which is the directory of the
+    symlink, not of the file it points at. Linking t into ~/bin therefore looks for
+    build.sbt and target/t-classpath under ~/bin and fails
+  - Not reachable today: t is only ever run as ./t or by its real path. Recorded when
+    the cwd fix landed, since that fix made the invocation directory meaningful and so
+    made linking t onto the PATH an obvious next thing to want
+  - Fix needs a resolution loop. macOS has no readlink -f, and the BSD readlink resolves
+    only one level, so a while loop over [[ -L ]] is the portable form
 
 Fix duplicate-name error handling in create-allocation-group and create-device-set
   - Both match Registry.DuplicateRegistration, which the transactional path never throws

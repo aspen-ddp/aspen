@@ -1,20 +1,4 @@
 
-Add add-storage-device command
-  - <host-root>/storage-devices will be a directory containing symbolic links to the actual storage device
-    directories. These will usually be mount points for physical storage devices but regular directories
-    must work as well
-  - takes the host root directory and storage device directory name as an arguments
-    - Storage device directory must not be in <host-root>/storage-devices
-  - Implement in a function that can be called later by the StoreManager daemon, not just the CLI
-  - Create StorageDeviceState object and update HostState in a single transaction
-  - Once device is initialized:
-    - Create the storage device configuration file
-    - create link with UUID of the storage device in <hostRootDir>/storage-devices/ to point to the
-      storage directory
-  - Update StoreManager to use FileSystems.getDefault().newWatchService() to monitor for additions in
-    <host-root>/storage-devices and load the devices when they appear
-    - Consider implementing this in a helper class to simplify StoreManager implementation
-
 Validate/fix ./t script unconditionally changing directory to the script's source directory
   - This could break the use of relative paths given to sub commands
   - Probably as easy as saving the original path and switching back to it before

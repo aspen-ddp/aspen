@@ -1,24 +1,45 @@
 
-Add required IP/dns-name argument to bootstrap CLI command
-  - Needed when adding hosts. They'll need to be able to connect to the boostrap-host
-    for adding HostState, Devices, and handling store transfers
+Add required IP/dns-name to bootstrap CLI command
+  - Needed when adding hosts. Remote processes need to be able to connect to the boostrap-host
+    via externally resolvable ip/hostname for real-world use cases.
+  - Update bootstrap logic to use provided IP/hostname instead of hardcoded value
 
 Add CLI command "add-host"
+  - Intended to run on a new machine being added to an existing Aspen system
+    - Initializes the current working directory to be the root directory for the new host
   - Takes optional ports (re-use from bootstrap command)
-  - Takes hostname as argument
-  - Takes public IP/dns-name to receive incoming connections on
+  - Takes required hostname as argument
+  - Takes required public IP/dns-name to receive incoming connections on
+  - Creates a new HostState object with this information
+  - Create a host configuration file
+    - See bootstrap command for an example of how to do this and how to name the file
+  - Create the storage devices directory
 
-Validate/fix ./t script running in script directory
-  - This could break usage of relative paths given to sub commands
+Add add-storage-device command
+  - takes the device dirname
+    - Must be under <host-root>/storage-devices directory
+      - Host id can be found in the configuration file that must exist in the parent directory of storage-devices
+  - Implement in a function that can be called later by the StoreManager daemon, not just the CLI
+  - Create StorageDeviceState object and update HostState in a single transaction
+  - Once device is initialized, create link in <hostRootDir>/storage-devices/
+  - Update StoreManager to use FileSystems.getDefault().newWatchService() to monitor for additions
+    - Wrap this in a helper class to simplify Host implementation
+
+Validate/fix ./t script unconditionally changing directory to the script's source directory
+  - This could break the use of relative paths given to sub commands
   - Probably as easy as saving the original path and switching back to it before
     invoking the wrapped command line process
 
 Reassignment of a pool to a new set:
+  - Safety check reassignment to same set. No-op in this case
   - MigratePoolToSetDurableTask
     - register with system task executor at time of creation
   - Always reassign each store to a new device and move it
   - Keep it simple.
     - Optimize for not moving existing stores that are already in the set later
+  - Must support assignement to level 1+ sets in addition to level 0
+    - Ideally the design and implementation will be the same for both
+      - Try to minimize and isolate any differences if the code cannot be made identical
   - Durable task selects a device for a store, calls transferStore, polls for
     completion then moves to next store. On complete, update PoolState to say
     migration status is Complete
@@ -28,25 +49,15 @@ Reassignment of a pool to a new set:
 
 Rebalancing as a passive background task
   - Part of the system-level Durable Service
-  - Periodically tries to rebalance each level 0 stoarge device set
+  - Periodically tries to rebalance each level 0 storage device set
     - Every 4 hours by default?
       - needs to be configurable
     - If it results in a non-empty plan, kick off a rebalancing task
 
 ---------
 
-Add add-host command
-  - takes address & ports
-  - generates a host config file in current directory
 
-Add add-storage-device command
-  - takes host-root and device dirname
-  - Impl in function that can be called later by the Host
-    - Maybe via a CnC message
-    - Listing and configuring new devices could be valid CnC
-  - Once device is initialized, create link in <hostRootDir>/storage-devices/
-  - Update host to use FileSystems.getDefault().newWatchService() to monitor for additions
-    - Wrap this in a helper class to simplify Host impl
+
 
 Switch AmoebaFS to use a registered object for the root
 

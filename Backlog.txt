@@ -1,0 +1,249 @@
+
+Switch AmoebaFS to use a registered object for the root
+
+Rename StoreManager to Host?
+
+os.Path note:
+  - can convert to java Path via os.Path.toNIO
+  - then to File via java Path.toFile()
+
+Need official mechanism for rebuilding a failed store
+  - Use Rebuilding state to StoreEntry in target StorageDeviceState?
+  - Simple and can be picked up by periodic host scans
+    - Same as TransferIn/TransferOut
+  - Rebuilder should periodically checkpoint to disk the UUID of the last restored object
+    - That way can pick up from where it left off in hte event of a crash
+
+Need a way to connect AllocationGroups to App-defined Allocators
+  - Application can just create them during initialization
+
+Consider removing usage of invalidateTransaction in favor of just throwing
+exceptions.
+  - May be needed in some contexts but probably ought to be avoided when
+    possible
+  - Makes it difficult to detect problems and recover from them
+  - Hides the source of the error
+  - Limited to just a single error per tx setup
+
+Need a mechanism to handle "out of space" errors
+  - Will present when we attempt to commit an object update to the store
+    - Read-Only or out of space underlying media will cause it to fail
+  - Will clog up the CRL if left untreated
+  - Might start with just relying on TransferStore to a device with space
+    - Might be able to automate this eventually
+  - Could set up "spillover stores"
+    - Dedicated to hosting data for full stores
+    - Lots of implications though, will require some thought
+
+How handle changing Host IP?
+  - Rely on heartbeating and drop non-bootstrap HostEntries we haven't
+    heard from in a long time?
+  - Wait for gossip protocol implementation?
+
+Add TLS Cert generation for hosts
+
+Add a Quic/Netty Network implementation
+
+----------------
+- Down the road
+
+May need to add an abortStoreTransfer method
+  - to get unstuck if destination drive is full
+
+Need a gossip protocol for spreading the word about cache invalidation for
+  1. Host changed it's address/port
+  2. StoreId has been migrated to a new hostState
+For now we can ignore this. Hosts don't change frequently and store moves
+can be found via error messages to read/write operations
+
+Investigate hash4j
+  - faster hashing alternatives
+  - Consistent bucket hashing could be used for interesting distributed data structures
+    - worth considering
+
+May want to consider Apache Fory as Protobuf alternative
+  - faster but not so good with unknown fields
+-----------------------------------------------------------
+- Brainstorming
+
+Could add concept of EventHandlers
+  - Identified by UUID
+  - Optionally able to be attached to "things of interest"
+    - Such as an AllocationGroup storage changing by 0.5%
+  - When an "event" triggers:
+    - Use TypeRegistry to get a factory for handler corresponding to UUID
+      - Factory type must castable to a base factory type
+        - Ensures that handler objects will have the needed API for handling events
+          of that type. like AllocGroupUsageChangeEventHandler
+
+For maximum recovery speed, DurableRecoveryManagerTask
+  - Delegates restore operations to groups of workers
+  - Workers restore objects
+     - Store the results locally (not re-erasure coded)
+       - Could use a RocksDB-like backend. Key = ObjId + PoolIndex
+     - Update dist datastructure noting their location
+  - End-location downloads rebulit slices as they're created
+
+  + End-location can be throttled so as not to overload bandwidth
+  + Data can be rebuilt at maximum speed (no choke points)
+  + Rebuilt data can be read from dist data structure at a speed penalty
+
+-----------------------------------------------------------
+- Setup/Testing Notes
+
+# Setting up intellij to use a JDK installed by homebrew:
+# homebrew install openjdk
+# Launch Intellj and open project folder
+# When a JDK is not detected:
+    Go to File -> Project Structure
+    In SDK option, add an SDK
+    Use the following path to the SDK:
+        /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home
+
+# Run only a single test suite
+sbt 'testOnly org.aspen_ddp.aspen.common.DataBufferSuite'
+
+# Run single test. Where "min/max" identifies a test containing this substring
+sbt 'testOnly *KeyValueObjectReaderSuite -- -z min/max'
+
+# Testing commands
+
+./t bootstrap /tmp/aspen-test 127.0.0.1 replication 2 3 3
+
+./t host /tmp/aspen-test/bootstrap-host
+
+sudo launchctl start com.apple.rpcbind
+./t nfs demo/cfg.yaml demo/log4j-conf.xml
+
+On Client:
+    ssh rakis@192.168.64.2
+    sudo
+    umount -f /mnt; mount -v -t nfs4 -o "vers=4.1" 192.168.56.1:/ /mnt
+
+./t new-pool demo/log4j-conf.xml demo/bootstrap_config.yaml new_pool_name replication 3 2 2 node_a,node_b,node_c
+
+./t transfer-store demo/bootstrap_config.yaml 3f1ca5f7-74be-405d-aa48-739fc23651a4:2 <target-storage-device-uuid>
+
+-----------------
+- Backlog issues
+
+ZMQNet.ioThread leaves a half-built host behind when NewHostAvailable fails
+partway through
+  - The send-queue loop now guards each item, so a throw here no longer takes
+    the IO thread down with it. What survives depends on where it threw, and
+    neither state ever heals
+  - Fail at setIdentity or connect and entry.odealer stays None. The created
+    socket leaks until the context closes, and every later message to that
+    host piles into entry.pendingMessages, which nothing will drain:
+    MetadataManager already holds Right(entry), so no second NewHostAvailable
+    is ever enqueued
+  - Fail at either send and the dealer is live and in connectedDealers, but
+    connectedHosts and rebuildPoller were skipped. The host is sendable yet
+    never polled, so its inbound traffic is discarded forever and nothing
+    ever marks it offline. This is the state a dealer.send failure actually
+    produces, and it is the worse of the two
+  - Likely fix is to move both sends after the connectedHosts/rebuildPoller
+    registration, which does not depend on them and cannot reorder anything
+    because every send on this path runs on the one IO thread. That leaves
+    only the narrow setIdentity/connect window, which wants the socket closed
+    on the failure path -- and a seam that lets a test make connect() fail.
+    The dealer is built inline from context.createSocket on the IO thread and
+    there is no ZMQNet harness to drive it, per the untested entry below
+  - SendToClient has a narrower variant: a throw from router.send(encoded)
+    leaves an unfinished multipart message on the ROUTER, so the next
+    SendToClient appends its identity as frame 2 of the stale frame 1. One
+    client gets a garbled body, one gets nothing. The encode is hoisted above
+    the first frame so encodeClientResponse cannot cause this, but the second
+    send still can. Bounded (the next SendToClient clears it) and accepted
+
+A createHostEntry that throws late orphans the entry the IO thread already
+accepted
+  - createHostEntry enqueues NewHostAvailable before the wakeIoThread() that
+    can throw, so a throw from that wake still leaves a fully live entry
+    behind: the IO loop drains sendQueue on every iteration regardless of the
+    wake, so the dealer is created and registered in connectedDealers, the
+    entry is added to connectedHosts, and both are flushed and heartbeated
+    thereafter
+  - Meanwhile MetadataManager's guard has removed the host from its map, so
+    the next send builds a second entry and a second dealer for the same host.
+    The first is unreachable from the manager but still live in the IO thread
+  - This is the accepted cost of the guard -- an orphaned entry beats a
+    permanent wedge -- and reachability is low, since wakeIoThread fails on a
+    closed socket, i.e. during teardown of a process that is exiting anyway.
+    Recorded rather than fixed
+  - Candidate fix is for createHostEntry to swallow a wakeIoThread failure
+    rather than propagate it. The wake is best-effort: the IO loop drains the
+    send queue unconditionally every iteration, and poll() never waits longer
+    than the next heartbeat, so a missed wake delays delivery by at most one
+    heartbeat period rather than losing it. Swallowing makes the orphaned
+    entry and the duplicate dealer impossible, and needs no test seam. The
+    same change to storeResolved, whose wakeIoThread is likewise unguarded,
+    would retire the handoff residue the MetadataManager guard now absorbs
+  - Distinct from the leak above: there NewHostAvailable fails, here it
+    succeeds for an entry the manager has already forgotten
+
+ZMQNet.heartbeat can still kill the IO thread
+  - heartbeat() calls dealer.send on every connected host from inside
+    ioThread's loop, outside both the per-item send-queue guard and the poll
+    guard above it. A throw while not shutting down matches neither handler,
+    so it propagates out of ioThread and the thread dies -- the exact failure
+    the send-queue guard was added to prevent, one screen higher in the same
+    method -- and unlike the two above it runs every heartbeat period, not
+    just on host setup
+  - Deliberately not fixed alongside the send loop, because the recovery
+    differs: a bad queue item is dropped, whereas a host whose heartbeat
+    throws needs a decision -- skip it this round, or mark it offline
+
+ZMQNet.ioThread's failure handling is untested
+  - There is no ZMQNet suite. ProtobufMessageCodecSuite is the only file under
+    zmqnet/, and ZMQNet's constructor binds real sockets, so covering the
+    guards would mean standing up a harness or extracting a seam
+  - The per-item send-queue guard therefore shipped without a test. That is a
+    decision rather than an oversight, and it is also why the half-built host
+    entry above is recorded rather than fixed: that fix wants the same seam
+
+-------------------------------------------------------------------------------
+- Old Testing Commands
+-------------------------------------------------------------------------------
+
+# Building for demo appliction
+# run "sbt pack"
+# then invoke ./target/pack/bin/demo
+
+sbt compile && rm -r demo/node_* && ./t bootstrap demo/cfg.yaml
+
+Bootstrap Procedure:
+    sbt pack
+    rm -r ~/temp/aspen/*
+    rm -r demo/*log
+    ./target/pack/bin/demo bootstrap demo/t.yaml
+    emacs demo/cfg.yaml
+    ./target/pack/bin/demo amoeba demo/cfg.yaml demo/amoeba-log4j.yaml
+
+  For each node:
+    ./target/pack/bin/demo node demo/cfg.yaml node_a
+
+  On client:
+    ssh rakis@192.168.64.2
+    sudo
+    umount -f /mnt; mount -v -t nfs4 -o "vers=4.1" 192.168.56.1:/ /mnt
+
+NFS Cache Clearing:
+  # To free pagecache
+  echo 1 > /proc/sys/vm/drop_caches
+
+  # To free dentries and inodes
+  echo 2 > /proc/sys/vm/drop_caches
+
+  # To free pagecache, dentries and inodes
+  echo 3 > /proc/sys/vm/drop_caches
+
+
+Pre sbt-pack demo launch script:
+#!/bin/bash
+
+# The CLASSPATH content is generated by sbt via running the "export runtime:fullClasspath" command
+#
+export CLASSPATH="<sbt content>"
+
+exec java -cp $CLASSPATH org.aspen_ddp.aspen.cmdline.Main "$@"

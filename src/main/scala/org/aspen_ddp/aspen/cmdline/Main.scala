@@ -35,6 +35,7 @@ import org.dcache.nfs.v4.xdr.nfs4_prot
 import org.dcache.nfs.v4.{MDSOperationExecutor, NFSServerV41}
 import org.dcache.nfs.vfs.VirtualFileSystem
 import org.dcache.oncrpc4j.rpc.{OncRpcProgram, OncRpcSvcBuilder}
+import org.yaml.snakeyaml.error.YAMLException
 import scopt.OptionDef
 import scribe.Logging
 import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, mdc, messages, methodName}
@@ -179,6 +180,29 @@ object Main {
         net.shutdown(NotificationSendLinger)
       catch
         case _: Throwable => ()
+
+  /** Maps a command failure the CLI reports as a one-line message onto that message.
+   *
+   *  Deliberately partial, and deliberately not NonFatal: anything outside this set is a bug,
+   *  and a bug should reach the user as a stack trace rather than as a tidy sentence. What is
+   *  in the set is the set of ways a user can get it wrong -- a config that does not parse, a
+   *  config that parses but does not validate, an argument naming something that is not there,
+   *  a storage system that does not answer.
+   *
+   *  YAMLException is the SnakeYAML side of a bad config: ScannerException for a tab indent,
+   *  ParserException for an unclosed flow sequence, ComposerException for an undefined alias.
+   *  None of them is a FormatError, which covers only Aspen's own validation, so without this
+   *  clause a truncated config unwinds out of main and skips both drainAndShutdown and the
+   *  explicit exit.
+   *
+   *  Extracted from main's catch so the mapping is reachable from a test; main itself is not.
+   */
+  private[cmdline] def commandErrorMessage: PartialFunction[Throwable, String] =
+    case e: YamlFormat.FormatError   => s"Error loading config file: $e"
+    case e: YAMLException            => s"Error parsing config file: $e"
+    case e: ConfigError              => s"Error: $e"
+    case _: TimeoutException         => "Error: operation timed out waiting for the storage system to respond"
+    case e: IllegalArgumentException => s"Error: ${e.getMessage}"
 
   def main(args: Array[String]): Unit = {
     val parser = new scopt.OptionParser[Args]("demo") {
@@ -696,17 +720,11 @@ object Main {
             case "show-device-set"        => show_device_set(bootstrapConfigPath, cfg.entityRef)
             case "show-allocation-group"  => show_allocation_group(bootstrapConfigPath, cfg.entityRef)
         catch
-          case e: YamlFormat.FormatError =>
-            println(s"Error loading config file: $e")
-            1
-          case e: ConfigError =>
-            println(s"Error: $e")
-            1
-          case e: TimeoutException =>
-            println(s"Error: operation timed out waiting for the storage system to respond")
-            1
-          case e: IllegalArgumentException =>
-            println(s"Error: ${e.getMessage}")
+          // Rethrowing from applyOrElse's default is what keeps an unrecognized exception
+          // loud. It still unwinds out of main and still skips the drain, which is the right
+          // trade for a bug: the stack trace is the point.
+          case e: Throwable =>
+            println(commandErrorMessage.applyOrElse(e, (t: Throwable) => throw t))
             1
 
       // scopt has already printed the usage message

@@ -8,12 +8,15 @@ import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.server.HostConfig
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
+import org.yaml.snakeyaml.parser.ParserException
 
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{FileVisitResult, Files, Path, SimpleFileVisitor}
 import java.util.UUID
+import java.util.concurrent.TimeoutException
 import scala.collection.mutable
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.{Duration, SECONDS}
@@ -249,3 +252,27 @@ class MainSuite extends AnyFunSuite with Matchers:
     Main.isUnreachableAddress("10.0.0.5") shouldBe false
     Main.isUnreachableAddress("node-a.example.com") shouldBe false
     Main.isUnreachableAddress("[fd00::5]") shouldBe false
+
+  test("commandErrorMessage reports a config that parses but does not validate"):
+    Main.commandErrorMessage(new YamlFormat.FormatError("Object Required")) should
+      include("Error loading config file")
+
+  test("commandErrorMessage reports a config that does not parse"):
+    // Taken from a real SnakeYAML failure rather than a hand-built exception, so this breaks
+    // if the hierarchy the clause matches on ever shifts. Malformed YAML raises none of the
+    // four types the catch originally listed, which is what let it escape main entirely.
+    val yamlEx = intercept[ParserException]:
+      BootstrapConfig.parseBootstrapConfig("bootstrap-hosts: [unclosed\n")
+
+    Main.commandErrorMessage(yamlEx) should include("Error parsing config file")
+
+  test("commandErrorMessage reports the remaining expected command failures"):
+    Main.commandErrorMessage(new Main.ConfigError("no such pool")) should include("no such pool")
+    Main.commandErrorMessage(new TimeoutException()) should include("timed out")
+    Main.commandErrorMessage(new IllegalArgumentException("bad width")) should include("bad width")
+
+  test("commandErrorMessage leaves an unexpected exception unhandled"):
+    // The clause set is the set of ways a user can get it wrong. Anything else is a bug and
+    // must stay loud, so widening this to NonFatal is what this assertion is here to catch.
+    Main.commandErrorMessage.isDefinedAt(new RuntimeException("boom")) shouldBe false
+    Main.commandErrorMessage.isDefinedAt(new NullPointerException()) shouldBe false

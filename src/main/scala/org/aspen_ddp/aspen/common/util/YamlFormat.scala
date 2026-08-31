@@ -17,10 +17,20 @@ object YamlFormat {
     *
     * The document is fully parsed before the underlying stream is closed, and the stream is
     * closed whether parsing succeeds or fails.
+    *
+    * Throws FormatError for an empty document. A document that parses to something other than a
+    * mapping is returned as-is; the FormatError for that comes later, from the YObject/Required
+    * formatters that consume it. Loaded as Object rather than as a map for exactly that reason:
+    * a narrower type parameter puts a checkcast at this call site, and a bare string or a
+    * sequence would then escape as a ClassCastException instead.
+    *
+    * Malformed YAML raises SnakeYAML's own YAMLException subclasses -- ScannerException,
+    * ParserException, ComposerException -- which are not FormatErrors. A caller guarding this
+    * must therefore catch YAMLException too. Main.commandErrorMessage is that caller.
     */
   def loadYamlFile(file: File): Object = {
     val doc = Using.resource(new FileInputStream(file)) { in =>
-      new Yaml(new SafeConstructor).load[java.util.AbstractMap[Object, Object]](in)
+      new Yaml(new SafeConstructor).load[Object](in)
     }
 
     if (doc == null)

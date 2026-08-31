@@ -1,27 +1,4 @@
 
-Malformed YAML escapes Main's catch block as a raw SnakeYAML stack trace
-  - The catch around the cfg.mode dispatch matches YamlFormat.FormatError, ConfigError,
-    TimeoutException, and IllegalArgumentException. A syntactically broken config raises
-    none of them: SnakeYAML throws YAMLException subclasses -- ScannerException,
-    ParserException, ComposerException -- and FormatError covers only Aspen's own
-    validation, i.e. an empty document or a missing/misshapen field
-  - loadYamlString's scaladoc in YamlFormat already documents this exact trap. Main is
-    the caller it warns about, and it catches the wrong thing. loadYamlFile, which is
-    the overload the CLI actually reaches via BootstrapConfig.loadBootstrapConfig,
-    behaves the same way but carries no such warning -- worth copying the note over
-  - Costs more than a stack trace. The exception unwinds out of main, so neither
-    drainAndShutdown() nor System.exit(exitCode) runs, and the drain is what lets a
-    nudge sent moments earlier survive process exit. Shell status is still nonzero
-    because the JVM exits 1 on an uncaught exception, so this is lost cleanup and bad
-    diagnostics rather than a wrong exit code
-  - Ordinary to hit: a truncated or half-edited bootstrap config does it. scopt's
-    validate only checks that the file exists, not that it parses
-  - Fix is a narrow "case e: YAMLException" clause alongside the existing four.
-    Deliberately not NonFatal: that would swallow genuine bugs into a one-line message,
-    and an unexpected exception should stay loud
-  - Affects every command taking a <bootstrap-config-file>, plus host, which loads both
-    the host and bootstrap configs inside host()
-
 Reassignment of a pool to a new set:
   - Safety check reassignment to same set. No-op in this case
   - MigratePoolToSetDurableTask

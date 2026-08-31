@@ -228,6 +228,33 @@ bootstrap-hosts:
     finally
       Files.deleteIfExists(f)
 
+  test("loadBootstrapConfig rejects a document that is not a mapping"):
+    // The file-path mirror of the parseBootstrapConfig case below. loadYamlFile used to load
+    // the document as a map, so a bare string or an HTML error page came back as a
+    // ClassCastException from the checkcast at that call site rather than as a FormatError --
+    // and Main's catch, which knows about FormatError, let it unwind out of main.
+    val f = Files.createTempFile("aspen-bootstrap-nonmapping", ".yaml")
+    try
+      Files.write(f, "<html><body>404</body></html>".getBytes(StandardCharsets.UTF_8))
+      val ex = intercept[FormatError]:
+        BootstrapConfig.loadBootstrapConfig(f.toFile)
+      ex.getMessage should include("Object Required")
+    finally
+      Files.deleteIfExists(f)
+
+  test("loadBootstrapConfig lets SnakeYAML's own parse failure out"):
+    // Same as the parseBootstrapConfig case below: malformed YAML never reaches Config's
+    // validation, so a guarding caller has to know about YAMLException as well as FormatError.
+    // Main.commandErrorMessage is that caller for this overload.
+    val f = Files.createTempFile("aspen-bootstrap-malformed", ".yaml")
+    try
+      Files.write(f, "bootstrap-hosts: [unclosed\n".getBytes(StandardCharsets.UTF_8))
+      val ex = intercept[ParserException]:
+        BootstrapConfig.loadBootstrapConfig(f.toFile)
+      ex shouldBe a[YAMLException]
+    finally
+      Files.deleteIfExists(f)
+
   test("parseBootstrapConfig round-trips generateBootstrapConfig"):
     val cfg = BootstrapConfig.parseBootstrapConfig(generated)
     assertMatchesGenerated(cfg)

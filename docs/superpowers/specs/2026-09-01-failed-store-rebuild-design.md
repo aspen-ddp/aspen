@@ -261,10 +261,15 @@ node's contents are visited paired with the wrong node, and the last node's cont
 visited at all.
 
 `foreachInRange` has the same slip, plus a second: its termination test compares `maxKey`
-against the *current* node's `minimum` rather than `nodeTail.minimum`, so it stops one node
-late or early depending on the range. The fix is to compare against `nodeTail.minimum` — the
-minimum key of the node about to be read — with `<= 0`, since the range is `[minKey, maxKey)`
-and a next node whose minimum equals `maxKey` holds nothing in range.
+against a bare `minimum`, which binds to the *class field* — the minimum of the node the walk
+started on — and so is constant for the entire recursion rather than tracking the node about to
+be read. Reached through `TieredKeyValueList.foreachInRange` the start node comes from
+`fetchContainingNode(minKey)`, so `minimum <= minKey <= maxKey` always holds and the guard
+never fired at all. The walk read every remaining tier-0 node through to the end of the list on
+every range query: unbounded read amplification, not an off-by-one. The fix is to compare
+against `nodeTail.minimum` — the minimum key of the node about to be read — with `<= 0`, since
+the range is `[minKey, maxKey)` and a next node whose minimum equals `maxKey` holds nothing in
+range.
 
 Both bugs are entirely within `KeyValueListNode`. `TieredKeyValueList.foreach` and
 `foreachInRange` only descend to the containing tier-0 node and delegate, so they need no fix.

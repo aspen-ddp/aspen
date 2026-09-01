@@ -333,16 +333,23 @@ class TKVLSuite extends IntegrationTestSuite {
 
   /** Builds a tier-0 list guaranteed to span several nodes.
    *
-   *  Splits are forced with 512 KiB values, the same lever the "Splitting tree insertion"
+   *  Splits are forced with oversized values, the same lever the "Splitting tree insertion"
    *  test uses. Inserts are sequential rather than concurrent so the node boundaries are
    *  deterministic from run to run.
+   *
+   *  `valueSize` sets how many keys fit in a node against the 1 MiB tier-0 budget. The default
+   *  gives one key per node, which is what most of these tests want. A caller that needs nodes
+   *  holding several keys - to place a key strictly inside a node rather than at its edge -
+   *  passes something smaller. No test should assume a particular layout either way; derive it
+   *  from `tier0NodeMinimums`.
    *
    *  Returns the tree, its root manager (needed to re-read the root after splits), and the
    *  inserted keys in ascending order.
    */
-  private def buildSplitTree(numKeys: Int): Future[(TieredKeyValueList, KVObjectRootManager, List[Key])] =
+  private def buildSplitTree(numKeys: Int,
+                             valueSize: Int = 512 * 1024): Future[(TieredKeyValueList, KVObjectRootManager, List[Key])] =
     val treeKey = Key(Array[Byte](0))
-    val bigValue = Value(new Array[Byte](512 * 1024))
+    val bigValue = Value(new Array[Byte](valueSize))
     val keys = (1 to numKeys).map(i => Key(i)).toList
 
     def insertSequentially(tree: TieredKeyValueList, remaining: List[Key]): Future[Unit] =
@@ -384,6 +391,35 @@ class TKVLSuite extends IntegrationTestSuite {
     yield
       (freshTree, root, keys)
 
+  /** The minimum key of every tier-0 node, in left-to-right list order.
+   *
+   *  Read out of the tree's own right pointers rather than reproduced from the split
+   *  arithmetic, so the boundary tests below keep covering what they claim if that arithmetic
+   *  ever shifts. Deliberately avoids the foreach variants: these are the fixtures those
+   *  walks get checked against.
+   */
+  private def tier0NodeMinimums(tree: TieredKeyValueList): Future[List[Key]] =
+
+    def walkRight(node: KeyValueListNode): Future[List[Key]] =
+      node.tail match
+        case None => Future.successful(node.minimum :: Nil)
+        case Some(nodeTail) =>
+          client.read(nodeTail.pointer).flatMap: kvos =>
+            walkRight(KeyValueListNode(client, nodeTail, node.ordering, kvos))
+              .map(node.minimum :: _)
+
+    for
+      (tier, ordering, oroot) <- tree.rootManager.getRootNode()
+      root = oroot.getOrElse(throw new BrokenTree())
+      e <- TieredKeyValueList.fetchContainingNode(client, tier, 0, ordering,
+             Key.AbsoluteMinimum, root, Set())
+      leftmost = e match
+        case Left(_) => throw new BrokenTree()
+        case Right(n) => n
+      mins <- walkRight(leftmost)
+    yield
+      mins
+
   atest("foreach visits every key exactly once on a split tree") {
     var visits = List[(Key, Boolean)]()
 
@@ -401,15 +437,24 @@ class TKVLSuite extends IntegrationTestSuite {
       // Guard the guard: if the tree never split, this test proves nothing.
       numTiers should be >= 1
 
-      val visitedKeys = visits.map(_._1)
-      visitedKeys.distinct.sortBy(k => keys.indexOf(k)) should be (keys)
-      visitedKeys.length should be (keys.length)
+      // visits is built by prepending, so reversing it recovers visit order. keys is ascending
+      // by construction, so asserting the exact ordered list also pins the ascending-order
+      // invariant that crash-resume leans on: a consumer checkpointing "last restored key = K"
+      // and resuming at foreachFrom(K) silently drops anything a non-monotonic walk delivered
+      // after K. This subsumes the set-equality and length checks it replaces.
+      visits.reverse.map(_._1) should be (keys)
       visits.filterNot(_._2) should be (Nil)
   }
 
-  // Covers key visitation and pairing across node boundaries. Cannot observe the
-  // termination guard (KeyValueListNode.scala:219): an extra read beyond the range
-  // contributes zero keys after filtering. Detecting that requires read-count instrumentation.
+  // Covers key visitation and pairing across node boundaries. It cannot observe the old
+  // termination defect. That guard compared maxKey against a bare `minimum`, which bound to the
+  // class field - the minimum of the node the walk started on, constant for the whole recursion.
+  // Reached through the tiered wrapper the walk starts at fetchContainingNode(minKey), so
+  // minimum <= minKey <= maxKey always held and the guard never fired: every remaining tier-0
+  // node was read through to the end of the list on every range query. Zero extra keys reached
+  // fn, so nothing is visible through the fn seam; catching it requires read-count
+  // instrumentation. The one symptom observable without instrumentation was an unreadable node
+  // past the range failing the returned future for a range that never touched it.
   atest("foreachInRange spans node boundaries and honors the half-open range") {
     var visits = List[(Key, Boolean)]()
 
@@ -440,15 +485,61 @@ class TKVLSuite extends IntegrationTestSuite {
       Future.unit
 
     for
-      (tree, root, keys) <- buildSplitTree(8)
+      // Smaller values so nodes hold several keys each; at the default size every node holds
+      // exactly one key and there is no "inside" for a key to be.
+      (tree, root, keys) <- buildSplitTree(12, 128 * 1024)
       (numTiers, _, _) <- root.getRootNode()
-      _ <- tree.foreachFrom(Key(5), record)
+      mins <- tier0NodeMinimums(tree)
+
+      // Derived from the tree rather than hardcoded: the first key that lives in a node other
+      // than the leftmost one AND sits strictly above that node's minimum. That is precisely
+      // what "inside a later node" means, and picking it this way keeps the claim true if the
+      // split arithmetic ever shifts.
+      nodeMinimumOf = (k: Key) => mins.filter(m => IntegerKeyOrdering.compare(m, k) <= 0).last
+      oresumeKey = keys.find: k =>
+        val m = nodeMinimumOf(k)
+        m != mins.head && IntegerKeyOrdering.compare(m, k) < 0
+
+      // Assert the premise rather than assume it.
+      _ = withClue(s"tier-0 node minimums: $mins - "):
+            oresumeKey should not be (None)
+
+      resumeKey = oresumeKey.get
+      _ <- tree.foreachFrom(resumeKey, record)
     yield
       numTiers should be >= 1
 
-      val visitedKeys = visits.map(_._1)
-      visitedKeys.length should be (4)
-      visitedKeys.toSet should be (Set(Key(5), Key(6), Key(7), Key(8)))
+      val expected = keys.filter(k => IntegerKeyOrdering.compare(k, resumeKey) >= 0)
+      visits.reverse.map(_._1) should be (expected)
+      visits.filterNot(_._2) should be (Nil)
+  }
+
+  atest("foreachFrom resumes from a key exactly on a node boundary") {
+    var visits = List[(Key, Boolean)]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visits = (key, node.keyInRange(key)) :: visits
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(8)
+      (numTiers, _, _) <- root.getRootNode()
+      mins <- tier0NodeMinimums(tree)
+
+      // The awkward descent: minKey is exactly a node's minimum, so the node to its left
+      // reports keyInRange(minKey) == false because minKey is that node's maximum. The walk
+      // has to land on the right of the two adjacent nodes.
+      _ = withClue(s"tier-0 node minimums: $mins - "):
+            mins.length should be >= 2
+
+      boundaryKey = mins(1)
+      _ <- tree.foreachFrom(boundaryKey, record)
+    yield
+      numTiers should be >= 1
+
+      val expected = keys.filter(k => IntegerKeyOrdering.compare(k, boundaryKey) >= 0)
+      expected should not be (Nil)
+      visits.reverse.map(_._1) should be (expected)
       visits.filterNot(_._2) should be (Nil)
   }
 
@@ -463,7 +554,25 @@ class TKVLSuite extends IntegrationTestSuite {
       (tree, root, keys) <- buildSplitTree(8)
       _ <- tree.foreachFrom(Key(0), record)
     yield
-      visitedKeys.length should be (keys.length)
-      visitedKeys.toSet should be (keys.toSet)
+      visitedKeys.reverse should be (keys)
+  }
+
+  atest("foreachFrom above the last key visits nothing") {
+    var visitedKeys = List[Key]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visitedKeys = key :: visitedKeys
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(8)
+      (numTiers, _, _) <- root.getRootNode()
+      // Reachable in production when the checkpointed key is deleted between the crash and the
+      // resume. The filter empties the last node, its tail is None, and the walk completes
+      // successfully having visited nothing.
+      _ <- tree.foreachFrom(Key(keys.length + 1), record)
+    yield
+      numTiers should be >= 1
+      visitedKeys should be (Nil)
   }
 }

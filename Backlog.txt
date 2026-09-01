@@ -276,6 +276,31 @@ forever
     workflow whose *progress* depends on transfers completing
   - Related to the abortStoreTransfer note above
 
+RebalancingServiceSuite leaks a 100ms pollPeriod when a test fails
+  - Six sweep tests set RebalancingDurableService.pollPeriod to 100ms and
+    restore it in the yield, so any failure earlier in the for-comprehension
+    leaves the short period in place for every later suite in the same JVM
+  - Pre-existing pattern (the original enrollment test does it too), but the
+    blast radius grew with the sweep tests. A fixture-level restore -- or an
+    andThen on the assembled future -- would make it unconditional
+
+rebalanceStorageDeviceSet now walks the services TKVL on its no-op path
+  - Splitting the entry point so the sweep can pass its own statePointer moved
+    the pointer lookup above the pendingTransfers.nonEmpty short-circuit, so a
+    set with a transfer in flight pays a multi-tier traversal to decide to do
+    nothing, and returns a failed future rather than Future.unit if the service
+    is unregistered
+  - Bootstrap always registers the service, so the failure mode is theoretical;
+    the wasted read is not. Reordering the short-circuit above the lookup fixes
+    both
+
+parseRebalancePeriod's range check is conservative for hours and minutes
+  - checkDurationRange bounds days at the exact FiniteDuration limit (106751)
+    but rounds hours and minutes down, rejecting a sliver of legal values
+    (23 hours' and 1427 minutes' worth). Safe direction -- nothing that passes
+    can throw -- but not exact, and only the days branch has a test, with no
+    boundary case
+
 StorageDeviceSetState set recursion has no cycle guard
   - collectDevices and the level-1 branch of selectDeviceWithSpace recurse
     through memberSets without a visited-set or decreasing-level check, and

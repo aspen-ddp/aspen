@@ -30,9 +30,11 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
   /** Overridable poll period (test seam; mirrors MissedUpdateFinalizationAction.errorTimeout). */
   @volatile var pollPeriod: Duration = DefaultPollPeriod
 
-  /** Test-only hook: counts sets that passed the level-0 filter in sweepOneSet. Exists solely
-   *  to allow tests to detect removal of the filter; not for production use. */
-  @volatile private[rebalancing] var testPlannedSetsCount = 0
+  /** Test-only hook: counts the sets sweepOneSet carried past the level-0 filter. Note that
+   *  this counts sets the sweep took up, not sets it planned -- a set skipped downstream for
+   *  pending transfers or an active task still increments it. Exists solely to allow tests to
+   *  detect removal of the filter; not for production use. */
+  @volatile private[rebalancing] var testSweptSetsCount = 0
 
   /** Default interval between automatic rebalance sweeps. Distinct from DefaultPollPeriod,
    *  which is how often reconcile() runs. */
@@ -306,11 +308,13 @@ class RebalancingDurableService(val client: AspenClient,
     else
       client.getStorageDeviceSetState(setId).flatMap: setState =>
         // Level 1+ sets hold sets rather than devices; getStateForRebalancePlanning throws on
-        // them, so they are filtered out here rather than allowed to abort the sweep.
+        // them. The .recover below would absorb that, so skipping them here is an optimization
+        // and log hygiene rather than a correctness requirement -- it saves the reads and keeps
+        // an expected condition out of the warning log.
         if setState.level != 0 then
           Future.unit
         else
-          RebalancingDurableService.testPlannedSetsCount += 1
+          RebalancingDurableService.testSweptSetsCount += 1
           RebalancingDurableService.rebalanceReadSet(client, setId, setState, statePointer)
       .recover:
         case err =>

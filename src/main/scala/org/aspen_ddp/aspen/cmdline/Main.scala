@@ -108,7 +108,9 @@ object Main {
                   poolName:String="",
                   srcGroupName:String="",
                   newGroupLevel:Int=0,
-                  entityRef:String="")
+                  entityRef:String="",
+                  rebalancePeriod:Option[String]=None,
+                  rebalancePeriodUnit:Option[String]=None)
 
   class ConfigError(msg: String) extends AmoebaError(msg)
 
@@ -555,6 +557,22 @@ object Main {
             },
         )
 
+      cmd("system-rebalance-period").text("Displays or sets the automatic rebalancing period").
+        action((_, c) => c.copy(mode = "system-rebalance-period")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<period>").optional().
+            text("Interval between automatic rebalance sweeps, or \"disabled\". " +
+                 "Omit to display the current period").
+            action((x, c) => c.copy(rebalancePeriod = Some(x))),
+
+          arg[String]("<unit>").optional().text("minutes, hours, or days").
+            action((x, c) => c.copy(rebalancePeriodUnit = Some(x))),
+        )
+
       cmd("migrate-pool").text("Migrates a storage pool to a different storage device set").
         action((_, c) => c.copy(mode = "migrate-pool")).
         children(
@@ -679,6 +697,12 @@ object Main {
           failure("Invalid command")
         else if Set(c.dataPort, c.cncPort, c.storeTransferPort).size != 3 then
           failure("data-port, cnc-port, and store-transfer-port must all be different")
+        else if c.mode == "system-rebalance-period" then
+          // Validated here rather than in the handler so a malformed period is a usage error,
+          // reported before any client or network is built.
+          parseRebalancePeriod(c.rebalancePeriod, c.rebalancePeriodUnit) match
+            case Left(msg) => failure(msg)
+            case Right(_) => success
         else
           success
       }
@@ -723,6 +747,8 @@ object Main {
                                                                   cfg.deviceSetName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
+            case "system-rebalance-period" =>
+              systemRebalancePeriod(bootstrapConfigPath, cfg.rebalancePeriod, cfg.rebalancePeriodUnit)
             case "migrate-pool" => migrate_pool(bootstrapConfigPath, cfg.poolName, cfg.deviceSetName)
             case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
             case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             _.listHosts(),             _.uuid)
@@ -1786,6 +1812,37 @@ object Main {
         println(s"Rebalance enrolled for storage device set $setIdStr")
       case Failure(err) =>
         println(s"Rebalance failed to enroll: ${err.getMessage}")
+
+  /** Display the automatic rebalancing period, or set it. checkConfig has already rejected a
+   *  malformed period, so the Left branch here is belt and braces. */
+  def systemRebalancePeriod(bootstrapConfigFile: os.Path,
+                            period: Option[String],
+                            unit: Option[String]): Int =
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    parseRebalancePeriod(period, unit) match
+      case Left(msg) =>
+        println(s"Invalid period: $msg")
+        1
+
+      case Right(None) =>
+        awaitAndReport(RebalancingDurableService.getAutoRebalanceStatus(client)):
+          case Success((current, lastSweep)) =>
+            println(formatRebalanceStatus(current, lastSweep))
+          case Failure(err) =>
+            println(s"Could not read the rebalance period: ${err.getMessage}")
+
+      case Right(Some(d)) =>
+        awaitAndReport(RebalancingDurableService.setAutoRebalancePeriod(client, d)):
+          case Success(_) =>
+            println(s"Automatic rebalancing period set to ${formatRebalancePeriod(d)}")
+          case Failure(err) =>
+            println(s"Could not set the rebalance period: ${err.getMessage}")
 
   /** Resolve a user-supplied entity reference that may be either a UUID or a name.
    *  If `ref` parses as a UUID it is wrapped via `byUuid`; otherwise it is looked up

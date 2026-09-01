@@ -2,13 +2,19 @@ package org.aspen_ddp.aspen.common.rebalancing
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.compute.{DurableTaskPointer, TaskStopped}
+import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
+import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.objects.Value
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 class PoolMigrationPlanningSuite extends IntegrationTestSuite:
 
@@ -114,3 +120,51 @@ class PoolMigrationPlanningSuite extends IntegrationTestSuite:
       planning <- State.getStateForRebalancePlanning(client, setState)
     yield
       planning.pools.keySet should contain(poolId)
+
+  atest("SetRebalanceDurableTask drops a pending transfer whose pool left planning state"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+
+    for
+      _ <- net.createSecondDevice()
+      poolState <- client.getStoragePoolState(poolId)
+      storeId = StoreId(poolId, 0.toByte)
+      source = poolState.stores(0).storageDeviceId
+
+      // Enroll a transfer for the pool, then mark the pool as migrating -- the race the
+      // backstop exists for.
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             for
+               setPtr <- client.getStorageDeviceSetPointer(setId)
+               dos <- client.read(setPtr)
+             yield
+               val updated = StorageDeviceSetState(dos).copy(
+                 pendingTransfers = List((storeId, source, net.secondDeviceId)))
+               tx.overwrite(setPtr, dos.revision, DataBuffer(updated.toBytes))
+      _ <- setMigration(poolId, Some(StoragePoolState.Migration(
+             StorageDeviceSetId(java.util.UUID.randomUUID()),
+             StoragePoolState.MigrationStatus.InProgress)))
+      _ <- waitForTransactionsToComplete()
+
+      taskPtr <- allocateTaskStateObject()
+      task = new SetRebalanceDurableTask(DurableTaskPointer(taskPtr), client, setId,
+               Duration(50, MILLISECONDS))
+      _ <- task.completed
+
+      finalSet <- client.getStorageDeviceSetState(setId)
+    yield
+      finalSet.pendingTransfers shouldBe empty
+
+  /** An empty KV object to serve as a durable task's state object. */
+  private def allocateTaskStateObject(): Future[org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+      for
+        pool <- client.getStoragePool(Radicle.poolId)
+        allocator = new PoolObjectAllocator(client, pool)
+        ptr <- allocator.allocateKeyValueObject(
+                 Map(org.aspen_ddp.aspen.common.objects.Key(99) -> Value(Array[Byte](0))))
+      yield ptr

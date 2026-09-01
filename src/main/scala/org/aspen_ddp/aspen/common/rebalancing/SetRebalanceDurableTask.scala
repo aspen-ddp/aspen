@@ -80,18 +80,32 @@ class SetRebalanceDurableTask(
             Future.unit
           else
             client.getStorageDeviceSetState(setId).flatMap: setState =>
-              State.getStateForRebalancePlanning(client, setState).map: planningState =>
-                val offline = client.offlineHosts()
+              State.getStateForRebalancePlanning(client, setState).flatMap: planningState =>
                 val notStarted = classified.collect { case (t, Phase.NotStarted) => t }
-                notStarted.find(t => TransferSafety.isSafe(planningState, offline,
-                    Plan.Transfer(t._1, t._2, t._3))) match
-                  case Some((storeId, _, toDevice)) =>
-                    client.transferStore(storeId, toDevice).failed.foreach: err =>
-                      logger.warn(s"Rebalance set $setId: transferStore for $storeId failed " +
-                        s"(will retry via poll): $err")
-                    scheduleRecheck()
+
+                // A pool that has left planning state (its migration is InProgress) is owned by
+                // MigratePoolToSetDurableTask. isSafe would return false forever for its
+                // transfers -- pools.get(poolId) is None -- wedging this set's whole rebalance.
+                // Drop them instead. migratePoolToSet strips this list at migration start; this
+                // is the backstop for a plan enrolled just after that strip committed.
+                notStarted.find(t => !planningState.pools.contains(t._1.poolId)) match
+                  case Some(t) =>
+                    logger.info(s"Rebalance set $setId: dropping transfer for ${t._1}; " +
+                      s"its pool is no longer in planning state")
+                    removePending(t).map(_ => processNext())
+
                   case None =>
-                    scheduleRecheck()
+                    val offline = client.offlineHosts()
+                    notStarted.find(t => TransferSafety.isSafe(planningState, offline,
+                        Plan.Transfer(t._1, t._2, t._3))) match
+                      case Some((storeId, _, toDevice)) =>
+                        client.transferStore(storeId, toDevice).failed.foreach: err =>
+                          logger.warn(s"Rebalance set $setId: transferStore for $storeId failed " +
+                            s"(will retry via poll): $err")
+                        scheduleRecheck()
+                      case None =>
+                        scheduleRecheck()
+                    Future.unit
 
   private enum Phase:
     case Completed, InFlight, NotStarted

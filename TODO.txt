@@ -1,0 +1,29 @@
+Need official mechanism for rebuilding a failed store
+  - Move rebuild logic in CLI to aspen.server.rebuild package
+    - Remove CLI
+  - Add CLI command fail-storage-device
+    - Creates a FailedStorageDeviceDurableTask
+      - Task State includes StorageDeviceId, StorageDeviceSetId that contains the device
+      - Uses a single transaction to
+        - Remove the device from its enclosing device set
+        - Remove the device from its owning HostState
+        - Zero the HostId and StorageDeviceId UUIDs
+      - One by one, allocate a new storage device from the same set using the rebuild allocation function
+        - In single Transaction:
+          - Add the store in Rebuilding state to the new device
+          - Remove the store entry from the failed device
+        - Send a nudge to the host for it to check the storage device state and thereby quickly start the
+          rebuild process
+  - Add guard code to StoreTransfer and Pool allocation logic that ensures the HostId and StorageDeviceId
+    are non-zero when new store entries are added to a StorageDevice
+    - Safety check guarding against transferring/allocating stores to failed storage devices
+  - Rebuild operations are managed the same way as Store TransferIn/TransferOut
+    - StoreManager polling function sees a Store assigned to the device in the Rebuilding state
+      - Start/Resume the rebuild process
+  - Use "rebuild-state.yaml" file in root directory of the storage device to indicate that the store is
+    being rebuilt and should not be loaded normally (similar to transfer in/out)
+    - May also serve to hold any beneficial checkpointing state
+  - Rebuild process may periodically checkpoint to disk to speed up the recovery process in the
+    event of a crash
+    - One exampe could be the UUID of the last restored object
+    - That way it can pick up from near where it left off rather than staring from the beginning

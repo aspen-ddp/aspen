@@ -7,13 +7,6 @@ os.Path note:
   - can convert to java Path via os.Path.toNIO
   - then to File via java Path.toFile()
 
-Need official mechanism for rebuilding a failed store
-  - Use Rebuilding state to StoreEntry in target StorageDeviceState?
-  - Simple and can be picked up by periodic host scans
-    - Same as TransferIn/TransferOut
-  - Rebuilder should periodically checkpoint to disk the UUID of the last restored object
-    - That way can pick up from where it left off in hte event of a crash
-
 Need a way to connect AllocationGroups to App-defined Allocators
   - Application can just create them during initialization
 

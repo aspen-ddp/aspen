@@ -30,6 +30,10 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
   /** Overridable poll period (test seam; mirrors MissedUpdateFinalizationAction.errorTimeout). */
   @volatile var pollPeriod: Duration = DefaultPollPeriod
 
+  /** Test-only hook: counts sets that passed the level-0 filter in sweepOneSet. Exists solely
+   *  to allow tests to detect removal of the filter; not for production use. */
+  @volatile private[rebalancing] var testPlannedSetsCount = 0
+
   /** Default interval between automatic rebalance sweeps. Distinct from DefaultPollPeriod,
    *  which is how often reconcile() runs. */
   val DefaultAutoRebalancePeriod: Duration = Duration(8, HOURS)
@@ -110,24 +114,29 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
    *  progress. Idempotent and safe against concurrent callers (revision-checked writes). */
   def rebalanceStorageDeviceSet(client: AspenClient, setId: StorageDeviceSetId): Future[Unit] =
     given ExecutionContext = client.clientContext
-    client.getStorageDeviceSetState(setId).flatMap(rebalanceReadSet(client, setId, _))
+    for
+      setState <- client.getStorageDeviceSetState(setId)
+      statePtr <- readServiceStatePointer(client)
+      r <- rebalanceReadSet(client, setId, setState, statePtr)
+    yield r
 
-  /** As above, for a caller that has already read the set's state. The automatic sweep reads
-   *  it to filter on level, and would otherwise pay for the same read twice.
+  /** As above, for a caller that has already read the set's state and the service state
+   *  pointer. The automatic sweep reads the set state to filter on level and already holds
+   *  the pointer as a field, so this variant avoids duplicate reads.
    *
    *  Note that the level check is deliberately *not* here: the public entry point above must
    *  keep surfacing the planning failure when a user names a non-level-0 set on the command
    *  line, rather than silently doing nothing. */
   private def rebalanceReadSet(client: AspenClient,
                                setId: StorageDeviceSetId,
-                               setState: StorageDeviceSetState): Future[Unit] =
+                               setState: StorageDeviceSetState,
+                               statePtr: KeyValueObjectPointer): Future[Unit] =
     given ExecutionContext = client.clientContext
 
     if setState.pendingTransfers.nonEmpty then
       Future.unit
     else
       for
-        statePtr <- readServiceStatePointer(client)
         stateKvos <- client.read(statePtr)
         active = RebalancingServiceState.decodeActiveTasks(
                    stateKvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
@@ -226,6 +235,10 @@ class RebalancingDurableService(val client: AspenClient,
       case AutoRebalancePeriodChanged =>
         reconcile()
 
+  /** Re-read service state, start any tasks not yet running, and run a sweep if one is due.
+   *  Because this future spans the entire sequential sweep, scheduleNonConcurrentPollingTask
+   *  suppresses timer ticks until the sweep finishes, so startTask for newly-enrolled tasks
+   *  can be deferred by up to one sweep duration. */
   private def reconcile(): Future[Unit] =
     if stopped then Future.unit
     else
@@ -246,7 +259,9 @@ class RebalancingDurableService(val client: AspenClient,
         if !sweepIsDue(period, lastSweep) || !beginSweep() then
           Future.unit
         else
-          sweep()
+          // Wrap sweep() in a flatMap so a synchronous throw in the first call (e.g.,
+          // listStorageDeviceSets()) becomes a failed future that .andThen still sees.
+          Future.unit.flatMap(_ => sweep())
             .andThen { case _ => endSweep() }
             .recover:
               case err => logger.warn(s"RebalancingDurableService sweep failed: $err")
@@ -292,8 +307,11 @@ class RebalancingDurableService(val client: AspenClient,
       client.getStorageDeviceSetState(setId).flatMap: setState =>
         // Level 1+ sets hold sets rather than devices; getStateForRebalancePlanning throws on
         // them, so they are filtered out here rather than allowed to abort the sweep.
-        if setState.level != 0 then Future.unit
-        else RebalancingDurableService.rebalanceReadSet(client, setId, setState)
+        if setState.level != 0 then
+          Future.unit
+        else
+          RebalancingDurableService.testPlannedSetsCount += 1
+          RebalancingDurableService.rebalanceReadSet(client, setId, setState, statePointer)
       .recover:
         case err =>
           logger.warn(s"Automatic rebalance of storage device set ${setId.uuid} failed: $err")

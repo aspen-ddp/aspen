@@ -336,6 +336,10 @@ class MainSuite extends AnyFunSuite with Matchers:
   test("parseRebalancePeriod rejects a negative count"):
     Main.parseRebalancePeriod(Some("-1"), Some("hours")) shouldBe Left("period must not be negative")
 
+  test("parseRebalancePeriod rejects a count that exceeds Duration's range"):
+    Main.parseRebalancePeriod(Some("999999999999999"), Some("days")) shouldBe
+      Left("period is too large (maximum ~292 years)")
+
   test("formatRebalancePeriod renders zero as disabled"):
     Main.formatRebalancePeriod(Duration.Zero) shouldBe "disabled"
 

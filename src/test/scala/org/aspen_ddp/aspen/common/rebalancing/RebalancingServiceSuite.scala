@@ -169,11 +169,11 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
   atest("a zero period disables the sweep even when a set is unbalanced"):
     given ExecutionContext = executionContext
     RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
-    val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration.Zero)
       _ <- writeLastAutoRebalance(HLCTimestamp.Zero)
+      exec = makeExecutor()
       quiet <- nothingEnrolledAfterSeveralPolls()
       lastSweep <- readLastAutoRebalance()
     yield
@@ -185,11 +185,11 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
   atest("a recent sweep defers the next one until the period elapses"):
     given ExecutionContext = executionContext
     RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
-    val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration(8, HOURS))
       _ <- writeLastAutoRebalance(HLCTimestamp.now)
+      exec = makeExecutor()
       quiet <- nothingEnrolledAfterSeveralPolls()
     yield
       exec.shutdown()
@@ -200,12 +200,16 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
+    RebalancingDurableService.testPlannedSetsCount = 0
     val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
       // A level-1 set holds sets, not devices. getStateForRebalancePlanning throws on it, so
-      // the sweep must filter it out before planning; if it does not, the level-0 set below
-      // is never reached and the awaitUntil times out.
+      // the sweep must filter it out before planning. Without the filter, sweepOneSet would
+      // call planAndEnroll on the level-1 set and getStateForRebalancePlanning would throw,
+      // but the per-set .recover swallows the error so the level-0 set is still reached.
+      // This test asserts that the level-1 set never makes it past the filter to planning,
+      // observable via the testPlannedSetsCount hook which increments only for sets that pass.
       upper <- client.createStorageDeviceSet("upper", 1, None)
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration(1, MINUTES))
       _ <- writeLastAutoRebalance(HLCTimestamp.Zero)
@@ -217,6 +221,8 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       exec.shutdown()
       RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       active.map(_._1) should not contain upper
+      // The filter prevents the level-1 set from being planned: only the bootstrap set was.
+      RebalancingDurableService.testPlannedSetsCount shouldBe 1
 
   atest("a set already being rebalanced is not enrolled twice by the sweep"):
     given ExecutionContext = executionContext
@@ -230,6 +236,7 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       _ <- RebalancingDurableService.rebalanceStorageDeviceSet(client, setId)
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration(1, MINUTES))
       _ <- writeLastAutoRebalance(HLCTimestamp.Zero)
+      _ <- awaitUntil("a sweep to complete")(readLastAutoRebalance().map(_ != HLCTimestamp.Zero))
       duringSweep <- readActiveTasks()
       _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))
     yield

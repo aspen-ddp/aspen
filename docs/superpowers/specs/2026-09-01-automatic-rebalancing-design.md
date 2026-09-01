@@ -126,8 +126,9 @@ HLC timestamps exist to provide and needs no special handling.
 
 1. `client.listStorageDeviceSets()` to enumerate all sets.
 2. For each set, read `client.getStorageDeviceSetState(setId)` and keep only `level == 0`.
-   This filter is mandatory: `State.getStateForRebalancePlanning` throws
-   `IllegalArgumentException` for non-level-0 sets.
+   This filter is an optimization: it prevents log noise from the per-set `.recover` that
+   would otherwise swallow the `IllegalArgumentException` that `State.getStateForRebalancePlanning`
+   throws for non-level-0 sets.
 3. **Sequentially** — folding over futures, not fanning out — call the rebalance entry
    point for each surviving set. Sequential enrollment bounds the burst of reads and
    revision-checked writes to the shared `ActiveTasksKey`, which is where concurrent

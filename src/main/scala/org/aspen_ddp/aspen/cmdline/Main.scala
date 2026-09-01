@@ -1959,7 +1959,20 @@ object Main {
                         case "hour" | "hours" => Right(HOURS)
                         case "day" | "days" => Right(DAYS)
                         case other => Left(s"unknown unit '$other': expected minutes, hours, or days")
+          _ <- checkDurationRange(count, timeUnit)
         yield Some(Duration(count, timeUnit))
+
+  /** Duration(count, unit) throws IllegalArgumentException if the result exceeds ~292 years
+   *  (2^63-1 nanoseconds). Check the range before constructing the Duration. */
+  private def checkDurationRange(count: Long, unit: java.util.concurrent.TimeUnit): Either[String, Unit] =
+    val maxDays = 106751L
+    val exceedsLimit = unit match
+      case DAYS => count > maxDays
+      case HOURS => count > maxDays * 24
+      case MINUTES => count > maxDays * 24 * 60
+      case _ => false
+    if exceedsLimit then Left(s"period is too large (maximum ~292 years)")
+    else Right(())
 
   /** Render an automatic rebalancing period using the largest unit that divides it evenly.
    *  A display helper in the mould of formatBytes. */

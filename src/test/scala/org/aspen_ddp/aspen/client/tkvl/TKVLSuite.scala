@@ -471,9 +471,10 @@ class TKVLSuite extends IntegrationTestSuite {
     yield
       numTiers should be >= 1
 
-      val visitedKeys = visits.map(_._1)
-      visitedKeys.length should be (4)
-      visitedKeys.toSet should be (Set(Key(3), Key(4), Key(5), Key(6)))
+      // Ascending order matters here for the same reason it does for foreachFrom: a caller
+      // that stops partway and resumes from the last key it saw is only safe on a walk that
+      // never goes backwards.
+      visits.reverse.map(_._1) should be (List(Key(3), Key(4), Key(5), Key(6)))
       visits.filterNot(_._2) should be (Nil)
   }
 

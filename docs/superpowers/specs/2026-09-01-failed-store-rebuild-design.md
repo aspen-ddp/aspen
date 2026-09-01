@@ -279,9 +279,13 @@ splits, `tail` is `None`, and the buggy branch never runs.
 
 **`foreachFrom(minKey, fn)`** is new, at both levels. A resume needs "from this key to the
 end," and `foreachInRange` cannot express it: keys are arbitrary-length byte arrays, so there
-is no maximum key to pass as the upper bound. At the `TieredKeyValueList` level it is
-`foreach` with `minKey` in place of `Key.AbsoluteMinimum` in the `fetchContainingNode` call; at
-the node level it is `foreach` with the head node's contents filtered to `>= minKey`.
+is no maximum key to pass as the upper bound. It is the general form of `foreach`, and the
+dependency runs that way in the implementation: `foreach` is `foreachFrom(Key.AbsoluteMinimum)`
+at both levels, since filtering to `>= Key.AbsoluteMinimum` is a no-op under every
+`KeyOrdering`. Every node's contents are filtered to `>= minKey`, not just the head node's —
+past the first node the filter is a no-op, but only when the walk was entered through
+`fetchContainingNode`. The bound is inclusive: a caller resuming from a checkpointed key
+re-visits that key, so per-key work must be idempotent.
 
 Both functions also swallow a failing `fn` — they log and continue. That is left as-is; the
 rebuild copes with it explicitly (see error handling), and changing it would alter behavior for

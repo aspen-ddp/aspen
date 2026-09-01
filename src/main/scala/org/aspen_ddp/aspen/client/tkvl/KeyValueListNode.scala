@@ -46,7 +46,7 @@ class KeyValueListNode(val reader: ObjectReader,
 
     val p = Promise[KeyValueListNode]()
 
-    def scan(right: KeyValueListPointer): Unit = reader.read(right.pointer, s"Scanning right KVListNode node ${pointer.id}. Minimum: $minimum. target: $target") onComplete {
+    def scan(right: KeyValueListPointer): Unit = reader.read(right.pointer, s"Scanning right KVListNode node ${right.pointer.id}. Minimum: ${right.minimum}. target: $target") onComplete {
       case Failure(err) => p.failure(err)
 
       case Success(kvos) =>

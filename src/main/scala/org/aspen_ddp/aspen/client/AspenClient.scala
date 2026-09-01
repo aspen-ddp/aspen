@@ -24,6 +24,10 @@ object AspenClient:
   class StoreNotActive(storeId: StoreId) extends Exception(s"Store $storeId is not in the Active state")
   class InvalidDeviceSetLevel(childLevel: Int, parentLevel: Int)
     extends Exception(s"Device set level $childLevel must be less than parent level $parentLevel")
+  /** A store was about to be written onto a device an operator has declared dead. Terminal:
+   *  retrying cannot help, since a tombstone is one-way. */
+  class DeviceFailed(deviceId: StorageDeviceId)
+    extends Exception(s"Storage device ${deviceId.uuid} has been declared failed")
 
 /** The primary interface for applications using Aspen object storage: object allocation,
  *  transaction building, and object retrieval.
@@ -248,6 +252,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: InvalidDestination => throw StopRetrying(e)
       case e: StoreNotActive => throw StopRetrying(e)
+      case e: DeviceFailed => throw StopRetrying(e)
 
     val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
@@ -272,6 +277,11 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       yield
         if sourceId == destinationId then
           throw InvalidDestination()
+
+        // A store on a tombstoned device is silently lost: nothing reconciles it, because
+        // reconcileDeviceState ignores failed devices outright.
+        if dstState.isFailed then
+          throw DeviceFailed(destinationId)
 
         srcState.stores.get(storeId) match
           case None => throw StoreNotActive(storeId)

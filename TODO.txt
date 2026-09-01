@@ -1,9 +1,25 @@
-Rebalancing as a passive background task
-  - Part of the system-level Durable Service
-  - Periodically tries to rebalance each level 0 storage device set
-    - Every 4 hours by default?
-      - needs to be configurable
+Extend RebalancingDurableService to automatically initiate rebalancing operations
+  - Periodically try to rebalance each level 0 storage device set
+    - If a set is already rebalancing, ignore it
     - If it results in a non-empty plan, kick off a rebalancing task
+  - Polling period needs to be configurable
+    - Store in unit of minutes
+    - 8 hours by default
+    - Poll for changes to this value every hour
+      - protect against pileups
+      - Use a nudge message to force immediate re-read of state
+    - If time is set to 0, the periodic rebalancing operation is disabled
+      - Need to continue polling for changes to the period
+      - When set to non-zero, rebalancing is enabled
+    - CLI system-rebalance-period
+      - When called with no argument, display current period
+        - API
+      - With argument, set the period
+        - Needs simple time formatting like "20 minutes" and "4 hours"
+        - Support just minutes, hours, and days units
+      - Nudge message should be sent to service after updating the period
+      - Support "disabled" as an argument
+        - Sets the time to 0
 
 
 

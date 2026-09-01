@@ -49,7 +49,15 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
                               storageDeviceSet: StorageDeviceSetId):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
-  
+
+  /** True once an operator has declared this device dead. A tombstoned device still exists and
+   *  is still readable -- it holds the list of stores awaiting reconstruction -- but it is no
+   *  longer a member of any set or host, and is never a legal destination for a store.
+   *
+   *  `||` rather than `&&`: a half-written tombstone must read as failed, not as healthy. */
+  def isFailed: Boolean =
+    hostId == fixed_ids.FailedHostId || storageDeviceId == fixed_ids.FailedStorageDeviceId
+
   def setHost(hostId: HostId): StorageDeviceState =
     this.copy(hostId=hostId)
 

@@ -28,6 +28,10 @@ object AspenClient:
    *  retrying cannot help, since a tombstone is one-way. */
   class DeviceFailed(deviceId: StorageDeviceId)
     extends Exception(s"Storage device ${deviceId.uuid} has been declared failed")
+  /** fail-storage-device was invoked against a device that already carries a tombstone.
+   *  Terminal: the tombstone is one-way, and a recovered device is re-introduced under a new id. */
+  class DeviceAlreadyFailed(deviceId: StorageDeviceId)
+    extends Exception(s"Storage device ${deviceId.uuid} has already been declared failed")
 
 /** The primary interface for applications using Aspen object storage: object allocation,
  *  transaction building, and object retrieval.
@@ -193,6 +197,21 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *  Fails with NoSuchElementException if the pool or the target set does not exist.
    */
   def migratePoolToSet(poolId: PoolId, targetSetId: StorageDeviceSetId): Future[Unit]
+
+  /** Declare `deviceId` dead and begin reconstructing every store that lived on it.
+   *
+   *  One transaction enrolls a FailedStorageDeviceDurableTask, which then tombstones the device
+   *  -- removing it from its set and its owning host and zeroing both ids -- and moves its stores
+   *  one at a time onto live devices of each store's pool's set, marked Rebuilding. Returns as
+   *  soon as the enrollment commits; progress is observable via `show-device`.
+   *
+   *  The tombstone is one-way. A recovered device is re-introduced as a new device with a new id.
+   *
+   *  Fails with NoSuchElementException if the device does not exist, or DeviceAlreadyFailed if it
+   *  is already tombstoned. Two simultaneous calls both enroll, which is harmless: the task's
+   *  steps are idempotent and racing drains lose on their KeyRevision requirements and retry.
+   */
+  def failStorageDevice(deviceId: StorageDeviceId): Future[Unit]
 
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()

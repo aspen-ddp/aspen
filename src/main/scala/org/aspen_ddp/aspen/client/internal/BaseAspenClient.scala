@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.*
-import org.aspen_ddp.aspen.common.metadata.management.MigratePoolToSetDurableTask
+import org.aspen_ddp.aspen.common.metadata.management.{FailedStorageDeviceDurableTask, MigratePoolToSetDurableTask}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -548,6 +548,30 @@ abstract class BaseAspenClient(
 
     migrated.recover:
       case _: SameSetNoOp => ()
+
+  override def failStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = clientContext
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: ReadError => throw StopRetrying(e)
+      case e: AspenClient.DeviceAlreadyFailed => throw StopRetrying(e)
+
+    transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+
+      for
+        devPtr <- getStorageDevicePointer(deviceId)
+        devKvos <- read(devPtr, "fail storage device")
+        state = StorageDeviceState(devKvos)
+        _ <-
+          if state.isFailed then
+            throw AspenClient.DeviceAlreadyFailed(deviceId)
+          else
+            // The set is captured now because step 1 zeroes the device's own record of it.
+            FailedStorageDeviceDurableTask.prepareSystemTask(
+              this, deviceId, state.storageDeviceSet)
+      yield ()
 
   override def prepareSystemDurableTask(taskTypeUUID: UUID,
                                         initialState: Map[Key, Array[Byte]])

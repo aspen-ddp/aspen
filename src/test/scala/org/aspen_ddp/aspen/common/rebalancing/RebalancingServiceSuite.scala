@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.compute.ServiceEntry
 import org.aspen_ddp.aspen.compute.impl.SimpleDurableServiceExecutor
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.concurrent.duration.{Duration, HOURS, MILLISECONDS, MINUTES}
 
 class RebalancingServiceSuite extends IntegrationTestSuite:
 
@@ -74,3 +74,16 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
               p.success(())
             p.future.flatMap(_ => loop())
     loop()
+
+  atest("setAutoRebalancePeriod persists the period and getAutoRebalancePeriod reads it back"):
+    given ExecutionContext = executionContext
+    for
+      initial  <- RebalancingDurableService.getAutoRebalancePeriod(client)
+      _        <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration(4, HOURS))
+      updated  <- RebalancingDurableService.getAutoRebalancePeriod(client)
+      _        <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration.Zero)
+      disabled <- RebalancingDurableService.getAutoRebalancePeriod(client)
+    yield
+      initial shouldBe Duration(8, HOURS)
+      updated shouldBe Duration(240, MINUTES)
+      disabled shouldBe Duration(0, MINUTES)

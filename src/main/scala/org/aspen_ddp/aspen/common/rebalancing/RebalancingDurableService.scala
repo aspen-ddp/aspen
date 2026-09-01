@@ -60,6 +60,52 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
       case Some(vs) => ServiceEntry.decode(vs.value.bytes).statePointer
       case None => throw new IllegalStateException("RebalancingDurableService is not registered")
 
+  /** The automatic rebalance period together with the time of the last completed sweep. Read
+   *  as a pair because the two live in the same object and the cmdline displays both, so a
+   *  caller that wants both should not pay for two round trips. */
+  private[aspen] def getAutoRebalanceStatus(client: AspenClient): Future[(Duration, HLCTimestamp)] =
+    given ExecutionContext = client.clientContext
+    for
+      statePtr <- readServiceStatePointer(client)
+      kvos <- client.read(statePtr)
+    yield
+      (RebalancingServiceState.decodeAutoRebalancePeriod(
+         kvos.contents(RebalancingServiceState.AutoRebalancePeriodKey).value.bytes),
+       RebalancingServiceState.decodeLastAutoRebalance(
+         kvos.contents(RebalancingServiceState.LastAutoRebalanceKey).value.bytes))
+
+  /** The interval between automatic rebalance sweeps. Zero means automatic rebalancing is off. */
+  def getAutoRebalancePeriod(client: AspenClient): Future[Duration] =
+    given ExecutionContext = client.clientContext
+    getAutoRebalanceStatus(client).map(_._1)
+
+  /** Set the interval between automatic rebalance sweeps; zero disables them. Deliberately does
+   *  not touch LastAutoRebalanceKey, so shortening the period can make a sweep immediately due
+   *  and lengthening it defers the next one relative to the last sweep that actually ran.
+   *
+   *  The nudge that follows is best-effort, as everywhere else in this service: the running
+   *  service re-reads this value on every poll, so a dropped message costs latency, not
+   *  correctness. */
+  def setAutoRebalancePeriod(client: AspenClient, period: Duration): Future[Unit] =
+    given ExecutionContext = client.clientContext
+
+    val done: Future[Unit] = client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+      for
+        statePtr <- readServiceStatePointer(client)
+        kvos <- client.read(statePtr)
+      yield
+        val reqs = KeyValueUpdate.KeyRevision(
+                     RebalancingServiceState.AutoRebalancePeriodKey,
+                     kvos.contents(RebalancingServiceState.AutoRebalancePeriodKey).revision) :: Nil
+        val ops = Insert(RebalancingServiceState.AutoRebalancePeriodKey,
+                    RebalancingServiceState.encodeAutoRebalancePeriod(period)) :: Nil
+        tx.update(statePtr, None, None, reqs, ops)
+
+    done.map: _ =>
+      client.sendServiceMessage(ServiceUUID, RebalancingMessage.encode(AutoRebalancePeriodChanged))
+      ()
+
   /** Build a plan for `setId` and enroll a SetRebalanceDurableTask, unless one is already in
    *  progress. Idempotent and safe against concurrent callers (revision-checked writes). */
   def rebalanceStorageDeviceSet(client: AspenClient, setId: StorageDeviceSetId): Future[Unit] =

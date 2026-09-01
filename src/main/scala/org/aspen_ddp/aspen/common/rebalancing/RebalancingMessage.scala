@@ -16,6 +16,10 @@ case class TransferComplete(setId: StorageDeviceSetId,
                             fromDevice: StorageDeviceId,
                             toDevice: StorageDeviceId) extends RebalancingMessage
 
+/** Sent after an administrator changes the automatic rebalance period. Carries no value: the
+ *  service re-reads the authoritative one from its state object. */
+case object AutoRebalancePeriodChanged extends RebalancingMessage
+
 object RebalancingMessage:
 
   def encode(m: RebalancingMessage): Array[Byte] =
@@ -30,6 +34,9 @@ object RebalancingMessage:
             storeId = Some(Codec.encode(storeId)),
             fromDevice = Some(Codec.encode(from)),
             toDevice = Some(Codec.encode(to)))))
+      case AutoRebalancePeriodChanged =>
+        codec.RebalancingMessage(codec.RebalancingMessage.Msg.AutoRebalancePeriodChanged(
+          codec.AutoRebalancePeriodChanged()))
     proto.toByteArray
 
   def decode(bytes: Array[Byte]): RebalancingMessage =
@@ -43,5 +50,7 @@ object RebalancingMessage:
           Codec.decode(m.storeId.get),
           Codec.decode(m.fromDevice.get),
           Codec.decode(m.toDevice.get))
+      case codec.RebalancingMessage.Msg.AutoRebalancePeriodChanged(_) =>
+        AutoRebalancePeriodChanged
       case codec.RebalancingMessage.Msg.Empty =>
         throw new IllegalArgumentException("Empty RebalancingMessage")

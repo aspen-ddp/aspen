@@ -21,3 +21,7 @@ class RebalancingMessageSuite extends AnyFunSuite with Matchers:
       StorageDeviceId(UUID.randomUUID()),
       StorageDeviceId(UUID.randomUUID()))
     RebalancingMessage.decode(RebalancingMessage.encode(m)) shouldBe m
+
+  test("AutoRebalancePeriodChanged round-trips"):
+    RebalancingMessage.decode(
+      RebalancingMessage.encode(AutoRebalancePeriodChanged)) shouldBe AutoRebalancePeriodChanged

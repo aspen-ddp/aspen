@@ -553,10 +553,14 @@ message TransferComplete {
   StorageDeviceId toDevice = 4;
 }
 
+message AutoRebalancePeriodChanged {
+}
+
 message RebalancingMessage {
   oneof msg {
     NewSetRebalanceInitiated newSetRebalanceInitiated = 1;
     TransferComplete transferComplete = 2;
+    AutoRebalancePeriodChanged autoRebalancePeriodChanged = 3;
   }
 }
 

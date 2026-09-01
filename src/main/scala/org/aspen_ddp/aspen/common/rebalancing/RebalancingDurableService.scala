@@ -168,6 +168,8 @@ class RebalancingDurableService(val client: AspenClient,
         reconcile()
       case TransferComplete(setId, _, _, _) =>
         synchronized(tasks.get(setId)).foreach(_.wake())
+      case AutoRebalancePeriodChanged =>
+        reconcile()
 
   private def reconcile(): Future[Unit] =
     if stopped then Future.unit

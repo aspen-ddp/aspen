@@ -1,9 +1,11 @@
 package org.aspen_ddp.aspen.common.metadata.management
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectState, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.metadata.{HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, fixed_ids}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
+import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision}
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
 import org.aspen_ddp.aspen.common.util.{byte2uuid, ignoreExtraCallsWhileRunning, uuid2byte}
@@ -32,6 +34,12 @@ object FailedStorageDeviceDurableTask extends DurableTaskFactory:
 
   /** Overridable poll period (test seam; mirrors MigratePoolToSetDurableTask.pollPeriod). */
   @volatile var pollPeriod: Duration = DefaultPollPeriod
+
+  /** The store this pass chose is no longer on the tombstone -- another pass, or a concurrent
+   *  invocation, moved it. Not an error: the pass is abandoned and the next poll picks up
+   *  whatever is left. */
+  class StoreAlreadyMoved(storeId: StoreId)
+      extends Throwable(s"store $storeId is no longer recorded on the failed device")
 
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
@@ -73,6 +81,8 @@ class FailedStorageDeviceDurableTask(
     setId: StorageDeviceSetId,
     pollPeriod: Duration
 ) extends DurableTask with Logging:
+
+  import FailedStorageDeviceDurableTask.StoreAlreadyMoved
 
   private given ExecutionContext = client.clientContext
 
@@ -135,8 +145,7 @@ class FailedStorageDeviceDurableTask(
   private def drive(): Future[Unit] =
     client.getStorageDeviceState(deviceId).flatMap: state =>
       if state.isFailed then
-        // Step 1 is already done. The drain (step 2) goes here in the next task.
-        Future.successful(finishOk())
+        drain(state)
       else
         tombstone()
 
@@ -150,7 +159,11 @@ class FailedStorageDeviceDurableTask(
    *  Widened to private[management] for the idempotency test.
    */
   private[management] def tombstone(): Future[Unit] =
-    val done = client.transactUntilSuccessful: tx =>
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: FatalReadError => throw StopRetrying(e)
+      case _ => Future.unit
+
+    val done = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       for
         devPtr <- client.getStorageDevicePointer(deviceId)
         devKvos <- client.read(devPtr, "fail storage device")
@@ -205,3 +218,121 @@ class FailedStorageDeviceDurableTask(
         logger.warn(s"Failed device ${deviceId.uuid}: tombstone transaction failed: $err")
         scheduleRecheck()
         Future.unit
+
+  /** The tombstone's own store map is the work list. Sorted so passes are deterministic and a
+   *  resumed task picks the same next store a crashed one would have. */
+  private def nextStore(state: StorageDeviceState): Option[StoreId] =
+    state.stores.keys.toList.sortBy(sid => (sid.poolId.uuid, sid.poolIndex)).headOption
+
+  /** Step 2. One store per pass.
+   *
+   *  Selection happens BEFORE the pool is repointed, and against the pool's own set rather than
+   *  the failed device's former set. The former is required: selectDeviceForRebuild derives the
+   *  failed device from `poolState.stores(poolIndex)`, so a pool already repointed would
+   *  hard-exclude the wrong device. The latter means a store lost during a pool migration is
+   *  rebuilt directly into the migration's target rather than into the set the pool is leaving.
+   */
+  private def drain(state: StorageDeviceState): Future[Unit] = nextStore(state) match
+    case None =>
+      Future.successful(finishOk())
+
+    case Some(storeId) =>
+      val moved = for
+        poolState <- client.getStoragePoolState(storeId.poolId)
+        set <- client.getStorageDeviceSetState(poolState.storageDeviceSet)
+        destinationId <- set.selectDeviceForRebuild(storeId.poolId, storeId.poolIndex, client)
+        nudge <- moveStore(storeId, destinationId)
+      yield nudge
+
+      moved.transformWith:
+        case Success(nudge) =>
+          // A best-effort wake-up so the destination host starts promptly rather than waiting
+          // out Main.CheckStorageDevicesPeriod. The poll is the guarantee; this is the
+          // optimization.
+          client.sendBestEffortHostMessage(nudge)
+          scheduleRecheck()
+          Future.unit
+
+        case Failure(err) =>
+          // AllocationError (no device with room), a lost transaction race, a read failure: all
+          // transient from this task's point of view. The store stays on the tombstone and the
+          // next poll retries, so capacity appearing later is enough to recover.
+          logger.warn(s"Failed device ${deviceId.uuid}: could not place $storeId: $err")
+          scheduleRecheck()
+          Future.unit
+
+  /** The one transaction that moves a single store off the tombstone. Returns the nudge to send
+   *  once it has committed -- built inside so a retried attempt cannot double-send, and sent by
+   *  the caller rather than from tx.result so the returned Future actually waits for it. */
+  private def moveStore(storeId: StoreId,
+                        destinationId: StorageDeviceId): Future[CheckStorageDevice] =
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: IndexOutOfBoundsException => throw StopRetrying(e)
+      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
+      case e: StoreAlreadyMoved => throw StopRetrying(e)
+      case e: FatalReadError => throw StopRetrying(e)
+      case _ => Future.unit
+
+    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+
+      for
+        devPtr <- client.getStorageDevicePointer(deviceId)
+        devKvos <- client.read(devPtr, "failed device drain")
+        tombstoneState = StorageDeviceState(devKvos)
+        dstPtr <- client.getStorageDevicePointer(destinationId)
+        dstKvos <- client.read(dstPtr, "failed device drain")
+        dstState = StorageDeviceState(dstKvos)
+        poolPtr <- client.getStoragePoolPointer(storeId.poolId)
+        poolKvos <- client.read(poolPtr, "failed device drain")
+        poolCfg = StoragePoolState(poolKvos)
+        _ =
+          if !tombstoneState.stores.contains(storeId) then
+            // Another pass, or a concurrent fail-storage-device, already moved it.
+            throw new StoreAlreadyMoved(storeId)
+          else if dstState.isFailed then
+            // Structurally unreachable once step 1 has removed the tombstone from its set, but
+            // the pool state driving selection can be stale.
+            throw AspenClient.DeviceFailed(destinationId)
+        // Pool: repoint now, at the start of the rebuild rather than at its end. Reads of a
+        // rebuilding store fail until it is reconstructed, but that is equally true of a store
+        // on a dead device, and the pool must stop naming the dead device before anything can
+        // route around it. The rebalancer already excludes non-Active stores from movement and
+        // from the write-threshold count.
+        //
+        // CRITICAL ORDERING: this mutation must precede prepRadicleUpdate. prepRadicleUpdate
+        // builds poolHosts from poolCfg.stores, so if the mutation happens after (in the yield
+        // block), it reads stale state: the failed device's old host lands in hostsList while
+        // storeMap remaps its only bootstrap store away, and generateBootstrapConfig's
+        // require(storesOnHost.nonEmpty) throws IllegalArgumentException — permanent, not in
+        // StopRetrying, infinite loop. Invisible in single-host TestNetwork; no test protects
+        // this ordering.
+        _ = poolCfg.stores(storeId.poolIndex) =
+              StoragePoolState.StoreEntry(dstState.hostId, destinationId)
+        _ <- BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, dstState.hostId)
+      yield
+        // Destination: gains a Rebuilding entry. This is the entire message to the consumer.
+        val newDst = dstState.setStoreEntry(
+          storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+        tx.update(dstPtr, None, None,
+          List(KeyRevision(StorageDeviceState.StateKey,
+            dstKvos.contents(StorageDeviceState.StateKey).revision)),
+          List(Insert(StorageDeviceState.StateKey, newDst.encode())))
+
+        // Tombstone: loses the store. This is also the progress record -- an empty store map is
+        // what completes the task.
+        val newTombstone = tombstoneState.removeStore(storeId)
+        tx.update(devPtr, None, None,
+          List(KeyRevision(StorageDeviceState.StateKey,
+            devKvos.contents(StorageDeviceState.StateKey).revision)),
+          List(Insert(StorageDeviceState.StateKey, newTombstone.encode())))
+
+        // Pool config update with the mutation already applied above.
+        tx.update(poolPtr, None, None,
+          List(KeyRevision(StoragePoolState.ConfigKey,
+            poolKvos.contents(StoragePoolState.ConfigKey).revision)),
+          List(Insert(StoragePoolState.ConfigKey, poolCfg.encode())))
+
+        CheckStorageDevice(dstState.hostId, client.clientId, destinationId)

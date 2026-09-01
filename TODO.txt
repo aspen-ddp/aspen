@@ -6,7 +6,7 @@ Reassignment of a pool to a new set:
   - Always reassign each store to a new device and move it
   - Keep it simple.
     - Optimize for not moving existing stores that are already in the set later
-  - Must support assignement to level 1+ sets in addition to level 0
+  - Must support assignment to level 1+ sets in addition to level 0
     - Ideally the design and implementation will be the same for both
       - Try to minimize and isolate any differences if the code cannot be made identical
   - Durable task selects a device for a store, calls transferStore, polls for

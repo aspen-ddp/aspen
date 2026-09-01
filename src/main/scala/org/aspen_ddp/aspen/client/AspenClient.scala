@@ -253,8 +253,15 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       given Transaction = tx
 
       for
-        pool <- getStoragePool(storeId.poolId)
-        poolState <- pool.getState()
+        // getStoragePoolState, not getStoragePool(...).getState(): SimpleStoragePool caches its
+        // StoragePoolState from construction and nothing ever calls dropCachedState(), so the
+        // cached copy is a permanent snapshot of where the stores were when this client first
+        // touched the pool. The source device must be read fresh -- a store that has already
+        // moved once (a migration retarget, or two successive rebalances) would otherwise be
+        // transferred out of the device it used to live on. When the stale source happens to
+        // equal the true destination this surfaces as a StopRetrying InvalidDestination and
+        // wedges the caller; when it does not, it marks the wrong device TransferringOut.
+        poolState <- getStoragePoolState(storeId.poolId)
         sourceId = poolState.stores(storeId.poolIndex).storageDeviceId
         srcPtr <- getStorageDevicePointer(sourceId)
         srcKvos <- read(srcPtr)

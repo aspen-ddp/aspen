@@ -1044,6 +1044,26 @@ object Codec extends Logging:
     case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig()
     case codec.BackendConfig.Unrecognized(v) => throw new EncodingError(f"Invalid Backend Config: $v")
 
+  def encodePoolMigrationStatus(o: StoragePoolState.MigrationStatus): codec.PoolMigrationStatus = o match
+    case StoragePoolState.MigrationStatus.InProgress => codec.PoolMigrationStatus.POOL_MIGRATION_STATUS_IN_PROGRESS
+    case StoragePoolState.MigrationStatus.Complete   => codec.PoolMigrationStatus.POOL_MIGRATION_STATUS_COMPLETE
+
+  def decodePoolMigrationStatus(m: codec.PoolMigrationStatus): StoragePoolState.MigrationStatus = m match
+    case codec.PoolMigrationStatus.POOL_MIGRATION_STATUS_IN_PROGRESS => StoragePoolState.MigrationStatus.InProgress
+    case codec.PoolMigrationStatus.POOL_MIGRATION_STATUS_COMPLETE => StoragePoolState.MigrationStatus.Complete
+    case codec.PoolMigrationStatus.Unrecognized(v) => throw new EncodingError(f"Invalid PoolMigrationStatus: $v")
+
+  def encode(o: StoragePoolState.Migration): codec.PoolMigration =
+    codec.PoolMigration(
+      targetSet = Some(encodeUUID(o.targetSet.uuid)),
+      status = encodePoolMigrationStatus(o.status)
+    )
+
+  def decode(m: codec.PoolMigration): StoragePoolState.Migration =
+    StoragePoolState.Migration(
+      StorageDeviceSetId(decodeUUID(m.targetSet.get)),
+      decodePoolMigrationStatus(m.status))
+
 
   def encode(o: StoragePoolState): codec.StoragePoolState =
     codec.StoragePoolState(
@@ -1056,7 +1076,8 @@ object Codec extends Logging:
       currentUsage = o.currentUsage,
       maximumStoreSize = o.maximumStoreSize,
       allocationGroups = o.allocationGroups.map(encodeUUID),
-      storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid))
+      storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid)),
+      migration = o.migration.map(encode)
     )
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
@@ -1070,9 +1091,10 @@ object Codec extends Logging:
     val maximumStoreSize = m.maximumStoreSize
     val allocationGroups = m.allocationGroups.map(decodeUUID).toList
     val storageDeviceSet = StorageDeviceSetId(decodeUUID(m.storageDeviceSet.get))
+    val migration = m.migration.map(decode)
 
     StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig,
-      storageDeviceSet, currentUsage, maximumStoreSize, allocationGroups)
+      storageDeviceSet, currentUsage, maximumStoreSize, allocationGroups, migration)
 
 
   def encodeAllocationGroupMemberType(o: AllocationGroupState.MemberType): codec.AllocationGroupMemberType = o match

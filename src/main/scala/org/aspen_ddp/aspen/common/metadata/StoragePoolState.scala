@@ -21,6 +21,13 @@ object StoragePoolState:
 
   case class StoreEntry(hostId: HostId, storageDeviceId: StorageDeviceId)
 
+  /** State of a pool-to-set migration. `Complete` persists rather than reverting to `None`,
+   *  so a pool records its last migration. */
+  enum MigrationStatus:
+    case InProgress, Complete
+
+  case class Migration(targetSet: StorageDeviceSetId, status: MigrationStatus)
+
   def getStoreUsageKey(poolIndex: Byte): Key = Key(s"sz${poolIndex}")
 
   def apply(cfg: Array[Byte]): StoragePoolState = Codec.decode(codec.StoragePoolState.parseFrom(cfg))
@@ -38,7 +45,8 @@ final case class StoragePoolState(
                                    storageDeviceSet: StorageDeviceSetId,
                                    currentUsage: Long = 0,
                                    maximumStoreSize: Long = 0,
-                                   allocationGroups: List[UUID] = Nil
+                                   allocationGroups: List[UUID] = Nil,
+                                   migration: Option[StoragePoolState.Migration] = None
                                  ):
 
   def encode(): Array[Byte] = Codec.encode(this).toByteArray

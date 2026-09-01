@@ -482,6 +482,16 @@ enum BackendConfig {
   BACKEND_CONFIG_ROCKS_DB = 0;
 }
 
+enum PoolMigrationStatus {
+  POOL_MIGRATION_STATUS_IN_PROGRESS = 0;
+  POOL_MIGRATION_STATUS_COMPLETE = 1;
+}
+
+message PoolMigration {
+  UUID targetSet = 1;
+  PoolMigrationStatus status = 2;
+}
+
 message StoragePoolState {
   UUID poolId = 1;
   string name = 2;
@@ -493,6 +503,7 @@ message StoragePoolState {
   int64 maximumStoreSize = 8;
   repeated UUID allocationGroups = 9;
   UUID storageDeviceSet = 10;
+  PoolMigration migration = 11;
 }
 
 enum AllocationGroupMemberType {

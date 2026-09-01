@@ -555,6 +555,29 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decodedNoMax = Codec.decode(Codec.encode(noMaxSize))
     decodedNoMax.maxObjectSize shouldBe None
 
+  test("StoragePoolState migration field round-trip"):
+    val withMigration = StoragePoolState(
+      PoolId(uuid(20)), "migrating-pool", Replication(3, 2), None,
+      Array.empty, RocksDBConfig(), StorageDeviceSetId(uuid(21)),
+      migration = Some(StoragePoolState.Migration(
+        StorageDeviceSetId(uuid(22)), StoragePoolState.MigrationStatus.InProgress))
+    )
+    val decoded = Codec.decode(Codec.encode(withMigration))
+    decoded.migration shouldBe Some(StoragePoolState.Migration(
+      StorageDeviceSetId(uuid(22)), StoragePoolState.MigrationStatus.InProgress))
+
+    val completed = withMigration.copy(migration = Some(StoragePoolState.Migration(
+      StorageDeviceSetId(uuid(22)), StoragePoolState.MigrationStatus.Complete)))
+    Codec.decode(Codec.encode(completed)).migration.get.status shouldBe
+      StoragePoolState.MigrationStatus.Complete
+
+    // Absent is the common case: every pool that has never been migrated.
+    val noMigration = StoragePoolState(
+      PoolId(uuid(23)), "plain-pool", Replication(3, 2), None,
+      Array.empty, RocksDBConfig(), StorageDeviceSetId(uuid(24))
+    )
+    Codec.decode(Codec.encode(noMigration)).migration shouldBe None
+
   test("AllocationGroupState round-trip"):
     val original = AllocationGroupState(
       AllocationGroupId(uuid(1)),

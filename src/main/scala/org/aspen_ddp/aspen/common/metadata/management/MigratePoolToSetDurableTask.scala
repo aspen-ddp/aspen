@@ -114,10 +114,21 @@ class MigratePoolToSetDurableTask(
         catch
           case err: Throwable => Future.failed(err)
 
-      pass.recover:
-        case err =>
-          logger.warn(s"Pool migration ${poolId.uuid}: transient error, will retry: $err")
-          scheduleRecheck()
+      // transformWith to a constant Future.unit rather than recover: a `recover` body that
+      // itself threw (logger.warn, or pollTask.cancel() inside scheduleRecheck) would fail the
+      // returned future and wedge the flag just the same. Nothing below can throw or fail.
+      pass.transformWith: outcome =>
+        try
+          outcome match
+            case Failure(err) =>
+              logger.warn(s"Pool migration ${poolId.uuid}: transient error, will retry: $err")
+              scheduleRecheck()
+
+            case Success(_) => ()
+        catch
+          case _: Throwable => () // nothing left to report with; the next tick is the recovery
+
+        Future.unit
 
   private def driveMigration(): Future[Unit] =
     for

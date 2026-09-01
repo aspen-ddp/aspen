@@ -277,15 +277,22 @@ class TieredKeyValueList(val client: AspenClient,
     }
   }
 
-  def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
+  /** Descends to the tier-0 node containing `startKey` and hands it to `walk`.
+   *
+   *  The three tier-0 walks below differ only in which node-level method they delegate to;
+   *  sharing the descent keeps that the only difference between them. Each keeps its own name
+   *  so the node-level diagnostics still report the method the caller invoked.
+   */
+  private def walkFromContainingNode(startKey: Key,
+                                     walk: KeyValueListNode => Future[Unit]): Future[Unit] =
 
     def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] =
       for
-        e <- fetchContainingNode(client, tier, 0, ordering, Key.AbsoluteMinimum, root, Set())
+        e <- fetchContainingNode(client, tier, 0, ordering, startKey, root, Set())
         node = e match
           case Left(_) => throw new BrokenTree()
           case Right(n) => n
-        _ <- node.foreach(fn)
+        _ <- walk(node)
       yield
         ()
 
@@ -295,46 +302,35 @@ class TieredKeyValueList(val client: AspenClient,
         case None => Future.unit
         case Some(root) => nonEmpty(tier, ordering, root)
 
+  /** Visit every entry in the tree, in ascending key order.
+   *
+   *  Exactly `foreachFrom(Key.AbsoluteMinimum, fn)` at both this level and the node level.
+   *
+   *  A failing `fn` is logged and the walk continues to the next key. A failing read fails the
+   *  returned future.
+   */
+  def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
+    walkFromContainingNode(Key.AbsoluteMinimum, _.foreach(fn))
+
+  /** Visit every entry in `[minKey, maxKey)`, in ascending key order. */
   def foreachInRange(minKey: Key,
                      maxKey: Key,
                      fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
+    walkFromContainingNode(minKey, _.foreachInRange(minKey, maxKey, fn))
 
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] =
-      for
-        e <- fetchContainingNode(client, tier, 0, ordering, minKey, root, Set())
-        node = e match
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-        _ <- node.foreachInRange(minKey, maxKey, fn)
-      yield
-        ()
-
-    rootManager.getRootNode().flatMap: t =>
-      val (tier, ordering, oroot) = t
-      oroot match
-        case None => Future.unit
-        case Some(root) => nonEmpty(tier, ordering, root)
-
-  /** Visit every entry at or above `minKey`. The open-ended counterpart to foreachInRange,
-   *  used to resume an interrupted walk from a checkpointed key. */
+  /** Visit every entry at or above `minKey`, in ascending key order. The open-ended
+   *  counterpart to foreachInRange, used to resume an interrupted walk from a checkpointed
+   *  key.
+   *
+   *  The bound is inclusive: if `minKey` is still present it is visited again. A consumer that
+   *  checkpoints the last key it finished therefore re-processes exactly that one key on
+   *  resume, so whatever it does per key must be idempotent. That is the safe side of the
+   *  trade - an exclusive bound would turn a crash between doing the work and recording the
+   *  checkpoint into work that is permanently skipped.
+   */
   def foreachFrom(minKey: Key,
                   fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] =
-      for
-        e <- fetchContainingNode(client, tier, 0, ordering, minKey, root, Set())
-        node = e match
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-        _ <- node.foreachFrom(minKey, fn)
-      yield
-        ()
-
-    rootManager.getRootNode().flatMap: t =>
-      val (tier, ordering, oroot) = t
-      oroot match
-        case None => Future.unit
-        case Some(root) => nonEmpty(tier, ordering, root)
+    walkFromContainingNode(minKey, _.foreachFrom(minKey, fn))
 }
 
 object TieredKeyValueList {

@@ -552,8 +552,11 @@ class TKVLSuite extends IntegrationTestSuite {
 
     for
       (tree, root, keys) <- buildSplitTree(8)
+      (numTiers, _, _) <- root.getRootNode()
       _ <- tree.foreachFrom(Key(0), record)
     yield
+      numTiers should be >= 1
+
       visitedKeys.reverse should be (keys)
   }
 

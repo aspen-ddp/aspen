@@ -367,35 +367,6 @@ class StoreManager(val client: AspenClient,
                                              fromDeviceId: StorageDeviceId,
                                              toDeviceid: StorageDeviceId): Future[Unit] =
     client.transactUntilSuccessful: tx =>
-      
-      def prepUpdateBootstrapConfig(poolCfg: StoragePoolState, toDevice: StorageDeviceState): Future[Unit] =
-        if storeId.poolId != PoolId.BootstrapPoolId then
-          Future.unit
-        else 
-          for
-            toHost <- client.getHostState(toDevice.hostId)
-            poolHosts <- Future.sequence(poolCfg.stores.zipWithIndex.toList.map((e, index) => client.getHostState(e.hostId).map(host => (StoreId(storeId.poolId, index.toByte), host))))
-            radicleKvos <- client.read(client.radicle)
-          yield
-            val hostsMap = poolHosts.map((_, host) => host.hostId -> host).toMap + (toHost.hostId -> toHost)
-            val hostsList = hostsMap.valuesIterator.toList
-            val storeMap = poolHosts.map: (sid, host) =>
-              if sid == storeId then
-                (sid, toHost.hostId)
-              else
-                (sid, host.hostId)
-                
-            val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
-              aspenSystemId,
-              poolCfg.ida,
-              hostsList,
-              storeMap
-            )
-
-            val reqs = List(KeyRevision(Radicle.BootstrapConfigKey, radicleKvos.contents(Radicle.BootstrapConfigKey).revision))
-            val ops = List(Insert(Radicle.BootstrapConfigKey, bootstrapConfig.getBytes(StandardCharsets.UTF_8)))
-            tx.update(client.radicle, None, None, reqs, ops)
-
       for
         poolPtr <- client.getStoragePoolPointer(storeId.poolId)
         fromDevPtr <- client.getStorageDevicePointer(fromDeviceId)
@@ -405,7 +376,7 @@ class StoreManager(val client: AspenClient,
         toDevKvos <- client.read(toDevPtr)
         poolCfg = StoragePoolState(poolKvos)
         toDev = StorageDeviceState(toDevKvos)
-        _ <- prepUpdateBootstrapConfig(poolCfg, toDev)
+        _ <- BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, toDev.hostId)(using tx)
       yield
         val fromDev = StorageDeviceState(fromDevKvos)
 

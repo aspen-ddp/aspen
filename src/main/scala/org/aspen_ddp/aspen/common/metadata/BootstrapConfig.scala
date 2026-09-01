@@ -1,12 +1,20 @@
 package org.aspen_ddp.aspen.common.metadata
 
+import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
+import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
+import org.aspen_ddp.aspen.common.objects.Insert
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.common.util.byte2uuid
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 
 import java.io.File
+import java.nio.charset.StandardCharsets
 import java.util.UUID
+import scala.concurrent.{ExecutionContext, Future}
 
 /*
 aspen-system-id:  BF1049AD-D2A8-4D17-8080-E01A4678C8B3
@@ -161,3 +169,49 @@ object BootstrapConfig:
         sb.append(f"      - $storeId\n")
 
     sb.toString
+
+  /** Stage a regeneration of the radicle's bootstrap config inside the caller's transaction,
+   *  for a bootstrap-pool store that is moving to `newHostId`. A no-op -- `Future.unit`, nothing
+   *  staged -- for any other pool.
+   *
+   *  Every host bootstraps by reading this config, so a bootstrap-pool store that changes device
+   *  without it leaves every host in the system pointing at where the store used to be.
+   *
+   *  `aspenSystemId` comes from the radicle's own SystemIdKey rather than from a parameter, so
+   *  this needs nothing but an AspenClient. StoreManager has the value in a constructor
+   *  parameter; the client-side callers do not.
+   */
+  def prepRadicleUpdate(client: AspenClient,
+                        storeId: StoreId,
+                        poolCfg: StoragePoolState,
+                        newHostId: HostId)
+                       (using tx: Transaction): Future[Unit] =
+    given ExecutionContext = client.clientContext
+
+    if storeId.poolId != PoolId.BootstrapPoolId then
+      Future.unit
+    else
+      for
+        newHost <- client.getHostState(newHostId)
+        poolHosts <- Future.sequence(poolCfg.stores.zipWithIndex.toList.map: (e, index) =>
+                       client.getHostState(e.hostId).map(host =>
+                         (StoreId(storeId.poolId, index.toByte), host)))
+        radicleKvos <- client.read(client.radicle)
+      yield
+        val hostsMap = poolHosts.map((_, host) => host.hostId -> host).toMap +
+          (newHost.hostId -> newHost)
+        val hostsList = hostsMap.valuesIterator.toList
+        val storeMap = poolHosts.map: (sid, host) =>
+          if sid == storeId then
+            (sid, newHost.hostId)
+          else
+            (sid, host.hostId)
+
+        val aspenSystemId = byte2uuid(radicleKvos.contents(Radicle.SystemIdKey).value.bytes)
+
+        val yaml = generateBootstrapConfig(aspenSystemId, poolCfg.ida, hostsList, storeMap)
+
+        val reqs = List(KeyRevision(Radicle.BootstrapConfigKey,
+          radicleKvos.contents(Radicle.BootstrapConfigKey).revision))
+        val ops = List(Insert(Radicle.BootstrapConfigKey, yaml.getBytes(StandardCharsets.UTF_8)))
+        tx.update(client.radicle, None, None, reqs, ops)

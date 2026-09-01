@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.common.util.byte2long
+import org.aspen_ddp.aspen.common.util.{byte2long, runBoundedParallel}
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -24,6 +24,9 @@ object StorageDeviceSetState:
     Codec.decode(codec.StorageDeviceSetState.parseFrom(cfg))
 
   def apply(dos: DataObjectState): StorageDeviceSetState = apply(dos.data.getByteArray)
+
+  /** Cap on concurrent member-set reads while walking a hierarchy. Bounds load on large trees. */
+  private[metadata] val MaxConcurrentSetReads: Int = 20
 
   /** Thrown when attempting to move a device into a set whose level is not 0.
    *  Only level-0 sets hold devices. */
@@ -172,6 +175,54 @@ final case class StorageDeviceSetState(
               id => client.getStorageDeviceState(id).map(s => s.totalSize - s.currentUsage),
               rng)
       yield device
+
+  /** Select a device within this set (at any level) to receive a store being migrated here.
+   *
+   *  `requiredSize` is the store's current size and is a hard requirement. `exclude` holds the
+   *  devices already hosting stores of the same pool; they are soft-excluded, so a target set
+   *  narrower than the pool's IDA width still works. Fails with `AllocationError` when no
+   *  device in the tree has room.
+   */
+  def selectDeviceForStore(
+      requiredSize: Long,
+      exclude: Set[StorageDeviceId],
+      client: AspenClient,
+      rng: Random = new Random()
+  ): Future[StorageDeviceId] =
+    given ExecutionContext = client.clientContext
+    selectDeviceWithSpace(
+      requiredSize = requiredSize,
+      hardExclude = Set.empty,
+      softExclude = exclude,
+      lookup = client.getStorageDeviceSetState,
+      freeSpaceLookup = id => client.getStorageDeviceState(id).map(s => s.totalSize - s.currentUsage),
+      rng = rng)
+
+  /** Every device reachable from this set: `memberDevices` at level 0, the union of the
+   *  members' walks above. This is the "is this store already in the target set?" predicate
+   *  used by pool migration.
+   *
+   *  The walk is downward. The cheaper upward walk (device -> its set -> follow `parent`) is
+   *  deliberately not used: `parent` is documented as unenforced and `moveDevice` never
+   *  maintains it, and -- more decisively -- selection walks downward, so an upward done-check
+   *  could fail to recognize a device that selection had just placed a store on, which is an
+   *  infinite migration loop rather than a stale read.
+   */
+  def collectMemberDevices(client: AspenClient): Future[Set[StorageDeviceId]] =
+    given ExecutionContext = client.clientContext
+    collectDevices(client.getStorageDeviceSetState)
+
+  /** Recursive core of `collectMemberDevices`, depending only on a narrow `lookup` so it is
+   *  unit-testable without a full `AspenClient`. */
+  private[metadata] def collectDevices(
+      lookup: StorageDeviceSetId => Future[StorageDeviceSetState]
+  )(using ec: ExecutionContext): Future[Set[StorageDeviceId]] =
+    if level == 0 then
+      Future.successful(memberDevices.toSet)
+    else
+      runBoundedParallel(memberSets, StorageDeviceSetState.MaxConcurrentSetReads): id =>
+        lookup(id).flatMap(_.collectDevices(lookup))
+      .map(_.foldLeft(Set.empty[StorageDeviceId])(_ ++ _))
 
   /** Recursive core. Depends only on a narrow `lookup` so it is unit-testable
    *  without a full `AspenClient`. `exclude` carries device ids already chosen

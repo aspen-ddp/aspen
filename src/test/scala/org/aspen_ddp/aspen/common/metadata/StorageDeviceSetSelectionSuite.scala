@@ -345,3 +345,43 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     intercept[AllocationError](
       Await.result(parent.selectDeviceWithSpace(100L, Set.empty, Set.empty, noLookup,
         fixedLookup(Map.empty), new Random(1)), timeout))
+
+  test("collectDevices: level 0 returns its own member devices"):
+    val a = dev()
+    val b = dev()
+    val set = leaf(List(a, b))
+    Await.result(set.collectDevices(noLookup), timeout) should be(Set(a, b))
+
+  test("collectDevices: level 0 with no devices returns the empty set"):
+    Await.result(leaf(Nil).collectDevices(noLookup), timeout) should be(Set.empty)
+
+  test("collectDevices: level 1 unions its children"):
+    val a = dev()
+    val b = dev()
+    val childA = leaf(List(a))
+    val childB = leaf(List(b))
+    val parent = upper(1, List(childA, childB))
+    Await.result(parent.collectDevices(lookupFor(childA, childB)), timeout) should be(Set(a, b))
+
+  test("collectDevices: nested levels are walked to the leaves"):
+    val deep = dev()
+    val shallow = dev()
+    val leafDeep = leaf(List(deep))
+    val leafShallow = leaf(List(shallow))
+    val mid = upper(1, List(leafDeep))
+    val top = upper(2, List(mid, leafShallow))
+    val members = Await.result(
+      top.collectDevices(lookupFor(mid, leafDeep, leafShallow)), timeout)
+    members should be(Set(deep, shallow))
+
+  test("collectDevices: a device outside the tree is not a member"):
+    val inside = dev()
+    val outside = dev()
+    val child = leaf(List(inside))
+    val parent = upper(1, List(child))
+    val members = Await.result(parent.collectDevices(lookupFor(child)), timeout)
+    members should contain(inside)
+    members should not contain outside
+
+  test("collectDevices: level 1 with no member sets returns the empty set"):
+    Await.result(upper(1, Nil).collectDevices(noLookup), timeout) should be(Set.empty)

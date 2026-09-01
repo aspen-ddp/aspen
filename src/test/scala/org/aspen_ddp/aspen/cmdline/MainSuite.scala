@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.util.YamlFormat
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.server.HostConfig
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.yaml.snakeyaml.parser.ParserException
@@ -19,7 +20,7 @@ import java.util.UUID
 import java.util.concurrent.TimeoutException
 import scala.collection.mutable
 import scala.concurrent.{Await, Future}
-import scala.concurrent.duration.{Duration, SECONDS}
+import scala.concurrent.duration.{DAYS, Duration, HOURS, MINUTES, SECONDS}
 
 class MainSuite extends AnyFunSuite with Matchers:
 
@@ -296,3 +297,77 @@ class MainSuite extends AnyFunSuite with Matchers:
     val s = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
       RocksDBConfig(), setId)
     Main.formatPoolState(s, None) should not include "Migration:"
+
+  test("parseRebalancePeriod returns the display form when no period is given"):
+    Main.parseRebalancePeriod(None, None) shouldBe Right(None)
+
+  test("parseRebalancePeriod accepts each unit in singular and plural form"):
+    Main.parseRebalancePeriod(Some("20"), Some("minutes")) shouldBe Right(Some(Duration(20, MINUTES)))
+    Main.parseRebalancePeriod(Some("1"), Some("minute")) shouldBe Right(Some(Duration(1, MINUTES)))
+    Main.parseRebalancePeriod(Some("4"), Some("hours")) shouldBe Right(Some(Duration(4, HOURS)))
+    Main.parseRebalancePeriod(Some("1"), Some("hour")) shouldBe Right(Some(Duration(1, HOURS)))
+    Main.parseRebalancePeriod(Some("7"), Some("days")) shouldBe Right(Some(Duration(7, DAYS)))
+    Main.parseRebalancePeriod(Some("1"), Some("day")) shouldBe Right(Some(Duration(1, DAYS)))
+
+  test("parseRebalancePeriod is case-insensitive about units"):
+    Main.parseRebalancePeriod(Some("4"), Some("HOURS")) shouldBe Right(Some(Duration(4, HOURS)))
+
+  test("parseRebalancePeriod maps 'disabled' to a zero period"):
+    Main.parseRebalancePeriod(Some("disabled"), None) shouldBe Right(Some(Duration.Zero))
+
+  test("parseRebalancePeriod accepts an explicit zero"):
+    Main.parseRebalancePeriod(Some("0"), Some("hours")) shouldBe Right(Some(Duration.Zero))
+
+  test("parseRebalancePeriod rejects 'disabled' with a unit"):
+    Main.parseRebalancePeriod(Some("disabled"), Some("hours")) shouldBe Left("'disabled' takes no unit")
+
+  test("parseRebalancePeriod rejects a count with no unit"):
+    Main.parseRebalancePeriod(Some("4"), None) shouldBe
+      Left("a unit is required: minutes, hours, or days")
+
+  test("parseRebalancePeriod rejects an unknown unit"):
+    Main.parseRebalancePeriod(Some("4"), Some("weeks")) shouldBe
+      Left("unknown unit 'weeks': expected minutes, hours, or days")
+
+  test("parseRebalancePeriod rejects a non-numeric count"):
+    Main.parseRebalancePeriod(Some("soon"), Some("hours")) shouldBe
+      Left("period must be a whole number")
+
+  test("parseRebalancePeriod rejects a negative count"):
+    Main.parseRebalancePeriod(Some("-1"), Some("hours")) shouldBe Left("period must not be negative")
+
+  test("formatRebalancePeriod renders zero as disabled"):
+    Main.formatRebalancePeriod(Duration.Zero) shouldBe "disabled"
+
+  test("formatRebalancePeriod selects the largest unit that divides evenly"):
+    Main.formatRebalancePeriod(Duration(20, MINUTES)) shouldBe "20 minutes"
+    Main.formatRebalancePeriod(Duration(240, MINUTES)) shouldBe "4 hours"
+    Main.formatRebalancePeriod(Duration(7, DAYS)) shouldBe "7 days"
+    Main.formatRebalancePeriod(Duration(90, MINUTES)) shouldBe "90 minutes"
+
+  test("formatRebalancePeriod uses singular units for one"):
+    Main.formatRebalancePeriod(Duration(1, MINUTES)) shouldBe "1 minute"
+    Main.formatRebalancePeriod(Duration(1, HOURS)) shouldBe "1 hour"
+    Main.formatRebalancePeriod(Duration(1, DAYS)) shouldBe "1 day"
+
+  test("formatRebalanceStatus reports 'never' and the next poll before the first sweep"):
+    val out = Main.formatRebalanceStatus(Duration(8, HOURS), HLCTimestamp.Zero)
+    out should include("Automatic rebalancing period: 8 hours")
+    out should include("Last sweep:                   never")
+    out should include("Next sweep due:               next poll")
+
+  test("formatRebalanceStatus omits the next sweep when disabled"):
+    val out = Main.formatRebalanceStatus(Duration.Zero, HLCTimestamp.Zero)
+    out should include("Automatic rebalancing period: disabled")
+    out should not include "Next sweep due"
+
+  test("formatRebalanceStatus reports both times once a sweep has run"):
+    val out = Main.formatRebalanceStatus(Duration(8, HOURS), HLCTimestamp.now)
+    out should include("Last sweep:")
+    out should include("Next sweep due:")
+    out should not include "never"
+
+  test("formatWallTime renders a fixed epoch millisecond value"):
+    // Asserted on shape rather than an exact string: the helper renders in the local zone.
+    Main.formatWallTime(1_756_742_400_000L) should fullyMatch regex
+      """\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"""

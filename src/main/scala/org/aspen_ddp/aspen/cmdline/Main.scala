@@ -47,7 +47,7 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeoutException}
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.concurrent.duration.{Duration, HOURS, MILLISECONDS, SECONDS}
+import scala.concurrent.duration.{DAYS, Duration, HOURS, MILLISECONDS, MINUTES, SECONDS}
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
 import scala.language.implicitConversions
@@ -1871,6 +1871,71 @@ object Main {
         value /= 1024.0
         idx += 1
       f"$value%.1f ${units(idx)}"
+
+  /** Parse the period arguments of `system-rebalance-period`.
+   *
+   *  `Right(None)` means no period was supplied: the display form. `Right(Some(d))` is the
+   *  period to set, where zero disables automatic rebalancing. `Left` carries a message fit
+   *  to show the user.
+   *
+   *  A missing period with a present unit cannot occur -- scopt fills positional arguments in
+   *  order -- and is treated as the display form rather than given its own error. */
+  private[cmdline] def parseRebalancePeriod(period: Option[String],
+                                            unit: Option[String]): Either[String, Option[Duration]] =
+    (period, unit) match
+      case (None, _) =>
+        Right(None)
+
+      case (Some(p), _) if p.equalsIgnoreCase("disabled") =>
+        if unit.isDefined then Left("'disabled' takes no unit")
+        else Right(Some(Duration.Zero))
+
+      case (Some(_), None) =>
+        Left("a unit is required: minutes, hours, or days")
+
+      case (Some(p), Some(u)) =>
+        for
+          count <- p.toLongOption.toRight("period must be a whole number")
+          _ <- if count < 0 then Left("period must not be negative") else Right(())
+          timeUnit <- u.toLowerCase match
+                        case "minute" | "minutes" => Right(MINUTES)
+                        case "hour" | "hours" => Right(HOURS)
+                        case "day" | "days" => Right(DAYS)
+                        case other => Left(s"unknown unit '$other': expected minutes, hours, or days")
+        yield Some(Duration(count, timeUnit))
+
+  /** Render an automatic rebalancing period using the largest unit that divides it evenly.
+   *  A display helper in the mould of formatBytes. */
+  private[cmdline] def formatRebalancePeriod(d: Duration): String =
+    val minutes = d.toMinutes
+    if minutes == 0 then "disabled"
+    else if minutes % (60 * 24) == 0 then pluralUnits(minutes / (60 * 24), "day")
+    else if minutes % 60 == 0 then pluralUnits(minutes / 60, "hour")
+    else pluralUnits(minutes, "minute")
+
+  private def pluralUnits(n: Long, unit: String): String =
+    if n == 1 then s"$n $unit" else s"$n ${unit}s"
+
+  /** Render a wall-clock millisecond value in the local time zone. */
+  private[cmdline] def formatWallTime(millis: Long): String =
+    java.time.Instant.ofEpochMilli(millis)
+      .atZone(java.time.ZoneId.systemDefault())
+      .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+
+  /** The display form of `system-rebalance-period`. The next-sweep line is omitted when
+   *  automatic rebalancing is disabled, because there is no next sweep to report. */
+  private[cmdline] def formatRebalanceStatus(period: Duration, lastSweep: HLCTimestamp): String =
+    val lines = scala.collection.mutable.ListBuffer[String]()
+    lines += s"Automatic rebalancing period: ${formatRebalancePeriod(period)}"
+    if lastSweep == HLCTimestamp.Zero then
+      lines += "Last sweep:                   never"
+      if period > Duration.Zero then
+        lines += "Next sweep due:               next poll"
+    else
+      lines += s"Last sweep:                   ${formatWallTime(lastSweep.wallTime)}"
+      if period > Duration.Zero then
+        lines += s"Next sweep due:               ${formatWallTime(lastSweep.wallTime + period.toMillis)}"
+    lines.mkString("\n")
 
   private[cmdline] def formatDeviceState(s: StorageDeviceState,
                                          hostName: Option[String],

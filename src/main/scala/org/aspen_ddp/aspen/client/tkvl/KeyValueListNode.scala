@@ -180,7 +180,7 @@ class KeyValueListNode(val reader: ObjectReader,
                     kvos.revision, kvos.refcount, kvos.contents,
                     kvos.right.map(v => KeyValueListPointer(v.bytes)))
 
-                  val contents = node.contents.toList.sortWith((a,b) => ordering.compare(a._1, b._1) < 0)
+                  val contents = nextNode.contents.toList.sortWith((a,b) => ordering.compare(a._1, b._1) < 0)
 
                   recurse(nextNode, contents)
               }

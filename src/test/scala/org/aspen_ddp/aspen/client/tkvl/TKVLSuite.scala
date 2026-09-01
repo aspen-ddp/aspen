@@ -330,4 +330,80 @@ class TKVLSuite extends IntegrationTestSuite {
       numTiers should be (0)
     }
   }
+
+  /** Builds a tier-0 list guaranteed to span several nodes.
+   *
+   *  Splits are forced with 512 KiB values, the same lever the "Splitting tree insertion"
+   *  test uses. Inserts are sequential rather than concurrent so the node boundaries are
+   *  deterministic from run to run.
+   *
+   *  Returns the tree, its root manager (needed to re-read the root after splits), and the
+   *  inserted keys in ascending order.
+   */
+  private def buildSplitTree(numKeys: Int): Future[(TieredKeyValueList, KVObjectRootManager, List[Key])] =
+    val treeKey = Key(Array[Byte](0))
+    val bigValue = Value(new Array[Byte](512 * 1024))
+    val keys = (1 to numKeys).map(i => Key(i)).toList
+
+    def insertSequentially(tree: TieredKeyValueList, remaining: List[Key]): Future[Unit] =
+      remaining match
+        case Nil => Future.unit
+        case key :: rest =>
+          val tx: Transaction = client.newTransaction()
+          for
+            _ <- tree.set(key, bigValue)(using tx)
+            _ <- tx.commit()
+            _ <- waitForTransactionsToComplete()
+            _ <- insertSequentially(tree, rest)
+          yield ()
+
+    for
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
+
+      nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, IntegerKeyOrdering,
+        nodeAllocator, Map())(using tx1)
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+
+      root <- froot
+      tree <- root.getTree()
+      _ <- insertSequentially(tree, keys)
+
+      // Re-read: splits replace the root, so the tree handle from before the inserts is stale.
+      freshTree <- root.getTree()
+    yield
+      (freshTree, root, keys)
+
+  atest("foreach visits every key exactly once on a split tree") {
+    var visits = List[(Key, Boolean)]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      // keyInRange is the check that catches the wrong-node pairing: a key handed to the
+      // caller with a node that does not own it is exactly the bug.
+      visits = (key, node.keyInRange(key)) :: visits
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(8)
+      (numTiers, _, _) <- root.getRootNode()
+      _ <- tree.foreach(record)
+    yield
+      // Guard the guard: if the tree never split, this test proves nothing.
+      numTiers should be >= 1
+
+      val visitedKeys = visits.map(_._1)
+      visitedKeys.distinct.sortBy(k => keys.indexOf(k)) should be (keys)
+      visitedKeys.length should be (keys.length)
+      visits.filterNot(_._2) should be (Nil)
+  }
 }

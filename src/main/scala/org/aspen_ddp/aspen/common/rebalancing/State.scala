@@ -68,6 +68,20 @@ object State:
       yield
         val poolKvos = poolPairs.toMap
 
+        // A pool with a migration in progress is owned by MigratePoolToSetDurableTask for the
+        // duration; the rebalancer must not plan moves for its stores. Omitting it from `pools`
+        // and its stores from every device makes Plan.computePlan skip them across all three
+        // phases with no changes of its own. Device currentUsage/totalSize are self-reported by
+        // StorageDeviceState rather than summed from stores, so fill ratios stay accurate.
+        val migratingPools: Set[PoolId] =
+          poolKvos.collect:
+            case (poolId, kvos)
+              if StoragePoolState(kvos).migration.exists(
+                   _.status == StoragePoolState.MigrationStatus.InProgress) => poolId
+          .toSet
+
+        val plannedPoolIds = poolIds -- migratingPools
+
         def storeSize(storeId: StoreId): Long =
           poolKvos.get(storeId.poolId)
             .flatMap(_.contents.get(StoragePoolState.getStoreUsageKey(storeId.poolIndex)))
@@ -77,17 +91,21 @@ object State:
         // One Store per owned store id, shared between the device and pool views.
         val storesById: Map[StoreId, Store] =
           deviceStates.flatMap: ds =>
-            ownedStores(ds).map((sid, entry) => sid -> Store(sid, storeSize(sid), entry.status))
+            ownedStores(ds)
+              .filterNot((sid, _) => migratingPools.contains(sid.poolId))
+              .map((sid, entry) => sid -> Store(sid, storeSize(sid), entry.status))
           .toMap
 
         val devices: Map[StorageDeviceId, Device] =
           deviceStates.map: ds =>
-            val itsStores = ownedStores(ds).keys.map(sid => sid -> storesById(sid)).toMap
+            val itsStores = ownedStores(ds).keys
+              .filter(storesById.contains)
+              .map(sid => sid -> storesById(sid)).toMap
             ds.storageDeviceId -> Device(ds.storageDeviceId, ds.hostId, ds.currentUsage, ds.totalSize, itsStores)
           .toMap
 
         val pools: Map[PoolId, Pool] =
-          poolIds.map: poolId =>
+          plannedPoolIds.map: poolId =>
             val ida = StoragePoolState(poolKvos(poolId)).ida
             val poolStores = storesById.filter((sid, _) => sid.poolId == poolId)
             poolId -> Pool(poolId, ida, poolStores)

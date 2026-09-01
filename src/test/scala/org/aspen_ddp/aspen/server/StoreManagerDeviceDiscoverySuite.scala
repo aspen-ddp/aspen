@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -143,6 +143,20 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    */
   def armLookupThrow(deviceId: StorageDeviceId, error: Throwable): Unit = synchronized:
     enqueueArmed(deviceId, Left(error))
+
+  /** Storage device ids passed to updateHostId, in call order.
+   *
+   *  Recorded rather than executed: the real updateHostId transacts against the host object,
+   *  and the case under test is precisely the one where that host does not exist. Lazy for the
+   *  same initialization-order reason as storeLoadAttempts.
+   */
+  lazy val hostIdClaims: mutable.ListBuffer[StorageDeviceId] =
+    mutable.ListBuffer[StorageDeviceId]()
+
+  override protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
+    synchronized:
+      hostIdClaims += storageDeviceId
+    Future.unit
 
   override protected def lookupStorageDeviceState(
       storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
@@ -301,6 +315,13 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
   private def deviceState(deviceId: StorageDeviceId,
                           stores: Map[StoreId, StorageDeviceState.StoreEntry] = Map()): StorageDeviceState =
     StorageDeviceState(deviceId, HostId.BootstrapHostId, 0L, 1024L, stores, deviceSetId)
+
+  /** A tombstoned StorageDeviceState for a device that is still mounted here. Both ids are
+   *  zeroed, which is what an operator's fail-storage-device leaves behind. */
+  private def tombstonedState(stores: Map[StoreId, StorageDeviceState.StoreEntry] = Map()):
+      StorageDeviceState =
+    StorageDeviceState(fixed_ids.FailedStorageDeviceId, fixed_ids.FailedHostId,
+                       0L, 1024L, stores, deviceSetId)
 
   atest("constructor loads a device that already exists on disk"):
     val hostRoot = newHostDir()
@@ -777,3 +798,37 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       // The finally still released, even though the try body threw.
       mgr.testingOnlyActiveDeviceChecks should be(empty)
       mgr.testingOnlyDeferredDeviceChecks should be(empty)
+
+  atest("a device owned by another host is claimed with updateHostId"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val mgr = newManager(hostRoot)
+
+    val armed = mgr.armLookup(deviceA)
+    mgr.testingOnlyCheckAllDevices()
+    armed.success(StorageDeviceState(deviceA, HostId(UUID.randomUUID()),
+                                     0L, 1024L, Map(), deviceSetId))
+
+    yieldUntil(mgr.hostIdClaims.nonEmpty).map: _ =>
+      mgr.hostIdClaims.toList should be(List(deviceA))
+
+  atest("a tombstoned device is not claimed and nothing is reconciled"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    val mgr = newManager(hostRoot)
+
+    val before = mgr.storeLoadAttempts.size
+
+    val armed = mgr.armLookup(deviceA)
+    mgr.testingOnlyCheckAllDevices()
+    // An Initializing store would normally drive createNewStore; on a tombstone nothing runs.
+    armed.success(tombstonedState(
+      Map(storeId -> StorageDeviceState.StoreEntry(
+        StorageDeviceState.StoreStatus.Initializing, None))))
+
+    yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+      mgr.hostIdClaims.toList should be(Nil)
+      mgr.storeLoadAttempts.size should be(before)
+      // The guard entry is released, so later checks of this device still run. That release
+      // is the actual regression: the old code held it for the life of the process.
+      mgr.testingOnlyActiveDeviceChecks should not contain deviceA

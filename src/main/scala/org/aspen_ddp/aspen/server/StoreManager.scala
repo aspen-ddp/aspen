@@ -567,7 +567,9 @@ class StoreManager(val client: AspenClient,
       ti.dataReceived(m.data)
   }
 
-  private def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
+  // protected so a test subclass can record the claim instead of transacting against a host
+  // object. Nothing outside StoreManager calls it.
+  protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
     client.transactUntilSuccessful: tx =>
       given Transaction = tx
 
@@ -713,12 +715,21 @@ class StoreManager(val client: AspenClient,
    *
    *  If the tree records a different host, none of that happens: the device has migrated here,
    *  so this claims it with updateHostId and re-requests the check once the claim commits.
+   *  A device the tree records as failed is ignored outright: it is neither claimed nor
+   *  reconciled, and its stores are being rebuilt elsewhere.
    *
    *  Callers hold the instance lock; the continuations it registers do not.
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
-    if remote.hostId != hostId then
+    if remote.isFailed then
+      // An operator has declared this device dead. Its directory can still mount -- a dead
+      // controller rather than a dead platter -- and without this the zeroed host id reads as a
+      // migration: updateHostId would call getHostPointer on a host that does not exist, fail
+      // inside transactUntilSuccessful, and retry forever while holding this device's entry in
+      // activeDeviceChecks. Every later check of the device would then be dropped silently.
+      logger.info(s"Ignoring failed storage device ${local.storageDeviceId}")
+    else if remote.hostId != hostId then
       updateHostId(local.storageDeviceId).foreach: _ =>
         checkStorageDevice(local.storageDeviceId)
     else

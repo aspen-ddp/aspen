@@ -155,6 +155,37 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
           p.future.flatMap(_ => loop())
     loop()
 
+  /** Like `driveUntilComplete`, but pumps several sets on every pass.
+   *
+   *  A retarget can leave a transfer in flight toward the set just abandoned, and the task
+   *  starts nothing new until its in-flight check clears -- so pumping only the new target
+   *  would deadlock. Sequential rather than parallel: each pump transacts against the same
+   *  pool object, and concurrent passes would collide. Fails on timeout. */
+  private def driveUntilCompleteAcross(task: MigratePoolToSetDurableTask,
+                                       destinationSetIds: List[StorageDeviceSetId],
+                                       timeout: Duration): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+
+    def pumpAll(remaining: List[StorageDeviceSetId]): Future[Unit] = remaining match
+      case Nil => Future.unit
+      case head :: tail => net.completeInFlightTransfers(head).flatMap(_ => pumpAll(tail))
+
+    def loop(): Future[Unit] =
+      if task.completed.isCompleted then
+        task.completed.map(_ => ())
+      else if System.nanoTime() > deadline then
+        client.getStoragePoolState(PoolId.BootstrapPoolId).flatMap: ps =>
+          Future.failed(new AssertionError(
+            s"migration did not complete; migration=${ps.migration} " +
+              s"stores=${ps.stores.map(_.storageDeviceId.uuid).mkString(",")}"))
+      else
+        pumpAll(destinationSetIds).flatMap: _ =>
+          val p = Promise[Unit]()
+          client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
+          p.future.flatMap(_ => loop())
+    loop()
+
   /** Complete in-flight transfers until `poolId` has at least `moved` stores sitting on a
    *  device of `destinationSetId`, then stop pumping. Used to leave a migration partially
    *  done: the task only ever has one transfer in flight and a transfer completes only when
@@ -206,6 +237,8 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
 
       poolState <- client.getStoragePoolState(poolId)
     yield
+      // Size checked first: a foreach over an empty array would assert nothing.
+      poolState.stores.size should be(3)
       poolState.stores.foreach: entry =>
         entry.storageDeviceId should be(net.secondDeviceId)
       poolState.migration should be(Some(StoragePoolState.Migration(
@@ -234,6 +267,8 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
 
       poolState <- client.getStoragePoolState(poolId)
     yield
+      // Size checked first: a foreach over an empty array would assert nothing.
+      poolState.stores.size should be(3)
       poolState.stores.foreach: entry =>
         entry.storageDeviceId should be(net.secondDeviceId)
       poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)
@@ -336,3 +371,47 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       afterAgain.migration should be(after.migration)
       afterAgain.stores.map(_.storageDeviceId).toList should be(
         after.stores.map(_.storageDeviceId).toList)
+
+  atest("retargeting mid-flight redirects the running task to the new set"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val bootstrapSetId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      setA <- client.createStorageDeviceSet("retarget-first", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      // Moving the second device out leaves the bootstrap set holding device 0 alone, so it
+      // serves as the second target -- no third device needed.
+      _ <- client.moveDeviceToSet(net.secondDeviceId, setA)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.migratePoolToSet(poolId, setA)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(poolId)
+      _ <- pumpUntilStoresMoved(poolId, setA, 1, Duration(30000, MILLISECONDS))
+      midPool <- client.getStoragePoolState(poolId)
+
+      // Retarget the same running task. It holds only the pool id and re-reads the target
+      // every pass, so no new task is enrolled and none needs to be.
+      _ <- client.migratePoolToSet(poolId, bootstrapSetId)
+      _ <- waitForTransactionsToComplete()
+      enrolled <- enrolledTasks()
+
+      // Both sets get pumped: a transfer toward setA may still be in flight at the moment of
+      // the retarget, and the task starts nothing new until it clears.
+      _ <- driveUntilCompleteAcross(task, List(setA, bootstrapSetId),
+             Duration(30000, MILLISECONDS))
+
+      poolState <- client.getStoragePoolState(poolId)
+    yield
+      // The retarget landed mid-flight: some stores had reached setA, some had not.
+      midPool.stores.count(_.storageDeviceId == net.secondDeviceId) should be >= 1
+      midPool.stores.count(_.storageDeviceId != net.secondDeviceId) should be >= 1
+      enrolled.size should be(1)
+      poolState.stores.size should be(3)
+      poolState.stores.foreach: entry =>
+        entry.storageDeviceId should be(net.storageDeviceId)
+      poolState.migration should be(Some(StoragePoolState.Migration(
+        bootstrapSetId, StoragePoolState.MigrationStatus.Complete)))

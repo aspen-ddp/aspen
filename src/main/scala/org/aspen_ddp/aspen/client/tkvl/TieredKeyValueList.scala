@@ -314,6 +314,27 @@ class TieredKeyValueList(val client: AspenClient,
       oroot match
         case None => Future.unit
         case Some(root) => nonEmpty(tier, ordering, root)
+
+  /** Visit every entry at or above `minKey`. The open-ended counterpart to foreachInRange,
+   *  used to resume an interrupted walk from a checkpointed key. */
+  def foreachFrom(minKey: Key,
+                  fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
+
+    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] =
+      for
+        e <- fetchContainingNode(client, tier, 0, ordering, minKey, root, Set())
+        node = e match
+          case Left(_) => throw new BrokenTree()
+          case Right(n) => n
+        _ <- node.foreachFrom(minKey, fn)
+      yield
+        ()
+
+    rootManager.getRootNode().flatMap: t =>
+      val (tier, ordering, oroot) = t
+      oroot match
+        case None => Future.unit
+        case Some(root) => nonEmpty(tier, ordering, root)
 }
 
 object TieredKeyValueList {

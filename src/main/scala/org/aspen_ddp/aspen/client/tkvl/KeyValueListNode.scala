@@ -243,6 +243,59 @@ class KeyValueListNode(val reader: ObjectReader,
 
     recurse(this, contents)
     p.future
+
+  /** Visit every entry at or above `minKey`, from this node rightward.
+   *
+   *  The open-ended counterpart to foreachInRange: keys are arbitrary-length byte arrays, so
+   *  there is no maximum key that could serve as an upper bound.
+   *
+   *  Every node's contents are filtered, not just the head node's. When reached through
+   *  TieredKeyValueList.foreachFrom the filter is a no-op past the first node, but filtering
+   *  unconditionally keeps this correct when called directly on a node to the left of minKey.
+   *
+   *  As with foreach and foreachInRange, a failing `fn` is logged and the walk continues.
+   */
+  def foreachFrom(minKey: Key,
+                  fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
+    val p = Promise[Unit]()
+
+    def inRange(node: KeyValueListNode): List[(Key, ValueState)] =
+      node.contents.filter(tpl => ordering.compare(tpl._1, minKey) >= 0)
+        .toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+
+    def recurse(node: KeyValueListNode, contents: List[(Key, ValueState)]): Unit = {
+      contents.headOption match
+        case Some((key, value)) =>
+          fn(node, key, value) onComplete:
+            case Failure(err) =>
+              logger.error(f"Failure in KeyValueListNode.foreachFrom: $err", err)
+              recurse(node, contents.tail)
+            case Success(_) =>
+              recurse(node, contents.tail)
+
+        case None =>
+          node.tail match
+            case None =>
+              p.success(())
+
+            case Some(nodeTail) =>
+              reader.read(nodeTail.pointer, s"foreachFrom() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
+
+                case Failure(err) =>
+                  p.failure(err)
+
+                case Success(kvos) =>
+                  val nextNode = new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
+                    kvos.revision, kvos.refcount, kvos.contents,
+                    kvos.right.map(v => KeyValueListPointer(v.bytes)))
+
+                  recurse(nextNode, inRange(nextNode))
+              }
+    }
+
+    recurse(this, inRange(this))
+
+    p.future
 }
 
 object KeyValueListNode {

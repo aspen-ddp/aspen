@@ -431,4 +431,39 @@ class TKVLSuite extends IntegrationTestSuite {
       visitedKeys.toSet should be (Set(Key(3), Key(4), Key(5), Key(6)))
       visits.filterNot(_._2) should be (Nil)
   }
+
+  atest("foreachFrom resumes from a key inside a later node") {
+    var visits = List[(Key, Boolean)]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visits = (key, node.keyInRange(key)) :: visits
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(8)
+      (numTiers, _, _) <- root.getRootNode()
+      _ <- tree.foreachFrom(Key(5), record)
+    yield
+      numTiers should be >= 1
+
+      val visitedKeys = visits.map(_._1)
+      visitedKeys.length should be (4)
+      visitedKeys.toSet should be (Set(Key(5), Key(6), Key(7), Key(8)))
+      visits.filterNot(_._2) should be (Nil)
+  }
+
+  atest("foreachFrom below the first key visits the whole tree") {
+    var visitedKeys = List[Key]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visitedKeys = key :: visitedKeys
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(8)
+      _ <- tree.foreachFrom(Key(0), record)
+    yield
+      visitedKeys.length should be (keys.length)
+      visitedKeys.toSet should be (keys.toSet)
+  }
 }

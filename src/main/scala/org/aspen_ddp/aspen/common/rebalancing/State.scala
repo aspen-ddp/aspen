@@ -94,3 +94,64 @@ object State:
           .toMap
 
         PlanningState(devices, pools)
+
+  /** Gather the planning state needed to decide whether one store of `poolId` may be moved to
+   *  `destinationDevice` right now. Holds exactly one pool and the devices that matter: the
+   *  pool's own store devices plus the candidate destination.
+   *
+   *  This is the level-agnostic counterpart to `getStateForRebalancePlanning`, which is
+   *  level-0-only. `TransferSafety.isSafe` needs only `devices.get(toDevice)` for the
+   *  offline-host check and `pools.get(poolId)` for the write-threshold count; it never
+   *  touches set membership, so this works for a target set at any level.
+   *
+   *  No `TransferringIn` filter is needed here. Each store's device of record comes from
+   *  `poolState.stores`, which StoreManager rewrites atomically at transfer completion, so
+   *  every store maps to exactly one device by construction.
+   */
+  def getStateForPoolMigration(client: AspenClient,
+                               poolId: PoolId,
+                               destinationDevice: StorageDeviceId,
+                               maxConcurrentReads: Int = DefaultMaxConcurrentReads): Future[PlanningState] =
+    given ExecutionContext = client.clientContext
+
+    for
+      poolPtr <- client.getStoragePoolPointer(poolId)
+      poolKvos <- client.read(poolPtr, "pool migration planning")
+      poolState = StoragePoolState(poolKvos)
+      deviceIds = (poolState.stores.map(_.storageDeviceId).toSet + destinationDevice).toSeq
+      deviceStates <- runBoundedParallel(deviceIds, maxConcurrentReads)(client.getStorageDeviceState)
+    yield
+      val stateByDevice = deviceStates.map(ds => ds.storageDeviceId -> ds).toMap
+
+      val deviceOfStore: Map[StoreId, StorageDeviceId] =
+        poolState.stores.indices
+          .map(i => StoreId(poolId, i.toByte) -> poolState.stores(i).storageDeviceId)
+          .toMap
+
+      def storeSize(storeId: StoreId): Long =
+        poolKvos.contents
+          .get(StoragePoolState.getStoreUsageKey(storeId.poolIndex))
+          .map(vs => byte2long(vs.value.bytes))
+          .getOrElse(0L)
+
+      // Status comes from the device of record, not from whichever device happens to list the
+      // store: mid-transfer the source says TransferringOut and the destination says
+      // TransferringIn, and the source is the one that still owns it. A store its device does
+      // not list yet reads as Initializing, which TransferSafety does not count as usable --
+      // the conservative direction.
+      def statusOf(storeId: StoreId): StorageDeviceState.StoreStatus =
+        stateByDevice.get(deviceOfStore(storeId))
+          .flatMap(_.stores.get(storeId))
+          .map(_.status)
+          .getOrElse(StorageDeviceState.StoreStatus.Initializing)
+
+      val storesById: Map[StoreId, Store] =
+        deviceOfStore.keys.map(sid => sid -> Store(sid, storeSize(sid), statusOf(sid))).toMap
+
+      val devices: Map[StorageDeviceId, Device] =
+        deviceStates.map: ds =>
+          val itsStores = storesById.filter((sid, _) => deviceOfStore(sid) == ds.storageDeviceId)
+          ds.storageDeviceId -> Device(ds.storageDeviceId, ds.hostId, ds.currentUsage, ds.totalSize, itsStores)
+        .toMap
+
+      PlanningState(devices, Map(poolId -> Pool(poolId, poolState.ida, storesById)))

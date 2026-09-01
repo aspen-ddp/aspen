@@ -276,3 +276,23 @@ class MainSuite extends AnyFunSuite with Matchers:
     // must stay loud, so widening this to NonFatal is what this assertion is here to catch.
     Main.commandErrorMessage.isDefinedAt(new RuntimeException("boom")) shouldBe false
     Main.commandErrorMessage.isDefinedAt(new NullPointerException()) shouldBe false
+
+  test("formatPoolState renders migration status when a migration is recorded"):
+    val poolId = PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val target = StorageDeviceSetId(UUID.fromString("66666666-6666-6666-6666-666666666666"))
+    val s = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
+      RocksDBConfig(), setId,
+      migration = Some(StoragePoolState.Migration(
+        target, StoragePoolState.MigrationStatus.InProgress)))
+    val out = Main.formatPoolState(s, Some("fast-nvme"))
+    out should include ("Migration:")
+    out should include ("InProgress")
+    out should include ("66666666-6666-6666-6666-666666666666")
+
+  test("formatPoolState omits the migration line when there is no migration"):
+    val poolId = PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val s = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
+      RocksDBConfig(), setId)
+    Main.formatPoolState(s, None) should not include "Migration:"

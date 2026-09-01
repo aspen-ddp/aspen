@@ -555,6 +555,20 @@ object Main {
             },
         )
 
+      cmd("migrate-pool").text("Migrates a storage pool to a different storage device set").
+        action((_, c) => c.copy(mode = "migrate-pool")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<pool-name-or-uuid>").text("Name or UUID of the pool to migrate").
+            action((x, c) => c.copy(poolName = x)),
+
+          arg[String]("<set-name-or-uuid>").text("Name or UUID of the target device set").
+            action((x, c) => c.copy(deviceSetName = x)),
+        )
+
       cmd("list-pools").text("Lists all storage pools").
         action((_, c) => c.copy(mode = "list-pools")).
         children(
@@ -709,6 +723,7 @@ object Main {
                                                                   cfg.deviceSetName)
             case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
+            case "migrate-pool" => migrate_pool(bootstrapConfigPath, cfg.poolName, cfg.deviceSetName)
             case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
             case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             _.listHosts(),             _.uuid)
             case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
@@ -1496,6 +1511,38 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
+  def migrate_pool(bootstrapConfigFile: os.Path,
+                   poolRef: String,
+                   setRef: String): Int =
+
+    configureLogging()
+
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val f = for
+      poolId      <- resolveRef(poolRef, PoolId(_), client.getStoragePoolId)
+      targetSetId <- resolveRef(setRef, StorageDeviceSetId(_), client.getStorageDeviceSetId)
+      _           <- client.migratePoolToSet(poolId, targetSetId)
+    yield ()
+
+    // getStoragePoolId / getStorageDeviceSetId / getStoragePoolPointer /
+    // getStorageDeviceSetPointer all throw NoSuchElementException for unknown names and ids.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: NoSuchElementException =>
+        println(s"Error: pool '$poolRef' or set '$setRef' not found")
+      case e =>
+        println(s"Error starting pool migration: ${e.getMessage}")
+
+    awaitAndReport(f):
+      case Success(_) =>
+        println(s"Migration of pool '$poolRef' to set '$setRef' started. " +
+          s"Track progress with: show-pool $poolRef")
+      case Failure(err) => reportError(err)
+
   def add_host(bootstrapCfg: BootstrapConfig.Config,
                bootstrapConfigFile: os.Path,
                hostDirectory: Path,
@@ -1853,6 +1900,8 @@ object Main {
     lines += s"  IDA:          ${s.ida}"
     lines += s"  Max Obj Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"
     lines += s"  Device Set:   $set (${s.storageDeviceSet.uuid})"
+    s.migration.foreach: m =>
+      lines += s"  Migration:    ${m.status} -> ${m.targetSet.uuid}"
     lines += s"  Usage:        ${formatBytes(s.currentUsage)}"
     lines += s"  Max Store Sz: ${if s.maximumStoreSize == 0 then "unbounded" else formatBytes(s.maximumStoreSize)}"
     if s.allocationGroups.isEmpty then

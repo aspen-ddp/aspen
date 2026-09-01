@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.*
+import org.aspen_ddp.aspen.common.metadata.management.MigratePoolToSetDurableTask
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -456,6 +457,87 @@ abstract class BaseAspenClient(
     transactUntilSuccessful: tx =>
       given Transaction = tx
       prepareSystemDurableTask(taskTypeUUID, initialState)
+
+  /** Signals that the pool's set pointer already equals the target. Thrown from inside the
+   *  transaction so nothing is staged: Aspen has no empty transactions. Recovered to unit. */
+  private class SameSetNoOp extends Throwable("pool is already assigned to the target set")
+
+  override def migratePoolToSet(poolId: PoolId,
+                                targetSetId: StorageDeviceSetId): Future[Unit] =
+    given ExecutionContext = clientContext
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: ReadError => throw StopRetrying(e)
+      case e: SameSetNoOp => throw StopRetrying(e)
+
+    val migrated = transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+
+      for
+        poolPtr <- getStoragePoolPointer(poolId)
+        poolKvos <- read(poolPtr, "migrate pool to set")
+        vs = poolKvos.contents(StoragePoolState.ConfigKey)
+        poolState = StoragePoolState(vs.value.bytes)
+        // `previousSet` is the pool's original set on a first call and the now-abandoned
+        // target on a retarget. One write path covers both.
+        previousSetId = poolState.storageDeviceSet
+        _ <-
+          if previousSetId == targetSetId then
+            throw new SameSetNoOp
+          else
+            for
+              targetPtr <- getStorageDeviceSetPointer(targetSetId)
+              targetDos <- read(targetPtr, "migrate pool to set")
+              previousPtr <- getStorageDeviceSetPointer(previousSetId)
+              previousDos <- read(previousPtr, "migrate pool to set")
+              _ <-
+                val poolStoreIds =
+                  poolState.stores.indices.map(i => StoreId(poolId, i.toByte)).toSet
+
+                // Pool config: flip the pointer and record the migration. The pointer flips at
+                // the start so a store lost mid-migration is rebuilt into the target set
+                // directly (selectDeviceForRebuild uses the pool's set) rather than into the
+                // old set and then migrated again.
+                val updatedPool = poolState.copy(
+                  storageDeviceSet = targetSetId,
+                  migration = Some(StoragePoolState.Migration(
+                    targetSetId, StoragePoolState.MigrationStatus.InProgress)))
+                val poolReqs = List(KeyRevision(StoragePoolState.ConfigKey, vs.revision))
+                val poolOps = List(Insert(StoragePoolState.ConfigKey, updatedPool.encode()))
+                tx.update(poolPtr, None, None, poolReqs, poolOps)
+
+                // Target set: gains the pool (dedup-guarded); defensively strip any pending
+                // transfers for it.
+                val target = StorageDeviceSetState(targetDos)
+                val newTarget = target.copy(
+                  assignedPools = poolId :: target.assignedPools.filter(_ != poolId),
+                  pendingTransfers = target.pendingTransfers.filterNot:
+                    (sid, _, _) => poolStoreIds.contains(sid))
+                tx.overwrite(targetPtr, targetDos.revision, DataBuffer(newTarget.toBytes))
+
+                // Previous set: loses the pool (self-healing if absent) and its pending
+                // transfers, which can never become safe once the pool leaves planning state.
+                val previous = StorageDeviceSetState(previousDos)
+                val newPrevious = previous.copy(
+                  assignedPools = previous.assignedPools.filter(_ != poolId),
+                  pendingTransfers = previous.pendingTransfers.filterNot:
+                    (sid, _, _) => poolStoreIds.contains(sid))
+                tx.overwrite(previousPtr, previousDos.revision, DataBuffer(newPrevious.toBytes))
+
+                // Enroll only on a first call. A retarget reuses the running task, which holds
+                // only the pool id and re-reads its target every pass.
+                val alreadyRunning = poolState.migration.exists(
+                  _.status == StoragePoolState.MigrationStatus.InProgress)
+                if alreadyRunning then
+                  Future.unit
+                else
+                  MigratePoolToSetDurableTask.prepareSystemTask(this, poolId)
+            yield ()
+      yield ()
+
+    migrated.recover:
+      case _: SameSetNoOp => ()
 
   override def prepareSystemDurableTask(taskTypeUUID: UUID,
                                         initialState: Map[Key, Array[Byte]])

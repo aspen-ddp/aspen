@@ -174,6 +174,22 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def moveDeviceToSet(deviceId: StorageDeviceId, targetSetId: StorageDeviceSetId): Future[Unit] =
     StorageDeviceSetState.moveDevice(this, deviceId, targetSetId)
 
+  /** Begin migrating every store of `poolId` onto devices of `targetSetId`.
+   *
+   *  One transaction flips the pool's `storageDeviceSet`, records
+   *  `Migration(targetSetId, InProgress)`, swaps the pool between the two sets'
+   *  `assignedPools`, strips the pool's stores from both sets' `pendingTransfers`, and (on a
+   *  first call) enrolls a MigratePoolToSetDurableTask with the system task executor. There is
+   *  therefore no window in which a pool is InProgress with no task driving it.
+   *
+   *  Returns as soon as that transaction commits; progress is observable via the pool's
+   *  `migration` field. A call naming the pool's current set is a silent no-op. A call against
+   *  a pool that is already migrating retargets it, reusing the running task.
+   *
+   *  Fails with NoSuchElementException if the pool or the target set does not exist.
+   */
+  def migratePoolToSet(poolId: PoolId, targetSetId: StorageDeviceSetId): Future[Unit]
+
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
 

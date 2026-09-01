@@ -340,6 +340,9 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       // Genuinely partial: some stores moved, some did not, so the second instance has work.
       midPool.stores.count(_.storageDeviceId == net.secondDeviceId) should be >= 1
       midPool.stores.count(_.storageDeviceId != net.secondDeviceId) should be >= 1
+      // Size checked first: a foreach over an empty array would assert nothing. The counts
+      // above constrain midPool, not poolState.
+      poolState.stores.size should be(3)
       poolState.stores.foreach: entry =>
         entry.storageDeviceId should be(net.secondDeviceId)
       poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)

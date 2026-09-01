@@ -202,6 +202,88 @@ ZMQNet.ioThread's failure handling is untested
     decision rather than an oversight, and it is also why the half-built host
     entry above is recorded rather than fixed: that fix wants the same seam
 
+A pool stuck at migration InProgress cannot be re-driven through the public
+API
+  - migratePoolToSet only enrolls a MigratePoolToSetDurableTask when the pool
+    is not already InProgress. Once it is, a same-set call is a no-op and a
+    different-set call retargets without enrolling, so no call can arm a
+    driver
+  - If the task instance is ever lost while the pool is InProgress, the pool
+    is wedged with no public recourse -- there is no way to clear the
+    migration field or re-enroll
+  - Not currently reachable. Enrollment is durable, so a crash is fine: the
+    runner re-creates enrolled tasks on restart. The one path that
+    deregisters without finishing is SystemTaskRunner.shutdown(), which
+    fails the task's promise with TaskStopped, and onTaskComplete
+    deregisters on failure too. That method has no production caller -- only
+    SystemTaskRunnerSuite and SystemTaskExecutorServiceSuite
+  - Candidate fix is to make enrollment idempotent and unconditional, or to
+    enroll when the pool is InProgress but nothing is registered for it.
+    Either removes the trap without needing shutdown() to change
+  - Note that AspenClient.migratePoolToSet's docstring currently claims there
+    is "no window in which a pool is InProgress with no task driving it".
+    That is true of the start transaction but not of the shutdown path
+
+MigratePoolToSetDurableTask awaits transferStore, so a stalled transfer
+stalls the task permanently
+  - SetRebalanceDurableTask fires transferStore and immediately reschedules;
+    the migration task awaits the result because it needs the boolean to
+    decide whether to advance to the next store
+  - transferStore is transactUntilSuccessfulWithRecovery, i.e. unbounded
+    internal retry. While it retries, the pass never completes, the
+    ignoreExtraCallsWhileRunning flag stays set, and no poll is armed
+  - Self-perpetuating: SystemTaskRunner.heartbeat() bumps every *running*
+    task regardless of progress, so the service never re-dispatches it
+    either, and a retarget cannot rescue it
+  - Accepted for now. The retry loop is the correct recovery for genuinely
+    transient faults, and every fast-fail case is already StopRetrying
+    (NoSuchElementException, InvalidDestination, StoreNotActive)
+
+StoragePool.getState() and dropCachedState() are now dead API
+  - SimpleStoragePool caches its StoragePoolState at construction and
+    dropCachedState() has never had a caller, so the cached copy was a
+    permanent snapshot of where the stores were when the client first
+    touched the pool
+  - Both stale-mapping consumers were fixed to use
+    AspenClient.getStoragePoolState instead: transferStore and
+    StoreManager.startStoreTransferOut. A survey of src/main and src/test
+    found no remaining getState() callers
+  - storagePoolCache still memoises the SimpleStoragePool instance, but its
+    other construction-time fields (ida, maxObjectSize, allocStrategy,
+    allocStrategyConfig, pointer) are immutable per pool and no consumer
+    reads a store-to-device mapping from them
+  - So this is now a cleanup, not a correctness issue: either delete
+    getState()/dropCachedState() or wire the invalidation up
+
+The server-side transfer path has no integration coverage
+  - startStoreTransferOut, transferDataReceived and createTransferOut are
+    never exercised by any test
+  - TestNetwork.sendHostMessage only appends to capturedHostMessages;
+    nothing forwards them to receiveHostMessage, so StartStoreTransfer is
+    captured and dropped. Tests that need a completed transfer call
+    simulateTransferComplete, which short-circuits the real path
+  - The startStoreTransferOut stale-source fix therefore shipped without a
+    regression guard, resting on being mechanically identical to the
+    transferStore fix, which was confirmed empirically by revert probe
+  - Building the harness is a piece of work in its own right
+
+A transfer whose source host dies mid-flight blocks its pool's migration
+forever
+  - The store is left TransferringOut, and MigratePoolToSetDurableTask's
+    in-flight gate then refuses to start any further transfer for that pool.
+    A retarget does not clear it
+  - Pre-existing gap in the transfer subsystem, but migration is the first
+    workflow whose *progress* depends on transfers completing
+  - Related to the abortStoreTransfer note above
+
+StorageDeviceSetState set recursion has no cycle guard
+  - collectDevices and the level-1 branch of selectDeviceWithSpace recurse
+    through memberSets without a visited-set or decreasing-level check, and
+    the memberSets/parent invariants are documented as unenforced
+  - Pre-existing shape -- selectDevices does the same -- but
+    collectMemberDevices now runs it on every migration poll pass, so a
+    malformed set graph would spin rather than fail
+
 -------------------------------------------------------------------------------
 - Old Testing Commands
 -------------------------------------------------------------------------------

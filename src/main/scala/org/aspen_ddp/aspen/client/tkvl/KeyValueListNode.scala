@@ -213,7 +213,10 @@ class KeyValueListNode(val reader: ObjectReader,
               p.success(())
 
             case Some(nodeTail) =>
-              if ordering.compare(maxKey, minimum) < 0 then
+              // nodeTail.minimum is the minimum key of the node we are about to read. The
+              // range is [minKey, maxKey), so a next node whose minimum is at or above maxKey
+              // holds nothing in range and neither does anything to its right.
+              if ordering.compare(maxKey, nodeTail.minimum) <= 0 then
                 p.success(())
               else
                 reader.read(nodeTail.pointer, s"foreachInRange() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
@@ -226,7 +229,7 @@ class KeyValueListNode(val reader: ObjectReader,
                       kvos.revision, kvos.refcount, kvos.contents,
                       kvos.right.map(v => KeyValueListPointer(v.bytes)))
 
-                    val contents = node.contents.filter:
+                    val contents = nextNode.contents.filter:
                           tpl => ordering.compare(tpl._1, minKey) >= 0 && ordering.compare(tpl._1, maxKey) < 0
                         .toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
 

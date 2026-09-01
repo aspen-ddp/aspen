@@ -406,4 +406,29 @@ class TKVLSuite extends IntegrationTestSuite {
       visitedKeys.length should be (keys.length)
       visits.filterNot(_._2) should be (Nil)
   }
+
+  // Covers key visitation and pairing across node boundaries. Cannot observe the
+  // termination guard (KeyValueListNode.scala:219): an extra read beyond the range
+  // contributes zero keys after filtering. Detecting that requires read-count instrumentation.
+  atest("foreachInRange spans node boundaries and honors the half-open range") {
+    var visits = List[(Key, Boolean)]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visits = (key, node.keyInRange(key)) :: visits
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(8)
+      (numTiers, _, _) <- root.getRootNode()
+      // Keys are 1..8 across several nodes; [3, 7) must yield exactly 3, 4, 5, 6 regardless
+      // of where the node boundaries happen to fall.
+      _ <- tree.foreachInRange(Key(3), Key(7), record)
+    yield
+      numTiers should be >= 1
+
+      val visitedKeys = visits.map(_._1)
+      visitedKeys.length should be (4)
+      visitedKeys.toSet should be (Set(Key(3), Key(4), Key(5), Key(6)))
+      visits.filterNot(_._2) should be (Nil)
+  }
 }

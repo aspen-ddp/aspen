@@ -1,11 +1,13 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -58,3 +60,26 @@ class TombstoneGuardSuite extends IntegrationTestSuite:
       dst <- client.getStorageDeviceState(net.secondDeviceId)
     yield
       dst.stores(storeId).status should be(StorageDeviceState.StoreStatus.TransferringIn)
+
+  atest("createNewStoragePool refuses to place a store on a tombstoned device"):
+    given ExecutionContext = executionContext
+    // A dedicated level-0 set holding exactly one device, which is then tombstoned, so
+    // selection has nowhere else to put the pool's stores.
+    for
+      setId <- client.createStorageDeviceSet("doomed-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.secondDeviceId, setId)
+      _ <- waitForTransactionsToComplete()
+      _ <- tombstone(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      result <- recoverToSucceededIf[AspenClient.DeviceFailed](
+                  client.createNewStoragePool(
+                    "doomed-pool",
+                    Replication(1, 1),
+                    None,
+                    RocksDBConfig(),
+                    setId,
+                    1_000_000L))
+    yield result

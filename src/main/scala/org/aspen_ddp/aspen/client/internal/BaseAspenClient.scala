@@ -330,6 +330,7 @@ abstract class BaseAspenClient(
     // the test client runCreate performs a single attempt regardless.
     def onFail(err: Throwable): Future[Unit] = err match
       case e: KeyAlreadyExists => throw StopRetrying(e)
+      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
       case _ => Future.unit
 
     val fStaged = runCreate(onFail): tx =>
@@ -378,6 +379,15 @@ abstract class BaseAspenClient(
         }.toList
 
       def stageDeviceUpdate(du: DeviceUpdate): CheckStorageDevice =
+        // collectDevices re-reads device state on every retry attempt, so this catches a device
+        // tombstoned after createNewStoragePool's pre-flight check. The partially staged
+        // transaction (allocated objects, staged puts) is discarded by transact's invalidation
+        // on failure, as at createStorageDevice (lines 298-302). No test covers this guard
+        // because deterministically staging the tombstone-during-retry race is not worth
+        // contorting the suite for.
+        if du.state.isFailed then
+          throw AspenClient.DeviceFailed(du.storageDeviceId)
+
         val updates = du.stores.map { storeId =>
           storeId -> StorageDeviceState.StoreEntry(
             StorageDeviceState.StoreStatus.Initializing,

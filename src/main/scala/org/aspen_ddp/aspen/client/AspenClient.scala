@@ -229,6 +229,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       set <- getStorageDeviceSetState(storageDeviceSet)
       deviceIds <- set.selectDevicesForPool(ida.width, this)
       devices <- Future.sequence(deviceIds.map(sid => getStorageDeviceState(sid)))
+      // A tombstoned device's zeroed storageDeviceId would otherwise flow into
+      // StoragePoolState.StoreEntry on the next line and blow up collectDevices' tree lookup
+      // before any downstream guard can run. Report the real id, not the zeroed one.
+      _ = deviceIds.zip(devices).find((_, dev) => dev.isFailed).foreach((sid, _) => throw DeviceFailed(sid))
       stores = devices.map(dev => StoragePoolState.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
       config = StoragePoolState(
         poolId,

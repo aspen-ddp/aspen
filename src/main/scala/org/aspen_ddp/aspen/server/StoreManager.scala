@@ -500,8 +500,14 @@ class StoreManager(val client: AspenClient,
         throw new Exception(msg)
 
       for
-        pool <- client.getStoragePool(m.storeId.poolId)
-        pstate <- pool.getState()
+        // getStoragePoolState, not getStoragePool(...).getState(): SimpleStoragePool caches its
+        // StoragePoolState from construction and nothing ever calls dropCachedState(), so the
+        // cached copy is a permanent snapshot of where the stores were when this client first
+        // touched the pool. The source device must be read fresh -- for a store that has already
+        // moved once (a migration retarget, or two successive rebalances) the snapshot names the
+        // device it used to live on, that device no longer lists the store, and the transfer-out
+        // dies below on "Transfer probably completed" without ever starting.
+        pstate <- client.getStoragePoolState(m.storeId.poolId)
         poolEntry = pstate.stores(m.storeId.poolIndex)
         fromDevice <- client.getStorageDeviceState(poolEntry.storageDeviceId)
         devEntry = fromDevice.stores.get(m.storeId) match

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.common.rebalancing
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
-import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceSetId, StorageDeviceSetState}
 import org.aspen_ddp.aspen.common.network.ServiceMessage
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, Value}
@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceFactory, Durab
 import scribe.Logging
 
 import java.util.UUID
-import scala.concurrent.duration.{Duration, MINUTES}
+import scala.concurrent.duration.{Duration, HOURS, MINUTES}
 import scala.concurrent.{ExecutionContext, Future}
 
 object RebalancingDurableService extends DurableServiceFactory with Logging:
@@ -30,15 +30,27 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
   /** Overridable poll period (test seam; mirrors MissedUpdateFinalizationAction.errorTimeout). */
   @volatile var pollPeriod: Duration = DefaultPollPeriod
 
+  /** Default interval between automatic rebalance sweeps. Distinct from DefaultPollPeriod,
+   *  which is how often reconcile() runs. */
+  val DefaultAutoRebalancePeriod: Duration = Duration(8, HOURS)
+
   override def createService(client: AspenClient,
                              statePointer: KeyValueObjectPointer,
                              state: KeyValueObjectState): DurableService =
     new RebalancingDurableService(client, statePointer, pollPeriod)
 
   /** The initial contents of the service's KV state object. Written into the services tree by
-   *  the Bootstrap process (the service is a system-critical singleton that must always exist). */
+   *  the Bootstrap process (the service is a system-critical singleton that must always exist).
+   *  All three keys are always written, so readers never have to handle an absent key. */
   def initialServiceState: Map[Key, Array[Byte]] =
-    Map(RebalancingServiceState.ActiveTasksKey -> RebalancingServiceState.encodeActiveTasks(Nil))
+    Map(
+      RebalancingServiceState.ActiveTasksKey ->
+        RebalancingServiceState.encodeActiveTasks(Nil),
+      RebalancingServiceState.AutoRebalancePeriodKey ->
+        RebalancingServiceState.encodeAutoRebalancePeriod(DefaultAutoRebalancePeriod),
+      RebalancingServiceState.LastAutoRebalanceKey ->
+        RebalancingServiceState.encodeLastAutoRebalance(HLCTimestamp.Zero)
+    )
 
   /** Read the service state object's pointer via the services TKVL. */
   private def readServiceStatePointer(client: AspenClient): Future[KeyValueObjectPointer] =

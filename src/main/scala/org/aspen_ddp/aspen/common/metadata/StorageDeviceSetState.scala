@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.util.byte2long
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.{Random, Success}
+import scala.util.{Failure, Random, Success}
 
 final case class StorageDeviceSetId(uuid: UUID) extends AnyVal
 
@@ -228,19 +228,72 @@ final case class StorageDeviceSetState(
 
       folded.map(_._1)
 
+  /** Select a device with at least `requiredSize` free bytes, at any level.
+   *
+   *  Level 0 draws from `memberDevices`; level 1+ shuffles `memberSets` and recurses until
+   *  one yields a device. `hardExclude` devices are never chosen. `softExclude` devices are
+   *  tried only after every non-excluded candidate has been rejected — soft rather than hard
+   *  so that a set narrower than the IDA width still works, for the same reason
+   *  `selectDevicesForPool` cycles its device list.
+   *
+   *  Selection is optimistic and lazy: candidates are tried in random order, reading each
+   *  device's free space one at a time via `freeSpaceLookup`, stopping at the first that fits.
+   *  A candidate whose lookup fails is skipped. Depends only on `lookup` and `freeSpaceLookup`
+   *  so it is unit-testable without a full `AspenClient`. `rng` is injectable so tests can be
+   *  deterministic.
+   */
+  private[metadata] def selectDeviceWithSpace(
+      requiredSize: Long,
+      hardExclude: Set[StorageDeviceId],
+      softExclude: Set[StorageDeviceId],
+      lookup: StorageDeviceSetId => Future[StorageDeviceSetState],
+      freeSpaceLookup: StorageDeviceId => Future[Long],
+      rng: Random
+  )(using ec: ExecutionContext): Future[StorageDeviceId] =
+    def exhausted: Future[StorageDeviceId] =
+      Future.failed(AllocationError(
+        s"no device in set ${setId.uuid} has >= $requiredSize free bytes available"))
+
+    if level == 0 then
+      if memberDevices.isEmpty then
+        Future.failed(AllocationError(s"StorageDeviceSet ${setId.uuid} (level 0) has no member devices"))
+      else
+        val eligible = memberDevices.filterNot(hardExclude.contains)
+        val preferred = rng.shuffle(eligible.filterNot(softExclude.contains))
+        val fallback = rng.shuffle(eligible.filter(softExclude.contains))
+
+        def scan(remaining: List[StorageDeviceId]): Future[StorageDeviceId] =
+          remaining match
+            case Nil => exhausted
+            case head :: tail =>
+              freeSpaceLookup(head).transformWith:
+                case Success(free) if free >= requiredSize => Future.successful(head)
+                case _ => scan(tail)
+
+        scan(preferred ++ fallback)
+    else
+      if memberSets.isEmpty then
+        Future.failed(AllocationError(s"StorageDeviceSet ${setId.uuid} (level $level) has no member sets"))
+      else
+        def scanSets(remaining: List[StorageDeviceSetId]): Future[StorageDeviceId] =
+          remaining match
+            case Nil => exhausted
+            case head :: tail =>
+              lookup(head)
+                .flatMap(sub => sub.selectDeviceWithSpace(
+                  requiredSize, hardExclude, softExclude, lookup, freeSpaceLookup, rng))
+                .transformWith:
+                  case Success(device) => Future.successful(device)
+                  case Failure(_) => scanSets(tail)
+
+        scanSets(rng.shuffle(memberSets))
+
   /** Select a device to host a store rebuilt from scratch (its data was lost).
    *
-   *  Only valid for level-0 sets. The failed device is hard-excluded (never chosen).
-   *  Devices already hosting a store in the pool (`poolDevices`) are soft-excluded:
-   *  preferred candidates that are not in `poolDevices` are tried first, falling back
-   *  to pool devices only if no preferred device has enough space. Free space is a hard
-   *  requirement in both phases.
-   *
-   *  Selection is optimistic and lazy: candidates are tried in random order, reading
-   *  each device's free space one at a time via `freeSpaceLookup`, stopping at the first
-   *  that fits. A candidate whose lookup fails is skipped. `rng` is injectable so tests
-   *  can be deterministic. Depends only on `freeSpaceLookup` so it is unit-testable
-   *  without a full `AspenClient`.
+   *  Only valid for level-0 sets. The failed device is hard-excluded; devices already hosting
+   *  a store in the pool (`poolDevices`) are soft-excluded. This is `selectDeviceWithSpace`
+   *  with the level-0 restriction retained -- the refactor beneath it is behavior-preserving,
+   *  not a widening of it.
    */
   private[metadata] def selectRebuildDevice(
       requiredSize: Long,
@@ -252,23 +305,11 @@ final case class StorageDeviceSetState(
     if level != 0 then
       Future.failed(AllocationError(
         s"selectDeviceForRebuild only supports level-0 sets; set ${setId.uuid} is level $level"))
-    else if memberDevices.isEmpty then
-      Future.failed(AllocationError(
-        s"StorageDeviceSet ${setId.uuid} (level 0) has no member devices"))
     else
-      val eligible = memberDevices.filterNot(_ == failedDevice)
-      val preferred = rng.shuffle(eligible.filterNot(poolDevices.contains))
-      val fallback = rng.shuffle(eligible.filter(poolDevices.contains))
-      val candidates = preferred ++ fallback
-
-      def scan(remaining: List[StorageDeviceId]): Future[StorageDeviceId] =
-        remaining match
-          case Nil =>
-            Future.failed(AllocationError(
-              s"no device in set ${setId.uuid} has >= $requiredSize free bytes available for rebuild"))
-          case head :: tail =>
-            freeSpaceLookup(head).transformWith:
-              case Success(free) if free >= requiredSize => Future.successful(head)
-              case _ => scan(tail)
-
-      scan(candidates)
+      selectDeviceWithSpace(
+        requiredSize,
+        hardExclude = Set(failedDevice),
+        softExclude = poolDevices,
+        lookup = _ => Future.failed(new IllegalStateException("a level-0 set must not recurse")),
+        freeSpaceLookup = freeSpaceLookup,
+        rng = rng)

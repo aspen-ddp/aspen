@@ -274,3 +274,74 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val b = Await.result(
       set.selectRebuildDevice(500L, failed, Set(failed), lookup, new Random(123)), timeout)
     a should be(b)
+
+  test("selectDeviceWithSpace: level 0 prefers non-soft-excluded devices"):
+    val preferredDev = dev()
+    val softDev = dev()
+    val set = leaf(List(softDev, preferredDev))
+    val free = fixedLookup(Map(preferredDev -> 1000L, softDev -> 1000L))
+    val chosen = Await.result(
+      set.selectDeviceWithSpace(100L, Set.empty, Set(softDev), noLookup, free, new Random(1)),
+      timeout)
+    chosen should be(preferredDev)
+
+  test("selectDeviceWithSpace: falls back to soft-excluded when preferred lack space"):
+    val tightDev = dev()
+    val softDev = dev()
+    val set = leaf(List(tightDev, softDev))
+    val free = fixedLookup(Map(tightDev -> 10L, softDev -> 1000L))
+    val chosen = Await.result(
+      set.selectDeviceWithSpace(100L, Set.empty, Set(softDev), noLookup, free, new Random(1)),
+      timeout)
+    chosen should be(softDev)
+
+  test("selectDeviceWithSpace: never returns a hard-excluded device"):
+    val banned = dev()
+    val ok = dev()
+    val set = leaf(List(banned, ok))
+    val free = fixedLookup(Map(banned -> 1000L, ok -> 1000L))
+    (0 until 20).foreach: i =>
+      val chosen = Await.result(
+        set.selectDeviceWithSpace(100L, Set(banned), Set.empty, noLookup, free, new Random(i)),
+        timeout)
+      chosen should be(ok)
+
+  test("selectDeviceWithSpace: level 1 recurses into member sets"):
+    val deepDev = dev()
+    val child = leaf(List(deepDev))
+    val parent = upper(1, List(child))
+    val free = fixedLookup(Map(deepDev -> 1000L))
+    val chosen = Await.result(
+      parent.selectDeviceWithSpace(100L, Set.empty, Set.empty,
+        lookupFor(child), free, new Random(1)),
+      timeout)
+    chosen should be(deepDev)
+
+  test("selectDeviceWithSpace: level 1 tries the next member set when the first is exhausted"):
+    val fullDev = dev()
+    val roomyDev = dev()
+    val childA = leaf(List(fullDev))
+    val childB = leaf(List(roomyDev))
+    val parent = upper(1, List(childA, childB))
+    val free = fixedLookup(Map(fullDev -> 10L, roomyDev -> 1000L))
+    (0 until 10).foreach: i =>
+      val chosen = Await.result(
+        parent.selectDeviceWithSpace(100L, Set.empty, Set.empty,
+          lookupFor(childA, childB), free, new Random(i)),
+        timeout)
+      chosen should be(roomyDev)
+
+  test("selectDeviceWithSpace: exhaustion fails with AllocationError"):
+    val tiny = dev()
+    val set = leaf(List(tiny))
+    val free = fixedLookup(Map(tiny -> 10L))
+    val err = intercept[AllocationError](
+      Await.result(set.selectDeviceWithSpace(100L, Set.empty, Set.empty, noLookup, free,
+        new Random(1)), timeout))
+    err.getMessage should include("free bytes available")
+
+  test("selectDeviceWithSpace: level 1 with no member sets fails with AllocationError"):
+    val parent = upper(1, Nil)
+    intercept[AllocationError](
+      Await.result(parent.selectDeviceWithSpace(100L, Set.empty, Set.empty, noLookup,
+        fixedLookup(Map.empty), new Random(1)), timeout))

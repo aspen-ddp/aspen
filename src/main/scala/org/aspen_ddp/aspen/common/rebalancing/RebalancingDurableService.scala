@@ -110,25 +110,33 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
    *  progress. Idempotent and safe against concurrent callers (revision-checked writes). */
   def rebalanceStorageDeviceSet(client: AspenClient, setId: StorageDeviceSetId): Future[Unit] =
     given ExecutionContext = client.clientContext
+    client.getStorageDeviceSetState(setId).flatMap(rebalanceReadSet(client, setId, _))
 
-    for
-      setState <- client.getStorageDeviceSetState(setId)
-      result <-
-        if setState.pendingTransfers.nonEmpty then
-          Future.unit
-        else
-          for
-            statePtr <- readServiceStatePointer(client)
-            stateKvos <- client.read(statePtr)
-            active = RebalancingServiceState.decodeActiveTasks(
-                       stateKvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
-            r <-
-              if active.exists(_._1 == setId) then
-                Future.unit
-              else
-                planAndEnroll(client, setId, setState, statePtr)
-          yield r
-    yield result
+  /** As above, for a caller that has already read the set's state. The automatic sweep reads
+   *  it to filter on level, and would otherwise pay for the same read twice.
+   *
+   *  Note that the level check is deliberately *not* here: the public entry point above must
+   *  keep surfacing the planning failure when a user names a non-level-0 set on the command
+   *  line, rather than silently doing nothing. */
+  private def rebalanceReadSet(client: AspenClient,
+                               setId: StorageDeviceSetId,
+                               setState: StorageDeviceSetState): Future[Unit] =
+    given ExecutionContext = client.clientContext
+
+    if setState.pendingTransfers.nonEmpty then
+      Future.unit
+    else
+      for
+        statePtr <- readServiceStatePointer(client)
+        stateKvos <- client.read(statePtr)
+        active = RebalancingServiceState.decodeActiveTasks(
+                   stateKvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
+        r <-
+          if active.exists(_._1 == setId) then
+            Future.unit
+          else
+            planAndEnroll(client, setId, setState, statePtr)
+      yield r
 
   private def planAndEnroll(client: AspenClient,
                             setId: StorageDeviceSetId,
@@ -195,6 +203,7 @@ class RebalancingDurableService(val client: AspenClient,
   private var tasks: Map[StorageDeviceSetId, SetRebalanceDurableTask] = Map.empty
   private var completing: Set[StorageDeviceSetId] = Set.empty
   private var pollTask: ScheduledTask = NoTask
+  private var sweeping = false
   @volatile private var stopped = false
 
   reconcile()
@@ -220,7 +229,7 @@ class RebalancingDurableService(val client: AspenClient,
   private def reconcile(): Future[Unit] =
     if stopped then Future.unit
     else
-      client.read(statePointer).map: kvos =>
+      client.read(statePointer).flatMap: kvos =>
         val active = RebalancingServiceState.decodeActiveTasks(
                        kvos.contents(RebalancingServiceState.ActiveTasksKey).value.bytes)
         synchronized:
@@ -228,8 +237,83 @@ class RebalancingDurableService(val client: AspenClient,
             active.foreach: (setId, taskStatePtr) =>
               if !tasks.contains(setId) && !completing.contains(setId) then
                 startTask(setId, taskStatePtr)
+
+        val period = RebalancingServiceState.decodeAutoRebalancePeriod(
+                       kvos.contents(RebalancingServiceState.AutoRebalancePeriodKey).value.bytes)
+        val lastSweep = RebalancingServiceState.decodeLastAutoRebalance(
+                          kvos.contents(RebalancingServiceState.LastAutoRebalanceKey).value.bytes)
+
+        if !sweepIsDue(period, lastSweep) || !beginSweep() then
+          Future.unit
+        else
+          sweep()
+            .andThen { case _ => endSweep() }
+            .recover:
+              case err => logger.warn(s"RebalancingDurableService sweep failed: $err")
       .recover:
         case err => logger.warn(s"RebalancingDurableService reconcile failed: $err")
+
+  /** A period of zero disables sweeping. The value is still read on every poll, so re-enabling
+   *  takes effect within one poll interval even if the nudge is lost.
+   *
+   *  A lastSweep in the future -- clock skew, or an HLC advanced by a peer -- yields a negative
+   *  difference and simply defers the sweep until wall time catches up. */
+  private def sweepIsDue(period: Duration, lastSweep: HLCTimestamp): Boolean =
+    period > Duration.Zero && (HLCTimestamp.now - lastSweep) >= period
+
+  /** Claim the sweep, returning false if one is already running. scheduleNonConcurrentPollingTask
+   *  suppresses overlapping *timer* ticks, but receiveMessage calls reconcile() directly and can
+   *  land on top of a timer-driven sweep. */
+  private def beginSweep(): Boolean = synchronized:
+    if sweeping || stopped then
+      false
+    else
+      sweeping = true
+      true
+
+  private def endSweep(): Unit = synchronized { sweeping = false }
+
+  /** Plan and enroll a rebalance for every level-0 storage device set, one set at a time, then
+   *  record the sweep. Sequential rather than fanned out: each enrollment is a revision-checked
+   *  write to the shared ActiveTasksKey, so concurrency here buys collisions rather than speed. */
+  private def sweep(): Future[Unit] =
+    for
+      sets <- client.listStorageDeviceSets()
+      _ <- sets.foldLeft(Future.unit): (prior, entry) =>
+             prior.flatMap(_ => sweepOneSet(entry._2))
+      _ <- recordSweep()
+    yield ()
+
+  /** One set's share of a sweep. A failure is logged and swallowed: one bad set must not stop
+   *  the rest of the sweep. */
+  private def sweepOneSet(setId: StorageDeviceSetId): Future[Unit] =
+    if stopped then Future.unit
+    else
+      client.getStorageDeviceSetState(setId).flatMap: setState =>
+        // Level 1+ sets hold sets rather than devices; getStateForRebalancePlanning throws on
+        // them, so they are filtered out here rather than allowed to abort the sweep.
+        if setState.level != 0 then Future.unit
+        else RebalancingDurableService.rebalanceReadSet(client, setId, setState)
+      .recover:
+        case err =>
+          logger.warn(s"Automatic rebalance of storage device set ${setId.uuid} failed: $err")
+
+  /** Record the sweep even when individual sets failed. Holding the timestamp back on failure
+   *  would turn the poll into a retry loop against the whole cluster for as long as one set
+   *  stayed broken.
+   *
+   *  Revision-checked on LastAutoRebalanceKey alone, so this does not contend with the
+   *  ActiveTasksKey writes that enrollment and completion perform. */
+  private def recordSweep(): Future[Unit] =
+    client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+      client.read(statePointer).map: kvos =>
+        val reqs = KeyValueUpdate.KeyRevision(
+                     RebalancingServiceState.LastAutoRebalanceKey,
+                     kvos.contents(RebalancingServiceState.LastAutoRebalanceKey).revision) :: Nil
+        val ops = Insert(RebalancingServiceState.LastAutoRebalanceKey,
+                    RebalancingServiceState.encodeLastAutoRebalance(HLCTimestamp.now)) :: Nil
+        tx.update(statePointer, None, None, reqs, ops)
 
   private def startTask(setId: StorageDeviceSetId, taskStatePtr: KeyValueObjectPointer): Unit =
     val task = new SetRebalanceDurableTask(DurableTaskPointer(taskStatePtr), client, setId, pollPeriod)

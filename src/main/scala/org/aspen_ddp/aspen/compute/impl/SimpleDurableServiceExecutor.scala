@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.network.ServiceMessage
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
-import org.aspen_ddp.aspen.common.util.{byte2uuid, ignoreExtraCallsWhileRunning}
+import org.aspen_ddp.aspen.common.util.{boundedSingleFlight, byte2uuid}
 import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceExecutor, DurableServiceFactory, ServiceEntry}
 
 import java.util.UUID
@@ -66,7 +66,7 @@ class SimpleDurableServiceExecutor(
       scanTask = backgroundTasks.schedule(Duration(delayMillis, MILLISECONDS)):
         doScan()
 
-  private val scanFn: () => Unit = ignoreExtraCallsWhileRunning:
+  private val scanFn: () => Unit = boundedSingleFlight("durable-service-scan"):
     val entries = ListBuffer[(Key, ServiceEntry, ObjectRevision)]()
 
     servicesTkvl.foreach: (_, key, vs) =>

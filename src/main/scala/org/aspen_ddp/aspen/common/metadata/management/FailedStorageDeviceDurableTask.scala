@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, O
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
-import org.aspen_ddp.aspen.common.util.{byte2uuid, ignoreExtraCallsWhileRunning, uuid2byte}
+import org.aspen_ddp.aspen.common.util.{boundedSingleFlight, byte2uuid, uuid2byte}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor, TaskStopped}
 import scribe.Logging
 
@@ -85,10 +85,13 @@ class FailedStorageDeviceDurableTask(
 
   /** Single-flight guard: a tick arriving while a pass is still running is dropped.
    *
-   *  processNext MUST never return a failed Future, nor throw: ignoreExtraCallsWhileRunning
-   *  clears its flag from `Future.foreach`, which does not run on failure, and a synchronous
-   *  throw escapes before the flag is ever cleared. Either would wedge the wrapper permanently. */
-  private val run: () => Unit = ignoreExtraCallsWhileRunning(processNext())
+   *  A failed Future or a synchronous throw out of processNext releases the guard rather than
+   *  wedging it, so neither is a correctness hazard here any more -- but both still cost a poll
+   *  period of progress, so processNext should continue to handle its own errors. The remaining
+   *  wedge mode is a Future that never completes: the guard reports it (see the device id in
+   *  the name) but cannot break it, because it cannot distinguish it from a slow pass. */
+  private val run: () => Unit =
+    boundedSingleFlight(s"failed-device-task ${deviceId.uuid}")(processNext())
 
   // Begin driving immediately.
   run()
@@ -111,15 +114,17 @@ class FailedStorageDeviceDurableTask(
       synchronized { if !promise.isCompleted then promise.failure(new TaskStopped) }
       Future.unit
     else
-      // try/catch as well as recover: a synchronous throw out of drive() would leave the
-      // single-flight flag set forever.
+      // try/catch as well as recover so a synchronous throw out of drive() reaches the same
+      // handler as an async one, and gets the same scheduleRecheck. The single-flight guard
+      // releases either way now, but only this path re-arms the poll.
       val pass =
         try drive()
         catch
           case err: Throwable => Future.failed(err)
 
       // transformWith to a constant Future.unit rather than recover: a `recover` body that
-      // itself threw would fail the returned future and wedge the flag just the same.
+      // itself threw would fail the returned future, and a failed future here is reported as a
+      // task failure by the guard even though the pass was handled.
       pass.transformWith: outcome =>
         try
           outcome match

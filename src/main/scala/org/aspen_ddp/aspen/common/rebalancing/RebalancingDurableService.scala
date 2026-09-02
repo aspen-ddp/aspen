@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceFactory, Durab
 import scribe.Logging
 
 import java.util.UUID
-import scala.concurrent.duration.{Duration, HOURS, MINUTES}
+import scala.concurrent.duration.{Duration, FiniteDuration, HOURS, MINUTES}
 import scala.concurrent.{ExecutionContext, Future}
 
 object RebalancingDurableService extends DurableServiceFactory with Logging:
@@ -218,7 +218,12 @@ class RebalancingDurableService(val client: AspenClient,
   @volatile private var stopped = false
 
   reconcile()
-  pollTask = client.backgroundTaskManager.scheduleNonConcurrentPollingTask(pollPeriod):
+  // stallAfter is an hour rather than the default because reconcile()'s future spans a whole
+  // sweep -- one enrollment transaction per level-0 set, sequentially -- so a large system can
+  // legitimately hold it open far longer than a poll period. A stall report means something is
+  // wrong; it must not fire for a sweep that is merely long.
+  pollTask = client.backgroundTaskManager.scheduleNonConcurrentPollingTask(
+    "rebalancing-reconcile", pollPeriod, stallAfter = FiniteDuration(1, HOURS)):
     reconcile()
 
   override def shutdown(): Unit = synchronized:

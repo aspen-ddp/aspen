@@ -238,11 +238,13 @@ package object util {
    *  @param maxInFlight  hard cap on concurrent invocations, and the ONLY thing bounding them.
    *                      At the default of 1 this is a strict single-flight guard: a stalled
    *                      invocation is reported but never joined, exactly as before. Above 1, a
-   *                      tick arriving after `stallAfter` may start an additional invocation, up
-   *                      to the cap -- trading a bounded, constant number of duplicate reads for
-   *                      liveness against an orphaned Future. Prefer this to a timeout that
-   *                      re-arms the guard: a timeout's worst case grows with the outage, this
-   *                      one is `maxInFlight` no matter how long the outage lasts. Only raise it
+   *                      tick may start an additional invocation once `stallAfter` has passed
+   *                      since the most recent one started, up to the cap -- trading a bounded,
+   *                      constant number of duplicate reads for liveness against an orphaned
+   *                      Future. Prefer this to a timeout that re-arms the guard: a timeout's
+   *                      worst case grows with the outage (a 20 second poll under a 5 minute
+   *                      timeout issues 288 reads across a day offline), while this one is
+   *                      `maxInFlight` reads no matter how long the outage lasts. Only raise it
    *                      for work that is safe to duplicate, since an abandoned invocation is not
    *                      cancelled and may still complete later.
    *  @param clock        nanosecond time source; injectable for testing
@@ -288,15 +290,25 @@ package object util {
               if outstanding < stallAfter then
                 suppressed += 1
                 (None, None)
-              else if inFlight.size < maxInFlight then
-                val ev = SingleFlightStall(name, outstanding, inFlight.size, suppressed,
-                                           startedExtra = true)
-                (Some(reserve(now)), Some(ev))
               else
-                suppressed += 1
-                val ev = SingleFlightStall(name, outstanding, inFlight.size, suppressed,
-                                           startedExtra = false)
-                (None, Some(ev))
+                // Something is stalled, so this tick is reported either way. Whether it also gets
+                // to START anything is gated on the NEWEST invocation, not the oldest: gating on
+                // the oldest would let consecutive ticks run straight to the cap seconds apart,
+                // whereas each extra should cost a full stallAfter of waiting. With a 10 minute
+                // threshold and a cap of 3 that is one invocation at t=0, t=10, t=20 -- and if
+                // the first was merely slow and finishes at t=12, the third never happens.
+                val sinceNewest = Duration.fromNanos(now - inFlight.head._2)
+                val admit = inFlight.size < maxInFlight && sinceNewest >= stallAfter
+
+                if admit then
+                  val ev = SingleFlightStall(name, outstanding, inFlight.size, suppressed,
+                                             startedExtra = true)
+                  (Some(reserve(now)), Some(ev))
+                else
+                  suppressed += 1
+                  val ev = SingleFlightStall(name, outstanding, inFlight.size, suppressed,
+                                             startedExtra = false)
+                  (None, Some(ev))
 
         toReport.foreach(onStall)
         toStart.foreach(launch)
@@ -315,20 +327,5 @@ package object util {
             scribe.warn(s"$name: invocation failed: $t")
 
     tracker.call
-
-  /**
-   * This method ensures that repeated invocations of the supplied code block (such as a scheduled periodic task)
-   * will ignore redundant calls while the Future is outstanding. It's intent is to be used with schedulePeriodic
-   * to ensure that duplicate reads don't pile up during extended offline periods. An example is of a host polling
-   * the physical device state to look for new store creations or transfers. Without the use of this method, an
-   * offline period could result in hundreds of backed-up read operations.
-   *
-   * Strict single-flight, with stall reporting at the default threshold. Prefer
-   * [[boundedSingleFlight]] directly where a meaningful task name can be supplied -- an unnamed
-   * task makes a stall report much harder to act on.
-   *  */
-  def ignoreExtraCallsWhileRunning[T](fn: => Future[T])(implicit ec: ExecutionContext): () => Unit =
-    boundedSingleFlight("unnamed polling task")(fn)
-
 
 }

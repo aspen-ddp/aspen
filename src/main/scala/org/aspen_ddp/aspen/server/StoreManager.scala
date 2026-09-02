@@ -259,7 +259,8 @@ class StoreManager(val client: AspenClient,
   private def startUsageTracking(executor: TaskExecutor): Unit =
     poolUsageManager.setTaskExecutor(executor)
 
-    usageUpdateTask = Some(backgroundTasks.scheduleNonConcurrentPollingTask(Duration(20, SECONDS)):
+    usageUpdateTask = Some(backgroundTasks.scheduleNonConcurrentPollingTask(
+      "store-usage-update", Duration(20, SECONDS)):
       val (slist, dlist) =
         synchronized:
           (stores.valuesIterator.toList, storageDevices.valuesIterator.toList)

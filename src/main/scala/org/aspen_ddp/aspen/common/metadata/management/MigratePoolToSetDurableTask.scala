@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.rebalancing.{Plan, State, TransferSafety}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
-import org.aspen_ddp.aspen.common.util.{byte2long, byte2uuid, ignoreExtraCallsWhileRunning, runBoundedParallel, uuid2byte}
+import org.aspen_ddp.aspen.common.util.{boundedSingleFlight, byte2long, byte2uuid, runBoundedParallel, uuid2byte}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTaskPointer, TaskExecutor, TaskStopped}
 import scribe.Logging
 
@@ -81,10 +81,13 @@ class MigratePoolToSetDurableTask(
    *  (TODO.txt's "protect against pileups", on the async-body side; the cancel-then-schedule
    *  in scheduleRecheck covers the timer side).
    *
-   *  processNext MUST never return a failed Future, nor throw: ignoreExtraCallsWhileRunning
-   *  clears its flag from `Future.foreach`, which does not run on failure, and a synchronous
-   *  throw escapes before the flag is ever cleared. Either would wedge the wrapper permanently. */
-  private val run: () => Unit = ignoreExtraCallsWhileRunning(processNext())
+   *  A failed Future or a synchronous throw out of processNext releases the guard rather than
+   *  wedging it, so neither is a correctness hazard here any more -- but both still cost a poll
+   *  period of progress, so processNext should continue to handle its own errors. The remaining
+   *  wedge mode is a Future that never completes: the guard reports it (see the pool id in the
+   *  name) but cannot break it, because it cannot distinguish it from a slow pass. */
+  private val run: () => Unit =
+    boundedSingleFlight(s"migrate-pool-task ${poolId.uuid}")(processNext())
 
   // Begin driving immediately.
   run()
@@ -107,8 +110,9 @@ class MigratePoolToSetDurableTask(
       synchronized { if !promise.isCompleted then promise.failure(new TaskStopped) }
       Future.unit
     else
-      // try/catch as well as recover: see the run() comment. A synchronous throw out of
-      // driveMigration would leave the single-flight flag set forever.
+      // try/catch as well as recover so a synchronous throw out of driveMigration reaches the
+      // same handler as an async one, and gets the same scheduleRecheck. The single-flight
+      // guard releases either way now, but only this path re-arms the poll.
       val pass =
         try driveMigration()
         catch
@@ -116,7 +120,8 @@ class MigratePoolToSetDurableTask(
 
       // transformWith to a constant Future.unit rather than recover: a `recover` body that
       // itself threw (logger.warn, or pollTask.cancel() inside scheduleRecheck) would fail the
-      // returned future and wedge the flag just the same. Nothing below can throw or fail.
+      // returned future, and a failed future here is reported as a task failure by the guard
+      // even though the pass was handled. Nothing below can throw or fail.
       pass.transformWith: outcome =>
         try
           outcome match

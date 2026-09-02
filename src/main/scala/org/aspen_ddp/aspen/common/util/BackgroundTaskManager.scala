@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.common.util
 import java.util.concurrent.{Executors, ScheduledFuture, ThreadLocalRandom, TimeUnit}
 
 import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS}
 
 /**
  * Spawns a background thread to use for scheduling the execution of the call by name
@@ -64,14 +64,29 @@ class BackgroundTaskManager(protected val executionContext: ExecutionContext) {
   /** Schedules a periodic polling task where only one invocation of the supplied
     * Future-returning function runs at a time. If a prior invocation's Future is still
     * outstanding when the period elapses, that tick is ignored. Combines schedulePeriodic
-    * with ignoreExtraCallsWhileRunning to prevent polling operations from piling up during
+    * with boundedSingleFlight to prevent polling operations from piling up during
     * extended offline periods.
     *
-    * @param callNow Defaults to false. If true, the function is executed immediately,
-    *               otherwise it waits for the polling period to elapse.
+    * @param name       identifies this task in stall reports. It is logged with no other
+    *                   context, so make it name the poll rather than the module: an operator
+    *                   reading "POLLING TASK STALLED: store-usage-update" should know what
+    *                   stopped without grepping.
+    * @param callNow    Defaults to false. If true, the function is executed immediately,
+    *                   otherwise it waits for the polling period to elapse.
+    * @param stallAfter how long a single invocation may stay outstanding before it is
+    *                   reported as stalled. Set it well above the slowest legitimate run,
+    *                   not just above the period -- a report is an operator's cue that
+    *                   something is wrong, so it must not fire for merely slow work.
+    * @param maxInFlight see boundedSingleFlight. Leave at 1 unless duplicate concurrent
+    *                   invocations of `fn` are harmless.
     */
-  def scheduleNonConcurrentPollingTask[T](period: Duration, callNow: Boolean = false)(fn: => Future[T]): ScheduledTask = synchronized {
-    val execute = ignoreExtraCallsWhileRunning(fn)
+  def scheduleNonConcurrentPollingTask[T](name: String,
+                                          period: Duration,
+                                          callNow: Boolean = false,
+                                          stallAfter: FiniteDuration = DefaultStallAfter,
+                                          maxInFlight: Int = 1)
+                                         (fn: => Future[T]): ScheduledTask = synchronized {
+    val execute = boundedSingleFlight(name, stallAfter, maxInFlight)(fn)
     schedulePeriodic(period, callNow) { execute() }
   }
 
@@ -143,7 +158,12 @@ object BackgroundTaskManager:
 
     override def schedulePeriodic(period: Duration, callNow: Boolean)(fn: => Unit): ScheduledTask = ShutdownTask
 
-    override def scheduleNonConcurrentPollingTask[T](period: Duration, callNow: Boolean)(fn: => Future[T]): ScheduledTask = ShutdownTask
+    override def scheduleNonConcurrentPollingTask[T](name: String,
+                                                     period: Duration,
+                                                     callNow: Boolean,
+                                                     stallAfter: FiniteDuration,
+                                                     maxInFlight: Int)
+                                                    (fn: => Future[T]): ScheduledTask = ShutdownTask
 
     override def retryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)(fn: => Boolean): ScheduledTask = ShutdownTask
   

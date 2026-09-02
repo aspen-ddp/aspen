@@ -64,9 +64,11 @@ class SystemTaskExecutorService(val client: AspenClient,
   @volatile private var stopped = false
 
   reconcile()
-  reconcileTask = client.backgroundTaskManager.scheduleNonConcurrentPollingTask(reconcilePeriod):
+  reconcileTask = client.backgroundTaskManager.scheduleNonConcurrentPollingTask(
+    "system-task-reconcile", reconcilePeriod):
     reconcile()
-  monitorTask = client.backgroundTaskManager.scheduleNonConcurrentPollingTask(monitorPeriod):
+  monitorTask = client.backgroundTaskManager.scheduleNonConcurrentPollingTask(
+    "system-task-monitor", monitorPeriod):
     monitor()
 
   override def shutdown(): Unit = synchronized:

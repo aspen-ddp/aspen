@@ -283,6 +283,11 @@ class FailedStorageDeviceDurableTask(
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: IndexOutOfBoundsException => throw StopRetrying(e)
+      // generateBootstrapConfig's require(storesOnHost.nonEmpty) raises this. The statement
+      // ordering above is what keeps it unfalsifiable, but that ordering is protected by a
+      // comment alone, and a permanent error with no route to StopRetrying is an infinite
+      // 60s retry loop and a never-completing future. One line to fail loudly instead.
+      case e: IllegalArgumentException => throw StopRetrying(e)
       case e: AspenClient.DeviceFailed => throw StopRetrying(e)
       case e: StoreAlreadyMoved => throw StopRetrying(e)
       case e: FatalReadError => throw StopRetrying(e)

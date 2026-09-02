@@ -480,6 +480,10 @@ abstract class BaseAspenClient(
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
       case e: SameSetNoOp => throw StopRetrying(e)
+      // Without this, anything else -- a CorruptedObject on a read, say -- throws MatchError out
+      // of the handler, ExponentialBackoffRetryStrategy catches it, reschedules, and the promise
+      // never completes.
+      case _ => Future.unit
 
     val migrated = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
@@ -556,6 +560,10 @@ abstract class BaseAspenClient(
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
       case e: AspenClient.DeviceAlreadyFailed => throw StopRetrying(e)
+      // Anything else would throw MatchError out of the handler and leave the promise forever
+      // incomplete. The CLI's 30 s Await.ready bounds what the operator sees to a timeout
+      // message, but the retry loop would go on running in the background regardless.
+      case _ => Future.unit
 
     transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx

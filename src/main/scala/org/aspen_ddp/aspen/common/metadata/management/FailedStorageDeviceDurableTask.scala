@@ -309,9 +309,14 @@ class FailedStorageDeviceDurableTask(
         // is the direction that matters. If it says "owned" and the store is disowned by the
         // time the transaction runs, moveStore's own check -- the authoritative one -- catches
         // it. The converse, a store becoming owned by a tombstoned device between the two reads,
-        // cannot happen: every placement path refuses a tombstoned device
-        // (StorageDeviceSetState.moveDevice, AspenClient.createNewStoragePool,
-        // AspenClient.transferStore, BaseAspenClient.createStoragePool's stageDeviceUpdate).
+        // cannot happen -- but only because every path that could place one refuses:
+        // StorageDeviceSetState.moveDevice, AspenClient.createNewStoragePool,
+        // AspenClient.transferStore and BaseAspenClient.createStoragePool's stageDeviceUpdate all
+        // throw DeviceFailed, and StoreManager.updateStateForTransferredStore -- a transfer whose
+        // destination was tombstoned mid-flight, the one path that reaches this state without any
+        // operator asking for it -- restores the source instead of repointing the pool. That last
+        // one was missing until the round-3 fix, and while it was missing this paragraph was
+        // false.
         odestination <-
           if isDisowned(state, poolState, storeId) then
             Future.successful(None)
@@ -399,10 +404,14 @@ class FailedStorageDeviceDurableTask(
           else
             odestinationId match
               case None =>
-                // drain saw a disowned entry, this read does not. Unreachable: the transition
-                // requires placing the store onto a tombstoned device, which every placement
-                // path refuses (see isDisowned's callers in drain). Fail loudly rather than
-                // retry a transaction that has nothing to write to.
+                // drain saw a disowned entry, this read does not. The transition requires the
+                // store becoming owned by a tombstoned device between the two reads, which is
+                // unreachable only because every path that could do it refuses -- see the
+                // paragraph above isDisowned's call in drain, and note that one of those guards
+                // (updateStateForTransferredStore) did not exist before round 3, so this branch
+                // was reachable then. It is cheap either way: the future fails, drain logs and
+                // reschedules, and the next pass rebuilds normally at the cost of one wasted
+                // pass. Fail loudly rather than retry a transaction with nothing to write to.
                 throw StopRetrying(new IllegalStateException(
                   s"$storeId became owned by tombstoned device ${deviceId.uuid} mid-pass"))
               case Some(destinationId) =>

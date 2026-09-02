@@ -39,9 +39,10 @@ object StorageDeviceSetState:
    *  and the old set's `memberDevices` (device removed).
    *
    *  No-op if the device is already in the target set. Fails with NoSuchElementException
-   *  if the device or a set object cannot be found, or NotLevelZero if the target set is
-   *  not level 0. The old set is updated even if it did not actually list the device
-   *  (self-healing toward the correct final state). */
+   *  if the device or a set object cannot be found, NotLevelZero if the target set is
+   *  not level 0, or AspenClient.DeviceFailed if the device is tombstoned. The old set is
+   *  updated even if it did not actually list the device (self-healing toward the correct
+   *  final state). */
   def moveDevice(client: AspenClient,
                  deviceId: StorageDeviceId,
                  targetSetId: StorageDeviceSetId): Future[Unit] =
@@ -52,6 +53,11 @@ object StorageDeviceSetState:
         devPtr <- client.getStorageDevicePointer(deviceId)
         devKvos <- client.read(devPtr)
         deviceState = StorageDeviceState(devKvos)
+        // A tombstoned device is a member of no set at all -- step 1 of the failure task removes
+        // it from the one it was in. Re-admitting it pollutes rebalancer accounting with a
+        // device that holds nothing reachable, and two tombstones in one set collide on
+        // UUID(0,0) in common/rebalancing/State.scala's device map, silently dropping one.
+        _ = if deviceState.isFailed then throw AspenClient.DeviceFailed(deviceId)
         oldSetId = deviceState.storageDeviceSet
         targetPtr <- client.getStorageDeviceSetPointer(targetSetId)
         targetDos <- client.read(targetPtr)
@@ -89,6 +95,7 @@ object StorageDeviceSetState:
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
       case e: NotLevelZero => throw StopRetrying(e)
+      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
 
     client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prep(tx)

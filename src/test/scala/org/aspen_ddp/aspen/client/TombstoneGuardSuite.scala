@@ -11,8 +11,9 @@ import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
 import scala.concurrent.{ExecutionContext, Future}
 
-/** Every code path that writes a StoreEntry into a StorageDeviceState must refuse a tombstoned
- *  destination: a store placed on a dead device is silently lost. */
+/** Every code path that places something on a tombstoned device, or places a tombstoned device
+ *  somewhere, must refuse: a store put on a dead device is silently lost, and a dead device
+ *  admitted to a live set pollutes every accounting that walks it. */
 class TombstoneGuardSuite extends IntegrationTestSuite:
 
   /** Zero the host and device ids of `deviceId`'s state in place, leaving everything else --
@@ -60,6 +61,19 @@ class TombstoneGuardSuite extends IntegrationTestSuite:
       dst <- client.getStorageDeviceState(net.secondDeviceId)
     yield
       dst.stores(storeId).status should be(StorageDeviceState.StoreStatus.TransferringIn)
+
+  atest("moveDeviceToSet refuses a tombstoned device"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("adopting-set", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- tombstone(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      result <- recoverToSucceededIf[AspenClient.DeviceFailed](
+                  client.moveDeviceToSet(net.secondDeviceId, setId))
+    yield result
 
   atest("createNewStoragePool refuses to place a store on a tombstoned device"):
     given ExecutionContext = executionContext

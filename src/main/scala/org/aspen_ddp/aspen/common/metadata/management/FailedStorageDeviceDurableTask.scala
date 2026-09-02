@@ -292,7 +292,7 @@ class FailedStorageDeviceDurableTask(
         // it. The converse, a store becoming owned by a tombstoned device between the two reads,
         // cannot happen: every placement path refuses a tombstoned device
         // (StorageDeviceSetState.moveDevice, AspenClient.createNewStoragePool,
-        // AspenClient.transferStore, StoreManager's stageDeviceUpdate).
+        // AspenClient.transferStore, BaseAspenClient.createStoragePool's stageDeviceUpdate).
         odestination <-
           if isDisowned(state, poolState, storeId) then
             Future.successful(None)

@@ -96,6 +96,14 @@ object State:
               .map((sid, entry) => sid -> Store(sid, storeSize(sid), entry.status))
           .toMap
 
+        // Keyed by the id inside the device's own state, which a tombstone zeroes -- so two
+        // tombstoned devices in one set would collide on UUID(0,0) and .toMap would silently
+        // drop one. Unreachable: a tombstone is a member of no set. Step 1 of
+        // FailedStorageDeviceDurableTask removes it from the one it was in, and every path that
+        // could put one back refuses -- StorageDeviceSetState.moveDevice,
+        // AspenClient.createNewStoragePool, AspenClient.transferStore, and
+        // BaseAspenClient.createStoragePool's stageDeviceUpdate all throw DeviceFailed on a
+        // tombstoned device.
         val devices: Map[StorageDeviceId, Device] =
           deviceStates.map: ds =>
             val itsStores = ownedStores(ds).keys

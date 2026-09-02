@@ -13,13 +13,15 @@ import java.util.{HexFormat, UUID}
  *  completion -- never on startup.
  *
  *  `lastRestoredKey` is an allocation-tree key (the raw bytes of an ObjectId), hex-encoded
- *  because those bytes are not text. `failedObjects` are objects the walk could not read; the
- *  checkpoint advances past them so one unreadable object cannot wedge the walk forever, and
- *  they are retried at the end of the pass.
+ *  because those bytes are not text. The hex is quoted so YAML reads it as a string: an
+ *  unquoted `0123456789` parses as a number and a `1e5` as a float, either of which would
+ *  come back as something other than the key that was written. `failedObjects` are objects
+ *  the walk could not read; the checkpoint advances past them so one unreadable object cannot
+ *  wedge the walk forever, and they are retried at the end of the pass.
  *
  *  ```
  *  store-id: 00000000-0000-0000-0000-000000000000:0
- *  last-restored-key: 0a1b2c
+ *  last-restored-key: '0a1b2c'
  *  failed-objects:
  *    - 22222222-2222-2222-2222-222222222222
  *  ```

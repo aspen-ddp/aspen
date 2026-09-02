@@ -232,8 +232,37 @@ directory to `<device>/<storeId.directoryName>`, then a transaction flipping the
 exactly as `createNewStore` does for `Initializing`. Then load the store and re-check the
 device.
 
+*As built, the flip both writes and decides, and the load is downstream of that decision.* An
+earlier draft of this section read as move → flip → load, with the load a foregone conclusion
+once the move succeeded. The implementation instead has `markRebuiltStoreActive` return an
+outcome — `Adopt` or `Discard` — read from the device's tree entry inside the flip transaction,
+and only the `Adopt` outcome loads the store. This is deliberate and stricter, not a deviation
+to be tidied away: the device can be tombstoned between a rebuild starting and finishing, and a
+load that does not wait on the decision hands a live copy to a device the tree has just said
+must not own it, with nothing left to take it back. `Discard` deletes the directory instead.
+This is what the "loading is downstream of the metadata decision" invariant means, and
+`StoreManagerTestHarness` stamps a sequence number at each of the two events specifically so a
+test can assert the ordering.
+
+The re-check that follows differs by outcome. `Adopt`, `Discard`, and a permanently failed flip
+re-check every loaded device, including this one, to start whatever is queued behind the slot
+just freed. A rebuild that *fails* re-checks every device **except** its own: the entry still
+reads `Rebuilding` and the slot has just been released, so re-checking its own device is a
+retry, and an unbounded one — a rebuild that fails in under a millisecond would spin with no
+backoff. Its device waits for the ordinary periodic check, which resumes from the checkpoint
+left in staging.
+
 If the final directory already exists on startup (a crash between the move and the flip), the
 rebuild skips straight to the flip.
+
+**The checkpoint is written atomically** — to a temp name in the staging directory, then renamed
+onto `rebuild-state.yaml`. Aspen is crash-only, so a crash between a truncating overwrite and
+the write that follows it is the ordinary termination mode landing in an unlucky window, and it
+would leave a file that cannot be parsed. Reading the checkpoint is the first thing a pass does,
+so a throw there would make the store permanently unrebuildable without an operator deleting the
+file by hand. `RebuildState.load` is correspondingly total: an unreadable checkpoint is reported
+as *no* checkpoint, costing a restart of the walk and nothing else, since `rebuildWrite` is a
+plain overwrite. Lose work; never claim work that never reached stable storage.
 
 ### 5. Residual staleness
 

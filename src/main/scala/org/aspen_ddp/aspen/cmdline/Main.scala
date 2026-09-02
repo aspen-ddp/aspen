@@ -1242,7 +1242,6 @@ object Main {
     0
   }
 
-
   def create_pool(bootstrapConfigFile: os.Path,
                   poolName: String,
                   ida: IDA,

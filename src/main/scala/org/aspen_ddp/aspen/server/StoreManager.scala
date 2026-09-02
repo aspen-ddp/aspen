@@ -588,9 +588,24 @@ class StoreManager(val client: AspenClient,
             //
             // Waiting costs no availability: the pool goes on naming the source until that
             // transaction commits, so nothing routes here before then anyway.
-            updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid).foreach:
-              case TransferOutcome.PoolRepointed => loadStoreById(toDeviceid, storeId)
-              case TransferOutcome.SourceRestored => discardArrivedTransferIn(storeId, toDeviceid)
+            updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid).onComplete:
+              case Success(TransferOutcome.PoolRepointed) =>
+                loadStoreById(toDeviceid, storeId)
+
+              case Success(TransferOutcome.SourceRestored) =>
+                discardArrivedTransferIn(storeId, toDeviceid)
+
+              case Failure(t) =>
+                // The only observer this Future has. Its onFail routes the permanent errors to
+                // StopRetrying, which fails the promise -- and an unobserved failed Promise is
+                // not reported by the ExecutionContext, so without this line a permanent give-up
+                // is exactly as silent as the infinite retry loop it replaced. What is left
+                // behind matters: the source's entry stays TransferringOut, which the abandoned
+                // transfer-out pass will not reinstate because it requires Active, so the
+                // source's copy stays offline behind its marker with nothing to say why.
+                logger.error(s"Failed to record the completed transfer of store $storeId from " +
+                             s"device $fromDeviceId to device $toDeviceid. The store is not " +
+                             s"loaded here and the pool still names the source", t)
           case Failure(_) =>
             cleanup()
             startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)

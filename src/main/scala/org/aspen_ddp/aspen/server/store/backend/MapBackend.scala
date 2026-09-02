@@ -79,4 +79,9 @@ class MapBackend(val storeId: StoreId) extends Backend {
       data = state.data)
     m += (state.objectId -> os)
     complete.success(())
+
+  override def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit =
+    // Objects are keyed by ObjectId alone, so the storePointer is not needed here.
+    m -= objectId
+    complete.success(())
 }

@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFin
 import scribe.Logging
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ReadError, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ReadError, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringIn, TransferringOut}
 import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
@@ -47,6 +47,8 @@ object Host:
   private case class ClientReq(msg: ClientRequest) extends Event
   private case class HostMsg(msg: HostMessage) extends Event
   private case class Repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]) extends Event
+  private case class RepairDelete(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte],
+                                  completion: Promise[Unit]) extends Event
   private case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend, completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   private case class Exit() extends Event
@@ -1484,6 +1486,16 @@ class Host(val client: AspenClient,
   def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
     events.put(Repair(storeId, os, completion))
 
+  /** Repairs a missed deletion on the given store. Used when the object is gone from the rest
+    * of the system, leaving only the ObjectId and the storePointer bytes recorded in the pool's
+    * errorTree to identify it.
+    */
+  def repairDelete(storeId: StoreId,
+                   objectId: ObjectId,
+                   storePointer: Array[Byte],
+                   completion: Promise[Unit]): Unit =
+    events.put(RepairDelete(storeId, objectId, storePointer, completion))
+
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     events.put(Exit())
     serviceExecutorPromise.future.foreach(_.shutdown())
@@ -1620,6 +1632,15 @@ class Host(val client: AspenClient,
       
       case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
         store.repair(os, completion)
+
+      case RepairDelete(storeId, objectId, storePointer, completion) => stores.get(storeId) match
+        case Some(store) => store.repairDelete(objectId, storePointer, completion)
+        case None =>
+          // We do not host this store, so there is nothing here to delete. Complete rather than
+          // leaving the caller -- which waits on this promise before dropping the errorTree
+          // entry -- blocked forever.
+          logger.debug(s"Ignoring repair deletion of $objectId for unhosted store $storeId")
+          completion.success(())
 
       case RecoveryEvent() =>
         handleRecoveryEvent()

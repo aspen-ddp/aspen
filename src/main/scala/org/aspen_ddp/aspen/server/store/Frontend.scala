@@ -159,6 +159,19 @@ class Frontend(val storeId: StoreId,
     }
   }
 
+  /** Repairs a missed deletion by dropping the object from this store.
+    *
+    * There is nothing to read first: the object is gone everywhere else, so there is no state
+    * to compare against. We evict the cache for the same reason `commit` does when a refcount
+    * reaches zero, then hand the removal to the backend.
+    */
+  def deleteObjectForRepair(objectId: ObjectId,
+                            storePointer: Array[Byte],
+                            completion: Promise[Unit]): Unit =
+    logger.trace(s"Repairing missed deletion of object $objectId")
+    objectCache.remove(objectId)
+    backend.repairDelete(objectId, storePointer, completion)
+
   private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit =
     val objectId = pointer.id
 

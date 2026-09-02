@@ -1012,6 +1012,25 @@ object Main {
   }
 
 
+  /** How long an errorTree entry must sit before its object's absence from the allocationTree
+    * is taken as proof of deletion.
+    *
+    * An absent allocationTree entry has two possible meanings: the object was deleted, or the
+    * allocating transaction's AllocationFinalizationAction has not landed yet -- it runs
+    * concurrently with the MissedUpdateFinalizationAction that wrote the errorTree entry, and
+    * both may re-run after a crash. Acting on the second case would drop the errorTree entry
+    * for a live object, leaving the store silently short a slice with no record of it.
+    *
+    * Repair is explicitly not latency-sensitive, so we wait long enough to make that race
+    * implausible. Waiting costs one more pass; guessing wrong costs a replica.
+    */
+  private[cmdline] val MinErrorEntryAgeForDeletion: Duration = Duration(60, SECONDS)
+
+  private[cmdline] def errorEntryMayBeDeleted(entryTimestamp: HLCTimestamp, now: HLCTimestamp): Boolean =
+    // A future-dated entry yields a negative age and is therefore ineligible, which is what we
+    // want -- clock skew is not evidence that anything was deleted.
+    (now - entryTimestamp) >= MinErrorEntryAgeForDeletion
+
   def repair(client: AspenClient, host: Host): Unit =
 
     def deleteErrorEntry(node: KeyValueListNode, key: Key): Future[Unit] =
@@ -1055,14 +1074,31 @@ object Main {
         println(s"**** REPAIR Complete: ${ptr.id}")
         ()
 
-    def step1(ovalue: Option[ValueState], pool: StoragePool, storeId: StoreId,
-              node: KeyValueListNode, key: Key): Future[Unit] = ovalue match
+    def step1(oAllocation: Option[ValueState], errorEntry: ValueState, objectId: ObjectId,
+              pool: StoragePool, storeId: StoreId,
+              node: KeyValueListNode, key: Key): Future[Unit] = oAllocation match
       case None =>
-        // No object found in the allocation tree. It must have been deleted. Remove error tree entry
-        deleteErrorEntry(node, key)
-        // TODO - we need to delete it from the store as well. Note that it's not an error if
-        //        the object doesn't exist within the store.
-      case Some(value) => step2(pool, storeId, ObjectPointer(value.value.bytes), node, key)
+        // Absent from the allocation tree means either the object was deleted or its allocation
+        // has yet to be recorded. Only the first is safe to act on; the age of the error entry
+        // is what tells them apart.
+        if errorEntryMayBeDeleted(errorEntry.timestamp, HLCTimestamp.now) then
+          // The error entry value holds the storePointer bytes captured when the update was
+          // missed -- the only surviving copy, since deletion removed the allocation tree entry.
+          // An empty value means "delete by ObjectId alone".
+          val fdelete = Promise[Unit]()
+          host.repairDelete(storeId, objectId, errorEntry.value.bytes, fdelete)
+          for
+            _ <- fdelete.future
+            _ <- deleteErrorEntry(node, key)
+          yield
+            println(s"**** REPAIR Complete (deletion): $objectId")
+            ()
+        else
+          // Leave the entry in place. The next pass will pick it up once it has aged.
+          println(s"**** REPAIR Deferred: $objectId is absent from the allocation tree but its " +
+                  s"error entry is too recent to treat as a deletion")
+          Future.unit
+      case Some(allocation) => step2(pool, storeId, ObjectPointer(allocation.value.bytes), node, key)
 
     def repairOne(pool: StoragePool, storeId: StoreId)(node: KeyValueListNode,
                                                        key: Key, value: ValueState): Future[Unit] =
@@ -1074,8 +1110,8 @@ object Main {
       val objectId = ObjectId(new UUID(msb, lsb))
       println(s"**** REPAIRING Object: ${objectId}")
       for
-        ovalue <- pool.allocationTree.get(Key(objectId.toBytes))
-        _ <- step1(ovalue, pool, storeId, node, key)
+        oAllocation <- pool.allocationTree.get(Key(objectId.toBytes))
+        _ <- step1(oAllocation, value, objectId, pool, storeId, node, key)
       yield
         ()
 

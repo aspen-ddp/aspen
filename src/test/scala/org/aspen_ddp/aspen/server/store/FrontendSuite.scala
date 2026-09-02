@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, TxMessage, TxPrepare, TxResolved}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -17,7 +17,8 @@ import org.aspen_ddp.aspen.server.transaction.TransactionStatusCache
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import scala.concurrent.Future
+import scala.concurrent.duration.{Duration, SECONDS}
+import scala.concurrent.{Await, Future, Promise}
 import scala.language.implicitConversions
 
 object FrontendSuite {
@@ -80,9 +81,65 @@ object FrontendSuite {
 
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = txDel = true
   }
+
+  def mkFrontend(): (Frontend, MapBackend, SimpleLRUObjectCache) =
+    val backend = new MapBackend(storeId)
+    val cache = new SimpleLRUObjectCache(10)
+    val frontend = new Frontend(storeId, backend, cache, new TestNet, new TestCrl,
+      new TransactionStatusCache())
+    (frontend, backend, cache)
+
+  def mkObjectState(objectId: ObjectId): ObjectState =
+    new ObjectState(objectId,
+      Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
+      ObjectType.Data,
+      DataBuffer(new Array[Byte](0)))
 }
 
 class FrontendSuite extends AnyFunSuite with Matchers {
   import FrontendSuite._
 
+  test("repair deletion removes the object from the backend") {
+    val (frontend, backend, _) = mkFrontend()
+    val os = mkObjectState(oid1)
+
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    backend.get(oid1) should not be None
+
+    val completion = Promise[Unit]()
+    frontend.deleteObjectForRepair(oid1, ObjectPointer.EmptyArray, completion)
+
+    Await.result(completion.future, Duration(5, SECONDS))
+
+    backend.get(oid1) shouldBe None
+  }
+
+  test("repair deletion evicts the object from the object cache") {
+    val (frontend, backend, cache) = mkFrontend()
+    val os = mkObjectState(oid1)
+
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    cache.insert(os)
+    cache.get(oid1) should not be None
+
+    val completion = Promise[Unit]()
+    frontend.deleteObjectForRepair(oid1, ObjectPointer.EmptyArray, completion)
+
+    Await.result(completion.future, Duration(5, SECONDS))
+
+    cache.get(oid1) shouldBe None
+  }
+
+  test("repair deletion succeeds when the store does not have the object") {
+    val (frontend, backend, _) = mkFrontend()
+
+    backend.get(oid2) shouldBe None
+
+    val completion = Promise[Unit]()
+    frontend.deleteObjectForRepair(oid2, ObjectPointer.EmptyArray, completion)
+
+    Await.result(completion.future, Duration(5, SECONDS))
+
+    backend.get(oid2) shouldBe None
+  }
 }

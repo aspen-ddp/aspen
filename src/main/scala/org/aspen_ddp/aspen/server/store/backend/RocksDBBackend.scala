@@ -138,4 +138,10 @@ class RocksDBBackend(dbPath:Path,
   override def repair(state: CommitState, complete: Promise[Unit]): Unit =
     db.put(tokey(state.objectId), encodeDBValue(state.objectType, state.metadata, state.data)).foreach: _ =>
       complete.success(())
+
+  override def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit =
+    // Objects are keyed by ObjectId alone, so the storePointer is not needed here. Deleting a
+    // key that isn't present is a no-op in RocksDB, which gives us idempotency for free.
+    db.delete(tokey(objectId)).foreach: _ =>
+      complete.success(())
 }

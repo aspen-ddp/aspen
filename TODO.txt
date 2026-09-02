@@ -1,18 +1,4 @@
 
-Host and Store support repairing an object by passing in its current state however we
-also need to support repair "deletion" operations where there is no state to pass in
-because the object has been deleted. The only information available for this operation
-is the ObjectId and storePointer array extracted from the ObjectPointer.
-
-  The errorTree now supplies both: the key carries the ObjectId and the value carries the
-  raw storePointer bytes. Note that an empty value is ambiguous -- it means either "this
-  object has no storePointer" or "this entry predates the change that started recording
-  them", and the two are indistinguishable. Treat an empty value as "delete by ObjectId
-  alone" rather than as an error.
-
-  Main.repairOne already receives the errorTree value and currently ignores it. That
-  parameter is now meaningful; don't let it be removed as unused before this is written.
-
 Failures to allocate, update, and delete objects on stores that are offline log these
 failures in the pool's errorTree. There is currently a CLI command that can run the
 repair operation on an entire pool. We need to create a continual repair operation
@@ -30,3 +16,9 @@ objects. The system is designed to tolerate transient failures well so repairs d
 to happen as fast as possible but longer delays increase the liklihood of data loss so we
 need to balance this effectively. Bounded parallelization of repairs on different stores
 is acceptable.
+
+  The repair logic itself now lives in Main.repair and handles both out-of-date objects
+  (Host.repair) and missed deletions (Host.repairDelete). Moving it into aspen.server.repair
+  should carry Main.errorEntryMayBeDeleted with it: an object absent from the allocationTree
+  has either been deleted or not yet had its allocation recorded, and only the age of the
+  errorTree entry distinguishes them. Dropping that guard silently costs replicas.

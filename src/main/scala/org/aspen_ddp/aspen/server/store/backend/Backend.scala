@@ -43,4 +43,16 @@ trait Backend extends Logging {
   def commit(state: CommitState, transactionId: TransactionId): Unit
   
   def repair(state: CommitState, complete: Promise[Unit]): Unit
+
+  /** Repairs a missed deletion by removing the object from the store.
+    *
+    * Unlike `repair`, no object state is available -- the object is already gone from the
+    * rest of the system, so all we have is the ObjectId and the storePointer bytes recorded
+    * in the pool's errorTree. The storePointer may be empty, which means "locate by ObjectId
+    * alone"; backends that do not need it may ignore it entirely.
+    *
+    * Must be idempotent: the object may never have reached this store, and a repair pass may
+    * run more than once. Removing an object that isn't present is a success, not an error.
+    */
+  def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit
 }

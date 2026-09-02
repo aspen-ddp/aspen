@@ -76,11 +76,17 @@ trait Transaction {
     */
   protected[client] def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit
 
-  /** Used by MissedUpdateFinalizationActions to prevent circular loops when marking objects as having missed update transactions.
+  /** Used by MissedUpdateFinalizationActions and by AspenClient.newRepairTransaction to prevent
+    *  circular loops when marking objects as having missed update transactions.
     *  This method should NOT be used for any other purposes.
     *
     */
   protected[client] def disableMissedUpdateTracking(): Unit
+
+  /** True unless disableMissedUpdateTracking() has been called. Exists so the repair service's
+    *  transaction factory is testable; the flag is otherwise write-only.
+    */
+  private[aspen] def missedUpdateTrackingEnabled: Boolean
 
   /** Sets the delay in Milliseconds after which peers will be marked as having missed the commit of the transaction
     */

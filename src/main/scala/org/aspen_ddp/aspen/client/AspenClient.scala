@@ -57,6 +57,18 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   def newTransaction(): Transaction
 
+  /** A transaction for the repair service's errorTree deletes.
+    *
+    * Missed-update tracking must be off: if the delete's own commit misses a store, the
+    * MissedUpdateFinalizationAction writes a fresh errorTree entry for the errorTree node
+    * itself, which the next sweep repairs, which writes another. A one-shot CLI pass survived
+    * that; a service that runs forever does not.
+    */
+  private[aspen] def newRepairTransaction(): Transaction =
+    val tx = newTransaction()
+    tx.disableMissedUpdateTracking()
+    tx
+
   def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator]
 
   def getStoragePool(poolId: PoolId): Future[StoragePool] =

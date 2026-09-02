@@ -151,6 +151,10 @@ class TransactionBuilder(
     objectPointers.map(_.poolId).toSet
   }
 
+  def missedUpdateTrackingEnabled: Boolean = synchronized {
+    addMissedUpdateTrackingFA
+  }
+
   def disableMissedUpdateTracking(): Unit = synchronized {
     addMissedUpdateTrackingFA = false
   }

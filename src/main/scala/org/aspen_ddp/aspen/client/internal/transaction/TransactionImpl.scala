@@ -37,6 +37,11 @@ class TransactionImpl(val client: AspenClient,
 
   def valid: Boolean = synchronized { !invalidated && havePendingUpdates }
 
+  def missedUpdateTrackingEnabled: Boolean = synchronized { state } match {
+    case Right(bldr) => bldr.missedUpdateTrackingEnabled
+    case Left(_) => throw PostCommitTransactionModification()
+  }
+
   def disableMissedUpdateTracking(): Unit = synchronized { state } match {
     case Right(bldr) => bldr.disableMissedUpdateTracking()
     case Left(_) => throw PostCommitTransactionModification()

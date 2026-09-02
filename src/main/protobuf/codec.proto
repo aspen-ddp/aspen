@@ -670,3 +670,16 @@ message SteppedDurableTaskState {
   uint32 step = 1;
   repeated SteppedDurableTaskEntry entries = 2;
 }
+
+//---------------------------------------------------------------------------
+//- Repair
+//---------------------------------------------------------------------------
+message RepairPolicy {
+  uint32 scanIntervalFloorSeconds = 1;
+  uint32 scanIntervalCapSeconds = 2;
+  uint32 minErrorEntryAgeForDeletionSeconds = 3;
+}
+
+message HostRepairLimits {
+  uint32 maxConcurrentStoreScans = 1;
+}

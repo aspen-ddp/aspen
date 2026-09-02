@@ -247,6 +247,17 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       val saved = RebuildState.load(staging).get
       saved.lastRestoredKey should not be None
 
+      // The count is what makes this a test of the cap rather than a second copy of the test
+      // above. On the cap path the latch fires at failure 11 -- one past a cap of 10 -- the
+      // remaining doomed keys short-circuit, and runPass fails at the abortCause check, so
+      // retryFailures never runs and the checkpoint keeps all 11. With the cap raised out of
+      // reach all 15 injected failures accumulate instead, and every other assertion here still
+      // passes. Named for the mechanism rather than the arithmetic, so the intent survives a
+      // change to either number.
+      val expectedFailures = 10 + 1
+      saved.failedObjects.size should be(expectedFailures)
+      outcome.failed.get.getMessage should include("more than 10 unreadable objects")
+
   atest("an undecodable pointer in the allocation tree is a failed object, not a wedged walk"):
     given ExecutionContext = executionContext
     val dev = deviceDir()

@@ -68,8 +68,13 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       // metadata flip to Active (loading is downstream of the metadata decision).
       mgr.loadStoreByIdRequests.toSet should be(expectedStores.map(s => (net.secondDeviceId, s)).toSet)
       expectedStores.foreach: sid =>
-        mgr.loadStoreByIdTreeStatus.get((net.secondDeviceId, sid)) should be(
-          Some(StorageDeviceState.StoreStatus.Active))
+        val key = (net.secondDeviceId, sid)
+        val flipSeq = mgr.rebuildFlipSeq.get(key)
+        val loadSeq = mgr.loadStoreByIdSeq.get(key)
+        withClue(s"Store $sid: flip must complete before load (flipSeq=$flipSeq, loadSeq=$loadSeq)"):
+          flipSeq should be(defined)
+          loadSeq should be(defined)
+          flipSeq.get should be < loadSeq.get
 
       // On disk, each store's final directory exists with a loadable StoreConfig, holds flushed
       // object data (not just scaffolding), and its staging directory under rebuilding/ is gone.

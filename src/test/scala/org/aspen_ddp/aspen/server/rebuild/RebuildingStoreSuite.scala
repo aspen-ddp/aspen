@@ -4,11 +4,13 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.store.backend.BufferedConsistentRocksDB
 
+import java.nio.ByteBuffer
 import scala.concurrent.{ExecutionContext, Future}
 
 /** Exercises the walk against a real RocksDB backend on a temp directory, driven by the
@@ -23,7 +25,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
 
   /** Allocate `n` data objects into the bootstrap pool so the allocation tree has content, and
    *  split it across more than one tier-0 node. */
-  private def populate(n: Int): Future[List[org.aspen_ddp.aspen.common.objects.ObjectId]] =
+  private def populate(n: Int): Future[List[ObjectId]] =
     given ExecutionContext = executionContext
     val allocated = (0 until n).toList.map: i =>
       client.transactUntilSuccessful: tx =>
@@ -44,10 +46,14 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- rebuild.complete
 
       // Reopen the rebuilt store and verify the objects are actually retrievable.
-      db = new org.aspen_ddp.aspen.server.store.backend.BufferedConsistentRocksDB(
-        (dev / storeId.directoryName).toNIO)
-      tokey = (id: org.aspen_ddp.aspen.common.objects.ObjectId) =>
-        val bb = java.nio.ByteBuffer.allocate(16)
+      db = new BufferedConsistentRocksDB((dev / storeId.directoryName).toNIO)
+      // Hand-rolled key encoding: RocksDBBackend.tokey is private and the backend's read path
+      // (RocksDBBackend.read) requires a CompletionHandler, which is heavyweight for this check.
+      // This couples to the encoding but is the simplest accessible read path. If
+      // RocksDBBackend.tokey's encoding changes, this test will read the wrong keys and silently
+      // stop proving reconstruction correctness.
+      tokey = (id: ObjectId) =>
+        val bb = ByteBuffer.allocate(16)
         bb.putLong(0, id.uuid.getMostSignificantBits)
         bb.putLong(8, id.uuid.getLeastSignificantBits)
         bb.array()

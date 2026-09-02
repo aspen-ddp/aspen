@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferFactory
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
+import org.aspen_ddp.aspen.server.StoreManager.RebuildOutcome
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -303,6 +304,27 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   lazy val hostIdClaims: mutable.ListBuffer[StorageDeviceId] =
     mutable.ListBuffer[StorageDeviceId]()
 
+  /** Monotonic counter for stamping rebuild event sequences. Incremented each time an event
+   *  (metadata flip or load decision) occurs. Lazy for the same initialization-order reason as
+   *  storeLoadAttempts.
+   */
+  lazy val rebuildEventSeq: java.util.concurrent.atomic.AtomicInteger =
+    new java.util.concurrent.atomic.AtomicInteger(0)
+
+  /** Sequence number stamped when markRebuiltStoreActive's returned Future completes, by
+   *  (deviceId, storeId). Used to verify the invariant "loading is downstream of the metadata
+   *  decision": the flip's stamp must be strictly less than the load's. Lazy for the same
+   *  initialization-order reason as storeLoadAttempts.
+   */
+  lazy val rebuildFlipSeq: mutable.Map[(StorageDeviceId, StoreId), Int] =
+    mutable.Map[(StorageDeviceId, StoreId), Int]()
+
+  /** Sequence number stamped synchronously at the top of loadStoreById, by (deviceId, storeId).
+   *  Lazy for the same initialization-order reason as storeLoadAttempts.
+   */
+  lazy val loadStoreByIdSeq: mutable.Map[(StorageDeviceId, StoreId), Int] =
+    mutable.Map[(StorageDeviceId, StoreId), Int]()
+
   /** (deviceId, storeId) for every loadStoreById call, in call order.
    *
    *  Recorded here rather than through storeLoadAttempts because loadStoreById only enqueues an
@@ -313,23 +335,16 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   lazy val loadStoreByIdRequests: mutable.ListBuffer[(StorageDeviceId, StoreId)] =
     mutable.ListBuffer[(StorageDeviceId, StoreId)]()
 
-  /** Tree status (Rebuilding/Active/...) at the moment loadStoreById was called, by (deviceId, storeId).
-   *
-   *  Recorded to verify the invariant "loading is downstream of the metadata decision": a store
-   *  must read Active in the tree before the manager adopts it. Lazy for the same
-   *  initialization-order reason as storeLoadAttempts.
-   */
-  lazy val loadStoreByIdTreeStatus: mutable.Map[(StorageDeviceId, StoreId), StorageDeviceState.StoreStatus] =
-    mutable.Map[(StorageDeviceId, StoreId), StorageDeviceState.StoreStatus]()
+  override protected def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
+                                                storeId: StoreId): Future[RebuildOutcome] =
+    synchronized:
+      rebuildFlipSeq += ((storageDeviceId, storeId) -> rebuildEventSeq.incrementAndGet())
+    super.markRebuiltStoreActive(storageDeviceId, storeId)
 
   override def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     synchronized:
       loadStoreByIdRequests += ((storageDeviceId, storeId))
-      // Record the tree's status at the moment of the adoption decision.
-      client.getStorageDeviceState(storageDeviceId).foreach: state =>
-        synchronized:
-          state.stores.get(storeId).foreach: entry =>
-            loadStoreByIdTreeStatus += ((storageDeviceId, storeId) -> entry.status)
+      loadStoreByIdSeq += ((storageDeviceId, storeId) -> rebuildEventSeq.incrementAndGet())
     super.loadStoreById(storageDeviceId, storeId)
 
   /** The outcome of every completed post-transfer metadata update, by store.

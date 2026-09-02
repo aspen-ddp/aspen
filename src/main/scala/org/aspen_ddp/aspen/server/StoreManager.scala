@@ -965,8 +965,8 @@ class StoreManager(val client: AspenClient,
    *  StopRetrying nor a match, so ExponentialBackoffRetryStrategy reschedules forever, the future
    *  never completes, and this device's rebuild queue never advances.
    */
-  private def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
-                                     storeId: StoreId): Future[RebuildOutcome] =
+  protected def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
+                                       storeId: StoreId): Future[RebuildOutcome] =
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: FatalReadError => throw StopRetrying(e)

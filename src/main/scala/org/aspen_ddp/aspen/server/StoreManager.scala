@@ -748,8 +748,8 @@ class StoreManager(val client: AspenClient,
     client.getStorageDeviceState(storageDeviceId)
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
-   *  storage-devices tree: deletes stores transferred away, creates Initializing stores, and
-   *  starts transfers in.
+   *  storage-devices tree: deletes stores transferred away, reinstates stores left offline by an
+   *  abandoned transfer out, creates Initializing stores, and starts transfers in.
    *
    *  If the tree records a different host, none of that happens: the device has migrated here,
    *  so this claims it with updateHostId and re-requests the check once the claim commits.
@@ -788,6 +788,41 @@ class StoreManager(val client: AspenClient,
             case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
 
       //----------------------
+      // Abandoned Transfers Out
+      //
+      // Nothing else ever clears a transfer-out marker from the source. TransferringIn deletes
+      // it only from the destination's unpacked copy, and a transfer that completes normally
+      // has the source's whole store directory deleted by the pass above -- the marker goes with
+      // it. So a transfer that ends without completing, which is what a destination declared
+      // failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads it on
+      // every restart and puts the store straight back into offlineStores.
+      //
+      // That pairs badly with the metadata repair for the same event. That repair puts this
+      // entry back to Active and leaves the pool naming this device, so afterwards the metadata
+      // reads entirely healthy while the slice is served by nobody, here or anywhere. Repairing
+      // the metadata alone would trade a visibly stalled TransferringOut entry for an invisible
+      // outage.
+      //
+      // On the source host's own poll rather than inline at either repair site, because only
+      // this host can touch this disk and one of those two sites -- the drain -- runs wherever
+      // the durable task happens to live. Polling for desired state rather than being told is
+      // also what the rest of this method does.
+      //
+      // The guard is narrow on purpose. Active *and* no transferDevice is the only combination
+      // that says no transfer is outstanding; an entry still TransferringOut, or Active with a
+      // destination still named, means the marker is doing its job. transferringOut is the same
+      // question asked of this process rather than the tree, and covers the window where the
+      // drain restores the entry while this host is still shipping bytes.
+      local.offlineStores.filter(storeId =>
+        !transferringOut.contains(storeId) &&
+        remote.stores.get(storeId).exists(entry =>
+          entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
+        ) &&
+        os.exists(os.Path(local.devicePath) / storeId.directoryName / TransferringOut.MarkerFile)
+      ).foreach: storeId =>
+        reinstateAbandonedTransferOut(local, storeId)
+
+      //----------------------
       // New Stores
       //
       remote.stores.filter((storeId, entry) =>
@@ -817,6 +852,47 @@ class StoreManager(val client: AspenClient,
               abandonTransferIn(local.storageDeviceId, storeId, fromDeviceId)
             else
               startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+
+  /** Brings a store back online after its transfer out was abandoned rather than completed.
+   *
+   *  Purely local: the tree already says Active and the pool already names this device, so there
+   *  is nothing to transact and no retry loop to get wrong. Removing the marker is what makes
+   *  the repair survive a restart; loading is what makes it take effect now.
+   *
+   *  Loading goes through tryLoadStore rather than opening a backend here, because that method
+   *  owns the rest of the bookkeeping -- reading the store config, and clearing the store from
+   *  both this device's offlineStores and the manager's. Those two sets and the marker file are
+   *  three representations of one fact and must not be allowed to disagree.
+   *
+   *  If the load fails after the marker is gone, tryLoadStore's own catch logs it and the store
+   *  stays in offlineStores for the life of the process: this pass will not pick it up again,
+   *  since it keys off the marker that is now removed. The next restart loads it normally. That
+   *  is a far smaller failure than the permanent, silent one this pass exists to close.
+   *
+   *  Caller holds the instance lock and has established the tree entry and the marker.
+   */
+  private def reinstateAbandonedTransferOut(local: LocalStorageDeviceState,
+                                            storeId: StoreId): Unit =
+    val storePath = os.Path(local.devicePath) / storeId.directoryName
+
+    logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline behind a " +
+                s"transfer-out marker, but the storage-devices tree records it as Active with " +
+                s"no transfer outstanding. Clearing the abandoned transfer and loading the store")
+
+    val markerRemoved =
+      try
+        os.remove(storePath / TransferringOut.MarkerFile)
+        true
+      catch
+        case t: Throwable =>
+          // Leave the store offline. Loading it with the marker still in place would be undone
+          // by the next restart, so this pass would have logged a repair that did not hold.
+          logger.error(s"Failed to remove the transfer-out marker for store $storeId at " +
+                       s"$storePath. The store stays offline. Error: $t")
+          false
+
+    if markerRemoved then
+      tryLoadStore(local, storePath.toNIO.toFile)
 
   /** Drops a TransferringIn entry whose source device has been declared failed.
    *

@@ -21,7 +21,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 /** A StoreTransferFactory whose transfers move no bytes and finish only when the test says so.
  *
  *  The real TransferringIn needs a live sending host and a `jar` subprocess, neither of which
- *  exists here, but the interesting half of a transfer for these tests is what StoreManager does
+ *  exists here, but the interesting half of a transfer for these tests is what Host does
  *  once `complete` resolves. createTransferOut is unimplemented on purpose: nothing in this
  *  suite ships a store out, and a silently-working stub would hide it if something started to.
  */
@@ -84,7 +84,7 @@ private class RecordingExecutionContext(underlying: ExecutionContext) extends Ex
   def failures: List[Throwable] = synchronized(recorded.toList)
 
 
-class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreManagerTestHarness:
+class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness:
 
   /** `foreignSystemId` is the rejection case: a device config carrying it must be ignored by
    *  the scan. */
@@ -116,43 +116,43 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
     Future.successful:
-      mgr.loadedDevices.keySet should be(Set(deviceA))
-      mgr.loadedDevices(deviceA).devicePath should be(deviceDir)
+      host.loadedDevices.keySet should be(Set(deviceA))
+      host.loadedDevices(deviceA).devicePath should be(deviceDir)
 
       // Also pins the recording seam itself: tryLoadStore is offered every child of the
       // device directory, and dev0's only child is the device config file.
-      mgr.storeLoadAttempts.toList should be(
+      host.storeLoadAttempts.toList should be(
         List((deviceA, deviceDir.resolve(StorageDeviceConfig.configFilename))))
 
   atest("a device created after construction is discovered on the next CheckAllDevices"):
     val hostRoot = newHostDir()
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    mgr.loadedDevices.keySet should be(empty)
+    host.loadedDevices.keySet should be(empty)
 
     writeDevice(hostRoot, "dev0", deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+    Future.successful(host.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("a missing storage-devices directory does not throw"):
-    val mgr = newManager(newHostDir(withStorageDevicesDir = false))
+    val host = newHost(newHostDir(withStorageDevicesDir = false))
 
-    noException should be thrownBy mgr.testingOnlyCheckAllDevices()
+    noException should be thrownBy host.testingOnlyCheckAllDevices()
 
-    Future.successful(mgr.loadedDevices.keySet should be(empty))
+    Future.successful(host.loadedDevices.keySet should be(empty))
 
   atest("an already-loaded device is not reloaded"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     Files.createDirectories(deviceDir.resolve("some-store-dir"))
 
-    val mgr = newManager(hostRoot)
-    val firstState = mgr.loadedDevices(deviceA)
-    val attemptsAfterConstruction = mgr.storeLoadAttempts.toList
+    val host = newHost(hostRoot)
+    val firstState = host.loadedDevices(deviceA)
+    val attemptsAfterConstruction = host.storeLoadAttempts.toList
 
     // tryLoadDevice offers every child of the device directory to tryLoadStore: here the
     // device config file and some-store-dir. The real tryLoadStore would load neither -- it
@@ -163,68 +163,68 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       deviceDir.resolve(StorageDeviceConfig.configFilename),
       deviceDir.resolve("some-store-dir")))
 
-    mgr.testingOnlyCheckAllDevices()
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
     // Same instance: the device's offlineStores tracking survives a rescan.
-    mgr.loadedDevices(deviceA) should be theSameInstanceAs firstState
-    Future.successful(mgr.storeLoadAttempts.toList should be(attemptsAfterConstruction))
+    host.loadedDevices(deviceA) should be theSameInstanceAs firstState
+    Future.successful(host.storeLoadAttempts.toList should be(attemptsAfterConstruction))
 
   atest("a device whose stores fail to load is retried on a later scan"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot, failFirstStoreLoad = true)
+    val host = newHost(hostRoot, failFirstStoreLoad = true)
 
     // The load threw part-way through, so the device must not be recorded as loaded. Were it
     // recorded, the idempotency guard would skip it forever and its stores would never load.
-    mgr.loadedDevices.keySet should be(empty)
+    host.loadedDevices.keySet should be(empty)
 
     // A later scan retries it from scratch and succeeds.
-    mgr.testingOnlyCheckAllDevices()
-    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+    host.testingOnlyCheckAllDevices()
+    Future.successful(host.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("a second directory claiming a loaded device id is ignored"):
     val hostRoot = newHostDir()
     val originalDir = writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
-    val originalState = mgr.loadedDevices(deviceA)
+    val host = newHost(hostRoot)
+    val originalState = host.loadedDevices(deviceA)
     originalState.devicePath should be(originalDir)
 
     // A duplicate mount or a copied config file: same device id, different directory.
     writeDevice(hostRoot, "dev0-copy", deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    mgr.loadedDevices.keySet should be(Set(deviceA))
-    Future.successful(mgr.loadedDevices(deviceA) should be theSameInstanceAs originalState)
+    host.loadedDevices.keySet should be(Set(deviceA))
+    Future.successful(host.loadedDevices(deviceA) should be theSameInstanceAs originalState)
 
   atest("a device directory with no config is skipped, then loaded once the config appears"):
     val hostRoot = newHostDir()
     val deviceDir = newDeviceDirWithoutConfig(hostRoot, "dev0")
 
-    val mgr = newManager(hostRoot)
-    mgr.loadedDevices.keySet should be(empty)
+    val host = newHost(hostRoot)
+    host.loadedDevices.keySet should be(empty)
 
     // createStorageDevice requires the directory to already exist and never creates one, so a
     // mounted-but-not-yet-registered directory is a normal steady state, not a brief window.
     // Every scan has to tolerate it and pick the device up whenever the config does appear.
     writeDeviceConfig(deviceDir, deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+    Future.successful(host.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("CheckStorageDevice for an unknown but on-disk device triggers discovery"):
     val hostRoot = newHostDir()
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    mgr.loadedDevices.keySet should be(empty)
+    host.loadedDevices.keySet should be(empty)
 
     writeDevice(hostRoot, "dev0", deviceA)
-    mgr.testingOnlyHandleHostMessage(
+    host.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
-    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+    Future.successful(host.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("an unusable entry under storage-devices does not stop its siblings from loading"):
     val hostRoot = newHostDir()
@@ -234,22 +234,22 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     newDeviceDirWithoutConfig(hostRoot, "unconfigured")
     writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+    Future.successful(host.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("a device belonging to another Aspen system is ignored"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA, foreignSystemId)
     writeDevice(hostRoot, "dev1", deviceB)
 
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    mgr.loadedDevices.keySet should be(Set(deviceB))
+    host.loadedDevices.keySet should be(Set(deviceB))
 
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceB)))
+    Future.successful(host.loadedDevices.keySet should be(Set(deviceB)))
 
   atest("an unparseable device config is skipped and retried on the next scan"):
     val hostRoot = newHostDir()
@@ -260,43 +260,43 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     // the missing-config test above.
     writeUnparseableDeviceConfig(deviceDir)
 
-    val mgr = newManager(hostRoot)
-    mgr.loadedDevices.keySet should be(empty)
+    val host = newHost(hostRoot)
+    host.loadedDevices.keySet should be(empty)
 
     // A config that stays broken must not poison later scans or half-register the device.
-    mgr.testingOnlyCheckAllDevices()
-    mgr.loadedDevices.keySet should be(empty)
+    host.testingOnlyCheckAllDevices()
+    host.loadedDevices.keySet should be(empty)
 
     writeDeviceConfig(deviceDir, deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    Future.successful(mgr.loadedDevices.keySet should be(Set(deviceA)))
+    Future.successful(host.loadedDevices.keySet should be(Set(deviceA)))
 
   atest("stores on a newly discovered device are offered to tryLoadStore"):
     val hostRoot = newHostDir()
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    mgr.storeLoadAttempts should be(empty)
+    host.storeLoadAttempts should be(empty)
 
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val storeDir = deviceDir.resolve(storeId.directoryName)
     Files.createDirectories(storeDir)
 
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    mgr.loadedDevices.keySet should be(Set(deviceA))
+    host.loadedDevices.keySet should be(Set(deviceA))
     // tryLoadDevice offers every child of the device directory to tryLoadStore: here the
     // device config file and the store directory. The real tryLoadStore would load neither --
     // it requires a store config file inside the candidate, and the config file is not a
     // directory while the store directory is empty -- but the recording override takes both.
-    Future.successful(mgr.storeLoadAttempts.toList should contain((deviceA, storeDir)))
+    Future.successful(host.storeLoadAttempts.toList should contain((deviceA, storeDir)))
 
   atest("a device check that fails does not wedge later checks of the same device"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
-    mgr.loadedDevices.keySet should be(Set(deviceA))
+    val host = newHost(hostRoot)
+    host.loadedDevices.keySet should be(Set(deviceA))
 
     // deviceA is on disk but absent from the StorageDevicesTree the TestNetwork bootstrapped,
     // so getStorageDeviceState fails with NoSuchElementException. In production that exact
@@ -306,69 +306,69 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     // is not that state at all but a failed metadata read, which arrives here identically.
     // (A copied or moved config is not one of these: its device is registered, so the lookup
     // succeeds.) The failure must still release the activeDeviceChecks entry.
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+    yieldUntil(host.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
       // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
       // into a failure rather than a pass.
-      mgr.testingOnlyActiveDeviceChecks should be(empty)
+      host.testingOnlyActiveDeviceChecks should be(empty)
 
       // And the release lets a later check of the same device start rather than being skipped
       // forever by the in-progress guard.
-      mgr.testingOnlyCheckAllDevices()
-      mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+      host.testingOnlyCheckAllDevices()
+      host.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
   atest("an armed lookup holds the device check open until the test completes it"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
-    val p = mgr.armLookup(deviceA)
+    val host = newHost(hostRoot)
+    val p = host.armLookup(deviceA)
 
-    mgr.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
 
-    mgr.lookupAttempts.toList should be(List(deviceA))
+    host.lookupAttempts.toList should be(List(deviceA))
 
     // Drain everything the check queued. A real client read of deviceA fails immediately --
     // deviceA is absent from the storage-devices tree -- so an unarmed check would have
     // released the guard by the time this wait exhausts. Still holding it is what proves the
     // armed promise, and not the client's read, is what the check is waiting on.
-    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).flatMap: _ =>
-      mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+    yieldUntil(host.testingOnlyActiveDeviceChecks.isEmpty).flatMap: _ =>
+      host.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
       p.failure(new RuntimeException("test-controlled lookup failure"))
 
-      yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+      yieldUntil(host.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
         // yieldUntil gives up silently, so this is the assertion that turns an exhausted wait
         // into a failure rather than a pass.
-        mgr.testingOnlyActiveDeviceChecks should be(empty)
+        host.testingOnlyActiveDeviceChecks should be(empty)
 
   atest("a check started before its device loads does not mark the loaded device's stores offline"):
     val hostRoot = newHostDir()
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    mgr.loadedDevices.keySet should be(empty)
+    host.loadedDevices.keySet should be(empty)
 
     // Two arms: the lookup held in flight across the load, and the one the deferred request
     // issues once it completes.
-    val p1 = mgr.armLookup(deviceA)
+    val p1 = host.armLookup(deviceA)
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
-    mgr.armLookup(deviceA)
+    host.armLookup(deviceA)
 
-    mgr.testingOnlyHandleHostMessage(
+    host.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
-    mgr.loadedDevices.keySet should be(empty)
-    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+    host.loadedDevices.keySet should be(empty)
+    host.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
     // The config appears and a later event loads the device while the lookup is outstanding.
     writeDevice(hostRoot, "dev0", deviceA)
-    mgr.testingOnlyCheckAllDevices()
-    mgr.loadedDevices.keySet should be(Set(deviceA))
+    host.testingOnlyCheckAllDevices()
+    host.loadedDevices.keySet should be(Set(deviceA))
 
     // That event's own check request collided with the outstanding lookup. It is the request
     // the guard used to discard outright, costing a full checkStorageDevicePeriod.
-    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+    host.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
 
     // An Active store makes reconcileDeviceState a no-op in every one of its branches, so this
     // pins branch selection alone rather than dragging in store creation or transfers.
@@ -376,120 +376,120 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
-    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+    yieldUntil(host.lookupAttempts.size == 2).map: _ =>
       // yieldUntil gives up silently, so assert its condition first. This also proves the
       // first callback ran, without which the negative assertion below would pass vacuously.
-      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
-      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+      host.lookupAttempts.toList should be(List(deviceA, deviceA))
+      host.testingOnlyDeferredDeviceChecks should be(empty)
 
       // The device was loaded before the lookup returned, so its stores must not be marked
       // offline by a decision taken back when it was not. In production nothing would clear
       // them afterwards: tryLoadStore and the LoadStore handler both ran on the way in, and
       // reconcileDeviceState's deleted-stores pass only removes ids recorded in the device's
       // own offlineStores set, which ids marked by this branch never enter.
-      mgr.testingOnlyOfflineStores should not contain storeId
+      host.testingOnlyOfflineStores should not contain storeId
 
   atest("a check for a device that never loads marks its stores offline"):
     val hostRoot = newHostDir()
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    val p = mgr.armLookup(deviceA)
+    val p = host.armLookup(deviceA)
 
-    mgr.testingOnlyHandleHostMessage(
+    host.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
     // Nothing was written under storage-devices/, so the check runs against a device this
-    // manager has never loaded -- the case the offline marking exists for.
-    mgr.loadedDevices.keySet should be(empty)
+    // host has never loaded -- the case the offline marking exists for.
+    host.loadedDevices.keySet should be(empty)
 
     p.success(deviceState(
       deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
-    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+    yieldUntil(host.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
       // yieldUntil gives up silently, so assert the condition it waited on.
-      mgr.testingOnlyActiveDeviceChecks should be(empty)
+      host.testingOnlyActiveDeviceChecks should be(empty)
 
       // Suppresses TxUnknownStore and ReadResponse(StoreNotFound) for stores on a device that
       // is down. Deleting this marking is silent in production and, until this test, silent in
       // the suite too.
-      mgr.testingOnlyOfflineStores should contain(storeId)
+      host.testingOnlyOfflineStores should contain(storeId)
 
   atest("a check request arriving during an in-flight check is deferred, not dropped"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
-    val p1 = mgr.armLookup(deviceA)
+    val host = newHost(hostRoot)
+    val p1 = host.armLookup(deviceA)
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
-    mgr.armLookup(deviceA)
+    host.armLookup(deviceA)
 
-    mgr.testingOnlyCheckAllDevices()
-    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
-    mgr.lookupAttempts.toList should be(List(deviceA))
+    host.testingOnlyCheckAllDevices()
+    host.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+    host.lookupAttempts.toList should be(List(deviceA))
 
     // Collides with the outstanding lookup. This is the create-storage-device nudge landing
     // during a periodic sweep, and dropping it costs a full checkStorageDevicePeriod.
-    mgr.testingOnlyCheckAllDevices()
-    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
-    mgr.lookupAttempts.toList should be(List(deviceA))
+    host.testingOnlyCheckAllDevices()
+    host.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+    host.lookupAttempts.toList should be(List(deviceA))
 
     // A third request collapses into the same deferral. The testingOnlyDeferredDeviceChecks
     // assertion after the drain is what pins Set semantics: a queue or a counter would still
     // be holding a second request for deviceA there, having only shed one on the re-dispatch.
     // lookupAttempts cannot pin it -- the re-dispatch consumes the second armed lookup, which
     // this test never completes, so no implementation gets as far as a second re-dispatch.
-    mgr.testingOnlyCheckAllDevices()
-    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+    host.testingOnlyCheckAllDevices()
+    host.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
 
     p1.success(deviceState(deviceA))
 
-    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+    yieldUntil(host.lookupAttempts.size == 2).map: _ =>
       // yieldUntil gives up silently, so assert the condition it waited on.
-      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
-      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+      host.lookupAttempts.toList should be(List(deviceA, deviceA))
+      host.testingOnlyDeferredDeviceChecks should be(empty)
 
   atest("a deferred check still runs when the in-flight lookup fails"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
-    val p1 = mgr.armLookup(deviceA)
+    val host = newHost(hostRoot)
+    val p1 = host.armLookup(deviceA)
     // The lookup the re-dispatch issues. Armed so it does not fall through to the real client.
-    mgr.armLookup(deviceA)
+    host.armLookup(deviceA)
 
-    mgr.testingOnlyCheckAllDevices()
-    mgr.testingOnlyCheckAllDevices()
-    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+    host.testingOnlyCheckAllDevices()
+    host.testingOnlyCheckAllDevices()
+    host.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
 
     // A failed lookup never reaches the completion-time re-read, so the deferral is the only
     // thing that rescues the request that collided with it.
     p1.failure(new RuntimeException("test-controlled lookup failure"))
 
-    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+    yieldUntil(host.lookupAttempts.size == 2).map: _ =>
       // yieldUntil gives up silently, so assert the condition it waited on.
-      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
-      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+      host.lookupAttempts.toList should be(List(deviceA, deviceA))
+      host.testingOnlyDeferredDeviceChecks should be(empty)
 
   atest("a lookup that throws synchronously does not wedge the device"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
 
-    val mgr = newManager(hostRoot)
-    mgr.loadedDevices.keySet should be(Set(deviceA))
+    val host = newHost(hostRoot)
+    host.loadedDevices.keySet should be(Set(deviceA))
 
     // A failed Promise cannot stage this: it still yields a Future, so the callback and its
     // finally still run. Only a throw before the Future exists skips them, and the guard entry
     // is added before the lookup call.
-    mgr.armLookupThrow(deviceA, new RuntimeException("test-controlled synchronous lookup failure"))
+    host.armLookupThrow(deviceA, new RuntimeException("test-controlled synchronous lookup failure"))
 
     // Treated as a failed lookup, not propagated. testingOnlyHandleHostMessage calls handleEvent
     // directly rather than going through the event loop, so start()'s catch-all is not in the
     // way and a propagating throw would surface right here.
-    noException should be thrownBy mgr.testingOnlyHandleHostMessage(
+    noException should be thrownBy host.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
-    mgr.lookupAttempts.toList should be(List(deviceA))
+    host.lookupAttempts.toList should be(List(deviceA))
 
     // Synchronous release is required here, not merely observed, so there is no yieldUntil.
     // Routing the throw back through the Future machinery instead -- catch it, wrap it in
@@ -500,71 +500,71 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     // release contingent on an ExecutionContext that actually drains -- the same class of leak
     // this test exists to close. A failure here means the release is no longer happening on the
     // calling thread -- either moved off it, or not happening at all.
-    mgr.testingOnlyActiveDeviceChecks should be(empty)
+    host.testingOnlyActiveDeviceChecks should be(empty)
 
     // A sanity anchor rather than a discriminator: no deferral can exist yet. checkStorageDevice
     // and startDeviceCheck both run under the instance monitor, so nothing can slip a deferral in
     // between the guard entry and the lookup call that throws.
-    mgr.testingOnlyDeferredDeviceChecks should be(empty)
+    host.testingOnlyDeferredDeviceChecks should be(empty)
 
     // The assertion that distinguishes released from wedged. A leaked entry makes every later
     // check of this device a no-op: checkStorageDevice records a deferral instead of starting a
     // lookup, and the only thing that would clear that deferral is the finally that never ran.
-    val p = mgr.armLookup(deviceA)
-    mgr.testingOnlyHandleHostMessage(
+    val p = host.armLookup(deviceA)
+    host.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
 
-    mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
-    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+    host.lookupAttempts.toList should be(List(deviceA, deviceA))
+    host.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
     // An empty store map makes reconcileDeviceState a no-op in every branch, so the check
     // finishes cleanly rather than leaving the suite's teardown to tidy up after it.
     p.success(deviceState(deviceA))
 
-    yieldUntil(mgr.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
+    yieldUntil(host.testingOnlyActiveDeviceChecks.isEmpty).map: _ =>
       // yieldUntil gives up silently, so assert the condition it waited on.
-      mgr.testingOnlyActiveDeviceChecks should be(empty)
-      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+      host.testingOnlyActiveDeviceChecks should be(empty)
+      host.testingOnlyDeferredDeviceChecks should be(empty)
 
   atest("a throw out of the check callback is not replaced by the re-dispatch's own throw"):
     val hostRoot = newHostDir()
     val recordingEc = new RecordingExecutionContext(executionContext)
-    val mgr = newManager(hostRoot, ec = recordingEc)
+    val host = newHost(hostRoot, ec = recordingEc)
 
     // A device the scan could not produce: devicePath is relative, so reconcileDeviceState's
     // deleted-stores pass throws at os.Path(local.devicePath) -- the first line on that path
     // above the try/catch wrapping os.remove.all. local.offlineStores holds the id that makes
     // the pass iterate at all; the armed remote state below omits it, which is what marks it
     // deleted.
-    val local = new StoreManager.LocalStorageDeviceState(
+    val local = new Host.LocalStorageDeviceState(
       deviceA, Paths.get("relative-device-dir"), hostRoot.toFile)
     local.offlineStores = Set(storeId)
-    mgr.injectLoadedDevice(local)
+    host.injectLoadedDevice(local)
 
-    val p1 = mgr.armLookup(deviceA)
+    val p1 = host.armLookup(deviceA)
 
     // The lookup the re-dispatch issues, armed to throw. Under the old code this throw escapes
     // the finally and replaces the reconcile's, which is the defect under test.
     val redispatchError = new RuntimeException("test-controlled re-dispatch lookup failure")
-    mgr.armLookupThrow(deviceA, redispatchError)
+    host.armLookupThrow(deviceA, redispatchError)
 
-    mgr.testingOnlyHandleHostMessage(
+    host.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
-    mgr.testingOnlyActiveDeviceChecks should be(Set(deviceA))
+    host.testingOnlyActiveDeviceChecks should be(Set(deviceA))
 
     // Collides with the outstanding lookup, so the finally has a deferral to re-dispatch.
-    mgr.testingOnlyHandleHostMessage(
+    host.testingOnlyHandleHostMessage(
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
-    mgr.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
+    host.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
 
     // Matching hostId keeps reconcileDeviceState off its host-migration branch; no stores means
     // storeId counts as deleted and the pass runs.
     p1.success(deviceState(deviceA))
 
-    yieldUntil(mgr.lookupAttempts.size == 2).map: _ =>
+    yieldUntil(host.lookupAttempts.size == 2).map: _ =>
       // yieldUntil gives up silently, so assert its condition first. It also proves the
       // re-dispatch happened, without which the assertions below would pass vacuously.
-      mgr.lookupAttempts.toList should be(List(deviceA, deviceA))
+      host.lookupAttempts.toList should be(List(deviceA, deviceA))
 
       // The discriminating pair, deliberately ahead of the release assertions below. Against the
       // pre-fix code those two failed with the same "was not empty" message the synchronous-throw
@@ -576,7 +576,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       // of the finally replaced the reconcile's. New code absorbs redispatchError inside the
       // re-dispatch and lets the reconcile's escape, so the one recorded failure is os-lib's.
       //
-      // Size before content, because this recorder sees every callback the manager runs
+      // Size before content, because this recorder sees every callback the host runs
       // through its ExecutionContext: a bare non-empty check would also pass on an unrelated
       // failure with the reconcile silently not throwing at all. Matched on the message
       // fragment rather than IllegalArgumentException, which is too common a class to pin
@@ -585,42 +585,42 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       recordingEc.failures.head.getMessage should include("is not an absolute path")
 
       // The finally still released, even though the try body threw.
-      mgr.testingOnlyActiveDeviceChecks should be(empty)
-      mgr.testingOnlyDeferredDeviceChecks should be(empty)
+      host.testingOnlyActiveDeviceChecks should be(empty)
+      host.testingOnlyDeferredDeviceChecks should be(empty)
 
   atest("a device owned by another host is claimed with updateHostId"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    val armed = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val armed = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
     armed.success(StorageDeviceState(deviceA, HostId(UUID.randomUUID()),
                                      0L, 1024L, Map(), deviceSetId))
 
-    yieldUntil(mgr.hostIdClaims.nonEmpty).map: _ =>
-      mgr.hostIdClaims.toList should be(List(deviceA))
+    yieldUntil(host.hostIdClaims.nonEmpty).map: _ =>
+      host.hostIdClaims.toList should be(List(deviceA))
 
   atest("a tombstoned device is not claimed and nothing is reconciled"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    val before = mgr.storeLoadAttempts.size
+    val before = host.storeLoadAttempts.size
 
-    val armed = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val armed = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
     // An Initializing store would normally drive createNewStore; on a tombstone nothing runs.
     armed.success(tombstonedState(
       Map(storeId -> StorageDeviceState.StoreEntry(
         StorageDeviceState.StoreStatus.Initializing, None))))
 
-    yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
-      mgr.hostIdClaims.toList should be(Nil)
-      mgr.storeLoadAttempts.size should be(before)
+    yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+      host.hostIdClaims.toList should be(Nil)
+      host.storeLoadAttempts.size should be(before)
       // The guard entry is released, so later checks of this device still run. That release
       // is the actual regression: the old code held it for the life of the process.
-      mgr.testingOnlyActiveDeviceChecks should not contain deviceA
+      host.testingOnlyActiveDeviceChecks should not contain deviceA
 
   /** Creates `<deviceDir>/<sid.directoryName>` holding a transfer-out marker file, which is what
    *  TransferringOut leaves in the source's store directory the moment a transfer begins. */
@@ -630,31 +630,31 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     Files.write(storeDir.resolve(TransferringOut.MarkerFile), Array.emptyByteArray)
     storeDir
 
-  /** Stages a store that this manager skipped at load time because of its transfer-out marker.
+  /** Stages a store that this host skipped at load time because of its transfer-out marker.
    *
    *  The directory and the marker are written after construction and `offlineStores` is set by
    *  hand, because the recording tryLoadStore does neither: it never honours the marker and
    *  never maintains the offline sets. Writing them before construction would only add a
    *  recorded attempt, not the state under test.
    */
-  private def stageOfflineTransferringOutStore(mgr: RecordingStoreManager,
+  private def stageOfflineTransferringOutStore(host: RecordingHost,
                                                deviceDir: Path,
                                                sids: StoreId*): List[Path] =
     val dirs = sids.map(sid => writeTransferringOutStore(deviceDir, sid)).toList
-    val local = mgr.loadedDevices(deviceA)
+    val local = host.loadedDevices(deviceA)
     local.offlineStores = local.offlineStores ++ sids
     dirs
 
   atest("an abandoned transfer-out's marker is cleared and the store loaded"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
-    val List(storeDir) = stageOfflineTransferringOutStore(mgr, deviceDir, storeId)
-    val before = mgr.storeLoadAttempts.size
+    val List(storeDir) = stageOfflineTransferringOutStore(host, deviceDir, storeId)
+    val before = host.storeLoadAttempts.size
 
-    val armed = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val armed = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
 
     // Active with no transferDevice: the destination was declared failed mid-flight and the
     // source's entry has been put back. Nothing will ever clear the marker on its own -- the
@@ -665,9 +665,9 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       deviceA,
       Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
 
-    yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+    yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
       // yieldUntil gives up silently, so assert the condition it waited on.
-      mgr.testingOnlyActiveDeviceChecks should not contain deviceA
+      host.testingOnlyActiveDeviceChecks should not contain deviceA
 
       // Both representations of "not served" have to go. The marker is the one that survives a
       // restart, so leaving it would make the repair last only until the process bounced.
@@ -676,19 +676,19 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       // And the load goes back through tryLoadStore rather than a parallel path, which is what
       // clears the two offlineStores sets in production. The recording override does not
       // maintain those sets, so this attempt is the assertion available here.
-      mgr.storeLoadAttempts.toList.drop(before) should be(List((deviceA, storeDir)))
+      host.storeLoadAttempts.toList.drop(before) should be(List((deviceA, storeDir)))
 
   atest("a store whose transfer-out is still outstanding keeps its marker"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val mgr = newManager(hostRoot)
+    val host = newHost(hostRoot)
 
     val List(outDir, stagedDir) =
-      stageOfflineTransferringOutStore(mgr, deviceDir, storeId, storeIdB)
-    val before = mgr.storeLoadAttempts.size
+      stageOfflineTransferringOutStore(host, deviceDir, storeId, storeIdB)
+    val before = host.storeLoadAttempts.size
 
-    val armed = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val armed = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
 
     // The two states that mean a transfer is still outstanding and the marker is doing its job.
     // Only Active *and* no transferDevice says the transfer is over and was abandoned.
@@ -699,13 +699,13 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
           storeIdB -> StorageDeviceState.StoreEntry(
             StorageDeviceState.StoreStatus.Active, Some(deviceB)))))
 
-    yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+    yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
       // yieldUntil gives up silently, so assert the condition it waited on.
-      mgr.testingOnlyActiveDeviceChecks should not contain deviceA
+      host.testingOnlyActiveDeviceChecks should not contain deviceA
 
       Files.exists(outDir.resolve(TransferringOut.MarkerFile)) should be(true)
       Files.exists(stagedDir.resolve(TransferringOut.MarkerFile)) should be(true)
-      mgr.storeLoadAttempts.size should be(before)
+      host.storeLoadAttempts.size should be(before)
 
   /** Zeroes both of `deviceId`'s ids in the storage-devices tree, exactly as
    *  FailedStorageDeviceDurableTask's step 1 does, without running the task. */
@@ -728,7 +728,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
    *
    *  yieldUntil alone is enough for work that is already queued on the test's ExecutionContext,
    *  but the post-transfer path runs a real transaction, and those only make progress while
-   *  waitForTransactionsToComplete is pumping the store manager's event queue.
+   *  waitForTransactionsToComplete is pumping the host.s event queue.
    *
    *  Gives up silently after `rounds`, for the same reason yieldUntil does: the caller's own
    *  assertion reports what went wrong far better than a timeout would. Callers MUST assert.
@@ -751,7 +751,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
     val transfers = new StagedTransferFactory
-    val mgr = newManager(hostRoot, transferFactory = transfers)
+    val host = newHost(hostRoot, transferFactory = transfers)
 
     val sourceId = StorageDeviceId.BootstrapStorageDeviceId
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
@@ -772,7 +772,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       // The destination host's own poll is what starts the receiving half. Driving it through
       // the device check rather than calling startStoreTransferIn directly is the point of the
       // test: the round-3 fix was tested through a seam that skipped this path entirely.
-      _ = mgr.testingOnlyCheckAllDevices()
+      _ = host.testingOnlyCheckAllDevices()
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       _ = transfers.startedTransfersIn should contain(movingStore)
 
@@ -787,7 +787,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
 
       // Not awaited: the pre-fix hazard in this area is a Future that never completes, and
       // awaiting one would hang the suite rather than fail it.
-      _ <- pumpUntil(mgr.transferOutcomes.contains(movingStore))
+      _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
       _ <- pumpUntil(!Files.exists(arrived))
 
       nudges = net.takeCapturedHostMessages().collect:
@@ -797,8 +797,8 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
       // pumpUntil gives up silently, so assert what it waited on.
-      mgr.transferOutcomes.get(movingStore) should be(
-        Some(StoreManager.TransferOutcome.SourceRestored))
+      host.transferOutcomes.get(movingStore) should be(
+        Some(Host.TransferOutcome.SourceRestored))
 
       // The metadata half, from round 3: the pool keeps naming the source and the source's
       // entry goes back to Active.
@@ -810,12 +810,12 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       // only considers offlineStores, and reconcileDeviceState ignores a failed device outright.
       // Same host as the source and it would replace the source's entry in `stores`, silently
       // discarding every update applied to it.
-      mgr.loadStoreByIdRequests.toList should be(Nil)
+      host.loadStoreByIdRequests.toList should be(Nil)
 
       // And the directory goes too, or the next restart's scan loads exactly what this refused.
       Files.exists(arrived) should be(false)
 
-      // This runs on the destination host, so the source is a different StoreManager and reads
+      // This runs on the destination host, so the source is a different Host and reads
       // nothing of the restore above. Its copy stays offline behind the transfer-out marker
       // while the pool names it, so without the nudge the slice answers nothing until that
       // host's next poll -- up to Main.CheckStorageDevicesPeriod later.
@@ -830,7 +830,7 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
     val transfers = new StagedTransferFactory
-    val mgr = newManager(hostRoot, transferFactory = transfers)
+    val host = newHost(hostRoot, transferFactory = transfers)
 
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
     val arrived = deviceDir.resolve(movingStore.directoryName)
@@ -841,19 +841,19 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
       _ <- client.transferStore(movingStore, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ = mgr.testingOnlyCheckAllDevices()
+      _ = host.testingOnlyCheckAllDevices()
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       _ = transfers.startedTransfersIn should contain(movingStore)
 
       _ = Files.createDirectories(arrived)
       _ = transfers.finishTransferIn(movingStore)
-      _ <- pumpUntil(mgr.transferOutcomes.contains(movingStore))
+      _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
 
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
-      mgr.transferOutcomes.get(movingStore) should be(
-        Some(StoreManager.TransferOutcome.PoolRepointed))
+      host.transferOutcomes.get(movingStore) should be(
+        Some(Host.TransferOutcome.PoolRepointed))
 
       poolState.stores(movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
-      mgr.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
+      host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
       Files.exists(arrived) should be(true)

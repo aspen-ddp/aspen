@@ -17,7 +17,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.control.NonFatal
 
 object RebuildingStore:
-  /** Staging directory under the device root. Invisible to StoreManager.tryLoadStore for the
+  /** Staging directory under the device root. Invisible to Host.tryLoadStore for the
    *  same reason transferring-in/ is: there is no StoreConfig at this level, only one level
    *  down. That is what keeps a half-rebuilt store from being loaded and answering reads. */
   val RebuildDirectory = "rebuilding"
@@ -91,7 +91,7 @@ class RebuildingStore(client: AspenClient,
   private val failBytes: Set[List[Byte]] = testingOnlyFailKeys.map(_.bytes.toList)
   private val outOfSpaceBytes: Set[List[Byte]] = testingOnlyOutOfSpaceKeys.map(_.bytes.toList)
 
-  // Started from the constructor, mirroring TransferringIn. StoreManager holds its instance
+  // Started from the constructor, mirroring TransferringIn. Host holds its instance
   // lock across the call, so everything expensive is inside the future.
   start()
 
@@ -100,7 +100,7 @@ class RebuildingStore(client: AspenClient,
       try
         if os.exists(finalPath) then
           // A crash between the move and the flip. The store is already whole; there is nothing to
-          // rebuild, only the flip left, and that is StoreManager's job on completion.
+          // rebuild, only the flip left, and that is Host's job on completion.
           logger.info(s"Rebuild of $storeId: store already in place at $finalPath")
           cleanupStaging()
           Future.unit
@@ -178,7 +178,7 @@ class RebuildingStore(client: AspenClient,
    *  foreach swallows a failing fn -- it logs and continues -- so read failures are recorded
    *  here instead. The checkpoint advances past them, so a read failure cannot wedge the walk
    *  forever, and they are retried at the end of the pass. (A read that never returns can still
-   *  stall the walk and hold its StoreManager rebuild slot; that is a known gap.)
+   *  stall the walk and hold its Host rebuild slot; that is a known gap.)
    */
   private def restoreObject(node: KeyValueListNode,
                             key: Key,

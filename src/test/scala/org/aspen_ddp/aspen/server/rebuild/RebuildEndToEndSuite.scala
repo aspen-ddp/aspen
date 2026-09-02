@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.metadata.management.FailedStorageDeviceTestHarness
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.{StoreConfig, StoreManagerTestHarness}
+import org.aspen_ddp.aspen.server.{StoreConfig, HostTestHarness}
 
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
@@ -14,7 +14,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
 /** Both halves against each other: an operator fails a device, the producer moves its stores
  *  onto a live one marked Rebuilding, and the consumer reconstructs them. */
 class RebuildEndToEndSuite extends IntegrationTestSuite
-                              with StoreManagerTestHarness
+                              with HostTestHarness
                               with FailedStorageDeviceTestHarness:
 
   atest("a failed device's stores are reconstructed on a live device"):
@@ -43,13 +43,13 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       staged <- client.getStorageDeviceState(net.secondDeviceId)
       _ = staged.stores.size should be(3)
 
-      // Consumer: create a manager after the producer finishes, so its constructor-time
+      // Consumer: create a host after the producer finishes, so its constructor-time
       // device scan and the drain do not race.
       hostRoot = newHostDir()
       deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
-      mgr = newManager(hostRoot, maxConcurrentRebuilds = 3)
+      host = newHost(hostRoot, maxConcurrentRebuilds = 3)
 
-      _ <- completeRebuilds(mgr, net.secondDeviceId)
+      _ <- completeRebuilds(host, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
       rebuilt <- client.getStorageDeviceState(net.secondDeviceId)
@@ -64,18 +64,18 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       rebuilt.stores.values.foreach: entry =>
         entry.status should be(StorageDeviceState.StoreStatus.Active)
 
-      // The manager decided to adopt all three stores, and the adoption happened after the
+      // The host decided to adopt all three stores, and the adoption happened after the
       // metadata flip to Active (loading is downstream of the metadata decision).
       val expectedLoadRequests = expectedStores.map(s => (net.secondDeviceId, s))
-      mgr.loadStoreByIdRequests.toSet should be(expectedLoadRequests.toSet)
+      host.loadStoreByIdRequests.toSet should be(expectedLoadRequests.toSet)
       // Three stores means exactly three load calls, not six (an unconditional load plus the
       // legitimate one would be hidden by .toSet).
-      mgr.loadStoreByIdRequests.size should be(3)
+      host.loadStoreByIdRequests.size should be(3)
 
       expectedStores.foreach: sid =>
         val key = (net.secondDeviceId, sid)
-        val flipSeq = mgr.rebuildFlipSeq.get(key)
-        val loadSeq = mgr.loadStoreByIdSeq.get(key)
+        val flipSeq = host.rebuildFlipSeq.get(key)
+        val loadSeq = host.loadStoreByIdSeq.get(key)
         withClue(s"Store $sid: flip must complete before load (flipSeq=$flipSeq, loadSeq=$loadSeq)"):
           flipSeq should be(defined)
           loadSeq should be(defined)
@@ -95,7 +95,7 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
         val stagingPath = os.Path(deviceDir) / RebuildingStore.RebuildDirectory / sid.directoryName
         os.exists(stagingPath) should be(false)
 
-      // A read-back assertion against the pool is not valid in this harness: RecordingStoreManager
+      // A read-back assertion against the pool is not valid in this harness: RecordingHost
       // overrides tryLoadStore to record instead of opening a RocksDB backend, so the rebuilt stores
       // do not actually come online. Reads are served by net.smgr's in-memory MapBackends throughout,
       // and a read-back would therefore pass whether the rebuild ran or not -- a vacuous assertion.

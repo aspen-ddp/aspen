@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.compute.ServiceEntry
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
-class StoreManagerSystemTaskSuite extends IntegrationTestSuite:
+class HostSystemTaskSuite extends IntegrationTestSuite:
 
   override def userTypeFactories: List[RegisteredTypeFactory] = List(CountingSystemTask)
 
@@ -28,14 +28,14 @@ class StoreManagerSystemTaskSuite extends IntegrationTestSuite:
     client.backgroundTaskManager.schedule(d)(p.success(()))
     p.future
 
-  atest("StoreManager runs a task delivered via ExecuteSystemTask"):
+  atest("Host runs a task delivered via ExecuteSystemTask"):
     given ExecutionContext = executionContext
     for
       statePtr <- serviceStatePtr()
       _ <- client.createSystemDurableTask(CountingSystemTask.typeUUID, CountingSystemTask.initialState(1))
       enrolled <- SystemTaskServiceState.scan(client, statePtr)
       (taskId, taskStatePtr) = enrolled.head
-      // Deliver the execute message straight to the StoreManager, as the network would.
+      // Deliver the execute message straight to the Host, as the network would.
       _ = net.smgr.receiveHostMessage(
             ExecuteSystemTask(HostId.BootstrapHostId, client.clientId, taskId, taskStatePtr))
       _ = net.handleEvents()

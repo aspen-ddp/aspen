@@ -87,7 +87,7 @@ class HostManagerSuite extends IntegrationTestSuite:
       _      <- waitForTransactionsToComplete()
       hs     <- client.getHostState(hostId)
     yield
-      // StoreManager scans this directory at startup, so an empty one is still required.
+      // Host scans this directory at startup, so an empty one is still required.
       Files.isDirectory(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName)) should be(true)
 
       val copied = hostDir.resolve(BootstrapConfig.configFilename)

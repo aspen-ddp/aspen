@@ -137,7 +137,7 @@ object State:
    *  touches set membership, so this works for a target set at any level.
    *
    *  No `TransferringIn` filter is needed here. Each store's device of record comes from
-   *  `poolState.stores`, which StoreManager rewrites atomically at transfer completion, so
+   *  `poolState.stores`, which Host rewrites atomically at transfer completion, so
    *  every store maps to exactly one device by construction.
    */
   def getStateForPoolMigration(client: AspenClient,

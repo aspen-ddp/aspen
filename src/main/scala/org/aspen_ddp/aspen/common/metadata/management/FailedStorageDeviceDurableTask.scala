@@ -63,9 +63,9 @@ object FailedStorageDeviceDurableTask extends DurableTaskFactory:
  *  transaction that moves a store also removes it from that map. Crash recovery is therefore
  *  free.
  *
- *  Nothing here reconstructs data. A Rebuilding entry is a message to the StoreManager on the
- *  destination host, which does the actual walk. The two halves never talk and either may crash
- *  and restart independently.
+ *  Nothing here reconstructs data. A Rebuilding entry is a message to the destination Host,
+ *  which does the actual walk. The two halves never talk and either may crash and restart
+ *  independently.
  */
 class FailedStorageDeviceDurableTask(
     val taskPointer: DurableTaskPointer,
@@ -323,7 +323,7 @@ class FailedStorageDeviceDurableTask(
         // cannot happen -- but only because every path that could place one refuses:
         // StorageDeviceSetState.moveDevice, AspenClient.createNewStoragePool,
         // AspenClient.transferStore and BaseAspenClient.createStoragePool's stageDeviceUpdate all
-        // throw DeviceFailed, and StoreManager.updateStateForTransferredStore -- a transfer whose
+        // throw DeviceFailed, and Host.updateStateForTransferredStore -- a transfer whose
         // destination was tombstoned mid-flight, the one path that reaches this state without any
         // operator asking for it -- restores the source instead of repointing the pool. That last
         // one was missing until the round-3 fix, and while it was missing this paragraph was
@@ -499,7 +499,7 @@ class FailedStorageDeviceDurableTask(
             // tombstoneState.storageDeviceId, which step 1 has zeroed.
             //
             // None when the source's own entry no longer names this device -- the transfer
-            // completed and StoreManager.updateStateForTransferredStore restored it first, or a
+            // completed and Host.updateStateForTransferredStore restored it first, or a
             // concurrent pass did. Both writes carry a KeyRevision on the source's StateKey, so
             // the loser re-reads and this guard turns the re-read into a no-op.
             osrc.flatMap: src =>

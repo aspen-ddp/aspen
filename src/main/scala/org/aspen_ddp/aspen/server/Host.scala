@@ -39,7 +39,7 @@ import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
-object StoreManager:
+object Host:
   private sealed abstract class Event
 
   private case class IOCompletion(op: Completion) extends Event
@@ -90,9 +90,9 @@ object StoreManager:
     case Discard
 
 
-  class IOHandler(mgr: StoreManager) extends CompletionHandler:
+  class IOHandler(host: Host) extends CompletionHandler:
     override def complete(op: Completion): Unit =
-      mgr.events.add(IOCompletion(op))
+      host.events.add(IOCompletion(op))
 
   class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
                                 val devicePath: Path,
@@ -106,7 +106,7 @@ object StoreManager:
   class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
 
 
-class StoreManager(val client: AspenClient,
+class Host(val client: AspenClient,
                    val hostId: HostId,
                    val aspenSystemId: UUID,
                    val rootDir: Path,
@@ -126,7 +126,7 @@ class StoreManager(val client: AspenClient,
                     *  wait; every completion re-checks all loaded devices and starts whatever is
                     *  queued. */
                    val maxConcurrentRebuilds: Int = 2) extends Logging {
-  import StoreManager._
+  import Host._
   
   given ExecutionContext = ec
 
@@ -148,7 +148,7 @@ class StoreManager(val client: AspenClient,
   // Append-only for the life of the process: tryLoadDevice is the only writer in production and
   // nothing anywhere removes an entry. So a device present here stays present, and a lookup miss
   // means a device this process has never loaded rather than one that has gone away. Tests inject
-  // entries directly via RecordingStoreManager.injectLoadedDevice.
+  // entries directly via RecordingHost.injectLoadedDevice.
   protected var storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
   protected var stores: Map[StoreId, Store] = Map()
 
@@ -294,7 +294,7 @@ class StoreManager(val client: AspenClient,
     else
       // listFiles returns null on an IO error even when isDirectory just succeeded. Unguarded
       // that is an NPE, and the constructor and the event loop fare differently: from the
-      // constructor it would abort StoreManager construction outright, while from the event loop
+      // constructor it would abort Host construction outright, while from the event loop
       // start()'s catch-all would keep the loop running but report only the event class and the
       // NPE. Warn here so both name the directory that could not be listed.
       storageDevicesDir.toFile.listFiles() match
@@ -488,7 +488,7 @@ class StoreManager(val client: AspenClient,
               List(Insert(StorageDeviceState.StateKey, restored.encode())))
 
             // This method runs on the destination host, so the source is a different
-            // StoreManager and learns nothing from the write above. Its copy is still offline
+            // host and learns nothing from the write above. Its copy is still offline
             // behind the transfer-out marker while the pool goes on naming it, which means the
             // slice answers nothing until that host's own poll reinstates it -- up to
             // Main.CheckStorageDevicesPeriod away. Best-effort, because that poll is the
@@ -739,7 +739,7 @@ class StoreManager(val client: AspenClient,
   }
 
   // protected so a test subclass can record the claim instead of transacting against a host
-  // object. Nothing outside StoreManager calls it.
+  // object. Nothing outside Host calls it.
   protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
     client.transactUntilSuccessful: tx =>
       given Transaction = tx
@@ -1179,7 +1179,7 @@ class StoreManager(val client: AspenClient,
    *
    *  Loading goes through tryLoadStore rather than opening a backend here, because that method
    *  owns the rest of the bookkeeping -- reading the store config, and clearing the store from
-   *  both this device's offlineStores and the manager's. Those two sets and the marker file are
+   *  both this device's offlineStores and the host.s. Those two sets and the marker file are
    *  three representations of one fact and must not be allowed to disagree.
    *
    *  If the load fails after the marker is gone, tryLoadStore's own catch logs it and the store
@@ -1338,7 +1338,7 @@ class StoreManager(val client: AspenClient,
    *
    *  The callback-body path is not hypothetical: the reconcile touches the filesystem and
    *  issues transactions, so it can throw. It and the synchronous throw are both covered by
-   *  StoreManagerDeviceDiscoverySuite.
+   *  HostDeviceDiscoverySuite.
    *
    *  Treating a synchronous throw as a failed lookup rather than letting it propagate leaves
    *  this method with no non-fatal synchronous throw path, and that is what makes
@@ -1370,7 +1370,7 @@ class StoreManager(val client: AspenClient,
     // which device they are releasing.
     //
     // The deferral flag is cleared before the re-dispatch, not after, and the order is enforced
-    // by StoreManagerDeviceDiscoverySuite rather than argued. Clearing after recurses an extra
+    // by HostDeviceDiscoverySuite rather than argued. Clearing after recurses an extra
     // frame whenever the re-dispatched lookup throws synchronously -- the nested call absorbs
     // its own throw and re-enters here with the flag still set -- which needs no inline or
     // parasitic ExecutionContext to reach. The callback-body test catches it as a third lookup

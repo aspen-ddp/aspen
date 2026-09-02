@@ -53,7 +53,7 @@ object MigratePoolToSetDurableTask extends DurableTaskFactory:
 /** Drives one pool's migration onto its target StorageDeviceSet, serially: one store transfer
  *  in flight at a time.
  *
- *  Progress needs no record of its own. StoreManager rewrites `poolState.stores(poolIndex)` to
+ *  Progress needs no record of its own. Host rewrites `poolState.stores(poolIndex)` to
  *  the new (host, device) in the same transaction that completes a transfer, so a store is
  *  migrated iff its device is a member of the target set. Crash recovery is therefore free: a
  *  fresh instance re-reads the pool and picks up exactly where the last one left off.

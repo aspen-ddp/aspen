@@ -10,13 +10,13 @@ import scala.concurrent.{ExecutionContext, Future}
 
 /** Creation and on-disk setup of storage devices.
  *
- *  Stateless by design: StoreManager will call the same functions when device creation is
+ *  Stateless by design: Host will call the same functions when device creation is
  *  automated, so nothing here may depend on running inside the CLI.
  */
 object StorageDeviceManager:
 
   /** Name of the directory under a host's root directory that holds its storage devices.
-   *  StoreManager scans the direct children of this directory at startup. */
+   *  Host scans the direct children of this directory at startup. */
   val StorageDevicesDirName = "storage-devices"
 
   class WrongAspenSystem(val expected: UUID, val found: UUID)
@@ -52,7 +52,7 @@ object StorageDeviceManager:
 
   /** Register `deviceDirectory` as a new storage device on `hostConfig`'s host and place it
    *  in the level-0 set `deviceSetId`, then write the device's config file into the
-   *  directory so the host's StoreManager will discover it.
+   *  directory so the host will discover it.
    *
    *  The directory must already exist. In production it is a mount point, or a symlink
    *  under `<host-directory>/storage-devices/` pointing at one; the config file has to land
@@ -61,7 +61,7 @@ object StorageDeviceManager:
    *  Precondition: `hostConfig` must be the config loaded from `hostDirectory`. This is not
    *  checked. Passing a mismatched pair registers the device to `hostConfig.hostId` while
    *  the config file lands under a different host's `storage-devices/`, and that host will
-   *  load it -- StoreManager validates only `aspenSystemId`, never `hostId`.
+   *  load it -- Host validates only `aspenSystemId`, never `hostId`.
    *
    *  Ordering: the transaction commits before the file is written, and the two cannot be
    *  made atomic. A crash in between leaves registered metadata with no on-disk device --
@@ -78,7 +78,7 @@ object StorageDeviceManager:
 
     // Deliberately lexical: normalize but do not call toRealPath, so a symlink at
     // storage-devices/<name> pointing at a mount elsewhere still counts as contained.
-    // Only direct children are accepted, because StoreManager scans only direct children.
+    // Only direct children are accepted, because Host scans only direct children.
     val expectedParent = hostDirectory.resolve(StorageDevicesDirName).toAbsolutePath.normalize
     val devDir = deviceDirectory.toAbsolutePath.normalize
     val configFile = devDir.resolve(StorageDeviceConfig.configFilename)

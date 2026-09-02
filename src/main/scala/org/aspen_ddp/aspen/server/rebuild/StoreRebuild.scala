@@ -11,7 +11,7 @@ import scala.concurrent.Future
  *
  *  `complete` resolves once the rebuilt store is in place at
  *  `<device>/<storeId.directoryName>`. Flipping the device entry from Rebuilding to Active and
- *  loading the store are StoreManager's job, exactly as they are for a transfer in.
+ *  loading the store are Host's job, exactly as they are for a transfer in.
  */
 trait StoreRebuild:
   val storeId: StoreId

@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferFactory
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
-import org.aspen_ddp.aspen.server.StoreManager.RebuildOutcome
+import org.aspen_ddp.aspen.server.Host.RebuildOutcome
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -22,16 +22,16 @@ import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
 
-/** Shared test harness for StoreManager device discovery and rebuild tests.
+/** Shared test harness for Host device discovery and rebuild tests.
  *
- *  Provides a RecordingStoreManager that logs tryLoadStore calls instead of opening RocksDB
+ *  Provides a RecordingHost that logs tryLoadStore calls instead of opening RocksDB
  *  backends, plus helpers for writing device configs, arming lookups, and waiting for async
  *  conditions to hold. Temp directory cleanup is automatic via subFixtureTeardown.
  */
-trait StoreManagerTestHarness:
+trait HostTestHarness:
   this: IntegrationTestSuite =>
 
-  /** The Aspen system that the manager under test and the device configs written to disk both
+  /** The Aspen system that the host under test and the device configs written to disk both
    *  belong to, so those devices are accepted. */
   protected val systemId = UUID.fromString("33333333-3333-3333-3333-333333333333")
 
@@ -65,7 +65,7 @@ trait StoreManagerTestHarness:
     else
       Future(()).flatMap(_ => yieldUntil(condition, maxYields - 1))
 
-  /** Drives `mgr`'s device check until no store on `deviceId` is Rebuilding.
+  /** Drives `host`'s device check until no store on `deviceId` is Rebuilding.
    *
    *  Rebuilds are started by the device-check machinery, which in production runs on an hourly
    *  timer. Tests do not wait an hour: this drives checks, yields to let the async rebuilds and
@@ -77,7 +77,7 @@ trait StoreManagerTestHarness:
    *
    *  Silent on exhaustion, like `yieldUntil`: the caller asserts the end state.
    */
-  protected def completeRebuilds(mgr: StoreManager,
+  protected def completeRebuilds(host: Host,
                                  deviceId: StorageDeviceId,
                                  maxRounds: Int = 500): Future[Unit] =
     given ExecutionContext = executionContext
@@ -92,7 +92,7 @@ trait StoreManagerTestHarness:
         anyRebuilding().flatMap:
           case false => Future.unit
           case true =>
-            mgr.testingOnlyCheckAllDevices()
+            host.testingOnlyCheckAllDevices()
             for
               // Yield so queued work -- the rebuild's own Future and its callbacks -- gets to run.
               _ <- Future(())
@@ -132,14 +132,14 @@ trait StoreManagerTestHarness:
       deviceDir.resolve(StorageDeviceConfig.configFilename),
       StorageDeviceConfig(deviceId, sysId).yamlConfig.getBytes(StandardCharsets.UTF_8))
 
-  protected def newManager(hostRoot: Path,
+  protected def newHost(hostRoot: Path,
                            failFirstStoreLoad: Boolean = false,
                            ec: ExecutionContext = executionContext,
                            transferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem,
                            storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                            maxConcurrentRebuilds: Int = 2
-                          ): RecordingStoreManager =
-    new RecordingStoreManager(client, systemId, hostRoot, ec,
+                          ): RecordingHost =
+    new RecordingHost(client, systemId, hostRoot, ec,
                               net.objectCacheFactory, net, net.FinalizerFactory,
                               failFirstStoreLoad, transferFactory, storeRebuildFactory,
                               maxConcurrentRebuilds)
@@ -153,33 +153,33 @@ trait StoreManagerTestHarness:
 
   protected val deviceSetId = StorageDeviceSetId(UUID.fromString("55555555-5555-5555-5555-555555555555"))
 
-  /** A StorageDeviceState for `deviceId` owned by this manager's host, carrying `stores`.
+  /** A StorageDeviceState for `deviceId` owned by this host, carrying `stores`.
    *
-   *  BootstrapHostId matches the manager's own hostId, which keeps reconcileDeviceState off
+   *  BootstrapHostId matches the host.s own hostId, which keeps reconcileDeviceState off
    *  its host-migration branch. The sizes are arbitrary; nothing under test reads them.
    */
   protected def deviceState(deviceId: StorageDeviceId,
                             stores: Map[StoreId, StorageDeviceState.StoreEntry] = Map()): StorageDeviceState =
     StorageDeviceState(deviceId, HostId.BootstrapHostId, 0L, 1024L, stores, deviceSetId)
 
-/** A StoreManager that records tryLoadStore calls instead of opening RocksDB backends, and
+/** A Host that records tryLoadStore calls instead of opening RocksDB backends, and
  *  exposes the protected device map to assertions.
  *
  *  The override records and, when `failFirstStoreLoad` is set, throws once before recording
  *  anything. It does nothing else. In particular it does not replicate the real
  *  tryLoadStore's bookkeeping: it never filters on `StoreConfig.configFilename`, never
  *  honours a TransferringOut marker, and never updates `sds.loadedStores`, `sds.offlineStores`
- *  or the manager's `offlineStores`. A test asserting that this override put something in them
+ *  or the host.s `offlineStores`. A test asserting that this override put something in them
  *  would therefore pass vacuously — assert on `storeLoadAttempts` instead. Assertions about
  *  what the *device check* writes to `offlineStores` are a different matter and are not
  *  vacuous: that write comes from startDeviceCheck's callback, which this override does not
  *  touch.
  *
- *  Constructor parameters are deliberately named differently from StoreManager's own members
+ *  Constructor parameters are deliberately named differently from Host's own members
  *  (`client`, `ec`, `net`, `rootDir`, ...) so the superclass constructor call cannot
  *  accidentally resolve to an inherited, not-yet-initialized member.
  */
-private class RecordingStoreManager(mgrClient: AspenClient,
+private class RecordingHost(mgrClient: AspenClient,
                             systemId: UUID,
                             hostRootDir: Path,
                             execCtx: ExecutionContext,
@@ -190,7 +190,7 @@ private class RecordingStoreManager(mgrClient: AspenClient,
                             transferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem,
                             rebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                             maxRebuilds: Int = 2)
-  extends StoreManager(
+  extends Host(
     mgrClient,
     HostId.BootstrapHostId,
     systemId,
@@ -214,7 +214,7 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    *  device directory, so a successfully loaded device always contributes at least one
    *  non-store entry: its own `aspen-storage-device-config.yaml`.
    *
-   *  Lazy because StoreManager's constructor scans storage-devices/ and can therefore call
+   *  Lazy because Host's constructor scans storage-devices/ and can therefore call
    *  the override below before this subclass's fields would otherwise be initialized. A
    *  plain val would still be null at that point, and tryLoadDevice's catch-all would
    *  silently swallow the resulting NPE.
@@ -227,14 +227,14 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    *  its stores (a yanked hot-plug disk, an IO error).
    *
    *  Boxed and lazy for the same initialization-order reason as storeLoadAttempts. A plain
-   *  `var` in this body would still hold `false` during StoreManager's constructor scan and
+   *  `var` in this body would still hold `false` during Host's constructor scan and
    *  would then be assigned after it, arming the failure for the first rescan instead. The
    *  constructor parameter it reads is safe: parameters are assigned before the superclass
    *  constructor runs.
    */
   private lazy val storeLoadFailureOwed = new AtomicBoolean(failFirstStoreLoad)
 
-  override protected def tryLoadStore(sds: StoreManager.LocalStorageDeviceState,
+  override protected def tryLoadStore(sds: Host.LocalStorageDeviceState,
                                       potentialStoreFile: File): Unit =
     synchronized:
       if storeLoadFailureOwed.getAndSet(false) then
@@ -257,7 +257,7 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    *  One queue per device rather than a queue of promises plus a separate set of throws, so the
    *  order in which a test arms a success and a throw is the order the device check sees them.
    *
-   *  Lazy to match storeLoadAttempts. Unlike that field, nothing in StoreManager's constructor
+   *  Lazy to match storeLoadAttempts. Unlike that field, nothing in Host's constructor
    *  reaches this override today: the constructor's device scan calls tryLoadStore, but a
    *  device check only ever runs from handleEvent. The uniformity is deliberate insurance
    *  against that changing.
@@ -292,7 +292,7 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   def armLookupThrow(deviceId: StorageDeviceId, error: Throwable): Unit = synchronized:
     enqueueArmed(deviceId, Left(error))
 
-  def loadedDevices: Map[StorageDeviceId, StoreManager.LocalStorageDeviceState] =
+  def loadedDevices: Map[StorageDeviceId, Host.LocalStorageDeviceState] =
     synchronized { storageDevices }
 
   /** Storage device ids passed to updateHostId, in call order.
@@ -330,7 +330,7 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   /** (deviceId, storeId) for every loadStoreById call, in call order.
    *
    *  Recorded here rather than through storeLoadAttempts because loadStoreById only enqueues an
-   *  event, and this suite never runs the manager's event loop -- so an assertion on
+   *  event, and this suite never runs the host.s event loop -- so an assertion on
    *  storeLoadAttempts would pass vacuously whether the call was made or not. This records the
    *  decision itself. Lazy for the same initialization-order reason as storeLoadAttempts.
    */
@@ -359,13 +359,13 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    *  Future that never completes, and a test that awaited one would hang the suite instead of
    *  failing it. Lazy for the same initialization-order reason as storeLoadAttempts.
    */
-  lazy val transferOutcomes: mutable.Map[StoreId, StoreManager.TransferOutcome] =
-    mutable.Map[StoreId, StoreManager.TransferOutcome]()
+  lazy val transferOutcomes: mutable.Map[StoreId, Host.TransferOutcome] =
+    mutable.Map[StoreId, Host.TransferOutcome]()
 
   override protected def updateStateForTransferredStore(
       storeId: StoreId,
       fromDeviceId: StorageDeviceId,
-      toDeviceId: StorageDeviceId): Future[StoreManager.TransferOutcome] =
+      toDeviceId: StorageDeviceId): Future[Host.TransferOutcome] =
     val f = super.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
     f.foreach: outcome =>
       synchronized:
@@ -399,7 +399,7 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    *  it. Refuses to replace an existing entry, so a test that both writes a device to disk and
    *  injects one for the same id fails here rather than in a confusing assertion later.
    */
-  def injectLoadedDevice(sds: StoreManager.LocalStorageDeviceState): Unit = synchronized:
+  def injectLoadedDevice(sds: Host.LocalStorageDeviceState): Unit = synchronized:
     require(!storageDevices.contains(sds.storageDeviceId),
             s"${sds.storageDeviceId} is already loaded; injectLoadedDevice does not replace")
     storageDevices += (sds.storageDeviceId -> sds)

@@ -19,7 +19,7 @@ import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, Transacti
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, StoreManager, transaction}
+import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, transaction}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.Bootstrap
@@ -168,7 +168,7 @@ class TestNetwork(executionContext: ExecutionContext,
   val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories)
   FinalizerFactory.client = client
 
-  val smgr = new StoreManager(
+  val smgr = new Host(
     client,
     HostId.BootstrapHostId,
     new UUID(0, 0),
@@ -228,7 +228,7 @@ class TestNetwork(executionContext: ExecutionContext,
         tx.overwrite(setPtr, setDos.revision, DataBuffer(updated.toBytes))
 
   /** Simulate completion of a single store transfer by performing the same metadata flip
-   *  StoreManager.updateStateForTransferredStore performs: pool StoreEntry -> (destHost, toDevice),
+   *  Host.updateStateForTransferredStore performs: pool StoreEntry -> (destHost, toDevice),
    *  remove store from source device, set store Active on destination device. In-memory KV only. */
   def simulateTransferComplete(storeId: StoreId,
                                fromDeviceId: StorageDeviceId,

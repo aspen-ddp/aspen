@@ -211,7 +211,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  first needed -- at the onComplete registration, after the flag is set and outside the
    *  wrapper, which is precisely where a throw strands it. Hence the strict val below, whose
    *  initializer runs before the flag is set, so such a throw propagates with nothing acquired.
-   *  Unlike StoreManager.startDeviceCheck this method has no caller in a finally, so a
+   *  Unlike Host.startDeviceCheck this method has no caller in a finally, so a
    *  propagating throw masks nothing.
    *
    *  Caller must hold this object's monitor. */

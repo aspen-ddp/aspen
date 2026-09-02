@@ -40,7 +40,7 @@ class BootstrapConfigRadicleUpdateSuite extends IntegrationTestSuite:
       // Store 0 is the only bootstrap store on the other host, and it is the store being moved
       // back to the bootstrap host. That is the shape a caller produces by mutating
       // poolCfg.stores *after* calling prepRadicleUpdate rather than before -- the order
-      // StoreManager.updateStateForTransferredStore uses. The other host then reaches
+      // Host.updateStateForTransferredStore uses. The other host then reaches
       // generateBootstrapConfig owning nothing and trips its require(storesOnHost.nonEmpty).
       _ = poolCfg.stores(0) = StoragePoolState.StoreEntry(
             otherHostId, StorageDeviceId(UUID.randomUUID()))

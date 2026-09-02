@@ -282,7 +282,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The decode runs in restoreObject's plain body, outside any Future combinator. Before it
       // was made total, the throw was absorbed by ExecutionContext.reportFailure from inside
       // walkFrom's own onComplete recursion: the recursion stopped, walkFrom's promise was never
-      // completed, runPass never completed, and the StoreManager rebuild slot was never
+      // completed, runPass never completed, and the Host rebuild slot was never
       // released. Two of those deadlock a host at the default maxConcurrentRebuilds of 2. So the
       // assertion that matters is that the future completed at all.
       settled.isDefined should be(true)

@@ -1,0 +1,35 @@
+Switch AmoebaFS to use a registered object to store the root filesystem object
+rather than embedding it within the radicle object.
+
+StoragePool errorTree has a problem
+  - Missed deletes have a problem for ObjectPointers that use storePointer
+  - Because the ObjectPointer in the allocationTree is deleted, there's no way
+    to obtain the storePointer. This means the stores relying on this will not
+    be able to delete the object state
+  - Fix is probably simple: If the storePointer content is non-empty, store this
+    in the value associated with the errorTree key.
+  - Update MissedUpdateFinalizationAction to store non-empty storePointer content
+    in the value of the kv pair.
+
+Host and Store support repairing an object by passing in its current state however we
+also need to support repair "deletion" operations where there is no state to pass in
+because the object has been deleted. The only information available for this operation
+is the ObjectId and storePointer array extracted from the ObjectPointer.
+
+Failures to allocate, update, and delete objects on stores that are offline log these
+failures in the pool's errorTree. There is currently a CLI command that can run the
+repair operation on an entire pool. We need to create a continual repair operation
+that periodically walks the error tree for each store, repairs out-of-date objects,
+and removes the associated entries from the errorTree. NOTE: the transaction removing
+the entry from the error tree must call disableMissedUpdateTracking() on the transaction
+object to prevent infinite recursion (similar to how MissedUpdateFinalizationAction does).
+The repair code should be placed in the aspen.server.repair package. The Host instance is
+responsible for driving the repair operation for all of the stores that it owns. The
+implementation must take into account that the Host will likely hold hundreds or even
+thousands of stores and the repair process, even when there are no errors to correct, still
+issues many reads and places a load on the system. Some strategy is needed to balance the
+repair load and overhead against the reliability problems associated with out-of-date
+objects. The system is designed to tolerate transient failures well so repairs do not need
+to happen as fast as possible but longer delays increase the liklihood of data loss so we
+need to balance this effectively. Bounded parallelization of repairs on different stores
+is acceptable.

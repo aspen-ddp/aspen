@@ -254,7 +254,7 @@ abstract class BaseAspenClient(
       case e: KeyAlreadyExists => throw StopRetrying(e)
       case _ => Future.unit
 
-    // No TaskExecutorRootKey is written. StoreManager inserts it on first start under a
+    // No TaskExecutorRootKey is written. Host inserts it on first start under a
     // DoesNotExist requirement, so seeding it here would only duplicate that.
     runCreate(onFail): tx =>
       given Transaction = tx

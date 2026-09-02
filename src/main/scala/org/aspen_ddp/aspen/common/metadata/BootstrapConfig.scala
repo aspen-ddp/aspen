@@ -178,7 +178,7 @@ object BootstrapConfig:
    *  without it leaves every host in the system pointing at where the store used to be.
    *
    *  `aspenSystemId` comes from the radicle's own SystemIdKey rather than from a parameter, so
-   *  this needs nothing but an AspenClient. StoreManager has the value in a constructor
+   *  this needs nothing but an AspenClient. Host has the value in a constructor
    *  parameter; the client-side callers do not.
    */
   def prepRadicleUpdate(client: AspenClient,

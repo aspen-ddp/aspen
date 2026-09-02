@@ -32,7 +32,7 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
       created += r
     r
 
-class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTestHarness:
+class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness:
 
   private def rebuilding(storeId: StoreId): (StoreId, StorageDeviceState.StoreEntry) =
     storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None)
@@ -44,10 +44,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory)
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
 
-    val armed = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val armed = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
     armed.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     yieldUntil(factory.created.nonEmpty).map: _ =>
@@ -58,19 +58,19 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory)
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
 
-    val first = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val first = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
       _ <- yieldUntil(factory.created.size == 1)
       // A second check of the same device sees the same Rebuilding entry.
-      second = mgr.armLookup(deviceA)
-      _ = mgr.testingOnlyCheckAllDevices()
+      second = host.armLookup(deviceA)
+      _ = host.testingOnlyCheckAllDevices()
       _ = second.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
-      _ <- yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceA))
+      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA))
     yield
       factory.created.size should be(1)
 
@@ -78,16 +78,16 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 2)
 
-    val armed = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val armed = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
     armed.success(deviceState(deviceA,
       Map(rebuilding(storeN(0)), rebuilding(storeN(1)), rebuilding(storeN(2)))))
 
     for
       _ <- yieldUntil(factory.created.size == 2)
-      _ <- yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceA))
+      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA))
     yield
       // Three entries, a bound of two: the third waits. A rebuild reads a whole store's worth
       // of data through the client, so an eight-store device must not start eight at once.
@@ -97,19 +97,19 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
-    val first = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val first = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
     val twoRebuilding = deviceState(deviceA, Map(rebuilding(storeN(0)), rebuilding(storeN(1))))
     first.success(twoRebuilding)
 
     for
       _ <- yieldUntil(factory.created.size == 1)
-      _ <- yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceA))
+      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA))
       // The first rebuild will complete and trigger a device check. Arm a second lookup
       // that returns a state where store 0 is now Active and store 1 is still Rebuilding.
-      second = mgr.armLookup(deviceA)
+      second = host.armLookup(deviceA)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
       active = (storeN(0), StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
@@ -123,10 +123,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
-    val first = mgr.armLookup(deviceA)
-    mgr.testingOnlyCheckAllDevices()
+    val first = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
     first.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
 
     for
@@ -135,14 +135,14 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
       // the slot has just been freed, so a re-check of this device here would start the same
       // rebuild again -- and a rebuild that fails in under a millisecond would then spin forever
       // with no backoff and no give-up.
-      second = mgr.armLookup(deviceA)
+      second = host.armLookup(deviceA)
       _ = second.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
       _ = factory.created.head.promise.failure(new Exception("disk on fire"))
       _ <- yieldUntil(factory.created.size == 2, 20)
       restartedImmediately = factory.created.size
       // The ordinary periodic check is what resumes it. The staging checkpoint survives the
       // failure, so that check resumes rather than restarting from the beginning.
-      _ = mgr.testingOnlyCheckAllDevices()
+      _ = host.testingOnlyCheckAllDevices()
       _ <- yieldUntil(factory.created.size == 2)
     yield
       restartedImmediately should be(1)
@@ -153,21 +153,21 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     writeDevice(hostRoot, "dev0", deviceA)
     writeDevice(hostRoot, "dev1", deviceB)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
     // deviceB's store is queued behind the single slot deviceA's rebuild holds.
-    val firstA = mgr.armLookup(deviceA)
-    val firstB = mgr.armLookup(deviceB)
-    mgr.testingOnlyCheckAllDevices()
+    val firstA = host.armLookup(deviceA)
+    val firstB = host.armLookup(deviceB)
+    host.testingOnlyCheckAllDevices()
     firstA.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
     firstB.success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
 
     for
       _ <- yieldUntil(factory.created.size == 1)
-      _ <- yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceB))
+      _ <- yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceB))
       // Pre-completed: the failure path issues this lookup itself, so there is no moment
       // between the check starting and the test completing it.
-      _ = mgr.armLookup(deviceB).success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
+      _ = host.armLookup(deviceB).success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
       _ = factory.created.head.promise.failure(new Exception("disk on fire"))
       // rebuildingStores is host-wide, so the freed slot is what deviceB was waiting on. Without
       // this re-check it would wait for the hourly sweep with data under-replicated.
@@ -180,7 +180,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory)
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
 
     // Register the device in the tree so the flip transaction can succeed
     for
@@ -200,21 +200,21 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
           tx.update(ptr, None, None, reqs, ops)
       _ <- waitForTransactionsToComplete()
       // Inject the device as loaded and trigger reconciliation
-      _ = mgr.injectLoadedDevice(new StoreManager.LocalStorageDeviceState(
+      _ = host.injectLoadedDevice(new Host.LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir.resolve(StorageDeviceConfig.configFilename).toFile))
-      armed = mgr.armLookup(realDeviceId)
-      _ = mgr.testingOnlyCheckAllDevices()
+      armed = host.armLookup(realDeviceId)
+      _ = host.testingOnlyCheckAllDevices()
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
-      _ <- yieldUntil(mgr.loadStoreByIdRequests.contains((realDeviceId, storeN(0))))
+      _ <- yieldUntil(host.loadStoreByIdRequests.contains((realDeviceId, storeN(0))))
       // Verify the entry was flipped to Active
       finalKvos <- client.read(ptr)
       finalState = StorageDeviceState(finalKvos)
     yield
-      mgr.loadStoreByIdRequests should contain((realDeviceId, storeN(0)))
+      host.loadStoreByIdRequests should contain((realDeviceId, storeN(0)))
       finalState.stores.get(storeN(0)).map(_.status) should be(
         Some(StorageDeviceState.StoreStatus.Active))
 
@@ -222,7 +222,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory)
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
 
     // Create and then tombstone the device
     for
@@ -259,10 +259,10 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
       _ = os.makeDir.all(storePath)
       _ = os.write(storePath / "marker.txt", "rebuilt store")
       // Inject device and trigger rebuild
-      _ = mgr.injectLoadedDevice(new StoreManager.LocalStorageDeviceState(
+      _ = host.injectLoadedDevice(new Host.LocalStorageDeviceState(
         realDeviceId, deviceDir, deviceDir.resolve(StorageDeviceConfig.configFilename).toFile))
-      armed = mgr.armLookup(realDeviceId)
-      _ = mgr.testingOnlyCheckAllDevices()
+      armed = host.armLookup(realDeviceId)
+      _ = host.testingOnlyCheckAllDevices()
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
@@ -271,14 +271,14 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
       _ <- yieldUntil(!os.exists(storePath), 200)
     yield
       // Store should NOT be loaded (no loadStoreById call for the real device)
-      mgr.loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
+      host.loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
       // Store directory should be discarded
       os.exists(storePath) should be(false)
 
   atest("a permanently failed flip is logged and releases its slot"):
     val hostRoot = newHostDir()
     val factory = new RecordingRebuildFactory
-    val mgr = newManager(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+    val host = newHost(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
 
     // Use synthetic IDs not registered in the tree - inject manually to avoid auto-scan
     val syntheticA = StorageDeviceId(UUID.fromString("cccccccc-0000-0000-0000-000000000001"))
@@ -292,19 +292,19 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     // This exercises the Failure(t) branch in markRebuiltStoreActive's onComplete
 
     // Inject both devices manually (no writeDevice, so auto-scan won't find them)
-    mgr.injectLoadedDevice(new StoreManager.LocalStorageDeviceState(
+    host.injectLoadedDevice(new Host.LocalStorageDeviceState(
       syntheticA, deviceDir, deviceDir.resolve("dummy.file").toFile))
-    mgr.injectLoadedDevice(new StoreManager.LocalStorageDeviceState(
+    host.injectLoadedDevice(new Host.LocalStorageDeviceState(
       syntheticB, deviceDir2, deviceDir2.resolve("dummy.file").toFile))
 
-    val first = mgr.armLookup(syntheticA)
-    mgr.testingOnlyCheckAllDevices()
+    val first = host.armLookup(syntheticA)
+    host.testingOnlyCheckAllDevices()
     first.success(deviceState(syntheticA, Map(rebuilding(storeN(0)))))
 
     for
       _ <- yieldUntil(factory.created.size == 1)
       // Arm a second lookup for syntheticB before completing the first rebuild
-      second = mgr.armLookup(syntheticB)
+      second = host.armLookup(syntheticB)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
       // The flip transaction will fail with NoSuchElementException (syntheticA not in tree)
@@ -313,6 +313,6 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
       _ <- yieldUntil(factory.created.size == 2, 200)
     yield
       // Store 0 should NOT be loaded (the flip failed)
-      mgr.loadStoreByIdRequests.exists(_._1 == syntheticA) should be(false)
+      host.loadStoreByIdRequests.exists(_._1 == syntheticA) should be(false)
       // Store 1 should eventually be created (slot was released)
       factory.created.map(_.storeId).toSet should contain(storeN(1))

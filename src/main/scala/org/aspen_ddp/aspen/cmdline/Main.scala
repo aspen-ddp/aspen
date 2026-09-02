@@ -63,9 +63,10 @@ object Main {
   val DefaultCnCPort: Int = 4751
   val DefaultStoreTransferPort: Int = 4752
 
-  // How often a running host rescans for storage devices it has not yet loaded. host() gives
-  // this to its StoreManager, and create-storage-device quotes it when telling the user how
-  // long an un-notified host may take to pick up a new device, so the two cannot drift.
+  // How often a running host rescans for storage devices it has not yet loaded. run_host()
+  // gives this to the Host it creates, and create-storage-device quotes it when telling the
+  // user how long an un-notified host may take to pick up a new device, so the two cannot
+  // drift.
   val CheckStorageDevicesPeriod: Duration = Duration(1, HOURS)
 
   // How long a terminating command waits for outbound messages to leave ZMQNet, and how long
@@ -122,17 +123,17 @@ object Main {
 
   class NetworkBridge extends MessageHandler with Logging {
     var oclient: Option[AspenClient] = None
-    var onode: Option[StoreManager] = None
+    var ohost: Option[Host] = None
 
     def onClientResponseReceived(msg: ClientResponse): Unit =
       //logger.trace(s"**** Recieved ClientResponse: $msg. $oclient")
       oclient.foreach(_.receiveClientResponse(msg))
     def onClientRequestReceived(msg: ClientRequest): Unit =
-      onode.foreach(_.receiveClientRequest(msg))
+      ohost.foreach(_.receiveClientRequest(msg))
     def onTransactionMessageReceived(msg: TxMessage): Unit =
-      onode.foreach(_.receiveTransactionMessage(msg))
+      ohost.foreach(_.receiveTransactionMessage(msg))
     def onHostMessageReceived(msg: HostMessage): Unit =
-      onode.foreach(_.receiveHostMessage(msg))
+      ohost.foreach(_.receiveHostMessage(msg))
   }
 
   def configureLogging(): Unit =
@@ -167,7 +168,7 @@ object Main {
    *  latency report rather than a command failure: the receiving host's periodic check remains
    *  the correctness guarantee.
    *
-   *  host() blocks in joinIoThread and amoeba_server() in Thread.currentThread.join(); neither
+   *  run_host() blocks in joinIoThread and amoeba_server() in Thread.currentThread.join(); neither
    *  reaches here.
    */
   private def drainAndShutdown(): Unit =
@@ -720,7 +721,7 @@ object Main {
           cfg.mode match
             case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
                                           cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
-            case "host" => host(absPath(cfg.hostDirectory))
+            case "host" => run_host(absPath(cfg.hostDirectory))
             case "amoeba" => amoeba_server(bootstrapConfigPath)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(bootstrapConfigPath)
@@ -955,7 +956,7 @@ object Main {
   }
 
 
-  def repair(client: AspenClient, storeManager: StoreManager): Unit =
+  def repair(client: AspenClient, host: Host): Unit =
 
     def deleteErrorEntry(node: KeyValueListNode, key: Key): Future[Unit] =
       val tx = client.newTransaction()
@@ -968,6 +969,11 @@ object Main {
     def deleteErrorEntryByTimestamp(timestamp: HLCTimestamp,
                                     node: KeyValueListNode,
                                     key: Key): Future[Unit] =
+      // Note that deletion of the entry is best-effort. It's okay if a transient error or
+      // collision causes the transaction to fail. The repair will simply happen again next
+      // time. And we want the transaction to fail if the timestamp has been updated. That
+      // means that between the time we restored the object and wrote it to the store, we
+      // missed another transaction and the update needs to happen again.
       val tx = client.newTransaction()
       val fdeletePrep = node.delete(key,
         None,
@@ -986,7 +992,7 @@ object Main {
       val frepair = Promise[Unit]()
       for
         os <- fos
-        _ = storeManager.repair(storeId, os, frepair)
+        _ = host.repair(storeId, os, frepair)
         _ <- frepair.future
         _ <- deleteErrorEntryByTimestamp(os.timestamp, node, key)
       yield
@@ -998,6 +1004,8 @@ object Main {
       case None =>
         // No object found in the allocation tree. It must have been deleted. Remove error tree entry
         deleteErrorEntry(node, key)
+        // TODO - we need to delete it from the store as well. Note that it's not an error if
+        //        the object doesn't exist within the store.
       case Some(value) => step2(pool, storeId, ObjectPointer(value.value.bytes), node, key)
 
     def repairOne(pool: StoragePool, storeId: StoreId)(node: KeyValueListNode,
@@ -1016,7 +1024,7 @@ object Main {
         ()
 
     println(s"*** Beginning Repair Process ***")
-    storeManager.getStoreIds.foreach: storeId =>
+    host.getStoreIds.foreach: storeId =>
       val min = Array[Byte](1)
       val max = Array[Byte](1)
       min(0) = storeId.poolIndex
@@ -1028,11 +1036,11 @@ object Main {
         println(s"*** Repair Process Complete for Store ${storeId} ***")
         Future {
           Thread.sleep(30000)
-          repair(client, storeManager)
+          repair(client, host)
         }
 
 
-  def host(hostDir: Path): Int = {
+  def run_host(hostDir: Path): Int = {
 
     val sched = Executors.newScheduledThreadPool(3)
     val ec = ExecutionContext.fromExecutorService(sched)
@@ -1084,7 +1092,7 @@ object Main {
 
     val nodeNet = nnet.serverMessenger
 
-    val storeManager = new StoreManager(
+    val host = new Host(
       client,
       hostCfg.hostId,
       bootstrapCfg.aspenSystemId,
@@ -1100,11 +1108,11 @@ object Main {
       CheckStorageDevicesPeriod
     ) with SimpleDriverRecoveryMixin
 
-    networkBridge.onode = Some(storeManager)
+    networkBridge.ohost = Some(host)
 
     network.startIoThread(client)
-    
-    storeManager.start()
+
+    host.start()
 
     /*val cncBackend = new ZCnCBackend(
       nnet,
@@ -1634,7 +1642,7 @@ object Main {
         // it. There is no device-removal command or client API, so the only executable remedy
         // is to move the orphan out of the set: while it remains in the set's memberDevices,
         // StorageDeviceSetState.selectFromDevices may hand it to createNewStoragePool, placing
-        // a store on a device no host will load (StoreManager.tryLoadDevice needs the config
+        // a store on a device no host will load (Host.tryLoadDevice needs the config
         // file). move-device-to-set removes it from the source set, so a level-0 quarantine set
         // that is assigned no pools takes it out of circulation.
         case e: StorageDeviceManager.ConfigWriteFailed if e.getCause.isInstanceOf[FileAlreadyExistsException] =>

@@ -146,6 +146,40 @@ abstract class BaseAspenClient(
   override def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]] =
     namespacedRegistry.getAllEntries(Namespaces.DeviceSet).map(_.map((n, u) => n -> StorageDeviceSetId(u)))
 
+  // ---- Generic registries ----
+  //
+  // Straight delegation. The typed lookups above deliberately keep going to the registries
+  // directly rather than routing through these: they are the curated API over the namespaces
+  // Aspen owns, and a subclass override of getRegisteredId should not be able to retarget
+  // every pool/host/group/device-set lookup in the system.
+
+  override def getRegisteredObject(objectId: UUID): Future[ObjectPointer] =
+    objectRegistry.getRegisteredObject(objectId)
+
+  override def getRegisteredKeyValueObject(objectId: UUID): Future[KeyValueObjectPointer] =
+    objectRegistry.getRegisteredKeyValueObject(objectId)
+
+  override def getRegisteredDataObject(objectId: UUID): Future[DataObjectPointer] =
+    objectRegistry.getRegisteredDataObject(objectId)
+
+  override def registerObject(objectId: UUID, pointer: ObjectPointer): Future[Unit] =
+    objectRegistry.registerObject(objectId, pointer)
+
+  override def prepareRegisterObject(objectId: UUID, pointer: ObjectPointer)(using tx: Transaction): Future[Unit] =
+    objectRegistry.prepareRegisterObject(objectId, pointer)
+
+  override def getRegisteredId(namespace: String, name: String): Future[UUID] =
+    namespacedRegistry.getRegisteredObject(namespace, name)
+
+  override def registerId(namespace: String, name: String, objectId: UUID): Future[Unit] =
+    namespacedRegistry.registerObject(namespace, name, objectId)
+
+  override def prepareRegisterId(namespace: String, name: String, objectId: UUID)(using tx: Transaction): Future[Unit] =
+    namespacedRegistry.prepareRegisterObject(namespace, name, objectId)
+
+  override def listRegisteredIds(namespace: String): Future[List[(String, UUID)]] =
+    namespacedRegistry.getAllEntries(namespace)
+
   // ---- Pointer lookups ----
 
   override def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer] =

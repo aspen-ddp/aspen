@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientResponse, HostMessage, ServiceMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -111,6 +111,32 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def listHosts(): Future[List[(String, HostId)]]
   def listAllocationGroups(): Future[List[(String, AllocationGroupId)]]
   def listStorageDeviceSets(): Future[List[(String, StorageDeviceSetId)]]
+
+  // ---- Generic registries ----
+  //
+  // Two registries live in the radicle: the object registry maps a UUID to an ObjectPointer,
+  // the namespaced registry maps "<namespace>.<name>" to a UUID. A subsystem that owns
+  // persistent named state composes the two -- it registers its name in its own namespace,
+  // and registers the resulting id against its root object.
+  //
+  // The prepare* forms stage into a caller-supplied transaction so a registration can be made
+  // atomic with the allocation of the thing being registered. A name that is already taken
+  // surfaces as KeyAlreadyExists from the prepare* forms and as Registry.DuplicateRegistration
+  // from the non-transactional register* forms.
+  //
+  // The typed getStoragePoolId / listHosts / ... family above is the supported way to reach the
+  // namespaces Aspen itself owns; these are the escape hatch for everyone else.
+
+  def getRegisteredObject(objectId: UUID): Future[ObjectPointer]
+  def getRegisteredKeyValueObject(objectId: UUID): Future[KeyValueObjectPointer]
+  def getRegisteredDataObject(objectId: UUID): Future[DataObjectPointer]
+  def registerObject(objectId: UUID, pointer: ObjectPointer): Future[Unit]
+  def prepareRegisterObject(objectId: UUID, pointer: ObjectPointer)(using tx: Transaction): Future[Unit]
+
+  def getRegisteredId(namespace: String, name: String): Future[UUID]
+  def registerId(namespace: String, name: String, objectId: UUID): Future[Unit]
+  def prepareRegisterId(namespace: String, name: String, objectId: UUID)(using tx: Transaction): Future[Unit]
+  def listRegisteredIds(namespace: String): Future[List[(String, UUID)]]
 
   private[aspen] def getStoragePoolPointer(poolId: PoolId): Future[KeyValueObjectPointer]
   private[aspen] def getHostPointer(hostId: HostId): Future[KeyValueObjectPointer]

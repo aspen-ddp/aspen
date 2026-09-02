@@ -1,10 +1,8 @@
 package org.aspen_ddp.aspen.server.rebuild
 
-import scala.language.implicitConversions
-
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.metadata.management.FailedStorageDeviceTestHarness
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -22,7 +20,6 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
   atest("a failed device's stores are reconstructed on a live device"):
     given ExecutionContext = executionContext
     val failedId = StorageDeviceId.BootstrapStorageDeviceId
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
 
     for
       // Content to reconstruct, and a live destination to reconstruct it onto.
@@ -82,12 +79,10 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
         val stagingPath = os.Path(deviceDir) / RebuildingStore.RebuildDirectory / storeId.directoryName
         os.exists(stagingPath) should be(false)
 
-      // Final assertion: all staging directories are gone.
-      val allStagingGone = expectedStores.forall: storeId =>
-        !os.exists(os.Path(deviceDir) / RebuildingStore.RebuildDirectory / storeId.directoryName)
-      allStagingGone should be(true)
-
       // A read-back assertion against the pool is not valid in this harness: RecordingStoreManager
       // overrides tryLoadStore to record instead of opening a RocksDB backend, so the rebuilt stores
       // do not actually come online. Reads are served by net.smgr's in-memory MapBackends throughout,
-      // and a read-back would therefore pass whether the rebuild ran or not — a vacuous assertion.
+      // and a read-back would therefore pass whether the rebuild ran or not -- a vacuous assertion.
+
+      // The foreach above yields Unit; the assertions it made are the test.
+      succeed

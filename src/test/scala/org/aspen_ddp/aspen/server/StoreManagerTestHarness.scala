@@ -67,8 +67,12 @@ trait StoreManagerTestHarness:
   /** Drives `mgr`'s device check until no store on `deviceId` is Rebuilding.
    *
    *  Rebuilds are started by the device-check machinery, which in production runs on an hourly
-   *  timer. Tests do not wait an hour: this drives checks, yields to let async rebuilds run,
-   *  and polls until all stores flip to Active.
+   *  timer. Tests do not wait an hour: this drives checks, yields to let the async rebuilds and
+   *  their completion callbacks run, and repeats until nothing is Rebuilding any more.
+   *
+   *  The predicate is "nothing is Rebuilding", not "everything is Active": a store that lands in
+   *  some other status is a result this helper should return so the caller's assertion can report
+   *  it, not a condition to spin on until the round budget runs out.
    *
    *  Silent on exhaustion, like `yieldUntil`: the caller asserts the end state.
    */
@@ -76,21 +80,21 @@ trait StoreManagerTestHarness:
                                  deviceId: StorageDeviceId,
                                  maxRounds: Int = 500): Future[Unit] =
     given ExecutionContext = executionContext
-    def allActive(): Future[Boolean] =
+    def anyRebuilding(): Future[Boolean] =
       client.getStorageDeviceState(deviceId).map: state =>
-        state.stores.values.forall(_.status == StorageDeviceState.StoreStatus.Active)
+        state.stores.values.exists(_.status == StorageDeviceState.StoreStatus.Rebuilding)
 
     def loop(rounds: Int): Future[Unit] =
       if rounds == 0 then
         Future.unit
       else
-        allActive().flatMap:
-          case true => Future.unit
-          case false =>
+        anyRebuilding().flatMap:
+          case false => Future.unit
+          case true =>
             mgr.testingOnlyCheckAllDevices()
             for
-              // Yield to let queued async work (the rebuild's complete Future and its callbacks) run.
-              _ <- yieldUntil(false, 1)
+              // Yield so queued work -- the rebuild's own Future and its callbacks -- gets to run.
+              _ <- Future(())
               _ <- waitForTransactionsToComplete()
               _ <- loop(rounds - 1)
             yield ()

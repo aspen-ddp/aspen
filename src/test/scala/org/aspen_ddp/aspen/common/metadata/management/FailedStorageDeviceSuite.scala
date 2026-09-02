@@ -24,7 +24,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
     factory should be(Some(FailedStorageDeviceDurableTask))
     TypeFactories.factories should contain(FailedStorageDeviceDurableTask)
 
-
   atest("failStorageDevice enrolls exactly one task"):
     given ExecutionContext = executionContext
     for

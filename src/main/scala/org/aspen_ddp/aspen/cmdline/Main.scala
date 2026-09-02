@@ -302,32 +302,6 @@ object Main {
             validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x"))
         )
 
-      // OBSOLETE: the "rebuild" command is defunct -- it hardcodes the demo bootstrap-host
-      // device path and needs rework before it can be re-enabled. The rebuild function is
-      // retained for reference but is not reachable.
-      //cmd("rebuild").text("Rebuilds a store").
-      //  action( (_,c) => c.copy(mode="rebuild")).
-      //  children(
-      //    arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-      //      action( (x, c) => c.copy(bootstrapConfigFile=x)).
-      //      validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-      //
-      //    arg[String]("<store-identifier>").text("Data Store Identifier. Format is \"pool-uuid:storeNumber\"").
-      //      action((x,c) => c.copy(storeName=x)).
-      //      validate { x =>
-      //        val arr = x.split(":")
-      //        if (arr.length == 2) {
-      //          try {
-      //            Integer.parseInt(arr(1))
-      //            success
-      //          } catch {
-      //            case _: Throwable => failure("Store name must match the format \"pool-name:storeNumber\"")
-      //          }
-      //        }
-      //        else failure("Store name must match the format \"pool-name:storeNumber\"")
-      //      }
-      //  )
-
       cmd("create-pool").text("Creates a new storage pool").
         action((_, c) => c.copy(mode = "create-pool")).
         children(
@@ -748,9 +722,8 @@ object Main {
                                           cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
             case "host" => host(absPath(cfg.hostDirectory))
             case "amoeba" => amoeba_server(bootstrapConfigPath)
-            // OBSOLETE: see the commented-out "debug" and "rebuild" parser entries above.
+            // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(bootstrapConfigPath)
-            //case "rebuild" => rebuild(cfg.storeName, bootstrapConfigPath)
             case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
             case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
@@ -1269,77 +1242,6 @@ object Main {
     0
   }
 
-  /** OBSOLETE: not reachable from the CLI. Hardcodes the demo bootstrap-host device path.
-   *  Retained for reference; needs rework. */
-  def rebuild(storeName: String, bootstrapConfigFile: os.Path): Unit = {
-
-    configureLogging()
-
-    val cfg = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toNIO.toFile)
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
-
-    network.startIoThread(client)
-    
-    given ExecutionContext = client.clientContext
-
-    val arr = storeName.split(":")
-    val poolUuid = UUID.fromString(arr(0))
-    val storeIndex = Integer.parseInt(arr(1))
-
-    var store: Backend = null
-    var storeId: StoreId = null
-
-    cfg.hosts.zipWithIndex.foreach: (node, index) =>
-      Path.of("demo", "bootstrap-host", StorageDeviceManager.StorageDevicesDirName, "bootstrap-device").toFile.listFiles.toList.foreach: storeFn =>
-        val cfg = StoreConfig.loadStoreConfig(storeFn.toPath.resolve(StoreConfig.configFilename).toFile)
-        if poolUuid == cfg.storeId.poolId && storeIndex == cfg.storeId.poolIndex then
-          cfg.backend match {
-            case b: StoreConfig.RocksDB =>
-              println(s"Rebuilding data store ${cfg.storeId}. Path $storeFn")
-              storeId = cfg.storeId
-              store = new RocksDBBackend(storeFn.toPath, cfg.storeId, client.clientContext)
-          }
-
-    assert(store != null)
-
-    def rebuildObject(node:KeyValueListNode, key: Key, value: ValueState): Future[Unit] =
-      def getMetadata(os: ObjectState): (ObjectType.Value, Metadata) = os match
-        case kvos: KeyValueObjectState =>
-          (ObjectType.KeyValue, Metadata(kvos.revision, kvos.refcount, kvos.timestamp))
-        case dos: DataObjectState =>
-          (ObjectType.Data, Metadata(dos.revision, dos.refcount, dos.timestamp))
-        case _: MetadataObjectState =>
-          assert(false, "Unsupported object type!")
-
-      val objectId = ObjectId(key.bytes)
-      val ptr = ObjectPointer(value.value.bytes)
-
-      println(f"Rebuilding object: $objectId")
-
-      if ptr.poolId != storeId.poolId then
-        return Future.unit
-
-      val fos = ptr match
-        case p: KeyValueObjectPointer => client.read(p)
-        case p: DataObjectPointer => client.read(p)
-
-      for
-        os <- fos
-        (objectType, metadata) = getMetadata(os)
-        localData = os.getRebuildDataForStore(storeId)
-        _ = store.rebuildWrite(os.id, objectType, metadata, localData.getOrElse(DataBuffer()))
-      yield
-        println(f"Rebuilt object ${os.id}")
-
-    for
-      pool <- client.getStoragePool(storeId.poolId)
-      allocTree = pool.allocationTree
-      _ <- allocTree.foreach(rebuildObject)
-    yield
-      store.rebuildFlush()
-      println("**** Rebuild Complete ****")
-      ()
-  }
 
   def create_pool(bootstrapConfigFile: os.Path,
                   poolName: String,

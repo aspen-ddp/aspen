@@ -80,7 +80,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
 
       // The rebuild should resume from that key
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
-                                    checkpointInterval = 5)
+                                    checkpointInterval = 5,
+                                    testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
       restored = rebuild.testingOnlyRestoredKeys
       restoredBytes = restored.map(_.bytes.toList).toSet

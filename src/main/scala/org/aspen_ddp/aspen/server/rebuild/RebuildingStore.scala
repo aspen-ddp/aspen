@@ -43,6 +43,7 @@ class RebuildingStore(client: AspenClient,
                       checkpointInterval: Int = RebuildingStore.CheckpointInterval,
                       testingOnlyFailKeys: Set[Key] = Set(),
                       testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
+                      testingOnlyTrackRestoredKeys: Boolean = false,
                       maxFailedObjects: Int = RebuildState.MaxFailedObjects) extends StoreRebuild with Logging:
 
   import RebuildingStore.*
@@ -55,9 +56,9 @@ class RebuildingStore(client: AspenClient,
   private val completionPromise: Promise[Unit] = Promise()
   def complete: Future[Unit] = completionPromise.future
 
-  /** Keys handed to rebuildWrite, in walk order. Test hook. Gated to only accumulate when not
-   *  using the default checkpoint interval, to avoid holding millions of keys in memory for no
-   *  production purpose. */
+  /** Keys handed to rebuildWrite, in walk order. Test hook, and off unless a test asks for it:
+   *  a real store holds millions of objects, and accumulating a Key per object for the life of
+   *  the rebuild would cost that memory for no production purpose. */
   private val restoredKeys = mutable.ListBuffer[Key]()
   private[rebuild] def testingOnlyRestoredKeys: List[Key] = synchronized(restoredKeys.toList)
 
@@ -254,7 +255,7 @@ class RebuildingStore(client: AspenClient,
 
   private def recordRestored(key: Key): Future[Unit] =
     val checkpointNow = synchronized:
-      if checkpointInterval != RebuildingStore.CheckpointInterval then
+      if testingOnlyTrackRestoredKeys then
         restoredKeys += key
       lastKey = Some(key)
       restoredSinceCheckpoint += 1

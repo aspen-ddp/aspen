@@ -879,9 +879,25 @@ class StoreManager(val client: AspenClient,
     }
 
   /** Flips a rebuilt store's device entry from Rebuilding to Active, then re-checks the device
-   *  so the next queued rebuild starts. */
+   *  so the next queued rebuild starts.
+   *
+   *  The device may have left the tree between a rebuild starting and finishing (an operator
+   *  removing it, say). Without exhaustive onFail, getStorageDevicePointer's NoSuchElementException
+   *  is neither StopRetrying nor a match, so ExponentialBackoffRetryStrategy reschedules forever,
+   *  the future never completes, and this device's rebuild queue never advances. Re-checking on
+   *  both Success and Failure ensures the queue advances even when the flip fails permanently.
+   *
+   *  The failure re-check cannot loop back into starting the same rebuild: reaching Failure at all
+   *  means a permanent error, which means the tree read is broken, so the device check that follows
+   *  also fails its lookupStorageDeviceState and never reaches reconcile.
+   */
   private def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
-    val txFuture = client.transactUntilSuccessful: tx =>
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: FatalReadError => throw StopRetrying(e)
+      case _ => Future.unit
+
+    val txFuture = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       for
         ptr <- client.getStorageDevicePointer(storageDeviceId)
         kvos <- client.read(ptr)
@@ -902,10 +918,11 @@ class StoreManager(val client: AspenClient,
             tx.result.foreach: _ =>
               logger.info(s"Rebuild of store $storeId complete")
 
-    // Re-check the device whether or not the update was staged. An empty transaction completes
-    // normally (the entry is already Active or has vanished), and the re-check releases the
-    // concurrency slot so the next queued rebuild can start immediately.
-    txFuture.foreach: _ =>
+    // Re-check the device whether or not the update was staged and whether or not the transaction
+    // succeeded. An empty transaction completes normally (the entry is already Active or has
+    // vanished). A permanently failed transaction (device removed from tree, fatal read error)
+    // must still advance the queue, otherwise one bad entry strands every rebuild behind it.
+    txFuture.onComplete: _ =>
       checkStorageDevice(storageDeviceId)
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.

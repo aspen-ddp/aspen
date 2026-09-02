@@ -1,3 +1,34 @@
+PoolObjectAllocator casts an Option to a Factory and will always throw
+  - PoolObjectAllocator.scala:18 is
+    client.typeRegistry.getType(uuid).asInstanceOf[StoragePoolAllocationStrategy.Factory]
+    but TypeRegistry.getType[T] returns Option[T], so this casts the Option
+    itself, not its contents. ClassCastException on first allocation
+  - Only reachable when pool.allocationStrategy is Some(uuid), i.e. a pool with
+    a custom allocation strategy. Nothing in src/main or src/test creates one,
+    which is why it has survived
+  - Sharpened by the errorTree storePointer work: custom allocation strategies
+    are exactly what produce non-empty storePointers, so the first pool that
+    makes that feature meaningful is the first pool to hit this
+  - Fix is one line -- .get, or getType[StoragePoolAllocationStrategy.Factory](uuid).get
+  - Also blocks testing anything storePointer-related through a real allocator.
+    MissedUpdateFinalizationActionSuite builds its pointers by hand instead
+
+TestNetwork's comment about missing the third store is wrong
+  - TestNetwork.scala:133-134 claims "All transactions will miss the third
+    store", justifying the short MissedUpdateFinalizationAction.errorTimeout on
+    the next line. All three stores are loaded and all three answer TxCommitted,
+    so updateCommitErrors takes the all-clear branch and cancels the mark task
+  - Consequence is that the FA's errorTree write path is dead in every existing
+    test, which is not what the comment leads you to believe
+  - Driving it for real needs a way to make a store silent. Not-loading it makes
+    Host reply StoreNotFound, which BaseReadDriver answers by re-reading
+    immediately -- unbounded recursion on TestNetwork's synchronous loop.
+    offlineStores is only reachable via the private closeStore, and backend
+    commit errors are discarded by Tx.commitComplete
+  - Candidate is a droppedStores filter in TestNetwork's two messengers, so a
+    store simply never replies. ~8 lines, defaults to empty. Wanted by the
+    repair-deletion item, not by anything today
+    
 Host and Store support repairing an object by passing in its current state however we
 also need to support repair "deletion" operations where there is no state to pass in
 because the object has been deleted. The only information available for this operation

@@ -568,9 +568,10 @@ abstract class BaseAspenClient(
           if state.isFailed then
             throw AspenClient.DeviceAlreadyFailed(deviceId)
           else
-            // The set is captured now because step 1 zeroes the device's own record of it.
-            FailedStorageDeviceDurableTask.prepareSystemTask(
-              this, deviceId, state.storageDeviceSet)
+            // Only the device id is recorded. The task re-reads everything else -- including the
+            // device's set -- inside its own transactions, so nothing here can go stale between
+            // enrollment and the first pass.
+            FailedStorageDeviceDurableTask.prepareSystemTask(this, deviceId)
       yield ()
 
   override def prepareSystemDurableTask(taskTypeUUID: UUID,

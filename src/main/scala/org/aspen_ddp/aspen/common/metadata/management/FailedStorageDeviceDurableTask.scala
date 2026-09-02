@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.metadata.management
 
 import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectState, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostState, StorageDeviceId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -26,10 +26,6 @@ object FailedStorageDeviceDurableTask extends DurableTaskFactory:
    *  UUID. */
   private[aspen] val DeviceIdKey: Key = Key(Array[Byte](0))
 
-  /** The set that contained the device, captured at enrollment because step 1 destroys the
-   *  device's own record of it. */
-  private[aspen] val SetIdKey: Key = Key(Array[Byte](1))
-
   val DefaultPollPeriod: Duration = Duration(2, MINUTES)
 
   /** Overridable poll period (test seam; mirrors MigratePoolToSetDurableTask.pollPeriod). */
@@ -47,16 +43,13 @@ object FailedStorageDeviceDurableTask extends DurableTaskFactory:
                  state: Map[Key, KeyValueObjectState.ValueState],
                  taskExecutor: TaskExecutor): DurableTask =
     val deviceId = StorageDeviceId(byte2uuid(state(DeviceIdKey).value.bytes))
-    val setId = StorageDeviceSetId(byte2uuid(state(SetIdKey).value.bytes))
-    new FailedStorageDeviceDurableTask(pointer, client, deviceId, setId, pollPeriod)
+    new FailedStorageDeviceDurableTask(pointer, client, deviceId, pollPeriod)
 
   /** Stage enrollment of a failure task for `deviceId` inside the caller's transaction. */
   def prepareSystemTask(client: AspenClient,
-                        deviceId: StorageDeviceId,
-                        setId: StorageDeviceSetId)(using tx: Transaction): Future[Unit] =
+                        deviceId: StorageDeviceId)(using tx: Transaction): Future[Unit] =
     client.prepareSystemDurableTask(typeUUID, Map(
-      DeviceIdKey -> uuid2byte(deviceId.uuid),
-      SetIdKey -> uuid2byte(setId.uuid)))
+      DeviceIdKey -> uuid2byte(deviceId.uuid)))
 
 
 /** Tombstones a failed storage device and drains its stores onto live devices, one at a time.
@@ -78,7 +71,6 @@ class FailedStorageDeviceDurableTask(
     val taskPointer: DurableTaskPointer,
     client: AspenClient,
     deviceId: StorageDeviceId,
-    setId: StorageDeviceSetId,
     pollPeriod: Duration
 ) extends DurableTask with Logging:
 
@@ -174,7 +166,12 @@ class FailedStorageDeviceDurableTask(
         // every attempt, transactUntilSuccessful loops forever, and this future never completes.
         // A future that never completes wedges the single-flight flag exactly as a failed one does.
         _ = if state.isFailed then throw StopRetrying(AspenClient.DeviceAlreadyFailed(deviceId))
-        setPtr <- client.getStorageDeviceSetPointer(setId)
+        // The set comes from the device's own record, read fresh here rather than captured at
+        // enrollment: step 1 preserves storageDeviceSet (it zeroes only the two ids), and an
+        // operator may have run move-device-to-set between enrollment and this pass. A captured
+        // set id would filter the device out of a set it had already left and leave it in its
+        // new set's memberDevices with both ids zeroed, permanently.
+        setPtr <- client.getStorageDeviceSetPointer(state.storageDeviceSet)
         setDos <- client.read(setPtr, "fail storage device")
         hostPtr <- client.getHostPointer(state.hostId)
         hostKvos <- client.read(hostPtr, "fail storage device")

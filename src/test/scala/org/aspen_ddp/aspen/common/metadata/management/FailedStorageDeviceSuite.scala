@@ -56,18 +56,16 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
   private val fastPoll = Duration(50, MILLISECONDS)
 
   /** Build a task instance over the state object failStorageDevice enrolled. */
-  protected def taskForEnrolled(deviceId: StorageDeviceId,
-                                setId: StorageDeviceSetId): Future[FailedStorageDeviceDurableTask] =
-    taskForEnrolled(deviceId, setId, fastPoll)
+  protected def taskForEnrolled(deviceId: StorageDeviceId): Future[FailedStorageDeviceDurableTask] =
+    taskForEnrolled(deviceId, fastPoll)
 
   protected def taskForEnrolled(deviceId: StorageDeviceId,
-                                setId: StorageDeviceSetId,
                                 pollPeriod: Duration): Future[FailedStorageDeviceDurableTask] =
     given ExecutionContext = executionContext
     enrolledTasks().map: enrolled =>
       enrolled.size should be(1)
       new FailedStorageDeviceDurableTask(
-        DurableTaskPointer(enrolled.head._2), client, deviceId, setId, pollPeriod)
+        DurableTaskPointer(enrolled.head._2), client, deviceId, pollPeriod)
 
   /** Poll until `deviceId` reads as tombstoned, or fail on timeout. A bare wait on the task's
    *  completion would hang the suite rather than fail if the loop stopped making progress. */
@@ -112,7 +110,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       _ <- client.failStorageDevice(net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ <- taskForEnrolled(net.secondDeviceId, setId)
+      _ <- taskForEnrolled(net.secondDeviceId)
       _ <- awaitTombstone(net.secondDeviceId, Duration(30000, MILLISECONDS))
 
       state <- client.getStorageDeviceState(net.secondDeviceId)
@@ -125,6 +123,33 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       set.memberDevices should not contain net.secondDeviceId
       host.storageDevices should not contain net.secondDeviceId
 
+  atest("step 1 removes the device from the set it is in now, not the one it was in at enrollment"):
+    given ExecutionContext = executionContext
+    val bootstrapSet = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.failStorageDevice(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      // An operator moves the device between enrollment and the first pass. That window is a
+      // whole poll period wide, and arbitrarily wide across a restart.
+      otherSet <- client.createStorageDeviceSet("other", 0, None)
+      _ <- client.moveDeviceToSet(net.secondDeviceId, otherSet)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- taskForEnrolled(net.secondDeviceId)
+      _ <- awaitTombstone(net.secondDeviceId, Duration(30000, MILLISECONDS))
+      _ <- waitForTransactionsToComplete()
+
+      other <- client.getStorageDeviceSetState(otherSet)
+      bootstrap <- client.getStorageDeviceSetState(bootstrapSet)
+    yield
+      // A set id captured at enrollment would filter the device out of the set it had already
+      // left and leave it in the new one with both ids zeroed, permanently.
+      other.memberDevices should not contain net.secondDeviceId
+      bootstrap.memberDevices should not contain net.secondDeviceId
+
   atest("step 1 against an already-tombstoned device changes nothing"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
@@ -135,13 +160,13 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       _ <- client.failStorageDevice(net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ <- taskForEnrolled(net.secondDeviceId, setId)
+      _ <- taskForEnrolled(net.secondDeviceId)
       _ <- awaitTombstone(net.secondDeviceId, timeout)
       _ <- waitForTransactionsToComplete()
       before <- client.getStorageDeviceState(net.secondDeviceId)
 
       // Re-running tombstone() against already-tombstoned state must complete and change nothing.
-      task <- taskForEnrolled(net.secondDeviceId, setId)
+      task <- taskForEnrolled(net.secondDeviceId)
       completed <- withTimeout(task.tombstone(), timeout, "tombstone() on already-tombstoned device")
       _ <- waitForTransactionsToComplete()
       after <- client.getStorageDeviceState(net.secondDeviceId)
@@ -152,14 +177,13 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   atest("failStorageDevice refuses a device that is already tombstoned"):
     given ExecutionContext = executionContext
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     for
       _ <- net.createSecondDevice()
       _ <- waitForTransactionsToComplete()
       _ <- client.failStorageDevice(net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ <- taskForEnrolled(net.secondDeviceId, setId)
+      _ <- taskForEnrolled(net.secondDeviceId)
       _ <- awaitTombstone(net.secondDeviceId, Duration(30000, MILLISECONDS))
       _ <- waitForTransactionsToComplete()
 
@@ -171,7 +195,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   atest("a failing pass does not wedge the task"):
     given ExecutionContext = executionContext
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     val bogusId = StorageDeviceId(java.util.UUID.randomUUID())
     for
       _ <- net.createSecondDevice()
@@ -181,7 +204,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
       // Build a task instance over the enrolled state but with a bogus device id, so
       // drive()'s getStorageDeviceState fails.
-      task <- taskForEnrolled(bogusId, setId)
+      task <- taskForEnrolled(bogusId)
       _ <- waitForTransactionsToComplete()
 
       // Wait several poll periods. The task should survive: neither completed nor failed,
@@ -229,7 +252,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   atest("the drain moves every store off the tombstone and completes"):
     given ExecutionContext = executionContext
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     val failedId = StorageDeviceId.BootstrapStorageDeviceId
     val result = for
       // A live destination in the same set. The bootstrap device carries all three stores.
@@ -239,7 +261,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       _ <- client.failStorageDevice(failedId)
       _ <- waitForTransactionsToComplete()
 
-      task <- taskForEnrolled(failedId, setId)
+      task <- taskForEnrolled(failedId)
       _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
@@ -266,7 +288,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   atest("the drain regenerates the bootstrap config for a bootstrap-pool store"):
     given ExecutionContext = executionContext
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     val failedId = StorageDeviceId.BootstrapStorageDeviceId
     val result = for
       _ <- net.createSecondDevice()
@@ -278,7 +299,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       // bootstrap-config key, so a revision change can only have come from it.
       beforeRev <- bootstrapConfigRevision()
 
-      task <- taskForEnrolled(failedId, setId)
+      task <- taskForEnrolled(failedId)
       _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
@@ -321,7 +342,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   atest("the drain disowns a TransferringIn entry rather than repointing the pool"):
     given ExecutionContext = executionContext
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     val liveId = StorageDeviceId.BootstrapStorageDeviceId
     val storeId = StoreId(PoolId.BootstrapPoolId, 1)
     val result = for
@@ -343,7 +363,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       _ <- client.failStorageDevice(net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      task <- taskForEnrolled(net.secondDeviceId, setId)
+      task <- taskForEnrolled(net.secondDeviceId)
       _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
@@ -368,7 +388,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   atest("the drain disowns a store the pool no longer names"):
     given ExecutionContext = executionContext
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     val failedId = StorageDeviceId.BootstrapStorageDeviceId
     val storeId = StoreId(PoolId.BootstrapPoolId, 0)
     val result = for
@@ -385,7 +404,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       _ <- repointPoolStore(storeId, net.thirdDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      task <- taskForEnrolled(failedId, setId)
+      task <- taskForEnrolled(failedId)
       _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
@@ -403,7 +422,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   atest("a resumed task picks up mid-drain"):
     given ExecutionContext = executionContext
-    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     val failedId = StorageDeviceId.BootstrapStorageDeviceId
     val slowerPoll = Duration(200, MILLISECONDS)
     val result = for
@@ -414,13 +432,13 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
       // Stop the first instance once it has moved at least one store, simulating a crash. Give
       // it a slower poll period than the watcher to widen the observation windows.
-      first <- taskForEnrolled(failedId, setId, slowerPoll)
+      first <- taskForEnrolled(failedId, slowerPoll)
       _ <- awaitStoresRemaining(failedId, atMost = 2, Duration(30000, MILLISECONDS))
       _ = first.stop()
       midDrain <- client.getStorageDeviceState(failedId)
 
       // A fresh instance over the same enrolled state finishes the job.
-      second <- taskForEnrolled(failedId, setId)
+      second <- taskForEnrolled(failedId)
       _ <- withTimeout(second.completed.map(_ => ()), Duration(30000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()

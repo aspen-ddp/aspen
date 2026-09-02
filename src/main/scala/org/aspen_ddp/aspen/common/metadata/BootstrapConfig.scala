@@ -200,12 +200,20 @@ object BootstrapConfig:
       yield
         val hostsMap = poolHosts.map((_, host) => host.hostId -> host).toMap +
           (newHost.hostId -> newHost)
-        val hostsList = hostsMap.valuesIterator.toList
         val storeMap = poolHosts.map: (sid, host) =>
           if sid == storeId then
             (sid, newHost.hostId)
           else
             (sid, host.hostId)
+
+        // Only the hosts storeMap actually names. hostsMap is built from poolCfg.stores as the
+        // caller left it, so if the caller has not yet applied the move, the old host of a store
+        // that storeMap remaps away is still in hostsMap with nothing left pointing at it, and
+        // generateBootstrapConfig's require(storesOnHost.nonEmpty) throws
+        // IllegalArgumentException. Filtering makes that require unfalsifiable whichever order
+        // the caller mutates in, and keeps phantom hosts out of the emitted YAML.
+        val referenced = storeMap.map((_, hostId) => hostId).toSet
+        val hostsList = hostsMap.valuesIterator.filter(h => referenced.contains(h.hostId)).toList
 
         val aspenSystemId = byte2uuid(radicleKvos.contents(Radicle.SystemIdKey).value.bytes)
 

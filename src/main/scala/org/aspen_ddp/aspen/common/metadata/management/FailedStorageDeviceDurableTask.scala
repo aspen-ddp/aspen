@@ -338,10 +338,9 @@ class FailedStorageDeviceDurableTask(
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: IndexOutOfBoundsException => throw StopRetrying(e)
-      // generateBootstrapConfig's require(storesOnHost.nonEmpty) raises this. The statement
-      // ordering above is what keeps it unfalsifiable, but that ordering is protected by a
-      // comment alone, and a permanent error with no route to StopRetrying is an infinite
-      // 60s retry loop and a never-completing future. One line to fail loudly instead.
+      // generateBootstrapConfig's two `require`s raise this. Both are believed unfalsifiable
+      // from here, but a permanent error with no route to StopRetrying is an infinite 60s retry
+      // loop and a never-completing future. One line to fail loudly instead.
       case e: IllegalArgumentException => throw StopRetrying(e)
       case e: AspenClient.DeviceFailed => throw StopRetrying(e)
       case e: StoreAlreadyMoved => throw StopRetrying(e)
@@ -411,13 +410,11 @@ class FailedStorageDeviceDurableTask(
               // anything can route around it. The rebalancer already excludes non-Active stores
               // from movement and from the write-threshold count.
               //
-              // CRITICAL ORDERING: this mutation must precede prepRadicleUpdate. prepRadicleUpdate
-              // builds poolHosts from poolCfg.stores, so if the mutation happens after (in the
-              // yield block), it reads stale state: the failed device's old host lands in
-              // hostsList while storeMap remaps its only bootstrap store away, and
-              // generateBootstrapConfig's require(storesOnHost.nonEmpty) throws
-              // IllegalArgumentException — permanent, infinite loop unless StopRetrying catches
-              // it. Invisible in single-host TestNetwork; no test protects this ordering.
+              // ORDERING: this mutation precedes prepRadicleUpdate, which builds poolHosts from
+              // poolCfg.stores. prepRadicleUpdate now filters its host list to the hosts its
+              // store map references, so the other order no longer trips
+              // generateBootstrapConfig's require(storesOnHost.nonEmpty) — but this order is the
+              // honest one and keeps the two statements describing the same pool.
               poolCfg.stores(storeId.poolIndex) =
                 StoragePoolState.StoreEntry(dst.state.hostId, dst.id)
               BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, dst.state.hostId)

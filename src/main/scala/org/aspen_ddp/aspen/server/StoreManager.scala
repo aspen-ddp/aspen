@@ -376,6 +376,11 @@ class StoreManager(val client: AspenClient,
         toDevKvos <- client.read(toDevPtr)
         poolCfg = StoragePoolState(poolKvos)
         toDev = StorageDeviceState(toDevKvos)
+        // Called before poolCfg.stores is mutated below, which is the opposite of the order
+        // FailedStorageDeviceDurableTask.moveStore uses. Safe only because prepRadicleUpdate
+        // filters its host list down to the hosts its store map references: without that, the
+        // moved store's old host reaches generateBootstrapConfig with no stores and trips its
+        // require(storesOnHost.nonEmpty).
         _ <- BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, toDev.hostId)(using tx)
       yield
         val fromDev = StorageDeviceState(fromDevKvos)

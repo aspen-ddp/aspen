@@ -222,9 +222,12 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result <- repairer.scan(storeId, policy)
       validEntryStillThere <- errorEntryExists(objectId)
     yield
-      // The malformed entry is skipped (seen count excludes it because it threw before
-      // incrementing), but the scan completes and processes the valid entry
+      // Both entries count as seen -- the malformed one is counted before it is decoded -- but
+      // only the valid one is repaired. The point is that the scan completes at all: before the
+      // decode was moved inside a Future, the throw escaped foreachInRange's failure handling
+      // and left the walk's promise uncompleted, hanging this scan forever.
       target.deletions shouldBe List((objectId, Seq[Byte](1)))
+      result.seen shouldBe 2
       result.repaired shouldBe 1
       validEntryStillThere shouldBe false
 

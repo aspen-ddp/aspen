@@ -181,7 +181,7 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val set = leaf(List(failed, poolDev, spare))
     val lookup = fixedLookup(Map(failed -> 9999L, poolDev -> 9999L, spare -> 9999L))
     val r = Await.result(
-      set.selectRebuildDevice(500L, failed, Set(failed, poolDev), lookup, new Random(1)), timeout)
+      set.selectRebuildDevice(500L, failed, Set(failed, poolDev), noLookup, lookup, new Random(1)), timeout)
     r should be(spare)
 
   test("rebuild: falls back to a pool device when no non-pool device fits"):
@@ -191,7 +191,7 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val set = leaf(List(failed, poolDev, spare))
     val lookup = fixedLookup(Map(failed -> 9999L, poolDev -> 1000L, spare -> 100L))
     val r = Await.result(
-      set.selectRebuildDevice(500L, failed, Set(failed, poolDev), lookup, new Random(2)), timeout)
+      set.selectRebuildDevice(500L, failed, Set(failed, poolDev), noLookup, lookup, new Random(2)), timeout)
     r should be(poolDev)
 
   test("rebuild: failed device is never selected, even as a last resort"):
@@ -201,7 +201,7 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val lookup = fixedLookup(Map(failed -> 9999L, other -> 0L))
     assertThrows[AllocationError]:
       Await.result(
-        set.selectRebuildDevice(500L, failed, Set(failed, other), lookup, new Random(3)), timeout)
+        set.selectRebuildDevice(500L, failed, Set(failed, other), noLookup, lookup, new Random(3)), timeout)
 
   test("rebuild: AllocationError when no device has sufficient space"):
     val failed = dev()
@@ -211,7 +211,7 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val lookup = fixedLookup(Map(failed -> 9999L, a -> 100L, b -> 200L))
     assertThrows[AllocationError]:
       Await.result(
-        set.selectRebuildDevice(500L, failed, Set(failed), lookup, new Random(4)), timeout)
+        set.selectRebuildDevice(500L, failed, Set(failed), noLookup, lookup, new Random(4)), timeout)
 
   test("rebuild: requiredSize 0 accepts any non-failed device with free space"):
     val failed = dev()
@@ -219,7 +219,7 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val set = leaf(List(failed, d1))
     val lookup = fixedLookup(Map(failed -> 9999L, d1 -> 0L))
     val r = Await.result(
-      set.selectRebuildDevice(0L, failed, Set(failed), lookup, new Random(5)), timeout)
+      set.selectRebuildDevice(0L, failed, Set(failed), noLookup, lookup, new Random(5)), timeout)
     r should be(d1)
 
   test("rebuild: stops reading device states once a fitting device is found"):
@@ -233,7 +233,7 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
       queried += id
       Future.successful(free(id))
     val r = Await.result(
-      set.selectRebuildDevice(500L, failed, Set(failed), lookup, new Random(6)), timeout)
+      set.selectRebuildDevice(500L, failed, Set(failed), noLookup, lookup, new Random(6)), timeout)
     // a and b both qualify, so only the first candidate should be queried
     queried.toList.length should be(1)
     List(a, b) should contain(r)
@@ -247,22 +247,46 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
       if id == bad then Future.failed(new RuntimeException("boom"))
       else Future.successful(9999L)
     val r = Await.result(
-      set.selectRebuildDevice(500L, failed, Set(failed, good), lookup, new Random(7)), timeout)
+      set.selectRebuildDevice(500L, failed, Set(failed, good), noLookup, lookup, new Random(7)), timeout)
     r should be(good)
 
-  test("rebuild: level != 0 fails with AllocationError"):
-    val upperSet = upper(1, List(leaf(List(dev()))))
-    val lookup = fixedLookup(Map.empty[StorageDeviceId, Long].withDefaultValue(9999L))
+  test("rebuild: a level-1 set recurses into its member sets"):
+    val target = dev()
+    val leafSet = leaf(List(target))
+    val upperSet = upper(1, List(leafSet))
+    val free = fixedLookup(Map(target -> 9999L))
+    val chosen = Await.result(
+      upperSet.selectRebuildDevice(
+        500L, dev(), Set.empty, lookupFor(leafSet), free, new Random(8)), timeout)
+    chosen should be(target)
+
+  test("rebuild: a level-1 set still hard-excludes the failed device"):
+    val failed = dev()
+    val alive = dev()
+    val leafSet = leaf(List(failed, alive))
+    val upperSet = upper(1, List(leafSet))
+    val free = fixedLookup(Map(failed -> 9999L, alive -> 9999L))
+    val chosen = Await.result(
+      upperSet.selectRebuildDevice(
+        500L, failed, Set(failed), lookupFor(leafSet), free, new Random(11)), timeout)
+    chosen should be(alive)
+
+  test("rebuild: a level-1 set with no room anywhere fails with AllocationError"):
+    val only = dev()
+    val leafSet = leaf(List(only))
+    val upperSet = upper(1, List(leafSet))
+    val free = fixedLookup(Map(only -> 10L))
     assertThrows[AllocationError]:
       Await.result(
-        upperSet.selectRebuildDevice(0L, dev(), Set.empty, lookup, new Random(8)), timeout)
+        upperSet.selectRebuildDevice(
+          500L, dev(), Set.empty, lookupFor(leafSet), free, new Random(12)), timeout)
 
   test("rebuild: empty member devices fails with AllocationError"):
     val set = leaf(Nil)
     val lookup = fixedLookup(Map.empty[StorageDeviceId, Long].withDefaultValue(9999L))
     assertThrows[AllocationError]:
       Await.result(
-        set.selectRebuildDevice(0L, dev(), Set.empty, lookup, new Random(9)), timeout)
+        set.selectRebuildDevice(0L, dev(), Set.empty, noLookup, lookup, new Random(9)), timeout)
 
   test("rebuild: identical seed produces identical selection"):
     val failed = dev()
@@ -270,9 +294,9 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val set = leaf(failed :: devices)
     val lookup = fixedLookup((failed :: devices).map(_ -> 9999L).toMap)
     val a = Await.result(
-      set.selectRebuildDevice(500L, failed, Set(failed), lookup, new Random(123)), timeout)
+      set.selectRebuildDevice(500L, failed, Set(failed), noLookup, lookup, new Random(123)), timeout)
     val b = Await.result(
-      set.selectRebuildDevice(500L, failed, Set(failed), lookup, new Random(123)), timeout)
+      set.selectRebuildDevice(500L, failed, Set(failed), noLookup, lookup, new Random(123)), timeout)
     a should be(b)
 
   test("selectDeviceWithSpace: level 0 prefers non-soft-excluded devices"):

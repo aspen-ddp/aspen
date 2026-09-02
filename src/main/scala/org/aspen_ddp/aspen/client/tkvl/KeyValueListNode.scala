@@ -46,7 +46,7 @@ class KeyValueListNode(val reader: ObjectReader,
 
     val p = Promise[KeyValueListNode]()
 
-    def scan(right: KeyValueListPointer): Unit = reader.read(right.pointer, s"Scanning right KVListNode node ${pointer.id}. Minimum: $minimum. target: $target") onComplete {
+    def scan(right: KeyValueListPointer): Unit = reader.read(right.pointer, s"Scanning right KVListNode node ${right.pointer.id}. Minimum: ${right.minimum}. target: $target") onComplete {
       case Failure(err) => p.failure(err)
 
       case Success(kvos) =>
@@ -123,6 +123,18 @@ class KeyValueListNode(val reader: ObjectReader,
     KeyValueListNode.splitAt(node, ordering, splitAtKey, inclusive, optionalDownPointer, allocator)
   }
 
+  /** Reads the node `nodeTail` points at. Every rightward walk advances through here.
+   *
+   *  `ctx` is the diagnostic handed to the reader. Callers name themselves and the node they
+   *  are advancing *from*.
+   */
+  private def readNext(nodeTail: KeyValueListPointer, ctx: String): Future[KeyValueListNode] =
+    reader.read(nodeTail.pointer, ctx).map { kvos =>
+      new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
+        kvos.revision, kvos.refcount, kvos.contents,
+        kvos.right.map(v => KeyValueListPointer(v.bytes)))
+    }
+
   def foldLeft[B](initialZ: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] = {
     val p = Promise[B]()
 
@@ -132,17 +144,13 @@ class KeyValueListNode(val reader: ObjectReader,
       node.tail match {
         case None => p.success(newz)
 
-        case Some(nodeTail) => reader.read(nodeTail.pointer, s"foldLeft() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
+        case Some(nodeTail) =>
+          readNext(nodeTail, s"foldLeft() KVListNode node ${node.pointer.id}. Minimum: ${node.minimum}.") onComplete {
 
-          case Failure(err) => p.failure(err)
+            case Failure(err) => p.failure(err)
 
-          case Success(kvos) =>
-            val nextNode = new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
-              kvos.revision, kvos.refcount, kvos.contents,
-              kvos.right.map(v => KeyValueListPointer(v.bytes)))
-
-            recurse(newz, nextNode)
-        }
+            case Success(nextNode) => recurse(newz, nextNode)
+          }
       }
     }
 
@@ -151,15 +159,59 @@ class KeyValueListNode(val reader: ObjectReader,
     p.future
   }
 
-  def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] = {
+  /** Visit every entry in this node and in every node to its right.
+   *
+   *  Exactly `foreachFrom(Key.AbsoluteMinimum, fn)`: all three KeyOrderings compare every key
+   *  as greater than or equal to the empty key, so foreachFrom's filter is a total no-op at
+   *  that bound.
+   *
+   *  A failing `fn` is logged and the walk continues to the next key. A failing read fails the
+   *  returned future.
+   */
+  def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
+    walkFrom(Key.AbsoluteMinimum, fn, "foreach")
+
+  /** Visit every entry at or above `minKey`, from this node rightward.
+   *
+   *  The open-ended counterpart to foreachInRange: keys are arbitrary-length byte arrays, so
+   *  there is no maximum key that could serve as an upper bound.
+   *
+   *  Every node's contents are filtered, not just the head node's. When reached through
+   *  TieredKeyValueList.foreachFrom the filter is a no-op past the first node, but filtering
+   *  unconditionally keeps this correct when called directly on a node to the left of minKey.
+   *
+   *  As with foreach and foreachInRange, a failing `fn` is logged and the walk continues.
+   */
+  def foreachFrom(minKey: Key,
+                  fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
+    walkFrom(minKey, fn, "foreachFrom")
+
+  /** Shared body of foreach and foreachFrom.
+   *
+   *  `label` is the name of the method the caller actually invoked; it appears in both the
+   *  read diagnostics and the `fn`-failure log so those stay accurate across the two entry
+   *  points.
+   */
+  private def walkFrom(minKey: Key,
+                       fn: (KeyValueListNode, Key, ValueState) => Future[Unit],
+                       label: String): Future[Unit] =
     val p = Promise[Unit]()
 
-    def recurse(node: KeyValueListNode, contents: List[(Key,ValueState)]): Unit = {
+    def inRange(node: KeyValueListNode): List[(Key, ValueState)] =
+      node.contents.filter(tpl => ordering.compare(tpl._1, minKey) >= 0)
+        .toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+
+    // The only place a node is paired with a list of contents. Routing every node through a
+    // function of one argument leaves the walk nowhere to pair a node with some other node's
+    // contents, which is the defect this branch fixed twice.
+    def advance(node: KeyValueListNode): Unit = recurse(node, inRange(node))
+
+    def recurse(node: KeyValueListNode, contents: List[(Key, ValueState)]): Unit = {
       contents.headOption match
         case Some((key, value)) =>
           fn(node, key, value) onComplete:
             case Failure(err) =>
-              logger.error(f"Failure in KeyValueListNode.foreach: $err", err)
+              logger.error(f"Failure in KeyValueListNode.$label: $err", err)
               recurse(node, contents.tail)
             case Success(_) =>
               recurse(node, contents.tail)
@@ -170,37 +222,44 @@ class KeyValueListNode(val reader: ObjectReader,
               p.success(())
 
             case Some(nodeTail) =>
-              reader.read(nodeTail.pointer, s"foreach() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
+              readNext(nodeTail, s"$label() KVListNode node ${node.pointer.id}. Minimum: ${node.minimum}.") onComplete {
 
                 case Failure(err) =>
                   p.failure(err)
 
-                case Success(kvos) =>
-                  val nextNode = new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
-                    kvos.revision, kvos.refcount, kvos.contents,
-                    kvos.right.map(v => KeyValueListPointer(v.bytes)))
-
-                  val contents = node.contents.toList.sortWith((a,b) => ordering.compare(a._1, b._1) < 0)
-
-                  recurse(nextNode, contents)
+                case Success(nextNode) =>
+                  advance(nextNode)
               }
     }
 
-    val contents = this.contents.toList.sortWith((a,b) => ordering.compare(a._1, b._1) < 0)
-    recurse(this, contents)
+    advance(this)
 
     p.future
-  }
 
+  /** Visit every entry in `[minKey, maxKey)`, from this node rightward.
+   *
+   *  Kept separate from walkFrom rather than folded into it behind an optional upper bound:
+   *  the bounded and unbounded walks are easier to tell apart as distinct methods.
+   *
+   *  As with foreach and foreachFrom, a failing `fn` is logged and the walk continues.
+   */
   def foreachInRange(minKey: Key,
                      maxKey: Key,
                      fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
     val p = Promise[Unit]()
 
+    def inRange(node: KeyValueListNode): List[(Key, ValueState)] =
+      node.contents
+        .filter(tpl => ordering.compare(tpl._1, minKey) >= 0 && ordering.compare(tpl._1, maxKey) < 0)
+        .toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+
+    // As in walkFrom: the only place a node is paired with a list of contents.
+    def advance(node: KeyValueListNode): Unit = recurse(node, inRange(node))
+
     def recurse(node: KeyValueListNode, contents: List[(Key, ValueState)]): Unit = {
       contents.headOption match
         case Some((key, value)) =>
-          fn(node, key, value) onComplete :
+          fn(node, key, value) onComplete:
             case Failure(err) =>
               logger.error(f"Failure in KeyValueListNode.foreachInRange: $err", err)
               recurse(node, contents.tail)
@@ -213,32 +272,24 @@ class KeyValueListNode(val reader: ObjectReader,
               p.success(())
 
             case Some(nodeTail) =>
-              if ordering.compare(maxKey, minimum) < 0 then
+              // nodeTail.minimum is the minimum key of the node we are about to read. The
+              // range is [minKey, maxKey), so a next node whose minimum is at or above maxKey
+              // holds nothing in range and neither does anything to its right.
+              if ordering.compare(maxKey, nodeTail.minimum) <= 0 then
                 p.success(())
               else
-                reader.read(nodeTail.pointer, s"foreachInRange() KVListNode node ${pointer.id}. Minimum: $minimum.") onComplete {
+                readNext(nodeTail, s"foreachInRange() KVListNode node ${node.pointer.id}. Minimum: ${node.minimum}.") onComplete {
 
                   case Failure(err) =>
                     p.failure(err)
 
-                  case Success(kvos) =>
-                    val nextNode = new KeyValueListNode(reader, kvos.ida, kvos.pointer, ordering, nodeTail.minimum,
-                      kvos.revision, kvos.refcount, kvos.contents,
-                      kvos.right.map(v => KeyValueListPointer(v.bytes)))
-
-                    val contents = node.contents.filter:
-                          tpl => ordering.compare(tpl._1, minKey) >= 0 && ordering.compare(tpl._1, maxKey) < 0
-                        .toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
-
-                    recurse(nextNode, contents)
+                  case Success(nextNode) =>
+                    advance(nextNode)
                 }
     }
 
-    val contents = this.contents.filter:
-        tpl => ordering.compare(tpl._1, minKey) >= 0 && ordering.compare(tpl._1, maxKey) < 0
-      .toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+    advance(this)
 
-    recurse(this, contents)
     p.future
 }
 

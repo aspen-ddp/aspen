@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.*
-import org.aspen_ddp.aspen.common.metadata.management.MigratePoolToSetDurableTask
+import org.aspen_ddp.aspen.common.metadata.management.{FailedStorageDeviceDurableTask, MigratePoolToSetDurableTask}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -330,6 +330,7 @@ abstract class BaseAspenClient(
     // the test client runCreate performs a single attempt regardless.
     def onFail(err: Throwable): Future[Unit] = err match
       case e: KeyAlreadyExists => throw StopRetrying(e)
+      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
       case _ => Future.unit
 
     val fStaged = runCreate(onFail): tx =>
@@ -378,6 +379,15 @@ abstract class BaseAspenClient(
         }.toList
 
       def stageDeviceUpdate(du: DeviceUpdate): CheckStorageDevice =
+        // collectDevices re-reads device state on every retry attempt, so this catches a device
+        // tombstoned after createNewStoragePool's pre-flight check. The partially staged
+        // transaction (allocated objects, staged puts) is discarded by transact's invalidation
+        // on failure, as at createStorageDevice (lines 298-302). No test covers this guard
+        // because deterministically staging the tombstone-during-retry race is not worth
+        // contorting the suite for.
+        if du.state.isFailed then
+          throw AspenClient.DeviceFailed(du.storageDeviceId)
+
         val updates = du.stores.map { storeId =>
           storeId -> StorageDeviceState.StoreEntry(
             StorageDeviceState.StoreStatus.Initializing,
@@ -470,6 +480,10 @@ abstract class BaseAspenClient(
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
       case e: SameSetNoOp => throw StopRetrying(e)
+      // Without this, anything else -- a CorruptedObject on a read, say -- throws MatchError out
+      // of the handler, ExponentialBackoffRetryStrategy catches it, reschedules, and the promise
+      // never completes.
+      case _ => Future.unit
 
     val migrated = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
@@ -538,6 +552,35 @@ abstract class BaseAspenClient(
 
     migrated.recover:
       case _: SameSetNoOp => ()
+
+  override def failStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = clientContext
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: ReadError => throw StopRetrying(e)
+      case e: AspenClient.DeviceAlreadyFailed => throw StopRetrying(e)
+      // Anything else would throw MatchError out of the handler and leave the promise forever
+      // incomplete. The CLI's 30 s Await.ready bounds what the operator sees to a timeout
+      // message, but the retry loop would go on running in the background regardless.
+      case _ => Future.unit
+
+    transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+
+      for
+        devPtr <- getStorageDevicePointer(deviceId)
+        devKvos <- read(devPtr, "fail storage device")
+        state = StorageDeviceState(devKvos)
+        _ <-
+          if state.isFailed then
+            throw AspenClient.DeviceAlreadyFailed(deviceId)
+          else
+            // Only the device id is recorded. The task re-reads everything else -- including the
+            // device's set -- inside its own transactions, so nothing here can go stale between
+            // enrollment and the first pass.
+            FailedStorageDeviceDurableTask.prepareSystemTask(this, deviceId)
+      yield ()
 
   override def prepareSystemDurableTask(taskTypeUUID: UUID,
                                         initialState: Map[Key, Array[Byte]])

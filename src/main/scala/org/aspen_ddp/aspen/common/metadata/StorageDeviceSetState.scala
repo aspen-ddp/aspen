@@ -39,9 +39,10 @@ object StorageDeviceSetState:
    *  and the old set's `memberDevices` (device removed).
    *
    *  No-op if the device is already in the target set. Fails with NoSuchElementException
-   *  if the device or a set object cannot be found, or NotLevelZero if the target set is
-   *  not level 0. The old set is updated even if it did not actually list the device
-   *  (self-healing toward the correct final state). */
+   *  if the device or a set object cannot be found, NotLevelZero if the target set is
+   *  not level 0, or AspenClient.DeviceFailed if the device is tombstoned. The old set is
+   *  updated even if it did not actually list the device (self-healing toward the correct
+   *  final state). */
   def moveDevice(client: AspenClient,
                  deviceId: StorageDeviceId,
                  targetSetId: StorageDeviceSetId): Future[Unit] =
@@ -52,6 +53,11 @@ object StorageDeviceSetState:
         devPtr <- client.getStorageDevicePointer(deviceId)
         devKvos <- client.read(devPtr)
         deviceState = StorageDeviceState(devKvos)
+        // A tombstoned device is a member of no set at all -- step 1 of the failure task removes
+        // it from the one it was in. Re-admitting it pollutes rebalancer accounting with a
+        // device that holds nothing reachable, and two tombstones in one set collide on
+        // UUID(0,0) in common/rebalancing/State.scala's device map, silently dropping one.
+        _ = if deviceState.isFailed then throw AspenClient.DeviceFailed(deviceId)
         oldSetId = deviceState.storageDeviceSet
         targetPtr <- client.getStorageDeviceSetPointer(targetSetId)
         targetDos <- client.read(targetPtr)
@@ -89,6 +95,12 @@ object StorageDeviceSetState:
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
       case e: NotLevelZero => throw StopRetrying(e)
+      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
+      // Without this, an unlisted error -- a CorruptedObject on any of the three reads, say --
+      // MatchErrors out of onFail, ExponentialBackoffRetryStrategy catches it and reschedules,
+      // and the promise never completes. The only caller is the move-device-to-set CLI command,
+      // which is Await-bounded, so the operator sees a timeout while the loop runs on unseen.
+      case _ => Future.unit
 
     client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prep(tx)
@@ -133,11 +145,15 @@ final case class StorageDeviceSetState(
    *  being rebuilt; its current size (the pool's per-store usage record, or 0 if absent)
    *  is the amount of free space a candidate device must have.
    *
-   *  Only valid for level-0 sets; level-1+ sets fail with `AllocationError` without any
-   *  reads. The pool object is read directly via its pointer so the per-store size key
-   *  and the config come from a single read. See `selectRebuildDevice` for the selection
-   *  policy (failed device hard-excluded, other pool devices soft-excluded, free space
-   *  required). All failures are `Future.failed(AllocationError(...))`.
+   *  Valid at any level: a level-1+ set recurses into its member sets. The pool object is read
+   *  directly via its pointer so the per-store size key and the config come from a single read.
+   *  See `selectRebuildDevice` for the selection policy (failed device hard-excluded, other pool
+   *  devices soft-excluded, free space required). All failures are
+   *  `Future.failed(AllocationError(...))`.
+   *
+   *  Callers must select BEFORE repointing the pool: the failed device is derived from
+   *  `poolState.stores(failedIndex)`, so a pool already repointed elsewhere would hard-exclude
+   *  the wrong device.
    */
   def selectDeviceForRebuild(
       poolId: PoolId,
@@ -146,10 +162,7 @@ final case class StorageDeviceSetState(
       rng: Random = new Random()
   ): Future[StorageDeviceId] =
     given ExecutionContext = client.clientContext
-    if level != 0 then
-      Future.failed(AllocationError(
-        s"selectDeviceForRebuild only supports level-0 sets; set ${setId.uuid} is level $level"))
-    else if memberDevices.isEmpty then
+    if level == 0 && memberDevices.isEmpty then
       Future.failed(AllocationError(
         s"StorageDeviceSet ${setId.uuid} (level 0) has no member devices"))
     else
@@ -172,6 +185,7 @@ final case class StorageDeviceSetState(
               requiredSize,
               failedDevice,
               poolDevices,
+              client.getStorageDeviceSetState,
               id => client.getStorageDeviceState(id).map(s => s.totalSize - s.currentUsage),
               rng)
       yield device
@@ -341,26 +355,22 @@ final case class StorageDeviceSetState(
 
   /** Select a device to host a store rebuilt from scratch (its data was lost).
    *
-   *  Only valid for level-0 sets. The failed device is hard-excluded; devices already hosting
-   *  a store in the pool (`poolDevices`) are soft-excluded. This is `selectDeviceWithSpace`
-   *  with the level-0 restriction retained -- the refactor beneath it is behavior-preserving,
-   *  not a widening of it.
+   *  The failed device is hard-excluded; devices already hosting a store in the pool
+   *  (`poolDevices`) are soft-excluded. Level-1+ sets recurse through `lookup`, so a pool
+   *  assigned to a tiered set can be rebuilt within that tier.
    */
   private[metadata] def selectRebuildDevice(
       requiredSize: Long,
       failedDevice: StorageDeviceId,
       poolDevices: Set[StorageDeviceId],
+      lookup: StorageDeviceSetId => Future[StorageDeviceSetState],
       freeSpaceLookup: StorageDeviceId => Future[Long],
       rng: Random
   )(using ec: ExecutionContext): Future[StorageDeviceId] =
-    if level != 0 then
-      Future.failed(AllocationError(
-        s"selectDeviceForRebuild only supports level-0 sets; set ${setId.uuid} is level $level"))
-    else
-      selectDeviceWithSpace(
-        requiredSize,
-        hardExclude = Set(failedDevice),
-        softExclude = poolDevices,
-        lookup = _ => Future.failed(new IllegalStateException("a level-0 set must not recurse")),
-        freeSpaceLookup = freeSpaceLookup,
-        rng = rng)
+    selectDeviceWithSpace(
+      requiredSize,
+      hardExclude = Set(failedDevice),
+      softExclude = poolDevices,
+      lookup = lookup,
+      freeSpaceLookup = freeSpaceLookup,
+      rng = rng)

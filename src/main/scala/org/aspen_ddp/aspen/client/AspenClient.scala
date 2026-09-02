@@ -24,6 +24,14 @@ object AspenClient:
   class StoreNotActive(storeId: StoreId) extends Exception(s"Store $storeId is not in the Active state")
   class InvalidDeviceSetLevel(childLevel: Int, parentLevel: Int)
     extends Exception(s"Device set level $childLevel must be less than parent level $parentLevel")
+  /** A store was about to be written onto a device an operator has declared dead. Terminal:
+   *  retrying cannot help, since a tombstone is one-way. */
+  class DeviceFailed(deviceId: StorageDeviceId)
+    extends Exception(s"Storage device ${deviceId.uuid} has been declared failed")
+  /** fail-storage-device was invoked against a device that already carries a tombstone.
+   *  Terminal: the tombstone is one-way, and a recovered device is re-introduced under a new id. */
+  class DeviceAlreadyFailed(deviceId: StorageDeviceId)
+    extends Exception(s"Storage device ${deviceId.uuid} has already been declared failed")
 
 /** The primary interface for applications using Aspen object storage: object allocation,
  *  transaction building, and object retrieval.
@@ -190,6 +198,21 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    */
   def migratePoolToSet(poolId: PoolId, targetSetId: StorageDeviceSetId): Future[Unit]
 
+  /** Declare `deviceId` dead and begin reconstructing every store that lived on it.
+   *
+   *  One transaction enrolls a FailedStorageDeviceDurableTask, which then tombstones the device
+   *  -- removing it from its set and its owning host and zeroing both ids -- and moves its stores
+   *  one at a time onto live devices of each store's pool's set, marked Rebuilding. Returns as
+   *  soon as the enrollment commits; progress is observable via `show-device`.
+   *
+   *  The tombstone is one-way. A recovered device is re-introduced as a new device with a new id.
+   *
+   *  Fails with NoSuchElementException if the device does not exist, or DeviceAlreadyFailed if it
+   *  is already tombstoned. Two simultaneous calls both enroll, which is harmless: the task's
+   *  steps are idempotent and racing drains lose on their KeyRevision requirements and retry.
+   */
+  def failStorageDevice(deviceId: StorageDeviceId): Future[Unit]
+
   def transact[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     val tx = newTransaction()
 
@@ -225,6 +248,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       set <- getStorageDeviceSetState(storageDeviceSet)
       deviceIds <- set.selectDevicesForPool(ida.width, this)
       devices <- Future.sequence(deviceIds.map(sid => getStorageDeviceState(sid)))
+      // A tombstoned device's zeroed storageDeviceId would otherwise flow into
+      // StoragePoolState.StoreEntry on the next line and blow up collectDevices' tree lookup
+      // before any downstream guard can run. Report the real id, not the zeroed one.
+      _ = deviceIds.zip(devices).find((_, dev) => dev.isFailed).foreach((sid, _) => throw DeviceFailed(sid))
       stores = devices.map(dev => StoragePoolState.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
       config = StoragePoolState(
         poolId,
@@ -248,6 +275,12 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: InvalidDestination => throw StopRetrying(e)
       case e: StoreNotActive => throw StopRetrying(e)
+      case e: DeviceFailed => throw StopRetrying(e)
+      // Without this, an unlisted error -- a CorruptedObject on either device read, say --
+      // MatchErrors out of onFail, ExponentialBackoffRetryStrategy catches it and reschedules,
+      // and the promise never completes. MigratePoolToSetDurableTask.tryStores awaits this
+      // future inside a pass, so that permanently wedges the migration task's single-flight flag.
+      case _ => Future.unit
 
     val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
@@ -272,6 +305,11 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       yield
         if sourceId == destinationId then
           throw InvalidDestination()
+
+        // A store on a tombstoned device is silently lost: nothing reconciles it, because
+        // reconcileDeviceState ignores failed devices outright.
+        if dstState.isFailed then
+          throw DeviceFailed(destinationId)
 
         srcState.stores.get(storeId) match
           case None => throw StoreNotActive(storeId)

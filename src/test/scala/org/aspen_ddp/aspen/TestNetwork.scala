@@ -192,12 +192,20 @@ class TestNetwork(executionContext: ExecutionContext,
   /** A second, empty device in the bootstrap set so stores have a transfer destination. */
   val secondDeviceId: StorageDeviceId = StorageDeviceId(new UUID(0, 100))
 
-  /** Register a second, empty StorageDeviceState in the StorageDevicesTree and append it to
+  /** A third, empty device, for scenarios that need a destination distinct from both the
+   *  bootstrap device and the second device. */
+  val thirdDeviceId: StorageDeviceId = StorageDeviceId(new UUID(0, 101))
+
+  def createSecondDevice(): Future[Unit] = createDevice(secondDeviceId)
+
+  def createThirdDevice(): Future[Unit] = createDevice(thirdDeviceId)
+
+  /** Register an empty StorageDeviceState in the StorageDevicesTree and append it to
    *  the bootstrap set's memberDevices. Mirrors Bootstrap's device indexing. */
-  def createSecondDevice(): Future[Unit] =
+  def createDevice(deviceId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = executionContext
     val sd = StorageDeviceState(
-      secondDeviceId,
+      deviceId,
       bootstrapHost.hostId,
       0L, 1_000_000L,
       Map.empty,
@@ -213,10 +221,10 @@ class TestNetwork(executionContext: ExecutionContext,
                     Map(StorageDeviceState.StateKey -> Value(sd.encode())))
         setPtr <- client.getStorageDeviceSetPointer(StorageDeviceSetId.BootstrapStorageDeviceSetId)
         setDos <- client.read(setPtr)
-        _ <- devicesTkvl.set(Key(secondDeviceId.uuid), Value(devPtr.toArray))
+        _ <- devicesTkvl.set(Key(deviceId.uuid), Value(devPtr.toArray))
       yield
         val curSet = StorageDeviceSetState(setDos)
-        val updated = curSet.copy(memberDevices = curSet.memberDevices :+ secondDeviceId)
+        val updated = curSet.copy(memberDevices = curSet.memberDevices :+ deviceId)
         tx.overwrite(setPtr, setDos.revision, DataBuffer(updated.toBytes))
 
   /** Simulate completion of a single store transfer by performing the same metadata flip

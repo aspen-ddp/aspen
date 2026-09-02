@@ -261,10 +261,15 @@ node's contents are visited paired with the wrong node, and the last node's cont
 visited at all.
 
 `foreachInRange` has the same slip, plus a second: its termination test compares `maxKey`
-against the *current* node's `minimum` rather than `nodeTail.minimum`, so it stops one node
-late or early depending on the range. The fix is to compare against `nodeTail.minimum` — the
-minimum key of the node about to be read — with `<= 0`, since the range is `[minKey, maxKey)`
-and a next node whose minimum equals `maxKey` holds nothing in range.
+against a bare `minimum`, which binds to the *class field* — the minimum of the node the walk
+started on — and so is constant for the entire recursion rather than tracking the node about to
+be read. Reached through `TieredKeyValueList.foreachInRange` the start node comes from
+`fetchContainingNode(minKey)`, so `minimum <= minKey <= maxKey` always holds and the guard
+never fired at all. The walk read every remaining tier-0 node through to the end of the list on
+every range query: unbounded read amplification, not an off-by-one. The fix is to compare
+against `nodeTail.minimum` — the minimum key of the node about to be read — with `<= 0`, since
+the range is `[minKey, maxKey)` and a next node whose minimum equals `maxKey` holds nothing in
+range.
 
 Both bugs are entirely within `KeyValueListNode`. `TieredKeyValueList.foreach` and
 `foreachInRange` only descend to the containing tier-0 node and delegate, so they need no fix.
@@ -274,9 +279,13 @@ splits, `tail` is `None`, and the buggy branch never runs.
 
 **`foreachFrom(minKey, fn)`** is new, at both levels. A resume needs "from this key to the
 end," and `foreachInRange` cannot express it: keys are arbitrary-length byte arrays, so there
-is no maximum key to pass as the upper bound. At the `TieredKeyValueList` level it is
-`foreach` with `minKey` in place of `Key.AbsoluteMinimum` in the `fetchContainingNode` call; at
-the node level it is `foreach` with the head node's contents filtered to `>= minKey`.
+is no maximum key to pass as the upper bound. It is the general form of `foreach`, and the
+dependency runs that way in the implementation: `foreach` is `foreachFrom(Key.AbsoluteMinimum)`
+at both levels, since filtering to `>= Key.AbsoluteMinimum` is a no-op under every
+`KeyOrdering`. Every node's contents are filtered to `>= minKey`, not just the head node's —
+past the first node the filter is a no-op, but only when the walk was entered through
+`fetchContainingNode`. The bound is inclusive: a caller resuming from a checkpointed key
+re-visits that key, so per-key work must be idempotent.
 
 Both functions also swallow a failing `fn` — they log and continue. That is left as-is; the
 rebuild copes with it explicitly (see error handling), and changing it would alter behavior for

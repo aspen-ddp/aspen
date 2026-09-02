@@ -446,6 +446,24 @@ object Main {
             action((x, c) => c.copy(deviceSetName = x)),
         )
 
+      cmd("fail-storage-device").text("Declares a storage device dead and rebuilds its stores elsewhere").
+        action((_, c) => c.copy(mode = "fail-storage-device")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<device-uuid>").text("UUID of the storage device to declare failed").
+            action((x, c) => c.copy(deviceId = x)).
+            validate { x =>
+              try
+                UUID.fromString(x)
+                success
+              catch
+                case _: Throwable => failure("Storage device id must be a valid UUID")
+            },
+        )
+
       // A single trailing slash on <device-name> is tolerated and stripped: tab-completing
       // inside storage-devices/ yields "dev0/". Shared by that argument's action and
       // validate so the stored name cannot drift from the one that was validated.
@@ -739,6 +757,7 @@ object Main {
             case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
             case "move-device-to-set" => move_device_to_set(bootstrapConfigPath, cfg.deviceId, cfg.deviceSetName)
+            case "fail-storage-device" => fail_storage_device(bootstrapConfigPath, cfg.deviceId)
             case "add-host" => add_host(bootstrapConfig, bootstrapConfigPath,
                                         absPath(cfg.hostDirectory), cfg.hostName, cfg.address,
                                         cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
@@ -1534,6 +1553,43 @@ object Main {
     awaitAndReport(f):
       case Success(_) =>
         println(s"Device '$deviceIdStr' moved to set '$setRef'")
+      case Failure(err) => reportError(err)
+  }
+
+  def fail_storage_device(bootstrapConfigFile: os.Path,
+                          deviceIdStr: String): Int = {
+
+    configureLogging()
+
+    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val deviceId = StorageDeviceId(UUID.fromString(deviceIdStr))
+
+    val f = client.failStorageDevice(deviceId)
+
+    // getStorageDevicePointer throws NoSuchElementException for an unknown id;
+    // failStorageDevice throws DeviceAlreadyFailed when the device already carries a tombstone.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: NoSuchElementException =>
+        println(s"Error: storage device '$deviceIdStr' not found")
+      case _: AspenClient.DeviceAlreadyFailed =>
+        println(s"Error: storage device '$deviceIdStr' has already been declared failed")
+      case e =>
+        println(s"Error failing storage device: ${e.getMessage}")
+
+    awaitAndReport(f):
+      case Success(_) =>
+        println(s"Storage device '$deviceIdStr' declared failed.")
+        println("Its stores have been marked for rebuild onto live devices, but server-side")
+        println("reconstruction is NOT YET IMPLEMENTED: nothing acts on those marks, so the")
+        println("slices that lived on this device are unavailable until it is. The tombstone")
+        println("is one-way.")
+        println("Watch the marks with:")
+        println(s"  show-device $bootstrapConfigFile $deviceIdStr")
       case Failure(err) => reportError(err)
   }
 

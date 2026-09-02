@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StoragePool, Transaction, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -54,7 +54,23 @@ object StoreManager:
   private case class CheckAllDevices() extends Event
   private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
   private case class InitializeTaskExecutor() extends Event
-  
+
+  /** What updateStateForTransferredStore decided about a transfer that has finished shipping
+   *  bytes, so its caller knows whether the destination is allowed to keep the copy that just
+   *  arrived.
+   *
+   *  Returned rather than acted on inside that method because the two halves live on opposite
+   *  sides of the boundary: the decision is metadata and belongs in the transaction, while
+   *  loading or discarding a store directory is local disk work that only the event loop does.
+   */
+  private[aspen] enum TransferOutcome:
+    /** The pool now names the destination, which therefore owns the arrived copy. */
+    case PoolRepointed
+
+    /** The destination was declared failed mid-flight, so the source was put back to Active and
+     *  the pool left naming it. The arrived copy belongs to nobody. */
+    case SourceRestored
+
 
   class IOHandler(mgr: StoreManager) extends CompletionHandler:
     override def complete(op: Completion): Unit =
@@ -117,6 +133,7 @@ class StoreManager(val client: AspenClient,
   private var transferringOut: Map[StoreId, StoreTransferOut] = Map()
   private var transferringInUUIDs: Map[UUID, StoreTransferIn] = Map()
   private var transferringInStoreIds: Set[StoreId] = Set()
+  private var abandoningTransferIns: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
   private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
@@ -363,39 +380,48 @@ class StoreManager(val client: AspenClient,
     storageDevices.get(storageDeviceId).map(_.devicePath)
   }
 
-  private def updateStateForTransferredStore(storeId: StoreId,
-                                             fromDeviceId: StorageDeviceId,
-                                             toDeviceid: StorageDeviceId): Future[Unit] =
-    client.transactUntilSuccessful: tx =>
-      
-      def prepUpdateBootstrapConfig(poolCfg: StoragePoolState, toDevice: StorageDeviceState): Future[Unit] =
-        if storeId.poolId != PoolId.BootstrapPoolId then
-          Future.unit
-        else 
-          for
-            toHost <- client.getHostState(toDevice.hostId)
-            poolHosts <- Future.sequence(poolCfg.stores.zipWithIndex.toList.map((e, index) => client.getHostState(e.hostId).map(host => (StoreId(storeId.poolId, index.toByte), host))))
-            radicleKvos <- client.read(client.radicle)
-          yield
-            val hostsMap = poolHosts.map((_, host) => host.hostId -> host).toMap + (toHost.hostId -> toHost)
-            val hostsList = hostsMap.valuesIterator.toList
-            val storeMap = poolHosts.map: (sid, host) =>
-              if sid == storeId then
-                (sid, toHost.hostId)
-              else
-                (sid, host.hostId)
-                
-            val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
-              aspenSystemId,
-              poolCfg.ida,
-              hostsList,
-              storeMap
-            )
+  /** Records the outcome of a store transfer that has finished shipping bytes.
+   *
+   *  Normally: the pool is repointed at the destination, the source drops the store, and the
+   *  destination gains an Active entry.
+   *
+   *  If the destination was declared failed while the transfer was in flight, none of that is
+   *  safe, and the failure is silent rather than loud. Its hostId reads as HostId(0,0), so the
+   *  pool would be repointed at a host that does not exist. reconcileDeviceState ignores a failed
+   *  device outright, so nothing on the destination would ever serve the store. And the only
+   *  thing that could rebuild it -- FailedStorageDeviceDurableTask's drain -- has already dropped
+   *  the entry, or will, precisely because a TransferringIn entry means the destination does not
+   *  own the store. The slice would be lost with a pool entry that still looks healthy.
+   *
+   *  So take the repair instead: put the source's entry back to Active, leave the pool naming the
+   *  source (it never stopped), and leave the tombstone's own store map alone -- that map is the
+   *  drain's work list and its to remove.
+   *
+   *  The returned TransferOutcome is how the caller learns which of the two happened. It must not
+   *  load the arrived copy on the restore path: nothing would ever reclaim it, since the
+   *  deleted-stores pass looks only at offlineStores and reconcileDeviceState ignores a failed
+   *  device outright.
+   *
+   *  protected so a test subclass can observe the returned Future; the production caller is
+   *  startStoreTransferIn.
+   */
+  protected def updateStateForTransferredStore(storeId: StoreId,
+                                               fromDeviceId: StorageDeviceId,
+                                               toDeviceid: StorageDeviceId): Future[TransferOutcome] =
+    // Nothing consumes the Future this returns, so under a bare transactUntilSuccessful a
+    // permanent error is a 60 s retry loop that runs for the life of the process and reports
+    // nothing at all. These are the permanent classes: an id with no entry in its tree, a pool
+    // index the config does not have, generateBootstrapConfig's two requires, and an object that
+    // cannot be read. The catch-all keeps every other error on the retry path, where a lost
+    // transaction race and a transient read failure belong.
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: IndexOutOfBoundsException => throw StopRetrying(e)
+      case e: IllegalArgumentException => throw StopRetrying(e)
+      case e: FatalReadError => throw StopRetrying(e)
+      case _ => Future.unit
 
-            val reqs = List(KeyRevision(Radicle.BootstrapConfigKey, radicleKvos.contents(Radicle.BootstrapConfigKey).revision))
-            val ops = List(Insert(Radicle.BootstrapConfigKey, bootstrapConfig.getBytes(StandardCharsets.UTF_8)))
-            tx.update(client.radicle, None, None, reqs, ops)
-
+    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       for
         poolPtr <- client.getStoragePoolPointer(storeId.poolId)
         fromDevPtr <- client.getStorageDevicePointer(fromDeviceId)
@@ -405,13 +431,51 @@ class StoreManager(val client: AspenClient,
         toDevKvos <- client.read(toDevPtr)
         poolCfg = StoragePoolState(poolKvos)
         toDev = StorageDeviceState(toDevKvos)
-        _ <- prepUpdateBootstrapConfig(poolCfg, toDev)
+        fromDev = StorageDeviceState(fromDevKvos)
+        // Skipped entirely on the restore path. A tombstone's hostId is HostId(0,0), which has no
+        // entry in the host tree, so prepRadicleUpdate's getHostState on it fails on every
+        // attempt -- and the restore does not move the store between hosts, so there is nothing
+        // for the bootstrap config to learn.
+        //
+        // On the normal path it is called before poolCfg.stores is mutated below, which is the
+        // opposite of the order FailedStorageDeviceDurableTask.moveStore uses. Safe only because
+        // prepRadicleUpdate filters its host list down to the hosts its store map references:
+        // without that, the moved store's old host reaches generateBootstrapConfig with no stores
+        // and trips its require(storesOnHost.nonEmpty).
+        _ <-
+          if toDev.isFailed then
+            Future.unit
+          else
+            BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, toDev.hostId)(using tx)
       yield
-        val fromDev = StorageDeviceState(fromDevKvos)
+        if toDev.isFailed then
+          logger.warn(s"Transfer of store $storeId onto device $toDeviceid finished after that " +
+                      s"device was declared failed. Restoring the store on source device " +
+                      s"$fromDeviceId rather than repointing the pool at a dead device")
+
+          // None when the drain's disown pass has already restored the entry, or when a
+          // concurrent call to this method has. Writing nothing is then correct.
+          fromDev.restoreAbandonedTransferSource(storeId, toDeviceid).foreach: restored =>
+            tx.update(fromDevPtr, None, None,
+              List(KeyRevision(StorageDeviceState.StateKey,
+                fromDevKvos.contents(StorageDeviceState.StateKey).revision)),
+              List(Insert(StorageDeviceState.StateKey, restored.encode())))
+
+            // This method runs on the destination host, so the source is a different
+            // StoreManager and learns nothing from the write above. Its copy is still offline
+            // behind the transfer-out marker while the pool goes on naming it, which means the
+            // slice answers nothing until that host's own poll reinstates it -- up to
+            // Main.CheckStorageDevicesPeriod away. Best-effort, because that poll is the
+            // guarantee and this is only the latency.
+            tx.result.foreach: _ =>
+              client.sendBestEffortHostMessage(
+                CheckStorageDevice(fromDev.hostId, client.clientId, fromDeviceId))
+
+          TransferOutcome.SourceRestored
 
         // If the from device doesn't contain the storeId, we're already done.
         // A concurrent call to this method must have succeeded
-        if fromDev.stores.contains(storeId) then
+        else if fromDev.stores.contains(storeId) then
           poolCfg.stores(storeId.poolIndex) = StoragePoolState.StoreEntry(hostId, toDeviceid)
           val poolReqs = List(KeyRevision(StoragePoolState.ConfigKey, poolKvos.contents(StoragePoolState.ConfigKey).revision))
           val poolOps = List(Insert(StoragePoolState.ConfigKey, poolCfg.encode()))
@@ -448,6 +512,50 @@ class StoreManager(val client: AspenClient,
               RebalancingMessage.encode(
                 TransferComplete(toDev.storageDeviceSet, storeId, fromDeviceId, toDeviceid)))
 
+          TransferOutcome.PoolRepointed
+
+        else
+          // The source has already dropped the store, so a concurrent call to this method
+          // repointed the pool at the destination. The destination owns the arrived copy either
+          // way, so this is the same outcome -- just reached by somebody else.
+          TransferOutcome.PoolRepointed
+
+  /** Reclaims the store copy a transfer just delivered onto a device that turned out to be
+   *  tombstoned.
+   *
+   *  Only reached with TransferOutcome.SourceRestored, which means the pool still names the
+   *  source and the source still holds the data -- so there is nothing here worth keeping. Left
+   *  in place it would be loaded by tryLoadStore on every restart (TransferringIn removes the
+   *  transfer marker from the unpacked copy, so nothing stops it), and if the source happens to
+   *  live on this same host that load would replace the source's entry in `stores`, which is
+   *  keyed by StoreId alone.
+   *
+   *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision.
+   */
+  private def discardArrivedTransferIn(storeId: StoreId,
+                                       toDeviceId: StorageDeviceId): Unit = synchronized {
+    storageDevices.get(toDeviceId) match
+      case None =>
+        // The device map is append-only, so this means the transfer arrived on a device this
+        // process never loaded -- which startStoreTransferIn cannot do. Log rather than assume.
+        logger.warn(s"Cannot discard the copy of store $storeId that arrived on unloaded " +
+                    s"device $toDeviceId")
+
+      case Some(sds) =>
+        val storePath = os.Path(sds.devicePath) / storeId.directoryName
+        if os.exists(storePath) then
+          logger.warn(s"Discarding the copy of store $storeId that arrived on failed device " +
+                      s"$toDeviceId. The pool still names the transfer source, which kept its " +
+                      s"copy, so this one belongs to nobody: $storePath")
+          try
+            os.remove.all(storePath)
+          catch
+            case t: Throwable =>
+              // The store is not loaded, so nothing serves it now. The cost of the leak is a
+              // directory on a dead device that a restart would load and then never route to.
+              logger.error(s"Failed to delete the discarded store copy $storePath. Error: $t")
+  }
+
   private def startStoreTransferIn(storeId: StoreId,
                                    fromHostId: HostId,
                                    fromDeviceId: StorageDeviceId,
@@ -473,8 +581,31 @@ class StoreManager(val client: AspenClient,
         ti.complete.onComplete:
           case Success(_) =>
             cleanup()
-            loadStoreById(toDeviceid, storeId)
-            updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid)
+
+            // Loading is downstream of the metadata decision, not ahead of it. An unconditional
+            // load hands a live copy of the store to a device that updateStateForTransferredStore
+            // may be about to decide must not own it, and nothing would ever take it back.
+            //
+            // Waiting costs no availability: the pool goes on naming the source until that
+            // transaction commits, so nothing routes here before then anyway.
+            updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid).onComplete:
+              case Success(TransferOutcome.PoolRepointed) =>
+                loadStoreById(toDeviceid, storeId)
+
+              case Success(TransferOutcome.SourceRestored) =>
+                discardArrivedTransferIn(storeId, toDeviceid)
+
+              case Failure(t) =>
+                // The only observer this Future has. Its onFail routes the permanent errors to
+                // StopRetrying, which fails the promise -- and an unobserved failed Promise is
+                // not reported by the ExecutionContext, so without this line a permanent give-up
+                // is exactly as silent as the infinite retry loop it replaced. What is left
+                // behind matters: the source's entry stays TransferringOut, which the abandoned
+                // transfer-out pass will not reinstate because it requires Active, so the
+                // source's copy stays offline behind its marker with nothing to say why.
+                logger.error(s"Failed to record the completed transfer of store $storeId from " +
+                             s"device $fromDeviceId to device $toDeviceid. The store is not " +
+                             s"loaded here and the pool still names the source", t)
           case Failure(_) =>
             cleanup()
             startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
@@ -517,8 +648,18 @@ class StoreManager(val client: AspenClient,
           case None => err(s"Store ${m.storeId} not in transfer state. Transfer probably completed")
           case Some(sid) => sid
         toDevice <- client.getStorageDeviceState(toDeviceId)
-        sourceDs = storageDevices.get(fromDevice.storageDeviceId) match
-          case None => err(s"Source storage device for transfer ${fromDevice.storageDeviceId} not loaded. Disk removed?")
+        // The destination was declared failed while the transfer was in flight, so both its ids
+        // read as zero. There is no fresher source for them -- unlike the source device's id
+        // below, which the pool entry carries -- so the only safe thing is to refuse. Shipping
+        // bytes to HostId(0,0) would run indefinitely against a host that does not exist.
+        _ = if toDevice.isFailed then
+              err(s"Destination device $toDeviceId for transfer of store ${m.storeId} has been " +
+                  s"declared failed")
+        // Keyed off the pool entry, not fromDevice.storageDeviceId: those are the same value in
+        // the healthy case, but a tombstoned source zeroes its own copy, and the lookup would
+        // then miss and blame a removed disk for a device that is loaded and present.
+        sourceDs = storageDevices.get(poolEntry.storageDeviceId) match
+          case None => err(s"Source storage device for transfer ${poolEntry.storageDeviceId} not loaded. Disk removed?")
           case Some(sds) => sds
       yield
         synchronized {
@@ -567,7 +708,9 @@ class StoreManager(val client: AspenClient,
       ti.dataReceived(m.data)
   }
 
-  private def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
+  // protected so a test subclass can record the claim instead of transacting against a host
+  // object. Nothing outside StoreManager calls it.
+  protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
     client.transactUntilSuccessful: tx =>
       given Transaction = tx
 
@@ -708,17 +851,26 @@ class StoreManager(val client: AspenClient,
     client.getStorageDeviceState(storageDeviceId)
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
-   *  storage-devices tree: deletes stores transferred away, creates Initializing stores, and
-   *  starts transfers in.
+   *  storage-devices tree: deletes stores transferred away, reinstates stores left offline by an
+   *  abandoned transfer out, creates Initializing stores, and starts transfers in.
    *
    *  If the tree records a different host, none of that happens: the device has migrated here,
    *  so this claims it with updateHostId and re-requests the check once the claim commits.
+   *  A device the tree records as failed is ignored outright: it is neither claimed nor
+   *  reconciled, and its stores are being rebuilt elsewhere.
    *
    *  Callers hold the instance lock; the continuations it registers do not.
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
-    if remote.hostId != hostId then
+    if remote.isFailed then
+      // An operator has declared this device dead. Its directory can still mount -- a dead
+      // controller rather than a dead platter -- and without this the zeroed host id reads as a
+      // migration: updateHostId would call getHostPointer on a host that does not exist, fail
+      // inside transactUntilSuccessful, and retry forever while holding this device's entry in
+      // activeDeviceChecks. Every later check of the device would then be dropped silently.
+      logger.info(s"Ignoring failed storage device ${local.storageDeviceId}")
+    else if remote.hostId != hostId then
       updateHostId(local.storageDeviceId).foreach: _ =>
         checkStorageDevice(local.storageDeviceId)
     else
@@ -737,6 +889,41 @@ class StoreManager(val client: AspenClient,
             os.remove.all(storePath)
           catch
             case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
+
+      //----------------------
+      // Abandoned Transfers Out
+      //
+      // Nothing else ever clears a transfer-out marker from the source. TransferringIn deletes
+      // it only from the destination's unpacked copy, and a transfer that completes normally
+      // has the source's whole store directory deleted by the pass above -- the marker goes with
+      // it. So a transfer that ends without completing, which is what a destination declared
+      // failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads it on
+      // every restart and puts the store straight back into offlineStores.
+      //
+      // That pairs badly with the metadata repair for the same event. That repair puts this
+      // entry back to Active and leaves the pool naming this device, so afterwards the metadata
+      // reads entirely healthy while the slice is served by nobody, here or anywhere. Repairing
+      // the metadata alone would trade a visibly stalled TransferringOut entry for an invisible
+      // outage.
+      //
+      // On the source host's own poll rather than inline at either repair site, because only
+      // this host can touch this disk and one of those two sites -- the drain -- runs wherever
+      // the durable task happens to live. Polling for desired state rather than being told is
+      // also what the rest of this method does.
+      //
+      // The guard is narrow on purpose. Active *and* no transferDevice is the only combination
+      // that says no transfer is outstanding; an entry still TransferringOut, or Active with a
+      // destination still named, means the marker is doing its job. transferringOut is the same
+      // question asked of this process rather than the tree, and covers the window where the
+      // drain restores the entry while this host is still shipping bytes.
+      local.offlineStores.filter(storeId =>
+        !transferringOut.contains(storeId) &&
+        remote.stores.get(storeId).exists(entry =>
+          entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
+        ) &&
+        os.exists(os.Path(local.devicePath) / storeId.directoryName / TransferringOut.MarkerFile)
+      ).foreach: storeId =>
+        reinstateAbandonedTransferOut(local, storeId)
 
       //----------------------
       // New Stores
@@ -758,7 +945,118 @@ class StoreManager(val client: AspenClient,
       }.toList.foreach: (storeId, ofromDeviceId) =>
         ofromDeviceId.foreach: fromDeviceId =>
           client.getStorageDeviceState(fromDeviceId).foreach: fromDevice =>
-            startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+            if fromDevice.isFailed then
+              // A tombstoned source has both ids zeroed, so fromDevice.hostId is HostId(0,0).
+              // Starting the transfer would address every StartStoreTransfer to a host that
+              // does not exist; the messages are dropped, the entry never resolves, and this
+              // check re-sends them forever. Nothing reports the stall either: rebalancing's
+              // ownedStores filters TransferringIn out of its accounting, so the store is
+              // invisible to the rebalancer too.
+              abandonTransferIn(local.storageDeviceId, storeId, fromDeviceId)
+            else
+              startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+
+  /** Brings a store back online after its transfer out was abandoned rather than completed.
+   *
+   *  Purely local: the tree already says Active and the pool already names this device, so there
+   *  is nothing to transact and no retry loop to get wrong. Removing the marker is what makes
+   *  the repair survive a restart; loading is what makes it take effect now.
+   *
+   *  Loading goes through tryLoadStore rather than opening a backend here, because that method
+   *  owns the rest of the bookkeeping -- reading the store config, and clearing the store from
+   *  both this device's offlineStores and the manager's. Those two sets and the marker file are
+   *  three representations of one fact and must not be allowed to disagree.
+   *
+   *  If the load fails after the marker is gone, tryLoadStore's own catch logs it and the store
+   *  stays in offlineStores for the life of the process: this pass will not pick it up again,
+   *  since it keys off the marker that is now removed. The next restart loads it normally. That
+   *  is a far smaller failure than the permanent, silent one this pass exists to close.
+   *
+   *  Caller holds the instance lock and has established the tree entry and the marker.
+   */
+  private def reinstateAbandonedTransferOut(local: LocalStorageDeviceState,
+                                            storeId: StoreId): Unit =
+    val storePath = os.Path(local.devicePath) / storeId.directoryName
+
+    logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline behind a " +
+                s"transfer-out marker, but the storage-devices tree records it as Active with " +
+                s"no transfer outstanding. Clearing the abandoned transfer and loading the store")
+
+    val markerRemoved =
+      try
+        os.remove(storePath / TransferringOut.MarkerFile)
+        true
+      catch
+        case t: Throwable =>
+          // Leave the store offline. Loading it with the marker still in place would be undone
+          // by the next restart, so this pass would have logged a repair that did not hold.
+          logger.error(s"Failed to remove the transfer-out marker for store $storeId at " +
+                       s"$storePath. The store stays offline. Error: $t")
+          false
+
+    if markerRemoved then
+      tryLoadStore(local, storePath.toNIO.toFile)
+
+  /** Drops a TransferringIn entry whose source device has been declared failed.
+   *
+   *  The store itself is not lost: FailedStorageDeviceDurableTask's drain owns the source's
+   *  TransferringOut entry and rebuilds the store onto a live device. This only clears the
+   *  destination's half, which that drain deliberately does not touch.
+   *
+   *  The two cannot fight. The drain writes the source device, the pool, and the rebuild
+   *  destination it selected; this writes only this device. Where they coincide -- the drain
+   *  happening to select this device -- both writes carry a KeyRevision on the same state key,
+   *  so one loses and re-reads: if the drain wins, the entry reads Rebuilding and the guard
+   *  below leaves it alone; if this wins, the drain's Rebuilding entry simply re-adds the store.
+   */
+  private def abandonTransferIn(toDeviceId: StorageDeviceId,
+                                storeId: StoreId,
+                                fromDeviceId: StorageDeviceId): Unit = synchronized {
+    // The entry that triggers this stands until the transaction commits, so every device check
+    // in the meantime calls here again. Without the guard each one starts its own retry loop,
+    // all writing the same key and losing to each other on KeyRevision. Same shape as
+    // createNewStore's creatingStores and startStoreTransferIn's transferringInStoreIds.
+    if ! abandoningTransferIns.contains(storeId) then
+      abandoningTransferIns += storeId
+
+      logger.warn(s"Abandoning transfer of store $storeId onto device $toDeviceId: source " +
+                  s"device $fromDeviceId has been declared failed")
+
+      // Nothing consumes this Future, so a bare transactUntilSuccessful would turn a permanent
+      // error into a silent 60 s loop for the life of the process -- and now that the guard above
+      // is set, one that no later check could ever displace. Only two permanent classes are
+      // reachable from these two reads: a device id with no entry in the storage-devices tree,
+      // and an object that cannot be read. Everything else stays on the retry path.
+      def onFail(err: Throwable): Future[Unit] = err match
+        case e: NoSuchElementException => throw StopRetrying(e)
+        case e: FatalReadError => throw StopRetrying(e)
+        case _ => Future.unit
+
+      val fabandon = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+        for
+          ptr <- client.getStorageDevicePointer(toDeviceId)
+          kvos <- client.read(ptr)
+          state = StorageDeviceState(kvos)
+        yield
+          // Re-read inside the transaction. A concurrent check may have dropped the entry already,
+          // and the entry may have moved on to Rebuilding or Active, neither of which is ours to
+          // remove.
+          state.stores.get(storeId).foreach: entry =>
+            if entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+               entry.transferDevice.contains(fromDeviceId) then
+              val newState = state.removeStore(storeId)
+              tx.update(ptr, None, None,
+                List(KeyRevision(StorageDeviceState.StateKey,
+                  kvos.contents(StorageDeviceState.StateKey).revision)),
+                List(Insert(StorageDeviceState.StateKey, newState.encode())))
+
+      // Cleared on failure as well as success. A StopRetrying means this attempt gave up, and the
+      // next device check -- an hour out, and possibly after whatever made the read fail has been
+      // repaired -- should be free to try again rather than find the flag stuck forever.
+      fabandon.onComplete: _ =>
+        synchronized:
+          abandoningTransferIns -= storeId
+  }
 
   /** Requests a check of one storage device.
    *
@@ -1018,6 +1316,15 @@ class StoreManager(val client: AspenClient,
    *  testingOnlyCheckAllDevices for why this bypasses the event queue. */
   private[aspen] def testingOnlyHandleHostMessage(msg: HostMessage): Unit =
     handleEvent(HostMsg(msg))
+
+  /** Testing hook: runs the post-transfer metadata update synchronously.
+   *
+   *  In production this is driven by a StoreTransferIn completing, which needs a real device
+   *  directory and a real byte stream. The metadata half is what the tests are about. */
+  private[aspen] def testingOnlyUpdateStateForTransferredStore(storeId: StoreId,
+                                                               fromDeviceId: StorageDeviceId,
+                                                               toDeviceId: StorageDeviceId): Future[TransferOutcome] =
+    updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
 
   /** Testing hook: the storage devices with a state lookup currently in flight. */
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =

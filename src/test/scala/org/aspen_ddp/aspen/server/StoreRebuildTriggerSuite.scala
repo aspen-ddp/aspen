@@ -119,7 +119,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
     yield
       factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(1)))
 
-  atest("a failed rebuild releases its slot"):
+  atest("a failed rebuild does not immediately restart itself"):
     val hostRoot = newHostDir()
     writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
@@ -131,13 +131,50 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
 
     for
       _ <- yieldUntil(factory.created.size == 1)
+      // Armed but not consumed if the failure path behaves: the entry still reads Rebuilding and
+      // the slot has just been freed, so a re-check of this device here would start the same
+      // rebuild again -- and a rebuild that fails in under a millisecond would then spin forever
+      // with no backoff and no give-up.
       second = mgr.armLookup(deviceA)
-      _ = factory.created.head.promise.failure(new Exception("disk on fire"))
       _ = second.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
-      // The same store is retried rather than being stuck behind a slot that never frees.
+      _ = factory.created.head.promise.failure(new Exception("disk on fire"))
+      _ <- yieldUntil(factory.created.size == 2, 20)
+      restartedImmediately = factory.created.size
+      // The ordinary periodic check is what resumes it. The staging checkpoint survives the
+      // failure, so that check resumes rather than restarting from the beginning.
+      _ = mgr.testingOnlyCheckAllDevices()
       _ <- yieldUntil(factory.created.size == 2)
     yield
+      restartedImmediately should be(1)
       factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(0)))
+
+  atest("a failed rebuild releases its slot for another device"):
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", deviceA)
+    writeDevice(hostRoot, "dev1", deviceB)
+    val factory = new RecordingRebuildFactory
+    val mgr = newManager(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+
+    // deviceB's store is queued behind the single slot deviceA's rebuild holds.
+    val firstA = mgr.armLookup(deviceA)
+    val firstB = mgr.armLookup(deviceB)
+    mgr.testingOnlyCheckAllDevices()
+    firstA.success(deviceState(deviceA, Map(rebuilding(storeN(0)))))
+    firstB.success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      _ <- yieldUntil(!mgr.testingOnlyActiveDeviceChecks.contains(deviceB))
+      // Pre-completed: the failure path issues this lookup itself, so there is no moment
+      // between the check starting and the test completing it.
+      _ = mgr.armLookup(deviceB).success(deviceState(deviceB, Map(rebuilding(storeN(1)))))
+      _ = factory.created.head.promise.failure(new Exception("disk on fire"))
+      // rebuildingStores is host-wide, so the freed slot is what deviceB was waiting on. Without
+      // this re-check it would wait for the hourly sweep with data under-replicated.
+      _ <- yieldUntil(factory.created.size == 2)
+    yield
+      factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(1)))
+      factory.created.map(_.storageDeviceId).toList should be(List(deviceA, deviceB))
 
   atest("a successfully flipped rebuild is loaded and marked Active"):
     val hostRoot = newHostDir()

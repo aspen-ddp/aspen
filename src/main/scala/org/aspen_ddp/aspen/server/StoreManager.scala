@@ -875,10 +875,13 @@ class StoreManager(val client: AspenClient,
    *  was failed. The slot is released only after the flip commits, so a concurrent check cannot
    *  restart the same store between the release and the commit.
    *
-   *  Every completion re-checks all loaded devices (not just this one), because `rebuildingStores`
-   *  is host-wide: a slot released by device A's rebuild could unblock a queued rebuild on device
-   *  B, and without a re-check of B it would wait for the periodic sweep (one hour) with data
-   *  under-replicated.
+   *  Every completion re-checks the other loaded devices, not just this one, because
+   *  `rebuildingStores` is host-wide: a slot released by device A's rebuild could unblock a queued
+   *  rebuild on device B, and without a re-check of B it would wait for the periodic sweep (one
+   *  hour) with data under-replicated. The three outcomes that settle the store's metadata
+   *  (`Adopt`, `Discard`, and a permanently failed flip) additionally re-check this device, to
+   *  start the next store queued behind the slot just freed. The walk-failure path does not: see
+   *  its comment.
    */
   private def startStoreRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     synchronized {
@@ -891,6 +894,20 @@ class StoreManager(val client: AspenClient,
 
         def recheckAll(): Unit =
           synchronized(storageDevices.keys).foreach(checkStorageDevice)
+
+        /** Every loaded device except the one this rebuild ran on.
+         *
+         *  For the failure path only. The freed slot is host-wide, so the other devices are still
+         *  worth re-checking, but re-checking this one restarts the rebuild that just failed:
+         *  `release()` has already dropped the store from `rebuildingStores`, the tree entry still
+         *  reads `Rebuilding`, and reconcileDeviceState's Rebuilding pass therefore starts it
+         *  again. The single-flight guard does not intervene -- this callback fires long after
+         *  startDeviceCheck returned, so `activeDeviceChecks` is empty.
+         */
+        def recheckOtherDevices(): Unit =
+          synchronized(storageDevices.keys)
+            .filter(_ != local.storageDeviceId)
+            .foreach(checkStorageDevice)
 
         // Guard-map leak defense: invoke `complete` in a try/catch that substitutes Future.failed(t)
         // on throw, so that either way a Future exists and onComplete below is registered. That
@@ -945,14 +962,19 @@ class StoreManager(val client: AspenClient,
                   recheckAll()
 
           case Failure(err) =>
-            // The checkpoint survives in the staging directory, so the next check resumes
-            // rather than restarting. Nothing here retries directly: a rebuild that fails
-            // immediately and repeatedly would otherwise spin.
+            // The checkpoint survives in the staging directory, so the next check of this device
+            // resumes rather than restarting. That next check is deliberately left to the
+            // ordinary periodic sweep: this device is excluded from the re-check here because
+            // including it is a retry, and an unbounded one. A rebuild that fails in well under a
+            // millisecond -- an unreadable checkpoint, a pool that cannot be read -- would spin
+            // through tree reads and WARN lines forever, with no backoff and no give-up. The
+            // other devices are re-checked because the slot just freed is host-wide and may be
+            // what a queued rebuild elsewhere is waiting on.
             try
               logger.warn(s"Rebuild of store $storeId failed: $err")
             finally
               release()
-              recheckAll()
+              recheckOtherDevices()
     }
 
   /** Decides whether a rebuilt store should be adopted or discarded.

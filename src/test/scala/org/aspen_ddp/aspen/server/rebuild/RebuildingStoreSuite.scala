@@ -1,17 +1,20 @@
 package org.aspen_ddp.aspen.server.rebuild
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.scalatest.compatible
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.store.backend.BufferedConsistentRocksDB
 
 import java.nio.ByteBuffer
+import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
 
 /** Exercises the walk against a real RocksDB backend on a temp directory, driven by the
  *  bootstrap pool's real allocation tree. */
@@ -76,14 +79,61 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
   atest("a pre-existing final directory skips straight to completion"):
     given ExecutionContext = executionContext
     val dev = deviceDir()
-    // A crash between the move and the flip leaves the store in place with no staging
-    // directory. The rebuild must not start over, and must not fail.
+    // A crash between the move and the flip leaves the store in place. The rebuild must not
+    // start over, and must not fail.
     os.makeDir.all(dev / storeId.directoryName)
-    val rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO)
+    // Staged as a crash just before the move would have left it: the move is not atomic with
+    // the flip, so a staging directory carrying a checkpoint can outlive the final directory
+    // appearing. Pre-created so that asserting on its removal is an assertion about
+    // cleanupStaging rather than about a directory that was never there.
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    os.makeDir.all(staging)
+    RebuildState.save(staging, RebuildState(storeId, Some(Key(Array[Byte](7))), Nil))
+
     for
+      _ <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+                                    testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
     yield
-      os.exists(dev / RebuildingStore.RebuildDirectory / storeId.directoryName) should be(false)
+      os.exists(staging) should be(false)
+      // Nothing was walked: the store is already whole, and re-reading a pool's worth of objects
+      // to rewrite a store that already holds them is precisely the work this branch exists to
+      // skip.
+      rebuild.testingOnlyRestoredKeys should be(Nil)
+
+  /** Shared body of the torn-checkpoint tests: `contents` is written where a checkpoint belongs
+   *  and the pass must restart from the beginning rather than throw at its first statement. */
+  private def tornCheckpointRestartsTheWalk(contents: String): Future[compatible.Assertion] =
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      ids <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+      _ = os.makeDir.all(staging)
+      _ = os.write.over(staging / RebuildState.stateFilename, contents)
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+                                    checkpointInterval = 5,
+                                    testingOnlyTrackRestoredKeys = true)
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+    yield
+      // Aspen is crash-only, so this file is what an ordinary termination in an unlucky window
+      // leaves behind. Throwing on it would make the store unrebuildable until an operator
+      // deleted the file by hand.
+      outcome.isSuccess should be(true)
+      val restoredBytes = rebuild.testingOnlyRestoredKeys.map(_.bytes.toList).toSet
+      val allocatedBytes = ids.map(id => Key(id.toBytes).bytes.toList).toSet
+      // From the beginning: every object, not the tail of some range the torn file half-named.
+      (allocatedBytes subsetOf restoredBytes) should be(true)
+      os.exists(dev / storeId.directoryName) should be(true)
+
+  atest("an empty checkpoint restarts the walk from the beginning"):
+    tornCheckpointRestartsTheWalk("")
+
+  atest("an unparsable checkpoint restarts the walk from the beginning"):
+    tornCheckpointRestartsTheWalk("failed-objects: [unclosed")
 
   atest("a resume skips the objects already restored"):
     given ExecutionContext = executionContext

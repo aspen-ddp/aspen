@@ -344,9 +344,10 @@ class RebuildingStore(client: AspenClient,
   private def finish(): Future[Unit] =
     backend.rebuildFlush()
     closeBackend().map: _ =>
-      val checkpointFile = stagingPath / RebuildState.stateFilename
-      if os.exists(checkpointFile) then
-        os.remove(checkpointFile)
+      // The temp file only exists if a crash caught a save between its write and its rename, and
+      // only survives if this pass never checkpointed. Dropping it here keeps it out of the
+      // directory that is about to become a live store.
+      RebuildState.removeAll(stagingPath)
 
       os.move(stagingPath, finalPath)
       logger.info(s"Rebuild of $storeId: store in place at $finalPath")

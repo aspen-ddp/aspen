@@ -14,6 +14,7 @@ import scribe.Logging
 import java.nio.file.Path
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.control.NonFatal
 
 object RebuildingStore:
   /** Staging directory under the device root. Invisible to StoreManager.tryLoadStore for the
@@ -24,6 +25,9 @@ object RebuildingStore:
   /** Objects between checkpoints. Small enough that a crash costs little, large enough that
    *  the flush is not the dominant cost. */
   val CheckpointInterval: Int = 1000
+
+  /** Length of an allocation-tree key that names an object: the raw bytes of an ObjectId. */
+  val ObjectIdKeyLength: Int = 16
 
 
 /** Reconstructs one store by walking its pool's allocation tree, reading each object through
@@ -184,37 +188,72 @@ class RebuildingStore(client: AspenClient,
     if synchronized(abortCause).isDefined then
       Future.unit
     else
-      val ptr = ObjectPointer(value.value.bytes)
+      // Everything below is inside the try, not just the decode: a synchronous throw out of this
+      // method is absorbed by ExecutionContext.reportFailure -- walkFrom calls fn from inside its
+      // own onComplete recursion -- which stops the recursion, leaves walkFrom's promise never
+      // completed, and so holds the rebuild slot forever. ObjectPointer decoding is the reachable
+      // way to get one: it throws BufferUnderflowException out of the Varint readers and
+      // MatchError out of its non-exhaustive typeCode match. Treating an undecodable pointer as
+      // one more failed object subjects it to the existing cap and retry machinery instead.
+      try
+        val ptr = ObjectPointer(value.value.bytes)
 
-      if ptr.poolId != storeId.poolId then
-        // The allocation tree is per-pool, but a pointer stored in it is only authoritative for
-        // its own pool. Skip anything foreign rather than writing it into the wrong store.
-        Future.unit
-      else
-        attemptRestore(key, ptr).transformWith:
-          case scala.util.Success(_) =>
-            recordRestored(key)
-          case scala.util.Failure(err) if isOutOfSpace(err) =>
-            // Distinct from a per-object read failure, and not something to accumulate 10,000 of:
-            // selectDeviceForRebuild checked free space at placement time against the pool's
-            // recorded store size, which can be stale and can grow. There is no automatic
-            // recovery in this scope -- the operator's remedy is to add capacity -- so log it
-            // loudly enough to alert on and set the abort latch.
-            // Latch first, then checkpoint. The checkpoint is expected to throw when the disk is
-            // full, and if it does, the throw must not unwind past the latch. A best-effort
-            // checkpoint on a full disk is fine -- losing it costs a restart from the last good
-            // one, which is bounded. Losing the latch costs the store.
-            synchronized:
-              if abortCause.isEmpty then
-                abortCause = Some(err)
-            try checkpoint()
-            catch case t: Throwable => logger.warn(s"Rebuild of $storeId: checkpoint after ENOSPC failed: $t")
-            logger.error(s"REBUILD OUT OF SPACE: store $storeId cannot fit on device " +
-                         s"$storageDeviceId at $devicePath. The store will remain Rebuilding " +
-                         s"until capacity is added. Underlying error: $err")
-            Future.unit
-          case scala.util.Failure(err) =>
-            recordFailure(ObjectId(key.bytes), err)
+        if ptr.poolId != storeId.poolId then
+          // The allocation tree is per-pool, but a pointer stored in it is only authoritative for
+          // its own pool. Skip anything foreign rather than writing it into the wrong store.
+          Future.unit
+        else
+          attemptRestore(key, ptr).transformWith:
+            case scala.util.Success(_) =>
+              recordRestored(key)
+            case scala.util.Failure(err) if isOutOfSpace(err) =>
+              // Distinct from a per-object read failure, and not something to accumulate 10,000
+              // of: selectDeviceForRebuild checked free space at placement time against the
+              // pool's recorded store size, which can be stale and can grow. There is no
+              // automatic recovery in this scope -- the operator's remedy is to add capacity --
+              // so log it loudly enough to alert on and set the abort latch.
+              // Latch first, then checkpoint. The checkpoint is expected to throw when the disk
+              // is full, and if it does, the throw must not unwind past the latch. A best-effort
+              // checkpoint on a full disk is fine -- losing it costs a restart from the last good
+              // one, which is bounded. Losing the latch costs the store.
+              latchOutOfSpace(err)
+              try checkpoint()
+              catch case t: Throwable => logger.warn(s"Rebuild of $storeId: checkpoint after ENOSPC failed: $t")
+              Future.unit
+            case scala.util.Failure(err) =>
+              recordFailedKey(key, err)
+      catch
+        case NonFatal(t) =>
+          recordFailedKey(key, t)
+
+  /** Latch a full destination as the abort cause and raise the operator alert.
+   *
+   *  Idempotent in the cause: the first fatal condition to fire owns the abort. The alert is
+   *  emitted every time, because a disk that fills during the wind-down is still news.
+   */
+  private def latchOutOfSpace(err: Throwable): Unit =
+    synchronized:
+      if abortCause.isEmpty then
+        abortCause = Some(err)
+    logger.error(s"REBUILD OUT OF SPACE: store $storeId cannot fit on device " +
+                 s"$storageDeviceId at $devicePath. The store will remain Rebuilding " +
+                 s"until capacity is added. Underlying error: $err")
+
+  /** recordFailure keyed by an allocation-tree key rather than by an ObjectId.
+   *
+   *  Deriving the id is itself a throw site -- ObjectId.apply reads two longs and throws
+   *  BufferUnderflowException on anything shorter -- and on restoreObject's synchronous failure
+   *  path that throw would escape the very catch that exists to keep the walk from wedging. A
+   *  key that is not sixteen bytes is not an object entry at all: there is nothing to restore
+   *  and nothing a retry could name, so it is logged and skipped rather than recorded.
+   */
+  private def recordFailedKey(key: Key, err: Throwable): Future[Unit] =
+    if key.bytes.length == ObjectIdKeyLength then
+      recordFailure(ObjectId(key.bytes), err)
+    else
+      logger.warn(s"Rebuild of $storeId: allocation tree entry whose ${key.bytes.length}-byte " +
+                  s"key is not an object id; skipping. Underlying error: $err")
+      Future.unit
 
   /** Best-effort detection of a full destination. Backends surface it differently -- RocksDB
    *  wraps it, the JDK throws IOException -- so this matches on the message as well as the

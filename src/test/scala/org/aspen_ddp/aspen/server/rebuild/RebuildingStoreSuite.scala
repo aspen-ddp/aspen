@@ -38,6 +38,22 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
           alloc.allocateDataObject(Array[Byte](i.toByte)).map(_.id)
     Future.sequence(allocated)
 
+  /** The rebuild's outcome, or None if it has still not finished after `maxYields` turns of the
+   *  test's execution context.
+   *
+   *  Never awaits an incomplete future. The failure mode this exists for is a rebuild whose
+   *  future never completes at all, and awaiting one of those hangs the suite instead of
+   *  failing it.
+   */
+  private def outcomeOrStalled(rebuild: RebuildingStore,
+                               maxYields: Int = 5000): Future[Option[Try[Unit]]] =
+    given ExecutionContext = executionContext
+    def loop(n: Int): Future[Option[Try[Unit]]] = rebuild.complete.value match
+      case Some(outcome) => Future.successful(Some(outcome))
+      case None if n == 0 => Future.successful(None)
+      case None => Future(()).flatMap(_ => loop(n - 1))
+    loop(maxYields)
+
   atest("a full walk restores every object and moves the store into place"):
     given ExecutionContext = executionContext
     val dev = deviceDir()
@@ -230,6 +246,42 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The checkpoint was written when the cap was hit
       val saved = RebuildState.load(staging).get
       saved.lastRestoredKey should not be None
+
+  atest("an undecodable pointer in the allocation tree is a failed object, not a wedged walk"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    // A key of the right shape -- sixteen bytes, so it names an object -- whose value is not a
+    // pointer. The leading 0xff makes Varint.getUnsignedInt read past the end of the buffer, so
+    // ObjectPointer's decode throws BufferUnderflowException. Written through the real tree
+    // rather than injected, because the decode is what is under test.
+    val bogusId = ObjectId(UUID.fromString("77777777-7777-7777-7777-777777777777"))
+    val bogusKey = Key(bogusId.toBytes)
+
+    for
+      _ <- populate(20)
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
+               pool.allocationTree.set(bogusKey, Value(Array[Byte](-1, -1, -1)))
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+                                    checkpointInterval = 5)
+      settled <- outcomeOrStalled(rebuild)
+    yield
+      // The decode runs in restoreObject's plain body, outside any Future combinator. Before it
+      // was made total, the throw was absorbed by ExecutionContext.reportFailure from inside
+      // walkFrom's own onComplete recursion: the recursion stopped, walkFrom's promise was never
+      // completed, runPass never completed, and the StoreManager rebuild slot was never
+      // released. Two of those deadlock a host at the default maxConcurrentRebuilds of 2. So the
+      // assertion that matters is that the future completed at all.
+      settled.isDefined should be(true)
+      // Having completed, it must report the pass as unsuccessful rather than move a store that
+      // is short an object into place.
+      settled.get.isFailure should be(true)
+      val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+      os.exists(dev / storeId.directoryName) should be(false)
+      // Recorded as one more failed object, subject to the existing cap and retry machinery.
+      RebuildState.load(staging).get.failedObjects should be(List(bogusId))
 
   atest("out of space fails the pass with empty failedObjects proving the latch alone stopped it"):
     given ExecutionContext = executionContext

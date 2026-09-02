@@ -64,6 +64,39 @@ trait StoreManagerTestHarness:
     else
       Future(()).flatMap(_ => yieldUntil(condition, maxYields - 1))
 
+  /** Drives `mgr`'s device check until no store on `deviceId` is Rebuilding.
+   *
+   *  Rebuilds are started by the device-check machinery, which in production runs on an hourly
+   *  timer. Tests do not wait an hour: this drives checks, yields to let async rebuilds run,
+   *  and polls until all stores flip to Active.
+   *
+   *  Silent on exhaustion, like `yieldUntil`: the caller asserts the end state.
+   */
+  protected def completeRebuilds(mgr: StoreManager,
+                                 deviceId: StorageDeviceId,
+                                 maxRounds: Int = 500): Future[Unit] =
+    given ExecutionContext = executionContext
+    def allActive(): Future[Boolean] =
+      client.getStorageDeviceState(deviceId).map: state =>
+        state.stores.values.forall(_.status == StorageDeviceState.StoreStatus.Active)
+
+    def loop(rounds: Int): Future[Unit] =
+      if rounds == 0 then
+        Future.unit
+      else
+        allActive().flatMap:
+          case true => Future.unit
+          case false =>
+            mgr.testingOnlyCheckAllDevices()
+            for
+              // Yield to let queued async work (the rebuild's complete Future and its callbacks) run.
+              _ <- yieldUntil(false, 1)
+              _ <- waitForTransactionsToComplete()
+              _ <- loop(rounds - 1)
+            yield ()
+
+    loop(maxRounds)
+
   /** Creates `<tmp>/host/storage-devices` and returns the host root directory. Pass
    *  `withStorageDevicesDir = false` to leave the `storage-devices` child absent. */
   protected def newHostDir(withStorageDevicesDir: Boolean = true): Path =

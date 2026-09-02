@@ -2,21 +2,20 @@ package org.aspen_ddp.aspen.common.metadata.management
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{Radicle, TypeFactories}
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.compute.{DurableTaskFactory, DurableTaskPointer, ServiceEntry}
-import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskServiceState}
+import org.aspen_ddp.aspen.compute.DurableTaskFactory
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
-class FailedStorageDeviceSuite extends IntegrationTestSuite:
+class FailedStorageDeviceSuite extends IntegrationTestSuite
+                                 with FailedStorageDeviceTestHarness:
 
   atest("FailedStorageDeviceDurableTask is registered in the client type registry"):
     given ExecutionContext = executionContext
@@ -25,16 +24,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
     factory should be(Some(FailedStorageDeviceDurableTask))
     TypeFactories.factories should contain(FailedStorageDeviceDurableTask)
 
-  /** The task state objects currently enrolled with the system task executor. */
-  protected def enrolledTasks(): Future[List[(java.util.UUID, KeyValueObjectPointer)]] =
-    given ExecutionContext = executionContext
-    val tkvl = TieredKeyValueList(client,
-      KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
-    for
-      vs <- tkvl.get(Key(SystemTaskExecutorService.ServiceUUID))
-      statePtr = ServiceEntry.decode(vs.get.value.bytes).statePointer
-      enrolled <- SystemTaskServiceState.scan(client, statePtr)
-    yield enrolled
 
   atest("failStorageDevice enrolls exactly one task"):
     given ExecutionContext = executionContext
@@ -54,20 +43,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
 
   // ---- Driving the task -----------------------------------------------------------
 
-  private val fastPoll = Duration(50, MILLISECONDS)
-
-  /** Build a task instance over the state object failStorageDevice enrolled. */
-  protected def taskForEnrolled(deviceId: StorageDeviceId): Future[FailedStorageDeviceDurableTask] =
-    taskForEnrolled(deviceId, fastPoll)
-
-  protected def taskForEnrolled(deviceId: StorageDeviceId,
-                                pollPeriod: Duration): Future[FailedStorageDeviceDurableTask] =
-    given ExecutionContext = executionContext
-    enrolledTasks().map: enrolled =>
-      enrolled.size should be(1)
-      new FailedStorageDeviceDurableTask(
-        DurableTaskPointer(enrolled.head._2), client, deviceId, pollPeriod)
-
   /** Poll until `deviceId` reads as tombstoned, or fail on timeout. A bare wait on the task's
    *  completion would hang the suite rather than fail if the loop stopped making progress. */
   protected def awaitTombstone(deviceId: StorageDeviceId, timeout: Duration): Future[Unit] =
@@ -84,16 +59,6 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
           client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
           p.future.flatMap(_ => loop())
     loop()
-
-  /** Race a future against a timeout, failing with an explicit assertion if the timeout wins. */
-  protected def withTimeout[T](fut: Future[T], timeout: Duration, what: String): Future[T] =
-    given ExecutionContext = executionContext
-    val p = Promise[T]()
-    client.backgroundTaskManager.schedule(timeout):
-      if !p.isCompleted then
-        p.failure(new AssertionError(s"$what did not complete within ${timeout.toMillis} ms"))
-    fut.onComplete(p.tryComplete)
-    p.future
 
   /** Wait without occupying a pool thread. Thread.sleep here would hold a thread the task under
    *  test needs to make the very progress the test is watching for. */

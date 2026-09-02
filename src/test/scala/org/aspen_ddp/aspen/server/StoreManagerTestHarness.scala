@@ -254,13 +254,6 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   def armLookupThrow(deviceId: StorageDeviceId, error: Throwable): Unit = synchronized:
     enqueueArmed(deviceId, Left(error))
 
-  override protected def lookupStorageDeviceState(deviceId: StorageDeviceId): Future[StorageDeviceState] =
-    lookupAttempts += deviceId
-    armedLookups.get(deviceId).flatMap(_.dequeueFirst(_ => true)) match
-      case Some(Left(err)) => throw err
-      case Some(Right(p)) => p.future
-      case None => super.lookupStorageDeviceState(deviceId)
-
   def loadedDevices: Map[StorageDeviceId, StoreManager.LocalStorageDeviceState] =
     synchronized { storageDevices }
 

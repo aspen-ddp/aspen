@@ -72,6 +72,21 @@ object StoreManager:
      *  the pool left naming it. The arrived copy belongs to nobody. */
     case SourceRestored
 
+  /** What markRebuiltStoreActive decided about a rebuilt store, so its caller knows whether the
+   *  device is allowed to adopt the copy the rebuild placed.
+   *
+   *  Returned rather than acted on inside that method because the two halves live on opposite
+   *  sides of the boundary: the decision is metadata and belongs in the transaction, while
+   *  loading or discarding a store directory is local disk work that only the event loop does.
+   */
+  private[aspen] enum RebuildOutcome:
+    /** The device entry was flipped to Active and the store should be loaded. */
+    case StoreAdopted
+
+    /** The device was tombstoned mid-rebuild, so the rebuilt store belongs to nobody and must
+     *  be discarded. */
+    case DeviceFailed
+
 
   class IOHandler(mgr: StoreManager) extends CompletionHandler:
     override def complete(op: Completion): Unit =
@@ -106,7 +121,8 @@ class StoreManager(val client: AspenClient,
                    val storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                    /** A rebuild reads a whole store's worth of data through the client, so an
                     *  eight-store device must not start eight at once. Entries beyond this bound
-                    *  wait; every completion re-checks the device and starts the next. */
+                    *  wait; every completion re-checks all loaded devices and starts whatever is
+                    *  queued. */
                    val maxConcurrentRebuilds: Int = 2) extends Logging {
   import StoreManager._
   
@@ -539,21 +555,20 @@ class StoreManager(val client: AspenClient,
    *
    *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision.
    */
-  private def discardArrivedTransferIn(storeId: StoreId,
-                                       toDeviceId: StorageDeviceId): Unit = synchronized {
-    storageDevices.get(toDeviceId) match
+  private def discardStoreDirectory(storeId: StoreId,
+                                    deviceId: StorageDeviceId,
+                                    reason: String): Unit = synchronized {
+    storageDevices.get(deviceId) match
       case None =>
-        // The device map is append-only, so this means the transfer arrived on a device this
-        // process never loaded -- which startStoreTransferIn cannot do. Log rather than assume.
-        logger.warn(s"Cannot discard the copy of store $storeId that arrived on unloaded " +
-                    s"device $toDeviceId")
+        // The device map is append-only, so this means the operation completed on a device this
+        // process never loaded. Log rather than assume.
+        logger.warn(s"Cannot discard the copy of store $storeId on unloaded device $deviceId")
 
       case Some(sds) =>
         val storePath = os.Path(sds.devicePath) / storeId.directoryName
         if os.exists(storePath) then
-          logger.warn(s"Discarding the copy of store $storeId that arrived on failed device " +
-                      s"$toDeviceId. The pool still names the transfer source, which kept its " +
-                      s"copy, so this one belongs to nobody: $storePath")
+          logger.warn(s"Discarding the copy of store $storeId on failed device $deviceId. " +
+                      s"$reason: $storePath")
           try
             os.remove.all(storePath)
           catch
@@ -562,6 +577,11 @@ class StoreManager(val client: AspenClient,
               // directory on a dead device that a restart would load and then never route to.
               logger.error(s"Failed to delete the discarded store copy $storePath. Error: $t")
   }
+
+  private def discardArrivedTransferIn(storeId: StoreId,
+                                       toDeviceId: StorageDeviceId): Unit =
+    discardStoreDirectory(storeId, toDeviceId,
+      "The pool still names the transfer source, which kept its copy, so this one belongs to nobody")
 
   private def startStoreTransferIn(storeId: StoreId,
                                    fromHostId: HostId,
@@ -841,16 +861,22 @@ class StoreManager(val client: AspenClient,
                   creatingStores -= storeId
   }
 
-  /** Begins reconstruction of one store staged into `<device>/rebuilding/<store>/`.
+  /** Begins reconstruction of one store from the rest of its pool.
    *
    *  Runs under the instance lock, so it does no more than construct the rebuild and register
    *  its continuation; the walk itself runs on the client's execution context.
    *
-   *  On success the store is already in place on disk, so this loads it and flips the device
-   *  entry from Rebuilding to Active -- re-reading inside the transaction and writing only if
-   *  the status is still Rebuilding, exactly as createNewStore does for Initializing. Either
-   *  outcome re-checks the device, which releases the concurrency slot and starts whatever was
-   *  queued behind it.
+   *  On success the walk places the rebuilt store at `<device>/<storeId.directoryName>`. Loading
+   *  is downstream of the metadata decision: markRebuiltStoreActive decides whether the device is
+   *  allowed to adopt the copy (reading the tree state inside a transaction to guard against
+   *  concurrent tombstone), then the completion handler loads if adopted or discards if the device
+   *  was failed. The slot is released only after the flip commits, so a concurrent check cannot
+   *  restart the same store between the release and the commit.
+   *
+   *  Every completion re-checks all loaded devices (not just this one), because `rebuildingStores`
+   *  is host-wide: a slot released by device A's rebuild could unblock a queued rebuild on device
+   *  B, and without a re-check of B it would wait for the periodic sweep (one hour) with data
+   *  under-replicated.
    */
   private def startStoreRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     synchronized {
@@ -858,16 +884,55 @@ class StoreManager(val client: AspenClient,
         val sr = storeRebuildFactory.createRebuild(
           client, storeId, local.storageDeviceId, local.devicePath)
 
-        rebuildingStores += storeId -> sr
-
         def release(): Unit = synchronized:
           rebuildingStores -= storeId
 
-        sr.complete.onComplete:
+        def recheckAll(): Unit =
+          synchronized(storageDevices.keys).foreach(checkStorageDevice)
+
+        // Register the guard map entry after invoking `complete`, not before: if `complete` is a
+        // def that throws when invoked, the store is left in the map for the life of the process,
+        // permanently consuming a slot and permanently blocking that store.
+        val completeFuture = try
+          sr.complete
+        catch
+          case t: Throwable =>
+            logger.error(s"Rebuild factory's complete threw for store $storeId: $t")
+            Future.failed(t)
+
+        synchronized:
+          rebuildingStores += storeId -> sr
+
+        completeFuture.onComplete:
           case Success(_) =>
-            release()
-            loadStoreById(local.storageDeviceId, storeId)
-            markRebuiltStoreActive(local.storageDeviceId, storeId)
+            // Loading is downstream of the metadata decision, not ahead of it. An unconditional
+            // load hands a live copy to a device that markRebuiltStoreActive may be about to
+            // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
+            // would ever take it back.
+            markRebuiltStoreActive(local.storageDeviceId, storeId).onComplete:
+              case Success(RebuildOutcome.StoreAdopted) =>
+                loadStoreById(local.storageDeviceId, storeId)
+                release()
+                recheckAll()
+
+              case Success(RebuildOutcome.DeviceFailed) =>
+                discardStoreDirectory(storeId, local.storageDeviceId,
+                  "The device was tombstoned mid-rebuild, so this copy belongs to nobody")
+                release()
+                recheckAll()
+
+              case Failure(t) =>
+                // The only observer this Future has. Its onFail routes the permanent errors to
+                // StopRetrying, which fails the promise -- and an unobserved failed Promise is
+                // not reported by the ExecutionContext, so without this line a permanent give-up
+                // is exactly as silent as the infinite retry loop it replaced. What is left
+                // behind matters: the store is on disk, the tree still says Rebuilding.
+                logger.error(s"Failed to record the completed rebuild of store $storeId on " +
+                             s"device ${local.storageDeviceId}. The store is on disk in " +
+                             s"${os.Path(local.devicePath) / storeId.directoryName} but is not " +
+                             s"loaded, and the device entry still says Rebuilding", t)
+                release()
+                recheckAll()
 
           case Failure(err) =>
             // The checkpoint survives in the staging directory, so the next check resumes
@@ -875,55 +940,59 @@ class StoreManager(val client: AspenClient,
             // immediately and repeatedly would otherwise spin.
             logger.warn(s"Rebuild of store $storeId failed: $err")
             release()
-            checkStorageDevice(local.storageDeviceId)
+            recheckAll()
     }
 
-  /** Flips a rebuilt store's device entry from Rebuilding to Active, then re-checks the device
-   *  so the next queued rebuild starts.
+  /** Decides whether a rebuilt store should be adopted or discarded.
    *
-   *  The device may have left the tree between a rebuild starting and finishing (an operator
-   *  removing it, say). Without exhaustive onFail, getStorageDevicePointer's NoSuchElementException
-   *  is neither StopRetrying nor a match, so ExponentialBackoffRetryStrategy reschedules forever,
-   *  the future never completes, and this device's rebuild queue never advances. Re-checking on
-   *  both Success and Failure ensures the queue advances even when the flip fails permanently.
+   *  The device may have been tombstoned or removed from the tree between a rebuild starting and
+   *  finishing. Reading the state inside the transaction and checking isFailed before the status
+   *  check ensures the decision is made from current metadata, not stale assumptions.
    *
-   *  The failure re-check cannot loop back into starting the same rebuild: reaching Failure at all
-   *  means a permanent error, which means the tree read is broken, so the device check that follows
-   *  also fails its lookupStorageDeviceState and never reaches reconcile.
+   *  Without exhaustive onFail, getStorageDevicePointer's NoSuchElementException is neither
+   *  StopRetrying nor a match, so ExponentialBackoffRetryStrategy reschedules forever, the future
+   *  never completes, and this device's rebuild queue never advances.
    */
-  private def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
+  private def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
+                                     storeId: StoreId): Future[RebuildOutcome] =
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: FatalReadError => throw StopRetrying(e)
       case _ => Future.unit
 
-    val txFuture = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       for
         ptr <- client.getStorageDevicePointer(storageDeviceId)
         kvos <- client.read(ptr)
         state = StorageDeviceState(kvos)
       yield
-        state.stores.get(storeId).foreach: entry =>
-          if entry.status == StorageDeviceState.StoreStatus.Rebuilding then
-            val newState = state.setStoreEntry(
-              storeId, StorageDeviceState.StoreStatus.Active, None)
+        // Check isFailed first. A concurrent tombstone leaves stores intact but zeroes the ids,
+        // so the entry still reads Rebuilding. Loading hands a live copy to a failed device, and
+        // reconcileDeviceState bails on isFailed so nothing ever takes it back. Meanwhile the
+        // drain is moving the store elsewhere, so two hosts serve a live copy of the same StoreId.
+        if state.isFailed then
+          RebuildOutcome.DeviceFailed
+        else
+          state.stores.get(storeId) match
+            case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Rebuilding =>
+              val newState = state.setStoreEntry(
+                storeId, StorageDeviceState.StoreStatus.Active, None)
 
-            val reqs = List(KeyRevision(StorageDeviceState.StateKey,
-              kvos.contents(StorageDeviceState.StateKey).revision))
-            val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
+              val reqs = List(KeyRevision(StorageDeviceState.StateKey,
+                kvos.contents(StorageDeviceState.StateKey).revision))
+              val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
 
-            logger.info(s"Updating device state to mark rebuilt store $storeId as Active")
-            tx.update(ptr, None, None, reqs, ops)
+              logger.info(s"Updating device state to mark rebuilt store $storeId as Active")
+              tx.update(ptr, None, None, reqs, ops)
 
-            tx.result.foreach: _ =>
-              logger.info(s"Rebuild of store $storeId complete")
+              tx.result.foreach: _ =>
+                logger.info(s"Rebuild of store $storeId complete")
 
-    // Re-check the device whether or not the update was staged and whether or not the transaction
-    // succeeded. An empty transaction completes normally (the entry is already Active or has
-    // vanished). A permanently failed transaction (device removed from tree, fatal read error)
-    // must still advance the queue, otherwise one bad entry strands every rebuild behind it.
-    txFuture.onComplete: _ =>
-      checkStorageDevice(storageDeviceId)
+              RebuildOutcome.StoreAdopted
+
+            case _ =>
+              // Entry already Active or missing. No update staged, transaction completes as empty.
+              RebuildOutcome.StoreAdopted
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
    *

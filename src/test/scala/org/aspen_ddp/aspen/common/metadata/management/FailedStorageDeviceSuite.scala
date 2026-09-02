@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{Radicle, TypeFactories}
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState, fixed_ids}
+import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -369,18 +370,24 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       _ <- client.failStorageDevice(net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
+      // Everything captured from here on belongs to the drain.
+      _ = net.takeCapturedHostMessages()
+
       task <- taskForEnrolled(net.secondDeviceId)
       _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
 
+      nudges = net.takeCapturedHostMessages().collect:
+        case m: CheckStorageDevice => m
+
       tombstone <- client.getStorageDeviceState(net.secondDeviceId)
       live <- client.getStorageDeviceState(liveId)
       third <- client.getStorageDeviceState(net.thirdDeviceId)
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
-    yield (tombstone, live, third, poolState)
+    yield (tombstone, live, third, poolState, nudges)
 
-    result.map: (tombstone, live, third, poolState) =>
+    result.map: (tombstone, live, third, poolState, nudges) =>
       // The entry is dropped, not filtered: the store map is also the completion condition, so
       // an entry left in place would strand the task.
       tombstone.stores.get(storeId) should be(None)
@@ -396,6 +403,14 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       // true forever.
       live.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)
       live.stores(storeId).transferDevice should be(None)
+
+      // Restoring the entry is only half of it: the source's local copy is still offline behind
+      // its transfer-out marker, and the pool names that device, so the slice answers nothing
+      // until the source host runs its own poll. Without this nudge that is up to
+      // Main.CheckStorageDevicesPeriod -- an hour -- of unavailability for a repair that has
+      // already been decided.
+      nudges should contain(
+        CheckStorageDevice(HostId.BootstrapHostId, client.clientId, liveId))
 
   atest("the drain disowns a store the pool no longer names"):
     given ExecutionContext = executionContext

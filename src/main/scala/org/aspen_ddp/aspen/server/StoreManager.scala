@@ -461,6 +461,16 @@ class StoreManager(val client: AspenClient,
                 fromDevKvos.contents(StorageDeviceState.StateKey).revision)),
               List(Insert(StorageDeviceState.StateKey, restored.encode())))
 
+            // This method runs on the destination host, so the source is a different
+            // StoreManager and learns nothing from the write above. Its copy is still offline
+            // behind the transfer-out marker while the pool goes on naming it, which means the
+            // slice answers nothing until that host's own poll reinstates it -- up to
+            // Main.CheckStorageDevicesPeriod away. Best-effort, because that poll is the
+            // guarantee and this is only the latency.
+            tx.result.foreach: _ =>
+              client.sendBestEffortHostMessage(
+                CheckStorageDevice(fromDev.hostId, client.clientId, fromDeviceId))
+
           TransferOutcome.SourceRestored
 
         // If the from device doesn't contain the storeId, we're already done.

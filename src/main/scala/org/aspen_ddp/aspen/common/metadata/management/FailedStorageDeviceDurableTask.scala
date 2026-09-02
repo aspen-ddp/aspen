@@ -262,8 +262,14 @@ class FailedStorageDeviceDurableTask(
                                  kvos: KeyValueObjectState,
                                  state: StorageDeviceState)
 
-  /** The mirror of Destination: the reads the disown path needs and the rebuild path does not. */
-  private case class TransferSource(ptr: KeyValueObjectPointer,
+  /** The mirror of Destination: the reads the disown path needs and the rebuild path does not.
+   *
+   *  `id` is carried separately from `state.storageDeviceId` because the two disagree when the
+   *  source has itself been tombstoned: that zeroes the copy inside the state, while this one
+   *  comes from the tombstone's own entry and stays addressable.
+   */
+  private case class TransferSource(id: StorageDeviceId,
+                                    ptr: KeyValueObjectPointer,
                                     kvos: KeyValueObjectState,
                                     state: StorageDeviceState)
 
@@ -330,10 +336,11 @@ class FailedStorageDeviceDurableTask(
 
       moved.transformWith:
         case Success(nudge) =>
-          // A best-effort wake-up so the destination host starts promptly rather than waiting
-          // out Main.CheckStorageDevicesPeriod. The poll is the guarantee; this is the
-          // optimization. None when the pass merely disowned an entry: nothing was written to
-          // any destination, so there is nothing to wake.
+          // A best-effort wake-up so the host that gained work starts promptly rather than
+          // waiting out Main.CheckStorageDevicesPeriod. The poll is the guarantee; this is the
+          // optimization. On the rebuild path that host holds the destination; on the disown
+          // path it holds the restored transfer source. None only when the pass wrote nothing
+          // outside the tombstone itself, so there is nothing to wake.
           nudge.foreach(client.sendBestEffortHostMessage)
           scheduleRecheck()
           Future.unit
@@ -350,9 +357,10 @@ class FailedStorageDeviceDurableTask(
    *  once it has committed -- built inside so a retried attempt cannot double-send, and sent by
    *  the caller rather than from tx.result so the returned Future actually waits for it.
    *
-   *  Returns None when the failed device turns out not to own the store: the entry is dropped
-   *  from the tombstone's work list and nothing else is touched, so there is no destination to
-   *  nudge.
+   *  When the failed device turns out not to own the store the entry is simply dropped from the
+   *  tombstone's work list. That still yields a nudge if the drop restored an abandoned transfer
+   *  source, since that source's host has work to do; None means nothing outside the tombstone
+   *  was written.
    *
    *  `odestinationId` is None exactly when `drain` already decided the store is disowned and so
    *  spent no selection on it. */
@@ -440,7 +448,7 @@ class FailedStorageDeviceDurableTask(
                   srcPtr <- client.getStorageDevicePointer(srcId)
                   srcKvos <- client.read(srcPtr, "failed device drain")
                 yield
-                  Some(TransferSource(srcPtr, srcKvos, StorageDeviceState(srcKvos)))
+                  Some(TransferSource(srcId, srcPtr, srcKvos, StorageDeviceState(srcKvos)))
 
         _ =
           odst.foreach: dst =>
@@ -489,8 +497,8 @@ class FailedStorageDeviceDurableTask(
             // completed and StoreManager.updateStateForTransferredStore restored it first, or a
             // concurrent pass did. Both writes carry a KeyRevision on the source's StateKey, so
             // the loser re-reads and this guard turns the re-read into a no-op.
-            osrc.foreach: src =>
-              src.state.restoreAbandonedTransferSource(storeId, deviceId).foreach: restored =>
+            osrc.flatMap: src =>
+              src.state.restoreAbandonedTransferSource(storeId, deviceId).map: restored =>
                 logger.info(s"Failed device ${deviceId.uuid}: restoring $storeId to Active on " +
                             s"transfer source ${restored.storageDeviceId}")
                 tx.update(src.ptr, None, None,
@@ -498,7 +506,17 @@ class FailedStorageDeviceDurableTask(
                     src.kvos.contents(StorageDeviceState.StateKey).revision)),
                   List(Insert(StorageDeviceState.StateKey, restored.encode())))
 
-            None
+                // The restore is metadata only. The source's own copy is still offline behind
+                // the transfer-out marker startStoreTransferOut wrote, and the pool never
+                // stopped naming the source, so until that host reinstates it every message for
+                // the slice is dropped. Its poll is the guarantee; this shortens the outage from
+                // up to Main.CheckStorageDevicesPeriod to the next event loop pass.
+                //
+                // The device id is the one the tombstone's own entry named, not
+                // src.state.storageDeviceId, which reads as zero if the source has since been
+                // tombstoned itself. A zeroed host id there just means the send finds nobody,
+                // which is what best-effort is for.
+                CheckStorageDevice(src.state.hostId, client.clientId, src.id)
 
           case Some(dst) =>
             // Destination: gains a Rebuilding entry. This is the entire message to the consumer.

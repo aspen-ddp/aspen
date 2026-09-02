@@ -1081,12 +1081,17 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
 
       _ = Files.createDirectories(arrived)
+      // Everything captured from here on belongs to the completion path.
+      _ = net.takeCapturedHostMessages()
       _ = transfers.finishTransferIn(movingStore)
 
       // Not awaited: the pre-fix hazard in this area is a Future that never completes, and
       // awaiting one would hang the suite rather than fail it.
       _ <- pumpUntil(mgr.transferOutcomes.contains(movingStore))
       _ <- pumpUntil(!Files.exists(arrived))
+
+      nudges = net.takeCapturedHostMessages().collect:
+        case m: CheckStorageDevice => m
 
       source <- client.getStorageDeviceState(sourceId)
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
@@ -1109,6 +1114,13 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
       // And the directory goes too, or the next restart's scan loads exactly what this refused.
       Files.exists(arrived) should be(false)
+
+      // This runs on the destination host, so the source is a different StoreManager and reads
+      // nothing of the restore above. Its copy stays offline behind the transfer-out marker
+      // while the pool names it, so without the nudge the slice answers nothing until that
+      // host's next poll -- up to Main.CheckStorageDevicesPeriod later.
+      nudges should contain(
+        CheckStorageDevice(HostId.BootstrapHostId, client.clientId, sourceId))
 
   atest("a transfer arriving on a healthy destination is loaded"):
     given ExecutionContext = executionContext

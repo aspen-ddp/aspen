@@ -304,7 +304,7 @@ class RebuildingStore(client: AspenClient,
       else
         false
 
-    if checkpointNow then checkpoint()
+    if checkpointNow then checkpointBestEffort("during the walk")
     Future.unit
 
   private def recordFailure(objectId: ObjectId, err: Throwable): Future[Unit] =
@@ -325,8 +325,7 @@ class RebuildingStore(client: AspenClient,
       synchronized:
         if abortCause.isEmpty then
           abortCause = Some(cause)
-      try checkpoint()
-      catch case t: Throwable => logger.warn(s"Rebuild of $storeId: checkpoint after max failures failed: $t")
+      checkpointBestEffort("after max failures")
       Future.unit
     else
       Future.unit
@@ -336,6 +335,26 @@ class RebuildingStore(client: AspenClient,
   private def checkpoint(): Unit =
     flushBackend()
     saveCheckpoint()
+
+  /** Checkpoint without letting the throw out, classifying it the way a failed object write is
+   *  classified.
+   *
+   *  The flush and the checkpoint write both touch the disk, so a full device surfaces here just
+   *  as readily as it does from rebuildWrite -- and when it does it has to produce the abort
+   *  latch and the operator alert, not a generic log line. Losing a checkpoint costs a restart
+   *  from the last good one, which is bounded; letting the throw escape costs more. On the walk
+   *  path it would become a failed Future that walkFrom logs and steps past with
+   *  restoredSinceCheckpoint already reset and lastKey already advanced; on the abort paths it
+   *  would unwind past a latch that has just been set.
+   */
+  private def checkpointBestEffort(context: String): Unit =
+    try
+      checkpoint()
+    catch
+      case t: Throwable if isOutOfSpace(t) =>
+        latchOutOfSpace(t)
+      case t: Throwable =>
+        logger.warn(s"Rebuild of $storeId: checkpoint $context failed: $t")
 
   private def flushBackend(): Unit =
     backend.rebuildFlush()

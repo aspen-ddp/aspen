@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
 
-import java.nio.file.Path
+import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{Future, Promise}
@@ -237,3 +237,45 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTes
       mgr.loadStoreByIdRequests.exists(_._1 == realDeviceId) should be(false)
       // Store directory should be discarded
       os.exists(storePath) should be(false)
+
+  atest("a permanently failed flip is logged and releases its slot"):
+    val hostRoot = newHostDir()
+    val factory = new RecordingRebuildFactory
+    val mgr = newManager(hostRoot, storeRebuildFactory = factory, maxConcurrentRebuilds = 1)
+
+    // Use synthetic IDs not registered in the tree - inject manually to avoid auto-scan
+    val syntheticA = StorageDeviceId(UUID.fromString("cccccccc-0000-0000-0000-000000000001"))
+    val syntheticB = StorageDeviceId(UUID.fromString("dddddddd-0000-0000-0000-000000000002"))
+    val deviceDir = hostRoot.resolve("storage-devices").resolve("synth-a")
+    val deviceDir2 = hostRoot.resolve("storage-devices").resolve("synth-b")
+    Files.createDirectories(deviceDir)
+    Files.createDirectories(deviceDir2)
+
+    // syntheticA is NOT registered in the tree, so getStorageDevicePointer will throw NoSuchElementException
+    // This exercises the Failure(t) branch in markRebuiltStoreActive's onComplete
+
+    // Inject both devices manually (no writeDevice, so auto-scan won't find them)
+    mgr.injectLoadedDevice(new StoreManager.LocalStorageDeviceState(
+      syntheticA, deviceDir, deviceDir.resolve("dummy.file").toFile))
+    mgr.injectLoadedDevice(new StoreManager.LocalStorageDeviceState(
+      syntheticB, deviceDir2, deviceDir2.resolve("dummy.file").toFile))
+
+    val first = mgr.armLookup(syntheticA)
+    mgr.testingOnlyCheckAllDevices()
+    first.success(deviceState(syntheticA, Map(rebuilding(storeN(0)))))
+
+    for
+      _ <- yieldUntil(factory.created.size == 1)
+      // Arm a second lookup for syntheticB before completing the first rebuild
+      second = mgr.armLookup(syntheticB)
+      _ = factory.created.head.promise.success(())
+      _ <- waitForTransactionsToComplete()
+      // The flip transaction will fail with NoSuchElementException (syntheticA not in tree)
+      // which should be logged, and the slot should be released so syntheticB's rebuild can start
+      _ = second.success(deviceState(syntheticB, Map(rebuilding(storeN(1)))))
+      _ <- yieldUntil(factory.created.size == 2, 200)
+    yield
+      // Store 0 should NOT be loaded (the flip failed)
+      mgr.loadStoreByIdRequests.exists(_._1 == syntheticA) should be(false)
+      // Store 1 should eventually be created (slot was released)
+      factory.created.map(_.storeId).toSet should contain(storeN(1))

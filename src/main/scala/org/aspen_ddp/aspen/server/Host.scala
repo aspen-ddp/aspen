@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.server.repair.{RepairTarget, StoreNotHosted}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -127,7 +128,7 @@ class Host(val client: AspenClient,
                     *  eight-store device must not start eight at once. Entries beyond this bound
                     *  wait; every completion re-checks all loaded devices and starts whatever is
                     *  queued. */
-                   val maxConcurrentRebuilds: Int = 2) extends Logging {
+                   val maxConcurrentRebuilds: Int = 2) extends Logging with RepairTarget {
   import Host._
   
   given ExecutionContext = ec
@@ -1455,6 +1456,14 @@ class Host(val client: AspenClient,
     stores.keysIterator.toList
   }
 
+  /** Stores this host can currently repair. A store mid-rebuild is already having everything
+    * read, and a store transferring out is about to stop being ours; scanning either wastes the
+    * load budget on work that will be redone or discarded.
+    */
+  def repairableStoreIds: List[StoreId] = synchronized {
+    (stores.keySet -- offlineStores -- rebuildingStores.keySet -- transferringOut.keySet).toList
+  }
+
   def hasTransactions: Boolean = synchronized {
     stores.valuesIterator.exists(_.hasTransactions)
   }
@@ -1630,17 +1639,24 @@ class Host(val client: AspenClient,
         case m: ExecuteSystemTask =>
           systemTaskRunnerPromise.future.foreach(_.receive(m))
       
-      case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
-        store.repair(os, completion)
+      case Repair(storeId, os, completion) => stores.get(storeId) match
+        case Some(store) => store.repair(os, completion)
+        case None =>
+          // The store left between the sweep selecting it and this event being handled. Leaving
+          // the promise open would strand the scan that awaits it, and with it the sweep's
+          // single-flight slot -- repair would stop host-wide until the process restarts.
+          // Failing also leaves the errorTree entry in place for the store's new host.
+          logger.debug(s"Ignoring repair of ${os.pointer.id}: store $storeId is not hosted here")
+          completion.failure(StoreNotHosted(storeId))
 
       case RepairDelete(storeId, objectId, storePointer, completion) => stores.get(storeId) match
         case Some(store) => store.repairDelete(objectId, storePointer, completion)
         case None =>
-          // We do not host this store, so there is nothing here to delete. Complete rather than
-          // leaving the caller -- which waits on this promise before dropping the errorTree
-          // entry -- blocked forever.
-          logger.debug(s"Ignoring repair deletion of $objectId for unhosted store $storeId")
-          completion.success(())
+          // Must fail, not succeed. Succeeding would tell the caller the slice was deleted, and
+          // the caller would drop the errorTree entry -- leaving the object on the departed
+          // store with no record that it needs removing.
+          logger.debug(s"Ignoring repair deletion of $objectId: store $storeId is not hosted here")
+          completion.failure(StoreNotHosted(storeId))
 
       case RecoveryEvent() =>
         handleRecoveryEvent()

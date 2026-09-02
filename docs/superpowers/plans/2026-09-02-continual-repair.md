@@ -481,7 +481,7 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
       p = Promise[Unit]()
       _ = net.smgr.repair(unhostedStore, kvos, p)
       _ = net.handleEvents()
-      result <- p.future.transform(Success(_): Try[Unit] => Try[Try[Unit]])
+      result <- p.future.transform(t => Success(t))
     yield
       result.isFailure shouldBe true
       result.failed.get shouldBe a [StoreNotHosted]
@@ -491,7 +491,7 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
     val p = Promise[Unit]()
     net.smgr.repairDelete(unhostedStore, objectId, Array[Byte](), p)
     net.handleEvents()
-    p.future.transform(Success(_): Try[Unit] => Try[Try[Unit]]).map: result =>
+    p.future.transform(t => Success(t)).map: result =>
       result.isFailure shouldBe true
       result.failed.get shouldBe a [StoreNotHosted]
 ```
@@ -811,8 +811,10 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       stillThere shouldBe true
 
-  // The recursion fix, observably: were the delete transactions still tracking missed updates,
-  // the delete's own missed commit would refill the tree and the second scan would find work.
+  // Idempotence only. This does NOT prove the recursion fix: in TestNetwork the store that
+  // misses updates is index 2, so a re-tracking regression would write its entry outside the
+  // [0,1) range this scan covers. Task 1's missedUpdateTrackingEnabled test is the direct proof
+  // that repair transactions disable tracking; this one checks a drained range stays drained.
   test("a second scan after a drained tree finds nothing"):
     val objectId = ObjectId(new UUID(12, 12))
     val target = RecordingTarget(List(storeId))
@@ -1593,6 +1595,17 @@ file.
 
 In `MainSuite.scala`, delete lines 380-395: the `nowMillis` value, the `tsAtOffset` helper, and
 the three `errorEntryMayBeDeleted` tests. Equivalent coverage now lives in `StoreRepairerSuite`.
+
+In `client/internal/transaction/MissedUpdateFinalizationAction.scala`, the comment above
+`markMissedUpdates` ends with "See the repair-deletion item in TODO.txt." That file is about to
+be deleted, so repoint the sentence at the code that now owns the behaviour:
+
+```scala
+  // A repair pass must therefore treat an empty value as "delete by ObjectId alone" rather
+  // than as an error. See StoreRepairer.repairDeletion in aspen.server.repair.
+```
+
+Change only that trailing sentence; leave the rest of the comment and all code untouched.
 
 Delete `TODO.txt`.
 

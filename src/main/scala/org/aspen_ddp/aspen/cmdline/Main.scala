@@ -55,8 +55,6 @@ import scala.language.implicitConversions
 
 object Main {
 
-  val AmoebafsKey: Key = Key("amoeba")
-
   // Default listening ports for a newly created host. Shared by every subcommand that
   // creates one so the ports a host is given do not depend on which command created it.
   val DefaultDataPort: Int = 4750
@@ -110,6 +108,7 @@ object Main {
                   srcGroupName:String="",
                   newGroupLevel:Int=0,
                   entityRef:String="",
+                  fsName:String="",
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None)
 
@@ -300,7 +299,11 @@ object Main {
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x"))
+            validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<filesystem-name>").text("Name of the filesystem to serve. It must already exist; create one with create-filesystem").
+            action( (x, c) => c.copy(fsName=x)).
+            validate( x => if (x.nonEmpty) success else failure("Filesystem name must not be empty"))
         )
 
       cmd("create-pool").text("Creates a new storage pool").
@@ -370,6 +373,21 @@ object Main {
           arg[Int]("<level>").text("Hierarchy level (0 = group of pools, 1+ = group of groups)").
             action((x, c) => c.copy(newGroupLevel = x)).
             validate(x => if (x >= 0) success else failure("Level must be >= 0")),
+        )
+
+      cmd("create-filesystem").text("Creates a new AmoebaFS filesystem").
+        action((_, c) => c.copy(mode = "create-filesystem")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+
+          arg[String]("<filesystem-name>").text("Name of the new filesystem").
+            action((x, c) => c.copy(fsName = x)).
+            validate(x => if (x.nonEmpty) success else failure("Filesystem name must not be empty")),
+
+          arg[String]("<pool-name>").text("Name of the storage pool to allocate the filesystem in").
+            action((x, c) => c.copy(poolName = x)),
         )
 
       cmd("add-pool-to-group").text("Adds a storage pool to an allocation group").
@@ -612,6 +630,14 @@ object Main {
             validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
         )
 
+      cmd("list-filesystems").text("Lists all AmoebaFS filesystems").
+        action((_, c) => c.copy(mode = "list-filesystems")).
+        children(
+          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+            action((x, c) => c.copy(bootstrapConfigFile = x)).
+            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
+        )
+
       cmd("list-devices").text("Lists all storage devices for a host").
         action((_, c) => c.copy(mode = "list-devices")).
         children(
@@ -722,12 +748,13 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
                                           cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
             case "host" => run_host(absPath(cfg.hostDirectory))
-            case "amoeba" => amoeba_server(bootstrapConfigPath)
+            case "amoeba" => amoeba_server(bootstrapConfigPath, cfg.fsName)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(bootstrapConfigPath)
             case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
             case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
+            case "create-filesystem" => create_filesystem(bootstrapConfigPath, cfg.fsName, cfg.poolName)
             case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
             case "move-device-to-set" => move_device_to_set(bootstrapConfigPath, cfg.deviceId, cfg.deviceSetName)
@@ -747,6 +774,8 @@ object Main {
             case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             _.listHosts(),             _.uuid)
             case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
             case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       _.listStorageDeviceSets(), _.uuid)
+            case "list-filesystems"       => list_entries(bootstrapConfigPath, "Filesystems",
+                                                          _.listRegisteredIds(FileSystem.RegistryNamespace), identity)
             case "list-devices"           => list_devices(bootstrapConfigPath, cfg.hostName)
             case "show-host"              => show_host(bootstrapConfigPath, cfg.entityRef)
             case "show-device"            => show_device(bootstrapConfigPath, cfg.entityRef)
@@ -821,27 +850,43 @@ object Main {
     ret
   }
 
-  def initializeAmoeba(client: AspenClient,
-                       radicle: KeyValueObjectPointer,
-                       numIndexNodeSegments: Int = 100,
-                       fileSegmentSize:Int=1024*1024): Future[FileSystem] = {
+  def create_filesystem(bootstrapConfigFile: os.Path,
+                        fsName: String,
+                        poolName: String): Int = {
+
+    configureLogging()
+
+    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+
+    network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
 
-    def loadFileSystem(kvos: KeyValueObjectState): Future[FileSystem] = kvos.contents.get(AmoebafsKey) match {
-      case Some(arr) =>
-        println("Amoeba already created")
-        SimpleFileSystem.load(client, KeyValueObjectPointer(arr.value.bytes), 3)
+    val f = for
+      poolId <- client.getStoragePoolId(poolName)
+      pool <- client.getStoragePool(poolId)
+      allocator = new PoolObjectAllocator(client, pool)
+      (fsId, _) <- SimpleFileSystem.create(client, allocator, fsName)
+    yield fsId
 
-      case None =>
-        println("Creating Amoeba")
-        client.getStoragePool(kvos.pointer.poolId).flatMap { pool =>
-          val allocator = new PoolObjectAllocator(client, pool)
-          SimpleFileSystem.bootstrap(client, allocator, kvos.pointer, AmoebafsKey)
-        }
-    }
+    // Translate the known failure modes into human-readable messages. Unlike create-pool,
+    // SimpleFileSystem.create makes a single transaction attempt with no retry strategy, so
+    // KeyAlreadyExists arrives unwrapped straight from the registry's prepareRegister.
+    def reportError(cause: Throwable): Unit = cause match
+      case _: KeyAlreadyExists =>
+        println(s"Error: a filesystem named '$fsName' already exists")
+      // getStoragePoolId throws this when the name is not registered.
+      case _: NoSuchElementException =>
+        println(s"Error: storage pool '$poolName' not found")
+      case e =>
+        println(s"Error creating filesystem: ${e.getMessage}")
 
-    client.read(radicle).flatMap(loadFileSystem)
+    awaitAndReport(f):
+      case Success(fsId) =>
+        println("******************************************")
+        println(s"* New Filesystem Created: $fsId")
+        println("******************************************")
+      case Failure(err) => reportError(err)
   }
 
   /** OBSOLETE: not reachable from the CLI. Retained for reference; needs rework. */
@@ -902,16 +947,27 @@ object Main {
       ()
   }
 
-  def amoeba_server(bootstrapConfigFile: os.Path): Int = {
+  def amoeba_server(bootstrapConfigFile: os.Path, fsName: String): Int = {
     configureLogging()
 
     val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
-    val f = initializeAmoeba(client, radicle)
-
-    val fs = Await.result(f, Duration(10000, MILLISECONDS))
+    // Load only. Creating a filesystem is an explicit act -- create-filesystem -- so that a
+    // typo in the name serves an empty new filesystem instead of the one that was wanted.
+    //
+    // awaitAndReport isn't usable here: this path has to keep the loaded filesystem rather
+    // than just report on it, and it never returns to the caller once the server is up.
+    val fs = Await.ready(SimpleFileSystem.load(client, fsName, 3),
+                         Duration(10000, MILLISECONDS)).value.get match
+      case Success(fs) => fs
+      case Failure(_: NoSuchElementException) =>
+        println(s"Error: filesystem '$fsName' not found")
+        return 1
+      case Failure(err) =>
+        println(s"Error loading filesystem '$fsName': ${err.getMessage}")
+        return 1
 
     val exports = "/ 192.168.64.2(rw)\n"
 

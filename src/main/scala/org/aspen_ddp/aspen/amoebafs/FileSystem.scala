@@ -175,6 +175,16 @@ trait FileSystem extends Logging {
 }
 
 object FileSystem {
+
+  /** Namespace under which filesystem *names* are registered in the client's namespaced UUID
+   *  registry. The registered id then maps, in the object registry, to that filesystem's root
+   *  object -- the same two-hop path storage pools, hosts, and device sets use.
+   *
+   *  Distinct from `register` / `getRegisteredFileSystem` below, which are an in-memory map of
+   *  the filesystems this process has loaded.
+   */
+  val RegistryNamespace: String = "filesystem"
+
   private var loadedFileSystems = Map[UUID, FileSystem]()
 
   def register(fs: FileSystem): Unit = synchronized {

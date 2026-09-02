@@ -2,15 +2,18 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
+import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
-import org.aspen_ddp.aspen.server.transfer.TransferringOut
+import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringOut}
 
 import java.io.File
 import java.nio.charset.StandardCharsets
@@ -45,7 +48,8 @@ private class RecordingStoreManager(mgrClient: AspenClient,
                             cacheFactory: () => ObjectCache,
                             messenger: ServerMessenger,
                             finalizers: TransactionFinalizer.Factory,
-                            failFirstStoreLoad: Boolean = false)
+                            failFirstStoreLoad: Boolean = false,
+                            transferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem)
   extends StoreManager(
     mgrClient,
     HostId.BootstrapHostId,
@@ -59,7 +63,8 @@ private class RecordingStoreManager(mgrClient: AspenClient,
     finalizers,
     TransactionDriver.noErrorRecoveryFactory,
     Duration(5, SECONDS),
-    Duration(60, SECONDS)):
+    Duration(60, SECONDS),
+    transferFactory):
 
   /** (deviceId, path) for every path tryLoadStore was invoked with, in call order.
    *
@@ -154,6 +159,40 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   lazy val hostIdClaims: mutable.ListBuffer[StorageDeviceId] =
     mutable.ListBuffer[StorageDeviceId]()
 
+  /** (deviceId, storeId) for every loadStoreById call, in call order.
+   *
+   *  Recorded here rather than through storeLoadAttempts because loadStoreById only enqueues an
+   *  event, and this suite never runs the manager's event loop -- so an assertion on
+   *  storeLoadAttempts would pass vacuously whether the call was made or not. This records the
+   *  decision itself. Lazy for the same initialization-order reason as storeLoadAttempts.
+   */
+  lazy val loadStoreByIdRequests: mutable.ListBuffer[(StorageDeviceId, StoreId)] =
+    mutable.ListBuffer[(StorageDeviceId, StoreId)]()
+
+  override def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
+    synchronized:
+      loadStoreByIdRequests += ((storageDeviceId, storeId))
+    super.loadStoreById(storageDeviceId, storeId)
+
+  /** The outcome of every completed post-transfer metadata update, by store.
+   *
+   *  Recorded rather than awaited directly: the failure mode these tests guard against is a
+   *  Future that never completes, and a test that awaited one would hang the suite instead of
+   *  failing it. Lazy for the same initialization-order reason as storeLoadAttempts.
+   */
+  lazy val transferOutcomes: mutable.Map[StoreId, StoreManager.TransferOutcome] =
+    mutable.Map[StoreId, StoreManager.TransferOutcome]()
+
+  override protected def updateStateForTransferredStore(
+      storeId: StoreId,
+      fromDeviceId: StorageDeviceId,
+      toDeviceId: StorageDeviceId): Future[StoreManager.TransferOutcome] =
+    val f = super.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
+    f.foreach: outcome =>
+      synchronized:
+        transferOutcomes += storeId -> outcome
+    f
+
   override protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
     synchronized:
       hostIdClaims += storageDeviceId
@@ -188,6 +227,49 @@ private class RecordingStoreManager(mgrClient: AspenClient,
     require(!storageDevices.contains(sds.storageDeviceId),
             s"${sds.storageDeviceId} is already loaded; injectLoadedDevice does not replace")
     storageDevices += (sds.storageDeviceId -> sds)
+
+
+/** A StoreTransferFactory whose transfers move no bytes and finish only when the test says so.
+ *
+ *  The real TransferringIn needs a live sending host and a `jar` subprocess, neither of which
+ *  exists here, but the interesting half of a transfer for these tests is what StoreManager does
+ *  once `complete` resolves. createTransferOut is unimplemented on purpose: nothing in this
+ *  suite ships a store out, and a silently-working stub would hide it if something started to.
+ */
+private class StagedTransferFactory extends StoreTransferFactory:
+  private val transfersIn = mutable.Map[StoreId, Promise[Unit]]()
+
+  /** The stores a transfer in has been created for. */
+  def startedTransfersIn: Set[StoreId] = synchronized(transfersIn.keySet.toSet)
+
+  /** Resolves `storeId`'s transfer as if every byte had arrived. */
+  def finishTransferIn(storeId: StoreId): Unit =
+    synchronized(transfersIn.get(storeId)).foreach(_.success(()))
+
+  def createTransferIn(client: AspenClient,
+                       sid: StoreId,
+                       storageDeviceId: StorageDeviceId,
+                       devicePath: Path): StoreTransferIn =
+    val p = synchronized:
+      val promise = Promise[Unit]()
+      transfersIn += sid -> promise
+      promise
+
+    new StoreTransferIn:
+      val storeId: StoreId = sid
+      val transferUUID: UUID = UUID.randomUUID()
+      def complete: Future[Unit] = p.future
+      def dataReceived(db: DataBuffer): Unit = ()
+
+  def createTransferOut(client: AspenClient,
+                        fromDevice: StorageDeviceId,
+                        devicePath: Path,
+                        storeId: StoreId,
+                        toHost: HostId,
+                        toDevice: StorageDeviceId,
+                        timestamp: HLCTimestamp,
+                        transferUUID: UUID): StoreTransferOut =
+    throw new UnsupportedOperationException("StagedTransferFactory does not send stores")
 
 
 /** Delegates execution to `underlying`, and records every reportFailure call instead of
@@ -294,10 +376,12 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
 
   private def newManager(hostRoot: Path,
                          failFirstStoreLoad: Boolean = false,
-                         ec: ExecutionContext = executionContext): RecordingStoreManager =
+                         ec: ExecutionContext = executionContext,
+                         transferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem
+                        ): RecordingStoreManager =
     new RecordingStoreManager(client, systemId, hostRoot, ec,
                               net.objectCacheFactory, net, net.FinalizerFactory,
-                              failFirstStoreLoad)
+                              failFirstStoreLoad, transferFactory)
 
   private val deviceA = StorageDeviceId(UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001"))
   private val deviceB = StorageDeviceId(UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002"))
@@ -922,3 +1006,142 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite:
       Files.exists(outDir.resolve(TransferringOut.MarkerFile)) should be(true)
       Files.exists(stagedDir.resolve(TransferringOut.MarkerFile)) should be(true)
       mgr.storeLoadAttempts.size should be(before)
+
+  /** Zeroes both of `deviceId`'s ids in the storage-devices tree, exactly as
+   *  FailedStorageDeviceDurableTask's step 1 does, without running the task. */
+  private def tombstoneDevice(deviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStorageDevicePointer(deviceId)
+        kvos <- client.read(ptr)
+      yield
+        val tombstoned = StorageDeviceState(kvos).copy(
+          hostId = fixed_ids.FailedHostId,
+          storageDeviceId = fixed_ids.FailedStorageDeviceId)
+        tx.update(ptr, None, None,
+          List(KeyRevision(StorageDeviceState.StateKey,
+            kvos.contents(StorageDeviceState.StateKey).revision)),
+          List(Insert(StorageDeviceState.StateKey, tombstoned.encode())))
+
+  /** Waits for `condition` by alternating yields with transaction drains.
+   *
+   *  yieldUntil alone is enough for work that is already queued on the test's ExecutionContext,
+   *  but the post-transfer path runs a real transaction, and those only make progress while
+   *  waitForTransactionsToComplete is pumping the store manager's event queue.
+   *
+   *  Gives up silently after `rounds`, for the same reason yieldUntil does: the caller's own
+   *  assertion reports what went wrong far better than a timeout would. Callers MUST assert.
+   */
+  private def pumpUntil(condition: => Boolean, rounds: Int = 20): Future[Unit] =
+    given ExecutionContext = executionContext
+    if condition || rounds == 0 then
+      Future.unit
+    else
+      for
+        _ <- yieldUntil(condition, 20)
+        _ <- waitForTransactionsToComplete()
+        _ <- pumpUntil(condition, rounds - 1)
+      yield ()
+
+  atest("a transfer arriving on a tombstoned destination is discarded, not loaded"):
+    given ExecutionContext = executionContext
+
+    // This host owns the transfer's destination, which the operator is about to declare dead.
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    val transfers = new StagedTransferFactory
+    val mgr = newManager(hostRoot, transferFactory = transfers)
+
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+
+    // What TransferringIn leaves behind: an unpacked store directory with no transfer marker,
+    // so tryLoadStore would happily load it. Created only when the bytes "arrive", to keep it
+    // out of the construction scan.
+    val arrived = deviceDir.resolve(movingStore.directoryName)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+
+      // Source goes TransferringOut, destination TransferringIn, pool still names the source.
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      // The destination host's own poll is what starts the receiving half. Driving it through
+      // the device check rather than calling startStoreTransferIn directly is the point of the
+      // test: the round-3 fix was tested through a seam that skipped this path entirely.
+      _ = mgr.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
+      _ = transfers.startedTransfersIn should contain(movingStore)
+
+      // The operator declares the destination dead while the bytes are still moving.
+      _ <- tombstoneDevice(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      _ = Files.createDirectories(arrived)
+      _ = transfers.finishTransferIn(movingStore)
+
+      // Not awaited: the pre-fix hazard in this area is a Future that never completes, and
+      // awaiting one would hang the suite rather than fail it.
+      _ <- pumpUntil(mgr.transferOutcomes.contains(movingStore))
+      _ <- pumpUntil(!Files.exists(arrived))
+
+      source <- client.getStorageDeviceState(sourceId)
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield
+      // pumpUntil gives up silently, so assert what it waited on.
+      mgr.transferOutcomes.get(movingStore) should be(
+        Some(StoreManager.TransferOutcome.SourceRestored))
+
+      // The metadata half, from round 3: the pool keeps naming the source and the source's
+      // entry goes back to Active.
+      poolState.stores(movingStore.poolIndex).storageDeviceId should be(sourceId)
+      source.stores(movingStore).status should be(StorageDeviceState.StoreStatus.Active)
+
+      // The disk half. Loading the arrived copy would put a live store on a device the metadata
+      // has just decided must not own it, with nothing to reclaim it: the deleted-stores pass
+      // only considers offlineStores, and reconcileDeviceState ignores a failed device outright.
+      // Same host as the source and it would replace the source's entry in `stores`, silently
+      // discarding every update applied to it.
+      mgr.loadStoreByIdRequests.toList should be(Nil)
+
+      // And the directory goes too, or the next restart's scan loads exactly what this refused.
+      Files.exists(arrived) should be(false)
+
+  atest("a transfer arriving on a healthy destination is loaded"):
+    given ExecutionContext = executionContext
+
+    // The other half of the same decision. Without this, a fix that simply never loaded an
+    // arrived store would pass the test above.
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    val transfers = new StagedTransferFactory
+    val mgr = newManager(hostRoot, transferFactory = transfers)
+
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    val arrived = deviceDir.resolve(movingStore.directoryName)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      _ = mgr.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
+      _ = transfers.startedTransfersIn should contain(movingStore)
+
+      _ = Files.createDirectories(arrived)
+      _ = transfers.finishTransferIn(movingStore)
+      _ <- pumpUntil(mgr.transferOutcomes.contains(movingStore))
+
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield
+      mgr.transferOutcomes.get(movingStore) should be(
+        Some(StoreManager.TransferOutcome.PoolRepointed))
+
+      poolState.stores(movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
+      mgr.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
+      Files.exists(arrived) should be(true)

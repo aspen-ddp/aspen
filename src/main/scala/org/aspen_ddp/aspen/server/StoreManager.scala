@@ -488,8 +488,18 @@ class StoreManager(val client: AspenClient,
           case None => err(s"Store ${m.storeId} not in transfer state. Transfer probably completed")
           case Some(sid) => sid
         toDevice <- client.getStorageDeviceState(toDeviceId)
-        sourceDs = storageDevices.get(fromDevice.storageDeviceId) match
-          case None => err(s"Source storage device for transfer ${fromDevice.storageDeviceId} not loaded. Disk removed?")
+        // The destination was declared failed while the transfer was in flight, so both its ids
+        // read as zero. There is no fresher source for them -- unlike the source device's id
+        // below, which the pool entry carries -- so the only safe thing is to refuse. Shipping
+        // bytes to HostId(0,0) would run indefinitely against a host that does not exist.
+        _ = if toDevice.isFailed then
+              err(s"Destination device $toDeviceId for transfer of store ${m.storeId} has been " +
+                  s"declared failed")
+        // Keyed off the pool entry, not fromDevice.storageDeviceId: those are the same value in
+        // the healthy case, but a tombstoned source zeroes its own copy, and the lookup would
+        // then miss and blame a removed disk for a device that is loaded and present.
+        sourceDs = storageDevices.get(poolEntry.storageDeviceId) match
+          case None => err(s"Source storage device for transfer ${poolEntry.storageDeviceId} not loaded. Disk removed?")
           case Some(sds) => sds
       yield
         synchronized {

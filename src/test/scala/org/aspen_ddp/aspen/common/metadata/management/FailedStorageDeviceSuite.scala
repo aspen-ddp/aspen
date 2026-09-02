@@ -5,8 +5,10 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{Radicle, TypeFactories}
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState, fixed_ids}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.compute.{DurableTaskFactory, DurableTaskPointer, ServiceEntry}
 import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskServiceState}
 
@@ -299,6 +301,105 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       afterRev should be(poolRev)
       val cfg = BootstrapConfig.parseBootstrapConfig(after)
       cfg.hosts.map(_.stores.length).sum should be(3)
+
+  /** Repoint one pool store entry at `deviceId`, as a completed transfer or a rebalance would. */
+  private def repointPoolStore(storeId: StoreId, deviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        devState <- client.getStorageDeviceState(deviceId)
+        poolPtr <- client.getStoragePoolPointer(storeId.poolId)
+        poolKvos <- client.read(poolPtr)
+      yield
+        val poolCfg = StoragePoolState(poolKvos)
+        poolCfg.stores(storeId.poolIndex) =
+          StoragePoolState.StoreEntry(devState.hostId, deviceId)
+        tx.update(poolPtr, None, None,
+          List(KeyRevision(StoragePoolState.ConfigKey,
+            poolKvos.contents(StoragePoolState.ConfigKey).revision)),
+          List(Insert(StoragePoolState.ConfigKey, poolCfg.encode())))
+
+  atest("the drain disowns a TransferringIn entry rather than repointing the pool"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    val liveId = StorageDeviceId.BootstrapStorageDeviceId
+    val storeId = StoreId(PoolId.BootstrapPoolId, 1)
+    val result = for
+      // A destination for the transfer, and a third device so the drain has somewhere to place
+      // the store if it wrongly decides to rebuild it. Without the third device the pass would
+      // fail on AllocationError and the test would pass for the wrong reason.
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+
+      // An operator starts a transfer of store 1 onto the second device. transferStore marks the
+      // source TransferringOut and the destination TransferringIn, and deliberately leaves the
+      // pool naming the source: the source owns the store until the transfer completes.
+      _ <- client.transferStore(storeId, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      // The transfer stalls, so the operator fails the destination. Its store map now holds a
+      // store it has no data for and does not own.
+      _ <- client.failStorageDevice(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(net.secondDeviceId, setId)
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+                       "task completion")
+      _ <- waitForTransactionsToComplete()
+
+      tombstone <- client.getStorageDeviceState(net.secondDeviceId)
+      live <- client.getStorageDeviceState(liveId)
+      third <- client.getStorageDeviceState(net.thirdDeviceId)
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield (tombstone, live, third, poolState)
+
+    result.map: (tombstone, live, third, poolState) =>
+      // The entry is dropped, not filtered: the store map is also the completion condition, so
+      // an entry left in place would strand the task.
+      tombstone.stores.get(storeId) should be(None)
+
+      // Nothing else moves. The pool still names the device that actually holds the slice, and
+      // that device's transfer entry is untouched.
+      poolState.stores(storeId.poolIndex).storageDeviceId should be(liveId)
+      live.stores(storeId).status should be(StorageDeviceState.StoreStatus.TransferringOut)
+      live.stores(storeId).transferDevice should be(Some(net.secondDeviceId))
+      third.stores.get(storeId) should be(None)
+
+  atest("the drain disowns a store the pool no longer names"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    val failedId = StorageDeviceId.BootstrapStorageDeviceId
+    val storeId = StoreId(PoolId.BootstrapPoolId, 0)
+    val result = for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.failStorageDevice(failedId)
+      _ <- waitForTransactionsToComplete()
+
+      // Something else repointed store 0 at the third device while its entry stayed on the
+      // failed device. Whatever did it, the failed device no longer owns store 0, and rebuilding
+      // it would route the pool away from the copy that exists.
+      _ <- repointPoolStore(storeId, net.thirdDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(failedId, setId)
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+                       "task completion")
+      _ <- waitForTransactionsToComplete()
+
+      tombstone <- client.getStorageDeviceState(failedId)
+      third <- client.getStorageDeviceState(net.thirdDeviceId)
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield (tombstone, third, poolState)
+
+    result.map: (tombstone, third, poolState) =>
+      // Store 0 is dropped and the other two drain normally, so the task still completes.
+      tombstone.stores shouldBe empty
+      poolState.stores(storeId.poolIndex).storageDeviceId should be(net.thirdDeviceId)
+      third.stores.get(storeId) should be(None)
 
   atest("a resumed task picks up mid-drain"):
     given ExecutionContext = executionContext

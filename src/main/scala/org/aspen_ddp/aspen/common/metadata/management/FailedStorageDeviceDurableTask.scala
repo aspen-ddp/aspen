@@ -248,8 +248,9 @@ class FailedStorageDeviceDurableTask(
         case Success(nudge) =>
           // A best-effort wake-up so the destination host starts promptly rather than waiting
           // out Main.CheckStorageDevicesPeriod. The poll is the guarantee; this is the
-          // optimization.
-          client.sendBestEffortHostMessage(nudge)
+          // optimization. None when the pass merely disowned an entry: nothing was written to
+          // any destination, so there is nothing to wake.
+          nudge.foreach(client.sendBestEffortHostMessage)
           scheduleRecheck()
           Future.unit
 
@@ -263,9 +264,13 @@ class FailedStorageDeviceDurableTask(
 
   /** The one transaction that moves a single store off the tombstone. Returns the nudge to send
    *  once it has committed -- built inside so a retried attempt cannot double-send, and sent by
-   *  the caller rather than from tx.result so the returned Future actually waits for it. */
+   *  the caller rather than from tx.result so the returned Future actually waits for it.
+   *
+   *  Returns None when the failed device turns out not to own the store: the entry is dropped
+   *  from the tombstone's work list and nothing else is touched, so there is no destination to
+   *  nudge. */
   private def moveStore(storeId: StoreId,
-                        destinationId: StorageDeviceId): Future[CheckStorageDevice] =
+                        destinationId: StorageDeviceId): Future[Option[CheckStorageDevice]] =
 
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
@@ -292,47 +297,78 @@ class FailedStorageDeviceDurableTask(
           if !tombstoneState.stores.contains(storeId) then
             // Another pass, or a concurrent fail-storage-device, already moved it.
             throw new StoreAlreadyMoved(storeId)
-          else if dstState.isFailed then
+
+        // An entry on the failed device does not by itself mean the failed device owns the
+        // store, and rebuilding a store it does not own repoints the pool away from the live
+        // copy and orphans it. Two ways that happens:
+        //
+        //   - TransferringIn: the entry is the receiving half of a store transfer. The source
+        //     owns the store until the transfer completes, which is why transferStore leaves the
+        //     pool naming the source, and why rebalancing's ownedStores (common/rebalancing/
+        //     State.scala) filters TransferringIn out of its accounting.
+        //   - the pool no longer names this device for that index, whatever repointed it.
+        //
+        // Either way the entry is stale bookkeeping, so drop it and touch nothing else. Dropping
+        // rather than filtering it out of nextStore is deliberate: the tombstone's store map is
+        // simultaneously the work list and the completion condition, so an entry left in place
+        // would keep the map non-empty and strand the task forever.
+        disowned =
+          tombstoneState.stores.get(storeId).exists(
+            _.status == StorageDeviceState.StoreStatus.TransferringIn) ||
+          poolCfg.stores(storeId.poolIndex).storageDeviceId != deviceId
+
+        _ =
+          if !disowned && dstState.isFailed then
             // Structurally unreachable once step 1 has removed the tombstone from its set, but
             // the pool state driving selection can be stale.
             throw AspenClient.DeviceFailed(destinationId)
-        // Pool: repoint now, at the start of the rebuild rather than at its end. Reads of a
-        // rebuilding store fail until it is reconstructed, but that is equally true of a store
-        // on a dead device, and the pool must stop naming the dead device before anything can
-        // route around it. The rebalancer already excludes non-Active stores from movement and
-        // from the write-threshold count.
-        //
-        // CRITICAL ORDERING: this mutation must precede prepRadicleUpdate. prepRadicleUpdate
-        // builds poolHosts from poolCfg.stores, so if the mutation happens after (in the yield
-        // block), it reads stale state: the failed device's old host lands in hostsList while
-        // storeMap remaps its only bootstrap store away, and generateBootstrapConfig's
-        // require(storesOnHost.nonEmpty) throws IllegalArgumentException — permanent, not in
-        // StopRetrying, infinite loop. Invisible in single-host TestNetwork; no test protects
-        // this ordering.
-        _ = poolCfg.stores(storeId.poolIndex) =
-              StoragePoolState.StoreEntry(dstState.hostId, destinationId)
-        _ <- BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, dstState.hostId)
-      yield
-        // Destination: gains a Rebuilding entry. This is the entire message to the consumer.
-        val newDst = dstState.setStoreEntry(
-          storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
-        tx.update(dstPtr, None, None,
-          List(KeyRevision(StorageDeviceState.StateKey,
-            dstKvos.contents(StorageDeviceState.StateKey).revision)),
-          List(Insert(StorageDeviceState.StateKey, newDst.encode())))
 
+        _ <-
+          if disowned then
+            Future.unit
+          else
+            // Pool: repoint now, at the start of the rebuild rather than at its end. Reads of a
+            // rebuilding store fail until it is reconstructed, but that is equally true of a
+            // store on a dead device, and the pool must stop naming the dead device before
+            // anything can route around it. The rebalancer already excludes non-Active stores
+            // from movement and from the write-threshold count.
+            //
+            // CRITICAL ORDERING: this mutation must precede prepRadicleUpdate. prepRadicleUpdate
+            // builds poolHosts from poolCfg.stores, so if the mutation happens after (in the
+            // yield block), it reads stale state: the failed device's old host lands in
+            // hostsList while storeMap remaps its only bootstrap store away, and
+            // generateBootstrapConfig's require(storesOnHost.nonEmpty) throws
+            // IllegalArgumentException — permanent, infinite loop unless StopRetrying catches
+            // it. Invisible in single-host TestNetwork; no test protects this ordering.
+            poolCfg.stores(storeId.poolIndex) =
+              StoragePoolState.StoreEntry(dstState.hostId, destinationId)
+            BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, dstState.hostId)
+      yield
         // Tombstone: loses the store. This is also the progress record -- an empty store map is
-        // what completes the task.
+        // what completes the task. Staged on both paths: a disowned entry is dropped and nothing
+        // else is written.
         val newTombstone = tombstoneState.removeStore(storeId)
         tx.update(devPtr, None, None,
           List(KeyRevision(StorageDeviceState.StateKey,
             devKvos.contents(StorageDeviceState.StateKey).revision)),
           List(Insert(StorageDeviceState.StateKey, newTombstone.encode())))
 
-        // Pool config update with the mutation already applied above.
-        tx.update(poolPtr, None, None,
-          List(KeyRevision(StoragePoolState.ConfigKey,
-            poolKvos.contents(StoragePoolState.ConfigKey).revision)),
-          List(Insert(StoragePoolState.ConfigKey, poolCfg.encode())))
+        if disowned then
+          logger.info(s"Failed device ${deviceId.uuid}: dropping $storeId, which it does not own")
+          None
+        else
+          // Destination: gains a Rebuilding entry. This is the entire message to the consumer.
+          val newDst = dstState.setStoreEntry(
+            storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+          tx.update(dstPtr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey,
+              dstKvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey, newDst.encode())))
 
-        CheckStorageDevice(dstState.hostId, client.clientId, destinationId)
+          // Pool config update with the mutation already applied above.
+          tx.update(poolPtr, None, None,
+            List(KeyRevision(StoragePoolState.ConfigKey,
+              poolKvos.contents(StoragePoolState.ConfigKey).revision)),
+            List(Insert(StoragePoolState.ConfigKey, poolCfg.encode())))
+
+          Some(CheckStorageDevice(dstState.hostId, client.clientId, destinationId))

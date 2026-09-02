@@ -32,12 +32,3 @@ object StoreRebuildFactory:
                       storageDeviceId: StorageDeviceId,
                       devicePath: Path): StoreRebuild =
       new RebuildingStore(client, storeId, storageDeviceId, devicePath)
-
-/** Placeholder until the walk lands. Replaced in full by
- *  server/rebuild/RebuildingStore.scala. */
-private class RebuildingStore(client: AspenClient,
-                              val storeId: StoreId,
-                              storageDeviceId: StorageDeviceId,
-                              devicePath: Path) extends StoreRebuild:
-  def complete: Future[Unit] =
-    Future.failed(new NotImplementedError("store rebuild is not implemented yet"))

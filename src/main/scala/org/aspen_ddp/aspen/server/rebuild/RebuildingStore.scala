@@ -1,0 +1,338 @@
+package org.aspen_ddp.aspen.server.rebuild
+
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState}
+import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
+import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
+import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
+import scribe.Logging
+
+import java.nio.file.Path
+import scala.collection.mutable
+import scala.concurrent.{ExecutionContext, Future, Promise}
+
+object RebuildingStore:
+  /** Staging directory under the device root. Invisible to StoreManager.tryLoadStore for the
+   *  same reason transferring-in/ is: there is no StoreConfig at this level, only one level
+   *  down. That is what keeps a half-rebuilt store from being loaded and answering reads. */
+  val RebuildDirectory = "rebuilding"
+
+  /** Objects between checkpoints. Small enough that a crash costs little, large enough that
+   *  the flush is not the dominant cost. */
+  val CheckpointInterval: Int = 1000
+
+
+/** Reconstructs one store by walking its pool's allocation tree, reading each object through
+ *  the client, and writing this store's slice of it into a fresh backend.
+ *
+ *  The store is not Active while this runs, so it participates in no transactions and receives
+ *  no writes. Objects the walk has not yet reached are therefore read at their current value.
+ *  The gap is the other side: an object already copied and then written before the rebuild
+ *  finishes leaves a stale slice here. That is the same condition as a store that missed writes
+ *  while briefly offline, and the repair-on-read path heals it for anything something reads.
+ *  Cold objects are not healed; a background scrubber is deliberately out of scope.
+ */
+class RebuildingStore(client: AspenClient,
+                      val storeId: StoreId,
+                      storageDeviceId: StorageDeviceId,
+                      devicePath: Path,
+                      checkpointInterval: Int = RebuildingStore.CheckpointInterval,
+                      testingOnlyFailKeys: Set[Key] = Set(),
+                      testingOnlyMaxFailedObjects: Int = RebuildState.MaxFailedObjects) extends StoreRebuild with Logging:
+
+  import RebuildingStore.*
+
+  private given ExecutionContext = client.clientContext
+
+  private val stagingPath = os.Path(devicePath) / RebuildDirectory / storeId.directoryName
+  private val finalPath = os.Path(devicePath) / storeId.directoryName
+
+  private val completionPromise: Promise[Unit] = Promise()
+  def complete: Future[Unit] = completionPromise.future
+
+  /** Keys handed to rebuildWrite, in walk order. Test hook. */
+  private val restoredKeys = mutable.ListBuffer[Key]()
+  private[rebuild] def testingOnlyRestoredKeys: List[Key] = synchronized(restoredKeys.toList)
+
+  /** "flush" / "checkpoint" in the order they happened. Test hook: the ordering between them
+   *  is the one thing that cannot be observed from disk after a successful pass. */
+  private val checkpointTrace = mutable.ListBuffer[String]()
+  private[rebuild] def testingOnlyCheckpointTrace: List[String] =
+    synchronized(checkpointTrace.toList)
+
+  private var backend: Backend = null
+  private var restoredSinceCheckpoint = 0
+  private var lastKey: Option[Key] = None
+  private var failed: List[ObjectId] = Nil
+
+  /** Abort latch: when a fatal condition fires (out of space or too many failures), we record
+   *  the cause here. KeyValueListNode.walkFrom swallows a failing fn by design -- it logs and
+   *  continues -- so a fatal condition has to be carried out of band. Once set, restoreObject
+   *  returns Future.unit immediately, making the remainder of the walk a cheap no-op. The
+   *  latched cause is checked after the walk returns, and if set, the pass fails before
+   *  retryFailures() and finish() run, leaving the checkpoint in staging so the next device
+   *  check resumes. */
+  private var abortCause: Option[Throwable] = None
+
+  // Started from the constructor, mirroring TransferringIn. StoreManager holds its instance
+  // lock across the call, so everything expensive is inside the future.
+  start()
+
+  private def start(): Unit =
+    val f =
+      try
+        if os.exists(finalPath) then
+          // A crash between the move and the flip. The store is already whole; there is nothing to
+          // rebuild, only the flip left, and that is StoreManager's job on completion.
+          logger.info(s"Rebuild of $storeId: store already in place at $finalPath")
+          cleanupStaging()
+          Future.unit
+        else
+          runPass()
+      catch
+        case err: Throwable => Future.failed(err)
+
+    f.onComplete: outcome =>
+      closeBackend().onComplete(_ => completionPromise.tryComplete(outcome))
+
+  private def cleanupStaging(): Unit =
+    try
+      if os.exists(stagingPath) then os.remove.all(stagingPath)
+    catch
+      case t: Throwable => logger.warn(s"Rebuild of $storeId: failed to remove $stagingPath: $t")
+
+  /** Idempotent: finish() closes on the happy path, start()'s onComplete closes on every path. */
+  private def closeBackend(): Future[Unit] =
+    val b = synchronized {
+      val prev = backend
+      backend = null
+      prev
+    }
+
+    if b == null then
+      Future.unit
+    else
+      b.close().recover:
+        case t => logger.warn(s"Rebuild of $storeId: backend close failed: $t")
+
+  /** One full pass: open (or reopen) the staging area, walk, retry failures, complete. */
+  private def runPass(): Future[Unit] =
+    // The checkpoint is never deleted on restart -- reading it is what makes a restart a
+    // resume.
+    val resume = RebuildState.load(stagingPath)
+
+    os.makeDir.all(stagingPath)
+
+    if !os.exists(stagingPath / StoreConfig.configFilename) then
+      // Written up front so the directory is loadable the instant it is moved into place.
+      os.write.over(stagingPath / StoreConfig.configFilename,
+        StoreConfig(storeId, StoreConfig.RocksDB()).yamlConfig)
+
+    resume.foreach: st =>
+      synchronized {
+        lastKey = st.lastRestoredKey
+        failed = st.failedObjects
+      }
+      logger.info(s"Rebuild of $storeId: resuming from ${st.lastRestoredKey}, " +
+                  s"${st.failedObjects.size} objects to retry")
+
+    for
+      pstate <- client.getStoragePoolState(storeId.poolId)
+      _ = synchronized {
+            backend = pstate.backendConfig match
+              case _: RocksDBConfig => new RocksDBBackend(stagingPath.toNIO, storeId, summon)
+          }
+      pool <- client.getStoragePool(storeId.poolId)
+      tree = pool.allocationTree
+      _ <- resume.flatMap(_.lastRestoredKey) match
+             // The resume range is inclusive of the checkpointed key. rebuildWrite is an
+             // overwrite, so re-restoring that one object is free, and inclusive is the only
+             // bound that cannot skip.
+             case Some(k) => tree.foreachFrom(k, restoreObject)
+             case None => tree.foreach(restoreObject)
+      // Check the abort latch after the walk completes. If it's set, fail the pass before
+      // retryFailures() and finish() run, leaving the checkpoint in staging.
+      _ <- synchronized(abortCause) match
+             case Some(cause) => Future.failed(cause)
+             case None => Future.unit
+      _ <- retryFailures()
+      _ <- finish()
+    yield ()
+
+  /** Copy one object's slice of this store into the backend.
+   *
+   *  foreach swallows a failing fn -- it logs and continues -- so read failures are recorded
+   *  here instead. The checkpoint advances past them, so one unreadable object cannot wedge the
+   *  walk forever, and they are retried at the end of the pass.
+   */
+  private def restoreObject(node: KeyValueListNode,
+                            key: Key,
+                            value: ValueState): Future[Unit] =
+    // If the abort latch is set, return immediately to make the remainder of the walk a cheap
+    // no-op rather than thousands of repeated failures.
+    synchronized(abortCause) match
+      case Some(_) => return Future.unit
+      case None => ()
+
+    val ptr = ObjectPointer(value.value.bytes)
+
+    if ptr.poolId != storeId.poolId then
+      // The allocation tree is per-pool, but a pointer stored in it is only authoritative for
+      // its own pool. Skip anything foreign rather than writing it into the wrong store.
+      Future.unit
+    else
+      attemptRestore(key, ptr).transformWith:
+        case scala.util.Success(_) =>
+          recordRestored(key)
+        case scala.util.Failure(err) if isOutOfSpace(err) =>
+          // Distinct from a per-object read failure, and not something to accumulate 10,000 of:
+          // selectDeviceForRebuild checked free space at placement time against the pool's
+          // recorded store size, which can be stale and can grow. There is no automatic
+          // recovery in this scope -- the operator's remedy is to add capacity -- so log it
+          // loudly enough to alert on and set the abort latch.
+          checkpoint()
+          logger.error(s"REBUILD OUT OF SPACE: store $storeId cannot fit on device " +
+                       s"$storageDeviceId at $devicePath. The store will remain Rebuilding " +
+                       s"until capacity is added. Underlying error: $err")
+          synchronized {
+            if abortCause.isEmpty then
+              abortCause = Some(err)
+          }
+          Future.unit
+        case scala.util.Failure(err) =>
+          recordFailure(ObjectId(key.bytes), err)
+
+  /** Best-effort detection of a full destination. Backends surface it differently -- RocksDB
+   *  wraps it, the JDK throws IOException -- so this matches on the message as well as the
+   *  type. A false negative only costs the slower path through recordFailure. */
+  private def isOutOfSpace(err: Throwable): Boolean =
+    def matches(t: Throwable): Boolean =
+      val msg = Option(t.getMessage).getOrElse("").toLowerCase
+      msg.contains("no space left") || msg.contains("disk full") ||
+        msg.contains("insufficient space")
+
+    Iterator.iterate(err)(_.getCause).takeWhile(_ != null).take(8).exists(matches)
+
+  // Key's equality is not something to bet a test seam on; compare the bytes directly.
+  private val failBytes: Set[List[Byte]] = testingOnlyFailKeys.map(_.bytes.toList)
+
+  private def attemptRestore(key: Key, ptr: ObjectPointer): Future[Unit] =
+    if failBytes.contains(key.bytes.toList) then
+      Future.failed(new Exception(s"injected read failure for $key"))
+    else
+      restore(ptr)
+
+  private def restore(ptr: ObjectPointer): Future[Unit] =
+    def metadataOf(os: ObjectState): (ObjectType.Value, Metadata) = os match
+      case kvos: KeyValueObjectState =>
+        (ObjectType.KeyValue, Metadata(kvos.revision, kvos.refcount, kvos.timestamp))
+      case dos: DataObjectState =>
+        (ObjectType.Data, Metadata(dos.revision, dos.refcount, dos.timestamp))
+      case _: MetadataObjectState =>
+        throw new Exception(s"Unsupported object type for rebuild: $ptr")
+
+    val fos = ptr match
+      case p: KeyValueObjectPointer => client.read(p)
+      case p: DataObjectPointer => client.read(p)
+
+    fos.map: os =>
+      val (objectType, metadata) = metadataOf(os)
+      val localData = os.getRebuildDataForStore(storeId)
+      backend.rebuildWrite(os.id, objectType, metadata, localData.getOrElse(DataBuffer()))
+
+  private def recordRestored(key: Key): Future[Unit] =
+    val checkpointNow = synchronized {
+      restoredKeys += key
+      lastKey = Some(key)
+      restoredSinceCheckpoint += 1
+      if restoredSinceCheckpoint >= checkpointInterval then
+        restoredSinceCheckpoint = 0
+        true
+      else
+        false
+    }
+
+    if checkpointNow then checkpoint()
+    Future.unit
+
+  private def recordFailure(objectId: ObjectId, err: Throwable): Future[Unit] =
+    val over = synchronized {
+      failed = objectId :: failed
+      failed.size > testingOnlyMaxFailedObjects
+    }
+
+    logger.warn(s"Rebuild of $storeId: failed to read object $objectId: $err")
+
+    if over then
+      // Something systemic is wrong -- the pool below its read threshold, most likely -- and
+      // continuing only burns I/O. Abort with the checkpoint intact; the next device check
+      // retries. Set the abort latch so the rest of the walk is a no-op.
+      checkpoint()
+      val cause = new Exception(
+        s"Rebuild of $storeId aborted: more than $testingOnlyMaxFailedObjects unreadable objects")
+      synchronized {
+        if abortCause.isEmpty then
+          abortCause = Some(cause)
+      }
+      Future.unit
+    else
+      Future.unit
+
+  /** Flush FIRST, then write the checkpoint. The reverse order would let a crash between the
+   *  two produce a checkpoint claiming objects that never reached stable storage. */
+  private def checkpoint(): Unit =
+    backend.rebuildFlush()
+    synchronized(checkpointTrace += "flush")
+    val (k, f) = synchronized((lastKey, failed))
+    RebuildState.save(stagingPath, RebuildState(storeId, k, f))
+    synchronized(checkpointTrace += "checkpoint")
+
+  /** Retry everything the walk could not read. Anything still failing leaves the store
+   *  Rebuilding for the next device check to pick up. */
+  private def retryFailures(): Future[Unit] =
+    val pending = synchronized {
+      val f = failed
+      failed = Nil
+      f
+    }
+
+    if pending.isEmpty then
+      Future.unit
+    else
+      logger.info(s"Rebuild of $storeId: retrying ${pending.size} unreadable objects")
+      val pool = client.getStoragePool(storeId.poolId)
+      val retries = pending.map: objectId =>
+        val key = Key(objectId.toBytes)
+        pool.flatMap(_.allocationTree.get(key)).flatMap:
+          case Some(vs) => attemptRestore(key, ObjectPointer(vs.value.bytes))
+          case None => Future.unit // deleted since the walk saw it; nothing to restore
+        .recover:
+          case err =>
+            synchronized {
+              failed = objectId :: failed
+            }
+            logger.warn(s"Rebuild of $storeId: retry of $objectId failed: $err")
+
+      Future.sequence(retries).flatMap: _ =>
+        val remaining = synchronized(failed)
+        if remaining.isEmpty then
+          Future.unit
+        else
+          checkpoint()
+          Future.failed(new Exception(
+            s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable"))
+
+  /** Flush, close, drop the checkpoint, move into place. */
+  private def finish(): Future[Unit] =
+    backend.rebuildFlush()
+    closeBackend().map: _ =>
+      val checkpointFile = stagingPath / RebuildState.stateFilename
+      if os.exists(checkpointFile) then
+        os.remove(checkpointFile)
+
+      os.move(stagingPath, finalPath)
+      logger.info(s"Rebuild of $storeId: store in place at $finalPath")

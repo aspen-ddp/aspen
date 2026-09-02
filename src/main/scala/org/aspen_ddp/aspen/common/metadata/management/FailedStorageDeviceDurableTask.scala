@@ -133,8 +133,19 @@ class FailedStorageDeviceDurableTask(
 
         Future.unit
 
-  /** One pass. Filled in by the tombstone step (Task 8) and the drain step (Task 9). */
+  /** Test hook: entries into drive(), counted before anything in the pass can fail.
+   *
+   *  A wedged single-flight flag is indistinguishable from a healthy poll loop by every other
+   *  observable this class has -- the promise stays incomplete either way, and the logs are
+   *  silent either way. Only the pass count separates them, which is why this seam exists.
+   *
+   *  Not atomic, and does not need to be: entries into drive() are serialized by the
+   *  single-flight wrapper. @volatile is for the reading test thread. */
+  @volatile private[management] var testDriveCount: Int = 0
+
+  /** One pass: tombstone the device (step 1) or move one of its stores (step 2). */
   private def drive(): Future[Unit] =
+    testDriveCount += 1
     client.getStorageDeviceState(deviceId).flatMap: state =>
       if state.isFailed then
         drain(state)

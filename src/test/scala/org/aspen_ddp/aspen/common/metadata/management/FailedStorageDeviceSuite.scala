@@ -206,12 +206,18 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       // drive()'s getStorageDeviceState fails.
       task <- taskForEnrolled(bogusId)
       _ <- waitForTransactionsToComplete()
+      before = task.testDriveCount
 
       // Wait several poll periods. The task should survive: neither completed nor failed,
       // still rescheduling.
       _ <- delay(fastPoll * 5)
     yield
       task.completed.isCompleted should be(false)
+      // The completion assertion alone is theatre: with a bogus device id that promise can only
+      // be completed by stop() or an empty store map, neither of which can happen here, so it
+      // holds identically whether the task is polling healthily or wedged solid. The pass count
+      // is what tells the two apart -- a wedged single-flight flag never re-enters drive().
+      (task.testDriveCount - before) should be >= 2
 
   /** The revision of the radicle's bootstrap-config key.
    *

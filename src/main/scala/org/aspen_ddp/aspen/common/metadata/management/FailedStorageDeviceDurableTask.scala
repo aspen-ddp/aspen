@@ -262,6 +262,25 @@ class FailedStorageDeviceDurableTask(
                                  kvos: KeyValueObjectState,
                                  state: StorageDeviceState)
 
+  /** The mirror of Destination: the reads the disown path needs and the rebuild path does not. */
+  private case class TransferSource(ptr: KeyValueObjectPointer,
+                                    kvos: KeyValueObjectState,
+                                    state: StorageDeviceState)
+
+  /** The live device shipping a store to this tombstone, when that is what the entry is.
+   *
+   *  Only a TransferringIn entry has one -- the other way an entry is disowned is the pool having
+   *  been repointed elsewhere, which says nothing about who is transferring what. Reads the id
+   *  out of the entry rather than out of the pool: they agree today, but the entry is the record
+   *  the source's own TransferringOut entry is paired with, and it is that pairing the restore
+   *  checks.
+   */
+  private def transferSourceId(tombstoneState: StorageDeviceState,
+                               storeId: StoreId): Option[StorageDeviceId] =
+    tombstoneState.stores.get(storeId)
+      .filter(_.status == StorageDeviceState.StoreStatus.TransferringIn)
+      .flatMap(_.transferDevice)
+
   /** Step 2. One store per pass.
    *
    *  Selection happens BEFORE the pool is repointed, and against the pool's own set rather than
@@ -393,6 +412,27 @@ class FailedStorageDeviceDurableTask(
                 yield
                   Some(Destination(destinationId, dstPtr, dstKvos, StorageDeviceState(dstKvos)))
 
+        // The mirror of the destination read above. Disowning a TransferringIn entry leaves the
+        // live source holding StoreEntry(TransferringOut, Some(this device)) with nothing left to
+        // clear it: startStoreTransferOut only runs on a StartStoreTransfer from this device,
+        // which is dead, and updateStateForTransferredStore only runs if the transfer completes.
+        // The entry would sit there permanently, and permanently is enough to matter -- it holds
+        // MigratePoolToSetDurableTask's inFlight true so the pool never leaves InProgress, and
+        // SetRebalanceDurableTask's classify at Phase.InFlight so the entry never leaves
+        // pendingTransfers.
+        osrc <-
+          if !disowned then
+            Future.successful(None)
+          else
+            transferSourceId(tombstoneState, storeId) match
+              case None => Future.successful(None)
+              case Some(srcId) =>
+                for
+                  srcPtr <- client.getStorageDevicePointer(srcId)
+                  srcKvos <- client.read(srcPtr, "failed device drain")
+                yield
+                  Some(TransferSource(srcPtr, srcKvos, StorageDeviceState(srcKvos)))
+
         _ =
           odst.foreach: dst =>
             if dst.state.isFailed then
@@ -431,6 +471,24 @@ class FailedStorageDeviceDurableTask(
         odst match
           case None =>
             logger.info(s"Failed device ${deviceId.uuid}: dropping $storeId, which it does not own")
+
+            // Put the abandoned transfer's source back to Active in the same transaction that
+            // drops this half of it. Compared against the constructor's deviceId, never
+            // tombstoneState.storageDeviceId, which step 1 has zeroed.
+            //
+            // None when the source's own entry no longer names this device -- the transfer
+            // completed and StoreManager.updateStateForTransferredStore restored it first, or a
+            // concurrent pass did. Both writes carry a KeyRevision on the source's StateKey, so
+            // the loser re-reads and this guard turns the re-read into a no-op.
+            osrc.foreach: src =>
+              src.state.restoreAbandonedTransferSource(storeId, deviceId).foreach: restored =>
+                logger.info(s"Failed device ${deviceId.uuid}: restoring $storeId to Active on " +
+                            s"transfer source ${restored.storageDeviceId}")
+                tx.update(src.ptr, None, None,
+                  List(KeyRevision(StorageDeviceState.StateKey,
+                    src.kvos.contents(StorageDeviceState.StateKey).revision)),
+                  List(Insert(StorageDeviceState.StateKey, restored.encode())))
+
             None
 
           case Some(dst) =>

@@ -68,3 +68,28 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
 
   def removeStore(storeId: StoreId): StorageDeviceState =
     this.copy(stores=stores - storeId)
+
+  /** The state this device should hold once a transfer of `storeId` onto `failedDestination` has
+   *  been abandoned because that destination was declared dead: the entry goes back to Active and
+   *  forgets the destination.
+   *
+   *  That is the whole of the repair. The source never gave up its copy and the pool never
+   *  stopped naming it -- a transfer leaves the pool alone until it completes -- so putting the
+   *  entry back is what makes the store look ordinary again to everything that keys off Active:
+   *  MigratePoolToSetDurableTask's inFlight, SetRebalanceDurableTask's Phase.InFlight, and
+   *  rebalancing's ownedStores. Nothing else about the transfer needs undoing at this level.
+   *
+   *  None when this device is not, or is no longer, the source of that particular transfer. Both
+   *  callers read this state inside a transaction that carries a KeyRevision on StateKey, so a
+   *  None is the loser of a race re-reading after the winner already restored the entry --
+   *  writing nothing is then the correct outcome rather than a clobber, and an empty transaction
+   *  commits immediately.
+   */
+  def restoreAbandonedTransferSource(storeId: StoreId,
+                                     failedDestination: StorageDeviceId): Option[StorageDeviceState] =
+    stores.get(storeId)
+      .filter: entry =>
+        entry.status == StorageDeviceState.StoreStatus.TransferringOut &&
+        entry.transferDevice.contains(failedDestination)
+      .map: _ =>
+        setStoreEntry(storeId, StorageDeviceState.StoreStatus.Active, None)

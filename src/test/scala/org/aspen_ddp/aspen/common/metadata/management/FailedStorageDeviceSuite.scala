@@ -385,12 +385,17 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       // an entry left in place would strand the task.
       tombstone.stores.get(storeId) should be(None)
 
-      // Nothing else moves. The pool still names the device that actually holds the slice, and
-      // that device's transfer entry is untouched.
+      // The pool still names the device that actually holds the slice.
       poolState.stores(storeId.poolIndex).storageDeviceId should be(liveId)
-      live.stores(storeId).status should be(StorageDeviceState.StoreStatus.TransferringOut)
-      live.stores(storeId).transferDevice should be(Some(net.secondDeviceId))
       third.stores.get(storeId) should be(None)
+
+      // And that device's half of the transfer is put back rather than left in place. The
+      // destination is dead, so nothing will ever send it a StartStoreTransfer or complete the
+      // transfer; a TransferringOut entry left here would never be cleared by anything, and it
+      // holds MigratePoolToSetDurableTask's inFlight and SetRebalanceDurableTask's Phase.InFlight
+      // true forever.
+      live.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)
+      live.stores(storeId).transferDevice should be(None)
 
   atest("the drain disowns a store the pool no longer names"):
     given ExecutionContext = executionContext
@@ -469,15 +474,84 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       // chosen forever and store 2 is never reached.
       tombstone.stores shouldBe empty
 
-      // Store 1 is dropped, not rebuilt: the pool still names the device holding the slice and
-      // that device's transfer entry is untouched.
+      // Store 1 is dropped, not rebuilt: the pool still names the device holding the slice, and
+      // that device's abandoned transfer entry is put back to Active.
       poolState.stores(stalled.poolIndex).storageDeviceId should be(liveId)
-      live.stores(stalled).status should be(StorageDeviceState.StoreStatus.TransferringOut)
-      live.stores(stalled).transferDevice should be(Some(net.secondDeviceId))
+      live.stores(stalled).status should be(StorageDeviceState.StoreStatus.Active)
+      live.stores(stalled).transferDevice should be(None)
 
       // Store 2 -- the one behind the blockage -- is rebuilt onto the only live device.
       poolState.stores(behind.poolIndex).storageDeviceId should be(liveId)
       live.stores(behind).status should be(StorageDeviceState.StoreStatus.Rebuilding)
+
+  /** Zero both of `deviceId`'s ids, exactly as the task's step 1 does, without running the task.
+   *
+   *  These tests need a tombstone in place while the drain is NOT running, so that the other
+   *  half of the transfer machinery can be exercised against it in isolation.
+   */
+  private def tombstoneDevice(deviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStorageDevicePointer(deviceId)
+        kvos <- client.read(ptr)
+      yield
+        val tombstoned = StorageDeviceState(kvos).copy(
+          hostId = fixed_ids.FailedHostId,
+          storageDeviceId = fixed_ids.FailedStorageDeviceId)
+        tx.update(ptr, None, None,
+          List(KeyRevision(StorageDeviceState.StateKey,
+            kvos.contents(StorageDeviceState.StateKey).revision)),
+          List(Insert(StorageDeviceState.StateKey, tombstoned.encode())))
+
+  atest("a transfer completing onto a tombstoned destination restores the source"):
+    given ExecutionContext = executionContext
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+    val storeId = StoreId(PoolId.BootstrapPoolId, 1)
+    val result = for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+
+      // Source goes TransferringOut, destination TransferringIn, pool still names the source.
+      _ <- client.transferStore(storeId, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      // The operator declares the destination dead while the bytes are still moving. The drain
+      // has not reached the entry yet -- and in the real trace it never will, because it disowns
+      // that entry on its very first pass, long before a real transfer finishes.
+      _ <- tombstoneDevice(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      // The transfer completes anyway: the source is alive and sending, and the destination's
+      // StoreTransferIn was created before the tombstone. withTimeout because the pre-fix
+      // failure mode is not a wrong answer but a never-completing future -- prepRadicleUpdate
+      // looks up HostId(0,0), which is absent from the host tree, and the bare retry loop
+      // re-runs it every 60 s forever.
+      _ <- withTimeout(net.smgr.testingOnlyUpdateStateForTransferredStore(
+                         storeId, sourceId, net.secondDeviceId),
+                       Duration(30000, MILLISECONDS),
+                       "post-transfer update against a tombstoned destination")
+      _ <- waitForTransactionsToComplete()
+
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      source <- client.getStorageDeviceState(sourceId)
+      tombstone <- client.getStorageDeviceState(net.secondDeviceId)
+    yield (poolState, source, tombstone)
+
+    result.map: (poolState, source, tombstone) =>
+      // Repointing the pool here loses the slice outright: reconcileDeviceState ignores a failed
+      // device, so nothing on the destination ever serves the store, and the drain has already
+      // disowned the entry rather than rebuilding it. The pool entry would look perfectly
+      // healthy while naming a device that answers nothing.
+      poolState.stores(storeId.poolIndex).storageDeviceId should be(sourceId)
+      poolState.stores(storeId.poolIndex).hostId should be(HostId.BootstrapHostId)
+
+      // The source keeps the store and goes back to Active: it never gave up its copy.
+      source.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)
+      source.stores(storeId).transferDevice should be(None)
+
+      // The tombstone's store map is the drain's work list, not ours to edit.
+      tombstone.stores(storeId).status should be(StorageDeviceState.StoreStatus.TransferringIn)
 
   atest("a resumed task picks up mid-drain"):
     given ExecutionContext = executionContext

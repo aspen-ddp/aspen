@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectSt
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostState, StorageDeviceId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
@@ -232,6 +232,36 @@ class FailedStorageDeviceDurableTask(
   private def nextStore(state: StorageDeviceState): Option[StoreId] =
     state.stores.keys.toList.sortBy(sid => (sid.poolId.uuid, sid.poolIndex)).headOption
 
+  /** True when the entry on the failed device is stale bookkeeping rather than ownership of the
+   *  store. Rebuilding a store the failed device does not own repoints the pool away from the
+   *  live copy and orphans it. Two ways that happens:
+   *
+   *    - TransferringIn: the entry is the receiving half of a store transfer. The source owns
+   *      the store until the transfer completes, which is why transferStore leaves the pool
+   *      naming the source, and why rebalancing's ownedStores (common/rebalancing/State.scala)
+   *      filters TransferringIn out of its accounting.
+   *    - the pool no longer names this device for that index, whatever repointed it.
+   *
+   *  One function, called from both `drain` (before a destination is selected) and `moveStore`
+   *  (inside the transaction, where it is authoritative), so the two cannot drift apart.
+   *
+   *  Compares against the constructor's `deviceId`, never `tombstoneState.storageDeviceId`,
+   *  which step 1 has zeroed.
+   */
+  private def isDisowned(tombstoneState: StorageDeviceState,
+                         poolCfg: StoragePoolState,
+                         storeId: StoreId): Boolean =
+    tombstoneState.stores.get(storeId).exists(
+      _.status == StorageDeviceState.StoreStatus.TransferringIn) ||
+    poolCfg.stores(storeId.poolIndex).storageDeviceId != deviceId
+
+  /** The destination reads the rebuild path needs and the disown path does not. Bundled so the
+   *  transaction can skip them entirely when there is no destination. */
+  private case class Destination(id: StorageDeviceId,
+                                 ptr: KeyValueObjectPointer,
+                                 kvos: KeyValueObjectState,
+                                 state: StorageDeviceState)
+
   /** Step 2. One store per pass.
    *
    *  Selection happens BEFORE the pool is repointed, and against the pool's own set rather than
@@ -247,9 +277,31 @@ class FailedStorageDeviceDurableTask(
     case Some(storeId) =>
       val moved = for
         poolState <- client.getStoragePoolState(storeId.poolId)
-        set <- client.getStorageDeviceSetState(poolState.storageDeviceSet)
-        destinationId <- set.selectDeviceForRebuild(storeId.poolId, storeId.poolIndex, client)
-        nudge <- moveStore(storeId, destinationId)
+        // Ownership is decided BEFORE a destination is selected, because a disowned entry is
+        // going to be dropped without touching the pool and selection for one can fail outright.
+        // Concretely: a TransferringIn whose pool entry names the only other device in the set
+        // has no legal candidate, since that device holds the live data and is hard-excluded.
+        // nextStore returns the head of a sorted list, so an entry selection cannot place is
+        // returned by every subsequent pass and blocks every store ordered after it -- the whole
+        // drain stalls and `completed` never fires. Not a wedge (the pass completes and the next
+        // poll runs), but permanent all the same.
+        //
+        // This read is outside the transaction, which is sound in one direction only, and that
+        // is the direction that matters. If it says "owned" and the store is disowned by the
+        // time the transaction runs, moveStore's own check -- the authoritative one -- catches
+        // it. The converse, a store becoming owned by a tombstoned device between the two reads,
+        // cannot happen: every placement path refuses a tombstoned device
+        // (StorageDeviceSetState.moveDevice, AspenClient.createNewStoragePool,
+        // AspenClient.transferStore, StoreManager's stageDeviceUpdate).
+        odestination <-
+          if isDisowned(state, poolState, storeId) then
+            Future.successful(None)
+          else
+            for
+              set <- client.getStorageDeviceSetState(poolState.storageDeviceSet)
+              destinationId <- set.selectDeviceForRebuild(storeId.poolId, storeId.poolIndex, client)
+            yield Some(destinationId)
+        nudge <- moveStore(storeId, odestination)
       yield nudge
 
       moved.transformWith:
@@ -276,9 +328,12 @@ class FailedStorageDeviceDurableTask(
    *
    *  Returns None when the failed device turns out not to own the store: the entry is dropped
    *  from the tombstone's work list and nothing else is touched, so there is no destination to
-   *  nudge. */
+   *  nudge.
+   *
+   *  `odestinationId` is None exactly when `drain` already decided the store is disowned and so
+   *  spent no selection on it. */
   private def moveStore(storeId: StoreId,
-                        destinationId: StorageDeviceId): Future[Option[CheckStorageDevice]] =
+                        odestinationId: Option[StorageDeviceId]): Future[Option[CheckStorageDevice]] =
 
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
@@ -300,9 +355,6 @@ class FailedStorageDeviceDurableTask(
         devPtr <- client.getStorageDevicePointer(deviceId)
         devKvos <- client.read(devPtr, "failed device drain")
         tombstoneState = StorageDeviceState(devKvos)
-        dstPtr <- client.getStorageDevicePointer(destinationId)
-        dstKvos <- client.read(dstPtr, "failed device drain")
-        dstState = StorageDeviceState(dstKvos)
         poolPtr <- client.getStoragePoolPointer(storeId.poolId)
         poolKvos <- client.read(poolPtr, "failed device drain")
         poolCfg = StoragePoolState(poolKvos)
@@ -311,51 +363,64 @@ class FailedStorageDeviceDurableTask(
             // Another pass, or a concurrent fail-storage-device, already moved it.
             throw new StoreAlreadyMoved(storeId)
 
-        // An entry on the failed device does not by itself mean the failed device owns the
-        // store, and rebuilding a store it does not own repoints the pool away from the live
-        // copy and orphans it. Two ways that happens:
+        // The authoritative ownership decision. drain applied the same predicate to a read taken
+        // outside the transaction, to avoid spending a selection on an entry it is only going to
+        // drop; this one is under the KeyRevision that commits.
         //
-        //   - TransferringIn: the entry is the receiving half of a store transfer. The source
-        //     owns the store until the transfer completes, which is why transferStore leaves the
-        //     pool naming the source, and why rebalancing's ownedStores (common/rebalancing/
-        //     State.scala) filters TransferringIn out of its accounting.
-        //   - the pool no longer names this device for that index, whatever repointed it.
-        //
-        // Either way the entry is stale bookkeeping, so drop it and touch nothing else. Dropping
+        // A disowned entry is stale bookkeeping, so drop it and touch nothing else. Dropping
         // rather than filtering it out of nextStore is deliberate: the tombstone's store map is
         // simultaneously the work list and the completion condition, so an entry left in place
         // would keep the map non-empty and strand the task forever.
-        disowned =
-          tombstoneState.stores.get(storeId).exists(
-            _.status == StorageDeviceState.StoreStatus.TransferringIn) ||
-          poolCfg.stores(storeId.poolIndex).storageDeviceId != deviceId
+        disowned = isDisowned(tombstoneState, poolCfg, storeId)
+
+        // Read the destination only on the rebuild path. A disowned entry has no destination --
+        // drain selected none -- and needs none.
+        odst <-
+          if disowned then
+            Future.successful(None)
+          else
+            odestinationId match
+              case None =>
+                // drain saw a disowned entry, this read does not. Unreachable: the transition
+                // requires placing the store onto a tombstoned device, which every placement
+                // path refuses (see isDisowned's callers in drain). Fail loudly rather than
+                // retry a transaction that has nothing to write to.
+                throw StopRetrying(new IllegalStateException(
+                  s"$storeId became owned by tombstoned device ${deviceId.uuid} mid-pass"))
+              case Some(destinationId) =>
+                for
+                  dstPtr <- client.getStorageDevicePointer(destinationId)
+                  dstKvos <- client.read(dstPtr, "failed device drain")
+                yield
+                  Some(Destination(destinationId, dstPtr, dstKvos, StorageDeviceState(dstKvos)))
 
         _ =
-          if !disowned && dstState.isFailed then
-            // Structurally unreachable once step 1 has removed the tombstone from its set, but
-            // the pool state driving selection can be stale.
-            throw AspenClient.DeviceFailed(destinationId)
+          odst.foreach: dst =>
+            if dst.state.isFailed then
+              // Structurally unreachable once step 1 has removed the tombstone from its set, but
+              // the pool state driving selection can be stale.
+              throw AspenClient.DeviceFailed(dst.id)
 
         _ <-
-          if disowned then
-            Future.unit
-          else
-            // Pool: repoint now, at the start of the rebuild rather than at its end. Reads of a
-            // rebuilding store fail until it is reconstructed, but that is equally true of a
-            // store on a dead device, and the pool must stop naming the dead device before
-            // anything can route around it. The rebalancer already excludes non-Active stores
-            // from movement and from the write-threshold count.
-            //
-            // CRITICAL ORDERING: this mutation must precede prepRadicleUpdate. prepRadicleUpdate
-            // builds poolHosts from poolCfg.stores, so if the mutation happens after (in the
-            // yield block), it reads stale state: the failed device's old host lands in
-            // hostsList while storeMap remaps its only bootstrap store away, and
-            // generateBootstrapConfig's require(storesOnHost.nonEmpty) throws
-            // IllegalArgumentException — permanent, infinite loop unless StopRetrying catches
-            // it. Invisible in single-host TestNetwork; no test protects this ordering.
-            poolCfg.stores(storeId.poolIndex) =
-              StoragePoolState.StoreEntry(dstState.hostId, destinationId)
-            BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, dstState.hostId)
+          odst match
+            case None => Future.unit
+            case Some(dst) =>
+              // Pool: repoint now, at the start of the rebuild rather than at its end. Reads of a
+              // rebuilding store fail until it is reconstructed, but that is equally true of a
+              // store on a dead device, and the pool must stop naming the dead device before
+              // anything can route around it. The rebalancer already excludes non-Active stores
+              // from movement and from the write-threshold count.
+              //
+              // CRITICAL ORDERING: this mutation must precede prepRadicleUpdate. prepRadicleUpdate
+              // builds poolHosts from poolCfg.stores, so if the mutation happens after (in the
+              // yield block), it reads stale state: the failed device's old host lands in
+              // hostsList while storeMap remaps its only bootstrap store away, and
+              // generateBootstrapConfig's require(storesOnHost.nonEmpty) throws
+              // IllegalArgumentException — permanent, infinite loop unless StopRetrying catches
+              // it. Invisible in single-host TestNetwork; no test protects this ordering.
+              poolCfg.stores(storeId.poolIndex) =
+                StoragePoolState.StoreEntry(dst.state.hostId, dst.id)
+              BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, dst.state.hostId)
       yield
         // Tombstone: loses the store. This is also the progress record -- an empty store map is
         // what completes the task. Staged on both paths: a disowned entry is dropped and nothing
@@ -366,22 +431,24 @@ class FailedStorageDeviceDurableTask(
             devKvos.contents(StorageDeviceState.StateKey).revision)),
           List(Insert(StorageDeviceState.StateKey, newTombstone.encode())))
 
-        if disowned then
-          logger.info(s"Failed device ${deviceId.uuid}: dropping $storeId, which it does not own")
-          None
-        else
-          // Destination: gains a Rebuilding entry. This is the entire message to the consumer.
-          val newDst = dstState.setStoreEntry(
-            storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
-          tx.update(dstPtr, None, None,
-            List(KeyRevision(StorageDeviceState.StateKey,
-              dstKvos.contents(StorageDeviceState.StateKey).revision)),
-            List(Insert(StorageDeviceState.StateKey, newDst.encode())))
+        odst match
+          case None =>
+            logger.info(s"Failed device ${deviceId.uuid}: dropping $storeId, which it does not own")
+            None
 
-          // Pool config update with the mutation already applied above.
-          tx.update(poolPtr, None, None,
-            List(KeyRevision(StoragePoolState.ConfigKey,
-              poolKvos.contents(StoragePoolState.ConfigKey).revision)),
-            List(Insert(StoragePoolState.ConfigKey, poolCfg.encode())))
+          case Some(dst) =>
+            // Destination: gains a Rebuilding entry. This is the entire message to the consumer.
+            val newDst = dst.state.setStoreEntry(
+              storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+            tx.update(dst.ptr, None, None,
+              List(KeyRevision(StorageDeviceState.StateKey,
+                dst.kvos.contents(StorageDeviceState.StateKey).revision)),
+              List(Insert(StorageDeviceState.StateKey, newDst.encode())))
 
-          Some(CheckStorageDevice(dstState.hostId, client.clientId, destinationId))
+            // Pool config update with the mutation already applied above.
+            tx.update(poolPtr, None, None,
+              List(KeyRevision(StoragePoolState.ConfigKey,
+                poolKvos.contents(StoragePoolState.ConfigKey).revision)),
+              List(Insert(StoragePoolState.ConfigKey, poolCfg.encode())))
+
+            Some(CheckStorageDevice(dst.state.hostId, client.clientId, dst.id))

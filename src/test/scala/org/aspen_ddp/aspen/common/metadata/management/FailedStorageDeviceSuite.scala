@@ -426,6 +426,59 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite:
       poolState.stores(storeId.poolIndex).storageDeviceId should be(net.thirdDeviceId)
       third.stores.get(storeId) should be(None)
 
+  atest("an unplaceable disowned entry does not block the stores behind it"):
+    given ExecutionContext = executionContext
+    val liveId = StorageDeviceId.BootstrapStorageDeviceId
+    val stalled = StoreId(PoolId.BootstrapPoolId, 1)
+    val behind = StoreId(PoolId.BootstrapPoolId, 2)
+    val result = for
+      // Deliberately two devices only. That is what makes the disowned entry unplaceable: the
+      // pool names the bootstrap device for store 1, selectDeviceForRebuild hard-excludes it as
+      // the holder of the live data, and step 1 has already removed the failed device from the
+      // set -- so there is no candidate at all and selection fails with AllocationError.
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+
+      // Store 1: a transfer onto the second device that never completes. The second device gets
+      // a TransferringIn entry it does not own; the pool still names the bootstrap device.
+      _ <- client.transferStore(stalled, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      // Store 2: a transfer onto the second device that did complete, so the second device
+      // genuinely owns it and the pool names it. Ordered after store 1 by nextStore's sort.
+      _ <- net.simulateTransferComplete(behind, liveId, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.failStorageDevice(net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(net.secondDeviceId)
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+                       "task completion")
+      _ <- waitForTransactionsToComplete()
+
+      tombstone <- client.getStorageDeviceState(net.secondDeviceId)
+      live <- client.getStorageDeviceState(liveId)
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield (tombstone, live, poolState)
+
+    result.map: (tombstone, live, poolState) =>
+      // Deciding ownership before spending a selection is what makes this pass. With the check
+      // only inside moveStore, store 1 has to be placed before it can be disowned, selection
+      // fails every pass, and because nextStore returns the head of a sorted list store 1 is
+      // chosen forever and store 2 is never reached.
+      tombstone.stores shouldBe empty
+
+      // Store 1 is dropped, not rebuilt: the pool still names the device holding the slice and
+      // that device's transfer entry is untouched.
+      poolState.stores(stalled.poolIndex).storageDeviceId should be(liveId)
+      live.stores(stalled).status should be(StorageDeviceState.StoreStatus.TransferringOut)
+      live.stores(stalled).transferDevice should be(Some(net.secondDeviceId))
+
+      // Store 2 -- the one behind the blockage -- is rebuilt onto the only live device.
+      poolState.stores(behind.poolIndex).storageDeviceId should be(liveId)
+      live.stores(behind).status should be(StorageDeviceState.StoreStatus.Rebuilding)
+
   atest("a resumed task picks up mid-drain"):
     given ExecutionContext = executionContext
     val failedId = StorageDeviceId.BootstrapStorageDeviceId

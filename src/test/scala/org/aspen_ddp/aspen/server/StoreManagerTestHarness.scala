@@ -17,7 +17,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
@@ -308,8 +308,7 @@ private class RecordingStoreManager(mgrClient: AspenClient,
    *  (metadata flip or load decision) occurs. Lazy for the same initialization-order reason as
    *  storeLoadAttempts.
    */
-  lazy val rebuildEventSeq: java.util.concurrent.atomic.AtomicInteger =
-    new java.util.concurrent.atomic.AtomicInteger(0)
+  lazy val rebuildEventSeq: AtomicInteger = new AtomicInteger(0)
 
   /** Sequence number stamped when markRebuiltStoreActive's returned Future completes, by
    *  (deviceId, storeId). Used to verify the invariant "loading is downstream of the metadata

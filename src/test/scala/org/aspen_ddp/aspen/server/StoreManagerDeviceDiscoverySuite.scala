@@ -1,28 +1,21 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
+import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, fixed_ids}
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
-import org.aspen_ddp.aspen.server.store.cache.ObjectCache
-import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringOut}
 
-import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, SECONDS}
 
 
 /** A StoreTransferFactory whose transfers move no bytes and finish only when the test says so.
@@ -96,10 +89,6 @@ class StoreManagerDeviceDiscoverySuite extends IntegrationTestSuite with StoreMa
   /** `foreignSystemId` is the rejection case: a device config carrying it must be ignored by
    *  the scan. */
   private val foreignSystemId = UUID.fromString("44444444-4444-4444-4444-444444444444")
-
-  override def subFixtureTeardown(): Unit =
-    tempRoots.foreach(deleteTree)
-    tempRoots.clear()
 
   /** Overwrites the config file with bytes SnakeYAML cannot parse. */
   private def writeUnparseableDeviceConfig(deviceDir: Path): Unit =

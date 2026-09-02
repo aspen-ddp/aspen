@@ -25,14 +25,7 @@ import scala.concurrent.duration.{Duration, SECONDS}
  *
  *  Provides a RecordingStoreManager that logs tryLoadStore calls instead of opening RocksDB
  *  backends, plus helpers for writing device configs, arming lookups, and waiting for async
- *  conditions to hold.
- *
- *  Suites that mix this in must override subFixtureTeardown to call the cleanup:
- *  ```scala
- *  override def subFixtureTeardown(): Unit =
- *    tempRoots.foreach(deleteTree)
- *    tempRoots.clear()
- *  ```
+ *  conditions to hold. Temp directory cleanup is automatic via subFixtureTeardown.
  */
 trait StoreManagerTestHarness:
   this: IntegrationTestSuite =>
@@ -42,6 +35,10 @@ trait StoreManagerTestHarness:
   protected val systemId = UUID.fromString("33333333-3333-3333-3333-333333333333")
 
   protected val tempRoots = mutable.ListBuffer[Path]()
+
+  override def subFixtureTeardown(): Unit =
+    tempRoots.foreach(deleteTree)
+    tempRoots.clear()
 
   /** Removes a tree. Failures are ignored; these are temp dirs. */
   protected def deleteTree(root: Path): Unit =
@@ -310,17 +307,21 @@ private class RecordingStoreManager(mgrClient: AspenClient,
         transferOutcomes += storeId -> outcome
     f
 
+  override protected def lookupStorageDeviceState(
+      storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
+    val armed = synchronized:
+      lookupAttempts += storageDeviceId
+      armedLookups.get(storageDeviceId).filter(_.nonEmpty).map(_.dequeue())
+
+    armed match
+      case Some(Right(p))    => p.future
+      case Some(Left(error)) => throw error
+      case None              => super.lookupStorageDeviceState(storageDeviceId)
+
   override protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
     synchronized:
       hostIdClaims += storageDeviceId
     Future.unit
-
-  /** Simulates injectLoadedDevice for tests that need a device already present. */
-  def injectLoadedDevice(deviceId: StorageDeviceId, path: Path): Unit =
-    synchronized:
-      val configFile = path.resolve(StorageDeviceConfig.configFilename).toFile
-      storageDevices += deviceId -> new StoreManager.LocalStorageDeviceState(
-        deviceId, path, configFile)
 
   /** Installs `sds` in the protected device map without it ever having been on disk.
    *

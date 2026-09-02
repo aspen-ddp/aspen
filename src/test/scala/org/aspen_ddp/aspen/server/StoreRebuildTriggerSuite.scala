@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
@@ -31,10 +31,6 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
     r
 
 class StoreRebuildTriggerSuite extends IntegrationTestSuite with StoreManagerTestHarness:
-
-  override def subFixtureTeardown(): Unit =
-    tempRoots.foreach(deleteTree)
-    tempRoots.clear()
 
   private def rebuilding(storeId: StoreId): (StoreId, StorageDeviceState.StoreEntry) =
     storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Rebuilding, None)

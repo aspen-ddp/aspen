@@ -1,17 +1,16 @@
-StoragePool errorTree has a problem
-  - Missed deletes have a problem for ObjectPointers that use storePointer
-  - Because the ObjectPointer in the allocationTree is deleted, there's no way
-    to obtain the storePointer. This means the stores relying on this will not
-    be able to delete the object state
-  - Fix is probably simple: If the storePointer content is non-empty, store this
-    in the value associated with the errorTree key.
-  - Update MissedUpdateFinalizationAction to store non-empty storePointer content
-    in the value of the kv pair.
-
 Host and Store support repairing an object by passing in its current state however we
 also need to support repair "deletion" operations where there is no state to pass in
 because the object has been deleted. The only information available for this operation
 is the ObjectId and storePointer array extracted from the ObjectPointer.
+
+  The errorTree now supplies both: the key carries the ObjectId and the value carries the
+  raw storePointer bytes. Note that an empty value is ambiguous -- it means either "this
+  object has no storePointer" or "this entry predates the change that started recording
+  them", and the two are indistinguishable. Treat an empty value as "delete by ObjectId
+  alone" rather than as an error.
+
+  Main.repairOne already receives the errorTree value and currently ignores it. That
+  parameter is now meaningful; don't let it be removed as unused before this is written.
 
 Failures to allocate, update, and delete objects on stores that are offline log these
 failures in the pool's errorTree. There is currently a CLI command that can run the

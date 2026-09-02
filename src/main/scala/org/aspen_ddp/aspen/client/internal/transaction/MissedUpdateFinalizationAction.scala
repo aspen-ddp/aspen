@@ -30,7 +30,6 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     this.commitErrors = commitErrors
 
     if txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.nonEmpty) then
-      println(s"All stores responded to commit of tx ${txd.transactionId} without error. No MissedUpdates.")
       logger.trace(s"All stores responded to commit of tx ${txd.transactionId} without error. No MissedUpdates.")
       markTask.foreach(_.cancel())
       if (!completionPromise.isCompleted)
@@ -43,14 +42,33 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     })
   }
 
+  // Records missed updates with storePointer bytes. Object deletion removes the pool's
+  // allocationTree entry, which is the only other place those bytes are persisted, so
+  // without this a repair pass cannot locate a deleted object's per-store state.
+  //
+  // An empty value means "this object has no storePointer" -- but it is also what entries
+  // written before this change contain, and the two are indistinguishable. A repair pass
+  // must therefore treat an empty value as "delete by ObjectId alone" rather than as an
+  // error. See the repair-deletion item in TODO.txt.
   def markMissedUpdates(): Unit = synchronized {
-    val errors = txd.allDataStores.foldLeft(List[(StoreId, ObjectId)]()) { (l, storeId) =>
+    // Build a map from ObjectId to ObjectPointer to recover pointers for ids in commitErrors
+    val idToPointer = txd.allReferencedObjectsSet.map(ptr => ptr.id -> ptr).toMap
+
+    val errors = txd.allDataStores.foldLeft(List[(StoreId, ObjectId, Array[Byte])]()) { (l, storeId) =>
       commitErrors.get(storeId) match
-        case None => txd.allHostedObjects(storeId).map(ptr => (storeId, ptr.id)) ++ l
-        case Some(lst) => lst.map(objectId => (storeId, objectId)) ++ l
+        case None =>
+          txd.allHostedObjects(storeId).map(ptr => (storeId, ptr.id, ptr.storePointer)) ++ l
+        case Some(lst) =>
+          // Note: this case is not reachable today (ids in commitErrors come from RequirementsChecker,
+          // which only reports r.objectPointer.id from this same txd's requirements), but we handle it
+          // defensively by looking up pointers from allReferencedObjectsSet, falling back to EmptyArray.
+          lst.map { objectId =>
+            val storePointer = idToPointer.get(objectId).map(_.storePointer).getOrElse(ObjectPointer.EmptyArray)
+            (storeId, objectId, storePointer)
+          } ++ l
     }
 
-    Future.sequence(errors.map(t => markMissedUpdate(t._1, t._2))).foreach { _ =>
+    Future.sequence(errors.map(t => markMissedUpdate(t._1, t._2, t._3))).foreach { _ =>
       synchronized {
         if (!completionPromise.isCompleted)
           completionPromise.success(())
@@ -58,7 +76,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     }
   }
 
-  def markMissedUpdate(storeId: StoreId, objectId: ObjectId): Future[Unit] = {
+  def markMissedUpdate(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte]): Future[Unit] = {
     //println(s"Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
 
     def onFail(err: Throwable): Future[Unit] = { err match {
@@ -84,7 +102,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
         pool <- client.getStoragePool(storeId.poolId)
         tx = client.newTransaction()
         _ = tx.disableMissedUpdateTracking()
-        _ <- pool.errorTree.set(key, Value(Array()))(using tx)
+        _ <- pool.errorTree.set(key, Value(storePointer))(using tx)
         _ <- tx.commit()
       } yield {
         logger.trace(s"COMPLETED - Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")

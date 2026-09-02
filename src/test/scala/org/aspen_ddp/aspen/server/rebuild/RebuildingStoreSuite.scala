@@ -70,25 +70,27 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
 
-      // Stage a checkpoint by hand with an arbitrary key, as a crashed pass would have left behind.
+      // Stage a checkpoint by hand with a key at a known rank, as a crashed pass would have left behind.
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       _ = os.makeDir.all(staging)
-      checkpointKey = Key(ids(9).toBytes)
-      _ = RebuildState.save(staging, RebuildState(storeId, Some(checkpointKey), Nil))
+      allocatedKeys = ids.map(id => Key(id.toBytes))
+      sorted = allocatedKeys.sortWith(ByteArrayKeyOrdering.lt)
+      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil))
 
       // The rebuild should resume from that key
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO)
       _ <- rebuild.complete
       restored = rebuild.testingOnlyRestoredKeys
+      restoredBytes = restored.map(_.bytes.toList).toSet
+      allocatedBytes = allocatedKeys.map(_.bytes.toList).toSet
+      expectedBytes = sorted.drop(9).map(_.bytes.toList).toSet
     yield
-      // The resume should have restored fewer objects than a full walk (which would be 20).
-      // We checkpointed at a key roughly halfway through (ids(9)), so we should skip objects
-      // before it in tree-traversal order. The exact count depends on tree structure, but it
-      // should be noticeably less than 20.
-      restored.size should be < 20
-      restored.size should be > 0
+      // The resume range is inclusive of the checkpointed key -- rebuildWrite is an overwrite,
+      // so re-restoring it is free -- and everything before it is skipped. Intersect against
+      // the keys we allocated to ignore system objects the fixture brought up.
+      (restoredBytes intersect allocatedBytes) should be(expectedBytes)
       // The checkpoint key should be in the restored set (inclusive resume)
-      restored should contain(checkpointKey)
+      restoredBytes should contain(sorted(9).bytes.toList)
 
   atest("the checkpoint is written after the flush, not before"):
     given ExecutionContext = executionContext

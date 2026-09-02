@@ -5,9 +5,11 @@ import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.*
 import java.util.UUID
-import java.util.concurrent.atomic.{AtomicInteger, AtomicReferenceArray}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReferenceArray}
 import scala.annotation.tailrec
+import scala.concurrent.duration.{Duration, FiniteDuration, MINUTES}
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.control.NonFatal
 
 package object util {
   import scala.language.implicitConversions
@@ -177,24 +179,156 @@ package object util {
       val workers = (0 until math.min(maxConcurrent, arr.length)).map(_ => worker())
       Future.sequence(workers).map(_ => Vector.tabulate(arr.length)(results.get))
 
+  /** Default threshold past which an outstanding invocation is treated as a stall worth reporting.
+   *
+   *  Deliberately far longer than any polling period in the system -- the longest is the hourly
+   *  storage device check -- so that an alarm means something is wrong rather than something is
+   *  slow.
+   */
+  val DefaultStallAfter: FiniteDuration = Duration(15, MINUTES)
+
+  /** Reported when a tick arrives while an earlier invocation has been outstanding longer than
+   *  the stall threshold.
+   *
+   *  @param name             identifies the polling task
+   *  @param outstandingFor   how long the OLDEST outstanding invocation has been running
+   *  @param inFlight         invocations outstanding when the tick arrived
+   *  @param suppressedTicks  ticks dropped since the guard was last completely idle
+   *  @param startedExtra     true if this tick was allowed to start an additional invocation
+   *                          anyway, false if it was dropped
+   */
+  case class SingleFlightStall(name: String,
+                               outstandingFor: FiniteDuration,
+                               inFlight: Int,
+                               suppressedTicks: Int,
+                               startedExtra: Boolean)
+
+  def logSingleFlightStall(s: SingleFlightStall): Unit =
+    val action =
+      if s.startedExtra then
+        s"starting an additional invocation (${s.inFlight + 1} now in flight)"
+      else
+        s"tick dropped; ${s.suppressedTicks} dropped since the last idle period"
+    scribe.error(
+      s"POLLING TASK STALLED: ${s.name} has had an invocation outstanding for " +
+      s"${s.outstandingFor.toSeconds}s. Either the operation it polls is genuinely offline, or " +
+      s"its Future was orphaned and will never complete. $action")
+
+  /** Runs `fn` on demand, dropping calls that arrive while an earlier one is still outstanding.
+   *
+   *  Intended for `schedulePeriodic`, so that polling reads do not pile up while the thing being
+   *  polled is offline. Reads retry indefinitely rather than timing out, so without this a
+   *  20-second poll across a day-long outage would issue thousands of redundant reads.
+   *
+   *  Total by construction. A tick releases its slot however it ends -- value, failed Future, or
+   *  synchronous throw -- because only an invocation that is genuinely still running has any
+   *  claim to suppress the next one. The predecessor released the slot only from `fn.foreach`,
+   *  so a throw or a failure left the guard permanently closed over nothing, and callers had to
+   *  carry a hand-written "must never throw nor fail" contract to stay safe. They no longer do.
+   *
+   *  The mode that remains, and cannot be designed away here: a Future that never completes.
+   *  That is indistinguishable from a slow one, and suppressing ticks is the CORRECT response
+   *  when a read is genuinely outstanding against an offline store. So this does not guess -- it
+   *  reports. Past `stallAfter`, every suppressed tick raises `onStall`, which turns an
+   *  invisible permanent wedge into a diagnosable one. Raising `maxInFlight` above 1 additionally
+   *  lets a stalled task make progress; see that parameter.
+   *
+   *  @param name         identifies the task in stall reports
+   *  @param stallAfter   how long an invocation may run before suppressed ticks raise `onStall`
+   *  @param maxInFlight  hard cap on concurrent invocations, and the ONLY thing bounding them.
+   *                      At the default of 1 this is a strict single-flight guard: a stalled
+   *                      invocation is reported but never joined, exactly as before. Above 1, a
+   *                      tick arriving after `stallAfter` may start an additional invocation, up
+   *                      to the cap -- trading a bounded, constant number of duplicate reads for
+   *                      liveness against an orphaned Future. Prefer this to a timeout that
+   *                      re-arms the guard: a timeout's worst case grows with the outage, this
+   *                      one is `maxInFlight` no matter how long the outage lasts. Only raise it
+   *                      for work that is safe to duplicate, since an abandoned invocation is not
+   *                      cancelled and may still complete later.
+   *  @param clock        nanosecond time source; injectable for testing
+   *  @param onStall      stall handler; defaults to logging at ERROR
+   */
+  def boundedSingleFlight[T](name: String,
+                             stallAfter: FiniteDuration = DefaultStallAfter,
+                             maxInFlight: Int = 1,
+                             clock: () => Long = () => System.nanoTime(),
+                             onStall: SingleFlightStall => Unit = logSingleFlightStall)
+                            (fn: => Future[T])
+                            (using ec: ExecutionContext): () => Unit =
+    require(maxInFlight >= 1, s"maxInFlight must be at least 1, got $maxInFlight")
+
+    val nextId = new AtomicLong(0)
+
+    object tracker:
+      // (id, start time), most recently started first, so the oldest is last. Identified by id
+      // rather than by start time because two invocations can share a timestamp.
+      private var inFlight: List[(Long, Long)] = Nil
+      private var suppressed = 0
+
+      /** Reserve a slot. Caller must hold the monitor. */
+      private def reserve(now: Long): Long =
+        val id = nextId.getAndIncrement()
+        inFlight = (id, now) :: inFlight
+        id
+
+      def call(): Unit =
+        val now = clock()
+
+        // Decide under the lock, act outside it: neither `fn` nor `onStall` is ours to run while
+        // holding a monitor. Evaluating `fn` under the lock is what made the predecessor's
+        // synchronous-throw mode a deadlock risk as well as a wedge.
+        val (toStart, toReport) = synchronized:
+          inFlight.lastOption match
+            case None =>
+              (Some(reserve(now)), None)
+
+            case Some((_, oldestStart)) =>
+              val outstanding = Duration.fromNanos(now - oldestStart)
+
+              if outstanding < stallAfter then
+                suppressed += 1
+                (None, None)
+              else if inFlight.size < maxInFlight then
+                val ev = SingleFlightStall(name, outstanding, inFlight.size, suppressed,
+                                           startedExtra = true)
+                (Some(reserve(now)), Some(ev))
+              else
+                suppressed += 1
+                val ev = SingleFlightStall(name, outstanding, inFlight.size, suppressed,
+                                           startedExtra = false)
+                (None, Some(ev))
+
+        toReport.foreach(onStall)
+        toStart.foreach(launch)
+
+      private def launch(id: Long): Unit =
+        val f =
+          try fn
+          catch case NonFatal(t) => Future.failed(t)
+
+        f.onComplete: outcome =>
+          synchronized:
+            inFlight = inFlight.filterNot(_._1 == id)
+            if inFlight.isEmpty then
+              suppressed = 0
+          outcome.failed.foreach: t =>
+            scribe.warn(s"$name: invocation failed: $t")
+
+    tracker.call
+
   /**
    * This method ensures that repeated invocations of the supplied code block (such as a scheduled periodic task)
    * will ignore redundant calls while the Future is outstanding. It's intent is to be used with schedulePeriodic
    * to ensure that duplicate reads don't pile up during extended offline periods. An example is of a host polling
    * the physical device state to look for new store creations or transfers. Without the use of this method, an
    * offline period could result in hundreds of backed-up read operations.
+   *
+   * Strict single-flight, with stall reporting at the default threshold. Prefer
+   * [[boundedSingleFlight]] directly where a meaningful task name can be supplied -- an unnamed
+   * task makes a stall report much harder to act on.
    *  */
   def ignoreExtraCallsWhileRunning[T](fn: => Future[T])(implicit ec: ExecutionContext): () => Unit =
-    object tracker:
-      var running = false
-      def call(): Unit =
-        synchronized:
-          if !running then
-            running = true
-            fn.foreach: _ =>
-              synchronized:
-                running = false
-    tracker.call
+    boundedSingleFlight("unnamed polling task")(fn)
 
 
 }

@@ -42,7 +42,8 @@ class RebuildingStore(client: AspenClient,
                       devicePath: Path,
                       checkpointInterval: Int = RebuildingStore.CheckpointInterval,
                       testingOnlyFailKeys: Set[Key] = Set(),
-                      testingOnlyMaxFailedObjects: Int = RebuildState.MaxFailedObjects) extends StoreRebuild with Logging:
+                      testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
+                      maxFailedObjects: Int = RebuildState.MaxFailedObjects) extends StoreRebuild with Logging:
 
   import RebuildingStore.*
 
@@ -54,7 +55,9 @@ class RebuildingStore(client: AspenClient,
   private val completionPromise: Promise[Unit] = Promise()
   def complete: Future[Unit] = completionPromise.future
 
-  /** Keys handed to rebuildWrite, in walk order. Test hook. */
+  /** Keys handed to rebuildWrite, in walk order. Test hook. Gated to only accumulate when not
+   *  using the default checkpoint interval, to avoid holding millions of keys in memory for no
+   *  production purpose. */
   private val restoredKeys = mutable.ListBuffer[Key]()
   private[rebuild] def testingOnlyRestoredKeys: List[Key] = synchronized(restoredKeys.toList)
 
@@ -77,6 +80,11 @@ class RebuildingStore(client: AspenClient,
    *  retryFailures() and finish() run, leaving the checkpoint in staging so the next device
    *  check resumes. */
   private var abortCause: Option[Throwable] = None
+
+  // Key's equality is not something to bet a test seam on; compare the bytes directly.
+  // Declared here, before start(), so it is initialized before the walk begins.
+  private val failBytes: Set[List[Byte]] = testingOnlyFailKeys.map(_.bytes.toList)
+  private val outOfSpaceBytes: Set[List[Byte]] = testingOnlyOutOfSpaceKeys.map(_.bytes.toList)
 
   // Started from the constructor, mirroring TransferringIn. StoreManager holds its instance
   // lock across the call, so everything expensive is inside the future.
@@ -107,11 +115,10 @@ class RebuildingStore(client: AspenClient,
 
   /** Idempotent: finish() closes on the happy path, start()'s onComplete closes on every path. */
   private def closeBackend(): Future[Unit] =
-    val b = synchronized {
+    val b = synchronized:
       val prev = backend
       backend = null
       prev
-    }
 
     if b == null then
       Future.unit
@@ -133,19 +140,17 @@ class RebuildingStore(client: AspenClient,
         StoreConfig(storeId, StoreConfig.RocksDB()).yamlConfig)
 
     resume.foreach: st =>
-      synchronized {
+      synchronized:
         lastKey = st.lastRestoredKey
         failed = st.failedObjects
-      }
       logger.info(s"Rebuild of $storeId: resuming from ${st.lastRestoredKey}, " +
                   s"${st.failedObjects.size} objects to retry")
 
     for
       pstate <- client.getStoragePoolState(storeId.poolId)
-      _ = synchronized {
+      _ = synchronized:
             backend = pstate.backendConfig match
               case _: RocksDBConfig => new RocksDBBackend(stagingPath.toNIO, storeId, summon)
-          }
       pool <- client.getStoragePool(storeId.poolId)
       tree = pool.allocationTree
       _ <- resume.flatMap(_.lastRestoredKey) match
@@ -166,45 +171,49 @@ class RebuildingStore(client: AspenClient,
   /** Copy one object's slice of this store into the backend.
    *
    *  foreach swallows a failing fn -- it logs and continues -- so read failures are recorded
-   *  here instead. The checkpoint advances past them, so one unreadable object cannot wedge the
-   *  walk forever, and they are retried at the end of the pass.
+   *  here instead. The checkpoint advances past them, so a read failure cannot wedge the walk
+   *  forever, and they are retried at the end of the pass. (A read that never returns can still
+   *  stall the walk and hold its StoreManager rebuild slot; that is a known gap.)
    */
   private def restoreObject(node: KeyValueListNode,
                             key: Key,
                             value: ValueState): Future[Unit] =
     // If the abort latch is set, return immediately to make the remainder of the walk a cheap
     // no-op rather than thousands of repeated failures.
-    synchronized(abortCause) match
-      case Some(_) => return Future.unit
-      case None => ()
-
-    val ptr = ObjectPointer(value.value.bytes)
-
-    if ptr.poolId != storeId.poolId then
-      // The allocation tree is per-pool, but a pointer stored in it is only authoritative for
-      // its own pool. Skip anything foreign rather than writing it into the wrong store.
+    if synchronized(abortCause).isDefined then
       Future.unit
     else
-      attemptRestore(key, ptr).transformWith:
-        case scala.util.Success(_) =>
-          recordRestored(key)
-        case scala.util.Failure(err) if isOutOfSpace(err) =>
-          // Distinct from a per-object read failure, and not something to accumulate 10,000 of:
-          // selectDeviceForRebuild checked free space at placement time against the pool's
-          // recorded store size, which can be stale and can grow. There is no automatic
-          // recovery in this scope -- the operator's remedy is to add capacity -- so log it
-          // loudly enough to alert on and set the abort latch.
-          checkpoint()
-          logger.error(s"REBUILD OUT OF SPACE: store $storeId cannot fit on device " +
-                       s"$storageDeviceId at $devicePath. The store will remain Rebuilding " +
-                       s"until capacity is added. Underlying error: $err")
-          synchronized {
-            if abortCause.isEmpty then
-              abortCause = Some(err)
-          }
-          Future.unit
-        case scala.util.Failure(err) =>
-          recordFailure(ObjectId(key.bytes), err)
+      val ptr = ObjectPointer(value.value.bytes)
+
+      if ptr.poolId != storeId.poolId then
+        // The allocation tree is per-pool, but a pointer stored in it is only authoritative for
+        // its own pool. Skip anything foreign rather than writing it into the wrong store.
+        Future.unit
+      else
+        attemptRestore(key, ptr).transformWith:
+          case scala.util.Success(_) =>
+            recordRestored(key)
+          case scala.util.Failure(err) if isOutOfSpace(err) =>
+            // Distinct from a per-object read failure, and not something to accumulate 10,000 of:
+            // selectDeviceForRebuild checked free space at placement time against the pool's
+            // recorded store size, which can be stale and can grow. There is no automatic
+            // recovery in this scope -- the operator's remedy is to add capacity -- so log it
+            // loudly enough to alert on and set the abort latch.
+            // Latch first, then checkpoint. The checkpoint is expected to throw when the disk is
+            // full, and if it does, the throw must not unwind past the latch. A best-effort
+            // checkpoint on a full disk is fine -- losing it costs a restart from the last good
+            // one, which is bounded. Losing the latch costs the store.
+            synchronized:
+              if abortCause.isEmpty then
+                abortCause = Some(err)
+            try checkpoint()
+            catch case t: Throwable => logger.warn(s"Rebuild of $storeId: checkpoint after ENOSPC failed: $t")
+            logger.error(s"REBUILD OUT OF SPACE: store $storeId cannot fit on device " +
+                         s"$storageDeviceId at $devicePath. The store will remain Rebuilding " +
+                         s"until capacity is added. Underlying error: $err")
+            Future.unit
+          case scala.util.Failure(err) =>
+            recordFailure(ObjectId(key.bytes), err)
 
   /** Best-effort detection of a full destination. Backends surface it differently -- RocksDB
    *  wraps it, the JDK throws IOException -- so this matches on the message as well as the
@@ -213,16 +222,15 @@ class RebuildingStore(client: AspenClient,
     def matches(t: Throwable): Boolean =
       val msg = Option(t.getMessage).getOrElse("").toLowerCase
       msg.contains("no space left") || msg.contains("disk full") ||
-        msg.contains("insufficient space")
+        msg.contains("insufficient space") || msg.contains("injected out of space")
 
     Iterator.iterate(err)(_.getCause).takeWhile(_ != null).take(8).exists(matches)
-
-  // Key's equality is not something to bet a test seam on; compare the bytes directly.
-  private val failBytes: Set[List[Byte]] = testingOnlyFailKeys.map(_.bytes.toList)
 
   private def attemptRestore(key: Key, ptr: ObjectPointer): Future[Unit] =
     if failBytes.contains(key.bytes.toList) then
       Future.failed(new Exception(s"injected read failure for $key"))
+    else if outOfSpaceBytes.contains(key.bytes.toList) then
+      Future.failed(new Exception(s"injected out of space error for $key"))
     else
       restore(ptr)
 
@@ -245,8 +253,9 @@ class RebuildingStore(client: AspenClient,
       backend.rebuildWrite(os.id, objectType, metadata, localData.getOrElse(DataBuffer()))
 
   private def recordRestored(key: Key): Future[Unit] =
-    val checkpointNow = synchronized {
-      restoredKeys += key
+    val checkpointNow = synchronized:
+      if checkpointInterval != RebuildingStore.CheckpointInterval then
+        restoredKeys += key
       lastKey = Some(key)
       restoredSinceCheckpoint += 1
       if restoredSinceCheckpoint >= checkpointInterval then
@@ -254,16 +263,14 @@ class RebuildingStore(client: AspenClient,
         true
       else
         false
-    }
 
     if checkpointNow then checkpoint()
     Future.unit
 
   private def recordFailure(objectId: ObjectId, err: Throwable): Future[Unit] =
-    val over = synchronized {
+    val over = synchronized:
       failed = objectId :: failed
-      failed.size > testingOnlyMaxFailedObjects
-    }
+      failed.size > maxFailedObjects
 
     logger.warn(s"Rebuild of $storeId: failed to read object $objectId: $err")
 
@@ -271,13 +278,15 @@ class RebuildingStore(client: AspenClient,
       // Something systemic is wrong -- the pool below its read threshold, most likely -- and
       // continuing only burns I/O. Abort with the checkpoint intact; the next device check
       // retries. Set the abort latch so the rest of the walk is a no-op.
-      checkpoint()
+      // Latch first, then checkpoint. If the checkpoint throws, the throw must not unwind past
+      // the latch.
       val cause = new Exception(
-        s"Rebuild of $storeId aborted: more than $testingOnlyMaxFailedObjects unreadable objects")
-      synchronized {
+        s"Rebuild of $storeId aborted: more than $maxFailedObjects unreadable objects")
+      synchronized:
         if abortCause.isEmpty then
           abortCause = Some(cause)
-      }
+      try checkpoint()
+      catch case t: Throwable => logger.warn(s"Rebuild of $storeId: checkpoint after max failures failed: $t")
       Future.unit
     else
       Future.unit
@@ -285,8 +294,14 @@ class RebuildingStore(client: AspenClient,
   /** Flush FIRST, then write the checkpoint. The reverse order would let a crash between the
    *  two produce a checkpoint claiming objects that never reached stable storage. */
   private def checkpoint(): Unit =
+    flushBackend()
+    saveCheckpoint()
+
+  private def flushBackend(): Unit =
     backend.rebuildFlush()
     synchronized(checkpointTrace += "flush")
+
+  private def saveCheckpoint(): Unit =
     val (k, f) = synchronized((lastKey, failed))
     RebuildState.save(stagingPath, RebuildState(storeId, k, f))
     synchronized(checkpointTrace += "checkpoint")
@@ -294,11 +309,10 @@ class RebuildingStore(client: AspenClient,
   /** Retry everything the walk could not read. Anything still failing leaves the store
    *  Rebuilding for the next device check to pick up. */
   private def retryFailures(): Future[Unit] =
-    val pending = synchronized {
+    val pending = synchronized:
       val f = failed
       failed = Nil
       f
-    }
 
     if pending.isEmpty then
       Future.unit
@@ -312,9 +326,8 @@ class RebuildingStore(client: AspenClient,
           case None => Future.unit // deleted since the walk saw it; nothing to restore
         .recover:
           case err =>
-            synchronized {
+            synchronized:
               failed = objectId :: failed
-            }
             logger.warn(s"Rebuild of $storeId: retry of $objectId failed: $err")
 
       Future.sequence(retries).flatMap: _ =>

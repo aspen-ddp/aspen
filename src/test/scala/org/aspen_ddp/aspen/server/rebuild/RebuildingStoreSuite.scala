@@ -39,7 +39,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO)
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+                                    checkpointInterval = 5)
       _ <- rebuild.complete
     yield
       val finalPath = dev / storeId.directoryName
@@ -78,7 +79,8 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil))
 
       // The rebuild should resume from that key
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO)
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+                                    checkpointInterval = 5)
       _ <- rebuild.complete
       restored = rebuild.testingOnlyRestoredKeys
       restoredBytes = restored.map(_.bytes.toList).toSet
@@ -144,7 +146,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
                                     checkpointInterval = 5,
                                     testingOnlyFailKeys = doomed,
-                                    testingOnlyMaxFailedObjects = 10)
+                                    maxFailedObjects = 10)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
     yield
       // The pass must fail when the cap is exceeded
@@ -156,3 +158,26 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // The checkpoint was written when the cap was hit
       val saved = RebuildState.load(staging).get
       saved.lastRestoredKey should not be None
+
+  atest("out of space fails the pass with empty failedObjects proving the latch alone stopped it"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    for
+      ids <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      // Inject an out-of-space error on the first object
+      doomed = Set(Key(ids.head.toBytes))
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+                                    checkpointInterval = 5,
+                                    testingOnlyOutOfSpaceKeys = doomed)
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+    yield
+      // The pass must fail
+      outcome.isFailure should be(true)
+      // The staging directory and its checkpoint survive
+      val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+      os.exists(staging) should be(true)
+      os.exists(dev / storeId.directoryName) should be(false)
+      // failedObjects is EMPTY -- proving the latch alone failed the pass, not retryFailures()
+      val saved = RebuildState.load(staging).get
+      saved.failedObjects should be(Nil)

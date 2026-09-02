@@ -20,6 +20,7 @@ import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ReadError, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringIn, TransferringOut}
+import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, ServiceEntry, TaskExecutor}
 import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTaskExecutor}
@@ -101,7 +102,12 @@ class StoreManager(val client: AspenClient,
                    val txDriverFactory: TransactionDriver.Factory,
                    val heartbeatPeriod: Duration,
                    val checkStorageDevicePeriod: Duration,
-                   val storeTransferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem) extends Logging {
+                   val storeTransferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem,
+                   val storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
+                   /** A rebuild reads a whole store's worth of data through the client, so an
+                    *  eight-store device must not start eight at once. Entries beyond this bound
+                    *  wait; every completion re-checks the device and starts the next. */
+                   val maxConcurrentRebuilds: Int = 2) extends Logging {
   import StoreManager._
   
   given ExecutionContext = ec
@@ -130,6 +136,7 @@ class StoreManager(val client: AspenClient,
 
   private var offlineStores: Set[StoreId] = Set()
   private var creatingStores: Set[StoreId] = Set()
+  private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
   private var transferringOut: Map[StoreId, StoreTransferOut] = Map()
   private var transferringInUUIDs: Map[UUID, StoreTransferIn] = Map()
   private var transferringInStoreIds: Set[StoreId] = Set()
@@ -834,6 +841,73 @@ class StoreManager(val client: AspenClient,
                   creatingStores -= storeId
   }
 
+  /** Begins reconstruction of one store staged into `<device>/rebuilding/<store>/`.
+   *
+   *  Runs under the instance lock, so it does no more than construct the rebuild and register
+   *  its continuation; the walk itself runs on the client's execution context.
+   *
+   *  On success the store is already in place on disk, so this loads it and flips the device
+   *  entry from Rebuilding to Active -- re-reading inside the transaction and writing only if
+   *  the status is still Rebuilding, exactly as createNewStore does for Initializing. Either
+   *  outcome re-checks the device, which releases the concurrency slot and starts whatever was
+   *  queued behind it.
+   */
+  private def startStoreRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
+    synchronized {
+      if !rebuildingStores.contains(storeId) && rebuildingStores.size < maxConcurrentRebuilds then
+        val sr = storeRebuildFactory.createRebuild(
+          client, storeId, local.storageDeviceId, local.devicePath)
+
+        rebuildingStores += storeId -> sr
+
+        def release(): Unit = synchronized:
+          rebuildingStores -= storeId
+
+        sr.complete.onComplete:
+          case Success(_) =>
+            release()
+            loadStoreById(local.storageDeviceId, storeId)
+            markRebuiltStoreActive(local.storageDeviceId, storeId)
+
+          case Failure(err) =>
+            // The checkpoint survives in the staging directory, so the next check resumes
+            // rather than restarting. Nothing here retries directly: a rebuild that fails
+            // immediately and repeatedly would otherwise spin.
+            logger.warn(s"Rebuild of store $storeId failed: $err")
+            release()
+            checkStorageDevice(local.storageDeviceId)
+    }
+
+  /** Flips a rebuilt store's device entry from Rebuilding to Active, then re-checks the device
+   *  so the next queued rebuild starts. */
+  private def markRebuiltStoreActive(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
+    val txFuture = client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStorageDevicePointer(storageDeviceId)
+        kvos <- client.read(ptr)
+        state = StorageDeviceState(kvos)
+      yield
+        state.stores.get(storeId).foreach: entry =>
+          if entry.status == StorageDeviceState.StoreStatus.Rebuilding then
+            val newState = state.setStoreEntry(
+              storeId, StorageDeviceState.StoreStatus.Active, None)
+
+            val reqs = List(KeyRevision(StorageDeviceState.StateKey,
+              kvos.contents(StorageDeviceState.StateKey).revision))
+            val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
+
+            logger.info(s"Updating device state to mark rebuilt store $storeId as Active")
+            tx.update(ptr, None, None, reqs, ops)
+
+            tx.result.foreach: _ =>
+              logger.info(s"Rebuild of store $storeId complete")
+
+    // Re-check the device whether or not the update was staged. An empty transaction completes
+    // normally (the entry is already Active or has vanished), and the re-check releases the
+    // concurrency slot so the next queued rebuild can start immediately.
+    txFuture.foreach: _ =>
+      checkStorageDevice(storageDeviceId)
+
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
    *
    *  A seam rather than a direct client call so a test can hold a lookup in flight while the
@@ -955,6 +1029,14 @@ class StoreManager(val client: AspenClient,
               abandonTransferIn(local.storageDeviceId, storeId, fromDeviceId)
             else
               startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+
+      //----------------------
+      // Rebuilding Stores
+      //
+      remote.stores.filter((_, entry) =>
+        entry.status == StorageDeviceState.StoreStatus.Rebuilding
+      ).keys.toList.sortBy(_.poolIndex).foreach: storeId =>
+        startStoreRebuild(local, storeId)
 
   /** Brings a store back online after its transfer out was abandoned rather than completed.
    *

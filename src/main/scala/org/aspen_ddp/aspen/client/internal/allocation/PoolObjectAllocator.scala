@@ -15,7 +15,7 @@ class PoolObjectAllocator(val client: AspenClient,
   private val allocationStrategy = pool.allocationStrategy match 
     case None => StoragePoolAllocationStrategy.Default
     case Some(uuid) => 
-      val factory = client.typeRegistry.getType(uuid).asInstanceOf[StoragePoolAllocationStrategy.Factory]
+      val factory = client.typeRegistry.getType[StoragePoolAllocationStrategy.Factory](uuid).get
       factory.createStrategy(client, pool, pool.allocationStrategyConfig)
   
   override def maxObjectSize: Option[Int] = pool.maxObjectSize

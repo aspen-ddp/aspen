@@ -1464,6 +1464,14 @@ class Host(val client: AspenClient,
     (stores.keySet -- offlineStores -- rebuildingStores.keySet -- transferringOut.keySet).toList
   }
 
+  /** O(1) per-entry counterpart to `repairableStoreIds`: whether the given store is currently
+    * repairable on this host. Must agree with `repairableStoreIds.contains(storeId)` exactly.
+    */
+  def isRepairable(storeId: StoreId): Boolean = synchronized {
+    stores.contains(storeId) && !offlineStores.contains(storeId) &&
+      !rebuildingStores.contains(storeId) && !transferringOut.contains(storeId)
+  }
+
   def hasTransactions: Boolean = synchronized {
     stores.valuesIterator.exists(_.hasTransactions)
   }

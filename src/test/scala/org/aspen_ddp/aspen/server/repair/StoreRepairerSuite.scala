@@ -38,6 +38,8 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
     def repairableStoreIds: List[StoreId] = if departed.get then Nil else hosted
 
+    def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
+
     def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
       synchronized { repairs = repairs :+ os.pointer.id }
       completion.success(())
@@ -149,10 +151,11 @@ class StoreRepairerSuite extends IntegrationTestSuite:
       result.seen shouldBe 0
       stillThere shouldBe true
 
-  test("a failed repair leaves the error tree entry in place"):
+  test("a failed deletion leaves the error tree entry in place"):
     val objectId = ObjectId(new UUID(11, 11))
     val failing = new RepairTarget:
       def repairableStoreIds: List[StoreId] = List(storeId)
+      def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
       def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
         completion.failure(StoreNotHosted(sid))
       def repairDelete(sid: StoreId, oid: ObjectId,
@@ -163,6 +166,24 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       _ <- seedErrorEntry(objectId, Array[Byte](1))
       _ <- repairer.scan(storeId, policy)
+      stillThere <- errorEntryExists(objectId)
+    yield
+      stillThere shouldBe true
+
+  test("a failed update leaves the error tree entry in place"):
+    val failing = new RepairTarget:
+      def repairableStoreIds: List[StoreId] = List(storeId)
+      def isRepairable(storeId: StoreId): Boolean = repairableStoreIds.contains(storeId)
+      def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
+        completion.failure(StoreNotHosted(sid))
+      def repairDelete(sid: StoreId, oid: ObjectId,
+                       sp: Array[Byte], completion: Promise[Unit]): Unit =
+        completion.failure(StoreNotHosted(sid))
+    val repairer = StoreRepairer(client, failing)
+    for
+      objectId <- allocateObject()
+      _ <- seedErrorEntry(objectId, Array[Byte](2))
+      _ <- repairer.scan(storeId, RepairPolicy.Default)
       stillThere <- errorEntryExists(objectId)
     yield
       stillThere shouldBe true
@@ -184,6 +205,28 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     yield
       first.seen shouldBe 1
       second.seen shouldBe 0
+
+  test("a malformed errorTree entry does not hang the scan"):
+    val objectId = ObjectId(new UUID(13, 13))
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target)
+    val policy = RepairPolicy.Default.copy(minErrorEntryAgeForDeletion = Duration(0, SECONDS))
+    for
+      // Seed a too-short key (only 5 bytes instead of 17) directly into the errorTree
+      tree <- errorTree
+      tx = client.newRepairTransaction()
+      _ <- tree.set(Key(Array[Byte](0, 1, 2, 3, 4)), Value(Array[Byte]()))(using tx)
+      _ <- tx.commit()
+      // Seed a valid entry after the malformed one to prove the scan continued
+      _ <- seedErrorEntry(objectId, Array[Byte](1))
+      result <- repairer.scan(storeId, policy)
+      validEntryStillThere <- errorEntryExists(objectId)
+    yield
+      // The malformed entry is skipped (seen count excludes it because it threw before
+      // incrementing), but the scan completes and processes the valid entry
+      target.deletions shouldBe List((objectId, Seq[Byte](1)))
+      result.repaired shouldBe 1
+      validEntryStillThere shouldBe false
 
   test("a future dated entry is never eligible for deletion repair"):
     Future.successful:

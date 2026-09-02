@@ -1,10 +1,10 @@
 package org.aspen_ddp.aspen.server.repair
 
-import org.aspen_ddp.aspen.client.{AspenClient, StoragePool, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer,
-                                           KeyValueOperation, ObjectId, ObjectPointer}
+                                           ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
@@ -53,7 +53,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
   private def repairOne(pool: StoragePool, storeId: StoreId, policy: RepairPolicy,
                         seen: AtomicInteger, repaired: AtomicInteger, deferred: AtomicInteger)
                        (node: KeyValueListNode, key: Key, value: ValueState): Future[Unit] =
-    if !target.repairableStoreIds.contains(storeId) then
+    if !target.isRepairable(storeId) then
       // The store left this host mid-scan. foreachInRange has no early exit so the remaining
       // tree-node reads still happen, but those are cheap next to the per-object read and two
       // transactions each remaining entry would otherwise cost. Entries stay put for whichever
@@ -61,36 +61,41 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
       logger.debug(s"Abandoning repair scan of $storeId: no longer repairable here")
       Future.unit
     else
-      seen.incrementAndGet()
-      val objectId = decodeObjectId(key)
+      // Wrap synchronous portion to convert throws into failed Futures. decodeObjectId and
+      // ObjectPointer construction both decode and can throw on malformed input; a throw that
+      // escapes before a Future is produced would hang the scan instead of letting foreachInRange
+      // log the failure and continue.
+      Future.unit.flatMap: _ =>
+        seen.incrementAndGet()
+        val objectId = decodeObjectId(key)
 
-      for
-        oAllocation <- pool.allocationTree.get(Key(objectId.toBytes))
-        _ <- oAllocation match
-          case Some(allocation) =>
-            repairUpdate(storeId, ObjectPointer(allocation.value.bytes), node, key).map: _ =>
-              repaired.incrementAndGet()
-              ()
-
-          case None =>
-            // Absent from the allocation tree means either the object was deleted or its
-            // allocation has yet to be recorded. Only the first is safe to act on; the age of
-            // the error entry is what tells them apart.
-            if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
-                                      policy.minErrorEntryAgeForDeletion) then
-              // The entry value holds the storePointer bytes captured when the update was
-              // missed -- the only surviving copy, since deletion removed the allocation tree
-              // entry. Empty means "delete by ObjectId alone".
-              repairDeletion(storeId, objectId, value.value.bytes, node, key).map: _ =>
+        for
+          oAllocation <- pool.allocationTree.get(Key(objectId.toBytes))
+          _ <- oAllocation match
+            case Some(allocation) =>
+              repairUpdate(storeId, ObjectPointer(allocation.value.bytes), node, key).map: _ =>
                 repaired.incrementAndGet()
                 ()
-            else
-              logger.debug(s"Deferring repair of $objectId on $storeId: absent from the " +
-                           s"allocation tree but its error entry is too recent to treat as a " +
-                           s"deletion")
-              deferred.incrementAndGet()
-              Future.unit
-      yield ()
+
+            case None =>
+              // Absent from the allocation tree means either the object was deleted or its
+              // allocation has yet to be recorded. Only the first is safe to act on; the age of
+              // the error entry is what tells them apart.
+              if errorEntryMayBeDeleted(value.timestamp, HLCTimestamp.now,
+                                        policy.minErrorEntryAgeForDeletion) then
+                // The entry value holds the storePointer bytes captured when the update was
+                // missed -- the only surviving copy, since deletion removed the allocation tree
+                // entry. Empty means "delete by ObjectId alone".
+                repairDeletion(storeId, objectId, value.value.bytes, node, key).map: _ =>
+                  repaired.incrementAndGet()
+                  ()
+              else
+                logger.debug(s"Deferring repair of $objectId on $storeId: absent from the " +
+                             s"allocation tree but its error entry is too recent to treat as a " +
+                             s"deletion")
+                deferred.incrementAndGet()
+                Future.unit
+        yield ()
 
   private def repairUpdate(storeId: StoreId, ptr: ObjectPointer,
                            node: KeyValueListNode, key: Key): Future[Unit] =

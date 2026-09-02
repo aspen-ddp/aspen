@@ -27,6 +27,11 @@ trait RepairTarget:
     */
   def repairableStoreIds: List[StoreId]
 
+  /** O(1) per-entry counterpart to `repairableStoreIds`: whether the given store is currently
+    * repairable on this host. Must agree with `repairableStoreIds.contains(storeId)` exactly.
+    */
+  def isRepairable(storeId: StoreId): Boolean
+
   /** Brings the store's copy of the object up to date. Completes `completion` with
     * Failure(StoreNotHosted) if the store has left this host.
     */

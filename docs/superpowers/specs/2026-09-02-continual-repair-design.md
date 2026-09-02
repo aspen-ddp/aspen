@@ -144,8 +144,54 @@ is exactly the load this design exists to avoid. The cost is that a damaged stor
 pool object drifts out to the cap. A separate, shorter error cap was considered and rejected as
 more knobs than the case warrants.
 
+### Store departure mid-scan
+
+A store can leave a host at any moment — `ShutdownStore` (which a transfer-out triggers) removes
+it from `stores` and adds it to `offlineStores`. A scan already walking that store's errorTree
+range must not keep trying to write to it, and must not delete entries it did not actually
+repair. Excluding departed stores at admission time is not enough, because a sweep can be
+minutes long.
+
+**Completion must not hang.** Today `Host.handleEvent` does:
+
+```scala
+case Repair(storeId, os, completion) => stores.get(storeId).foreach: store =>
+  store.repair(os, completion)
+```
+
+If the store is gone the promise is never completed. `StoreRepairer` awaits it, that entry's
+callback never completes, `foreachInRange` never advances, the store's scan future never
+completes, and `boundedSingleFlight` holds it in flight forever — with `maxInFlight = 1` the
+`repair-sweep` tick is dropped from then on. A single transfer-out at the wrong instant would
+silently stop repair for every store on the host until the process restarts. This is latent only
+because nothing calls `Host.repair` today.
+
+**Both events fail the promise instead.** Add a `StoreNotHosted` error; `Repair` and
+`RepairDelete` both complete with `Failure(StoreNotHosted(storeId))` when the store is absent
+from `stores`. `StoreRepairer` then leaves the errorTree entry in place, which is the point: the
+store still exists, it just belongs to another host now, and that host's sweep is what will
+repair it. `foreachInRange` already logs a failing callback and continues, so no new per-entry
+handling is needed.
+
+This changes existing behavior. `RepairDelete` currently *succeeds* the promise for an unhosted
+store, with a comment explaining that the alternative would block the caller forever. Succeeding
+also causes `StoreRepairer` to delete the errorTree entry, so no host ever deletes the object
+from the moved store and the slice leaks. Failing the promise resolves the hang the comment was
+addressing without that cost.
+
+**Cooperative abandonment.** `StoreRepairer` re-checks ownership before each entry and no-ops the
+remainder of the walk once the store has departed, rather than doing a per-object read and two
+transactions apiece for entries it cannot repair. It cannot exit the walk outright:
+`foreachInRange` has no early termination, so the remaining tree-node reads still happen. Those
+are cheap next to what is being skipped, and the sweep is bounded either way.
+
+**Scan state.** The departed store's `ScanState` is dropped at the next tick, so if it ever
+returns it is re-admitted at the floor — correct, since a store that has been away is a store
+likely to have missed updates.
+
 ### Host integration
 
+- `Repair` gains the unhosted-store branch described above, mirroring `RepairDelete`.
 - New `Host.repairableStoreIds: List[StoreId]` — `stores.keySet` less `offlineStores`,
   `rebuildingStores.keySet`, and `transferringOut.keySet`, under `synchronized`. `Host`
   implements `RepairTarget`; its existing `repair` and `repairDelete` already have the right
@@ -182,6 +228,17 @@ Test-driven, following the existing suites.
   refill.
 - `RepairServiceSuite` — a counting fake proves concurrent scans never exceed the cap, and one
   store whose scan fails does not abort the sweep for the rest.
+- Store departure, the case most likely to regress:
+  - `Host` completes a `Repair` for an unhosted store with `Failure(StoreNotHosted)` rather than
+    leaving the promise open. Asserted directly against a `Host`, since the hang it prevents is
+    invisible from `StoreRepairer`'s side.
+  - Same for `RepairDelete`, replacing the current assertion of success if one exists.
+  - A failed repair leaves the errorTree entry in place — the entry is still there after the
+    scan, for both the update and the deletion path.
+  - A store removed mid-scan causes the remaining entries to be skipped: the recording
+    `RepairTarget` sees no further `repair` calls after the store leaves.
+  - The sweep survives it — a subsequent tick still runs, which is what proves the
+    single-flight slot was released.
 
 ## Out of scope
 

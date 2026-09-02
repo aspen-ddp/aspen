@@ -740,7 +740,52 @@ class StoreManager(val client: AspenClient,
       }.toList.foreach: (storeId, ofromDeviceId) =>
         ofromDeviceId.foreach: fromDeviceId =>
           client.getStorageDeviceState(fromDeviceId).foreach: fromDevice =>
-            startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+            if fromDevice.isFailed then
+              // A tombstoned source has both ids zeroed, so fromDevice.hostId is HostId(0,0).
+              // Starting the transfer would address every StartStoreTransfer to a host that
+              // does not exist; the messages are dropped, the entry never resolves, and this
+              // check re-sends them forever. Nothing reports the stall either: rebalancing's
+              // ownedStores filters TransferringIn out of its accounting, so the store is
+              // invisible to the rebalancer too.
+              abandonTransferIn(local.storageDeviceId, storeId, fromDeviceId)
+            else
+              startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+
+  /** Drops a TransferringIn entry whose source device has been declared failed.
+   *
+   *  The store itself is not lost: FailedStorageDeviceDurableTask's drain owns the source's
+   *  TransferringOut entry and rebuilds the store onto a live device. This only clears the
+   *  destination's half, which that drain deliberately does not touch.
+   *
+   *  The two cannot fight. The drain writes the source device, the pool, and the rebuild
+   *  destination it selected; this writes only this device. Where they coincide -- the drain
+   *  happening to select this device -- both writes carry a KeyRevision on the same state key,
+   *  so one loses and re-reads: if the drain wins, the entry reads Rebuilding and the guard
+   *  below leaves it alone; if this wins, the drain's Rebuilding entry simply re-adds the store.
+   */
+  private def abandonTransferIn(toDeviceId: StorageDeviceId,
+                                storeId: StoreId,
+                                fromDeviceId: StorageDeviceId): Unit =
+    logger.warn(s"Abandoning transfer of store $storeId onto device $toDeviceId: source " +
+                s"device $fromDeviceId has been declared failed")
+
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStorageDevicePointer(toDeviceId)
+        kvos <- client.read(ptr)
+        state = StorageDeviceState(kvos)
+      yield
+        // Re-read inside the transaction. A concurrent check may have dropped the entry already,
+        // and the entry may have moved on to Rebuilding or Active, neither of which is ours to
+        // remove.
+        state.stores.get(storeId).foreach: entry =>
+          if entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+             entry.transferDevice.contains(fromDeviceId) then
+            val newState = state.removeStore(storeId)
+            tx.update(ptr, None, None,
+              List(KeyRevision(StorageDeviceState.StateKey,
+                kvos.contents(StorageDeviceState.StateKey).revision)),
+              List(Insert(StorageDeviceState.StateKey, newState.encode())))
 
   /** Requests a check of one storage device.
    *

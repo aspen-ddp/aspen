@@ -64,19 +64,25 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       rebuilt.stores.values.foreach: entry =>
         entry.status should be(StorageDeviceState.StoreStatus.Active)
 
-      // The manager decided to adopt all three stores.
+      // The manager decided to adopt all three stores, and the adoption happened after the
+      // metadata flip to Active (loading is downstream of the metadata decision).
       mgr.loadStoreByIdRequests.toSet should be(expectedStores.map(s => (net.secondDeviceId, s)).toSet)
+      expectedStores.foreach: sid =>
+        mgr.loadStoreByIdTreeStatus.get((net.secondDeviceId, sid)) should be(
+          Some(StorageDeviceState.StoreStatus.Active))
 
-      // On disk, each store's final directory exists with a loadable StoreConfig, and its
-      // staging directory under rebuilding/ is gone. This is the assertion that proves real
-      // bytes were written and moved into place.
-      expectedStores.foreach: storeId =>
-        val finalPath = os.Path(deviceDir) / storeId.directoryName
+      // On disk, each store's final directory exists with a loadable StoreConfig, holds flushed
+      // object data (not just scaffolding), and its staging directory under rebuilding/ is gone.
+      expectedStores.foreach: sid =>
+        val finalPath = os.Path(deviceDir) / sid.directoryName
         os.exists(finalPath) should be(true)
         StoreConfig.loadStoreConfig((finalPath / StoreConfig.configFilename).toIO).storeId should
-          be(storeId)
+          be(sid)
 
-        val stagingPath = os.Path(deviceDir) / RebuildingStore.RebuildDirectory / storeId.directoryName
+        // The store holds flushed object data, not just a config file.
+        os.list(finalPath).count(_.last.endsWith(".sst")) should be > 0
+
+        val stagingPath = os.Path(deviceDir) / RebuildingStore.RebuildDirectory / sid.directoryName
         os.exists(stagingPath) should be(false)
 
       // A read-back assertion against the pool is not valid in this harness: RecordingStoreManager

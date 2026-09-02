@@ -13,9 +13,9 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 /** Shared test harness for driving FailedStorageDeviceDurableTask instances.
  *
- *  Provides helpers for enrolling tasks, awaiting tombstone state, and racing futures against
- *  timeouts. Factored out so both FailedStorageDeviceSuite and RebuildEndToEndSuite can drive
- *  the producer half without duplication.
+ *  Provides helpers for enrolling tasks and racing futures against timeouts. Factored out so
+ *  both FailedStorageDeviceSuite and RebuildEndToEndSuite can drive the producer half without
+ *  duplication.
  */
 trait FailedStorageDeviceTestHarness:
   this: IntegrationTestSuite =>

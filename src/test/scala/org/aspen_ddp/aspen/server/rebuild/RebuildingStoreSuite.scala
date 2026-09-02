@@ -42,6 +42,17 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
                                     checkpointInterval = 5)
       _ <- rebuild.complete
+
+      // Reopen the rebuilt store and verify the objects are actually retrievable.
+      db = new org.aspen_ddp.aspen.server.store.backend.BufferedConsistentRocksDB(
+        (dev / storeId.directoryName).toNIO)
+      tokey = (id: org.aspen_ddp.aspen.common.objects.ObjectId) =>
+        val bb = java.nio.ByteBuffer.allocate(16)
+        bb.putLong(0, id.uuid.getMostSignificantBits)
+        bb.putLong(8, id.uuid.getLeastSignificantBits)
+        bb.array()
+      readResults <- Future.sequence(ids.map(id => db.get(tokey(id))))
+      _ <- db.close()
     yield
       val finalPath = dev / storeId.directoryName
       os.exists(finalPath) should be(true)
@@ -51,6 +62,10 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // A StoreConfig is written up front, so the moved directory is loadable.
       StoreConfig.loadStoreConfig((finalPath / StoreConfig.configFilename).toIO).storeId should
         be(storeId)
+
+      // Every allocated object was reconstructed and is readable from the rebuilt store.
+      readResults.size should be(20)
+      readResults.forall(_.isDefined) should be(true)
 
   atest("a pre-existing final directory skips straight to completion"):
     given ExecutionContext = executionContext

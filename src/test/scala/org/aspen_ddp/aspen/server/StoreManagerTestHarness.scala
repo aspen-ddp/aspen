@@ -313,9 +313,23 @@ private class RecordingStoreManager(mgrClient: AspenClient,
   lazy val loadStoreByIdRequests: mutable.ListBuffer[(StorageDeviceId, StoreId)] =
     mutable.ListBuffer[(StorageDeviceId, StoreId)]()
 
+  /** Tree status (Rebuilding/Active/...) at the moment loadStoreById was called, by (deviceId, storeId).
+   *
+   *  Recorded to verify the invariant "loading is downstream of the metadata decision": a store
+   *  must read Active in the tree before the manager adopts it. Lazy for the same
+   *  initialization-order reason as storeLoadAttempts.
+   */
+  lazy val loadStoreByIdTreeStatus: mutable.Map[(StorageDeviceId, StoreId), StorageDeviceState.StoreStatus] =
+    mutable.Map[(StorageDeviceId, StoreId), StorageDeviceState.StoreStatus]()
+
   override def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     synchronized:
       loadStoreByIdRequests += ((storageDeviceId, storeId))
+      // Record the tree's status at the moment of the adoption decision.
+      client.getStorageDeviceState(storageDeviceId).foreach: state =>
+        synchronized:
+          state.stores.get(storeId).foreach: entry =>
+            loadStoreByIdTreeStatus += ((storageDeviceId, storeId) -> entry.status)
     super.loadStoreById(storageDeviceId, storeId)
 
   /** The outcome of every completed post-transfer metadata update, by store.

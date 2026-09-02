@@ -117,6 +117,7 @@ class StoreManager(val client: AspenClient,
   private var transferringOut: Map[StoreId, StoreTransferOut] = Map()
   private var transferringInUUIDs: Map[UUID, StoreTransferIn] = Map()
   private var transferringInStoreIds: Set[StoreId] = Set()
+  private var abandoningTransferIns: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
   private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
@@ -831,27 +832,52 @@ class StoreManager(val client: AspenClient,
    */
   private def abandonTransferIn(toDeviceId: StorageDeviceId,
                                 storeId: StoreId,
-                                fromDeviceId: StorageDeviceId): Unit =
-    logger.warn(s"Abandoning transfer of store $storeId onto device $toDeviceId: source " +
-                s"device $fromDeviceId has been declared failed")
+                                fromDeviceId: StorageDeviceId): Unit = synchronized {
+    // The entry that triggers this stands until the transaction commits, so every device check
+    // in the meantime calls here again. Without the guard each one starts its own retry loop,
+    // all writing the same key and losing to each other on KeyRevision. Same shape as
+    // createNewStore's creatingStores and startStoreTransferIn's transferringInStoreIds.
+    if ! abandoningTransferIns.contains(storeId) then
+      abandoningTransferIns += storeId
 
-    client.transactUntilSuccessful: tx =>
-      for
-        ptr <- client.getStorageDevicePointer(toDeviceId)
-        kvos <- client.read(ptr)
-        state = StorageDeviceState(kvos)
-      yield
-        // Re-read inside the transaction. A concurrent check may have dropped the entry already,
-        // and the entry may have moved on to Rebuilding or Active, neither of which is ours to
-        // remove.
-        state.stores.get(storeId).foreach: entry =>
-          if entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
-             entry.transferDevice.contains(fromDeviceId) then
-            val newState = state.removeStore(storeId)
-            tx.update(ptr, None, None,
-              List(KeyRevision(StorageDeviceState.StateKey,
-                kvos.contents(StorageDeviceState.StateKey).revision)),
-              List(Insert(StorageDeviceState.StateKey, newState.encode())))
+      logger.warn(s"Abandoning transfer of store $storeId onto device $toDeviceId: source " +
+                  s"device $fromDeviceId has been declared failed")
+
+      // Nothing consumes this Future, so a bare transactUntilSuccessful would turn a permanent
+      // error into a silent 60 s loop for the life of the process -- and now that the guard above
+      // is set, one that no later check could ever displace. Only two permanent classes are
+      // reachable from these two reads: a device id with no entry in the storage-devices tree,
+      // and an object that cannot be read. Everything else stays on the retry path.
+      def onFail(err: Throwable): Future[Unit] = err match
+        case e: NoSuchElementException => throw StopRetrying(e)
+        case e: FatalReadError => throw StopRetrying(e)
+        case _ => Future.unit
+
+      val fabandon = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+        for
+          ptr <- client.getStorageDevicePointer(toDeviceId)
+          kvos <- client.read(ptr)
+          state = StorageDeviceState(kvos)
+        yield
+          // Re-read inside the transaction. A concurrent check may have dropped the entry already,
+          // and the entry may have moved on to Rebuilding or Active, neither of which is ours to
+          // remove.
+          state.stores.get(storeId).foreach: entry =>
+            if entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+               entry.transferDevice.contains(fromDeviceId) then
+              val newState = state.removeStore(storeId)
+              tx.update(ptr, None, None,
+                List(KeyRevision(StorageDeviceState.StateKey,
+                  kvos.contents(StorageDeviceState.StateKey).revision)),
+                List(Insert(StorageDeviceState.StateKey, newState.encode())))
+
+      // Cleared on failure as well as success. A StopRetrying means this attempt gave up, and the
+      // next device check -- an hour out, and possibly after whatever made the read fail has been
+      // repaired -- should be free to try again rather than find the flag stuck forever.
+      fabandon.onComplete: _ =>
+        synchronized:
+          abandoningTransferIns -= storeId
+  }
 
   /** Requests a check of one storage device.
    *

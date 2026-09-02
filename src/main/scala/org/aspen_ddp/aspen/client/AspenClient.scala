@@ -276,6 +276,11 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       case e: InvalidDestination => throw StopRetrying(e)
       case e: StoreNotActive => throw StopRetrying(e)
       case e: DeviceFailed => throw StopRetrying(e)
+      // Without this, an unlisted error -- a CorruptedObject on either device read, say --
+      // MatchErrors out of onFail, ExponentialBackoffRetryStrategy catches it and reschedules,
+      // and the promise never completes. MigratePoolToSetDurableTask.tryStores awaits this
+      // future inside a pass, so that permanently wedges the migration task's single-flight flag.
+      case _ => Future.unit
 
     val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx

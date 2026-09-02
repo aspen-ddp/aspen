@@ -394,7 +394,10 @@ class RebuildingStore(client: AspenClient,
         if remaining.isEmpty then
           Future.unit
         else
-          checkpoint()
+          // Best-effort for the same reason the walk path is: a device that fills up here has to
+          // produce the operator alert and the latch, not a generic warning. The pass fails
+          // either way, so the classification is the only thing at stake.
+          checkpointBestEffort("after retries")
           Future.failed(new Exception(
             s"Rebuild of $storeId incomplete: ${remaining.size} objects still unreadable"))
 

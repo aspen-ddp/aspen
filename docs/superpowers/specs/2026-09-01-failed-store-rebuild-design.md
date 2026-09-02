@@ -229,12 +229,12 @@ restart — reading it is what makes a restart a resume.
 **Completion:** flush, close the backend, delete `rebuild-state.yaml`, `os.move` the staging
 directory to `<device>/<storeId.directoryName>`, then a transaction flipping the entry from
 `Rebuilding` to `Active` — re-reading and writing only if the status is still `Rebuilding`,
-exactly as `createNewStore` does for `Initializing`. Then load the store and re-check the
-device.
+exactly as `createNewStore` does for `Initializing`. That flip both writes and decides; the
+store is loaded only if it decides in this device's favour, and re-checks follow either way.
 
-*As built, the flip both writes and decides, and the load is downstream of that decision.* An
-earlier draft of this section read as move → flip → load, with the load a foregone conclusion
-once the move succeeded. The implementation instead has `markRebuiltStoreActive` return an
+*The load is downstream of the metadata decision.* An earlier draft of the paragraph above read
+as move → flip → load, with the load a foregone conclusion once the move succeeded, and has
+been corrected in place. The implementation instead has `markRebuiltStoreActive` return an
 outcome — `Adopt` or `Discard` — read from the device's tree entry inside the flip transaction,
 and only the `Adopt` outcome loads the store. This is deliberate and stricter, not a deviation
 to be tidied away: the device can be tombstoned between a rebuild starting and finishing, and a

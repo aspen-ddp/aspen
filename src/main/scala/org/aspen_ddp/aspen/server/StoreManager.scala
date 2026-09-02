@@ -875,7 +875,7 @@ class StoreManager(val client: AspenClient,
    *  was failed. The slot is released only after the flip commits, so a concurrent check cannot
    *  restart the same store between the release and the commit.
    *
-   *  Every completion re-checks the other loaded devices, not just this one, because
+   *  Every completion re-checks the host's other loaded devices, because
    *  `rebuildingStores` is host-wide: a slot released by device A's rebuild could unblock a queued
    *  rebuild on device B, and without a re-check of B it would wait for the periodic sweep (one
    *  hour) with data under-replicated. The three outcomes that settle the store's metadata
@@ -903,6 +903,11 @@ class StoreManager(val client: AspenClient,
          *  reads `Rebuilding`, and reconcileDeviceState's Rebuilding pass therefore starts it
          *  again. The single-flight guard does not intervene -- this callback fires long after
          *  startDeviceCheck returned, so `activeDeviceChecks` is empty.
+         *
+         *  The cost, accepted: on a single-device host the filter leaves nothing to re-check, so
+         *  a sibling store queued behind the freed slot waits for the periodic sweep rather than
+         *  starting at once. Delaying an innocent sibling by one sweep is the cheaper error than
+         *  spinning on the failed store with no backoff.
          */
         def recheckOtherDevices(): Unit =
           synchronized(storageDevices.keys)

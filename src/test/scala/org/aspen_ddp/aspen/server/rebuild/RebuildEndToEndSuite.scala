@@ -66,7 +66,12 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
 
       // The manager decided to adopt all three stores, and the adoption happened after the
       // metadata flip to Active (loading is downstream of the metadata decision).
-      mgr.loadStoreByIdRequests.toSet should be(expectedStores.map(s => (net.secondDeviceId, s)).toSet)
+      val expectedLoadRequests = expectedStores.map(s => (net.secondDeviceId, s))
+      mgr.loadStoreByIdRequests.toSet should be(expectedLoadRequests.toSet)
+      // Three stores means exactly three load calls, not six (an unconditional load plus the
+      // legitimate one would be hidden by .toSet).
+      mgr.loadStoreByIdRequests.size should be(3)
+
       expectedStores.foreach: sid =>
         val key = (net.secondDeviceId, sid)
         val flipSeq = mgr.rebuildFlipSeq.get(key)

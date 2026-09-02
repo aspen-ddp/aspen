@@ -313,14 +313,17 @@ private class RecordingStoreManager(mgrClient: AspenClient,
 
   /** Sequence number stamped when markRebuiltStoreActive's returned Future completes, by
    *  (deviceId, storeId). Used to verify the invariant "loading is downstream of the metadata
-   *  decision": the flip's stamp must be strictly less than the load's. Lazy for the same
-   *  initialization-order reason as storeLoadAttempts.
+   *  decision": the flip's stamp must be strictly less than the load's. Stamped at completion,
+   *  not at call, because the invariant is about the decision, and the decision exists only once
+   *  the Future completes. Lazy for the same initialization-order reason as storeLoadAttempts.
    */
   lazy val rebuildFlipSeq: mutable.Map[(StorageDeviceId, StoreId), Int] =
     mutable.Map[(StorageDeviceId, StoreId), Int]()
 
-  /** Sequence number stamped synchronously at the top of loadStoreById, by (deviceId, storeId).
-   *  Lazy for the same initialization-order reason as storeLoadAttempts.
+  /** Sequence number stamped at the FIRST loadStoreById call for each (deviceId, storeId). First-
+   *  wins, not last-write-wins: an unconditional rogue load before the flip would overwrite its
+   *  own stamp with a later legitimate one, hiding the inversion. Lazy for the same
+   *  initialization-order reason as storeLoadAttempts.
    */
   lazy val loadStoreByIdSeq: mutable.Map[(StorageDeviceId, StoreId), Int] =
     mutable.Map[(StorageDeviceId, StoreId), Int]()
@@ -337,14 +340,18 @@ private class RecordingStoreManager(mgrClient: AspenClient,
 
   override protected def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
                                                 storeId: StoreId): Future[RebuildOutcome] =
-    synchronized:
-      rebuildFlipSeq += ((storageDeviceId, storeId) -> rebuildEventSeq.incrementAndGet())
-    super.markRebuiltStoreActive(storageDeviceId, storeId)
+    given ExecutionContext = ec
+    super.markRebuiltStoreActive(storageDeviceId, storeId).map: outcome =>
+      synchronized:
+        rebuildFlipSeq += ((storageDeviceId, storeId) -> rebuildEventSeq.incrementAndGet())
+      outcome
 
   override def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     synchronized:
       loadStoreByIdRequests += ((storageDeviceId, storeId))
-      loadStoreByIdSeq += ((storageDeviceId, storeId) -> rebuildEventSeq.incrementAndGet())
+      val key = (storageDeviceId, storeId)
+      if !loadStoreByIdSeq.contains(key) then
+        loadStoreByIdSeq += (key -> rebuildEventSeq.incrementAndGet())
     super.loadStoreById(storageDeviceId, storeId)
 
   /** The outcome of every completed post-transfer metadata update, by store.

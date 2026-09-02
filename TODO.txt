@@ -1,6 +1,3 @@
-Switch AmoebaFS to use a registered object to store the root filesystem object
-rather than embedding it within the radicle object.
-
 StoragePool errorTree has a problem
   - Missed deletes have a problem for ObjectPointers that use storePointer
   - Because the ObjectPointer in the allocationTree is deleted, there's no way

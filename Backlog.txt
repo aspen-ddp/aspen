@@ -32,6 +32,12 @@ Add TLS Cert generation for hosts
 
 Add a Quic/Netty Network implementation
 
+TransferStore - Needs redesign
+  - Current implementation is brittle if either side fails or TCP connection is
+    dropped, it hangs forever
+  - Rebalance & Migration operations are 1 at a time and assumes eventual completion
+    hangs forever in event of failure
+
 May need to add an abortStoreTransfer method
   - to get unstuck if destination drive is full
 
@@ -202,18 +208,6 @@ StoragePool.getState() and dropCachedState() are now dead API
   - So this is now a cleanup, not a correctness issue: either delete
     getState()/dropCachedState() or wire the invalidation up
 
-The server-side transfer path has no integration coverage
-  - startStoreTransferOut, transferDataReceived and createTransferOut are
-    never exercised by any test
-  - TestNetwork.sendHostMessage only appends to capturedHostMessages;
-    nothing forwards them to receiveHostMessage, so StartStoreTransfer is
-    captured and dropped. Tests that need a completed transfer call
-    simulateTransferComplete, which short-circuits the real path
-  - The startStoreTransferOut stale-source fix therefore shipped without a
-    regression guard, resting on being mechanically identical to the
-    transferStore fix, which was confirmed empirically by revert probe
-  - Building the harness is a piece of work in its own right
-
 A transfer whose source host dies mid-flight blocks its pool's migration
 forever
   - The store is left TransferringOut, and MigratePoolToSetDurableTask's
@@ -222,14 +216,6 @@ forever
   - Pre-existing gap in the transfer subsystem, but migration is the first
     workflow whose *progress* depends on transfers completing
   - Related to the abortStoreTransfer note above
-
-RebalancingServiceSuite leaks a 100ms pollPeriod when a test fails
-  - Six sweep tests set RebalancingDurableService.pollPeriod to 100ms and
-    restore it in the yield, so any failure earlier in the for-comprehension
-    leaves the short period in place for every later suite in the same JVM
-  - Pre-existing pattern (the original enrollment test does it too), but the
-    blast radius grew with the sweep tests. A fixture-level restore -- or an
-    andThen on the assembled future -- would make it unconditional
 
 rebalanceStorageDeviceSet now walks the services TKVL on its no-op path
   - Splitting the entry point so the sweep can pass its own statePointer moved
@@ -241,18 +227,5 @@ rebalanceStorageDeviceSet now walks the services TKVL on its no-op path
     the wasted read is not. Reordering the short-circuit above the lookup fixes
     both
 
-parseRebalancePeriod's range check is conservative for hours and minutes
-  - checkDurationRange bounds days at the exact FiniteDuration limit (106751)
-    but rounds hours and minutes down, rejecting a sliver of legal values
-    (23 hours' and 1427 minutes' worth). Safe direction -- nothing that passes
-    can throw -- but not exact, and only the days branch has a test, with no
-    boundary case
 
-StorageDeviceSetState set recursion has no cycle guard
-  - collectDevices and the level-1 branch of selectDeviceWithSpace recurse
-    through memberSets without a visited-set or decreasing-level check, and
-    the memberSets/parent invariants are documented as unenforced
-  - Pre-existing shape -- selectDevices does the same -- but
-    collectMemberDevices now runs it on every migration poll pass, so a
-    malformed set graph would spin rather than fail
 

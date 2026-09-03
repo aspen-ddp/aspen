@@ -49,7 +49,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   // An empty value means "this object has no storePointer" -- but it is also what entries
   // written before this change contain, and the two are indistinguishable. A repair pass
   // must therefore treat an empty value as "delete by ObjectId alone" rather than as an
-  // error. See the repair-deletion item in TODO.txt.
+  // error. See StoreRepairer.repairDeletion in aspen.server.repair.
   def markMissedUpdates(): Unit = synchronized {
     // Build a map from ObjectId to ObjectPointer to recover pointers for ids in commitErrors
     val idToPointer = txd.allReferencedObjectsSet.map(ptr => ptr.id -> ptr).toMap

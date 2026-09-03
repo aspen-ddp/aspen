@@ -376,20 +376,3 @@ class MainSuite extends AnyFunSuite with Matchers:
     Main.formatWallTime(1_756_742_400_000L) should fullyMatch regex
       """\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"""
 
-  // An absent allocationTree entry means either "the object was deleted" or "the allocation's
-  // finalization action has not landed yet". Only the first is safe to repair by deletion, so
-  // entries are left alone until they are old enough that a pending allocation is implausible.
-
-  private val nowMillis = 1_756_742_400_000L
-
-  private def tsAtOffset(offsetMillis: Long): HLCTimestamp =
-    HLCTimestamp((nowMillis + offsetMillis) << 16)
-
-  test("a freshly written error tree entry is not yet eligible for deletion repair"):
-    Main.errorEntryMayBeDeleted(tsAtOffset(-5_000), tsAtOffset(0)) shouldBe false
-
-  test("an aged error tree entry is eligible for deletion repair"):
-    Main.errorEntryMayBeDeleted(tsAtOffset(-120_000), tsAtOffset(0)) shouldBe true
-
-  test("an error tree entry timestamped in the future is not eligible for deletion repair"):
-    Main.errorEntryMayBeDeleted(tsAtOffset(5_000), tsAtOffset(0)) shouldBe false

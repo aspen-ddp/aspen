@@ -39,3 +39,10 @@ class HostRepairTargetSuite extends IntegrationTestSuite:
     p.future.transform(t => Success(t)).map: result =>
       result.isFailure shouldBe true
       result.failed.get shouldBe a [StoreNotHosted]
+
+  test("the host runs a repair service that can be cancelled"):
+    client.read(radicle, "repair service").map: _ =>
+      // Constructed alongside the other periodic tasks rather than waiting on task-executor
+      // initialization: early sweeps simply find few stores, and the policy fallback covers
+      // metadata reads that are not ready yet.
+      noException should be thrownBy net.smgr.testingOnlyCancelRepairService()

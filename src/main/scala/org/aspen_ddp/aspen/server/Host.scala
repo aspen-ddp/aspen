@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
-import org.aspen_ddp.aspen.server.repair.{RepairTarget, StoreNotHosted}
+import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget, StoreNotHosted}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
@@ -189,7 +189,15 @@ class Host(val client: AspenClient,
   private val checkStorageDeviceTask = backgroundTasks.schedulePeriodic(checkStorageDevicePeriod) {
     events.put(CheckAllDevices())
   }
-  
+
+  /** Continual repair of this host's stores. Constructed here rather than after task-executor
+    * initialization: early sweeps simply find few stores, and RepairService falls back to
+    * default policy for metadata that is not readable yet.
+    */
+  private val repairService = new RepairService(client, hostId, this, backgroundTasks)(using ec)
+
+  private[aspen] def testingOnlyCancelRepairService(): Unit = repairService.cancel()
+
   checkForNewDevices()
 
   // After we've loaded all the stores, initiate an initial check of all our
@@ -1521,6 +1529,7 @@ class Host(val client: AspenClient,
     heartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
     usageUpdateTask.foreach(_.cancel())
+    repairService.cancel()
     shutdownPromise.future
   }
   

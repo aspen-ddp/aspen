@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
-import scala.concurrent.{Await, Future, Promise}
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, MINUTES, SECONDS}
 
 class RepairServiceSuite extends IntegrationTestSuite:

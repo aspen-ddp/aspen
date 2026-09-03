@@ -58,6 +58,14 @@ class RepairService(client: AspenClient,
   /** Overridable so the metadata deadline can be tested without waiting for it. */
   protected def metadataDeadline: FiniteDuration = MetadataDeadline
 
+  /** Overridable so tests can hang a policy read. */
+  protected def readPolicy(poolId: PoolId): Future[RepairPolicy] =
+    RepairPolicy.read(client, poolId)
+
+  /** Overridable so tests can hang a limits read. */
+  protected def readLimits(): Future[HostRepairLimits] =
+    HostRepairLimits.read(client, hostId)
+
   /** Bounds a future that would otherwise never settle.
     *
     * Aspen reads of an unavailable object retry indefinitely rather than failing, so any read on
@@ -113,7 +121,7 @@ class RepairService(client: AspenClient,
       val fp = Future.unit.flatMap(_ =>
         withDeadline(metadataDeadline,
                      MetadataReadTimedOut(s"policy of pool $poolId", metadataDeadline)):
-          RepairPolicy.read(client, poolId)
+          readPolicy(poolId)
       ).map: policy =>
         synchronized:
           policyCache = policyCache + (poolId -> policy)
@@ -127,7 +135,7 @@ class RepairService(client: AspenClient,
     val fl = Future.unit.flatMap(_ =>
       withDeadline(metadataDeadline,
                    MetadataReadTimedOut(s"limits of host $hostId", metadataDeadline)):
-        HostRepairLimits.read(client, hostId)
+        readLimits()
     ).map: l =>
       synchronized:
         limits = l

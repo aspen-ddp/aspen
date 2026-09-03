@@ -162,6 +162,38 @@ class RepairServiceSuite extends IntegrationTestSuite:
       svc.cancel()
       bgTasks.shutdown(FiniteDuration(2, SECONDS))
 
+  test("a metadata read that never completes does not wedge the sweep"):
+    val clock = AtomicLong(0L)
+    val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
+
+    class HangingMetadataService extends RepairService(client, HostId.BootstrapHostId,
+                                                       FixedTarget(), bgTasks, () => clock.get):
+      override protected def metadataDeadline: FiniteDuration =
+        FiniteDuration(50, MILLISECONDS)
+
+      override protected def readPolicy(poolId: PoolId): Future[RepairPolicy] =
+        Promise[RepairPolicy]().future
+
+      override protected def scanStore(storeId: StoreId,
+                                       policy: RepairPolicy): Future[ScanResult] =
+        Future.successful(ScanResult.Empty)
+
+    val svc = HangingMetadataService()
+    val testFuture = for
+      _ <- svc.sweep()
+      _ = clock.set(60_000L)
+      _ <- svc.sweep()
+    yield
+      // The sweep completing at all is the core property. The stores having been scanned/paced
+      // despite the hung policy read proves the timeout path worked and did not skip the stores.
+      svc.testingOnlyScanStates.keySet shouldBe storeIds.toSet
+      val representative = svc.testingOnlyScanStates(storeIds.head)
+      representative.nextDue should be > 60_000L
+
+    testFuture.andThen: _ =>
+      svc.cancel()
+      bgTasks.shutdown(FiniteDuration(2, SECONDS))
+
   test("the sweep tick period matches the default scan floor"):
     Future.successful:
       RepairService.TickPeriod shouldBe RepairPolicy.Default.scanIntervalFloor

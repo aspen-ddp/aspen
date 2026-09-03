@@ -9,8 +9,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 
 import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
-import scala.concurrent.{Future, Promise}
-import scala.concurrent.duration.MINUTES
+import scala.concurrent.{Await, Future, Promise}
+import scala.concurrent.duration.{Duration, FiniteDuration, MILLISECONDS, MINUTES, SECONDS}
 
 class RepairServiceSuite extends IntegrationTestSuite:
 
@@ -55,6 +55,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
     val svc = CountingService(clock, None)
     svc.sweep().map: _ =>
       svc.scanned.get shouldBe 0
+      svc.testingOnlyScanStates.keySet shouldBe storeIds.toSet
 
   test("concurrent scans never exceed the host limit"):
     val clock = AtomicLong(0L)
@@ -108,6 +109,58 @@ class RepairServiceSuite extends IntegrationTestSuite:
       readmitted.currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
       readmitted.nextDue should be >= 120_000L
       readmitted.nextDue should be < 120_000L + RepairPolicy.Default.scanIntervalFloor.toMillis
+
+  test("a scan that finds entries snaps the store back to the floor"):
+    val clock = AtomicLong(0L)
+
+    class FindingService extends RepairService(client, HostId.BootstrapHostId, FixedTarget(),
+                                               BackgroundTaskManager.NoBackgroundTaskManager,
+                                               () => clock.get):
+      override protected def scanStore(storeId: StoreId,
+                                       policy: RepairPolicy): Future[ScanResult] =
+        Future.successful(ScanResult(seen = 3, repaired = 2, deferred = 1))
+
+    val svc = FindingService()
+    for
+      _ <- svc.sweep()
+      _ = clock.set(60_000L)
+      _ <- svc.sweep()
+    yield
+      // nextDue past the scan instant proves advance() ran at all; the interval still sitting at
+      // the floor rather than doubled to 60s proves it took the found-entries branch.
+      val s = svc.testingOnlyScanStates(storeIds.head)
+      s.currentInterval shouldBe RepairPolicy.Default.scanIntervalFloor
+      s.nextDue should be > 60_000L
+
+  test("a scan that never completes does not wedge the sweep"):
+    val clock = AtomicLong(0L)
+    val bgTasks = BackgroundTaskManager(scala.concurrent.ExecutionContext.global)
+
+    class HangingService extends RepairService(client, HostId.BootstrapHostId, FixedTarget(),
+                                               bgTasks, () => clock.get):
+      override protected def scanDeadline: FiniteDuration =
+        FiniteDuration(50, MILLISECONDS)
+
+      override protected def scanStore(storeId: StoreId,
+                                       policy: RepairPolicy): Future[ScanResult] =
+        if storeId == storeIds.head then Promise[ScanResult]().future
+        else Future.successful(ScanResult.Empty)
+
+    val svc = HangingService()
+    val testFuture = for
+      _ <- svc.sweep()
+      _ = clock.set(60_000L)
+      _ <- svc.sweep()
+    yield
+      // The sweep completing at all is the point. The hung store having advanced to a doubled
+      // interval proves it went through the timeout and the recover rather than being skipped.
+      val hung = svc.testingOnlyScanStates(storeIds.head)
+      hung.currentInterval shouldBe Duration(60, SECONDS)
+      hung.nextDue should be > 60_000L
+
+    testFuture.andThen: _ =>
+      svc.cancel()
+      bgTasks.shutdown(FiniteDuration(2, SECONDS))
 
   test("the sweep tick period matches the default scan floor"):
     Future.successful:

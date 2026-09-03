@@ -7,9 +7,12 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runBoundedParallel}
 import scribe.Logging
 
-import scala.concurrent.duration.{Duration, FiniteDuration, HOURS, SECONDS}
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.{Duration, FiniteDuration, HOURS, MINUTES, SECONDS}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.Random
+
+case class ScanTimedOut(storeId: StoreId, after: Duration)
+  extends Exception(s"Repair scan of $storeId did not complete within $after")
 
 /** Drives continual repair of every store a host owns.
   *
@@ -24,7 +27,7 @@ import scala.util.Random
 class RepairService(client: AspenClient,
                     hostId: HostId,
                     target: RepairTarget,
-                    backgroundTasks: BackgroundTaskManager,
+                    private val backgroundTasks: BackgroundTaskManager,
                     clock: () => Long = () => System.nanoTime() / 1000000L)
                    (using ec: ExecutionContext) extends Logging:
 
@@ -45,6 +48,31 @@ class RepairService(client: AspenClient,
   /** Overridable so tests can count concurrency without doing I/O. */
   protected def scanStore(storeId: StoreId, policy: RepairPolicy): Future[ScanResult] =
     repairer.scan(storeId, policy)
+
+  /** Overridable so the deadline can be tested without waiting for it. */
+  protected def scanDeadline: FiniteDuration = ScanDeadline
+
+  /** Bounds a single store's scan.
+    *
+    * Aspen reads of a pool below its restore threshold retry indefinitely rather than failing, so
+    * a scan of a sick pool can stay outstanding forever. Unbounded, that scan holds its
+    * bounded-parallel slot, the sweep never completes, and the single-flight guard suppresses
+    * every later tick -- one sick pool would stop repair for every healthy store on the host. The
+    * abandoned read continues in the background; the timed-out scan is reported through the same
+    * recover path as any other failure, so the store backs off toward the cap, which is what
+    * bounds how fast abandoned reads can accumulate.
+    */
+  private def withDeadline(storeId: StoreId, f: Future[ScanResult]): Future[ScanResult] =
+    val p = Promise[ScanResult]()
+
+    val timer = backgroundTasks.schedule(scanDeadline):
+      p.tryFailure(ScanTimedOut(storeId, scanDeadline))
+
+    f.onComplete: t =>
+      timer.cancel()
+      p.tryComplete(t)
+
+    p.future
 
   private[repair] def testingOnlyScanStates: Map[StoreId, ScanState] = synchronized { scanStates }
 
@@ -71,7 +99,7 @@ class RepairService(client: AspenClient,
     */
   private def refreshPolicies(pools: List[PoolId]): Future[Unit] =
     val f = runBoundedParallel(pools, limitOf.maxConcurrentStoreScans): poolId =>
-      val fp = RepairPolicy.read(client, poolId).map: policy =>
+      val fp = Future.unit.flatMap(_ => RepairPolicy.read(client, poolId)).map: policy =>
         synchronized:
           policyCache = policyCache + (poolId -> policy)
       fp.recover:
@@ -81,7 +109,7 @@ class RepairService(client: AspenClient,
     f.map(_ => ())
 
   private def refreshLimits(): Future[Unit] =
-    val fl = HostRepairLimits.read(client, hostId).map: l =>
+    val fl = Future.unit.flatMap(_ => HostRepairLimits.read(client, hostId)).map: l =>
       synchronized:
         limits = l
     fl.recover:
@@ -112,11 +140,12 @@ class RepairService(client: AspenClient,
   private def scanOne(storeId: StoreId): Future[Unit] =
     val policy = policyOf(storeId.poolId)
 
-    val fFound = scanStore(storeId, policy).map: result =>
-      if result.seen > 0 then
-        logger.info(s"Repair scan of $storeId: ${result.seen} seen, ${result.repaired} " +
-                    s"repaired, ${result.deferred} deferred")
-      result.foundEntries
+    val fFound = Future.unit.flatMap(_ => withDeadline(storeId, scanStore(storeId, policy)))
+      .map: result =>
+        if result.seen > 0 then
+          logger.info(s"Repair scan of $storeId: ${result.seen} seen, ${result.repaired} " +
+                      s"repaired, ${result.deferred} deferred")
+        result.foundEntries
 
     val recovered = fFound.recover:
       case t: Throwable =>
@@ -143,3 +172,10 @@ object RepairService:
     * slow work.
     */
   val StallAfter: FiniteDuration = FiniteDuration(6, HOURS)
+
+  /** Generous relative to a healthy scan and well below StallAfter, so a timeout means a scan is
+    * genuinely stuck rather than merely slow. A store working through a large backlog may be cut
+    * off mid-drain; that is harmless, since every repaired entry is deleted as it goes and the
+    * next scan resumes where this one stopped.
+    */
+  val ScanDeadline: FiniteDuration = FiniteDuration(10, MINUTES)

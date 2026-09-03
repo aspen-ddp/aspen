@@ -196,8 +196,6 @@ class Host(val client: AspenClient,
     */
   private val repairService = new RepairService(client, hostId, this, backgroundTasks)(using ec)
 
-  private[aspen] def testingOnlyCancelRepairService(): Unit = repairService.cancel()
-
   checkForNewDevices()
 
   // After we've loaded all the stores, initiate an initial check of all our

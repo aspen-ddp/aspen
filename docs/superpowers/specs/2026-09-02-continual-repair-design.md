@@ -66,6 +66,16 @@ Two rules make this safe:
    and falls back to defaults on a failed read, logging at debug. Repair is the service that
    must keep working while the system is unhealthy; the config read is advisory, never a gate.
 
+   **"Unreadable" means a read that never returns, not only one that fails.** Aspen reads retry
+   indefinitely — `SimpleReadDriver` settles only on success or a fatal `ObjectReader` error — so
+   an unavailable object yields a future that never completes rather than one that fails. A
+   `recover` block therefore does not implement this requirement on its own: it handles the case
+   that does not happen. Every metadata read on the sweep's critical path must be bounded by a
+   deadline, with the fallback taken on timeout. This applies to any future component that reads
+   system metadata on a periodic path, not just to repair: an unbounded read inside a
+   single-flight periodic task converts one unavailable object into a permanent, silent stall of
+   that task for the life of the process.
+
 Defaults: floor 30s, cap 15min, deletion age 60s (preserving today's
 `Main.MinErrorEntryAgeForDeletion` exactly), `maxConcurrentStoreScans` 4.
 

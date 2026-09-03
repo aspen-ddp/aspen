@@ -256,7 +256,7 @@ class RepairPolicySuite extends IntegrationTestSuite:
       p shouldBe RepairPolicy.Default
 
   test("a host with no repair limits key reads as the default limits"):
-    HostRepairLimits.read(client, HostState.BootstrapHostId).map: l =>
+    HostRepairLimits.read(client, HostId.BootstrapHostId).map: l =>
       l shouldBe HostRepairLimits.Default
 ```
 
@@ -1263,7 +1263,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
 
   /** Counts concurrent scans and optionally fails one store's scan. */
   private class CountingService(clock: AtomicLong, failFor: Option[StoreId])
-    extends RepairService(client, HostState.BootstrapHostId, FixedTarget(),
+    extends RepairService(client, HostId.BootstrapHostId, FixedTarget(),
                           BackgroundTaskManager.NoBackgroundTaskManager,
                           () => clock.get):
 
@@ -1323,7 +1323,7 @@ class RepairServiceSuite extends IntegrationTestSuite:
                        sp: Array[Byte], completion: Promise[Unit]): Unit =
         completion.success(())
 
-    val svc = new RepairService(client, HostState.BootstrapHostId, target,
+    val svc = new RepairService(client, HostId.BootstrapHostId, target,
                                 BackgroundTaskManager.NoBackgroundTaskManager, () => clock.get)
     for
       _ <- svc.sweep()

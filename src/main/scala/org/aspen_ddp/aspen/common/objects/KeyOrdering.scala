@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.objects
 
 import java.nio.charset.StandardCharsets
 import scala.util.control.Breaks._
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 
 sealed abstract class KeyOrdering extends Ordering[Key] {
   def compare(a: Key, b: Key): Int

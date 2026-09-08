@@ -5,13 +5,13 @@ import java.util.UUID
 
 import scala.util.Using
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 import org.yaml.snakeyaml.Yaml
 import org.yaml.snakeyaml.constructor.SafeConstructor
 
 object YamlFormat {
 
-  class FormatError(val msg: String) extends AmoebaError(msg)
+  class FormatError(val msg: String) extends AspenError(msg)
 
   /** Loads and parses the YAML document contained in the given file.
     *

@@ -1,5 +1,5 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 
-class CorruptedEntry(msg: String) extends AmoebaError(msg)
+class CorruptedEntry(msg: String) extends AspenError(msg)

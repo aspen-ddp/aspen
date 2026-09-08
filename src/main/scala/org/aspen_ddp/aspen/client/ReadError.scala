@@ -1,9 +1,9 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 
-sealed abstract class ReadError(msg: String) extends AmoebaError(msg) {
+sealed abstract class ReadError(msg: String) extends AspenError(msg) {
   val pointer: ObjectPointer
 
   override def toString: String = s"${this.getClass.getSimpleName}(${pointer.getClass.getSimpleName}:${pointer.id})"

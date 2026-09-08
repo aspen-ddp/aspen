@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.cmdline
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 import org.aspen_ddp.aspen.amoebafs.FileSystem
 import org.aspen_ddp.aspen.amoebafs.impl.simple.SimpleFileSystem
 import org.aspen_ddp.aspen.amoebafs.nfs.AmoebaNFS
@@ -112,7 +112,7 @@ object Main {
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None)
 
-  class ConfigError(msg: String) extends AmoebaError(msg)
+  class ConfigError(msg: String) extends AspenError(msg)
 
   private case class HostNotFound(hostname: String)
     extends Exception(s"host '$hostname' not found")

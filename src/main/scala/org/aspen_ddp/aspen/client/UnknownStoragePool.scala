@@ -1,5 +1,5 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 
-class UnknownStoragePool extends AmoebaError
+class UnknownStoragePool extends AspenError

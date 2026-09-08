@@ -1,10 +1,10 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 
-sealed abstract class TransactionError extends AmoebaError
+sealed abstract class TransactionError extends AspenError
 
 abstract class TransactionCreationError extends TransactionError
 

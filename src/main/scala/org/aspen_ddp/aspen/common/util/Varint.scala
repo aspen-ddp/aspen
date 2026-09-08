@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.util
 
 import java.nio.ByteBuffer
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 
 /**
   *  Implements Variable-sized integer encoding according to the ProtocolBuffers description
@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.AmoebaError
   */
 object Varint {
 
-  class VarintEncodingError extends AmoebaError
+  class VarintEncodingError extends AspenError
 
   def getSignedIntEncodingLength(v: Int): Int = {
     val bb = ByteBuffer.allocate(12)

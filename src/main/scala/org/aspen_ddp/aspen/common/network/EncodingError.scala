@@ -1,5 +1,5 @@
 package org.aspen_ddp.aspen.common.network
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 
-class EncodingError(msg: String) extends AmoebaError(msg)
+class EncodingError(msg: String) extends AspenError(msg)

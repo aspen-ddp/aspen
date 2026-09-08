@@ -1,9 +1,9 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.AmoebaError
+import org.aspen_ddp.aspen.AspenError
 import org.aspen_ddp.aspen.common.objects.Key
 
-sealed abstract class KeyValueError extends AmoebaError
+sealed abstract class KeyValueError extends AspenError
 
 class BelowMinimumError(minimum: Key, attempted: Key) extends KeyValueError
 

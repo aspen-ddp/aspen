@@ -41,7 +41,7 @@ as well as your application as a whole.
 Aspen aims to provide a third option for distributed systems architects. One that provides many 
 of the benefits of the ground-up approach while simultaneously reducing some of the burden inherent
 to composition. To do this, Aspen focuses on solving the distributed data management problem in a
-nwe, general-purpose manner that emphasizes flexibility in terms of architectural design and 
+new, general-purpose manner that emphasizes flexibility in terms of architectural design and 
 runtime operation. 
 
 ## What it is
@@ -82,7 +82,8 @@ required.
 In short, Aspen aims to fill a role in the distributed data world similar to the role scripting
 languages serve in software development. Scripts can be used to quickly and effectively tackle
 many problems that would be difficult to solve with a lower level language. There's a reason
-there aren't any C/C++ web content platforms competing with Django. Aspen is aiming at a
+there aren't any C/C++ web content platforms competing with Django. Python is just better
+suited to solving that problem and its performance is more than adequate. Aspen is aiming at a
 similar niche with distributed data arena.
 
 ## How it's different
@@ -91,9 +92,10 @@ Of course, Aspen isn't a silver bullet. At the end of the day, it's just another
 toolbox. So, the question is how is it different and what is it good for? To answer that, we
 must first describe the basics of how it works.
 
-At it's core, Aspen is an object storage system written in Scala. All operations are carried
-out through transactions that can update multiple objects simultaneously with ACD semantics 
-from the standard ACID model (Isolation is achievable but deferred for the moment).
+At it's core, Aspen is an object storage system that runs on top of the JVM. All operations
+are carried out through transactions that can update multiple objects simultaneously with 
+ACD semantics from the standard ACID model (Isolation is achievable but deferred for the 
+moment).
 
 Object data is stored in logical DataStores that support pluggable backend implementations,
 such as RocksDB and flat files. DataStores are not fixed in place and may be migrated 
@@ -156,18 +158,16 @@ co-developed with it. AmoebaFS was created for a couple of reasons.
 
 Currently, just the basics are implemented but future features could include things
 like:
-* Copy-On-Write files or entire file-system
+* Copy-On-Write files or entire file-systems
 * Snapshots
 * Deduplication
 * Compression
 * Per-directory geo-location settings
 * Background transfers of file content between media types (NVMe, HDD, Tape)
 * Directing all writes to NVMe media with background transfer to HDD
-* You name it
 
 The file system is exposed to the outside world through dcache's Java NFS server 
-library and, unlike traditional NFS servers, multiple server instances can be run
-concurrently that export the same underlying file system.
+library.
 
 More information about the potential design and use cases for AmoebaFS may be found in
 its section of the [Project Homepage](https://aspen-ddp.org)

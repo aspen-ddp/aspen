@@ -176,7 +176,8 @@ its section of the [Project Homepage](https://aspen-ddp.org)
 
 ### Setup
 1. Ensure JAVA_HOME is set correctly
-2. Run `sbt compile`
+2. Install sbt (the Scala Build Tool)
+3. Run `sbt compile`
 
 ### Execution
 Run the following command to create a new Aspen system under `/tmp/aspen-test`. The first

@@ -9,6 +9,7 @@
 * Provides an adaptable run-time environment that easily adjusts to change
 * Focuses on providing "good" performance across a broad range of domains rather than
   "great" performance in just one
+* Provides AmoebaFS, a distributed file system that serves as Aspen's first practical use case.
 
 ## Motivation
 

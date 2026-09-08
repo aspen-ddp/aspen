@@ -24,7 +24,7 @@ sbt 'testOnly *KeyValueObjectReaderSuite -- -z min/max'
 
 sudo launchctl start com.apple.rpcbind
 ./aspen create-filesystem /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs aspen-bootstrap
-./aspen nfs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
+./aspen amoebafs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
 
 On Client:
     ssh rakis@192.168.64.2

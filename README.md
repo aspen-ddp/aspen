@@ -212,7 +212,7 @@ Then launch the AmoebaFS NFS server process against it. Note that on MacOS you n
 first run `sudo launchctl start com.apple.rpcbind` to allow the NFS server to register with
 the local RPC daemon. On Linux, ensure you have the rpcbind service running.
 ```
-./aspen nfs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
+./aspen amoebafs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
 ```
 
 To attach a client to the NFS server, run the following on the client machine:

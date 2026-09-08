@@ -167,7 +167,7 @@ object Main {
    *  latency report rather than a command failure: the receiving host's periodic check remains
    *  the correctness guarantee.
    *
-   *  run_host() blocks in joinIoThread and amoeba_server() in Thread.currentThread.join(); neither
+   *  run_host() blocks in joinIoThread and run_amoebafs() in Thread.currentThread.join(); neither
    *  reaches here.
    */
   private def drainAndShutdown(): Unit =
@@ -299,8 +299,8 @@ object Main {
             validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
         )
 
-      cmd("nfs").text("Launches an AmoebaFS NFS server").
-        action( (_,c) => c.copy(mode="amoeba")).
+      cmd("amoebafs").text("Launches an AmoebaFS NFS server").
+        action( (_,c) => c.copy(mode="amoebafs")).
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
             action( (x, c) => c.copy(bootstrapConfigFile=x)).
@@ -753,7 +753,7 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
                                           cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
             case "host" => run_host(absPath(cfg.hostDirectory))
-            case "amoeba" => amoeba_server(bootstrapConfigPath, cfg.fsName)
+            case "amoebafs" => run_amoebafs(bootstrapConfigPath, cfg.fsName)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(bootstrapConfigPath)
             case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
@@ -952,7 +952,7 @@ object Main {
       ()
   }
 
-  def amoeba_server(bootstrapConfigFile: os.Path, fsName: String): Int = {
+  def run_amoebafs(bootstrapConfigFile: os.Path, fsName: String): Int = {
     configureLogging()
 
     val (client, network, radicle) = createAspenClient(bootstrapConfigFile)

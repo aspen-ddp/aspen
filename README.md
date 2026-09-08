@@ -185,7 +185,7 @@ remaining four are the bootstrap pool's IDA: type, read threshold, write thresho
 width. This creates `/tmp/aspen-test/bootstrap-host`, containing the host's configuration,
 its storage devices, and the three bootstrap data stores.
 ```
-./t bootstrap /tmp/aspen-test 127.0.0.1 replication 2 3 3
+./aspen bootstrap /tmp/aspen-test 127.0.0.1 replication 2 3 3
 ```
 
 This walkthrough runs everything on one machine, so `127.0.0.1` is the right address here
@@ -197,22 +197,22 @@ The host directory is self-describing: bootstrap writes both `aspen-host-config.
 `aspen-bootstrap-config.yaml` into it, so starting the storage host needs nothing more than
 the directory itself.
 ```
-./t host /tmp/aspen-test/bootstrap-host
+./aspen host /tmp/aspen-test/bootstrap-host
 ```
 
 In a second terminal, create a filesystem. A freshly bootstrapped system has exactly one
 storage pool, `aspen-bootstrap`, so that is what to allocate it in. Any number of
-filesystems may coexist, each under its own name; `./t list-filesystems <config>` shows
+filesystems may coexist, each under its own name; `./aspen list-filesystems <config>` shows
 them.
 ```
-./t create-filesystem /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs aspen-bootstrap
+./aspen create-filesystem /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs aspen-bootstrap
 ```
 
 Then launch the AmoebaFS NFS server process against it. Note that on MacOS you need to
 first run `sudo launchctl start com.apple.rpcbind` to allow the NFS server to register with
 the local RPC daemon. On Linux, ensure you have the rpcbind service running.
 ```
-./t nfs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
+./aspen nfs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
 ```
 
 To attach a client to the NFS server, run the following on the client machine:

@@ -165,7 +165,7 @@ bootstrap-hosts:
       Files.deleteIfExists(f)
 
   test("loadBootstrapConfig accepts every bootstrap store on a single host"):
-    // This is what "./t bootstrap <dir> replication 2 3 3" produces: one host, three stores.
+    // This is what "./aspen bootstrap <dir> replication 2 3 3" produces: one host, three stores.
     val singleHostYaml = """aspen-system-id: 22222222-2222-2222-2222-222222222222
 bootstrap-ida:
   type: replication

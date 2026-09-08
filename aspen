@@ -10,14 +10,14 @@ set -u
 # Setup and launch want different working directories. The classpath cache, the build-file
 # staleness checks, and "sbt compile" all have to run from the repo root. The CLI, on the
 # other hand, resolves its file arguments against the process cwd, so it must see the
-# directory the user actually invoked t from -- otherwise a relative path either fails
+# directory the user actually invoked aspen from -- otherwise a relative path either fails
 # validation or, worse, silently resolves to a same-named file under the repo root.
 #
 # So: run setup from the repo root, then return to the invocation directory before exec'ing.
 invocation_dir="$PWD"
 
 # Finding the repo root means resolving this script's own path, which may be a symlink --
-# t linked onto the PATH, say. dirname on the link would name the directory holding it
+# aspen linked onto the PATH, say. dirname on the link would name the directory holding it
 # rather than the checkout. macOS ships no "readlink -f" and its BSD readlink follows only
 # one level, so walk the chain by hand.
 #
@@ -39,7 +39,7 @@ repo_root="$(cd -P "$(dirname "$src")" && pwd)" || exit 1
 cd "$repo_root" || exit 1
 
 # Absolute, so reading the cache does not depend on the cwd at the time of the read.
-CP_CACHE="$repo_root/target/t-classpath"
+CP_CACHE="$repo_root/target/aspen-classpath"
 
 #--- JDK selection ---------------------------------------------------------------------
 
@@ -53,7 +53,7 @@ fi
 
 if [[ ! -x "$JAVA_BIN" ]]
 then
-  echo "t: no java found; set JAVA_HOME or put java on the PATH" >&2
+  echo "aspen: no java found; set JAVA_HOME or put java on the PATH" >&2
   exit 1
 fi
 
@@ -84,7 +84,7 @@ needs_refresh() {
 
 if needs_refresh
 then
-  echo "t: regenerating the classpath (this invokes sbt and may take a moment)..." >&2
+  echo "aspen: regenerating the classpath (this invokes sbt and may take a moment)..." >&2
 
   cp_new="$(sbt -batch --error 'export runtime:fullClasspath' 2>/dev/null | tail -n 1 | tr -d '\r')"
 
@@ -92,7 +92,7 @@ then
   # failed export must not leave a truncated cache behind.
   if [[ -z $cp_new || $cp_new != /* ]]
   then
-    echo "t: failed to export the runtime classpath from sbt" >&2
+    echo "aspen: failed to export the runtime classpath from sbt" >&2
     exit 1
   fi
 
@@ -105,13 +105,13 @@ CLASSPATH="$(cat "$CP_CACHE")"
 #--- Run -------------------------------------------------------------------------------
 
 # Sources are not compiled on every invocation; that would make each command pay for an
-# sbt startup. Run "sbt compile" by hand after editing, or set T_COMPILE=1.
-if [[ -n ${T_COMPILE:-} ]]
+# sbt startup. Run "sbt compile" by hand after editing, or set ASPEN_COMPILE=1.
+if [[ -n ${ASPEN_COMPILE:-} ]]
 then
   sbt compile || exit 1
 fi
 
-# Back to where the user ran t from, so relative path arguments mean what they typed. The
+# Back to where the user ran aspen from, so relative path arguments mean what they typed. The
 # classpath is absolute (enforced by the "/*" guard on the sbt export above), so it keeps
 # working from here.
 cd "$invocation_dir" || exit 1

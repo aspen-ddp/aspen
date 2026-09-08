@@ -207,8 +207,13 @@ object Main {
     case e: IllegalArgumentException => s"Error: ${e.getMessage}"
 
   def main(args: Array[String]): Unit = {
-    val parser = new scopt.OptionParser[Args]("demo") {
-      head("demo", "0.1")
+    val parser = new scopt.OptionParser[Args]("aspen") {
+      head("aspen", "0.1")
+
+      // scopt's help option prints the usage text and terminates with status 0 from inside
+      // parse(), so it never reaches the drainAndShutdown() below. That is correct here:
+      // nothing has been started at parse time, so there is nothing to drain.
+      help("help").text("Prints this usage text")
 
       val validPort = (p: Int) =>
         if p >= 1 && p <= 65535 then success else failure(s"Port must be between 1 and 65535: $p")
@@ -233,7 +238,7 @@ object Main {
           action((x, c) => c.copy(storeTransferPort = x)),
       )
 
-      cmd("bootstrap").text("Bootstrap a new Amoeba system").
+      cmd("bootstrap").text("Bootstrap a new Aspen system").
         action( (_,c) => c.copy(mode="bootstrap")).
         children(
           // Unlike every other directory argument in this parser, the target is not required
@@ -284,7 +289,7 @@ object Main {
       //      validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
       //  )
 
-      cmd("host").text("Starts an Amoeba Storage Host").
+      cmd("host").text("Starts an Aspen Storage Host").
         action( (_,c) => c.copy(mode="host")).
         children(
           // No bootstrap config argument: the host reads it from its own directory so that
@@ -294,7 +299,7 @@ object Main {
             validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
         )
 
-      cmd("nfs").text("Launches a Amoeba NFS server").
+      cmd("nfs").text("Launches an AmoebaFS NFS server").
         action( (_,c) => c.copy(mode="amoeba")).
         children(
           arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
@@ -819,8 +824,8 @@ object Main {
     (b, net)
   }
 
-  def createAmoebaClient(bootstrapConfigFile: os.Path,
-                         onnet: Option[(NetworkBridge, ZMQNet)]=None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
+  def createAspenClient(bootstrapConfigFile: os.Path,
+                        onnet: Option[(NetworkBridge, ZMQNet)]=None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
 
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfigFile, None, None))
 
@@ -856,7 +861,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -893,7 +898,7 @@ object Main {
   def run_debug_code(bootstrapConfigFile: os.Path): Unit = {
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -950,7 +955,7 @@ object Main {
   def amoeba_server(bootstrapConfigFile: os.Path, fsName: String): Int = {
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1002,7 +1007,7 @@ object Main {
     nfsSvc.register(new OncRpcProgram(nfs4_prot.NFS4_PROGRAM, nfs4_prot.NFS_V4), nfs4)
     nfsSvc.start()
 
-    println("Amoeba NFS server started...")
+    println("AmoebaFS NFS server started...")
 
     // The NFS server is meant to run indefinitely. Blocking the main thread is what keeps
     // the process alive; every worker thread in the system is a daemon thread.
@@ -1051,7 +1056,7 @@ object Main {
 
     val (networkBridge, nnet) = createNetwork(bootstrapConfigFile, Some((hostCfg.hostId, hostCfg.dataPort)), None)
 
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile, Some((networkBridge, nnet)))
+    val (client, network, _) = createAspenClient(bootstrapConfigFile, Some((networkBridge, nnet)))
 
     networkBridge.oclient = Some(client)
 
@@ -1231,7 +1236,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1270,7 +1275,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1317,7 +1322,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1349,7 +1354,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1377,7 +1382,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1408,7 +1413,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1443,7 +1448,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1481,7 +1486,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1524,7 +1529,7 @@ object Main {
 
     val hostDir = hostDirectory.toAbsolutePath.normalize
 
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1588,7 +1593,7 @@ object Main {
       // a second line of defence for its non-CLI callers rather than the mechanism here.
       val deviceDirectory = StorageDeviceManager.deviceDirectory(hostDirectory, deviceName)
 
-      val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+      val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
       network.startIoThread(client)
 
@@ -1667,7 +1672,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -1736,7 +1741,7 @@ object Main {
   def rebalance(bootstrapConfigFile: os.Path, setIdStr: String): Int =
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
     network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
@@ -1758,7 +1763,7 @@ object Main {
                             unit: Option[String]): Int =
     configureLogging()
 
-    val (client, network, radicle) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
     network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
@@ -2042,7 +2047,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 
@@ -2092,7 +2097,7 @@ object Main {
 
   def show_host(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2110,7 +2115,7 @@ object Main {
 
   def show_device(bootstrapConfigFile: os.Path, uuidStr: String): Int =
     configureLogging()
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2131,7 +2136,7 @@ object Main {
 
   def show_pool(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2150,7 +2155,7 @@ object Main {
 
   def show_device_set(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2171,7 +2176,7 @@ object Main {
 
   def show_allocation_group(bootstrapConfigFile: os.Path, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2194,7 +2199,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, _) = createAmoebaClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(bootstrapConfigFile)
 
     network.startIoThread(client)
 

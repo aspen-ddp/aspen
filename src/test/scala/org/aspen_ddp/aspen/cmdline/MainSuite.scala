@@ -376,3 +376,128 @@ class MainSuite extends AnyFunSuite with Matchers:
     Main.formatWallTime(1_756_742_400_000L) should fullyMatch regex
       """\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"""
 
+  //--- Help ------------------------------------------------------------------------------
+
+  test("every command's help names that command in its usage line"):
+    Main.Commands.foreach: c =>
+      val help = Main.helpRequest(Seq(c.name, "--help")).getOrElse(
+        fail(s"no help for command '${c.name}'"))
+      withClue(s"command '${c.name}':\n$help\n"):
+        help should include(s"Usage: aspen ${c.name}")
+        help should include(c.description)
+
+  test("a command's help describes only that command"):
+    // The point of the feature: "aspen show-pool --help" must not spill the other 27
+    // commands. Compared as whole lines rather than substrings, because a description is
+    // rendered on a line of its own and because both names and descriptions overlap as
+    // substrings -- "show-device" is a prefix of "show-device-set", and so is its
+    // description.
+    Main.Commands.foreach: c =>
+      val help = Main.helpRequest(Seq(c.name, "--help")).get
+      val lines = help.linesIterator.map(_.trim).toSet
+
+      withClue(s"'${c.name}' help:\n$help\n"):
+        lines should contain(c.description)
+        // "Commands:" heads the top-level listing; a command's own help must not carry one.
+        lines should not contain "Commands:"
+
+        Main.Commands.filter(_.name != c.name).foreach: other =>
+          withClue(s"leaked '${other.name}': "):
+            lines should not contain other.description
+
+  test("a command's help lists that command's own arguments and options"):
+    val help = Main.helpRequest(Seq("bootstrap", "--help")).get
+    help should include("<target-directory>")
+    help should include("<write-threshold>")
+    help should include("--data-port")
+    help should include("Port for client/store data traffic (default: 4750)")
+
+  test("command help is offered for an optional trailing argument"):
+    Main.helpRequest(Seq("create-pool", "--help")).get should include("<maximum-store-size>")
+
+  test("top-level help lists every command with its description"):
+    val help = Main.helpRequest(Seq("--help")).getOrElse(fail("no top-level help"))
+    Main.Commands.foreach: c =>
+      help should include(c.name)
+      help should include(c.description)
+
+  test("top-level help points at the per-command help"):
+    Main.helpRequest(Seq("--help")).get should include("aspen <command> --help")
+
+  test("top-level help omits the individual commands' arguments"):
+    // The reason the top level was compacted: it used to render every argument of every
+    // command inline, which ran to 148 lines.
+    val help = Main.helpRequest(Seq("--help")).get
+    help should not include "<target-directory>"
+    help should not include "--data-port"
+
+  test("an unrecognized command falls back to the top-level help"):
+    val help = Main.helpRequest(Seq("bogus", "--help")).getOrElse(fail("no fallback help"))
+    help should include("Run 'aspen <command> --help'")
+
+  test("--help after a command's arguments is still a help request"):
+    Main.helpRequest(Seq("show-pool", "mypool", "--help")).get should
+      include("Usage: aspen show-pool")
+
+  test("arguments without --help are not a help request"):
+    Main.helpRequest(Seq("create-pool")) shouldBe None
+    Main.helpRequest(Seq("show-pool", "mypool")) shouldBe None
+    Main.helpRequest(Seq.empty) shouldBe None
+
+  //--- Parser ----------------------------------------------------------------------------
+  //
+  // The parser is generated from Main.Commands, so these guard the generation: that each
+  // command still sets its own mode, that positional arguments still bind in declared
+  // order, and that the shared port options still reach the commands that take them.
+
+  test("command names are unique"):
+    // The table is keyed by name for both dispatch and help, so a duplicate would shadow.
+    val names = Main.Commands.map(_.name)
+    names.distinct.size shouldBe names.size
+
+  test("a command sets the mode its handler is dispatched on"):
+    withTempDir("parse-mode"): dir =>
+      val cfg = Files.createFile(dir.resolve("bootstrap.yaml")).toFile.getPath
+      Main.buildParser.parse(Seq("list-pools", cfg), Main.Args()).map(_.mode) shouldBe
+        Some("list-pools")
+      Main.buildParser.parse(Seq("show-pool", cfg, "mypool"), Main.Args()).map(_.mode) shouldBe
+        Some("show-pool")
+
+  test("positional arguments bind in their declared order"):
+    withTempDir("parse-order"): dir =>
+      val cfg = Files.createFile(dir.resolve("bootstrap.yaml")).toFile
+      val cfgs = cfg.getPath
+      val parsed = Main.buildParser.parse(
+        Seq("create-pool", cfgs, "mypool", "Replication", "3", "2", "2", "myset", "4096"),
+        Main.Args()).getOrElse(fail("create-pool did not parse"))
+
+      parsed.newPoolName shouldBe "mypool"
+      parsed.idaType shouldBe "replication"
+      parsed.width shouldBe 3
+      parsed.readThreshold shouldBe 2
+      parsed.writeThreshold shouldBe 2
+      parsed.deviceSetName shouldBe "myset"
+      parsed.maximumStoreSize shouldBe 4096L
+
+  test("the shared port options reach a command that takes them"):
+    withTempDir("parse-ports"): dir =>
+      val parsed = Main.buildParser.parse(
+        Seq("bootstrap", dir.resolve("target").toString, "10.0.0.1", "Replication", "2", "2", "3",
+            "--data-port", "5000", "--cnc-port", "5001", "--store-transfer-port", "5002"),
+        Main.Args()).getOrElse(fail("bootstrap did not parse"))
+
+      parsed.dataPort shouldBe 5000
+      parsed.cncPort shouldBe 5001
+      parsed.storeTransferPort shouldBe 5002
+
+  test("a command's validation still rejects a bad argument"):
+    withTempDir("parse-reject"): dir =>
+      val cfg = Files.createFile(dir.resolve("bootstrap.yaml")).toFile.getPath
+      // scopt reports the rejection on stderr; swallowed so a passing run stays quiet.
+      val sink = new java.io.ByteArrayOutputStream
+      val parsed = Console.withErr(sink):
+        Main.buildParser.parse(Seq("show-device", cfg, "not-a-uuid"), Main.Args())
+
+      parsed shouldBe None
+      sink.toString should include("Storage device id must be a valid UUID")
+

@@ -206,531 +206,545 @@ object Main {
     case _: TimeoutException         => "Error: operation timed out waiting for the storage system to respond"
     case e: IllegalArgumentException => s"Error: ${e.getMessage}"
 
-  def main(args: Array[String]): Unit = {
-    val parser = new scopt.OptionParser[Args]("aspen") {
-      head("aspen", "0.1")
-
-      // scopt's help option prints the usage text and terminates with status 0 from inside
-      // parse(), so it never reaches the drainAndShutdown() below. That is correct here:
-      // nothing has been started at parse time, so there is nothing to drain.
-      help("help").text("Prints this usage text")
-
-      val validPort = (p: Int) =>
-        if p >= 1 && p <= 65535 then success else failure(s"Port must be between 1 and 65535: $p")
-
-      // The listening ports of a host being created. Shared by every subcommand that creates
-      // one. This must be a def rather than a val: scopt records the owning command on each
-      // OptionDef, so every subcommand needs its own instances.
-      def portOptions: List[OptionDef[?, Args]] = List(
-        opt[Int]("data-port").valueName("<port>").
-          text(s"Port for client/store data traffic (default: $DefaultDataPort)").
-          validate(validPort).
-          action((x, c) => c.copy(dataPort = x)),
-
-        opt[Int]("cnc-port").valueName("<port>").
-          text(s"Port for command-and-control messages (default: $DefaultCnCPort)").
-          validate(validPort).
-          action((x, c) => c.copy(cncPort = x)),
-
-        opt[Int]("store-transfer-port").valueName("<port>").
-          text(s"Port for store transfers (default: $DefaultStoreTransferPort)").
-          validate(validPort).
-          action((x, c) => c.copy(storeTransferPort = x)),
-      )
-
-      cmd("bootstrap").text("Bootstrap a new Aspen system").
-        action( (_,c) => c.copy(mode="bootstrap")).
-        children(
-          // Unlike every other directory argument in this parser, the target is not required
-          // to exist: bootstrap creates it. Bootstrapping over an existing system is caught
-          // later by the bootstrap-host check in bootstrap() itself.
-          arg[File]("<target-directory>").text("Directory the bootstrap host and its stores are created under").
-            action((x, c) => c.copy(targetDirectory = x)).
-            validate { x =>
-              if !x.exists() || x.isDirectory then
-                success
-              else
-                failure(s"Not a directory: $x")
-            },
-
-          arg[String]("<address>").
-            text("IP address or DNS name other hosts use to reach this bootstrap host").
-            action((x, c) => c.copy(address = x)).
-            validate(x => validateHostAddress(x).fold(success)(failure)),
-
-          arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
-            action((x, c) => c.copy(idaType = x.toLowerCase())).
-            validate { x =>
-              val xl = x.toLowerCase
-              if xl == "replication" || xl == "reed-solomon" then
-                success
-              else
-                failure("IDA type must be Replication or Reed-Solomon")
-            },
-
-          arg[Int]("<read-threshold>").text("Minimum number of slices/replicas that must be read to reconstruct an object").
-            action((x, c) => c.copy(readThreshold = x)),
-
-          arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
-            action((x, c) => c.copy(writeThreshold = x)),
-
-          arg[Int]("<width>").text("Number of hosts holding slices/replicas").
-            action((x, c) => c.copy(width = x)),
-        ).
-        children(portOptions*)
-
-      // OBSOLETE: the "debug" command is defunct and needs rework before it can be
-      // re-enabled. run_debug_code is retained for reference but is not reachable.
-      //cmd("debug").text("Runs debugging code").
-      //  action((_, c) => c.copy(mode = "debug")).
-      //  children(
-      //    arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-      //      action((x, c) => c.copy(bootstrapConfigFile = x)).
-      //      validate(x => if (x.exists()) success else failure(s"Bootstrap Config file does not exist: $x"))
-      //  )
-
-      cmd("host").text("Starts an Aspen Storage Host").
-        action( (_,c) => c.copy(mode="host")).
-        children(
-          // No bootstrap config argument: the host reads it from its own directory so that
-          // MetadataManager can keep the file up to date as the bootstrap pool moves.
-          arg[File]("<host-directory>").text("Host Directory").
-            action( (x, c) => c.copy(hostDirectory=x)).
-            validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
-        )
-
-      cmd("amoebafs").text("Launches an AmoebaFS NFS server").
-        action( (_,c) => c.copy(mode="amoebafs")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action( (x, c) => c.copy(bootstrapConfigFile=x)).
-            validate( x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<filesystem-name>").text("Name of the filesystem to serve. It must already exist; create one with create-filesystem").
-            action( (x, c) => c.copy(fsName=x)).
-            validate( x => if (x.nonEmpty) success else failure("Filesystem name must not be empty"))
-        )
-
-      cmd("create-pool").text("Creates a new storage pool").
-        action((_, c) => c.copy(mode = "create-pool")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<pool-name>").text("Name of the new Pool").
-            action((x, c) => c.copy(newPoolName = x)),
-
-          arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
-            action((x, c) => c.copy(idaType = x.toLowerCase())).
-            validate { x =>
-              val xl = x.toLowerCase
-              if xl == "replication" || xl == "reed-solomon" then
-                success
-              else
-                failure("IDA type must be Replication or Reed-Solomon")
-            },
-
-          arg[Int]("<width>").text("Total number of slices/replicas").
-            action((x, c) => c.copy(width = x)),
-
-          arg[Int]("<read-threshold>").text("Minimum number of slices/replicas that must be read to reconstruct an object").
-            action((x, c) => c.copy(readThreshold = x)),
-
-          arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
-            action((x, c) => c.copy(writeThreshold = x)),
-
-          arg[String]("<device-set-name>").text("Name of the storage device set that will host the pool's stores").
-            action((x, c) => c.copy(deviceSetName = x)),
-
-          arg[Long]("<maximum-store-size>").optional().text("Maximum per-store size in bytes (0 = default/unbounded)").
-            action((x, c) => c.copy(maximumStoreSize = x)),
-        )
-
-      cmd("create-device-set").text("Creates a new storage device set").
-        action((_, c) => c.copy(mode = "create-device-set")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<name>").text("Name of the new storage device set").
-            action((x, c) => c.copy(newSetName = x)),
-
-          arg[Int]("<level>").text("Hierarchy level (0 = set of physical devices, 1+ = set of sets)").
-            action((x, c) => c.copy(newSetLevel = x)).
-            validate(x => if (x >= 0) success else failure("Level must be >= 0")),
-
-          arg[String]("[parent-set-name]").optional().text("Optional name of the parent device set to link into").
-            action((x, c) => c.copy(parentSetName = x)),
-        )
-
-      cmd("create-allocation-group").text("Creates a new allocation group").
-        action((_, c) => c.copy(mode = "create-allocation-group")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<name>").text("Name of the new allocation group").
-            action((x, c) => c.copy(newGroupName = x)),
-
-          arg[Int]("<level>").text("Hierarchy level (0 = group of pools, 1+ = group of groups)").
-            action((x, c) => c.copy(newGroupLevel = x)).
-            validate(x => if (x >= 0) success else failure("Level must be >= 0")),
-        )
-
-      cmd("create-filesystem").text("Creates a new AmoebaFS filesystem").
-        action((_, c) => c.copy(mode = "create-filesystem")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<filesystem-name>").text("Name of the new filesystem").
-            action((x, c) => c.copy(fsName = x)).
-            validate(x => if (x.nonEmpty) success else failure("Filesystem name must not be empty")),
-
-          arg[String]("<pool-name>").text("Name of the storage pool to allocate the filesystem in").
-            action((x, c) => c.copy(poolName = x)),
-        )
-
-      cmd("add-pool-to-group").text("Adds a storage pool to an allocation group").
-        action((_, c) => c.copy(mode = "add-pool-to-group")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<pool-name>").text("Name of the pool to add").
-            action((x, c) => c.copy(poolName = x)),
-
-          arg[String]("<group-name>").text("Name of the allocation group").
-            action((x, c) => c.copy(newGroupName = x)),
-        )
-
-      cmd("add-group-to-group").text("Nests one allocation group inside another").
-        action((_, c) => c.copy(mode = "add-group-to-group")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<source-group-name>").text("Name of the source (lower-level) allocation group").
-            action((x, c) => c.copy(srcGroupName = x)),
-
-          arg[String]("<destination-group-name>").text("Name of the destination allocation group (level must be strictly greater than the source)").
-            action((x, c) => c.copy(newGroupName = x)),
-        )
-
-      cmd("move-device-to-set").text("Moves a storage device into a different level-0 device set").
-        action((_, c) => c.copy(mode = "move-device-to-set")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<device-uuid>").text("UUID of the storage device to move").
-            action((x, c) => c.copy(deviceId = x)).
-            validate { x =>
-              try
-                UUID.fromString(x)
-                success
-              catch
-                case _: Throwable => failure("Storage device id must be a valid UUID")
-            },
-
-          arg[String]("<set-name-or-uuid>").text("Name or UUID of the target level-0 device set").
-            action((x, c) => c.copy(deviceSetName = x)),
-        )
-
-      cmd("fail-storage-device").text("Declares a storage device dead and rebuilds its stores elsewhere").
-        action((_, c) => c.copy(mode = "fail-storage-device")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<device-uuid>").text("UUID of the storage device to declare failed").
-            action((x, c) => c.copy(deviceId = x)).
-            validate { x =>
-              try
-                UUID.fromString(x)
-                success
-              catch
-                case _: Throwable => failure("Storage device id must be a valid UUID")
-            },
-        )
-
-      // A single trailing slash on <device-name> is tolerated and stripped: tab-completing
-      // inside storage-devices/ yields "dev0/". Shared by that argument's action and
-      // validate so the stored name cannot drift from the one that was validated.
-      val stripTrailingSlash = (s: String) => s.stripSuffix("/")
-
-      cmd("add-host").text("Registers a new host and initializes its root directory").
-        action((_, c) => c.copy(mode = "add-host")).
-        children(
-          // Copied from an existing host by the operator. add-host needs it to reach the
-          // running system, and leaves a copy in <host-directory> for the host command.
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          // Unlike the <host-directory> of host and create-storage-device, this one is not
-          // required to exist: add-host creates it. An already-initialized directory is
-          // caught by the host-config check in HostManager.createHost.
-          arg[File]("<host-directory>").text("Directory to initialize as the new host's root").
-            action((x, c) => c.copy(hostDirectory = x)).
-            validate { x =>
-              if !x.exists() || x.isDirectory then
-                success
-              else
-                failure(s"Not a directory: $x")
-            },
-
-          arg[String]("<hostname>").text("Name for the new host. Must not already be in use").
-            action((x, c) => c.copy(hostName = x)).
-            validate(x => if x.trim.nonEmpty then success else failure("Host name must not be empty")),
-
-          arg[String]("<address>").
-            text("IP address or DNS name other hosts use to reach this host").
-            action((x, c) => c.copy(address = x)).
-            validate(x => validateHostAddress(x).fold(success)(failure)),
-        ).
-        children(portOptions*)
-
-      cmd("create-storage-device").text("Registers a new storage device on a host").
-        action((_, c) => c.copy(mode = "create-storage-device")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[File]("<host-directory>").text("Host Directory").
-            action((x, c) => c.copy(hostDirectory = x)).
-            validate(x => if (x.exists()) success else failure(s"Host directory does not exist: $x")),
-
-          arg[String]("<device-name>").text(s"Name of the already-provisioned device directory under <host-directory>/${StorageDeviceManager.StorageDevicesDirName}").
-            action((x, c) => c.copy(deviceName = stripTrailingSlash(x))).
-            validate { x =>
-              val n = stripTrailingSlash(x)
-              if n.nonEmpty && !n.contains("/") && n != "." && n != ".." then success
-              else failure(s"Device name must be the bare name of a directory under <host-directory>/${StorageDeviceManager.StorageDevicesDirName}")
-            },
-
-          arg[String]("<set-name-or-uuid>").text("Name or UUID of the target level-0 device set").
-            action((x, c) => c.copy(deviceSetName = x)),
-        )
-
-      cmd("transfer-store").text("Transfers a store to a different storage device").
-        action((_, c) => c.copy(mode = "transfer-store")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<store-identifier>").text("Data Store Identifier. Format is \"pool-uuid:storeNumber\"").
-            action((x, c) => c.copy(storeName = x)).
-            validate { x =>
-              val arr = x.split(":")
-              if (arr.length == 2) {
-                try {
-                  UUID.fromString(arr(0))
-                  Integer.parseInt(arr(1))
-                  success
-                } catch {
-                  case _: Throwable => failure("Store name must match the format \"pool-uuid:storeNumber\"")
-                }
-              }
-              else failure("Store name must match the format \"pool-uuid:storeNumber\"")
-            },
-          arg[String]("<target-storage-device-id>").text("UUID of the storage device to receive the store").
-            action((x, c) => c.copy(host = x)).
-            validate { x =>
-              try
-                UUID.fromString(x)
-                success
-              catch
-                case _: Throwable => failure("Target storage device id must be a valid UUID")
-            },
-        )
-
-      cmd("rebalance").text("Rebalances a level-0 storage device set").
-        action((_, c) => c.copy(mode = "rebalance")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<storage-device-set-id>").text("UUID of the storage device set to rebalance").
-            action((x, c) => c.copy(setId = x)).
-            validate { x =>
-              try
-                UUID.fromString(x)
-                success
-              catch
-                case _: Throwable => failure("Storage device set id must be a valid UUID")
-            },
-        )
-
-      cmd("system-rebalance-period").text("Displays or sets the automatic rebalancing period").
-        action((_, c) => c.copy(mode = "system-rebalance-period")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<period>").optional().
-            text("Interval between automatic rebalance sweeps, or \"disabled\". " +
-                 "Omit to display the current period").
-            action((x, c) => c.copy(rebalancePeriod = Some(x))),
-
-          arg[String]("<unit>").optional().text("minutes, hours, or days").
-            action((x, c) => c.copy(rebalancePeriodUnit = Some(x))),
-        )
-
-      cmd("migrate-pool").text("Migrates a storage pool to a different storage device set").
-        action((_, c) => c.copy(mode = "migrate-pool")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<pool-name-or-uuid>").text("Name or UUID of the pool to migrate").
-            action((x, c) => c.copy(poolName = x)),
-
-          arg[String]("<set-name-or-uuid>").text("Name or UUID of the target device set").
-            action((x, c) => c.copy(deviceSetName = x)),
-        )
-
-      cmd("list-pools").text("Lists all storage pools").
-        action((_, c) => c.copy(mode = "list-pools")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-        )
-
-      cmd("list-hosts").text("Lists all hosts").
-        action((_, c) => c.copy(mode = "list-hosts")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-        )
-
-      cmd("list-allocation-groups").text("Lists all allocation groups").
-        action((_, c) => c.copy(mode = "list-allocation-groups")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-        )
-
-      cmd("list-device-sets").text("Lists all storage device sets").
-        action((_, c) => c.copy(mode = "list-device-sets")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-        )
-
-      cmd("list-filesystems").text("Lists all AmoebaFS filesystems").
-        action((_, c) => c.copy(mode = "list-filesystems")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-        )
-
-      cmd("list-devices").text("Lists all storage devices for a host").
-        action((_, c) => c.copy(mode = "list-devices")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<hostname>").text("Name of the host whose devices to list").
-            action((x, c) => c.copy(hostName = x)),
-        )
-
-      cmd("show-host").text("Displays the full state of a host").
-        action((_, c) => c.copy(mode = "show-host")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<name-or-uuid>").text("Host name or UUID").
-            action((x, c) => c.copy(entityRef = x)),
-        )
-
-      cmd("show-device").text("Displays the full state of a storage device").
-        action((_, c) => c.copy(mode = "show-device")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<uuid>").text("Storage device UUID").
-            action((x, c) => c.copy(entityRef = x)).
-            validate { x =>
-              try
-                UUID.fromString(x)
-                success
-              catch
-                case _: Throwable => failure("Storage device id must be a valid UUID")
-            },
-        )
-
-      cmd("show-pool").text("Displays the full state of a storage pool").
-        action((_, c) => c.copy(mode = "show-pool")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<name-or-uuid>").text("Pool name or UUID").
-            action((x, c) => c.copy(entityRef = x)),
-        )
-
-      cmd("show-device-set").text("Displays the full state of a storage device set").
-        action((_, c) => c.copy(mode = "show-device-set")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<name-or-uuid>").text("Device set name or UUID").
-            action((x, c) => c.copy(entityRef = x)),
-        )
-
-      cmd("show-allocation-group").text("Displays the full state of an allocation group").
-        action((_, c) => c.copy(mode = "show-allocation-group")).
-        children(
-          arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-            action((x, c) => c.copy(bootstrapConfigFile = x)).
-            validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x")),
-
-          arg[String]("<name-or-uuid>").text("Allocation group name or UUID").
-            action((x, c) => c.copy(entityRef = x)),
-        )
-
-      checkConfig { c =>
-        if c.mode == "" then
-          failure("Invalid command")
-        else if Set(c.dataPort, c.cncPort, c.storeTransferPort).size != 3 then
-          failure("data-port, cnc-port, and store-transfer-port must all be different")
-        else if c.mode == "system-rebalance-period" then
-          // Validated here rather than in the handler so a malformed period is a usage error,
-          // reported before any client or network is built.
-          parseRebalancePeriod(c.rebalancePeriod, c.rebalancePeriodUnit) match
-            case Left(msg) => failure(msg)
-            case Right(_) => success
-        else
-          success
-      }
+  val Version: String = "0.1"
+
+  /** The flag that asks for help. See helpRequest. */
+  private val HelpFlag = "--help"
+
+  private type ArgParser = scopt.OptionParser[Args]
+
+  /** One subcommand of the CLI.
+   *
+   *  Commands, below, is the single source of truth for the command set: buildParser
+   *  generates the parser's cmd() entries from it and helpRequest generates every line of
+   *  --help output from it. Neither the parser nor the help can list a command the other
+   *  does not, and a command cannot be added without a description.
+   *
+   *  `children` takes the parser to attach to rather than returning ready-made OptionDefs
+   *  because scopt records the owning parser on each one. buildParser and the throwaway
+   *  parser commandUsage renders from therefore each need their own instances -- the same
+   *  reason portOptions is a def.
+   */
+  case class Command(name: String,
+                     description: String,
+                     children: ArgParser => List[OptionDef[?, Args]])
+
+  // Every argument builder below is a def over the parser for the reason given above. Each
+  // opens with "import p.*" to bring scopt's arg/opt builders and its success/failure
+  // results into scope, which is what lets these read the same as they did when they were
+  // written inline in the parser body.
+
+  /** The bootstrap config file, named identically by every command that reaches a running
+   *  system. Only bootstrap and host do not: bootstrap has no system to reach yet, and host
+   *  reads the file from its own directory so MetadataManager can keep it up to date.
+   */
+  private def bootstrapConfigArg(p: ArgParser): OptionDef[File, Args] =
+    import p.*
+    arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
+      action((x, c) => c.copy(bootstrapConfigFile = x)).
+      validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x"))
+
+  /** The listening ports of a host being created. Shared by every subcommand that creates
+   *  one so the ports a host is given do not depend on which command created it.
+   */
+  private def portOptions(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+
+    val validPort = (n: Int) =>
+      if n >= 1 && n <= 65535 then success else failure(s"Port must be between 1 and 65535: $n")
+
+    List(
+      opt[Int]("data-port").valueName("<port>").
+        text(s"Port for client/store data traffic (default: $DefaultDataPort)").
+        validate(validPort).
+        action((x, c) => c.copy(dataPort = x)),
+
+      opt[Int]("cnc-port").valueName("<port>").
+        text(s"Port for command-and-control messages (default: $DefaultCnCPort)").
+        validate(validPort).
+        action((x, c) => c.copy(cncPort = x)),
+
+      opt[Int]("store-transfer-port").valueName("<port>").
+        text(s"Port for store transfers (default: $DefaultStoreTransferPort)").
+        validate(validPort).
+        action((x, c) => c.copy(storeTransferPort = x)),
+    )
+
+  /** Shared by the <ida-type> arguments of bootstrap and create-pool. */
+  private val validateIdaType: String => Either[String, Unit] = x =>
+    val xl = x.toLowerCase
+    if xl == "replication" || xl == "reed-solomon" then
+      Right(())
+    else
+      Left("IDA type must be Replication or Reed-Solomon")
+
+  /** Shared by every argument that names an entity by UUID. The message varies because the
+   *  entity does; what it rejects does not.
+   */
+  private def validateUUID(failureMessage: String): String => Either[String, Unit] = x =>
+    try
+      UUID.fromString(x)
+      Right(())
+    catch
+      case _: Throwable => Left(failureMessage)
+
+  // A single trailing slash on <device-name> is tolerated and stripped: tab-completing
+  // inside storage-devices/ yields "dev0/". Shared by that argument's action and validate
+  // so the stored name cannot drift from the one that was validated.
+  private val stripTrailingSlash = (s: String) => s.stripSuffix("/")
+
+  private def bootstrapArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      // Unlike every other directory argument in this parser, the target is not required
+      // to exist: bootstrap creates it. Bootstrapping over an existing system is caught
+      // later by the bootstrap-host check in bootstrap() itself.
+      arg[File]("<target-directory>").text("Directory the bootstrap host and its stores are created under").
+        action((x, c) => c.copy(targetDirectory = x)).
+        validate { x =>
+          if !x.exists() || x.isDirectory then
+            success
+          else
+            failure(s"Not a directory: $x")
+        },
+
+      arg[String]("<address>").
+        text("IP address or DNS name other hosts use to reach this bootstrap host").
+        action((x, c) => c.copy(address = x)).
+        validate(x => validateHostAddress(x).fold(success)(failure)),
+
+      arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
+        action((x, c) => c.copy(idaType = x.toLowerCase())).
+        validate(validateIdaType),
+
+      arg[Int]("<read-threshold>").text("Minimum number of slices/replicas that must be read to reconstruct an object").
+        action((x, c) => c.copy(readThreshold = x)),
+
+      arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
+        action((x, c) => c.copy(writeThreshold = x)),
+
+      arg[Int]("<width>").text("Number of hosts holding slices/replicas").
+        action((x, c) => c.copy(width = x)),
+    ) ::: portOptions(p)
+
+  private def hostArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      // No bootstrap config argument: the host reads it from its own directory so that
+      // MetadataManager can keep the file up to date as the bootstrap pool moves.
+      arg[File]("<host-directory>").text("Host Directory").
+        action( (x, c) => c.copy(hostDirectory=x)).
+        validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
+    )
+
+  private def amoebafsArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<filesystem-name>").text("Name of the filesystem to serve. It must already exist; create one with create-filesystem").
+        action( (x, c) => c.copy(fsName=x)).
+        validate( x => if (x.nonEmpty) success else failure("Filesystem name must not be empty"))
+    )
+
+  private def createPoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<pool-name>").text("Name of the new Pool").
+        action((x, c) => c.copy(newPoolName = x)),
+
+      arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
+        action((x, c) => c.copy(idaType = x.toLowerCase())).
+        validate(validateIdaType),
+
+      arg[Int]("<width>").text("Total number of slices/replicas").
+        action((x, c) => c.copy(width = x)),
+
+      arg[Int]("<read-threshold>").text("Minimum number of slices/replicas that must be read to reconstruct an object").
+        action((x, c) => c.copy(readThreshold = x)),
+
+      arg[Int]("<write-threshold>").text("Minimum number of slices/replicas that must be written to successfully write an object").
+        action((x, c) => c.copy(writeThreshold = x)),
+
+      arg[String]("<device-set-name>").text("Name of the storage device set that will host the pool's stores").
+        action((x, c) => c.copy(deviceSetName = x)),
+
+      arg[Long]("<maximum-store-size>").optional().text("Maximum per-store size in bytes (0 = default/unbounded)").
+        action((x, c) => c.copy(maximumStoreSize = x)),
+    )
+
+  private def createDeviceSetArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<name>").text("Name of the new storage device set").
+        action((x, c) => c.copy(newSetName = x)),
+
+      arg[Int]("<level>").text("Hierarchy level (0 = set of physical devices, 1+ = set of sets)").
+        action((x, c) => c.copy(newSetLevel = x)).
+        validate(x => if (x >= 0) success else failure("Level must be >= 0")),
+
+      arg[String]("[parent-set-name]").optional().text("Optional name of the parent device set to link into").
+        action((x, c) => c.copy(parentSetName = x)),
+    )
+
+  private def createAllocationGroupArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<name>").text("Name of the new allocation group").
+        action((x, c) => c.copy(newGroupName = x)),
+
+      arg[Int]("<level>").text("Hierarchy level (0 = group of pools, 1+ = group of groups)").
+        action((x, c) => c.copy(newGroupLevel = x)).
+        validate(x => if (x >= 0) success else failure("Level must be >= 0")),
+    )
+
+  private def createFilesystemArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<filesystem-name>").text("Name of the new filesystem").
+        action((x, c) => c.copy(fsName = x)).
+        validate(x => if (x.nonEmpty) success else failure("Filesystem name must not be empty")),
+
+      arg[String]("<pool-name>").text("Name of the storage pool to allocate the filesystem in").
+        action((x, c) => c.copy(poolName = x)),
+    )
+
+  private def addPoolToGroupArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<pool-name>").text("Name of the pool to add").
+        action((x, c) => c.copy(poolName = x)),
+
+      arg[String]("<group-name>").text("Name of the allocation group").
+        action((x, c) => c.copy(newGroupName = x)),
+    )
+
+  private def addGroupToGroupArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<source-group-name>").text("Name of the source (lower-level) allocation group").
+        action((x, c) => c.copy(srcGroupName = x)),
+
+      arg[String]("<destination-group-name>").text("Name of the destination allocation group (level must be strictly greater than the source)").
+        action((x, c) => c.copy(newGroupName = x)),
+    )
+
+  private def moveDeviceToSetArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<device-uuid>").text("UUID of the storage device to move").
+        action((x, c) => c.copy(deviceId = x)).
+        validate(validateUUID("Storage device id must be a valid UUID")),
+
+      arg[String]("<set-name-or-uuid>").text("Name or UUID of the target level-0 device set").
+        action((x, c) => c.copy(deviceSetName = x)),
+    )
+
+  private def failStorageDeviceArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<device-uuid>").text("UUID of the storage device to declare failed").
+        action((x, c) => c.copy(deviceId = x)).
+        validate(validateUUID("Storage device id must be a valid UUID")),
+    )
+
+  private def addHostArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      // Copied from an existing host by the operator. add-host needs it to reach the
+      // running system, and leaves a copy in <host-directory> for the host command.
+      bootstrapConfigArg(p),
+
+      // Unlike the <host-directory> of host and create-storage-device, this one is not
+      // required to exist: add-host creates it. An already-initialized directory is
+      // caught by the host-config check in HostManager.createHost.
+      arg[File]("<host-directory>").text("Directory to initialize as the new host's root").
+        action((x, c) => c.copy(hostDirectory = x)).
+        validate { x =>
+          if !x.exists() || x.isDirectory then
+            success
+          else
+            failure(s"Not a directory: $x")
+        },
+
+      arg[String]("<hostname>").text("Name for the new host. Must not already be in use").
+        action((x, c) => c.copy(hostName = x)).
+        validate(x => if x.trim.nonEmpty then success else failure("Host name must not be empty")),
+
+      arg[String]("<address>").
+        text("IP address or DNS name other hosts use to reach this host").
+        action((x, c) => c.copy(address = x)).
+        validate(x => validateHostAddress(x).fold(success)(failure)),
+    ) ::: portOptions(p)
+
+  private def createStorageDeviceArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[File]("<host-directory>").text("Host Directory").
+        action((x, c) => c.copy(hostDirectory = x)).
+        validate(x => if (x.exists()) success else failure(s"Host directory does not exist: $x")),
+
+      arg[String]("<device-name>").text(s"Name of the already-provisioned device directory under <host-directory>/${StorageDeviceManager.StorageDevicesDirName}").
+        action((x, c) => c.copy(deviceName = stripTrailingSlash(x))).
+        validate { x =>
+          val n = stripTrailingSlash(x)
+          if n.nonEmpty && !n.contains("/") && n != "." && n != ".." then success
+          else failure(s"Device name must be the bare name of a directory under <host-directory>/${StorageDeviceManager.StorageDevicesDirName}")
+        },
+
+      arg[String]("<set-name-or-uuid>").text("Name or UUID of the target level-0 device set").
+        action((x, c) => c.copy(deviceSetName = x)),
+    )
+
+  private def transferStoreArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<store-identifier>").text("Data Store Identifier. Format is \"pool-uuid:storeNumber\"").
+        action((x, c) => c.copy(storeName = x)).
+        validate { x =>
+          val arr = x.split(":")
+          if (arr.length == 2) {
+            try {
+              UUID.fromString(arr(0))
+              Integer.parseInt(arr(1))
+              success
+            } catch {
+              case _: Throwable => failure("Store name must match the format \"pool-uuid:storeNumber\"")
+            }
+          }
+          else failure("Store name must match the format \"pool-uuid:storeNumber\"")
+        },
+
+      arg[String]("<target-storage-device-id>").text("UUID of the storage device to receive the store").
+        action((x, c) => c.copy(host = x)).
+        validate(validateUUID("Target storage device id must be a valid UUID")),
+    )
+
+  private def rebalanceArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<storage-device-set-id>").text("UUID of the storage device set to rebalance").
+        action((x, c) => c.copy(setId = x)).
+        validate(validateUUID("Storage device set id must be a valid UUID")),
+    )
+
+  private def systemRebalancePeriodArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<period>").optional().
+        text("Interval between automatic rebalance sweeps, or \"disabled\". " +
+             "Omit to display the current period").
+        action((x, c) => c.copy(rebalancePeriod = Some(x))),
+
+      arg[String]("<unit>").optional().text("minutes, hours, or days").
+        action((x, c) => c.copy(rebalancePeriodUnit = Some(x))),
+    )
+
+  private def migratePoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<pool-name-or-uuid>").text("Name or UUID of the pool to migrate").
+        action((x, c) => c.copy(poolName = x)),
+
+      arg[String]("<set-name-or-uuid>").text("Name or UUID of the target device set").
+        action((x, c) => c.copy(deviceSetName = x)),
+    )
+
+  /** The list-* commands, which take nothing beyond the config file. */
+  private def configOnlyArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    List(bootstrapConfigArg(p))
+
+  private def listDevicesArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<hostname>").text("Name of the host whose devices to list").
+        action((x, c) => c.copy(hostName = x)),
+    )
+
+  /** The show-* commands other than show-device, which differ only in what they call the
+   *  entity they are given.
+   */
+  private def showArgs(entityName: String)(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<name-or-uuid>").text(entityName).
+        action((x, c) => c.copy(entityRef = x)),
+    )
+
+  private def showDeviceArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      bootstrapConfigArg(p),
+
+      arg[String]("<uuid>").text("Storage device UUID").
+        action((x, c) => c.copy(entityRef = x)).
+        validate(validateUUID("Storage device id must be a valid UUID")),
+    )
+
+  /** The full command set, in the order it is presented to the user.
+   *
+   *  Each command's handler is dispatched on a mode string equal to its name -- see the
+   *  match in main -- so buildParser derives the action rather than storing it here.
+   */
+  val Commands: List[Command] = List(
+    Command("bootstrap", "Bootstrap a new Aspen system", bootstrapArgs),
+
+    // OBSOLETE: the "debug" command is defunct and needs rework before it can be
+    // re-enabled. run_debug_code is retained for reference but is not reachable.
+    //Command("debug", "Runs debugging code", configOnlyArgs),
+
+    Command("host", "Starts an Aspen Storage Host", hostArgs),
+    Command("amoebafs", "Launches an AmoebaFS NFS server", amoebafsArgs),
+    Command("create-pool", "Creates a new storage pool", createPoolArgs),
+    Command("create-device-set", "Creates a new storage device set", createDeviceSetArgs),
+    Command("create-allocation-group", "Creates a new allocation group", createAllocationGroupArgs),
+    Command("create-filesystem", "Creates a new AmoebaFS filesystem", createFilesystemArgs),
+    Command("add-pool-to-group", "Adds a storage pool to an allocation group", addPoolToGroupArgs),
+    Command("add-group-to-group", "Nests one allocation group inside another", addGroupToGroupArgs),
+    Command("move-device-to-set", "Moves a storage device into a different level-0 device set", moveDeviceToSetArgs),
+    Command("fail-storage-device", "Declares a storage device dead and rebuilds its stores elsewhere", failStorageDeviceArgs),
+    Command("add-host", "Registers a new host and initializes its root directory", addHostArgs),
+    Command("create-storage-device", "Registers a new storage device on a host", createStorageDeviceArgs),
+    Command("transfer-store", "Transfers a store to a different storage device", transferStoreArgs),
+    Command("rebalance", "Rebalances a level-0 storage device set", rebalanceArgs),
+    Command("system-rebalance-period", "Displays or sets the automatic rebalancing period", systemRebalancePeriodArgs),
+    Command("migrate-pool", "Migrates a storage pool to a different storage device set", migratePoolArgs),
+    Command("list-pools", "Lists all storage pools", configOnlyArgs),
+    Command("list-hosts", "Lists all hosts", configOnlyArgs),
+    Command("list-allocation-groups", "Lists all allocation groups", configOnlyArgs),
+    Command("list-device-sets", "Lists all storage device sets", configOnlyArgs),
+    Command("list-filesystems", "Lists all AmoebaFS filesystems", configOnlyArgs),
+    Command("list-devices", "Lists all storage devices for a host", listDevicesArgs),
+    Command("show-host", "Displays the full state of a host", showArgs("Host name or UUID")),
+    Command("show-device", "Displays the full state of a storage device", showDeviceArgs),
+    Command("show-pool", "Displays the full state of a storage pool", showArgs("Pool name or UUID")),
+    Command("show-device-set", "Displays the full state of a storage device set", showArgs("Device set name or UUID")),
+    Command("show-allocation-group", "Displays the full state of an allocation group", showArgs("Allocation group name or UUID")),
+  )
+
+  private[cmdline] def buildParser: ArgParser = new scopt.OptionParser[Args]("aspen") {
+    head("aspen", Version)
+
+    // Never fires: helpRequest intercepts --help before parse() is called, because scopt's
+    // help option can only print the whole usage text -- its action is fixed to the full
+    // render no matter where the option is declared. It is declared anyway because scopt
+    // only ends a parse error with "Try --help for more information." when a help option
+    // exists. Drop it and every usage error dumps the usage text instead.
+    help("help").text("Prints this usage text")
+
+    Commands.foreach: command =>
+      cmd(command.name).text(command.description).
+        action((_, c) => c.copy(mode = command.name)).
+        children(command.children(this)*)
+
+    checkConfig { c =>
+      if c.mode == "" then
+        failure("Invalid command")
+      else if Set(c.dataPort, c.cncPort, c.storeTransferPort).size != 3 then
+        failure("data-port, cnc-port, and store-transfer-port must all be different")
+      else if c.mode == "system-rebalance-period" then
+        // Validated here rather than in the handler so a malformed period is a usage error,
+        // reported before any client or network is built.
+        parseRebalancePeriod(c.rebalancePeriod, c.rebalancePeriodUnit) match
+          case Left(msg) => failure(msg)
+          case Right(_) => success
+      else
+        success
     }
+  }
+
+  /** Renders the help for a single command.
+   *
+   *  The command's arguments are handed to a throwaway parser holding nothing else, so scopt
+   *  renders them as that parser's own top-level arguments: the two-column layout the CLI
+   *  has always produced, minus the other twenty-seven commands. Reusing scopt's renderer
+   *  rather than formatting here is what keeps this identical in style to the usage text
+   *  scopt still prints of its own accord.
+   */
+  private[cmdline] def commandUsage(command: Command): String =
+    val p = new scopt.OptionParser[Args](s"aspen ${command.name}") {
+      head("aspen", Version)
+      // The trailing newline separates the description from the argument list below it.
+      note(command.description + "\n")
+      command.children(this)
+      help("help").text("Prints this usage text")
+    }
+    p.usage
+
+  /** Renders the command list shown for a bare --help.
+   *
+   *  Deliberately not scopt's rendering, which expands every command's arguments inline and
+   *  runs to well over a hundred lines. The details now have somewhere better to live.
+   */
+  private[cmdline] def topLevelHelp: String =
+    val column = (HelpFlag.length :: Commands.map(_.name.length)).max + 2
+    def row(left: String, right: String): String = s"  ${left.padTo(column, ' ')}$right"
+
+    (s"aspen $Version" ::
+     "Usage: aspen <command> [options] <args>..." ::
+     "" ::
+     row(HelpFlag, "Prints this usage text") ::
+     "" ::
+     "Commands:" ::
+     Commands.map(c => row(c.name, c.description)) :::
+     "" ::
+     s"Run 'aspen <command> $HelpFlag' for command-specific help." :: Nil).mkString("\n")
+
+  /** The help text `args` asks for, or None if they are not a help request.
+   *
+   *  Handled here rather than in the parser because scopt's help option cannot be made
+   *  command-specific: see the comment on the one buildParser declares.
+   *
+   *  Only the leading token selects a command, so "aspen show-pool --help" is show-pool's
+   *  help however many arguments follow. Everything else falls back to the command list,
+   *  which is the useful answer both to a bare --help and to a name that is not a command.
+   */
+  private[cmdline] def helpRequest(args: Seq[String]): Option[String] =
+    if !args.contains(HelpFlag) then
+      None
+    else
+      Some(args.headOption.flatMap(name => Commands.find(_.name == name)) match
+        case Some(command) => commandUsage(command)
+        case None => topLevelHelp)
+
+  def main(args: Array[String]): Unit = {
+    // Before the parser, and before anything is started: a help request builds no client and
+    // no network, so there is nothing for drainAndShutdown() to do on the way out.
+    helpRequest(args.toSeq).foreach: text =>
+      println(text)
+      System.exit(0)
+
+    val parser = buildParser
 
     val exitCode = parser.parse(args, Args()) match
       case Some(cfg) =>

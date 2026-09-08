@@ -20,8 +20,8 @@ you use composition.
 In the first case, you build a custom-purpose distributed system from the ground up that solves all
 the hard distributed data problems like replication/erasure-coding, consensus, transactions, 
 version management, drive failure recovery. etc. The advantage is that you get a system ideally 
-suited to your use case and that gives you the best possible performance but at an enormous up 
-front cost.
+suited to your use case and that gives you the best possible performance but the up front cost is
+enormous.
 
 The alternative is composition where you build your system on top of an aggregation of existing 
 systems. Say CockroachDB for the database, S3 for bulk data, Kafka for event streaming, and Redis
@@ -39,10 +39,10 @@ different from one another, in order to plan, operate, and maintain each system 
 as well as your application as a whole.  
 
 Aspen aims to provide a third option for distributed systems architects. One that provides many 
-of the benefits of the ground-up approach while simultaneously reducing some of the need for
-composition. To do this, Aspen focuses on solving the distributed data management problem in a
-general-purpose manner that emphasizes flexibility in terms of architectural design and runtime
-operation. 
+of the benefits of the ground-up approach while simultaneously reducing some of the burden inherent
+to composition. To do this, Aspen focuses on solving the distributed data management problem in a
+nwe, general-purpose manner that emphasizes flexibility in terms of architectural design and 
+runtime operation. 
 
 ## What it is
 
@@ -56,31 +56,31 @@ Like all systems, the design choices underpinning Aspen make it better suited to
 than others. Rather than try to optimize for ideal performance in a narrow range of use cases, 
 Aspen instead aims to provide "good" performance across a wide range of application domains. The
 primary goal of Aspen is to provide distributed system architects with a new set of tools with
-which to address problems. So, hopefully, we'll see it put to use to tackle challenges that are
-difficult to overcome with traditional systems. 
+which to address problems.
 
-In addition to going off in new directions, Aspen can also be used to build the kinds of systems
-we already use today. You can use it to build a traditional database, S3 storage system, 
-distributed file system, message broker, event sourcing application, etc. Due to Aspen being
-designed for general-purpose use rather than tailored for optimal performance in a specific domain,
-these kinds of systems built on top of Aspen probably won't be quite as good as their traditional
-counterparts. The obvious question of "then why bother?" arises and the answer is threefold.
+In addition to opening the door for system designers to go off in new directions, Aspen can also 
+be used to build the kinds of systems we already use today. You can use it to build a traditional
+database, S3 storage system, distributed file system, message broker, event sourcing application, 
+etc. Due to Aspen being designed for general-purpose use rather than tailored for optimal 
+performance in a specific domain, these kinds of systems built on top of Aspen probably won't be
+quite as performant as their traditional counterparts. The obvious question of "then why bother?" 
+arises and the answer is threefold.
 
-One: Not every deployment needs maximum performance. In fact, the vast majority don't and
+First: Not every deployment needs maximum performance. In fact, the vast majority do not and
 "good enough" is usually just that.
 
-Two: Operational simplicity. All applications built on top of Aspen share the same underlying
+Second: Operational simplicity. All applications built on top of Aspen share the same underlying
 operational model. There would be little difference between deploying and maintaining a 
 distributed file system built on Aspen than there would be an event sourcing system or database.
 
-Three: (The main one) Systems built on top of Aspen are much more easily integrated as they
+Third: (The main one) Systems built on top of Aspen are much more easily integrated as they
 share the same operational, data, and transaction models. If you need an all-or-nothing atomic
 operation that updates a database entry, deletes an file in a distributed file system, and adds
 an event to a stream... you can do that. And you can do it naturally, no complex shenanigans
 required.
 
 In short, Aspen aims to fill a role in the distributed data world similar to the role scripting
-languages serve in software development. They can be used to quickly and effectively tackle
+languages serve in software development. Scripts can be used to quickly and effectively tackle
 many problems that would be difficult to solve with a lower level language. There's a reason
 there aren't any C/C++ web content platforms competing with Django. Aspen is aiming at a
 similar niche with distributed data arena.
@@ -133,95 +133,41 @@ tasks that provide exactly-once guarantees. To do this, we use a UUID that defin
 task type and a state object that contains the crash-proof state needed to carry out
 the task. Each time a step in the task is completed, the state is updated to point to
 the next step in the process. Should the host running the durable task crash, another
-host can resume the task by using the UUID and state object. The resumed task will simply
-pick up where the crash happend and restart te last operation. When an exactly-once 
-operation is needed, add the objects being modified to the transaction that updates 
-the task state to the next step. Aspen is largely a self-hosting system and makes use
-of this strategy to implement many of its internal features.
+host can resume the task by using the UUID and state object. The resumed task will 
+simply pick up where the crash happend and restart te last operation. When an 
+exactly-once operation is needed, add the objects being modified to the transaction
+that updates the task state to the next step. It's as simple as that. Aspen is a 
+self-hosting system and makes use of this strategy to implement many of its internal
+features.
 
-
-
-
-
-## What it is
-For the last few decades there have been two general solutions for managing distributed
-data at scale, consistent hashing and sharding. Aspen breaks the status quo by
-offering a third approach which is based on explicit data pointers. It requires a little 
-more overhead in the data lookup process but offers an order of magnitude more flexibility
-for both distributed application design and run time operation.
-
-The goal of the Aspen project is to create a general-purpose platform for
-building higher-level distributed applications like object stores, distributed file 
-systems, distributed indices, databases, and other solutions, particularly those that are
-not well suited to current distributed system architectures. It is not designed to "do the
-same thing only better" or to replace any existing systems. Rather, the intent is to take a
-completely different approach to the distributed data management problem and provide
-developers with a new set of tools for taking distributed system designs in directions that
-were not previously possible.
-
-In short: it's the storage substrate for distributed systems — you build distributed data 
-structures out of transactionally-updated, location-encoded objects, and Aspen handles consensus,
-dispersal, durability, and crash recovery underneath.
-
-## Why Aspen?
-Aspen emphasizes flexibility for both application design and run time operation. It provides
-distributed system designers with a completely different set of capabilities for building
-solutions that simply aren't possible with the consistent hashing or sharding models. It's 
-also designed to be a common component shared across a wide variety of applications. This 
-is to spread out the maintenance burden and allow enhancements made in support of one 
-application to benefit a community of others.
-
-## How is it different?
-As mentioned before, the key difference in Aspen, as compared to other distributed data 
-architectures, is that it uses a model based on explicit object pointers for locating data
-in the system rather than the conventional consistent hashing or sharding approaches. The
-cost is a little more overhead in the data lookup process and bookkeeping but the benefit
-is unparalleled flexibility in data configuration and placement options that may be
-leveraged during application design. It also provides run time benefits for on-the-fly 
-tuning of operational factors such as availability, reliability, latency, and cost, to 
-name a few.
-
-At its core, Aspen is an object store. At least insofar as all data managed by the system
-is stored as discreet "objects" which are relatively small, typically on the order of
-kilobytes to tens of megabytes. The following list outlines some of the characteristics of
-the system. While most of these aspects are not unique to Aspen, the combination of them
-results in an architecture significantly different from current mainstream distributed 
-system designs.
-
-- **Object allocation results in an Object Pointer** - These are relatively small,
-typically 50 - 100 bytes in size and may be stored in other objects to form distributed
-data structures like linked-lists, B-trees, graphs, etc.
-- **The choice between replication or erasure coding and their factor is made at the
-time of allocation** - This allows applications to mix-and-match various replication and
-erasure coding schemes to best suit their needs.
-- **All object updates are made via transactions** - Transactions may simultaneously
-update single or multiple objects with Atomic, Consistent, and Durable guarantees.
-- **Transactions require only one round trip in the contention and error free case**
-- **Transactions may specify required post-commit actions** - These idempotent actions
-are guaranteed to be completed after a transaction successfully commits and are useful
-for short-duration cleanup and maintenance activities.
-- **Provides a tasking model for durable, long-running operations** - Tasks leverage Aspen
-objects to store task state and multi-object transactions to ensure the successful
-completion of multi-phase, long-running tasks in the presence of node failure and system 
-crashes, e.g, deleting a tree structure comprised of millions of individual objects.
-- **Designed to take advantage of heterogeneous storage media** - Data stores may be placed
-on storage media to optimize their intended use case. For example, the upper tiers of a
-B-tree could be backed by NVME media for fast lookups while the bottom tier could be backed
-by spinning disks to store bulk data.
-- **Data stores and, consequently, their stored objects may be freely migrated between hosts
-and backing media on-the-fly** - Data stores are logical entities that may be freely moved
-about to satisfy changing needs of the operational environment.
-
+## More information
 A full description of how Aspen works and its design tradeoffs may be found in the 
 Architecture section of the [Project Homepage](https://aspen-ddp.org)
 
 # AmoebaFS
-AmoebaFS is included with Aspen as a proof-of-concept application that demonstrates most
-of Aspen's unique features. It leverage's dcache's Java NFS server library to export a
-file system built on top of Aspen and currently supports most of the basic file system
-operations. It's very much alpha quality at the moment but it does a decent job of
-showcasing what Aspen is capable of and could eventually morph into something useful,
-should others find it interesting enough to chip in on its development.
+
+AmoebaFS is a distributed file system built on top of Aspen and is currently being
+co-developed with it. AmoebaFS was created for a couple of reasons.
+
+1. It provides a real-world use case for Aspen to help uncover and fix weaknesses in
+   Aspen's design and implementation.
+2. It's a strong use-case for Aspen's architecture. 
+3. There are a ton of useful features that could be added to AmoebaFS.
+
+Currently, just the basics are implemented but future features could include things
+like:
+* Copy-On-Write files or entire file-system
+* Snapshots
+* Deduplication
+* Compression
+* Per-directory geo-location settings
+* Background transfers of file content between media types (NVMe, HDD, Tape)
+* Directing all writes to NVMe media with background transfer to HDD
+* You name it
+
+The file system is exposed to the outside world through dcache's Java NFS server 
+library and, unlike traditional NFS servers, multiple server instances can be run
+concurrently that export the same underlying file system.
 
 More information about the potential design and use cases for AmoebaFS may be found in
 its section of the [Project Homepage](https://aspen-ddp.org)

@@ -14,9 +14,9 @@
 ## Motivation
 
 Aspen solves a problem you probably didn't realize we have and that's the lack of a
-general-purpose data management platform for building distributed systems. To date, if you want
-to build a distributed system, you essentially have two choices. You either start from scratch or
-you use composition. 
+general-purpose distributed data platform for building various kinds of distributed systems. 
+To date, if you want to build a distributed system, you essentially have two choices. You either
+start from scratch or you use composition. 
 
 In the first case, you build a custom-purpose distributed system from the ground up that solves all
 the hard distributed data problems like replication/erasure-coding, consensus, transactions, 

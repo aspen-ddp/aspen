@@ -1,7 +1,7 @@
 # Aspen
 [Project Homepage](https://aspen-ddp.org)
 
-## TL;DR:
+## TL;DR
 
 * Aspen is a general-purpose platform for building various distributed systems
 * Takes a new approach to organizing and managing data at scale

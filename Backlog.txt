@@ -41,6 +41,10 @@ TransferStore - Needs redesign
 May need to add an abortStoreTransfer method
   - to get unstuck if destination drive is full
 
+DurableService polling time needs to scale with cluster size
+  - Current impl will place heavy read burden on Radicle & service tree when
+    there are a large number of hosts
+
 Need a gossip protocol for spreading the word about cache invalidation for
   1. Host changed it's address/port
   2. StoreId has been migrated to a new hostState

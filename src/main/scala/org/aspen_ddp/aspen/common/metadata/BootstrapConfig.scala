@@ -112,7 +112,7 @@ object BootstrapConfig:
 
   object Config extends YObject[Config]:
     val aspenSystemId: Required[UUID]        = Required("aspen-system-id", YUUID)
-    val bootstrapIDA: Required[IDA]          = Required("bootstrap-ida",   Choice("type", Map("replication" -> ReplicationFormat)))
+    val bootstrapIDA: Required[IDA]          = Required("bootstrap-ida",   Choice("type", IDAOptions))
     val hosts: Required[List[BootstrapHost]] = Required("bootstrap-hosts", YList(BootstrapHost))
 
     val attrs: List[Attr] = aspenSystemId :: bootstrapIDA :: hosts :: Nil

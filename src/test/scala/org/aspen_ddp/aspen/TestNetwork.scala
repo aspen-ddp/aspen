@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, ReadResponse, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
@@ -90,20 +90,26 @@ object TestNetwork {
 
 
 class TestNetwork(executionContext: ExecutionContext,
-                  userTypeFactories: List[RegisteredTypeFactory] = Nil) extends ServerMessenger {
+                  userTypeFactories: List[RegisteredTypeFactory] = Nil,
+                  val ida: IDA = Replication(3, 2)) extends ServerMessenger {
   import TestNetwork._
 
   val objectCacheFactory: () => SimpleLRUObjectCache = () => new SimpleLRUObjectCache(1000)
 
-  val storeId0 = StoreId(Radicle.poolId, 0)
-  val storeId1 = StoreId(Radicle.poolId, 1)
-  val storeId2 = StoreId(Radicle.poolId, 2)
+  /** One store per IDA element. Bootstrap.initialize requires width == stores.length, which
+   *  deriving the list from the width satisfies by construction. */
+  val stores: List[MapBackend] =
+    (0 until ida.width).toList.map(i => new MapBackend(StoreId(Radicle.poolId, i.toByte)))
 
-  val store0 = new MapBackend(storeId0)
-  val store1 = new MapBackend(storeId1)
-  val store2 = new MapBackend(storeId2)
+  // Retained for the suites that reach for individual stores by name. Every IDA used with this
+  // harness is at least three wide.
+  val store0 = stores(0)
+  val store1 = stores(1)
+  val store2 = stores(2)
 
-  val ida = Replication(3, 2)
+  val storeId0 = store0.storeId
+  val storeId1 = store1.storeId
+  val storeId2 = store2.storeId
 
   val storageDeviceId = StorageDeviceId.BootstrapStorageDeviceId
 
@@ -115,11 +121,7 @@ class TestNetwork(executionContext: ExecutionContext,
     bootstrapHost.hostId,
     0L,
     0L,
-    Map(
-      store0.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
-      store1.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
-      store2.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
-    ),
+    stores.map(s => s.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)).toMap,
     StorageDeviceSetId.BootstrapStorageDeviceSetId
   )
 
@@ -128,7 +130,7 @@ class TestNetwork(executionContext: ExecutionContext,
     ida,
     bootstrapHost,
     bootstrapSD,
-    List(store0, store1, store2))
+    stores)
 
   // All transactions will miss the third store. Don't wait long before updating the
   // error tree
@@ -183,9 +185,7 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(5, SECONDS),
     Duration(60, SECONDS))
 
-  smgr.loadStore(storageDeviceId, store0)
-  smgr.loadStore(storageDeviceId, store1)
-  smgr.loadStore(storageDeviceId, store2)
+  stores.foreach(s => smgr.loadStore(storageDeviceId, s))
 
   // ---- Rebalancing test helpers -------------------------------------------------
 
@@ -309,10 +309,39 @@ class TestNetwork(executionContext: ExecutionContext,
   // process load store events
   smgr.testingOnlyHandleEvents()
 
-  override def sendClientResponse(msg: ClientResponse): Unit = {
-    handleEvents()
-    client.receiveClientResponse(msg)
-    handleEvents()
+  // ---- Degraded-read helpers ----------------------------------------------------
+
+  /** Stores whose ReadResponses are dropped on the floor, simulating unavailability at the
+   *  network layer. Transaction traffic is deliberately left alone, so a silenced store still
+   *  participates in commits -- this exists to exercise reads that must be restored from fewer
+   *  than `width` slices, not to model a genuinely dead store.
+   *
+   *  Dropping responses rather than deleting objects out of the MapBackends is what makes this
+   *  work at all: Frontend.readObjectForNetwork consults the store's SimpleLRUObjectCache before
+   *  the backend, so a deleted object would keep being served from cache.
+   */
+  @volatile var readSilencedStores: Set[StoreId] = Set()
+
+  /** Runs `f` with the given stores' ReadResponses suppressed, restoring the previous set
+   *  whether `f` succeeds or fails. */
+  def withReadSilenced[T](silenced: Set[StoreId])(f: => Future[T]): Future[T] =
+    given ExecutionContext = executionContext
+    val previous = readSilencedStores
+    readSilencedStores = silenced
+    f.transform: result =>
+      readSilencedStores = previous
+      result
+
+  // -------------------------------------------------------------------------------
+
+  override def sendClientResponse(msg: ClientResponse): Unit = msg match {
+    case rr: ReadResponse if readSilencedStores.contains(rr.fromStore) =>
+      handleEvents()
+
+    case _ =>
+      handleEvents()
+      client.receiveClientResponse(msg)
+      handleEvents()
   }
 
   override def sendTransactionMessage(msg: TxMessage): Unit = {

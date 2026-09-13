@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen
 
 import org.aspen_ddp.aspen.client.{AspenClient, RegisteredTypeFactory}
+import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
 import org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer
 import org.scalatest.{FutureOutcome, Tag, compatible}
 import org.scalatest.funsuite.AsyncFunSuite
@@ -18,6 +19,10 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   /** Override to supply additional type factories to the TestNetwork's TypeRegistry. */
   def userTypeFactories: List[RegisteredTypeFactory] = Nil
 
+  /** Override to bootstrap the test network with a different IDA. The store count follows the
+    * width, so no other change is needed to run a suite against a wider pool. */
+  def testIda: IDA = Replication(3, 2)
+
   def subFixtureSetup(): Unit = {}
   def subFixtureTeardown(): Unit = ()
 
@@ -29,7 +34,7 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   }
 
   override def withFixture(test: NoArgAsyncTest): FutureOutcome = {
-    net = new TestNetwork(executionContext, userTypeFactories)
+    net = new TestNetwork(executionContext, userTypeFactories, testIda)
     client = net.client
     testName = test.name
     radicle = net.radicle

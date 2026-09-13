@@ -3,116 +3,45 @@ package org.aspen_ddp.aspen.server.store.cache
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.server.store.ObjectState
 
-import scala.collection.immutable.HashMap
+/** Fixed-capacity object cache with LRU eviction.
+  *
+  * Objects currently locked to a transaction are never evicted; eviction walks
+  * from the least-recently-used end until it finds an unlocked entry. If every
+  * entry is locked, the cache grows beyond maxEntries rather than dropping state
+  * that a transaction still needs.
+  */
+class SimpleLRUObjectCache(val maxEntries: Int) extends ObjectCache:
 
-object SimpleLRUObjectCache {
-  class Entry(initialState: ObjectState) {
-    var next: Int = 0
-    var prev: Int = 0
-    var state: ObjectState = initialState
-  }
-}
+  require(maxEntries > 0)
 
-class SimpleLRUObjectCache(val maxEntries: Int) extends ObjectCache {
-  import SimpleLRUObjectCache._
+  // Access-ordered: iteration runs least-recently-used first, and get()/put()
+  // move the touched entry to the most-recently-used end.
+  private val entries = new java.util.LinkedHashMap[ObjectId, ObjectState](16, 0.75f, true)
 
-  var leastRecentlyUsed: Int = 0
-  var mostRecentlyUsed: Int = 0
-  var entries: Vector[Entry] = Vector()
-  var map: HashMap[ObjectId, Int] = new HashMap
+  def clear(): Unit = synchronized:
+    entries.clear()
 
-  def clear(): Unit = {
-    entries = Vector()
-    map = map.empty
-    leastRecentlyUsed = 0
-    mostRecentlyUsed = 0
-  }
+  def remove(objectId: ObjectId): Unit = synchronized:
+    entries.remove(objectId)
 
-  def remove(objectId: ObjectId): Unit = {
-    // Just remove the entry from the lookup index. To keep ownership simple,
-    // we'll leave it in the LRU chain and let it fall off the end naturally
-    // since it can no longer be accessed.
-    map -= objectId
-  }
+  def get(objectId: ObjectId): Option[ObjectState] = synchronized:
+    Option(entries.get(objectId))
 
-  def get(objectId: ObjectId): Option[ObjectState] = {
-    if (entries.isEmpty)
+  def insert(state: ObjectState): Option[ObjectState] = synchronized:
+    entries.put(state.objectId, state)
+
+    if entries.size <= maxEntries then
       None
-    else {
-      map.get(objectId) match {
-        case None => None
-        case Some(idx) =>
-          if (idx == leastRecentlyUsed) {
-            val newLru = entries(leastRecentlyUsed).next
-            entries(newLru).prev = newLru
-            leastRecentlyUsed = newLru
-          }
+    else
+      // Evict the least-recently-used entry that isn't pinned by a transaction
+      val iter = entries.entrySet.iterator
+      var evicted: Option[ObjectState] = None
 
-          if (idx != mostRecentlyUsed) {
-            val mru = entries(mostRecentlyUsed)
-            mru.next = idx
+      while evicted.isEmpty && iter.hasNext do
+        val e = iter.next()
+        if e.getKey != state.objectId && e.getValue.transactionReferences == 0 then
+          val victim = e.getValue
+          iter.remove()
+          evicted = Some(victim)
 
-            val prev = entries(idx).prev
-            entries(prev).next = entries(idx).next
-
-            val next = entries(idx).next
-            entries(next).prev = entries(idx).prev
-
-            entries(idx).prev = mostRecentlyUsed
-            entries(idx).next = idx
-          }
-
-          Some(entries(idx).state)
-      }
-    }
-  }
-
-  def insert(state: ObjectState): Option[ObjectState] = {
-    if (entries.isEmpty) {
-      leastRecentlyUsed = 0
-      mostRecentlyUsed = 0
-      map += (state.objectId -> 0)
-      val e = new Entry(state)
-      entries = entries.:+(e)
-      None
-    }
-    else if (entries.size < maxEntries) {
-      val idx = entries.size
-      entries(mostRecentlyUsed).next = idx
-      map += (state.objectId -> idx)
-      val e = new Entry(state)
-      e.prev = mostRecentlyUsed
-      e.next = idx
-      entries = entries.:+(e)
-      mostRecentlyUsed = idx
-      None
-    }
-    else {
-      // Index is full, need to pop an entry. However, we cannot pop objects locked
-      // to transactions. So we'll use get() on them to put those at the head of
-      // the list until a non-locked object occurs
-      while (entries(leastRecentlyUsed).state.transactionReferences != 0) {
-        get(entries(leastRecentlyUsed).state.objectId)
-      }
-
-      val lruObjectId = entries(leastRecentlyUsed).state.objectId
-      val newLru = entries(leastRecentlyUsed).next
-      val newMru = entries(newLru).prev
-      entries(newLru).prev = newLru
-
-      map -= lruObjectId
-      map += (state.objectId -> newMru)
-
-      val removedState = entries(leastRecentlyUsed).state
-
-      entries(leastRecentlyUsed).prev = mostRecentlyUsed
-      entries(leastRecentlyUsed).next = leastRecentlyUsed
-      entries(leastRecentlyUsed).state = state
-
-      mostRecentlyUsed = leastRecentlyUsed
-      leastRecentlyUsed = newLru
-
-      Some(removedState)
-    }
-  }
-}
+      evicted

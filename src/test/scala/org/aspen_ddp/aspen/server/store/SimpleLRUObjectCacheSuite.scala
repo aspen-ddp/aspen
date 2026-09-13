@@ -93,7 +93,8 @@ class SimpleLRUObjectCacheSuite extends AnyFunSuite with Matchers {
     assert(c.insert(o3).isEmpty)
     assert(c.get(o2.objectId).contains(o2))
 
-    assert(c.insert(o4).contains(o3))
+    // Access order is o1, o3, o2 (oldest first) so o1 is the eviction target
+    assert(c.insert(o4).contains(o1))
   }
 
   test("Skip locked transactions") {

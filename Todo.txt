@@ -1,0 +1,36 @@
+SimpleFileRootManager.getRData decodes the inode outside the try block
+  - SimpleFileRootManager.scala:35 calls FileInode(client, inodeDos.data) before
+    the try on line 37
+  - A decode failure therefore escapes into the executor uncaught AND leaves the
+    promise p uncompleted, so the caller's Future hangs forever
+  - This is how the LRU cache corruption bug presented: a bare traceback in the
+    NFS server log plus a permanently stalled copy
+  - Move the decode inside the try so the failure reaches p.failure()
+
+BufferedConsistentRocksDB.get bypasses the pending WriteBatch
+  - A read issued between put() and the batch write returns the previous value
+  - Combined with object cache eviction this yields stale reads
+  - Reads should consult nextBatch before falling through to db.get
+
+BufferedConsistentRocksDB deadlocks if db.write throws
+  - commit() never reaches promise.success(()) and commitInProgress stays true
+  - All subsequent writes then hang forever with no error reported
+  - Needs try/finally around the write plus failure propagation to the promise
+
+Transaction requirement check/apply swallow unexpected errors to println
+  - RequirementsChecker.scala:67 and RequirementsApplyer.scala:87-89
+  - "UNEXPECTED ERROR IN TX REQ CHECK: $e" / "... IN TX Apply: $e" then continue
+  - Corrupt-state bugs stay silent; these need real logging at minimum, and
+    probably should fail the transaction rather than proceeding
+
+DataUpdateOperation.Append is silently incorrect under Reed-Solomon
+  - Remove support for Append operations entirely
+
+DataBuffer mixes relative and absolute ByteBuffer indexing
+  - size is relative (buf.limit() - buf.position()) but get/getInt/getLong take
+    absolute byte offsets
+  - Latent source of off-by-position bugs for any buffer with a non-zero position
+
+DataBuffer.getDirectByteArray always copies
+  - buf is always read-only (see the given Conversions) so hasArray() is never
+    true and the zero-copy path is dead code

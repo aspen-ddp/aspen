@@ -16,3 +16,10 @@ case class KeyExistenceError() extends RequirementError
 case class ContentMismatch() extends RequirementError
 case class WithinRangeError() extends  RequirementError
 
+/** An unexpected error prevented the store from evaluating a requirement.
+  *
+  * The store cannot know whether the requirement is satisfied, so it must vote to abort
+  * rather than assume success. Purely local: RequirementErrors are never placed on the wire.
+  */
+case class RequirementCheckFailure() extends RequirementError
+

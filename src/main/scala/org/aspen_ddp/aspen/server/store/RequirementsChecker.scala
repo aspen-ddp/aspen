@@ -4,8 +4,9 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRefcount, ObjectRevis
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import scribe.Logging
 
-object RequirementsChecker {
+object RequirementsChecker extends Logging {
 
   case class ObjectErr(objectId: ObjectId, err: RequirementError) extends Exception
   case class NonObjectErr(err: RequirementError) extends Exception
@@ -64,7 +65,23 @@ object RequirementsChecker {
       } catch {
         case err: ObjectErr => objectErrors += (err.objectId -> err.err)
         case err: NonObjectErr => nonObjectErrors = err.err :: nonObjectErrors
-        case e: Throwable => println(s"UNEXPECTED ERROR IN TX REQ CHECK: $e")
+
+        // An unexpected error means the requirement could not be evaluated. Record it as a
+        // failure so the store votes to abort rather than silently treating the requirement
+        // as satisfied. Object-scoped requirements are attributed to their object: apply()
+        // consumes only the object errors, so a failure reported as non-object would let the
+        // update be applied anyway.
+        case e: Throwable =>
+          req match
+            case tor: TransactionObjectRequirement =>
+              logger.error(s"Unexpected error checking requirement $req of transaction " +
+                s"$transactionId against object ${tor.objectPointer.id}. Failing the requirement.", e)
+              objectErrors += (tor.objectPointer.id -> RequirementCheckFailure())
+
+            case _ =>
+              logger.error(s"Unexpected error checking requirement $req of transaction " +
+                s"$transactionId. Failing the requirement.", e)
+              nonObjectErrors = RequirementCheckFailure() :: nonObjectErrors
       }
     }
 

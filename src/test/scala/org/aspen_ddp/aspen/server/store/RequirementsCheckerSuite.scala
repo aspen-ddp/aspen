@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -722,6 +722,54 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       kvos.min = None
       kvos.max = None
     }
+  }
+
+  test("unexpected error checking an object requirement fails that object") {
+    // A malformed key requirement makes the inner match throw a MatchError. The check cannot
+    // be evaluated, so it must be reported as an error against the object rather than ignored.
+    val kvos = new KVObjectState
+
+    val o = new ObjectState(
+      oid1,
+      Metadata(rev1, ref1, ts1),
+      ObjectType.Data,
+      DataBuffer(new Array[Byte](0))
+    )
+
+    o.kvState = Some(kvos)
+
+    var objects: HashMap[ObjectId, ObjectState] = new HashMap
+    var updates: HashMap[ObjectId, DataBuffer] = new HashMap
+
+    objects += (o.objectId -> o)
+    updates += (o.objectId -> DataBuffer.Empty)
+
+    val req = KeyValueUpdate(kp1, Some(rev1), None, List(null))
+
+    val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+
+    var expected: HashMap[ObjectId, RequirementError] = new HashMap
+    expected += (o.objectId -> RequirementCheckFailure())
+    assert(oerrs == expected)
+    assert(errs.isEmpty)
+  }
+
+  test("unexpected error checking a non-object requirement fails the transaction") {
+    // A LocalTimeRequirement with no valid comparison makes checkLocalTime throw a MatchError.
+    // There is no object to attribute it to, so it becomes a non-object error.
+    val (o1, _) = mkobjs()
+
+    var objects: HashMap[ObjectId, ObjectState] = new HashMap
+    val updates: HashMap[ObjectId, DataBuffer] = new HashMap
+
+    objects += (o1.objectId -> o1)
+
+    val req = LocalTimeRequirement(ts1, null)
+
+    val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+
+    assert(oerrs.isEmpty)
+    assert(errs == List(RequirementCheckFailure()))
   }
 
 }

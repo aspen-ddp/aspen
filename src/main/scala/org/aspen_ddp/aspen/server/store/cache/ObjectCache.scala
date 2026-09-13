@@ -20,9 +20,12 @@ trait ObjectCache {
     */
   def insert(state: ObjectState): Option[ObjectState]
 
-  /** Only used by aborted allocations. Removes an object from the cache
+  /** Removes an object from the cache
     *
-    * @param objectId Identity of the object for which allocation was aborted
+    * Used when the cached state must not be served to later readers: the object has been
+    * deleted, or its in-memory state is suspect and should be reloaded from the backing store.
+    *
+    * @param objectId Identity of the object to drop
     */
   def remove(objectId: ObjectId): Unit
 }

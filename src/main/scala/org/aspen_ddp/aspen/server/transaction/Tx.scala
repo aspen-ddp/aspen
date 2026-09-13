@@ -153,20 +153,45 @@ class Tx( trs: TransactionRecoveryState,
 
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
-    val skipped = RequirementsApplyer.apply(transactionId, txd.startTimestamp, txd.requirements,
+    val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, txd.requirements,
       objects, ou)
 
-    pendingObjectCommits = objects.size - skipped.size
-
-    objects.valuesIterator.foreach { os =>
-      if (!skipped.contains(os.objectId)) {
-        val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
-
-        frontend.commit(os, cs, transactionId)
-      }
+    // Objects that threw partway through their update hold partially-applied, potentially
+    // corrupt state. Drop them from the cache so the next access reloads the last durable
+    // version from the backing store rather than serving the corruption.
+    result.failed.foreach { objectId =>
+      logger.error(s"Tx $transactionId. Discarding cached state of object $objectId after a failed update")
+      frontend.objectCache.remove(objectId)
     }
 
-    objectCommitErrors = skipped.toList
+    val uncommittable = result.uncommittable
+
+    // Count what is actually committed. uncommittable may name objects this store never
+    // loaded, so objects.size - uncommittable.size can undercount the commits in flight.
+    val toCommit = objects.valuesIterator.filter(os => !uncommittable.contains(os.objectId)).toList
+
+    pendingObjectCommits = toCommit.size
+
+    toCommit.foreach { os =>
+      val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
+
+      frontend.commit(os, cs, transactionId)
+    }
+
+    objectCommitErrors = uncommittable.toList
+
+    // Nothing was committed, so no commit completions will arrive to trigger the notification.
+    // Without this the proposer never learns this store's outcome.
+    if pendingObjectCommits == 0 then
+      allObjectCommitsComplete()
+  }
+
+  private def allObjectCommitsComplete(): Unit = {
+    committed = true
+    saveObjectUpdates = false
+    crl.dropTransactionObjectData(storeId, transactionId)
+    val m = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors)
+    net.sendTransactionMessage(m)
   }
 
   private def resolvedAndAllObjectsLoaded(committed: Boolean): Unit = {
@@ -272,12 +297,7 @@ class Tx( trs: TransactionRecoveryState,
 
   def commitComplete(objectId: ObjectId, result: Either[Unit, CommitError.Value]): Unit = {
     pendingObjectCommits -= 1
-    if (pendingObjectCommits == 0) {
-      committed = true
-      saveObjectUpdates = false
-      crl.dropTransactionObjectData(storeId, transactionId)
-      val m = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors)
-      net.sendTransactionMessage(m)
-    }
+    if (pendingObjectCommits == 0)
+      allObjectCommitsComplete()
   }
 }

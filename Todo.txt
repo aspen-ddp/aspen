@@ -1,9 +1,3 @@
-Transaction requirement check/apply swallow unexpected errors to println
-  - RequirementsChecker.scala:67 and RequirementsApplyer.scala:87-89
-  - "UNEXPECTED ERROR IN TX REQ CHECK: $e" / "... IN TX Apply: $e" then continue
-  - Corrupt-state bugs stay silent; these need real logging at minimum, and
-    probably should fail the transaction rather than proceeding
-
 DataUpdateOperation.Append is silently incorrect under Reed-Solomon
   - Remove support for Append operations entirely
 

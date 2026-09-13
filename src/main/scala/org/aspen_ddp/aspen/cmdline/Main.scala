@@ -988,7 +988,7 @@ object Main {
         println(s"Error loading filesystem '$fsName': ${err.getMessage}")
         return 1
 
-    val exports = "/ 192.168.64.2(rw)\n"
+    val exports = "/ *(rw)\n"
 
     val sched = Executors.newScheduledThreadPool(10)
     val ec = ExecutionContext.fromExecutorService(sched)

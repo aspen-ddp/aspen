@@ -176,9 +176,10 @@ its section of the [Project Homepage](https://aspen-ddp.org)
 ## How to run the AmoebaFS NFS server demo
 
 ### Setup
-1. Ensure JAVA_HOME is set correctly
+1. Ensure jdk17+ is installed and JAVA_HOME is set correctly
 2. Install sbt (the Scala Build Tool)
-3. Run `sbt compile`
+2. git submodule update --init --recursive # to pull in Backblaze's Reed-Solomon library
+4. Run `sbt compile`
 
 ### Execution
 Run the following command to create a new Aspen system under `/tmp/aspen-test`. The first

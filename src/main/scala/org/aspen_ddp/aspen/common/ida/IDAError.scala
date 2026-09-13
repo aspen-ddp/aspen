@@ -2,11 +2,11 @@ package org.aspen_ddp.aspen.common.ida
 
 import org.aspen_ddp.aspen.AspenError
 
-sealed abstract class IDAError extends AspenError
+sealed abstract class IDAError(msg: String = null) extends AspenError(msg)
 
 /** Thrown when an unknown IDA type is found embedded within a serialized ObjectPointer */
-class IDAEncodingError extends IDAError
+class IDAEncodingError(msg: String = null) extends IDAError(msg)
 
-class IDARestoreError extends IDAError
+class IDARestoreError(msg: String = null) extends IDAError(msg)
 
-class IDANotSupportedError extends IDAError
+class IDANotSupportedError(msg: String = null) extends IDAError(msg)

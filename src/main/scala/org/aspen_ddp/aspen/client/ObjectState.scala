@@ -69,7 +69,7 @@ class DataObjectState(
 
   def lastUpdateTimestamp: HLCTimestamp = timestamp
 
-  def size: Int = ida.calculateRestoredObjectSize(sizeOnStore)
+  def size: Int = data.size
 
   def canEqual(other: Any): Boolean = other.isInstanceOf[DataObjectState]
 
@@ -247,7 +247,13 @@ class KeyValueObjectState(
         val idaEncodedValue = Value(ida.encode(vs.value.bytes)(idaIndex))
         storeContent += (key -> new ValueState(idaEncodedValue, vs.revision, vs.timestamp, None))
       }
-      val kvos = new KVObjectState(minimum, maximum, left, right, storeContent, Map())
+      // left & right are IDA-encoded on the write path (SetLeft/SetRight are SingleEncodedValues)
+      // so the rebuild data must be encoded to match
+      val kvos = new KVObjectState(
+        minimum, maximum,
+        left.map(v => Value(ida.encode(v.bytes)(idaIndex))),
+        right.map(v => Value(ida.encode(v.bytes)(idaIndex))),
+        storeContent, Map())
       Some(kvos.encode())
 }
 

@@ -1,3 +1,7 @@
+Modify RocksDB class to use a shared ENV
+  - Causes all RocksDB instances to share a backround thread pool
+  - Needed for larger scale deployments
+
 os.Path note:
   - can convert to java Path via os.Path.toNIO
   - then to File via java Path.toFile()

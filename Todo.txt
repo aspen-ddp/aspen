@@ -1,13 +1,3 @@
-BufferedConsistentRocksDB.get bypasses the pending WriteBatch
-  - A read issued between put() and the batch write returns the previous value
-  - Combined with object cache eviction this yields stale reads
-  - Reads should consult nextBatch before falling through to db.get
-
-BufferedConsistentRocksDB deadlocks if db.write throws
-  - commit() never reaches promise.success(()) and commitInProgress stays true
-  - All subsequent writes then hang forever with no error reported
-  - Needs try/finally around the write plus failure propagation to the promise
-
 Transaction requirement check/apply swallow unexpected errors to println
   - RequirementsChecker.scala:67 and RequirementsApplyer.scala:87-89
   - "UNEXPECTED ERROR IN TX REQ CHECK: $e" / "... IN TX Apply: $e" then continue

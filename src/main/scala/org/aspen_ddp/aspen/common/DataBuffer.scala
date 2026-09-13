@@ -24,13 +24,25 @@ final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal:
 
   def size: Int = buf.limit() - buf.position()
 
-  def get(byteOffset: Int): Byte = buf.get(byteOffset)
-  def getShort(byteOffset: Int): Short = buf.getShort(byteOffset)
-  def getInt(byteOffset: Int): Int = buf.getInt(byteOffset)
-  def getLong(byteOffset: Int): Long = buf.getLong(byteOffset)
+  /** Translates a DataBuffer-relative byte offset into an absolute index into the wrapped ByteBuffer.
+    *
+    * All DataBuffer offsets are relative to the start of the content this buffer exposes, which is the
+    * wrapped buffer's position rather than index zero. The bounds check is done here rather than being
+    * left to ByteBuffer since a negative offset would otherwise read content preceding this buffer.
+    */
+  private def absoluteIndex(byteOffset: Int, nbytes: Int): Int =
+    if byteOffset < 0 || byteOffset > size - nbytes then
+      throw new IndexOutOfBoundsException(
+        s"Read of $nbytes byte(s) at offset $byteOffset exceeds DataBuffer of size $size")
+    buf.position() + byteOffset
 
-  def getDouble(byteOffset: Int): Double = buf.getDouble(byteOffset)
-  def getFloat(byteOffset: Int): Float = buf.getFloat(byteOffset)
+  def get(byteOffset: Int): Byte = buf.get(absoluteIndex(byteOffset, 1))
+  def getShort(byteOffset: Int): Short = buf.getShort(absoluteIndex(byteOffset, 2))
+  def getInt(byteOffset: Int): Int = buf.getInt(absoluteIndex(byteOffset, 4))
+  def getLong(byteOffset: Int): Long = buf.getLong(absoluteIndex(byteOffset, 8))
+
+  def getDouble(byteOffset: Int): Double = buf.getDouble(absoluteIndex(byteOffset, 8))
+  def getFloat(byteOffset: Int): Float = buf.getFloat(absoluteIndex(byteOffset, 4))
 
   def hashString: String = DataBuffer.hash(this :: Nil).toHexString
 

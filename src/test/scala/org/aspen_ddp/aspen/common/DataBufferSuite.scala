@@ -39,6 +39,62 @@ class DataBufferSuite extends AnyFunSuite with Matchers:
     db.slice(3, 2).compareTo(bdb(4, 5)) should be(0)
     db.slice(4, 1).compareTo(bdb(5)) should be(0)
 
+  test("get is relative to the buffer content, not the backing buffer"):
+    val db = bdb(1, 2, 3, 4, 5)
+
+    db.get(0) should be(1.toByte)
+    db.get(4) should be(5.toByte)
+
+    val tail = db.slice(2)
+    tail.size should be(3)
+    tail.get(0) should be(3.toByte)
+    tail.get(2) should be(5.toByte)
+
+    val mid = db.slice(1, 3)
+    mid.size should be(3)
+    mid.get(0) should be(2.toByte)
+    mid.get(2) should be(4.toByte)
+
+  test("multi-byte gets are relative to the buffer content"):
+    val bb = ByteBuffer.allocate(2 + 2 + 4 + 8 + 4 + 8)
+    bb.put(0xAA.toByte)
+    bb.put(0xBB.toByte) // two bytes of leading padding to be sliced away
+    bb.putShort(0x1234)
+    bb.putInt(0x01020304)
+    bb.putLong(0x0102030405060708L)
+    bb.putFloat(1.5f)
+    bb.putDouble(2.5)
+    bb.position(0)
+
+    val db = DataBuffer(bb).slice(2)
+
+    db.getShort(0) should be(0x1234.toShort)
+    db.getInt(2) should be(0x01020304)
+    db.getLong(6) should be(0x0102030405060708L)
+    db.getFloat(14) should be(1.5f)
+    db.getDouble(18) should be(2.5)
+
+  test("gets bounds-check against the buffer content"):
+    val db = bdb(1, 2, 3, 4, 5, 6, 7, 8, 9, 10).slice(2, 8)
+
+    db.size should be(8)
+
+    // Offsets preceding the content are rejected even though the backing buffer has data there
+    an[IndexOutOfBoundsException] should be thrownBy db.get(-1)
+    an[IndexOutOfBoundsException] should be thrownBy db.getInt(-1)
+
+    // Reads running past the end of the content are rejected even though the backing buffer has data there
+    an[IndexOutOfBoundsException] should be thrownBy db.get(8)
+    an[IndexOutOfBoundsException] should be thrownBy db.getShort(7)
+    an[IndexOutOfBoundsException] should be thrownBy db.getInt(5)
+    an[IndexOutOfBoundsException] should be thrownBy db.getLong(1)
+
+    // The largest in-bounds read of each width is accepted
+    db.get(7) should be(10.toByte)
+    noException should be thrownBy db.getShort(6)
+    noException should be thrownBy db.getInt(4)
+    noException should be thrownBy db.getLong(0)
+
   test("split"):
     val db = bdb(1, 2, 3, 4, 5)
 

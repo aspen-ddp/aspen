@@ -1,0 +1,3 @@
+[submodule "submodules/JavaReedSolomon"]
+	path = submodules/JavaReedSolomon
+	url = https://github.com/Backblaze/JavaReedSolomon.git

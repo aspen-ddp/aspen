@@ -1,6 +1,2 @@
-DataBuffer.getDirectByteArray always copies
-  - buf is always read-only (see the given Conversions) so hasArray() is never
-    true and the zero-copy path is dead code
-
 DataUpdateOperation.Append is silently incorrect under Reed-Solomon
   - Remove support for Append operations entirely

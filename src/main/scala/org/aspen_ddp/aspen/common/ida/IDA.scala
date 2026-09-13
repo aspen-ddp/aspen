@@ -225,13 +225,13 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
     encodeToShards(objectContent, 0, objectContent.length)
 
   def encode(objectContent: DataBuffer): Array[DataBuffer] =
-    val arr = objectContent.getDirectByteArray
+    val arr = objectContent.getByteArray
     encodeToShards(arr, 0, arr.length).map(shard => DataBuffer(shard))
 
   def encodeInto(objectContent: DataBuffer, bbArray: Array[ByteBuffer]): Unit =
     require(bbArray.length == width,
       s"encodeInto requires exactly $width buffers. Got ${bbArray.length}")
-    val arr = objectContent.getDirectByteArray
+    val arr = objectContent.getByteArray
     val shards = encodeToShards(arr, 0, arr.length)
     var i = 0
     while i < width do
@@ -242,7 +242,7 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
     restoreToArray(segments)
 
   def restore(segments: List[(Byte, DataBuffer)]): DataBuffer =
-    DataBuffer(restoreToArray(segments.map(t => (t._1, t._2.getDirectByteArray))))
+    DataBuffer(restoreToArray(segments.map(t => (t._1, t._2.getByteArray))))
 
   /** Pads the content out to an exact multiple of k, slices it into the k data shards, and
     * calculates the parity shards

@@ -298,18 +298,19 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
       for i <- 0 until ida.width do
         assertSameBytes(actual(i).getByteArray, expected(i), s"$ida/$n shard $i")
 
-  test("encode handles DataBuffers backed by an offset and by an aliased array"):
+  test("encode handles DataBuffers backed by an offset and by a converted array"):
     val ida = ReedSolomon(5, 3, 4)
 
-    // A slice of a larger backing array has a non-zero position, so getDirectByteArray copies
+    // A slice of a larger backing array has a non-zero position, so encode must read relative
+    // to that position rather than from the start of the backing array
     val backing = randomBytes(100, 11)
     val expected = ida.encode(backing.slice(10, 60))
     val actual = ida.encode(DataBuffer(backing).slice(10, 50))
     for i <- 0 until 5 do
       assertSameBytes(actual(i).getByteArray, expected(i), s"offset slice shard $i")
 
-    // The implicit conversion wraps a writable buffer, so getDirectByteArray aliases the
-    // caller's array rather than copying it. Encoding must not modify it.
+    // Encoding a DataBuffer obtained from the implicit conversion must leave the caller's
+    // array untouched
     val src = randomBytes(37, 12)
     val snapshot = src.clone()
     val aliased: DataBuffer = src

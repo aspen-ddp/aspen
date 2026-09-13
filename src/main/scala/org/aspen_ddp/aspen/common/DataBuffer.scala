@@ -54,15 +54,6 @@ final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal:
     buf.asReadOnlyBuffer().get(arr)
     arr
 
-  /** Returns the underlying Array storage for this data buffer IFF an underlying array exists and exactly matches
-    * the buffer size. Otherwise it returns a copy
-    */
-  private[aspen] def getDirectByteArray: Array[Byte] =
-    if (buf.hasArray && buf.arrayOffset() == 0 && buf.array().length == this.size)
-      buf.array
-    else
-      getByteArray
-
   def copy(): DataBuffer = DataBuffer(this.getByteArray)
 
   def compareTo(that: DataBuffer): Int = buf.compareTo(that.buf)
@@ -99,8 +90,8 @@ final class DataBuffer private (private val buf: ByteBuffer) extends AnyVal:
 object DataBuffer:
   val Empty = DataBuffer(new Array[Byte](0))
 
-  given Conversion[ByteBuffer, DataBuffer] = buf => new DataBuffer(buf.asReadOnlyBuffer())
-  given Conversion[Array[Byte], DataBuffer] = arr => new DataBuffer(ByteBuffer.wrap(arr))
+  given Conversion[ByteBuffer, DataBuffer] = bb => DataBuffer(bb)
+  given Conversion[Array[Byte], DataBuffer] = arr => DataBuffer(arr)
   given Conversion[DataBuffer, ByteBuffer] = db => db.asReadOnlyBuffer()
 
   def apply(): DataBuffer = Empty

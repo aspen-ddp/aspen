@@ -16,7 +16,55 @@ import scribe.Logging
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration.Duration
 
-object ZMQNet:
+object ZMQNet extends Logging:
+
+  /** Reads whole multipart messages from a ROUTER socket until it runs dry, handing each one to
+   *  `dispatch` as (payload, identity).
+   *
+   *  Extracted from the IO thread so its framing can be tested without a socket. `recv` is a
+   *  non-blocking receive returning null when no frame is available, `hasReceiveMore` reports
+   *  whether the frame just returned was followed by another *within the same message*.
+   *
+   *  The contract this exists to hold: on return, the socket is positioned on a message
+   *  boundary. Losing that alignment is unrecoverable on a live socket -- every later read pairs
+   *  one message's payload with the next one's identity, so payloads decode as the 36-byte
+   *  ClientId strings ZMQNet uses for DEALER identities and are dropped. The peer goes silent
+   *  until a lull in traffic happens to resynchronize it. Hence the rules here:
+   *
+   *    - never call recv() speculatively; only when hasReceiveMore() says a frame is owed
+   *    - consume every frame of a message, even a malformed one of unexpected length, before
+   *      looking for the next
+   */
+  private[zmqnet] def drainRouter(recv: () => Array[Byte],
+                                  hasReceiveMore: () => Boolean,
+                                  dispatch: (Array[Byte], Array[Byte]) => Unit): Unit =
+    var from = recv()
+
+    while from != null do
+      var payload: Array[Byte] = null
+      var frameCount = 1
+      var truncated = false
+
+      while !truncated && hasReceiveMore() do
+        val frame = recv()
+        if frame == null then
+          truncated = true
+        else
+          frameCount += 1
+          if frameCount == 2 then
+            payload = frame
+
+      if truncated then
+        // Should not be reachable: ZMQ commits a multipart message to the receive queue whole,
+        // so a frame promised by hasReceiveMore is always there. Logged rather than ignored
+        // because the alternative is spinning on a socket that will never advance.
+        logger.error("ROUTER promised another frame but returned none; dropping partial message")
+      else if frameCount != 2 then
+        logger.error(s"Dropping ROUTER message with $frameCount frames; expected 2 (identity, payload)")
+      else
+        dispatch(payload, from)
+
+      from = recv()
 
   class ZMQHostEntry(hostId: HostId,
                      name: String,
@@ -383,15 +431,14 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
         // Process router messages (if server node)
         orouterSocket.foreach: router =>
           if poller.pollin(hostsArray.length + 1) then
-            var from = router.recv(ZMQ.DONTWAIT)
-            var msg = router.recv(ZMQ.DONTWAIT)
-            while from != null && msg != null do
-              try
-                decodeAndDispatch(msg, Some(from))
-              catch
-                case t: Throwable => logger.error(s"Error in decodeAndDispatch (router): $t", t)
-              from = router.recv(ZMQ.DONTWAIT)
-              msg = router.recv(ZMQ.DONTWAIT)
+            ZMQNet.drainRouter(
+              () => router.recv(ZMQ.DONTWAIT),
+              () => router.hasReceiveMore,
+              (payload, from) =>
+                try
+                  decodeAndDispatch(payload, Some(from))
+                catch
+                  case t: Throwable => logger.error(s"Error in decodeAndDispatch (router): $t", t))
 
         // Process send queue items
         var qmsg = sendQueue.poll()

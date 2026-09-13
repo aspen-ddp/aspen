@@ -139,4 +139,22 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     // The refcount update follows the failure and must not have been applied
     assert(o.metadata.refcount == ref1)
   }
+
+  test("an Append DataUpdate is rejected and leaves the object untouched") {
+    val o = mkDataObject()
+
+    var objects: HashMap[ObjectId, ObjectState] = new HashMap
+    var updates: HashMap[ObjectId, DataBuffer] = new HashMap
+
+    objects += (o.objectId -> o)
+    updates += (o.objectId -> DataBuffer(Array[Byte](9, 9)))
+
+    val req = DataUpdate(p1, rev1, DataUpdateOperation.Append)
+
+    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(req), objects, updates)
+
+    assert(result.uncommittable == Set(oid1))
+    assert(o.metadata.revision == rev1)
+    assert(o.data.getByteArray sameElements Array[Byte](1, 2, 3))
+  }
 }

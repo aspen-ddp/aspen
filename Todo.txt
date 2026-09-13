@@ -1,2 +1,1 @@
-DataUpdateOperation.Append is silently incorrect under Reed-Solomon
-  - Remove support for Append operations entirely
+

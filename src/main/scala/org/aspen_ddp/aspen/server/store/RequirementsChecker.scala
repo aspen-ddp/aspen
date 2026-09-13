@@ -45,6 +45,11 @@ object RequirementsChecker extends Logging {
           case r: LocalTimeRequirement => checkLocalTime(r)
 
           case r: DataUpdate =>
+            // Clients are blocked from building these, but the operation is still on the wire so
+            // a peer can send one. Fail it here rather than in apply() so the store votes abort.
+            if r.operation == DataUpdateOperation.Append then
+              throw ObjectErr(r.objectPointer.id, UnsupportedOperation())
+
             checkRevision(getState(r.objectPointer.id), r.requiredRevision, txTimestamp)
             if (!objectUpdates.contains(r.objectPointer.id))
               throw ObjectErr(r.objectPointer.id, MissingObjectUpdate())

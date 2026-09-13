@@ -23,3 +23,11 @@ case class WithinRangeError() extends  RequirementError
   */
 case class RequirementCheckFailure() extends RequirementError
 
+/** The requirement names an operation the store does not implement.
+  *
+  * Currently only DataUpdateOperation.Append. The operation remains in the protocol as a
+  * placeholder, so a peer can still put one on the wire; the store must vote to abort rather
+  * than apply it. See the note on DataUpdateOperation.Append.
+  */
+case class UnsupportedOperation() extends RequirementError
+

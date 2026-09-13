@@ -39,6 +39,14 @@ Add TLS Cert generation for hosts
 
 Add a Quic/Netty Network implementation
 
+Implement DataUpdateOperation.Append correctly for slicing IDAs
+  - Currently rejected at every layer: TransactionBuilder.append throws AppendNotYetSupported,
+    RequirementsChecker fails the requirement with UnsupportedOperation, RequirementsApplyer throws
+  - The old store-local append was silently incorrect under ReedSolomon: each store appended raw
+    update bytes to its own encoded fragment, producing data that does not reconstruct
+  - A correct implementation must encode the appended data through the pool's IDA and hand each
+    store its own fragment
+
 TransferStore - Needs redesign
   - Current implementation is brittle if either side fails or TCP connection is
     dropped, it hangs forever

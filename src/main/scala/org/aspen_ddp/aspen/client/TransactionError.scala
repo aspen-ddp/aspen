@@ -14,6 +14,12 @@ final case class MultipleDataUpdatesToObject(objectPointer:ObjectPointer) extend
 /** Used if revision modifications and revision-locks are applied to the same object */
 final case class ConflictingRequirements(objectPointer:ObjectPointer) extends TransactionCreationError
 
+/** Used if a transaction attempts a DataUpdateOperation.Append, which is not yet implemented.
+  *
+  * See the note on DataUpdateOperation.Append for why appends are currently rejected.
+  */
+final case class AppendNotYetSupported(objectPointer:ObjectPointer) extends TransactionCreationError
+
 /** Used if multiple refcount modifications are attempted on the same object within a single transaction */
 final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) extends TransactionCreationError
 

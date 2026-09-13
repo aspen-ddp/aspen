@@ -52,7 +52,13 @@ object RequirementsApplyer extends Logging {
 
             r.operation match {
               case DataUpdateOperation.Overwrite => s.data = objectUpdates(ptr.id)
-              case DataUpdateOperation.Append => s.data = s.data.append(objectUpdates(ptr.id))
+
+              // Unreachable: RequirementsChecker rejects Append, so the object is skipped before
+              // reaching here. Kept as defense in depth and as the site of a future IDA-correct
+              // implementation. See the note on DataUpdateOperation.Append.
+              case DataUpdateOperation.Append =>
+                throw new UnsupportedOperationException(
+                  s"DataUpdateOperation.Append is not yet supported (object ${ptr.id})")
             }
 
           case r: KeyValueUpdate =>

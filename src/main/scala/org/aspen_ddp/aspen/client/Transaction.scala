@@ -17,6 +17,11 @@ trait Transaction {
   def revision: ObjectRevision = ObjectRevision(id)
 
   // All returns are what the new object revision/refcount will be if the transaction completes successfully
+
+  /** NOT YET SUPPORTED -- always throws AppendNotYetSupported.
+    *
+    * Reserved for a future implementation. See the note on DataUpdateOperation.Append.
+    */
   def append(objectPointer: DataObjectPointer,
              requiredRevision: ObjectRevision,
              data: DataBuffer): Unit

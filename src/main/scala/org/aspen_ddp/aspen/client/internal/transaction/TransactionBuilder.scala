@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
-import org.aspen_ddp.aspen.client.{ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject}
+import org.aspen_ddp.aspen.client.{AppendNotYetSupported, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -163,17 +163,14 @@ class TransactionBuilder(
     missedCommitDelayInMs = msec
   }
 
-  def append(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized {
-    //println(s"   TXB Append txid $transactionUUID object ${objectPointer.uuid}")
-    if (updatingObjects.contains(objectPointer))
-      throw MultipleDataUpdatesToObject(objectPointer)
-    if (revisionLocks.contains(objectPointer))
-      throw ConflictingRequirements(objectPointer)
-
-    updatingObjects += objectPointer
-    dataObjectUpdates += (objectPointer -> data)
-    requirements = DataUpdate(objectPointer, requiredRevision, DataUpdateOperation.Append) :: requirements
-  }
+  /** Not yet implemented -- always throws. See the note on DataUpdateOperation.Append.
+    *
+    * Retained as the placeholder for an eventual IDA-correct implementation. Building the
+    * transaction was never the hard part; what is missing is a store-side apply that is correct
+    * when object data is sliced across stores rather than replicated.
+    */
+  def append(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit =
+    throw AppendNotYetSupported(objectPointer)
 
   def overwrite(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized {
     //println(s"   TXB Overwrite txid $transactionUUID object ${objectPointer.uuid}")

@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, UnsupportedOperation, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -82,6 +82,32 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
 
     assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  test("DataUpdate with an Append operation is rejected") {
+    // Append is not yet implemented: a store-local append under a slicing IDA produces a slice
+    // that will not reconstruct. Stores must vote to abort rather than apply it.
+    val o = new ObjectState(
+      oid1,
+      Metadata(rev1, ref1, ts1),
+      ObjectType.Data,
+      DataBuffer(new Array[Byte](0))
+    )
+
+    o.lockedToTransaction = Some(tx1)
+
+    val req = DataUpdate(p1, rev1, DataUpdateOperation.Append)
+
+    var objects: HashMap[ObjectId, ObjectState] = new HashMap
+    var updates: HashMap[ObjectId, DataBuffer] = new HashMap
+
+    objects += (o.objectId -> o)
+    updates += (o.objectId -> DataBuffer.Empty)
+
+    val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+
+    assert(oerrs == Map(oid1 -> UnsupportedOperation()))
     assert(errs.isEmpty)
   }
 

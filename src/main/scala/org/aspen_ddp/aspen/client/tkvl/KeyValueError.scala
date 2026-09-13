@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.AspenError
 import org.aspen_ddp.aspen.common.objects.Key
 
-sealed abstract class KeyValueError extends AspenError
+sealed abstract class KeyValueError(cause: Throwable = null) extends AspenError(cause = cause)
 
 class BelowMinimumError(minimum: Key, attempted: Key) extends KeyValueError
 
@@ -16,7 +16,9 @@ class NodeSizeExceeded extends KeyValueError
 
 class KeyDoesNotExist(val key: Key) extends KeyValueError
 
-class InvalidRoot extends KeyValueError
+/** `cause` carries the underlying decode failure when the root could not be read out of an
+  * inode. Without it the original traceback is lost entirely. */
+class InvalidRoot(cause: Throwable = null) extends KeyValueError(cause)
 
 class TierAlreadyCreated extends KeyValueError
 

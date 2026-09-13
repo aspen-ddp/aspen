@@ -1,12 +1,3 @@
-SimpleFileRootManager.getRData decodes the inode outside the try block
-  - SimpleFileRootManager.scala:35 calls FileInode(client, inodeDos.data) before
-    the try on line 37
-  - A decode failure therefore escapes into the executor uncaught AND leaves the
-    promise p uncompleted, so the caller's Future hangs forever
-  - This is how the LRU cache corruption bug presented: a bare traceback in the
-    NFS server log plus a permanently stalled copy
-  - Move the decode inside the try so the failure reaches p.failure()
-
 BufferedConsistentRocksDB.get bypasses the pending WriteBatch
   - A read issued between put() and the batch write returns the previous value
   - Combined with object cache eviction this yields stale reads

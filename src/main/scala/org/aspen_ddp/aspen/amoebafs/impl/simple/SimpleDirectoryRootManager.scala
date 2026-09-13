@@ -32,9 +32,12 @@ class SimpleDirectoryRootManager(client: AspenClient,
     fInodeDos.onComplete {
       case Failure(err) => p.failure(err)
       case Success(inodeDos) =>
-        val inode = DirectoryInode(client, inodeDos.data)
-        val root = inode.contents
+        // The decode must stay inside the try. Outside it, a malformed inode throws into the
+        // executor and leaves p uncompleted, hanging the caller's Future forever.
         try {
+          val inode = DirectoryInode(client, inodeDos.data)
+          val root = inode.contents
+
           root.orootObject match {
             case None => p.success(RData(root, inodeDos.revision, None))
             case Some(rootObject) =>
@@ -52,7 +55,7 @@ class SimpleDirectoryRootManager(client: AspenClient,
               }
           }
         } catch {
-          case _: Throwable => p.failure(new InvalidRoot)
+          case cause: Throwable => p.failure(new InvalidRoot(cause))
         }
 
     }

@@ -2,6 +2,9 @@ Modify RocksDB class to use a shared ENV
   - Causes all RocksDB instances to share a backround thread pool
   - Needed for larger scale deployments
 
+Consider reimplementing aspen/server/store/cache/SimpleLRUObjectCache.scala
+  - Scaffiene might be better performing, no synchronization
+
 os.Path note:
   - can convert to java Path via os.Path.toNIO
   - then to File via java Path.toFile()

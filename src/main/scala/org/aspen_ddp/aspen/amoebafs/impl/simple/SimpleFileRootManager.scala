@@ -32,10 +32,13 @@ class SimpleFileRootManager(client: AspenClient,
     fInodeDos.onComplete:
       case Failure(err) => p.failure(err)
       case Success(inodeDos) =>
-        val inode = FileInode(client, inodeDos.data)
-        val root = inode.contents
-        try 
-          root.orootObject match 
+        // The decode must stay inside the try. Outside it, a malformed inode throws into the
+        // executor and leaves p uncompleted, hanging the caller's Future forever.
+        try
+          val inode = FileInode(client, inodeDos.data)
+          val root = inode.contents
+
+          root.orootObject match
             case None => p.success(RData(root, inodeDos.revision, None))
             case Some(rootObject) =>
               client.read(rootObject).onComplete:
@@ -48,8 +51,8 @@ class SimpleFileRootManager(client: AspenClient,
                   val rootLp = KeyValueListPointer(Key.AbsoluteMinimum, rootObject)
                   val node = KeyValueListNode(client, rootLp, root.ordering, rootKvos)
                   p.success(RData(root, inodeDos.revision, Some(node)))
-        catch 
-          case _: Throwable => p.failure(new InvalidRoot)
+        catch
+          case cause: Throwable => p.failure(new InvalidRoot(cause))
     
     p.future
   

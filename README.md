@@ -22,7 +22,7 @@ capabilities.
   applications rather than *great* performance in just one.
 * **Unique Architecture** - Uses a new approach to managing data at scale that doesn't rely on consistent
   hashing or sharding.
-* **Flexible** - Provides unparallelsed flexibility to both distributed system architects and
+* **Flexible** - Provides unparalleled flexibility to both distributed system architects and
   runtime operators
 * **AmoebaFS** - Provides a distributed file system that demonstrates Aspen's capabilities
 

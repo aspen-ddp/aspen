@@ -91,7 +91,7 @@ distributed file system built on Aspen than there would be an event sourcing sys
 
 **Third:** (The main one) Systems built on top of Aspen are much more easily integrated as they
 share the same operational, data, and transaction models. If you need an all-or-nothing atomic
-operation that updates a database entry, deletes an file in a distributed file system, and adds
+operation that updates a database entry, deletes a file in a distributed file system, and adds
 an event to a stream... you can do that. And you can do it naturally, no complex shenanigans
 required.
 

@@ -1,3 +1,11 @@
+Possible bug in AmoebaFS
+  - Looks like UnlinkFileTask may double-decrement the inode number
+  - prepareUnlink method decrements the inode number and creates the UnlinkFileTask atomically
+    if the refcount is zero.
+  - The task always decrements the refcount as the first step
+  - Need to verify that this is a flaw and look for cases where the task doing the decrement is
+    valid. If never valid, just skip the decrement step and move on to freeing resources.
+
 Modify RocksDB class to use a shared ENV
   - Causes all RocksDB instances to share a backround thread pool
   - Needed for larger scale deployments

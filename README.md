@@ -1,15 +1,30 @@
-# Aspen
-[Project Homepage](https://aspen-ddp.org)
+<p align="center">
+  <picture>
+    <!-- Displayed when GitHub user is in Dark Mode -->
+    <source media="(prefers-color-scheme: dark)" srcset="assets/aspen-logo-dark.svg">
+    <!-- Displayed when GitHub user is in Light Mode -->
+    <source media="(prefers-color-scheme: light)" srcset="assets/aspen-logo-light.svg">
+    <!-- Fallback for renders that do not support <picture> -->
+    <img alt="Project Logo" src="assets/aspen-logo-dark.svg" width="450">
+  </picture>
+</p>
 
-## TL;DR
+---
 
-* Aspen is a general-purpose platform for building various distributed systems
-* Takes a new approach to organizing and managing data at scale
-* Provides distributed system architects with a new set of design tools
-* Provides an adaptable run-time environment that easily adjusts to change
-* Focuses on providing "good" performance across a broad range of domains rather than
-  "great" performance in just one
-* Provides AmoebaFS, a distributed file system that serves as Aspen's first practical use case.
+Aspen is a general-purpose distributed data platform for building higher-level distributed
+systems. It provides a solid foundation suitable to a broad range of applications and it does
+so in a unique way that emphasizes flexibility in both application design and runtime operation
+capabilities.
+
+## Key Features
+
+* **General-Purpose** - Designed to provide *good* performance across a broad range of
+  applications rather than *great* performance in just one.
+* **Unique Architecture** - Uses a new approach to managing data at scale that doesn't rely on consistent
+  hashing or sharding.
+* **Flexible** - Provides unparallelsed flexibility to both distributed system architects and
+  runtime operators
+* **AmoebaFS** - Provides a distributed file system that demonstrates Aspen's capabilities
 
 ## Motivation
 
@@ -63,18 +78,18 @@ In addition to opening the door for system designers to go off in new directions
 be used to build the kinds of systems we already use today. You can use it to build a traditional
 database, S3 storage system, distributed file system, message broker, event sourcing application, 
 etc. Due to Aspen being designed for general-purpose use rather than tailored for optimal 
-performance in a specific domain, these kinds of systems built on top of Aspen probably won't be
+performance in a specific domain, these kinds of systems built on top of Aspen won't always be
 quite as performant as their traditional counterparts. The obvious question of "then why bother?" 
 arises and the answer is threefold.
 
-First: Not every deployment needs maximum performance. In fact, the vast majority do not and
+**First:** Not every deployment needs maximum performance. In fact, the vast majority do not and
 "good enough" is usually just that.
 
-Second: Operational simplicity. All applications built on top of Aspen share the same underlying
+**Second:** Operational simplicity. All applications built on top of Aspen share the same underlying
 operational model. There would be little difference between deploying and maintaining a 
 distributed file system built on Aspen than there would be an event sourcing system or database.
 
-Third: (The main one) Systems built on top of Aspen are much more easily integrated as they
+**Third:** (The main one) Systems built on top of Aspen are much more easily integrated as they
 share the same operational, data, and transaction models. If you need an all-or-nothing atomic
 operation that updates a database entry, deletes an file in a distributed file system, and adds
 an event to a stream... you can do that. And you can do it naturally, no complex shenanigans
@@ -137,41 +152,76 @@ task type and a state object that contains the crash-proof state needed to carry
 the task. Each time a step in the task is completed, the state is updated to point to
 the next step in the process. Should the host running the durable task crash, another
 host can resume the task by using the UUID and state object. The resumed task will 
-simply pick up where the crash happend and restart te last operation. When an 
+simply pick up where the crash happened and restart te last operation. When an 
 exactly-once operation is needed, add the objects being modified to the transaction
 that updates the task state to the next step. It's as simple as that. Aspen is a 
 self-hosting system and makes use of this strategy to implement many of its internal
 features.
 
-## More information
+For an example of how Aspen is used, the following is a snippet from the AmoebaFS 
+implementation. This method atomically decrements an inode's reference count and creates a
+durable task to delete the file content if the update to the reference count will set it
+to zero:
+```scala
+def prepareUnlink()(using tx: Transaction): Future[Future[Unit]] = synchronized {
+    val updatedInode = inode.update(links=Some(inode.links-1))
+
+    tx.overwrite(pointer.pointer, cachedInodeRevision, updatedInode.toDataBuffer)
+
+    tx.result.foreach(_ => setCachedInode(updatedInode, tx.revision))
+
+    if (inode.links == 1)
+      UnlinkFileTask.prepareTask(fs, pointer).map(f => f.map(_=>()))
+    else
+      Future.successful(Future.unit)
+}
+```
+
+Another example is from safely deleting an empty node from a distributed linked list:
+```scala
+def deleteNode(ptr: KeyValueListPointer,
+               nodeRevision: ObjectRevision,
+               optr: Option[KeyValueListPointer]): Future[Unit] =
+  client.read(ptr.pointer).flatMap { kvos =>
+
+    if kvos.contents.nonEmpty then
+      throw new Exception("Node is not empty")
+      
+    val tx = client.newTransaction()
+
+    val op = optr match
+      case None => DeleteRight()
+      case Some(ptr) => SetRight(ptr.toArray)
+
+    // Lock full content to ensure nothing is inserted while we're trying to
+    // delete the node
+    tx.update(ptr.pointer, Some(kvos.revision), Some(FullContentLock(List())), Nil, Nil)
+    tx.setRefcount(ptr.pointer, kvos.refcount, kvos.refcount.decrement())
+
+    // Update the right pointer of the start node to point to the next node
+    // in the chain
+    tx.update(nodePointer.pointer, Some(nodeRevision), None, Nil, List(op))
+    tx.commit().map(_ => ())
+  }.recover:
+    case _: InvalidObject => () // node already deleted. Return success
+```
+
+## System Architecture
 A full description of how Aspen works and its design tradeoffs may be found in the 
-Architecture section of the [Project Homepage](https://aspen-ddp.org)
+[Architecture](ARCHITECTURE.md) document.
 
 # AmoebaFS
 
-AmoebaFS is a distributed file system built on top of Aspen and is currently being
-co-developed with it. AmoebaFS was created for a couple of reasons.
+[AmoebaFS](AMOEBAFS.md) is a distributed file system built on top of Aspen and is 
+currently being co-developed with it. AmoebaFS was created for a couple of reasons.
 
 1. It provides a real-world use case for Aspen to help uncover and fix weaknesses in
    Aspen's design and implementation.
 2. It's a strong use-case for Aspen's architecture. 
-3. There are a ton of useful features that could be added to AmoebaFS.
+3. There are a ton of potential features that could be added to it should people
+   find it useful.
 
-Currently, just the basics are implemented but future features could include things
-like:
-* Copy-On-Write files or entire file-systems
-* Snapshots
-* Deduplication
-* Compression
-* Per-directory geo-location settings
-* Background transfers of file content between media types (NVMe, HDD, Tape)
-* Directing all writes to NVMe media with background transfer to HDD
-
-The file system is exposed to the outside world through dcache's Java NFS server 
-library.
-
-More information about the potential design and use cases for AmoebaFS may be found in
-its section of the [Project Homepage](https://aspen-ddp.org)
+See the [AmoebaFS](AMOEBAFS.md) document for more information.
 
 ## How to run the AmoebaFS NFS server demo
 

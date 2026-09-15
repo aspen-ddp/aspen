@@ -13,8 +13,7 @@
 
 Aspen is a general-purpose distributed data platform for building higher-level distributed
 systems. It provides a solid foundation suitable to a broad range of applications and it does
-so in a unique way that emphasizes flexibility in both application design and runtime operation
-capabilities.
+so in a unique way that emphasizes flexibility in both application design and runtime operation.
 
 ## Key Features
 

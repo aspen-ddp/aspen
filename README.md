@@ -204,9 +204,9 @@ def deleteNode(ptr: KeyValueListPointer,
     case _: InvalidObject => () // node already deleted. Return success
 ```
 
-## System Architecture
-A full description of how Aspen works and its design tradeoffs may be found in the 
-[Architecture](ARCHITECTURE.md) document.
+# System Architecture
+The [Architecture](ARCHITECTURE.md) document contains full description of how Aspen works and its design 
+tradeoffs.
 
 # AmoebaFS
 

@@ -217,10 +217,11 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
       val (ainode, arevision) = inodeState
 
       def commit(): Future[ObjectRevision] = {
-        if (tx.valid)
-          tx.commit().map(_ => tx.revision)
-        else
-          Future.unit.map(_ => arevision) // op added nothing to the transaction
+        // An empty transaction commits immediately and successfully, leaving the inode
+        // revision untouched. Always going through commit() is what keeps an aborted
+        // transaction from being mistaken for an empty one -- it returns the stored failure.
+        val addedNothing = tx.isEmpty
+        tx.commit().map(_ => if addedNothing then arevision else tx.revision)
       }
 
       val fresult = for

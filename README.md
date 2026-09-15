@@ -207,7 +207,7 @@ def deleteNode(ptr: KeyValueListPointer,
 # System Architecture
 The [Architecture](ARCHITECTURE.md) document contains full description of how Aspen works and its design 
 tradeoffs. Unlike SQL databases which are more or less interchangeable black boxes you can
-"just use", a solid understanding of how Aspen works is required to use it effectively. It's 
+"just use", a solid understanding of how Aspen works is required to use it effectively. Its 
 design and implementation are the foundational structure supporting everything built on top 
 of it.
 

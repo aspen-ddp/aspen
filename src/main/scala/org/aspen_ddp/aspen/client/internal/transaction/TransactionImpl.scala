@@ -37,6 +37,8 @@ class TransactionImpl(val client: AspenClient,
 
   def valid: Boolean = synchronized { !invalidated && havePendingUpdates }
 
+  def isEmpty: Boolean = synchronized { !havePendingUpdates }
+
   def missedUpdateTrackingEnabled: Boolean = synchronized { state } match {
     case Right(bldr) => bldr.missedUpdateTrackingEnabled
     case Left(_) => throw PostCommitTransactionModification()
@@ -125,11 +127,17 @@ class TransactionImpl(val client: AspenClient,
     case Left(_) => throw PostCommitTransactionModification()
   }
 
-  def invalidateTransaction(reason: Throwable): Unit = synchronized {
+  def abort(reason: Throwable): Unit = synchronized {
     invalidated = true
     if (!promise.isCompleted)
       promise.failure(reason)
   }
+
+  def abortAndThrow(reason: Throwable): Nothing =
+    abort(reason)
+    throw reason
+
+  def invalidateTransaction(reason: Throwable): Unit = abort(reason)
 
   def result: Future[HLCTimestamp] = promise.future
 

@@ -58,6 +58,27 @@ trait Transaction {
   /** Adds a human-readable note that may be used for debugging transactions */
   def note(note: String): Unit
 
+  /** Permanently marks the transaction as unable to commit and throws `reason`.
+   *
+   *  Use this when a precondition check fails while building a transaction. Throwing unwinds
+   *  the builder so no further work -- allocations in particular -- is performed against a
+   *  transaction that can never commit. Only the first reason is propagated.
+   */
+  def abortAndThrow(reason: Throwable): Nothing
+
+  /** Permanently marks the transaction as unable to commit, without throwing.
+   *
+   *  For recording a failure that has already been raised elsewhere, such as from a callback
+   *  on an already-failed Future. Prefer abortAndThrow when this is the site that detects the
+   *  failure. Only the first reason is propagated.
+   */
+  def abort(reason: Throwable): Unit
+
+  /** True if no updates have been added to the transaction. Says nothing about whether the
+   *  transaction has been aborted -- inspect `result` for that.
+   */
+  def isEmpty: Boolean
+
   /** Only the first error will be propagated should multiple attempts are made to invalidate the transaction
    *
    */

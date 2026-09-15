@@ -76,9 +76,9 @@ In addition to opening the door for system designers to go off in new directions
 be used to build the kinds of systems we already use today. You can use it to build a traditional
 database, S3 storage system, distributed file system, message broker, event sourcing application, 
 etc. Due to Aspen being designed for general-purpose use rather than tailored for optimal 
-performance in a specific domain, these kinds of systems built on top of Aspen won't always be
-quite as performant as their traditional counterparts. The obvious question of "then why bother?" 
-arises and the answer is threefold.
+performance in a specific domain, these kinds of systems built on top of Aspen won't always match the
+performance of their traditional counterparts. The obvious question then becomes "why bother"? 
+The answer is threefold.
 
 **First:** Not every deployment needs maximum performance. In fact, the vast majority do not and
 "good enough" is usually just that.

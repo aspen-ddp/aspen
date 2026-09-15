@@ -17,8 +17,8 @@ so in a unique way that emphasizes flexibility in both application design and ru
 
 ## Key Features
 
-* **General-Purpose** - Designed to provide *good* performance across a broad range of
-  applications rather than *great* performance in just one.
+* **General-Purpose** - Designed to provide good performance across a broad range of
+  applications rather than great performance in just one.
 * **Unique Architecture** - Uses a new approach to managing data at scale that doesn't rely on consistent
   hashing or sharding.
 * **Flexible** - Provides unparalleled flexibility to both distributed system architects and

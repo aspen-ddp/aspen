@@ -206,7 +206,7 @@ def deleteNode(ptr: KeyValueListPointer,
 
 # System Architecture
 The [Architecture](ARCHITECTURE.md) document contains full description of how Aspen works and its design 
-tradeoffs.
+tradeoffs. In order to effectively use Aspen, a solid understanding of how it works is required.
 
 # AmoebaFS
 

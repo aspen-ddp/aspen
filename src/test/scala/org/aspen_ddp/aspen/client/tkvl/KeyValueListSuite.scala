@@ -9,6 +9,8 @@ import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRefc
 import scala.concurrent.Future
 import scala.language.implicitConversions
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
+import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.objects.KeyAlreadyExists
 
 class KeyValueListSuite extends IntegrationTestSuite {
 
@@ -548,6 +550,31 @@ class KeyValueListSuite extends IntegrationTestSuite {
       val vs2 = v2.get
       vs2.value.bytes.length should be (1)
       vs2.value.bytes(0) should be (5)
+    }
+  }
+
+  atest("insert with requireDoesNotExist fails when the key is already present") {
+    val key = Key(Array[Byte](1))
+    val value = Value(Array[Byte](2))
+
+    given tx: Transaction = client.newTransaction()
+
+    for {
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+      lptr <- alloc.allocateKeyValueObject()
+
+      lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum,
+        tx.revision, ObjectRefcount(0, 1),
+        Map(key -> ValueState(value, tx.revision, HLCTimestamp.now)), None)
+
+      err <- lst.insert(key, value, 100, alloc, requirement = Some(Left(true))).failed
+      txErr <- tx.result.failed
+    } yield {
+      // The insert must unwind rather than fall through to the split path, which would
+      // allocate a node for a transaction that can never commit.
+      err shouldBe a[KeyAlreadyExists]
+      txErr shouldBe a[KeyAlreadyExists]
     }
   }
 }

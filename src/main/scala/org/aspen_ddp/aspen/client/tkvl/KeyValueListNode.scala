@@ -331,7 +331,7 @@ object KeyValueListNode {
       case Some(e) => e match {
         case Left(req) => if (req) {
           if (node.contents.contains(key))
-            tx.invalidateTransaction(new KeyAlreadyExists(key))
+            tx.abortAndThrow(new KeyAlreadyExists(key))
           DoesNotExist(key) :: Nil
         } else
           Nil
@@ -585,7 +585,7 @@ object KeyValueListNode {
         val tx = client.newTransaction()
 
         if kvos.contents.nonEmpty then
-          tx.invalidateTransaction(new Exception("Node is not empty"))
+          tx.abortAndThrow(new Exception("Node is not empty"))
 
         val op = optr match
           case None => DeleteRight()
@@ -619,7 +619,7 @@ object KeyValueListNode {
       def tryDelete(kvos: KeyValueObjectState): Future[Unit] =
         val tx = client.newTransaction()
         if kvos.contents.nonEmpty then
-          tx.invalidateTransaction(new Exception("Node is not empty"))
+          tx.abortAndThrow(new Exception("Node is not empty"))
         tx.update(kvos.pointer, Some(kvos.revision), Some(FullContentLock(List())), Nil, Nil)
         tx.setRefcount(kvos.pointer, kvos.refcount, kvos.refcount.decrement())
         tx.commit().map(_ => ())

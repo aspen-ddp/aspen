@@ -516,7 +516,7 @@ just the command to shut down all stores on a device and note that it is ready f
 by a little bit of code in the Host to detect a transferred drive and properly load all the stores.
 A good portion of this is already implemented but not quite all of it just yet.
 
-Aspen is currently being co-developed with the distributed file system [AmoebaFS](AMOEBAFS.md) which is 
+Aspen is currently being co-developed with the distributed file system [AmoebaFS](Amoebafs.md) which is 
 Aspen's first real-world use case. AmoebaFS and designed both validate and demonstrate most of 
 Aspen's capabilities. It's still in the early stages of development but the core functionality is in 
 place and it serves as a good demonstration of how to use Aspen's feature set.

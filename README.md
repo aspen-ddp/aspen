@@ -205,7 +205,7 @@ def deleteNode(ptr: KeyValueListPointer,
 ```
 
 # System Architecture
-The [Architecture](ARCHITECTURE.md) document contains full description of how Aspen works and its design 
+The [Architecture](Architecture.md) document contains full description of how Aspen works and its design 
 tradeoffs. Unlike SQL databases which are more or less interchangeable black boxes you can
 "just use", a solid understanding of how Aspen works is required to use it effectively. Its 
 design and implementation are the foundational structure supporting everything built on top 
@@ -213,7 +213,7 @@ of it.
 
 # AmoebaFS
 
-[AmoebaFS](AMOEBAFS.md) is a distributed file system built on top of Aspen and is 
+[AmoebaFS](Amoebafs.md) is a distributed file system built on top of Aspen and is 
 currently being co-developed with it. AmoebaFS was created for a couple of reasons.
 
 1. It provides a real-world use case for Aspen to help uncover and fix weaknesses in
@@ -222,7 +222,7 @@ currently being co-developed with it. AmoebaFS was created for a couple of reaso
 3. There are a ton of potential features that could be added to it should people
    find it useful.
 
-See the [AmoebaFS](AMOEBAFS.md) document for more information.
+See the [AmoebaFS](Amoebafs.md) document for more information.
 
 ## How to run the AmoebaFS NFS server demo
 

@@ -34,4 +34,4 @@ Currently, AmoebaFS is very much in the experimental stage. The core
 functionality is implemented but it has seen little practical testing. It
 consists of about 3k lines of code and is a good example of how to use
 Aspen. Please refer to the [Readme](README.md) and 
-[Architecture](ARCHITECTURE.md) documents for additional information.
+[Architecture](Architecture.md) documents for additional information.

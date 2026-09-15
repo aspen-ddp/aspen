@@ -64,8 +64,7 @@ runtime operation.
 Aspen is a general-purpose distributed data management platform that is intended to serve as the
 foundation for building a wide range of distributed applications. It solves the difficult distributed
 data management problems like transactional updates, recovering from disk failure, and gracefully 
-handling growing and shrinking hardware footprints in a way that provides a high degree of 
-flexibility to both application designers and runtime operators.
+handling growing and shrinking hardware footprints in a way that maximizes flexibility.
 
 Like all systems, the design choices underpinning Aspen make it better suited to some applications
 than others. Rather than try to optimize for ideal performance in a narrow range of use cases, 

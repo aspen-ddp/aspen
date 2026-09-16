@@ -1,13 +1,25 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.amoebafs.FileInode
+import org.aspen_ddp.aspen.amoebafs.{FileInode, FilePointer, FileSystem, Inode}
+import org.aspen_ddp.aspen.client.{StopRetrying, Transaction}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.language.implicitConversions
 
 class SimpleFileContentSuite extends FilesSystemTestSuite:
-  def boot(osegmentSize: Option[Int]=None): Future[SimpleFile] = for
+
+  // Test-only extension to expose enqueueOp for testing aborted operations
+  class TestSimpleFile(pointer: FilePointer,
+                       cachedInodeRevision: ObjectRevision,
+                       initialInode: FileInode,
+                       fs: FileSystem,
+                       osegmentSize: Option[Int]=None)
+      extends SimpleFile(pointer, cachedInodeRevision, initialInode, fs, osegmentSize):
+    def testEnqueueOp(op: SimpleBaseFile.FileOperation): Future[Unit] = enqueueOp(op)
+
+  def boot(osegmentSize: Option[Int]=None): Future[TestSimpleFile] = for
     fs <- bootstrap()
 
     rootDir <- fs.loadRoot()
@@ -22,7 +34,7 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
 
     (newInode, _, revision) <- fs.readInode(newFilePointer)
   yield
-    new SimpleFile(newFilePointer, revision, newInode.asInstanceOf[FileInode], fs, osegmentSize)
+    new TestSimpleFile(newFilePointer, revision, newInode.asInstanceOf[FileInode], fs, osegmentSize)
 
   def readFully(file: SimpleFile): Future[Array[Byte]] =
     for
@@ -236,4 +248,28 @@ class SimpleFileContentSuite extends FilesSystemTestSuite:
     yield
       file.inode.size should be(3)
       a should be(Array[Byte](1, 2, 3))
+
+  atest("aborted file operation fails rather than reporting success"):
+    case class TestAbortException(msg: String) extends Exception(msg)
+
+    case class AbortingOp() extends SimpleBaseFile.FileOperation:
+      override def prepareTransaction(pointer: DataObjectPointer,
+                                      revision: ObjectRevision,
+                                      inode: Inode)
+                                     (using tx: Transaction, ec: ExecutionContext): Future[(Inode, () => Future[Unit])] =
+        // Abort the transaction but return normally. The old isEmpty-based short-circuit
+        // would bypass commit() and report success; the fixed version calls commit() which
+        // returns the stored failure.
+        tx.abort(StopRetrying(TestAbortException("test abort")))
+        Future.successful((inode, () => Future.unit))
+
+    val testResult = for
+      file <- boot()
+      fresult = file.testEnqueueOp(AbortingOp())
+      result <- fresult.failed
+    yield
+      result shouldBe a[TestAbortException]
+      result.getMessage should be("test abort")
+
+    testResult
 

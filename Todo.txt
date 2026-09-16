@@ -1,1 +1,81 @@
+TODO
+====
 
+Surfaced by the transaction-abort-and-throw work (merged 2026-09-15, e8891c0..46a973e).
+All three were pre-existing, out of scope for that branch, and are documented in
+docs/superpowers/specs/2026-09-15-transaction-abort-and-throw-design.md.
+
+[ ] TieredKeyValueList.set silently drops its `requirement` argument on the empty-tree path
+    src/main/scala/org/aspen_ddp/aspen/client/tkvl/TieredKeyValueList.scala:172-174
+
+    The `empty(...)` branch routes to `rootManager.createInitialNode(Map(key -> value))`
+    and never passes `requirement` along, so a DoesNotExist requirement simply vanishes
+    when the tree has no root yet. Callers that rely on the requirement for correctness
+    -- Registry.prepareRegister and MetadataTree.preparePut both do -- get no protection
+    on an empty tree. Their scaladoc is currently qualified with "on a non-empty tree" to
+    match reality; that qualifier should disappear once this is fixed.
+
+    This is the most consequential of the three. It is a silent correctness hole, not
+    just a latent trap.
+
+[ ] TransactionImpl.commit() releases its monitor while the transaction is still in flight
+    src/main/scala/org/aspen_ddp/aspen/client/internal/transaction/TransactionImpl.scala:145-205
+
+    commit() synchronizes to check `!promise.isCompleted` at :149, then releases the
+    monitor and does the real work inside `poolIDAMapFuture.foreach` (:168-205). An
+    abort() arriving in that window fails the promise while the stores proceed to commit;
+    the subsequent `promise.success(ts)` at :197 then throws IllegalStateException into
+    the ExecutionContext.
+
+    Pre-existing and unchanged by the abort work -- the old `invalidated` flag had no
+    reader in commit() either. Note :190/:197/:200 use the plain success/failure variants
+    while :165/:204 use tryFailure; making them consistent would convert the crash into a
+    silently-ignored late abort, which may or may not be what's wanted. Decide the
+    intended semantics first: should an abort racing an in-flight commit win, lose, or be
+    rejected outright?
+
+[ ] KeyValueListNode.deleteContents has a broad catch-all that swallows everything
+    src/main/scala/org/aspen_ddp/aspen/client/tkvl/KeyValueListNode.scala:705-710
+
+        } recover:
+          case _: InvalidObject => None // already deleted
+          case t: Throwable =>
+            println(s"Unexpected error while deleting ...: $t")
+            None
+
+    Called from deleteRight (:613) and deleteRootNode (:629), two lines from migrated
+    abortAndThrow sites. No abort routes through it today, so nothing is broken now. But
+    deleteOneAtATime invokes a caller-supplied deleteKVPair callback, and a precondition
+    check added there would be swallowed -- reintroducing exactly the silent-failure
+    behaviour the abort work removed. Narrow the catch, and replace the println with real
+    logging while in there.
+
+----
+
+[ ] Track down and fix the cause of the flaky test suite
+
+    `sbt test` fails intermittently with a single failure in a timing-sensitive suite.
+    Measured 2026-09-15: RebalancingServiceSuite failed 2 of 4 full runs on unmodified
+    main (e8891c0), and 2 of 4 on a feature branch off it. Same suite, same rate on both
+    trees. Measured 2026-09-02: SimpleCRLSuite failed 1 of 4 on merged main;
+    RebalancingServiceSuite failed 1 of 4 on 4e6a828. Every one of these passes 100% when
+    the suite is run standalone.
+
+    Passing standalone but failing under a full run points at cross-suite interference
+    rather than a bug inside the suite itself -- either load-sensitivity in the timing
+    assertions, or state leaking from a suite that ran earlier. There is precedent for
+    the latter: a leaked BackgroundTaskManager from a repair suite once broke
+    RebalancingServiceSuite deterministically, and the fix was sequencing cleanup in
+    .andThen rather than onComplete.
+
+    Worth doing properly. The current cost is that every full-suite failure needs a
+    baseline comparison against an unmodified tree before it can be believed, which is
+    both slow and an invitation to wave off a real regression as "just the flake."
+
+    Suggested first steps:
+      - Capture the actual assertion failure. `sbt test | tail` truncates it; redirect the
+        whole run to a file and grep for the suite name.
+      - Run RebalancingServiceSuite immediately after each other suite in turn to find
+        which predecessor triggers it.
+      - Audit BackgroundTaskManager and any other shared scheduler for cleanup that isn't
+        sequenced before the next suite starts.

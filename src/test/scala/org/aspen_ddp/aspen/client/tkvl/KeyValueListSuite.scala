@@ -577,4 +577,31 @@ class KeyValueListSuite extends IntegrationTestSuite {
       txErr shouldBe a[KeyAlreadyExists]
     }
   }
+
+  atest("insert with requireDoesNotExist fails without allocating when a split would be needed") {
+    val key = Key(Array[Byte](1))
+    // Use a large value to force the split path. With maxNodeSize=100 and overhead,
+    // available space is ~92 bytes. A 40-byte value means newPairSize + currentSize >= maxSize.
+    val largeValue = Value(Array.fill[Byte](40)(2))
+
+    given tx: Transaction = client.newTransaction()
+
+    for {
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+      lptr <- alloc.allocateKeyValueObject()
+
+      lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum,
+        tx.revision, ObjectRefcount(0, 1),
+        Map(key -> ValueState(largeValue, tx.revision, HLCTimestamp.now)), None)
+
+      err <- lst.insert(key, largeValue, 100, alloc, requirement = Some(Left(true))).failed
+      txErr <- tx.result.failed
+    } yield {
+      // The insert must unwind before reaching the split path that would allocate.
+      // With the large value, the split branch would be taken if abortAndThrow didn't unwind.
+      err shouldBe a[KeyAlreadyExists]
+      txErr shouldBe a[KeyAlreadyExists]
+    }
+  }
 }

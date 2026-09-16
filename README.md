@@ -211,8 +211,13 @@ tradeoffs. Unlike SQL databases which are more or less interchangeable black box
 design and implementation are the foundational structure supporting everything built on top 
 of it.
 
+# Usage Guide
+The [Usage Guide](UsageGuide.md) provides an overview of how do develop applications on top of Aspen.
+It describes the most important classes and displays a few choice snippets from the AmoebaFS and Aspen
+codebases that demonstrate the use of Aspen's API.
+
 # Operating an Aspen Deployment
-The [Operations](Operations.md) document describes how to bootstrap and operate an Aspen
+The [Operation](Operation.md) document describes how to bootstrap and operate an Aspen
 system. At least, to some degree. Given the early-development stage Aspen is currently in, much
 of the practical knowledge and experience to effectively operate the system is lacking. And
 the tooling for doing so is still in its infancy. The situation should improve rapidly if a few

@@ -274,14 +274,16 @@ them.
 ./aspen create-filesystem /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs aspen-bootstrap
 ```
 
-Then launch the AmoebaFS NFS server process against it. Note that on MacOS you need to
+Then launch the AmoebaFS NFS server process to allow clients to attach to the file system via the
+normal NFS mounting process for the client machine. Note that on MacOS you need to
 first run `sudo launchctl start com.apple.rpcbind` to allow the NFS server to register with
 the local RPC daemon. On Linux, ensure you have the rpcbind service running.
 ```
 ./aspen amoebafs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
 ```
 
-To attach a client to the NFS server, run the following on the client machine:
+To use the AmoebaFS file system, just mount it like you would any other NFS filesystem. On Linux,
+execute the following to mount it at /mnt:
 ```
 umount -f /mnt; mount -v -t nfs4 -o "vers=4.1" <Server IP Address>:/ /mnt
 ```

@@ -231,7 +231,7 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
       yield 
         (updatedRevision, updatedInode, postCommitOp)
 
-      fresult.failed.foreach(err => tx.invalidateTransaction(err))
+      fresult.failed.foreach(err => tx.abort(err))
 
       fresult
     }

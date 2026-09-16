@@ -30,12 +30,10 @@ class TransactionImpl(val client: AspenClient,
   val id: TransactionId = TransactionId(UUID.randomUUID())
   private  val promise = Promise[HLCTimestamp]()
   private  var state: Either[HLCTimestamp, TransactionBuilder] = Right(new TransactionBuilder(id, chooseDesignatedLeader, client.clientId))
-  private  var invalidated = false
   private  var havePendingUpdates = false
 
   private  val stack = org.aspen_ddp.aspen.common.util.getStack // for debugging
 
-  def valid: Boolean = synchronized { !invalidated && havePendingUpdates }
 
   def isEmpty: Boolean = synchronized { !havePendingUpdates }
 
@@ -128,7 +126,6 @@ class TransactionImpl(val client: AspenClient,
   }
 
   def abort(reason: Throwable): Unit = synchronized {
-    invalidated = true
     if (!promise.isCompleted)
       promise.failure(reason)
   }
@@ -137,7 +134,6 @@ class TransactionImpl(val client: AspenClient,
     abort(reason)
     throw reason
 
-  def invalidateTransaction(reason: Throwable): Unit = abort(reason)
 
   def result: Future[HLCTimestamp] = promise.future
 

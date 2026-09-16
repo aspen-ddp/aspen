@@ -79,13 +79,6 @@ trait Transaction {
    */
   def isEmpty: Boolean
 
-  /** Only the first error will be propagated should multiple attempts are made to invalidate the transaction
-   *
-   */
-  def invalidateTransaction(reason: Throwable): Unit
-
-  /** True if one or more updates have been added to the transaction and it has not been invalidated */
-  def valid: Boolean
 
   def result: Future[HLCTimestamp]
 

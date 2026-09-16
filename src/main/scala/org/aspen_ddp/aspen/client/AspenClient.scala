@@ -262,7 +262,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       _ <- tx.commit()
     yield prepResult
 
-    fresult.failed.foreach(err => tx.invalidateTransaction(err))
+    fresult.failed.foreach(err => tx.abort(err))
 
     fresult
 

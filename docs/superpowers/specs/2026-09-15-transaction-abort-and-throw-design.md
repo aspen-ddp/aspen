@@ -42,8 +42,10 @@ established, but the mechanism produces exactly that symptom.
 `KeyValueListNode.insert` aborts at line 334 and continues. When the node is full it
 takes the split path and calls `allocator.allocateKeyValueObject` at line 386 for a
 transaction that can never commit. `SimpleFileContent.scala:218` has already allocated
-a data object before the failing `set`. Both objects are allocated and never referenced
-by any committed transaction.
+a data object before the failing `set`. Allocation is purely client-side (a minted
+`UUID.randomUUID()` plus staged `update`/`setRefcount`/`AllocationFinalizationAction`);
+nothing reaches a store until commit. The damage is wasted client work and a burned
+ObjectId, not leaked storage.
 
 ### 3. The throw semantics are already wanted, and hand-rolled
 
@@ -68,8 +70,12 @@ nothing beyond the containing node's read" — true only because of this manual 
 - Both `ExponentialBackoffRetryStrategy` loops wrap `attempt` in try/catch
   (lines 48-55, 103-110).
 - Retries construct a **fresh** transaction per attempt, so an aborted one is never reused.
-- All 18 `recover`/`recoverWith` sites under `client/` and `amoebafs/` are narrowly typed
-  and end in `case other => throw other`.
+- The throw sites migrated by this branch each land inside a Future combinator whose
+  failure reaches `AspenClient.transact`'s try/catch or a retry strategy's; no `recover` on
+  any of those paths swallows it. (`KeyValueListNode.deleteContents:705-710` has a broad
+  `case t: Throwable =>` catch-all adjacent to two migrated sites at `:613` and `:629`, but
+  nothing routes an abort through it today. A future precondition check inside a
+  `deleteKVPair` callback would be swallowed by it.)
 - `KeyValueListNode` **already throws** `NodeSizeExceeded` at lines 327 and 428 — in the
   same function as the abort call. Two "this cannot work" conditions using two different
   mechanisms is the inconsistency being removed.
@@ -117,6 +123,17 @@ silent-failure path. `commit()` already succeeds immediately on an empty transac
 (`TransactionImpl.scala:148-152`) and returns the stored failure on an aborted one, so a
 single unconditional `commit()` call is correct for both.
 
+### Known limitation: abort/commit race
+
+`TransactionImpl.commit()` synchronizes but releases the monitor while the transaction is
+still in flight (the work runs in `poolIDAMapFuture.foreach`, lines 168-205). An `abort`
+arriving after `commit()` clears its `!promise.isCompleted` guard at `:149` fails the
+promise while the stores proceed; the later `promise.success(ts)` at `:197` then throws
+`IllegalStateException` into the ExecutionContext. This is **pre-existing and unchanged
+by this branch** — the old `invalidated` flag had no reader in `commit()` either. The
+spec's unqualified "Invalidation is permanent and is honoured" holds for
+abort-before-commit only.
+
 ## Call site migration
 
 | Site | Becomes |
@@ -147,6 +164,8 @@ continue to hold.
 
 Reproducing the `SimpleFileContent` duplicate-segment race deterministically. The race
 requires two concurrent writes allocating the same segment offset. The regression guard
-is the transaction-level contract test (an aborted non-empty transaction must fail its
-`commit()`), plus the deterministic tkvl test that an insert with requireDoesNotExist
-against a present key throws and allocates nothing.
+is the transaction-level contract test (`SimpleFileContentSuite` — an aborted file
+operation must fail its future), plus the deterministic tkvl test
+(`KeyValueListSuite:556,581`) that an insert with requireDoesNotExist against a present
+key unwinds without allocating. The second test covers both the non-split and split
+branches.

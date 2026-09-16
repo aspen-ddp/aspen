@@ -65,7 +65,7 @@ class HostCreationSuite extends IntegrationTestSuite:
       // Registry.DuplicateRegistration belongs to the non-transactional register() path.
       err shouldBe a[KeyAlreadyExists]
       // The allocation and the hosts-tree insert are already staged when the registration
-      // rejects, so this holds because the failed transaction is invalidated wholesale.
+      // rejects, so this holds because the failed transaction is aborted wholesale.
       after should be(before)
 
   atest("createHost fails for the bootstrap host's name"):

@@ -4,13 +4,12 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectRefcount, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyAlreadyExists, ObjectRefcount, Value}
+import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
+import org.aspen_ddp.aspen.common.HLCTimestamp
 
 import scala.concurrent.Future
 import scala.language.implicitConversions
-import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
-import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.KeyAlreadyExists
 
 class KeyValueListSuite extends IntegrationTestSuite {
 

@@ -333,7 +333,7 @@ abstract class BaseAspenClient(
         // the new object's update and setRefcount, and preparePut staged its tree insert.
         // Throwing below therefore rejects a partially staged transaction, which is safe
         // because the throw fails this future before the yield completes and transact
-        // invalidates the transaction on failure, discarding everything staged.
+        // aborts the transaction on failure, discarding everything staged.
         val setState = StorageDeviceSetState(setDos)
 
         if setState.level != 0 then
@@ -415,10 +415,10 @@ abstract class BaseAspenClient(
       def stageDeviceUpdate(du: DeviceUpdate): CheckStorageDevice =
         // collectDevices re-reads device state on every retry attempt, so this catches a device
         // tombstoned after createNewStoragePool's pre-flight check. The partially staged
-        // transaction (allocated objects, staged puts) is discarded by transact's invalidation
-        // on failure, as at createStorageDevice (lines 298-302). No test covers this guard
-        // because deterministically staging the tombstone-during-retry race is not worth
-        // contorting the suite for.
+        // transaction (allocated objects, staged puts) is discarded by transact's abort on
+        // failure, as at createStorageDevice (lines 298-302). No test covers this guard because
+        // deterministically staging the tombstone-during-retry race is not worth contorting the
+        // suite for.
         if du.state.isFailed then
           throw AspenClient.DeviceFailed(du.storageDeviceId)
 

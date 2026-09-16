@@ -52,9 +52,8 @@ object SimpleFileSystem {
       given tx: Transaction = t
 
       for
-        // Claim the name first. Registry.prepareRegister invalidates the transaction
-        // synchronously when it finds the key already present, so a taken name costs nothing
-        // beyond the containing node's read.
+        // Claim the name first. Registry.prepareRegister aborts and throws when it finds the
+        // key already present, so a taken name costs nothing beyond the containing node's read.
         _ <- client.prepareRegisterId(FileSystem.RegistryNamespace, fsName, fileSystemUUID)
         taskRoot <- allocator.allocateKeyValueObject(Map())
         rootRoot = new Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(client, taskRoot.poolId))

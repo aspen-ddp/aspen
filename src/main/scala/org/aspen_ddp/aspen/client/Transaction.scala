@@ -62,7 +62,8 @@ trait Transaction {
    *
    *  Use this when a precondition check fails while building a transaction. Throwing unwinds
    *  the builder so no further work -- allocations in particular -- is performed against a
-   *  transaction that can never commit. Only the first reason is propagated.
+   *  transaction that can never commit. Only the first reason is propagated: if the
+   *  transaction is already aborted, this always throws its own `reason`, not the earlier one.
    */
   def abortAndThrow(reason: Throwable): Nothing
 

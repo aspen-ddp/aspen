@@ -78,8 +78,8 @@ class StorageDeviceCreationSuite extends IntegrationTestSuite:
     yield
       err shouldBe a[StorageDeviceSetState.NotLevelZero]
       // The rejected attempt must leave no residue. The allocation and tree insert are
-      // already staged when the level check throws, so this holds because transact
-      // invalidates the transaction on failure, not because nothing was staged.
+      // already staged when the level check throws, so this holds because transact aborts the
+      // transaction on failure, not because nothing was staged.
       hsAfter.storageDevices should be(hsBefore.storageDevices)
       setAfter.memberDevices should be(setBefore.memberDevices)
       l1After.memberDevices should be(Nil)

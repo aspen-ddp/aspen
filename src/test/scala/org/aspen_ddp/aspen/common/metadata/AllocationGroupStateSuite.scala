@@ -420,5 +420,5 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       // non-transactional register() path.
       err shouldBe a[KeyAlreadyExists]
       // The allocation and the groups-tree insert are already staged when the registration
-      // rejects, so this holds because the failed transaction is invalidated wholesale.
+      // rejects, so this holds because the failed transaction is aborted wholesale.
       after should be(before)

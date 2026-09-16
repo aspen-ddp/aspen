@@ -36,8 +36,9 @@ class Registry(val client: AspenClient,
       Future.unit
     }).map(_ => buf.toList)
 
-  /** Fails with KeyAlreadyExists if the key is taken. The requirement's abortAndThrow
-   *  raises it directly, before this insert stages anything on the transaction.
+  /** Fails with KeyAlreadyExists if the key is taken. On a non-empty tree the
+   *  requirement's abortAndThrow raises it directly, before this insert stages anything on
+   *  the transaction.
    */
   def prepareRegister(key: Key, value: Value)(using tx: Transaction): Future[Unit] =
     tkvl.set(key, value, requirement = Some(Left(true)))

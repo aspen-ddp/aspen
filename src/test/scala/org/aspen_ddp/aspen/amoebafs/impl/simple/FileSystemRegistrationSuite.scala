@@ -63,8 +63,8 @@ class FileSystemRegistrationSuite extends IntegrationTestSuite:
       // Unwrapped rather than a StopRetrying: create makes a single transact() attempt, so
       // KeyAlreadyExists comes straight out of Registry.prepareRegister.
       err shouldBe a[KeyAlreadyExists]
-      // The second attempt claims the name before it allocates, and the transaction it
-      // invalidated took the whole attempt with it -- so the name still points at the first.
+      // The second attempt claims the name before it allocates, and the aborted transaction
+      // took the whole attempt with it -- so the name still points at the first.
       byName should be(fsId)
       all should be(List("myfs" -> fsId))
 

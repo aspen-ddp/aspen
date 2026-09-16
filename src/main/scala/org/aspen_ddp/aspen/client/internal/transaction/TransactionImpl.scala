@@ -34,7 +34,6 @@ class TransactionImpl(val client: AspenClient,
 
   private  val stack = org.aspen_ddp.aspen.common.util.getStack // for debugging
 
-
   def isEmpty: Boolean = synchronized { !havePendingUpdates }
 
   def missedUpdateTrackingEnabled: Boolean = synchronized { state } match {
@@ -130,10 +129,10 @@ class TransactionImpl(val client: AspenClient,
       promise.failure(reason)
   }
 
-  def abortAndThrow(reason: Throwable): Nothing =
+  def abortAndThrow(reason: Throwable): Nothing = {
     abort(reason)
     throw reason
-
+  }
 
   def result: Future[HLCTimestamp] = promise.future
 

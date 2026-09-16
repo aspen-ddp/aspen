@@ -6,7 +6,6 @@ import org.aspen_ddp.aspen.common.objects.{Key, KeyAlreadyExists, KeyValueObject
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.Failure
 
 class MetadataTree(client: AspenClient, radicle: KeyValueObjectPointer, treeKey: Key):
   val tree = TieredKeyValueList(client, KVObjectRootManager(client, treeKey, radicle))
@@ -18,10 +17,8 @@ class MetadataTree(client: AspenClient, radicle: KeyValueObjectPointer, treeKey:
       case None => throw new NoSuchElementException(uuid.toString)
       case Some(vs) => ObjectPointer(vs.value.bytes)
 
+  /** Fails with KeyAlreadyExists if the uuid is already mapped. On a non-empty tree the
+   *  requirement's abortAndThrow raises it directly out of the insert.
+   */
   def preparePut(uuid: UUID, ptr: ObjectPointer)(using tx: Transaction): Future[Unit] =
-    val key = Key(uuid)
-    val value = Value(ptr.toArray)
-    tree.set(key, value, requirement = Some(Left(true))).map: _ =>
-      tx.result.value match
-        case Some(Failure(_: KeyAlreadyExists)) => throw KeyAlreadyExists(key)
-        case _ => ()
+    tree.set(Key(uuid), Value(ptr.toArray), requirement = Some(Left(true)))

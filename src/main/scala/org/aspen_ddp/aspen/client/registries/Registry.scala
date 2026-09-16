@@ -5,7 +5,6 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyAlreadyExists, KeyValueObjectPointer, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
-import scala.util.Failure
 
 object Registry:
   class DuplicateRegistration(val key: Key, val existing: Value)
@@ -37,11 +36,11 @@ class Registry(val client: AspenClient,
       Future.unit
     }).map(_ => buf.toList)
 
+  /** Fails with KeyAlreadyExists if the key is taken. The requirement's abortAndThrow
+   *  raises it directly, before anything else is staged on the transaction.
+   */
   def prepareRegister(key: Key, value: Value)(using tx: Transaction): Future[Unit] =
-    tkvl.set(key, value, requirement = Some(Left(true))).map: _ =>
-      tx.result.value match
-        case Some(Failure(_: KeyAlreadyExists)) => throw KeyAlreadyExists(key)
-        case _ => ()
+    tkvl.set(key, value, requirement = Some(Left(true)))
 
   def register(key: Key, value: Value): Future[Unit] =
     client.retryStrategy.retryUntilSuccessful:

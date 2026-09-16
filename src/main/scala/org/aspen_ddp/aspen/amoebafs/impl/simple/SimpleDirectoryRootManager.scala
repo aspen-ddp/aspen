@@ -112,6 +112,13 @@ class SimpleDirectoryRootManager(client: AspenClient,
     for {
       dos <- client.read(inodePointer)
       RData(root, _, onode) <- getRData(Some(dos))
+
+      // Check for a race condition where multiple concurrent attempts to
+      // create the initial node might clash with each other. Done before the
+      // allocation below so a loser stages nothing.
+      _ = if onode.isDefined then
+            tx.abortAndThrow(new Exception("Initial TKVL node already exists."))
+
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
       rptr <- alloc.allocateKeyValueObject(contents)
     } yield {
@@ -120,11 +127,6 @@ class SimpleDirectoryRootManager(client: AspenClient,
       val newInode = dinode.setContentTree(newRoot)
 
       tx.overwrite(inodePointer, dos.revision, newInode.toArray)
-
-      onode.foreach: _ =>
-        // Check for a race condition where multiple concurrent attempts to
-        // create the initial node might clash with each other
-        tx.abortAndThrow(new Exception("Initial TKVL node already exists."))
     }
   }
 }

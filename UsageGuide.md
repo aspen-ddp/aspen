@@ -481,7 +481,7 @@ utility.
 ```
 
 ### Initializing AmoebaFS
-The next except is pulled from AmoebaFS and shows the steps needed to create and register a new 
+The next excerpt is pulled from AmoebaFS and shows the steps needed to create and register a new 
 filesystem with Aspen.
 
 ```scala

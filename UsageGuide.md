@@ -41,9 +41,13 @@ for a multi-terabyte file, and must properly deallocate the inode when the opera
 provides a basic distributed processing service that ensures that if the host running your DurableTask
 fails, another will pick it up and resume operation relatively quickly.
 
-One last item is the Radicle. This is the name for the root object in an Aspen system. All objects stored
-in an Aspen system are found by navigating the pointers stored in this object. Ultimately, Aspen is a giant
-graph and the Radicle is the root node of the graph.
+**Key Concept:** Aspen is self-hosting in that it is implemented largely in terms of itself. All 
+metadata needed to define and operate an Aspen system is stored within the system itself. There are
+no external metadata servers or databases. It is entirely self-sufficient.
+
+One last item is the Radicle. This is the name for the root object in an Aspen system from which all
+other objects can be found. All Aspen systems are effectively a giant distributed graph structure and
+the Radicle is the root object from which all others can be found.
 
 This should be enough to get you going but to really understand what's going on, read through 
 the [Architecture](Architecture.md) document.

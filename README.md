@@ -231,8 +231,7 @@ currently being co-developed with it. AmoebaFS was created for a couple of reaso
 1. It provides a real-world use case for Aspen to help uncover and fix weaknesses in
    Aspen's design and implementation.
 2. It's a strong use-case for Aspen's architecture. 
-3. There are a ton of potential features that could be added to it should people
-   find it useful.
+3. There are a wide variety of potential features that could be added to it.
 
 See the [AmoebaFS](Amoebafs.md) document for more information.
 

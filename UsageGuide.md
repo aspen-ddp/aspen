@@ -1,12 +1,14 @@
 # Usage Guide
-This section will give you a brief introduction to the main Aspen classes and how to use them.
-To fully appreciate how this code works and what's going on under the hood, you must read 
-the [Architecture](Architecture.md) document. It's rather long and involved though so for those
-just looking to get the gist of what Aspen is and how to use it, the next section provides
+This document will give you a brief introduction to the main Aspen classes and how to use them.
+The [Architecture](Architecture.md) document needs to be read in order to fully understand how
+to properly use Aspen to build distributed applications. It's rather long and involved though so
+for those just looking to get the gist of what Aspen is and how to use it, the next section provides
 an extremely condensed overview.
 
-**Note:** Aspen is built on top of Scala's Future library. A solid understanding of asynchronous
-programming using that library is essential to understand this code.
+**Note:** Aspen is written in Scala and implemented in terms of the standard Future library. For
+those unfamiliar with Scala or asynchronous programming using Scala Futures, the following code
+will look a little weird. If you just look at it as oddly structured pseudo code though, you 
+should be able to understand the key points.
 
 ## Architecture Crash Course
 Aspen is all about building and using distributed data structures. Objects allocated in Aspen

@@ -219,12 +219,9 @@ Aspen codebases that demonstrate the use of Aspen's API.
 # Operating an Aspen Deployment
 The [Operation](Operation.md) document describes how to bootstrap and operate an Aspen
 system. At least, to some degree. Given the early-development stage Aspen is currently in, much
-of the practical knowledge and experience to effectively operate the system is lacking. And
-the tooling for doing so is still in its infancy. The situation should improve rapidly if a few
-early adopters are willing to jump in and experiment.
+of the practical knowledge and experience to effectively operate the system has yet to be developed.
 
 # AmoebaFS
-
 [AmoebaFS](Amoebafs.md) is a distributed file system built on top of Aspen and is 
 currently being co-developed with it. AmoebaFS was created for a couple of reasons.
 

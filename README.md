@@ -211,7 +211,7 @@ design and implementation are the foundational structure supporting everything b
 of it.
 
 # Usage Guide
-The [Usage Guide](UsageGuide.md) provides an overview of how do develop applications on top of Aspen.
+The [Usage Guide](UsageGuide.md) provides an overview of how to develop applications on top of Aspen.
 It describes the most important classes and provides a few fundamental examples of how objects are
 allocated, combined, and updated over time. Followed by a few choice snippets from the AmoebaFS and 
 Aspen codebases that demonstrate the use of Aspen's API.

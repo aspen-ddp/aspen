@@ -108,8 +108,7 @@ must first describe the basics of how it works.
 
 At it's core, Aspen is an object storage system that runs on top of the JVM. All operations
 are carried out through transactions that can update multiple objects simultaneously with 
-ACD semantics from the standard ACID model (Isolation is achievable but deferred for the 
-moment).
+ACD semantics from the standard ACID model (Isolation support will be added in the future).
 
 Object data is stored in logical DataStores that support pluggable backend implementations,
 such as RocksDB and flat files. DataStores are not fixed in place and may be migrated 

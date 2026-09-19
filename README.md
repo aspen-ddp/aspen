@@ -125,7 +125,15 @@ deleted when a transaction sets their ReferenceCount to zero.
 
 Much like C/C++ programs, you get a small, binary pointer when you allocate an object
 in Aspen and you embed those pointers within other objects to create distributed data
-structures. 
+structures.
+
+Distributed Data Structures are the key concept that serves as the foundation for Aspen's goal of 
+being a general-purpose distributed data platform. This is facilitated by the on-the-fly ability
+to move DataStores to geographical locations and backing media to optimize the run-time deployment
+strategy to the application's needs. The [Architecture](Architecture.md) document goes into much
+greater detail but this is the core concept that defines Aspen's niche in the distributed system
+arena. It isn't intended to do X better than ever before. It's intended to allow you to approach the
+problem from a completely new direction Z, which was never an option before now.
 
 Movable DataStores, StoragePools, Transactional Objects, ObjectPointers, and Distributed
 Data Structures are the foundational concepts in Aspen. There's a lot more to the system, 

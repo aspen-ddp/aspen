@@ -232,7 +232,11 @@ currently being co-developed with it. AmoebaFS was created for a couple of reaso
 
 See the [AmoebaFS](Amoebafs.md) document for more information.
 
-## How to run the AmoebaFS NFS server demo
+# AmoebaFS NFS Server Demo
+
+<p align="center">
+  <img src="assets/amoebafs-demo.png" alt="Amoeba NFS Demo Architecture" width="700">
+</p>
 
 ### Setup
 1. Ensure jdk17+ is installed and JAVA_HOME is set correctly

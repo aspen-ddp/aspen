@@ -19,11 +19,11 @@ kinds of features. To name a few:
 
 * UnionFS style system. Read-only root w/ CopyOnWrite to writable layers
 * Customizing the AllocationGroups used for each directory. Which would enable:
-* Geo-location of directory content
-* Per-directory control over baking media (NVMe vs 5400rpm hdd)
+  * Geo-location of directory content
+  * Per-directory control over backing media (NVMe vs 5400rpm hdd)
 * All writes to NVMe w/ background migration to slower media
 * Track hot/cold data and migrate between storage media
-* Geo-dispursed base FS with per-site cache for hot files
+* Geo-dispersed base FS with per-site cache for hot files
 * Background compression / deduplication
 * Btrfs-style COW implementation with snapshotting support
 * Embed a type UUID in the Inode to support multiple File implementations

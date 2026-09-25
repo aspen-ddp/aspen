@@ -29,7 +29,7 @@ Aspen deployments always start with three things:
 3. A single storage device set named `bootstrap`
 
 The `target-directory` provided to the command is where the host instance and storage
-device will be created. All the DataStore instances backing the `aspen-bootstrap` pool will
+device will be created. All the DataStore instances backing the `aspen-bootstrap` pool
 are initially stored on the single storage device. This is the basis from which the
 deployment will grow. To expand the system, add new hosts and new storage devices.
 

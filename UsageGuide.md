@@ -254,7 +254,9 @@ def loadStore(): Future[(KeyValueObjectPointer, DataObjectPointer, String)] =
 
     // `contents` is a Map[Key, ValueState]. A ValueState carries the value's bytes plus the
     // revision and timestamp of the transaction that last wrote *that key* -- per-key metadata
-    // is what makes fine-grained requirements possible.
+    // is what makes fine-grained requirements possible. It's also part of what makes their storage
+    // efficiency quite poor. The keys and metadata must be replicated on each node even when
+    // erasure-coding is being used. Use KeyValueObjects judiciously.
     indexPtr = KeyValueObjectPointer(rkvos.contents(BookmarkStoreKey).value.bytes)
 
     index <- client.read(indexPtr)

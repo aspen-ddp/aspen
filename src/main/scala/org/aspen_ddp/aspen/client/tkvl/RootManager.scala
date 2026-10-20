@@ -12,6 +12,9 @@ trait RootManager {
   /** Returns (numTiers, keyOrdering, rootNode) */
   def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])]
 
+  /** Implementations must only commit if the tree is still empty at commit time.
+   *  TieredKeyValueList.set relies on this in place of key requirements.
+   */
   def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit]
 
   def getAllocatorForTier(tier: Int): Future[ObjectAllocator]

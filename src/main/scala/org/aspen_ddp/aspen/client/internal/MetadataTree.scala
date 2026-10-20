@@ -17,8 +17,8 @@ class MetadataTree(client: AspenClient, radicle: KeyValueObjectPointer, treeKey:
       case None => throw new NoSuchElementException(uuid.toString)
       case Some(vs) => ObjectPointer(vs.value.bytes)
 
-  /** Fails with KeyAlreadyExists if the uuid is already mapped. On a non-empty tree the
-   *  requirement's abortAndThrow raises it directly out of the insert.
+  /** Fails with KeyAlreadyExists if the uuid is already mapped. The requirement's
+   *  abortAndThrow raises it directly out of the insert.
    */
   def preparePut(uuid: UUID, ptr: ObjectPointer)(using tx: Transaction): Future[Unit] =
     tree.set(Key(uuid), Value(ptr.toArray), requirement = Some(Left(true)))

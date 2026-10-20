@@ -99,13 +99,22 @@ class KVObjectRootManager(val client: AspenClient,
 
   def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit] = {
     for {
-      RData(root, _, _) <- getRData()
+      RData(root, rootRevision, onode) <- getRData()
+
+      // Check for a race condition where multiple concurrent attempts to
+      // create the initial node might clash with each other. Done before the
+      // allocation below so a loser stages nothing.
+      _ = if onode.isDefined then
+            tx.abortAndThrow(new Exception("Initial TKVL node already exists."))
+
       alloc <- root.nodeAllocator.getAllocatorForTier(0)
-      kvos <- client.read(pointer, s"Reading root node of TKVL tree $treeKey for createInitialNode")
       rptr <- alloc.allocateKeyValueObject(contents)
     } yield {
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator)
-      val kreqs = KeyValueUpdate.KeyRevision(treeKey, kvos.contents(treeKey).revision) :: Nil
+      // Pin the revision at which the tree was observed to be empty. Callers
+      // such as TieredKeyValueList.set rely on this to make key requirements
+      // unnecessary for the initial node's contents.
+      val kreqs = KeyValueUpdate.KeyRevision(treeKey, rootRevision) :: Nil
       tx.update(pointer, None, None, kreqs, Insert(treeKey, newRoot.encode()) :: Nil)
       tx.result.map { _ =>
         new KVObjectRootManager(client, treeKey, pointer)

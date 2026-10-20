@@ -170,6 +170,9 @@ class TieredKeyValueList(val client: AspenClient,
       Future.unit
     }
     def empty(tier: Int, ordering: KeyOrdering): Future[Unit] = {
+      // `requirement` is intentionally dropped. createInitialNode only commits
+      // if the tree is still empty, in which case the key cannot exist and a
+      // DoesNotExist requirement is already satisfied.
       rootManager.createInitialNode(Map(key -> value)).map(_=>())
     }
     def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] = {

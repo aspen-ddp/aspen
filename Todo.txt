@@ -2,21 +2,8 @@ TODO
 ====
 
 Surfaced by the transaction-abort-and-throw work (merged 2026-09-15, e8891c0..46a973e).
-All three were pre-existing, out of scope for that branch, and are documented in
+All were pre-existing, out of scope for that branch, and are documented in
 docs/superpowers/specs/2026-09-15-transaction-abort-and-throw-design.md.
-
-[ ] TieredKeyValueList.set silently drops its `requirement` argument on the empty-tree path
-    src/main/scala/org/aspen_ddp/aspen/client/tkvl/TieredKeyValueList.scala:172-174
-
-    The `empty(...)` branch routes to `rootManager.createInitialNode(Map(key -> value))`
-    and never passes `requirement` along, so a DoesNotExist requirement simply vanishes
-    when the tree has no root yet. Callers that rely on the requirement for correctness
-    -- Registry.prepareRegister and MetadataTree.preparePut both do -- get no protection
-    on an empty tree. Their scaladoc is currently qualified with "on a non-empty tree" to
-    match reality; that qualifier should disappear once this is fixed.
-
-    This is the most consequential of the three. It is a silent correctness hole, not
-    just a latent trap.
 
 [ ] TransactionImpl.commit() releases its monitor while the transaction is still in flight
     src/main/scala/org/aspen_ddp/aspen/client/internal/transaction/TransactionImpl.scala:145-205

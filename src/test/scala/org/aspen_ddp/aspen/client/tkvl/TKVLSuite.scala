@@ -261,6 +261,57 @@ class TKVLSuite extends IntegrationTestSuite {
     }
   }
 
+  atest("createInitialNode refuses to replace an existing root") {
+    val treeKey = Key(Array[Byte](0))
+    val key = Key(Array[Byte](1))
+    val key2 = Key(Array[Byte](2))
+    val key3 = Key(Array[Byte](3))
+    val value = Value(Array[Byte](3))
+
+    for {
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+
+      tx0 = client.newTransaction()
+      ptr <- alloc.allocateKeyValueObject()(using tx0)
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
+
+      nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId)
+      tx1 = client.newTransaction()
+      froot <- KVObjectRootManager.createNewTree(client, ptr, treeKey, ByteArrayKeyOrdering, nodeAllocator, Map(key -> value))(using tx1)
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+
+      root <- froot
+      tree <- root.getTree()
+      _ <- tree.deleteTree(None)
+      (_, _, emptyRoot) <- tree.rootManager.getRootNode()
+
+      // Recreate the initial node through the empty-tree path of set
+      tx2 = client.newTransaction()
+      _ <- tree.set(key2, value, requirement = Some(Left(true)))(using tx2)
+      _ <- tx2.commit()
+      _ <- waitForTransactionsToComplete()
+
+      // A second, late attempt must not replace the root created above
+      tx3 = client.newTransaction()
+      err <- tree.rootManager.createInitialNode(Map(key3 -> value))(using tx3).failed
+      txErr <- tx3.result.failed
+
+      v2 <- tree.get(key2)
+      v3 <- tree.get(key3)
+    } yield {
+      emptyRoot.isEmpty should be (true)
+      err.getMessage should be ("Initial TKVL node already exists.")
+      txErr should be theSameInstanceAs err
+      v2.isEmpty should be (false)
+      v3.isEmpty should be (true)
+    }
+  }
+
   atest("Joining tree deletion with tier reduction") {
     val treeKey = Key(Array[Byte](0))
     val key = Key(Array[Byte](1))

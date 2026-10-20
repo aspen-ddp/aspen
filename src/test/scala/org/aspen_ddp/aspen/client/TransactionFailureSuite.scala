@@ -63,3 +63,48 @@ class TransactionFailureSuite extends IntegrationTestSuite:
       untouched.isEmpty should be(true)
       // The conflation this replaces: `valid` was false here, which read as "empty".
       aborted.isEmpty should be(false)
+
+  atest("abort after commit throws AbortAfterCommit and does not affect the outcome"):
+    given ExecutionContext = executionContext
+    for
+      before <- client.read(radicle)
+      tx = client.newTransaction()
+      _ = tx.lockRevision(radicle, before.revision)
+      fcommit = tx.commit()
+      reason = new Exception("too late")
+      thrown = intercept[AbortAfterCommit](tx.abort(reason))
+      _ <- fcommit
+    yield
+      thrown.reason should be theSameInstanceAs reason
+
+  atest("abortAndThrow after commit throws AbortAfterCommit"):
+    given ExecutionContext = executionContext
+    val tx = client.newTransaction()
+    val fcommit = tx.commit()
+
+    intercept[AbortAfterCommit](tx.abortAndThrow(new Exception("too late")))
+
+    fcommit.map(_ => succeed)
+
+  atest("modifications are rejected as soon as commit is called"):
+    given ExecutionContext = executionContext
+    for
+      before <- client.read(radicle)
+      tx = client.newTransaction()
+      _ = tx.lockRevision(radicle, before.revision)
+      fcommit = tx.commit()
+      _ = intercept[PostCommitTransactionModification](tx.note("too late"))
+      _ <- fcommit
+    yield
+      succeed
+
+  atest("abort after commit of an already-aborted transaction is still a no-op"):
+    given ExecutionContext = executionContext
+    val tx = client.newTransaction()
+    val first = new Exception("first")
+
+    tx.abort(first)
+    tx.commit()
+    tx.abort(new Exception("second"))
+
+    tx.result.failed.map(_ should be theSameInstanceAs first)

@@ -257,14 +257,14 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     val fprep = try prepare(tx) catch
       case err: Throwable => Future.failed(err)
 
-    val fresult = for
+    // Only a preparation failure aborts. Once commit() is called the outcome belongs to the
+    // stores and abort() would throw AbortAfterCommit.
+    fprep.failed.foreach(err => tx.abort(err))
+
+    for
       prepResult <- fprep
       _ <- tx.commit()
     yield prepResult
-
-    fresult.failed.foreach(err => tx.abort(err))
-
-    fresult
 
   def transactUntilSuccessful[T](prepare: Transaction => Future[T])(using ec: ExecutionContext): Future[T] =
     retryStrategy.retryUntilSuccessful:

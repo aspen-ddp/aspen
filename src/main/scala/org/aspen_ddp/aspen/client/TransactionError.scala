@@ -26,6 +26,12 @@ final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) ex
 /** Thrown if attempts are made to add content to a transaction that has already had commit() called */
 final case class PostCommitTransactionModification() extends TransactionCreationError
 
+/** Thrown if abort() or abortAndThrow() is called on a transaction that has already had commit() called.
+  * Once the commit process has begun the outcome is decided by the stores, so the abort cannot take effect.
+  * `reason` is the abort reason that was rejected.
+  */
+final case class AbortAfterCommit(reason: Throwable) extends TransactionCreationError
+
 /** Used when procedure adding content to a transaction detects a logical flaw that causes the overall
   * Transaction to become invalid.
   *

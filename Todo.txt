@@ -5,22 +5,6 @@ Surfaced by the transaction-abort-and-throw work (merged 2026-09-15, e8891c0..46
 All were pre-existing, out of scope for that branch, and are documented in
 docs/superpowers/specs/2026-09-15-transaction-abort-and-throw-design.md.
 
-[ ] TransactionImpl.commit() releases its monitor while the transaction is still in flight
-    src/main/scala/org/aspen_ddp/aspen/client/internal/transaction/TransactionImpl.scala:145-205
-
-    commit() synchronizes to check `!promise.isCompleted` at :149, then releases the
-    monitor and does the real work inside `poolIDAMapFuture.foreach` (:168-205). An
-    abort() arriving in that window fails the promise while the stores proceed to commit;
-    the subsequent `promise.success(ts)` at :197 then throws IllegalStateException into
-    the ExecutionContext.
-
-    Pre-existing and unchanged by the abort work -- the old `invalidated` flag had no
-    reader in commit() either. Note :190/:197/:200 use the plain success/failure variants
-    while :165/:204 use tryFailure; making them consistent would convert the crash into a
-    silently-ignored late abort, which may or may not be what's wanted. Decide the
-    intended semantics first: should an abort racing an in-flight commit win, lose, or be
-    rejected outright?
-
 [ ] KeyValueListNode.deleteContents has a broad catch-all that swallows everything
     src/main/scala/org/aspen_ddp/aspen/client/tkvl/KeyValueListNode.scala:705-710
 

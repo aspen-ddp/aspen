@@ -64,6 +64,8 @@ trait Transaction {
    *  the builder so no further work -- allocations in particular -- is performed against a
    *  transaction that can never commit. Only the first reason is propagated: if the
    *  transaction is already aborted, this always throws its own `reason`, not the earlier one.
+   *
+   *  Throws AbortAfterCommit instead if commit() has already been called.
    */
   def abortAndThrow(reason: Throwable): Nothing
 
@@ -72,6 +74,9 @@ trait Transaction {
    *  For recording a failure that has already been raised elsewhere, such as from a callback
    *  on an already-failed Future. Prefer abortAndThrow when this is the site that detects the
    *  failure. Only the first reason is propagated.
+   *
+   *  Throws AbortAfterCommit if commit() has already been called: once the commit process has
+   *  begun the outcome is decided by the stores, so calling abort() at that point is a logic error.
    */
   def abort(reason: Throwable): Unit
 

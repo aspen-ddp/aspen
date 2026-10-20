@@ -224,16 +224,18 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
         tx.commit().map(_ => if addedNothing then arevision else tx.revision)
       }
 
-      val fresult = for
-        (updatedInode, postCommitOp) <- op.prepareTransaction(pointer.pointer, arevision, ainode)
+      val fprep = op.prepareTransaction(pointer.pointer, arevision, ainode)
+
+      // Only a preparation failure aborts. Once commit() is called the outcome belongs to the
+      // stores and abort() would throw AbortAfterCommit.
+      fprep.failed.foreach(err => tx.abort(err))
+
+      for
+        (updatedInode, postCommitOp) <- fprep
 
         updatedRevision <- commit()
-      yield 
+      yield
         (updatedRevision, updatedInode, postCommitOp)
-
-      fresult.failed.foreach(err => tx.abort(err))
-
-      fresult
     }
 
     var retryCount = 0

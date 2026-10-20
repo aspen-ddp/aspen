@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AspenClient, PostCommitTransactionModification, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{AbortAfterCommit, AspenClient, PostCommitTransactionModification, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
@@ -29,39 +29,42 @@ class TransactionImpl(val client: AspenClient,
 
   val id: TransactionId = TransactionId(UUID.randomUUID())
   private  val promise = Promise[HLCTimestamp]()
-  private  var state: Either[HLCTimestamp, TransactionBuilder] = Right(new TransactionBuilder(id, chooseDesignatedLeader, client.clientId))
+  private  val bldr = new TransactionBuilder(id, chooseDesignatedLeader, client.clientId)
+  private  var commitStarted = false
   private  var havePendingUpdates = false
 
   private  val stack = org.aspen_ddp.aspen.common.util.getStack // for debugging
 
   def isEmpty: Boolean = synchronized { !havePendingUpdates }
 
-  def missedUpdateTrackingEnabled: Boolean = synchronized { state } match {
-    case Right(bldr) => bldr.missedUpdateTrackingEnabled
-    case Left(_) => throw PostCommitTransactionModification()
+  /** Runs `f` against the builder while holding the monitor. Once commit() has been called the
+    *  builder is frozen; it is read without the monitor while the transaction is built.
+    */
+  private def modify[T](f: TransactionBuilder => T): T = synchronized {
+    if commitStarted then
+      throw PostCommitTransactionModification()
+    f(bldr)
   }
 
-  def disableMissedUpdateTracking(): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.disableMissedUpdateTracking()
-    case Left(_) => throw PostCommitTransactionModification()
+  def missedUpdateTrackingEnabled: Boolean = modify { bldr =>
+    bldr.missedUpdateTrackingEnabled
   }
 
-  def setMissedCommitDelayInMs(msec: Int): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.setMissedCommitDelayInMs(msec)
-    case Left(_) => throw PostCommitTransactionModification()
+  def disableMissedUpdateTracking(): Unit = modify { bldr =>
+    bldr.disableMissedUpdateTracking()
   }
 
-  def append(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized { state } match {
-    case Right(bldr) =>
-      havePendingUpdates = true
-      bldr.append(objectPointer, requiredRevision, data)
-    case Left(_) => throw PostCommitTransactionModification()
+  def setMissedCommitDelayInMs(msec: Int): Unit = modify { bldr =>
+    bldr.setMissedCommitDelayInMs(msec)
   }
-  def overwrite(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized { state } match {
-    case Right(bldr) =>
-      havePendingUpdates = true
-      bldr.overwrite(objectPointer, requiredRevision, data)
-    case Left(_) => throw PostCommitTransactionModification()
+
+  def append(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = modify { bldr =>
+    havePendingUpdates = true
+    bldr.append(objectPointer, requiredRevision, data)
+  }
+  def overwrite(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = modify { bldr =>
+    havePendingUpdates = true
+    bldr.overwrite(objectPointer, requiredRevision, data)
   }
 
   def update(
@@ -69,62 +72,51 @@ class TransactionImpl(val client: AspenClient,
               requiredRevision: Option[ObjectRevision],
               contentLock: Option[FullContentLock],
               requirements: List[KeyValueUpdate.KeyRequirement],
-              operations: List[KeyValueOperation]): Unit = synchronized { state } match {
-    case Right(bldr) =>
-      havePendingUpdates = true
-      bldr.update(pointer, requiredRevision, contentLock, requirements, operations)
-    case Left(_) => throw PostCommitTransactionModification()
+              operations: List[KeyValueOperation]): Unit = modify { bldr =>
+    havePendingUpdates = true
+    bldr.update(pointer, requiredRevision, contentLock, requirements, operations)
   }
 
-  def setRefcount(objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount, refcount: ObjectRefcount): Unit = synchronized { state } match {
-    case Right(bldr) =>
-      havePendingUpdates = true
-      bldr.setRefcount(objectPointer, requiredRefcount, refcount)
-    case Left(_) => throw PostCommitTransactionModification()
+  def setRefcount(objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount, refcount: ObjectRefcount): Unit = modify { bldr =>
+    havePendingUpdates = true
+    bldr.setRefcount(objectPointer, requiredRefcount, refcount)
   }
 
-  def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized { state } match {
-    case Right(bldr) =>
-      havePendingUpdates = true
-      bldr.bumpVersion(objectPointer, requiredRevision)
-    case Left(_) => throw PostCommitTransactionModification()
+  def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = modify { bldr =>
+    havePendingUpdates = true
+    bldr.bumpVersion(objectPointer, requiredRevision)
   }
 
-  def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.lockRevision(objectPointer, requiredRevision)
-    case Left(_) => throw PostCommitTransactionModification()
+  def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = modify { bldr =>
+    bldr.lockRevision(objectPointer, requiredRevision)
   }
 
-  def ensureHappensAfter(timestamp: HLCTimestamp): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.ensureHappensAfter(timestamp)
-    case Left(_) => throw PostCommitTransactionModification()
+  def ensureHappensAfter(timestamp: HLCTimestamp): Unit = modify { bldr =>
+    bldr.ensureHappensAfter(timestamp)
   }
 
-  def addFinalizationAction(finalizationActionId: FinalizationActionId, serializedContent: Option[Array[Byte]]): Unit = synchronized { state } match {
-    case Right(bldr) => serializedContent match {
+  def addFinalizationAction(finalizationActionId: FinalizationActionId, serializedContent: Option[Array[Byte]]): Unit = modify { bldr =>
+    serializedContent match {
       case Some(content) => bldr.addFinalizationAction(finalizationActionId, content)
       case None => bldr.addFinalizationAction(finalizationActionId)
     }
-
-    case Left(_) => throw PostCommitTransactionModification()
   }
 
-  def addAllocatingObject(objectPtr: ObjectPointer): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.addAllocatingObject(objectPtr)
-    case Left(_) => throw PostCommitTransactionModification()
+  def addAllocatingObject(objectPtr: ObjectPointer): Unit = modify { bldr =>
+    bldr.addAllocatingObject(objectPtr)
   }
 
-  def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.addNotifyOnResolution(storesToNotify)
-    case Left(_) => throw PostCommitTransactionModification()
+  def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit = modify { bldr =>
+    bldr.addNotifyOnResolution(storesToNotify)
   }
 
-  def note(note: String): Unit = synchronized { state } match {
-    case Right(bldr) => bldr.note(note)
-    case Left(_) => throw PostCommitTransactionModification()
+  def note(note: String): Unit = modify { bldr =>
+    bldr.note(note)
   }
 
   def abort(reason: Throwable): Unit = synchronized {
+    if commitStarted then
+      throw AbortAfterCommit(reason)
     if (!promise.isCompleted)
       promise.failure(reason)
   }
@@ -145,64 +137,60 @@ class TransactionImpl(val client: AspenClient,
 
     given ExecutionContext = client.clientContext
 
-    if (!promise.isCompleted) {
+    if (!promise.isCompleted && !commitStarted) {
+      commitStarted = true
 
-      state.foreach { bldr =>
-        if bldr.isEmpty then {
-          // Completely empty transactions succeed immediately
-          val timestamp = HLCTimestamp.now
-          state = Left(timestamp)
-          promise.success(timestamp)
-        } else
-          val poolIds = bldr.allReferencedPoolIds
+      if bldr.isEmpty then {
+        // Completely empty transactions succeed immediately
+        promise.success(HLCTimestamp.now)
+      } else
+        val poolIds = bldr.allReferencedPoolIds
 
-          val poolIDAMapFuture = Future.sequence(
-            poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.ida))
-          ).map(_.toMap)
+        val poolIDAMapFuture = Future.sequence(
+          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.ida))
+        ).map(_.toMap)
 
-          poolIDAMapFuture.failed.foreach { cause =>
-            promise.tryFailure(cause)
-          }
+        poolIDAMapFuture.failed.foreach { cause =>
+          promise.tryFailure(cause)
+        }
 
-          poolIDAMapFuture.foreach { poolIDAMap =>
-            try
-              val (txd, transactionData, timestamp) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap)
+        poolIDAMapFuture.foreach { poolIDAMap =>
+          try
+            val (txd, transactionData, _) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap)
 
-              //---- Tx Debugging ----
-              result.onComplete {
-                case Success(_) =>
-                  logger.info(s"TX SUCCESS: ${txd.shortString}\n${txd.shortString}")
-                case Failure(e) =>
-                  logger.info(s"TX FAILURE: ${txd.shortString}: $e\n$stack")
-              }
-              //---------------------
+            //---- Tx Debugging ----
+            result.onComplete {
+              case Success(_) =>
+                logger.info(s"TX SUCCESS: ${txd.shortString}\n${txd.shortString}")
+              case Failure(e) =>
+                logger.info(s"TX FAILURE: ${txd.shortString}: $e\n$stack")
+            }
+            //---------------------
 
-              state = Left(timestamp)
-              if (txd.requirements.isEmpty)
-                promise.success(txd.startTimestamp)
-              else
+            if (txd.requirements.isEmpty)
+              promise.success(txd.startTimestamp)
+            else
 
-                txManager.runTransaction(txd, transactionData, transactionDriverStrategy) onComplete {
-                  case Failure(cause) =>
-                    // TODO Catch transaction timeout from lower layer and convert to TransactionError.TransactionTimedOut
+              txManager.runTransaction(txd, transactionData, transactionDriverStrategy) onComplete {
+                case Failure(cause) =>
+                  // TODO Catch transaction timeout from lower layer and convert to TransactionError.TransactionTimedOut
+                  client.txStatusCache.transactionAborted(txd.transactionId)
+                  promise.failure(cause)
+                case Success(committed) =>
+
+                  if (committed) {
+                    val ts = txd.startTimestamp
+                    HLCTimestamp.update(ts)
+                    client.txStatusCache.transactionCommitted(txd.transactionId)
+                    promise.success(ts)
+                  } else {
                     client.txStatusCache.transactionAborted(txd.transactionId)
-                    promise.failure(cause)
-                  case Success(committed) =>
-
-                    if (committed) {
-                      val ts = txd.startTimestamp
-                      HLCTimestamp.update(ts)
-                      client.txStatusCache.transactionCommitted(txd.transactionId)
-                      promise.success(ts)
-                    } else {
-                      client.txStatusCache.transactionAborted(txd.transactionId)
-                      promise.failure(TransactionAborted(txd))
-                    }
-                }
-            catch
-              case e: Throwable => promise.tryFailure(e)
-          }
-      }
+                    promise.failure(TransactionAborted(txd))
+                  }
+              }
+          catch
+            case e: Throwable => promise.tryFailure(e)
+        }
     }
     result
   }

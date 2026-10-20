@@ -293,7 +293,7 @@ class KeyValueListNode(val reader: ObjectReader,
     p.future
 }
 
-object KeyValueListNode {
+object KeyValueListNode extends Logging {
   def apply(reader: ObjectReader,
             pointer: KeyValueListPointer,
             ordering: KeyOrdering,
@@ -685,14 +685,14 @@ object KeyValueListNode {
           pdone.success(())
         else
           val (key, vs) = contents.head
-          deleteKVPair(key, vs).onComplete:
-            case Failure(_) => recurse(contents.tail)
-            case Success(_) =>
-              val dtx = client.newTransaction()
-              dtx.update(node.pointer, None, None, Nil, List(Delete(key)))
-              dtx.commit().onComplete:
-                case Failure(_) => recurse(contents.tail)
-                case Success(_) => recurse(contents.tail)
+          val fdeleted = Future.delegate(deleteKVPair(key, vs)).flatMap: _ =>
+            val dtx = client.newTransaction()
+            dtx.update(node.pointer, None, None, Nil, List(Delete(key)))
+            dtx.commit()
+
+          fdeleted.onComplete:
+            case Failure(err) => pdone.failure(err)
+            case Success(_) => recurse(contents.tail)
 
       recurse(node.contents.toList)
 
@@ -703,11 +703,11 @@ object KeyValueListNode {
       odeleteKVPair match
         case None => deleteOneShot(node).map(_ => node.tail)
         case Some(deleteKVPair) => deleteOneAtATime(node, deleteKVPair).map(_ => node.tail)
-    } recover:
+    } recover {
       case _: InvalidObject => None // already deleted
-      case t: Throwable =>
-        println(s"Unexpected error while deleting KeyValueListNode content ${nodePointer.pointer.id}: $t")
-        None
+    } andThen:
+      case Failure(err) =>
+        logger.warn(s"Failed to delete KeyValueListNode content ${nodePointer.pointer.id}: $err")
 
   /**
    * Splits the list at the specified key. The original list node will have

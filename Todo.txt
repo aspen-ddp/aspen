@@ -1,28 +1,6 @@
 TODO
 ====
 
-Surfaced by the transaction-abort-and-throw work (merged 2026-09-15, e8891c0..46a973e).
-All were pre-existing, out of scope for that branch, and are documented in
-docs/superpowers/specs/2026-09-15-transaction-abort-and-throw-design.md.
-
-[ ] KeyValueListNode.deleteContents has a broad catch-all that swallows everything
-    src/main/scala/org/aspen_ddp/aspen/client/tkvl/KeyValueListNode.scala:705-710
-
-        } recover:
-          case _: InvalidObject => None // already deleted
-          case t: Throwable =>
-            println(s"Unexpected error while deleting ...: $t")
-            None
-
-    Called from deleteRight (:613) and deleteRootNode (:629), two lines from migrated
-    abortAndThrow sites. No abort routes through it today, so nothing is broken now. But
-    deleteOneAtATime invokes a caller-supplied deleteKVPair callback, and a precondition
-    check added there would be swallowed -- reintroducing exactly the silent-failure
-    behaviour the abort work removed. Narrow the catch, and replace the println with real
-    logging while in there.
-
-----
-
 [ ] Track down and fix the cause of the flaky test suite
 
     `sbt test` fails intermittently with a single failure in a timing-sensitive suite.

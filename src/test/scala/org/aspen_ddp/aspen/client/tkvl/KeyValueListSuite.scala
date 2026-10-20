@@ -147,6 +147,46 @@ class KeyValueListSuite extends IntegrationTestSuite {
     }
   }
 
+  atest("Delete content propagates deleteKVPair failure") {
+    val key = Key(Array[Byte](1))
+    val value = Value(Array[Byte](2))
+
+    case class PreconditionFailed() extends Exception
+
+    def deleteKVPair(key: Key, value: ValueState): Future[Unit] =
+      Future.failed(PreconditionFailed())
+
+    for {
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+
+      tx = client.newTransaction()
+
+      lptr <- alloc.allocateKeyValueObject()(using tx)
+
+      lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
+        ObjectRefcount(0, 1), Map(), None)
+
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
+
+      _ <- tx.commit().map(_ => ())
+      _ <- waitForTransactionsToComplete()
+
+      lst <- lst.refresh()
+
+      result <- KeyValueListNode.deleteContents(client,
+        KeyValueListPointer(Key.AbsoluteMinimum, lst.pointer),
+        lst.ordering,
+        Some(deleteKVPair)).failed
+
+      lst <- lst.refresh()
+
+    } yield {
+      result shouldBe a [PreconditionFailed]
+      lst.contents.contains(key) should be (true)
+    }
+  }
+
   atest("Delete content oneshot") {
     val key = Key(Array[Byte](1))
     val value = Value(Array[Byte](2))

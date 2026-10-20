@@ -611,7 +611,7 @@ object KeyValueListNode extends Logging {
           nodeKvos <- client.read(nodePointer.pointer).recover:
             case e:InvalidObject => throw StopRetrying(e)
           optr <- deleteContents(client, ptr, ordering, odeleteKVPair)
-          _ <- deleteNode(ptr, nodeKvos.revision, Some(ptr))
+          _ <- deleteNode(ptr, nodeKvos.revision, optr)
         yield
           optr
 

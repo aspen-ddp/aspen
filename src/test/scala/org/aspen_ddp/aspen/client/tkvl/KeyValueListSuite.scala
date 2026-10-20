@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyAlreadyExists, ObjectRefcount, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyAlreadyExists, KeyValueObjectPointer, ObjectRefcount, Value}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.common.HLCTimestamp
 
@@ -328,6 +328,63 @@ class KeyValueListSuite extends IntegrationTestSuite {
       deletedKeys should be(Set(key, key2))
       oroot.isEmpty should be (true)
       otail.isEmpty should be (true)
+    }
+  }
+
+  atest("Delete list keeps root linked to remaining nodes") {
+    val key = Key(Array[Byte](1))
+    val key2 = Key(Array[Byte](2))
+    val key3 = Key(Array[Byte](3))
+    val value = Value(new Array[Byte](60))
+
+    var lptr: KeyValueObjectPointer = null
+    var rootRightWhenDeletingKey3: Option[KeyValueListPointer] = None
+
+    // By the time key3's node is being emptied, key2's node has been deleted
+    // and unlinked. The root must point at key3's node, not the deleted one
+    def deleteKV(k: Key, vs: ValueState): Future[Unit] =
+      if k == key3 then
+        client.read(lptr).map: kvos =>
+          rootRightWhenDeletingKey3 = kvos.right.map(v => KeyValueListPointer(v.bytes))
+      else
+        Future.unit
+
+    for {
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+
+      tx = client.newTransaction()
+
+      ptr <- alloc.allocateKeyValueObject()(using tx)
+      _ = lptr = ptr
+
+      lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
+        ObjectRefcount(0, 1), Map(), None)
+
+      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- tx.commit()
+
+      lst1 <- lst.refresh()
+      tx2 = client.newTransaction()
+      _ <- lst1.insert(key2, value, 100, alloc)(using tx2)
+      _ <- tx2.commit()
+
+      lst2 <- lst.refresh()
+      node2 <- lst2.fetchContainingNode(key3)
+      tx3 = client.newTransaction()
+      _ <- node2.insert(key3, value, 100, alloc)(using tx3)
+      _ <- tx3.commit()
+
+      node2 <- node2.refresh()
+
+      _ <- KeyValueListNode.deleteList(client,
+        KeyValueListPointer(Key.AbsoluteMinimum, lptr),
+        ByteArrayKeyOrdering,
+        Some(deleteKV))
+
+    } yield {
+      node2.tail.isEmpty should be (false)
+      rootRightWhenDeletingKey3.map(_.pointer.id) should be (node2.tail.map(_.pointer.id))
     }
   }
 

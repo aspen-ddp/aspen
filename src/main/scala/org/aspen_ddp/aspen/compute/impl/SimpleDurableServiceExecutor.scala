@@ -16,7 +16,7 @@ import java.util.UUID
 import java.util.concurrent.ThreadLocalRandom
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration.*
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 class SimpleDurableServiceExecutor(
   val client: AspenClient,
@@ -63,8 +63,11 @@ class SimpleDurableServiceExecutor(
     val rangeMillis = maxScanInterval.toMillis - minScanInterval.toMillis
     val delayMillis = minScanInterval.toMillis + ThreadLocalRandom.current().nextLong(rangeMillis)
     synchronized:
-      scanTask = backgroundTasks.schedule(Duration(delayMillis, MILLISECONDS)):
-        doScan()
+      // A scan that was in flight when shutdown() ran finishes by calling this. Without the
+      // check it would re-arm itself and scan for the life of the process.
+      if !isShutdown then
+        scanTask = backgroundTasks.schedule(Duration(delayMillis, MILLISECONDS)):
+          doScan()
 
   private val scanFn: () => Unit = boundedSingleFlight("durable-service-scan"):
     val entries = ListBuffer[(Key, ServiceEntry, ObjectRevision)]()
@@ -134,33 +137,54 @@ class SimpleDurableServiceExecutor(
                   service.shutdown()
 
   protected def startRenewalTimer(serviceUUID: UUID): ScheduledTask =
+    // Single flight: a tick must not start a second renewal while the previous one is still
+    // retrying, or the chains pile up, collide on the one services key, and keep each other
+    // failing. stallAfter is the lease because a renewal outliving the lease has lost it.
+    val renew = boundedSingleFlight("durable-service-renewal", stallAfter = FiniteDuration(leaseDuration.toMillis, MILLISECONDS)):
+      renewLease(serviceUUID)
     backgroundTasks.schedulePeriodic(renewalInterval):
-      doRenewal(serviceUUID)
+      renew()
 
-  protected def doRenewal(serviceUUID: UUID): Unit =
+  /** Renew one service's lease, retrying a failed attempt after a short jittered delay until it
+   *  commits, the lease is found lost, or this host stops owning the service. Every attempt
+   *  starts from a fresh read, so ownership changes and an expired lease end the retrying. */
+  private def renewLease(serviceUUID: UUID): Future[Unit] =
     val serviceKey = Key(serviceUUID)
 
-    def attempt(): Unit =
-      servicesTkvl.get(serviceKey).foreach:
-        case None =>
-          // Service was unregistered; scan will detect and clean up ownedServices
-          ()
-        case Some(vs) =>
-          val entry = ServiceEntry.decode(vs.value.bytes)
-          val now   = HLCTimestamp.now
+    def stillOwned: Boolean = synchronized(!isShutdown && ownedServices.contains(serviceUUID))
 
-          if entry.hostId != hostId.uuid then
-            handleLeaseLoss(serviceUUID)
-          else if entry.leaseExpiry < now then
-            handleLeaseLoss(serviceUUID)
-          else
-            val newExpiry = HLCTimestamp(now.asLong + (leaseDuration.toMillis << 16))
-            val newEntry  = entry.copy(leaseExpiry = newExpiry)
-            client.transact: tx =>
-              given Transaction = tx
-              servicesTkvl.set(serviceKey, Value(newEntry.encode()), Some(Right(vs.revision)))(using tx)
-            .failed.foreach: _ =>
-              attempt()  // retry from a fresh read to pick up any ownership changes
+    def retryLater(): Future[Unit] =
+      val p = Promise[Unit]()
+      val delayMillis = 10 + ThreadLocalRandom.current().nextLong(math.max(1L, renewalInterval.toMillis / 4))
+      backgroundTasks.schedule(Duration(delayMillis, MILLISECONDS)):
+        p.success(())
+      p.future.flatMap(_ => attempt())
+
+    def attempt(): Future[Unit] =
+      if !stillOwned then
+        Future.unit
+      else
+        servicesTkvl.get(serviceKey).flatMap:
+          case None =>
+            // Service was unregistered; scan will detect and clean up ownedServices
+            Future.unit
+          case Some(vs) =>
+            val entry = ServiceEntry.decode(vs.value.bytes)
+            val now   = HLCTimestamp.now
+
+            if entry.hostId != hostId.uuid || entry.leaseExpiry < now then
+              handleLeaseLoss(serviceUUID)
+              Future.unit
+            else
+              val newExpiry = HLCTimestamp(now.asLong + (leaseDuration.toMillis << 16))
+              val newEntry  = entry.copy(leaseExpiry = newExpiry)
+              client.transact: tx =>
+                given Transaction = tx
+                servicesTkvl.set(serviceKey, Value(newEntry.encode()), Some(Right(vs.revision)))(using tx)
+              .recoverWith:
+                case _ => retryLater()
+        .recoverWith:
+          case _ => retryLater()
 
     attempt()
 

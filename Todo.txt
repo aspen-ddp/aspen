@@ -163,3 +163,32 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     pollPeriod are the same static pattern but no test sets them (the FailedStorageDevice
     harness passes the period explicitly), so they are inert; remove or convert if a test ever
     needs them.
+
+
+[x] 6. Lease renewal retried without delay or bound; stacked chains starved loaded runs  (FIXED 2026-10-21)
+
+    Found by re-running the full suite under saturation (24 busy loops) after items 1-5.
+    Moderate load (12 loops, 10 runs) passed 10/10, so item 1's measurement had missed this.
+    Saturated, before the fix: of ~10 full runs, 4 failed and 5 hung (until the 900s timeout),
+    nearly always in RebalancingServiceSuite's first test, once in DurableServiceSuite. The
+    failures looked like item 4's (120s deadline, "active tasks did not empty") but were not
+    starvation: a hung run had ~550 reads/s on the services TKVL for 5+ minutes.
+    Root cause: SimpleDurableServiceExecutor.doRenewal retried a failed renewal transaction
+    immediately and forever (`.failed.foreach(_ => attempt())`), and schedulePeriodic started a
+    new chain every renewalInterval whether or not the last one had finished. One failure under
+    load left a chain; each later tick added another; they all write the same services key with
+    a revision check, so they kept failing each other. The reads (and a watchdog thread per read
+    in the test network's read driver) saturated the suite's serial executor, so the test's own
+    continuations and its deadline never ran. A production bug too: renewals competing with
+    scans/claims could starve the executor and lose leases.
+    Fix: renewal runs through boundedSingleFlight (one per tick), retries after a jittered delay,
+    and stops when the executor is shut down or the service is no longer owned; each attempt
+    re-reads, so an expired lease still ends in handleLeaseLoss.
+    Also fixed: shutdown() did not stop an in-flight scan, which re-armed itself via
+    scheduleScan() and scanned forever (a zombie executor). Seen 6 times in one loaded run.
+    scheduleScan now does nothing once shut down.
+    Verified: 8 saturated full runs, 941/941 each; idle 47/47 on the four executor suites.
+    Not verified: no deterministic regression test for either fix (both need a failing
+    transaction / a shutdown racing a scan). The first sat run after the fix is a small sample.
+    Not changed: DurableServiceSuite still calls exec.shutdown() only in the success path
+    (the item 5 pattern), and the test network read driver spawns a thread per read.

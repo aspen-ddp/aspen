@@ -217,7 +217,7 @@ class MainSuite extends AnyFunSuite with Matchers:
       val bsHost = bsCfg.hosts.head
       bsHost.name shouldBe hostCfg.name
       bsHost.dataPort shouldBe hostCfg.dataPort
-      bsHost.cncPort shouldBe hostCfg.cncPort
+      bsHost.httpPort shouldBe hostCfg.httpPort
       bsHost.storeTransferPort shouldBe hostCfg.storeTransferPort
       bsHost.stores shouldBe (0 until 3).map(i => StoreId(PoolId.BootstrapPoolId, i.toByte)).toList
 
@@ -248,7 +248,7 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   test("validateHostAddress rejects an embedded port"):
     Main.validateHostAddress("10.0.0.5:4750") shouldBe
-      Some("Address must not include a port; use --data-port/--cnc-port/--store-transfer-port")
+      Some("Address must not include a port; use --data-port/--http-port/--store-transfer-port")
 
   test("validateHostAddress rejects an unbracketed IPv6 literal"):
     Main.validateHostAddress("fd00::5") shouldBe
@@ -498,11 +498,11 @@ class MainSuite extends AnyFunSuite with Matchers:
     withTempDir("parse-ports"): dir =>
       val parsed = Main.buildParser.parse(
         Seq("bootstrap", dir.resolve("target").toString, "10.0.0.1", "Replication", "2", "2", "3",
-            "--data-port", "5000", "--cnc-port", "5001", "--store-transfer-port", "5002"),
+            "--data-port", "5000", "--http-port", "5001", "--store-transfer-port", "5002"),
         Main.Args()).getOrElse(fail("bootstrap did not parse"))
 
       parsed.dataPort shouldBe 5000
-      parsed.cncPort shouldBe 5001
+      parsed.httpPort shouldBe 5001
       parsed.storeTransferPort shouldBe 5002
 
   test("a command's validation still rejects a bad argument"):

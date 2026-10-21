@@ -59,7 +59,7 @@ object Main {
   // Default listening ports for a newly created host. Shared by every subcommand that
   // creates one so the ports a host is given do not depend on which command created it.
   val DefaultDataPort: Int = 4750
-  val DefaultCnCPort: Int = 4751
+  val DefaultHttpPort: Int = 4751
   val DefaultStoreTransferPort: Int = 4752
 
   // How often a running host rescans for storage devices it has not yet loaded. run_host()
@@ -91,7 +91,7 @@ object Main {
                   host:String="",
                   port:Int=0,
                   dataPort:Int=DefaultDataPort,
-                  cncPort:Int=DefaultCnCPort,
+                  httpPort:Int=DefaultHttpPort,
                   storeTransferPort:Int=DefaultStoreTransferPort,
                   newPoolName: String="",
                   idaType: String="",
@@ -260,10 +260,10 @@ object Main {
         validate(validPort).
         action((x, c) => c.copy(dataPort = x)),
 
-      opt[Int]("cnc-port").valueName("<port>").
-        text(s"Port for command-and-control messages (default: $DefaultCnCPort)").
+      opt[Int]("http-port").valueName("<port>").
+        text(s"Port for the HTTP bootstrap endpoint (default: $DefaultHttpPort)").
         validate(validPort).
-        action((x, c) => c.copy(cncPort = x)),
+        action((x, c) => c.copy(httpPort = x)),
 
       opt[Int]("store-transfer-port").valueName("<port>").
         text(s"Port for store transfers (default: $DefaultStoreTransferPort)").
@@ -671,8 +671,8 @@ object Main {
     checkConfig { c =>
       if c.mode == "" then
         failure("Invalid command")
-      else if Set(c.dataPort, c.cncPort, c.storeTransferPort).size != 3 then
-        failure("data-port, cnc-port, and store-transfer-port must all be different")
+      else if Set(c.dataPort, c.httpPort, c.storeTransferPort).size != 3 then
+        failure("data-port, http-port, and store-transfer-port must all be different")
       else if c.mode == "system-rebalance-period" then
         // Validated here rather than in the handler so a malformed period is a usage error,
         // reported before any client or network is built.
@@ -766,7 +766,7 @@ object Main {
           //println(s"Config file: $config")
           cfg.mode match
             case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
-                                          cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
+                                          cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
             case "host" => run_host(absPath(cfg.hostDirectory))
             case "amoebafs" => run_amoebafs(bootstrapConfigPath, cfg.fsName)
             // OBSOLETE: see the commented-out "debug" parser entry above.
@@ -781,7 +781,7 @@ object Main {
             case "fail-storage-device" => fail_storage_device(bootstrapConfigPath, cfg.deviceId)
             case "add-host" => add_host(bootstrapConfig, bootstrapConfigPath,
                                         absPath(cfg.hostDirectory), cfg.hostName, cfg.address,
-                                        cfg.dataPort, cfg.cncPort, cfg.storeTransferPort)
+                                        cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
             case "create-storage-device" => create_storage_device(bootstrapConfig, bootstrapConfigPath,
                                                                   absPath(cfg.hostDirectory), cfg.deviceName,
                                                                   cfg.deviceSetName)
@@ -1124,7 +1124,7 @@ object Main {
                 baseDirectory: Path, // created if it does not already exist
                 address: String, // advertised to other hosts; never bound to
                 dataPort: Int,
-                cncPort: Int,
+                httpPort: Int,
                 storeTransferPort: Int): Int = {
 
     if isUnreachableAddress(address) then
@@ -1163,7 +1163,7 @@ object Main {
       "bootstrap-host",
       address,
       dataPort,
-      cncPort,
+      httpPort,
       storeTransferPort,
       HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300),
       Pem.encodeCertificate(tlsCert),
@@ -1215,7 +1215,7 @@ object Main {
       "bootstrap-host",
       address,
       hostConfig.dataPort,
-      hostConfig.cncPort,
+      hostConfig.httpPort,
       hostConfig.storeTransferPort,
       Set(storageDevConfig.storageDeviceId)
     )
@@ -1544,7 +1544,7 @@ object Main {
                hostName: String,
                address: String,
                dataPort: Int,
-               cncPort: Int,
+               httpPort: Int,
                storeTransferPort: Int): Int = {
 
     configureLogging()
@@ -1563,7 +1563,7 @@ object Main {
 
     val f = HostManager.createHost(
       client, hostDir, bootstrapConfigFile.toNIO, bootstrapCfg.aspenSystemId,
-      hostName, address, dataPort, cncPort, storeTransferPort)
+      hostName, address, dataPort, httpPort, storeTransferPort)
 
     def reportError(cause: Throwable): Unit = cause match
       case e: HostManager.HostAlreadyConfigured =>
@@ -1843,7 +1843,7 @@ object Main {
     lines += s"  UUID:                ${s.hostId.uuid}"
     lines += s"  Address:             ${s.address}"
     lines += s"  Data Port:           ${s.dataPort}"
-    lines += s"  CnC Port:            ${s.cncPort}"
+    lines += s"  HTTP Port:           ${s.httpPort}"
     lines += s"  Store Transfer Port: ${s.storeTransferPort}"
     if s.storageDevices.isEmpty then
       lines += "  Storage Devices:     none"
@@ -1872,7 +1872,7 @@ object Main {
     else if address.startsWith("[") && address.endsWith("]") && colons > 0 then
       None // bracketed IPv6 literal
     else if colons == 1 then
-      Some("Address must not include a port; use --data-port/--cnc-port/--store-transfer-port")
+      Some("Address must not include a port; use --data-port/--http-port/--store-transfer-port")
     else if colons > 1 then
       Some("IPv6 literals must be bracketed, e.g. [fd00::5]")
     else

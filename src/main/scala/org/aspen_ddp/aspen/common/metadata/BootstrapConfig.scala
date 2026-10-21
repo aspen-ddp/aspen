@@ -28,7 +28,7 @@ bootstrap-hosts:
     name: node_a
     address: 127.0.0.1
     data-port: 5000
-    cnc-port: 5001
+    http-port: 5001
     store-transfer-port: 5002
     stores:
       - 00000000-0000-0000-0000-000000000000:0
@@ -88,7 +88,7 @@ object BootstrapConfig:
                            name: String,
                            address: String,
                            dataPort: Int,
-                           cncPort: Int,
+                           httpPort: Int,
                            storeTransferPort: Int,
                            stores: List[StoreId])
 
@@ -97,18 +97,18 @@ object BootstrapConfig:
     val name: Required[String]           = Required("name", YString)
     val address: Required[String]        = Required("address", YString)
     val dataPort: Required[Int]          = Required("data-port", YInt)
-    val cncPort: Required[Int]           = Required("cnc-port", YInt)
+    val httpPort: Required[Int]           = Required("http-port", YInt)
     val storeTransferPort: Required[Int] = Required("store-transfer-port", YInt)
     val stores: Required[List[StoreId]]  = Required("stores", YList(StoreId.YStoreId))
 
-    val attrs: List[Attr] = hostId :: name :: address :: dataPort :: cncPort :: storeTransferPort :: stores :: Nil
+    val attrs: List[Attr] = hostId :: name :: address :: dataPort :: httpPort :: storeTransferPort :: stores :: Nil
 
     def create(o: Object): BootstrapHost = BootstrapHost(
       hostId.get(o),
       name.get(o),
       address.get(o),
       dataPort.get(o),
-      cncPort.get(o),
+      httpPort.get(o),
       storeTransferPort.get(o),
       stores.get(o)
     )
@@ -204,7 +204,7 @@ object BootstrapConfig:
       sb.append(f"    name: ${host.name}\n")
       sb.append(f"    address: ${host.address}\n")
       sb.append(f"    data-port: ${host.dataPort}\n")
-      sb.append(f"    cnc-port: ${host.cncPort}\n")
+      sb.append(f"    http-port: ${host.httpPort}\n")
       sb.append(f"    store-transfer-port: ${host.storeTransferPort}\n")
       sb.append(f"    stores:\n")
       storesOnHost.foreach: storeId =>

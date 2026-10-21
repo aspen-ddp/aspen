@@ -180,7 +180,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def createHost(name: String,
                  address: String,
                  dataPort: Int,
-                 cncPort: Int,
+                 httpPort: Int,
                  storeTransferPort: Int,
                  hostId: HostId = HostId(UUID.randomUUID())): Future[HostId]
 

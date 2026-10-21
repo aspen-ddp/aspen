@@ -78,7 +78,7 @@ object HostManager:
                  name: String,
                  address: String,
                  dataPort: Int,
-                 cncPort: Int,
+                 httpPort: Int,
                  storeTransferPort: Int)
                 (using ExecutionContext): Future[HostId] =
 
@@ -116,7 +116,7 @@ object HostManager:
               tlsCert <- client.createTLSCertificate(hostId.uuid, tlsKeyPair.getPublic)
                            .recoverWith:
                              case t => Future.failed(new CertificateCreationFailed(t))
-              _       <- client.createHost(name, address, dataPort, cncPort, storeTransferPort, hostId)
+              _       <- client.createHost(name, address, dataPort, httpPort, storeTransferPort, hostId)
             yield tlsCert
 
           registered.map: tlsCert =>
@@ -126,7 +126,7 @@ object HostManager:
               name,
               address,
               dataPort,
-              cncPort,
+              httpPort,
               storeTransferPort,
               HostConfig.SimpleCRL(DefaultCrlNumStreams, DefaultCrlFileSizeMb),
               Pem.encodeCertificate(tlsCert),

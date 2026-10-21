@@ -595,7 +595,7 @@ message HostState {
   string name = 2;
   string address = 3;
   uint32 dataPort = 4;
-  uint32 cncPort = 5;
+  uint32 httpPort = 5;
   uint32 storeTransferPort = 6;
   repeated StorageDeviceId storageDevices = 7;
 }

@@ -114,7 +114,7 @@ class HostManagerSuite extends IntegrationTestSuite:
       cfg.name should be("node_b")
       cfg.address should be("10.0.0.7")
       cfg.dataPort should be(5750)
-      cfg.cncPort should be(5751)
+      cfg.httpPort should be(5751)
       cfg.storeTransferPort should be(5752)
       cfg.crl should be(HostConfig.SimpleCRL(HostManager.DefaultCrlNumStreams,
                                              HostManager.DefaultCrlFileSizeMb))

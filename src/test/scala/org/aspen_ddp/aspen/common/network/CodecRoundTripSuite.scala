@@ -625,7 +625,7 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.name shouldBe "host-1"
     decoded.address shouldBe "192.168.1.1"
     decoded.dataPort shouldBe 5000
-    decoded.cncPort shouldBe 5001
+    decoded.httpPort shouldBe 5001
     decoded.storeTransferPort shouldBe 5002
     decoded.storageDevices.size shouldBe 2
 

@@ -73,7 +73,7 @@ aspen-system-id: 00000000-0000-0000-0000-000000000000
 name: bootstrap-host
 address: 127.0.0.1
 data-port: 4750
-cnc-port: 4751
+http-port: 4751
 store-transfer-port: 4752
 crl:
   storage-engine: simple-crl
@@ -99,7 +99,7 @@ tls-private-key: |
       cfg.name should be("bootstrap-host")
       cfg.address should be("127.0.0.1")
       cfg.dataPort should be(4750)
-      cfg.cncPort should be(4751)
+      cfg.httpPort should be(4751)
       cfg.storeTransferPort should be(4752)
       cfg.crl should be(HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300))
 

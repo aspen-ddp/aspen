@@ -17,7 +17,7 @@ object MetadataManager:
                   val name: String,
                   val address: String,
                   val dataPort: Int,
-                  val cncPort: Int,
+                  val httpPort: Int,
                   val storeTransferPort: Int)
 
   trait NetworkImplInterface[T <: HostEntry]:
@@ -25,7 +25,7 @@ object MetadataManager:
                         name: String,
                         address: String,
                         dataPort: Int,
-                        cncPort: Int,
+                        httpPort: Int,
                         storeTransferPort: Int,
                         queuedMessages: EvictingQueue[Message]): T
 
@@ -345,7 +345,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
           bsHost.name,
           bsHost.address,
           bsHost.dataPort,
-          bsHost.cncPort,
+          bsHost.httpPort,
           bsHost.storeTransferPort,
           new EvictingQueue[Message](1)
         ))
@@ -396,7 +396,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
                     hostState.name,
                     hostState.address,
                     hostState.dataPort,
-                    hostState.cncPort,
+                    hostState.httpPort,
                     hostState.storeTransferPort,
                     phl.messageQueue
                   ))

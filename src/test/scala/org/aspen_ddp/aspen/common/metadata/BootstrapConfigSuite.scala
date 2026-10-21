@@ -45,7 +45,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     h.name should be("node_a")
     h.address should be("127.0.0.1")
     h.dataPort should be(5000)
-    h.cncPort should be(5001)
+    h.httpPort should be(5001)
     h.storeTransferPort should be(5002)
     h.stores should be(List(storeId))
 
@@ -53,6 +53,8 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     generated should include("bootstrap-hosts:")
     generated should include("- host-id: 11111111-1111-1111-1111-111111111111")
     generated should not include "hostState"
+    generated should include("http-port: 5001")
+    generated should not include "cnc-port"
 
   test("loadBootstrapConfig round-trips generateBootstrapConfig"):
     val f = Files.createTempFile("aspen-bootstrap-config", ".yaml")
@@ -109,7 +111,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       h1.name should be("node_1")
       h1.address should be("10.0.0.1")
       h1.dataPort should be(5000)
-      h1.cncPort should be(5001)
+      h1.httpPort should be(5001)
       h1.storeTransferPort should be(5002)
       h1.stores should be(List(store0))
 
@@ -118,7 +120,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       h2.name should be("node_2")
       h2.address should be("10.0.0.2")
       h2.dataPort should be(5010)
-      h2.cncPort should be(5011)
+      h2.httpPort should be(5011)
       h2.storeTransferPort should be(5012)
       h2.stores should be(List(store1, store2))
 
@@ -127,7 +129,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       h3.name should be("node_3")
       h3.address should be("10.0.0.3")
       h3.dataPort should be(5020)
-      h3.cncPort should be(5021)
+      h3.httpPort should be(5021)
       h3.storeTransferPort should be(5022)
       h3.stores should be(List(store3))
     finally
@@ -144,7 +146,7 @@ bootstrap-hosts:
     name: node_a
     address: 127.0.0.1
     data-port: 5000
-    cnc-port: 5001
+    http-port: 5001
     store-transfer-port: 5002
     stores:
       - 00000000-0000-0000-0000-000000000000:0
@@ -177,7 +179,7 @@ cli-private-key: |
       h.name should be("node_a")
       h.address should be("127.0.0.1")
       h.dataPort should be(5000)
-      h.cncPort should be(5001)
+      h.httpPort should be(5001)
       h.storeTransferPort should be(5002)
       h.stores should be(List(StoreId(PoolId(UUID.fromString("00000000-0000-0000-0000-000000000000")), 0.toByte)))
     finally
@@ -195,7 +197,7 @@ bootstrap-hosts:
     name: bootstrap-host
     address: 127.0.0.1
     data-port: 4750
-    cnc-port: 4751
+    http-port: 4751
     store-transfer-port: 4752
     stores:
       - 00000000-0000-0000-0000-000000000000:0
@@ -237,7 +239,7 @@ bootstrap-hosts:
     name: node_a
     address: 127.0.0.1
     data-port: 5000
-    cnc-port: 5001
+    http-port: 5001
     store-transfer-port: 5002
     stores:
       - 44444444-4444-4444-4444-444444444444:0
@@ -245,7 +247,7 @@ bootstrap-hosts:
     name: node_b
     address: 127.0.0.2
     data-port: 5003
-    cnc-port: 5004
+    http-port: 5004
     store-transfer-port: 5005
     stores:
       - 44444444-4444-4444-4444-444444444444:1

@@ -19,7 +19,7 @@ class HostCreationSuite extends IntegrationTestSuite:
       hs.name should be("node_b")
       hs.address should be("10.0.0.7")
       hs.dataPort should be(5750)
-      hs.cncPort should be(5751)
+      hs.httpPort should be(5751)
       hs.storeTransferPort should be(5752)
       hs.storageDevices should be(Set.empty)
 

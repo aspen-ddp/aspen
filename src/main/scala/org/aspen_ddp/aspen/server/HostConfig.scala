@@ -13,7 +13,7 @@ aspen-system-id: 00000000-0000-0000-0000-000000000000
 name: bootstrap-host
 address: 127.0.0.1
 data-port: 4750
-cnc-port: 4751
+http-port: 4751
 store-transfer-port: 4752
 crl:
   storage-engine: simple-crl
@@ -33,7 +33,7 @@ case class HostConfig(hostId: HostId,
                       name: String,
                       address: String,
                       dataPort: Int,
-                      cncPort: Int,
+                      httpPort: Int,
                       storeTransferPort: Int,
                       crl: HostConfig.CRLBackend,
                       tlsCertificate: String,
@@ -44,7 +44,7 @@ case class HostConfig(hostId: HostId,
        |name: $name
        |address: $address
        |data-port: $dataPort
-       |cnc-port: $cncPort
+       |http-port: $httpPort
        |store-transfer-port: $storeTransferPort
        |crl:
        |""".stripMargin
@@ -84,7 +84,7 @@ object HostConfig extends YObject[HostConfig]:
   val name: Required[String]           = Required("name", YString)
   val address: Required[String]        = Required("address", YString)
   val dataPort: Required[Int]          = Required("data-port", YInt)
-  val cncPort: Required[Int]           = Required("cnc-port", YInt)
+  val httpPort: Required[Int]           = Required("http-port", YInt)
   val storeTransferPort: Required[Int] = Required("store-transfer-port", YInt)
   val crl: Required[SimpleCRL]         = Required("crl", Choice("storage-engine", Map("simple-crl" -> SimpleCRL)))
 
@@ -97,7 +97,7 @@ object HostConfig extends YObject[HostConfig]:
     name,
     address,
     dataPort,
-    cncPort,
+    httpPort,
     storeTransferPort,
     crl,
     tlsCertificate,
@@ -110,7 +110,7 @@ object HostConfig extends YObject[HostConfig]:
     name.get(o),
     address.get(o),
     dataPort.get(o),
-    cncPort.get(o),
+    httpPort.get(o),
     storeTransferPort.get(o),
     crl.get(o),
     tlsCertificate.get(o),

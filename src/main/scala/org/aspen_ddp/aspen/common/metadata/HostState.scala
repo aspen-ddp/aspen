@@ -38,7 +38,7 @@ case class HostState(hostId: HostId,
                      name: String,
                      address: String,
                      dataPort: Int,
-                     cncPort: Int,
+                     httpPort: Int,
                      storeTransferPort: Int,
                      storageDevices: Set[StorageDeviceId]):
   

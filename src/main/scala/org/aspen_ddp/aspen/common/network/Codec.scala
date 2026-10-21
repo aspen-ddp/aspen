@@ -1189,7 +1189,7 @@ object Codec extends Logging:
       name = o.name,
       address = o.address,
       dataPort = o.dataPort,
-      cncPort = o.cncPort,
+      httpPort = o.httpPort,
       storeTransferPort = o.storeTransferPort,
       storageDevices = o.storageDevices.map(encode).toSeq
     )
@@ -1199,11 +1199,11 @@ object Codec extends Logging:
     val name = m.name
     val address = m.address
     val dataPort = m.dataPort
-    val cncPort = m.cncPort
+    val httpPort = m.httpPort
     val storeTransferPort = m.storeTransferPort
     val storageDevices = m.storageDevices.map(decode).toSet
 
-    HostState(hostId, name, address, dataPort, cncPort, storeTransferPort, storageDevices)
+    HostState(hostId, name, address, dataPort, httpPort, storeTransferPort, storageDevices)
 
   // Storage Device Messages -----------------------------------------------------------------
 

@@ -224,7 +224,7 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
                       name: String,
                       address: String,
                       dataPort: Int,
-                      cncPort: Int,
+                      httpPort: Int,
                       storeTransferPort: Int,
                       queuedMessages: EvictingQueue[Message]): MetadataManager.HostEntry =
     synchronized:
@@ -232,7 +232,7 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
       createFailures.get(hostId) match
         case Some(err) => throw err
         case None => ()
-    new MetadataManager.HostEntry(hostId, name, address, dataPort, cncPort, storeTransferPort)
+    new MetadataManager.HostEntry(hostId, name, address, dataPort, httpPort, storeTransferPort)
 
   def storeResolved(hostEntry: MetadataManager.HostEntry,
                     storeId: StoreId,

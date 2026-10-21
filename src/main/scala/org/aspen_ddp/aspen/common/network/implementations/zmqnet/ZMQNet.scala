@@ -70,8 +70,8 @@ object ZMQNet extends Logging:
                      name: String,
                      address: String,
                      dataPort: Int,
-                     cncPort: Int,
-                     storeTransferPort: Int) extends MetadataManager.HostEntry(hostId, name, address, dataPort, cncPort, storeTransferPort) with Logging:
+                     httpPort: Int,
+                     storeTransferPort: Int) extends MetadataManager.HostEntry(hostId, name, address, dataPort, httpPort, storeTransferPort) with Logging:
     // Unless noted otherwise, the state below is read and written only by the zmq-io thread and
     // is published without synchronization. Reading one of these fields from another thread
     // requires making it volatile first -- see odealer. pendingMessages is the exception: it is
@@ -187,10 +187,10 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
                         name: String,
                         address: String,
                         dataPort: Int,
-                        cncPort: Int,
+                        httpPort: Int,
                         storeTransferPort: Int,
                         queuedMessages: EvictingQueue[Message]): ZMQHostEntry =
-      val entry = new ZMQHostEntry(hostId, name, address, dataPort, cncPort, storeTransferPort)
+      val entry = new ZMQHostEntry(hostId, name, address, dataPort, httpPort, storeTransferPort)
       // Drain any queued messages into the host entry's pending queue
       var omsg = queuedMessages.dequeue()
       while omsg.isDefined do

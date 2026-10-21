@@ -274,12 +274,12 @@ abstract class BaseAspenClient(
   override def createHost(name: String,
                           address: String,
                           dataPort: Int,
-                          cncPort: Int,
+                          httpPort: Int,
                           storeTransferPort: Int,
                           hostId: HostId): Future[HostId] =
     // The id is fixed outside runCreate, as createStorageDevice does for its device id, so a
     // retried attempt reuses it rather than leaking a fresh UUID per attempt.
-    val state = HostState(hostId, name, address, dataPort, cncPort, storeTransferPort, Set())
+    val state = HostState(hostId, name, address, dataPort, httpPort, storeTransferPort, Set())
 
     // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
     // name registration through Registry.prepareRegister, which reports a taken name that way.

@@ -1205,30 +1205,6 @@ object Codec extends Logging:
 
     HostState(hostId, name, address, dataPort, cncPort, storeTransferPort, storageDevices)
 
-  // CnC Messages -----------------------------------------------------------------
-
-  // Maps a concrete CnCRequest to its (msgType, payload) wire envelope. This is
-  // the single place to extend when a new CnC request type is added. No request
-  // types are currently defined.
-  def encodeCnCRequest(o: CnCRequest): codec.CnCRequest = o match
-    // case m: SomeFutureRequest =>
-    //   codec.CnCRequest(msgType = "SomeFutureRequest", payload = encode(m).toByteString)
-    case _ => throw new UnsupportedOperationException("No CnC request types are defined")
-
-  // Reconstructs a CnCRequest from its wire envelope. Mirror of encodeCnCRequest.
-  def decodeCnCRequest(m: codec.CnCRequest): CnCRequest = m.msgType match
-    // case "SomeFutureRequest" => decode(codec.SomeFutureRequest.parseFrom(m.payload.toByteArray))
-    case other => throw new UnsupportedOperationException(s"Unknown CnC request type: $other")
-
-  def encode(o: CnCReply): codec.CnCReply = o match
-    case CnCReply.Ok()       => codec.CnCReply(codec.CnCReply.Msg.Ok(codec.CnCOk()))
-    case CnCReply.Error(msg) => codec.CnCReply(codec.CnCReply.Msg.Error(codec.CnCError(message = msg)))
-
-  def decode(m: codec.CnCReply): CnCReply = m.msg match
-    case codec.CnCReply.Msg.Ok(_)    => CnCReply.Ok()
-    case codec.CnCReply.Msg.Error(e) => CnCReply.Error(e.message)
-    case codec.CnCReply.Msg.Empty    => CnCReply.Error("empty CnC reply")
-
   // Storage Device Messages -----------------------------------------------------------------
 
   def encode(o: StorageDeviceId): codec.StorageDeviceId =

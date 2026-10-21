@@ -601,29 +601,6 @@ message HostState {
 }
 
 //---------------------------------------------------------------------------
-//- CnC Messages
-//---------------------------------------------------------------------------
-
-message CnCRequest {
-  string msgType = 1;
-  bytes  payload = 2;
-}
-
-message CnCOk {
-}
-
-message CnCError {
-  string message = 1;
-}
-
-message CnCReply {
-  oneof msg {
-    CnCOk ok = 1;
-    CnCError error = 2;
-  }
-}
-
-//---------------------------------------------------------------------------
 //- Storage Device Messages
 //---------------------------------------------------------------------------
 

@@ -1109,11 +1109,6 @@ object Main {
 
     host.start()
 
-    /*val cncBackend = new ZCnCBackend(
-      nnet,
-      hostCfg.cncPort,
-      CnCMessageReceiver.Unhandled)*/
-
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO
     // thread is what keeps the process alive; the IO thread itself is a daemon thread.
     network.joinIoThread()
@@ -1861,8 +1856,8 @@ object Main {
   /** Validates the advertised address of a host being created. Returns None if the address is
    *  usable, or Some(message) explaining why it is not.
    *
-   *  This is the host component of the `tcp://<address>:<port>` endpoints ZMQNet and
-   *  ZCnCFrontend build, so anything that would corrupt that string is rejected here rather
+   *  This is the host component of the `tcp://<address>:<port>` endpoints ZMQNet builds,
+   *  so anything that would corrupt that string is rejected here rather
    *  than surfacing later as an unexplained connect failure. Nothing is resolved: a system may
    *  well be bootstrapped before its DNS entry exists.
    */

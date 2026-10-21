@@ -629,14 +629,6 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.storeTransferPort shouldBe 5002
     decoded.storageDevices.size shouldBe 2
 
-  test("CnCReply round-trip"):
-    val ok: CnCReply = CnCReply.Ok()
-    Codec.decode(Codec.encode(ok)) shouldBe a[CnCReply.Ok]
-
-    val err: CnCReply = CnCReply.Error("boom")
-    val decodedErr = Codec.decode(Codec.encode(err)).asInstanceOf[CnCReply.Error]
-    decodedErr.message shouldBe "boom"
-
   test("StorageDeviceId round-trip"):
     val original = StorageDeviceId(uuid(42))
     val decoded = Codec.decode(Codec.encode(original))

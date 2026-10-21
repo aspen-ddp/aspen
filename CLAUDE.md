@@ -113,12 +113,6 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - If committed, FinalizationActions are then run. Once complete, the CRL content is dropped and the transaction is forgotten.
   - If the refcount of the object is set to zero, it is deleted
 
-### Command and Control (CnC)
-- Mechanism to instruct a store to do something immediately
-- Generally avoided as messages can be lost and/or hosts may be unavailable when the command is issued
-- Prefer updating state in the system for a later polling by the target entity
-- Largely deprecated and may be removed entirely
-
 ### Host and StorageDevice Management
 - Most administration is done by reading and writing host and device objects containing the desired state
 - Hosts will poll these instances and act on changes

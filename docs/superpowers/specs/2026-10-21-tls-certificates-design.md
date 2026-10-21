@@ -119,13 +119,9 @@ This is **intentional technical debt**: the CLI private key lives in a shared fi
 host and stored in the Radicle.
 
 ### CLI identity
-The CLI uses the fixed CLI UUID from the bootstrap config as its client id (instead of a per-run
-random id) when creating the network/client in `Main.createNetwork`/`createAspenClient`.
-Consequence accepted by the user: concurrent CLI processes share one client id. Acceptable while
-Aspen is in development.
-
-Commands that currently take an explicit client id, or `run_host` (which uses the host id), are
-unaffected except where they use the CLI's default client id.
+*(Revised after implementation.)* The certificate's UUID is not used as the client id. Mapping
+certificate identities to connections is left to the network plugin. All clients, including the
+CLI and `amoebafs`, keep using a randomly generated client id for each process.
 
 ### `aspen-host-config.yaml`
 New **required** fields on `HostConfig`:
@@ -163,7 +159,7 @@ concrete trait method (like `getBootstrapConfig`) since it only needs `read`.
 - Add an entry: design a proper certificate-management solution for CLIs and other client
   applications. Note the intentional technical debt: CLI cert/private key stored in
   `aspen-bootstrap-config.yaml` (copied to every host, stored in the Radicle), generated once at
-  bootstrap, and the CLI uses a fixed shared client id.
+  bootstrap.
 - Add an entry for certificate rotation / renewal / revocation (certs are currently ~100-year,
   never renewed).
 - No entry for CA private-key access control.

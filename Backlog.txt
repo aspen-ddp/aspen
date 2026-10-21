@@ -48,12 +48,6 @@ Design proper certificate management for the CLI and other client applications
     aspen-bootstrap-config.yaml, which is copied to every host and stored in the
     Radicle. They are generated once at bootstrap and carried forward unchanged
     whenever the config is regenerated.
-  - Every CLI process uses the same fixed client id taken from that certificate,
-    so concurrent CLI invocations share one identity. Consequently only one process
-    using the CLI identity can be connected at a time, and long-running commands such
-    as `amoebafs` count: while one is running, other CLI commands may stall or receive
-    the wrong replies. Long-running client applications like amoebafs should get their
-    own identity.
 
 TLS certificate rotation, renewal and revocation
   - CA and entity certificates are issued with ~100 year lifetimes and are never

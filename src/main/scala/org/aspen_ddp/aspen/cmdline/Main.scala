@@ -844,9 +844,7 @@ object Main {
 
     val bootstrapConfig = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO)
 
-    // The CLI always connects under the client id baked into its certificate
-    val (networkBridge, nnet) = onnet.getOrElse(
-      createNetwork(bootstrapConfigFile, None, Some(ClientId(bootstrapConfig.cli.cliId))))
+    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfigFile, None, None))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
     val initialReadDelay = Duration(10, SECONDS)

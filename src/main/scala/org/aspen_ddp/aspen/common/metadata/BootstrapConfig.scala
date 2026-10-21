@@ -174,8 +174,8 @@ object BootstrapConfig:
       require(storesOnHost.nonEmpty)
 
       sb.append(f"  - host-id: ${host.hostId.uuid}\n")
-      sb.append(f"    name: ${host.name}\n")
-      sb.append(f"    address: ${host.address}\n")
+      sb.append(f"    name: ${yamlQuote(host.name)}\n")
+      sb.append(f"    address: ${yamlQuote(host.address)}\n")
       sb.append(f"    data-port: ${host.dataPort}\n")
       sb.append(f"    http-port: ${host.httpPort}\n")
       sb.append(f"    store-transfer-port: ${host.storeTransferPort}\n")

@@ -55,6 +55,14 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     generated should include("http-port: 5001")
     generated should not include "cnc-port"
 
+  test("parseBootstrapConfig round-trips a bracketed IPv6 address and a YAML-special name"):
+    val host = HostState(hostId, "node: #a \"b\" \\c", "[::1]", 5000, 5001, 5002, Set())
+    val yaml = BootstrapConfig.generateBootstrapConfig(
+      systemId, Replication(1, 1), List(host), List(storeId -> hostId), TestTLS.caCertificatePem)
+    val cfg = BootstrapConfig.parseBootstrapConfig(yaml)
+    cfg.hosts.head.address should be("[::1]")
+    cfg.hosts.head.name should be("node: #a \"b\" \\c")
+
   test("loadBootstrapConfig round-trips generateBootstrapConfig"):
     val f = Files.createTempFile("aspen-bootstrap-config", ".yaml")
     try

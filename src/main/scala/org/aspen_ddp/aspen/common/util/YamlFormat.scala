@@ -73,6 +73,22 @@ object YamlFormat {
     sb.toString
   }
 
+  /** Emits `s` as a YAML double-quoted scalar, so values such as bracketed IPv6 addresses
+    * or names containing `: ` or `#` parse back as the same string.
+    */
+  def yamlQuote(s: String): String = {
+    val sb = new StringBuilder("\"")
+    s.foreach {
+      case '"'  => sb.append("\\\"")
+      case '\\' => sb.append("\\\\")
+      case '\n' => sb.append("\\n")
+      case '\t' => sb.append("\\t")
+      case c if c < ' ' => sb.append(f"\\x${c.toInt}%02x")
+      case c    => sb.append(c)
+    }
+    sb.append('"').toString
+  }
+
   trait Format[T] {
     def format(o: Object): T
   }

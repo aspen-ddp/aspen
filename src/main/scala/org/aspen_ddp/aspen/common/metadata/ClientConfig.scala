@@ -138,7 +138,7 @@ object ClientConfig:
     sb.append(yamlBlockScalar("private-key", cfg.credentials.privateKey))
     sb.append("bootstrap-hosts:\n")
     cfg.bootstrapHosts.foreach: e =>
-      sb.append(s"""  - "$e"\n""")
+      sb.append(s"  - ${yamlQuote(e.toString)}\n")
     sb.toString
 
   def parse(yaml: String): Config =

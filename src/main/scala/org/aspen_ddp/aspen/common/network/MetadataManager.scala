@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.util.{EvictingQueue, atomicWrite}
+import org.aspen_ddp.aspen.common.util.EvictingQueue
 import scribe.Logging
 
 import scala.concurrent.ExecutionContext
@@ -53,7 +53,12 @@ object MetadataManager:
         storeQueue.dequeue().foreach(messageQueue.enqueue)
 
 
-class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: os.Path,
+/** `initialBootstrapConfig` seeds the store and host maps at construction.
+ *  `onBootstrapConfigRefreshed` receives the fetched yaml and its parsed form after each refresh
+ *  has been applied; it is best-effort, see applyBootstrapConfig.
+ */
+class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: BootstrapConfig.Config,
+                                                      onBootstrapConfigRefreshed: (String, BootstrapConfig.Config) => Unit,
                                                       val networkImplInterface: MetadataManager.NetworkImplInterface[T],
                                                       val pendingStoreLookupQueueSize: Int = 20,
                                                       // Must be >= pendingStoreLookupQueueSize; see
@@ -217,7 +222,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  Caller must hold this object's monitor. */
   private def refreshBootstrapConfig(): Unit =
     if !refreshingBootstrapConfig then
-      logger.info("Refreshing bootstrap config file")
+      logger.info("Refreshing bootstrap config")
       oClient match
         case None => logger.error(s"Refreshing bootstrap config before AspenClient initialized!")
         case Some(client) =>
@@ -257,22 +262,27 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
               refreshingBootstrapConfig = false
               logger.error(s"The getBootstrapConfig call threw. Error: $t", t)
 
-  /** Installs a freshly fetched bootstrap config, writing it through to disk on the way.
+  /** Installs a freshly fetched bootstrap config, then hands it to onBootstrapConfigRefreshed.
    *
-   *  Parse first. The config is written only once it is known to be readable, so a bad fetch
-   *  cannot replace a good file with one that fails at the next construction. A parse failure
+   *  Parse first. The callback sees a config only once it is known to be readable, so a bad
+   *  fetch cannot reach whatever the callback persists it to -- a host writes it over its
+   *  on-disk config, where an unreadable one would fail the next construction. A parse failure
    *  propagates to the caller's catch, which logs it; the guard release is in that caller's
    *  finally, so a rejected config leaves the refresh retryable.
    *
-   *  Then map, then write. A failed write cannot stop the mapping: it has already been applied.
-   *  And the mapping comes from the parsed config rather than from a re-read of the file, so it
-   *  neither reinstates stale placements nor depends on the file being readable at all -- the
-   *  process picks up the new placements immediately and only loses them across a restart,
-   *  strictly better than discarding a good config because the disk is full or read-only.
+   *  Then map, then call back. A failed callback cannot stop the mapping: it has already been
+   *  applied. And the mapping comes from the parsed config rather than from anything the callback
+   *  does, so the process picks up the new placements immediately whatever the callback's fate --
+   *  a host whose write fails only loses them across a restart, strictly better than discarding
+   *  a good config because the disk is full or read-only.
    *
    *  Do not reorder those two. The mapping is the repair this refresh exists to deliver and it
-   *  is free; the write is best-effort, and going first it would delay the repair by however
-   *  long the disk takes.
+   *  is free; the callback is best-effort, and going first it would delay the repair by however
+   *  long it takes -- a disk write, for a host. It runs outside the monitor for the same reason.
+   *
+   *  A NonFatal throw from the callback is logged here rather than propagated. Propagating would
+   *  still release the guard -- the caller's finally sees to that -- but would log the failure as
+   *  a failure to apply a config that has in fact been applied.
    */
   private def applyBootstrapConfig(cfg: String): Unit =
     val config = BootstrapConfig.parseBootstrapConfig(cfg)
@@ -280,12 +290,10 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
     synchronized:
       mapBootstrapStores(config)
 
-    try
-      atomicWrite(bootstrapConfigFile.toNIO, cfg)
-      logger.info(s"Updated bootstrap config written to $bootstrapConfigFile")
+    try onBootstrapConfigRefreshed(cfg, config)
     catch
       case NonFatal(t) =>
-        logger.error(s"Failed to update bootstrap config file $bootstrapConfigFile. Error: $t", t)
+        logger.error(s"The bootstrap config refresh callback failed. Error: $t", t)
 
   /** Installs every store -> host mapping the config names and marks each store as a bootstrap
    *  store.
@@ -312,7 +320,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
         stores += storeId -> bsHost.hostId
         bootstrapStores += storeId
 
-  /** Loads the on-disk bootstrap config at construction: the store mappings, plus a HostEntry
+  /** Installs the initial bootstrap config at construction: the store mappings, plus a HostEntry
    *  for each named host so those hosts are reachable before any lookup completes.
    *
    *  Only the mapping half is shared with a refresh. A refresh deliberately does not touch
@@ -329,17 +337,15 @@ class MetadataManager[T <: MetadataManager.HostEntry](val bootstrapConfigFile: o
    *  end of construction that gives a later synchronized reader -- isBootstrapStore's, say -- a
    *  happens-before edge to these writes. Uncontended and once per manager, so it costs nothing.
    *  createHostEntry under the monitor is not a new pattern: startHostLookup's Success
-   *  continuation already calls it that way. The file read and parse are hoisted out, though,
-   *  both to keep that the only call-out under this monitor and to match applyBootstrapConfig,
-   *  which likewise parses first and takes the monitor only to install the result.
+   *  continuation already calls it that way. The config arrives already parsed, so that stays
+   *  the only call-out under this monitor, matching applyBootstrapConfig, which likewise parses
+   *  first and takes the monitor only to install the result.
    */
   private def loadInitialBootstrapConfig(): Unit =
-    val config = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO)
-
     synchronized:
-      mapBootstrapStores(config)
+      mapBootstrapStores(initialBootstrapConfig)
 
-      config.hosts.foreach: bsHost =>
+      initialBootstrapConfig.hosts.foreach: bsHost =>
         hosts += bsHost.hostId -> Right(networkImplInterface.createHostEntry(
           bsHost.hostId,
           bsHost.name,

@@ -23,9 +23,9 @@ import java.util.UUID
  *  itself, which refreshBootstrapConfig releases past rather than absorbing.
  *
  *  Beyond guard release the tests carry two further claims. Where the fetched config ends up:
- *  parsing it before writing is what keeps a rejected config off disk, and mapping from the
- *  parsed result rather than from a re-read is what keeps a failed write from discarding a good
- *  config. And what a refresh does to the store maps: it installs the store -> host mappings the
+ *  parsing it before the refresh callback runs is what keeps a rejected config away from the
+ *  callback -- a host's writes it to disk -- and mapping from the parsed result before the
+ *  callback is what keeps a throwing callback from discarding a good config. And what a refresh does to the store maps: it installs the store -> host mappings the
  *  config names *and* adopts those stores as bootstrap stores, so a store the original config did
  *  not name is corrected by a later refresh rather than dropped by dropStoreMapping and left to a
  *  pool lookup that routes back through the bootstrap stores themselves. That adoption is
@@ -109,10 +109,8 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
 
     client.bootstrapConfigFetches should be(1)
 
-  test("a fetched config that does not parse leaves the file unchanged and the refresh retryable"):
-    val (mgr, client, _, configFile) = newManagerWithConfigFile()
-
-    val before = os.read(configFile)
+  test("a fetched config that does not parse is not passed to the callback and leaves the refresh retryable"):
+    val (mgr, client, _, recorded) = newManagerWithRecorder()
 
     mgr.dropStoreMapping(bootstrapStoreId)
 
@@ -126,41 +124,16 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
 
     client.bootstrapConfigPromise(1).success(unparseable)
 
-    // Pre-fix the string is written before anything parses it, so the on-disk config is replaced
-    // by one the process cannot read back -- and a restart then fails at construction.
-    os.read(configFile) should be(before)
+    // A host's callback writes the yaml over its on-disk config, so handing it a string nothing
+    // has parsed would replace that config with one the process cannot read back -- and a
+    // restart would then fail at construction.
+    recorded shouldBe empty
 
     mgr.dropStoreMapping(bootstrapStoreId)
     client.bootstrapConfigFetches should be(2)
 
-  test("a config that cannot be written is still applied in memory"):
-    val (mgr, client, _, configFile) = newManagerWithConfigFile()
-
-    mgr.dropStoreMapping(bootstrapStoreId)
-
-    // atomicWrite creates its temp file in the target's parent directory, so removing the
-    // directory makes the write fail with NoSuchFileException whatever the suite's privileges.
-    os.remove.all(configFile / os.up)
-
-    client.bootstrapConfigPromise(1).success(bootstrapConfigYaml(
-      Replication(1, 1),
-      List(remoteHostState),
-      List(bootstrapStoreId -> remoteHostId)))
-
-    // The store now routes to remoteHostId, which has no HostEntry, so reaching it starts a
-    // lookup and parks the message. Pre-fix the mapping came from a re-read of the file, and
-    // removing the directory takes the file with it, so that re-read raised
-    // FileNotFoundException and the apply never reached the mapping at all -- the store still
-    // mapped to bootstrapHostId and this returned Some. Mapping from the parsed config is what
-    // makes the write and the mapping independent.
-    mgr.getHostEntryOrQueueMessage(bootstrapStoreId, nudge()) should be(None)
-    client.lookups.toList should be(List(remoteHostId))
-
-    mgr.dropStoreMapping(bootstrapStoreId)
-    client.bootstrapConfigFetches should be(2)
-
-  test("a fetched config that parses is written through to disk"):
-    val (mgr, client, _, configFile) = newManagerWithConfigFile()
+  test("a callback that throws does not prevent the mapping"):
+    val (mgr, client, _, recorded) = newManagerWithRecorder(_ => throw new RuntimeException("callback failed"))
 
     mgr.dropStoreMapping(bootstrapStoreId)
 
@@ -171,7 +144,33 @@ class MetadataManagerBootstrapRefreshSuite extends AnyFunSuite
 
     client.bootstrapConfigPromise(1).success(fresh)
 
-    os.read(configFile) should be(fresh)
+    // Reached, and threw -- so what follows is about surviving that throw, not about a callback
+    // that never ran.
+    recorded.toList should be(List(fresh))
+
+    // The store now routes to remoteHostId, which has no HostEntry, so reaching it starts a
+    // lookup and parks the message. Mapping before the callback, from the parsed config, is what
+    // makes the two independent: had the throw come first, the store would still map to
+    // bootstrapHostId and this would return Some.
+    mgr.getHostEntryOrQueueMessage(bootstrapStoreId, nudge()) should be(None)
+    client.lookups.toList should be(List(remoteHostId))
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+    client.bootstrapConfigFetches should be(2)
+
+  test("a fetched config that parses is passed to the refresh callback"):
+    val (mgr, client, _, recorded) = newManagerWithRecorder()
+
+    mgr.dropStoreMapping(bootstrapStoreId)
+
+    val fresh = bootstrapConfigYaml(
+      Replication(1, 1),
+      List(remoteHostState),
+      List(bootstrapStoreId -> remoteHostId))
+
+    client.bootstrapConfigPromise(1).success(fresh)
+
+    recorded.toList shouldBe List(fresh)
 
   test("a successful refresh remaps the store and adopts new bootstrap stores"):
     val (mgr, client, _) = newManager()

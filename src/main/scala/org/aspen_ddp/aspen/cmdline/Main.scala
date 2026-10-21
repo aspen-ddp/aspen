@@ -21,7 +21,7 @@ import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, DaemonThreads, YamlFormat}
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, DaemonThreads, YamlFormat, atomicWrite}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
@@ -828,23 +828,28 @@ object Main {
       case "reed-solomon" => ReedSolomon(args.width, args.readThreshold, args.writeThreshold)
       case _ => throw new Exception(s"Invalid IDA type: ${args.idaType}")
 
-  def createNetwork(bootstrapConfigFile: os.Path,
+  def createNetwork(bootstrapConfig: BootstrapConfig.Config,
+                    onRefresh: (String, BootstrapConfig.Config) => Unit,
                     ohost: Option[(HostId, Int)],
                     oclientId: Option[ClientId]): (NetworkBridge, ZMQNet) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    val net = new ZMQNet(bootstrapConfigFile, oclientId, ohost, heartbeatPeriod, b)
+    val net = new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
     onetwork = Some(net)
     (b, net)
   }
 
-  def createAspenClient(bootstrapConfigFile: os.Path,
-                        onnet: Option[(NetworkBridge, ZMQNet)]=None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
+  // Temporary: the client commands still take a bootstrap config path. They have no host
+  // directory, so a refreshed config is not persisted anywhere.
+  private def createAspenClient(bootstrapConfigFile: os.Path): (AspenClient, ZMQNet, KeyValueObjectPointer) =
+    createAspenClient(BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO), (_, _) => ())
 
-    val bootstrapConfig = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO)
+  def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
+                        onRefresh: (String, BootstrapConfig.Config) => Unit,
+                        onnet: Option[(NetworkBridge, ZMQNet)] = None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
 
-    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfigFile, None, None))
+    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
     val initialReadDelay = Duration(10, SECONDS)
@@ -1057,7 +1062,12 @@ object Main {
       throw Exception(s"Bootstrap config file not found: $bsCfgFile")
 
     val bootstrapCfg = BootstrapConfig.loadBootstrapConfig(bsCfgFile.toFile)
-    val bootstrapConfigFile = os.Path(bsCfgFile)
+
+    // Keeps the host directory's copy current, so a restart starts from the refreshed placements.
+    // A failed write is logged by the MetadataManager, which calls this.
+    val onBootstrapConfigRefreshed: (String, BootstrapConfig.Config) => Unit = (yaml, _) =>
+      atomicWrite(bsCfgFile, yaml)
+      scribe.info(s"Updated bootstrap config written to $bsCfgFile")
 
     configureLogging()
 
@@ -1071,9 +1081,11 @@ object Main {
 
     val objectCacheFactory = () => new SimpleLRUObjectCache(100)
 
-    val (networkBridge, nnet) = createNetwork(bootstrapConfigFile, Some((hostCfg.hostId, hostCfg.dataPort)), None)
+    val (networkBridge, nnet) = createNetwork(bootstrapCfg, onBootstrapConfigRefreshed,
+                                              Some((hostCfg.hostId, hostCfg.dataPort)), None)
 
-    val (client, network, _) = createAspenClient(bootstrapConfigFile, Some((networkBridge, nnet)))
+    val (client, network, _) = createAspenClient(bootstrapCfg, onBootstrapConfigRefreshed,
+                                                 Some((networkBridge, nnet)))
 
     networkBridge.oclient = Some(client)
 

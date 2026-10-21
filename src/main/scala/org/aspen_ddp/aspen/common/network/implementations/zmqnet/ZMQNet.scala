@@ -4,7 +4,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
-import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{DaemonThreads, EvictingQueue}
@@ -134,7 +134,8 @@ object ZMQNet extends Logging:
       net.metadataManager.dropStoreMapping(storeId)
 
 
-class ZMQNet(val bootstrapConfigFile: os.Path,
+class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
+             onBootstrapConfigRefreshed: (String, BootstrapConfig.Config) => Unit,
              val oclientId: Option[ClientId],
              val ohost: Option[(HostId, Int)],
              val heartbeatPeriod: Duration,
@@ -212,7 +213,7 @@ class ZMQNet(val bootstrapConfigFile: os.Path,
       wakeIoThread()
 
   val metadataManager: MetadataManager[ZMQHostEntry] =
-    new MetadataManager[ZMQHostEntry](bootstrapConfigFile, networkImpl)
+    new MetadataManager[ZMQHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl)
 
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)

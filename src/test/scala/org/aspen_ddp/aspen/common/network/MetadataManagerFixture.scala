@@ -11,8 +11,6 @@ import org.aspen_ddp.aspen.common.util.EvictingQueue
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.scalatest.{BeforeAndAfterAll, Suite}
 
-import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -293,21 +291,14 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
       RocksDBConfig(),
       StorageDeviceSetId(UUID.randomUUID()))
 
-  private var tempDir: Path = scala.compiletime.uninitialized
   private var templateConfig: String = scala.compiletime.uninitialized
 
   override protected def beforeAll(): Unit =
     super.beforeAll()
-    tempDir = Files.createTempDirectory("aspen-metadata-manager")
     templateConfig = bootstrapConfigYaml(
       Replication(1, 1),
       List(HostState(bootstrapHostId, "bootstrap_host", "127.0.0.1", 5000, 5001, 5002, Set())),
       List(StoreId(poolId, 0.toByte) -> bootstrapHostId))
-
-  override protected def afterAll(): Unit =
-    try os.remove.all(os.Path(tempDir))
-    catch case _: Throwable => ()
-    finally super.afterAll()
 
   /** A bootstrap config over the fixture's systemId.
    *
@@ -320,30 +311,30 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
     BootstrapConfig.generateBootstrapConfig(systemId, ida, hostStates, storeMap,
       org.aspen_ddp.aspen.TestTLS.caCertificatePem)
 
-  /** newManager, plus the path of the config file that manager was handed.
+  /** newManager, plus a recorder holding the yaml of every onBootstrapConfigRefreshed call, in
+   *  order.
    *
-   *  Every manager gets its own copy in its own directory. Sharing one file across managers was
-   *  harmless while nothing rewrote it, but a refresh that succeeds writes through
-   *  atomicWrite -- one test's refreshed config would then be the next test's starting state.
-   *  The private directory also gives a test a way to make the write fail: remove the directory
-   *  and atomicWrite's Files.createTempFile(parentDir, ...) raises NoSuchFileException, which
-   *  works regardless of the privileges the suite runs under.
+   *  The callback records before it runs `afterRecord`, so a test that makes the callback throw
+   *  can still see that it was reached -- without that, a callback that was never invoked would
+   *  pass a "throwing callback does no harm" test vacuously.
    */
-  protected def newManagerWithConfigFile(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl, os.Path) =
-    val dir = Files.createTempDirectory(tempDir, "manager-")
-    val f = dir.resolve(BootstrapConfig.configFilename)
-    Files.write(f, templateConfig.getBytes(StandardCharsets.UTF_8))
-    val path = os.Path(f)
-
+  protected def newManagerWithRecorder(afterRecord: String => Unit = _ => ()):
+      (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl, mutable.ListBuffer[String]) =
+    val recorded = mutable.ListBuffer[String]()
     val impl = new RecordingNetworkImpl
     val client = new LookupRecordingClient
-    val mgr = new MetadataManager[MetadataManager.HostEntry](path, impl)
+    val mgr = new MetadataManager[MetadataManager.HostEntry](
+      BootstrapConfig.parseBootstrapConfig(templateConfig),
+      (yaml, _) =>
+        recorded += yaml
+        afterRecord(yaml),
+      impl)
     mgr.setAspenClient(client)
-    (mgr, client, impl, path)
+    (mgr, client, impl, recorded)
 
   /** A MetadataManager over a bootstrap config naming exactly one host, wired to a fresh
    *  recording client and a fresh RecordingNetworkImpl. Returning the impl is what lets a suite
    *  assert that a message actually reached a host rather than merely that a lookup was started. */
   protected def newManager(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl) =
-    val (mgr, client, impl, _) = newManagerWithConfigFile()
+    val (mgr, client, impl, _) = newManagerWithRecorder()
     (mgr, client, impl)

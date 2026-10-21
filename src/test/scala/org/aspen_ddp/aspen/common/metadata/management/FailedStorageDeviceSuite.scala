@@ -59,6 +59,16 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
           p.future.flatMap(_ => loop())
     loop()
 
+  /** Poll until `task` has run `count` drive passes in total, or the timeout elapses. */
+  protected def awaitDrivePasses(task: FailedStorageDeviceDurableTask, count: Int,
+                                 timeout: Duration): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+    def loop(): Future[Unit] =
+      if task.testDriveCount >= count || System.nanoTime() > deadline then Future.unit
+      else delay(fastPoll).flatMap(_ => loop())
+    loop()
+
   /** Wait without occupying a pool thread. Thread.sleep here would hold a thread the task under
    *  test needs to make the very progress the test is watching for. */
   protected def delay(d: Duration): Future[Unit] =
@@ -76,7 +86,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       _ <- taskForEnrolled(net.secondDeviceId)
-      _ <- awaitTombstone(net.secondDeviceId, Duration(30000, MILLISECONDS))
+      _ <- awaitTombstone(net.secondDeviceId, Duration(120000, MILLISECONDS))
 
       state <- client.getStorageDeviceState(net.secondDeviceId)
       set <- client.getStorageDeviceSetState(setId)
@@ -104,7 +114,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       _ <- taskForEnrolled(net.secondDeviceId)
-      _ <- awaitTombstone(net.secondDeviceId, Duration(30000, MILLISECONDS))
+      _ <- awaitTombstone(net.secondDeviceId, Duration(120000, MILLISECONDS))
       _ <- waitForTransactionsToComplete()
 
       other <- client.getStorageDeviceSetState(otherSet)
@@ -118,7 +128,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
   atest("step 1 against an already-tombstoned device changes nothing"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    val timeout = Duration(30000, MILLISECONDS)
+    val timeout = Duration(120000, MILLISECONDS)
     for
       _ <- net.createSecondDevice()
       _ <- waitForTransactionsToComplete()
@@ -149,7 +159,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       _ <- taskForEnrolled(net.secondDeviceId)
-      _ <- awaitTombstone(net.secondDeviceId, Duration(30000, MILLISECONDS))
+      _ <- awaitTombstone(net.secondDeviceId, Duration(120000, MILLISECONDS))
       _ <- waitForTransactionsToComplete()
 
       // A second enrollment attempt sees the tombstoned device and rejects it.
@@ -173,9 +183,11 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
       before = task.testDriveCount
 
-      // Wait several poll periods. The task should survive: neither completed nor failed,
-      // still rescheduling.
-      _ <- delay(fastPoll * 5)
+      // Wait for at least two further passes. The task should survive: neither completed nor
+      // failed, still rescheduling. Waiting on the pass count (with a generous deadline) rather
+      // than a fixed number of poll periods keeps this independent of how late a starved
+      // process runs the poll timer.
+      _ <- awaitDrivePasses(task, before + 2, Duration(60000, MILLISECONDS))
     yield
       task.completed.isCompleted should be(false)
       // The completion assertion alone is theatre: with a bogus device id that promise can only
@@ -233,7 +245,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       task <- taskForEnrolled(failedId)
-      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(120000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
 
@@ -271,7 +283,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       beforeRev <- bootstrapConfigRevision()
 
       task <- taskForEnrolled(failedId)
-      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(120000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
 
@@ -338,7 +350,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ = net.takeCapturedHostMessages()
 
       task <- taskForEnrolled(net.secondDeviceId)
-      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(120000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
 
@@ -395,7 +407,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       task <- taskForEnrolled(failedId)
-      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(120000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
 
@@ -437,7 +449,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       task <- taskForEnrolled(net.secondDeviceId)
-      _ <- withTimeout(task.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+      _ <- withTimeout(task.completed.map(_ => ()), Duration(120000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
 
@@ -508,7 +520,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       // re-runs it every 60 s forever.
       _ <- withTimeout(net.smgr.testingOnlyUpdateStateForTransferredStore(
                          storeId, sourceId, net.secondDeviceId),
-                       Duration(30000, MILLISECONDS),
+                       Duration(120000, MILLISECONDS),
                        "post-transfer update against a tombstoned destination")
       _ <- waitForTransactionsToComplete()
 
@@ -545,13 +557,13 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       // Stop the first instance once it has moved at least one store, simulating a crash. Give
       // it a slower poll period than the watcher to widen the observation windows.
       first <- taskForEnrolled(failedId, slowerPoll)
-      _ <- awaitStoresRemaining(failedId, atMost = 2, Duration(30000, MILLISECONDS))
+      _ <- awaitStoresRemaining(failedId, atMost = 2, Duration(120000, MILLISECONDS))
       _ = first.stop()
       midDrain <- client.getStorageDeviceState(failedId)
 
       // A fresh instance over the same enrolled state finishes the job.
       second <- taskForEnrolled(failedId)
-      _ <- withTimeout(second.completed.map(_ => ()), Duration(30000, MILLISECONDS),
+      _ <- withTimeout(second.completed.map(_ => ()), Duration(120000, MILLISECONDS),
                        "task completion")
       _ <- waitForTransactionsToComplete()
 

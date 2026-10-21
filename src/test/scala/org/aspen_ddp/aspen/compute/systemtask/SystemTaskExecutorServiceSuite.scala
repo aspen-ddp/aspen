@@ -68,7 +68,7 @@ class SystemTaskExecutorServiceSuite extends IntegrationTestSuite:
     for
       statePtr <- serviceStatePtr()
       _ <- client.createSystemDurableTask(CountingSystemTask.typeUUID, CountingSystemTask.initialState(5))
-      dispatches <- countDispatchesFor(Duration(5000, MILLISECONDS))
+      dispatches <- countDispatchesUntil(2, Duration(60000, MILLISECONDS))
     yield
       exec.shutdown()
       resetTuning()
@@ -96,12 +96,14 @@ class SystemTaskExecutorServiceSuite extends IntegrationTestSuite:
         else sleep(Duration(50, MILLISECONDS)).flatMap(_ => loop())
     loop()
 
-  /** Count distinct ExecuteSystemTask dispatch messages captured over `window`. */
-  private def countDispatchesFor(window: Duration): Future[Int] =
+  /** Count distinct ExecuteSystemTask dispatch messages captured until `target` have been seen
+   *  or `limit` elapses. Waiting on the count, not a fixed window, keeps the test independent
+   *  of how late a starved process runs the service's timers. */
+  private def countDispatchesUntil(target: Int, limit: Duration): Future[Int] =
     given ExecutionContext = executionContext
-    val deadline = System.nanoTime() + window.toNanos
+    val deadline = System.nanoTime() + limit.toNanos
     def loop(count: Int): Future[Int] =
       val n = count + net.takeCapturedHostMessages().count(_.isInstanceOf[ExecuteSystemTask])
-      if System.nanoTime() > deadline then Future.successful(n)
+      if n >= target || System.nanoTime() > deadline then Future.successful(n)
       else sleep(Duration(50, MILLISECONDS)).flatMap(_ => loop(n))
     loop(0)

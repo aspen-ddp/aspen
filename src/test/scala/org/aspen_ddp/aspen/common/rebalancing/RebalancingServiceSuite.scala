@@ -38,7 +38,7 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
     for
       _ <- net.createSecondDevice()
       _ <- RebalancingDurableService.rebalanceStorageDeviceSet(client, setId)
-      _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))
+      _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
       finalSet <- client.getStorageDeviceSetState(setId)
     yield
       exec.shutdown()
@@ -86,7 +86,7 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
           tx.update(ptr, None, None, reqs, ops)
 
   /** Poll `cond` until it holds or `timeout` elapses. Fails the test on timeout. */
-  private def awaitUntil(what: String, timeout: Duration = Duration(20000, MILLISECONDS))
+  private def awaitUntil(what: String, timeout: Duration = Duration(120000, MILLISECONDS))
                         (cond: => Future[Boolean]): Future[Unit] =
     given ExecutionContext = executionContext
     val deadline = System.nanoTime() + timeout.toNanos
@@ -155,7 +155,7 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration(1, MINUTES))
       _ <- writeLastAutoRebalance(HLCTimestamp.Zero)
       _ <- awaitUntil("the sweep to enroll the set")(readActiveTasks().map(_.exists(_._1 == setId)))
-      _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))
+      _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
       lastSweep <- readLastAutoRebalance()
       finalSet <- client.getStorageDeviceSetState(setId)
     yield
@@ -220,7 +220,7 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
              readActiveTasks().map(_.exists(_._1 == setId)))
       active <- readActiveTasks()
       statePtr <- readServiceStatePointer()
-      _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))
+      _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
     yield
       exec.shutdown()
       RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
@@ -242,7 +242,7 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       _ <- writeLastAutoRebalance(HLCTimestamp.Zero)
       _ <- awaitUntil("a sweep to complete")(readLastAutoRebalance().map(_ != HLCTimestamp.Zero))
       duringSweep <- readActiveTasks()
-      _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))
+      _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
     yield
       exec.shutdown()
       RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
@@ -263,7 +263,7 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       // matters either way round: the healthy set is reached and the sweep is recorded.
       _ <- awaitUntil("the healthy set to be enrolled despite the broken one")(
              readActiveTasks().map(_.exists(_._1 == setId)))
-      _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))
+      _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
       lastSweep <- readLastAutoRebalance()
     yield
       exec.shutdown()

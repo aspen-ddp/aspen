@@ -233,7 +233,7 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
 
       task <- taskForEnrolled(poolId)
-      _ <- driveUntilComplete(task, targetSetId, Duration(30000, MILLISECONDS))
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
 
       poolState <- client.getStoragePoolState(poolId)
     yield
@@ -263,7 +263,7 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
 
       task <- taskForEnrolled(poolId)
       // Destinations land on the level-0 child's member devices.
-      _ <- driveUntilComplete(task, childId, Duration(30000, MILLISECONDS))
+      _ <- driveUntilComplete(task, childId, Duration(120000, MILLISECONDS))
 
       poolState <- client.getStoragePoolState(poolId)
     yield
@@ -298,7 +298,7 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
 
       task <- taskForEnrolled(poolId)
-      _ <- awaitCompletion(task, Duration(30000, MILLISECONDS))
+      _ <- awaitCompletion(task, Duration(120000, MILLISECONDS))
 
       poolState <- client.getStoragePoolState(poolId)
     yield
@@ -324,7 +324,7 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
 
       first <- taskForEnrolled(poolId)
       // Let exactly one store land, then stop the task mid-migration.
-      _ <- pumpUntilStoresMoved(poolId, targetSetId, 1, Duration(30000, MILLISECONDS))
+      _ <- pumpUntilStoresMoved(poolId, targetSetId, 1, Duration(120000, MILLISECONDS))
       _ = first.stop()
 
       midPool <- client.getStoragePoolState(poolId)
@@ -332,7 +332,7 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       // Nothing was written to say where the migration got to -- the pool's own stores array
       // is the progress record, so a fresh instance simply picks up.
       second <- taskForEnrolled(poolId)
-      _ <- driveUntilComplete(second, targetSetId, Duration(30000, MILLISECONDS))
+      _ <- driveUntilComplete(second, targetSetId, Duration(120000, MILLISECONDS))
 
       poolState <- client.getStoragePoolState(poolId)
     yield
@@ -362,13 +362,13 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
 
       task <- taskForEnrolled(poolId)
-      _ <- driveUntilComplete(task, targetSetId, Duration(30000, MILLISECONDS))
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
       after <- client.getStoragePoolState(poolId)
 
       // Re-dispatch: SystemTaskExecutorService may restart a task whose state object is still
       // enrolled.
       again <- taskForEnrolled(poolId)
-      _ <- awaitCompletion(again, Duration(30000, MILLISECONDS))
+      _ <- awaitCompletion(again, Duration(120000, MILLISECONDS))
       afterAgain <- client.getStoragePoolState(poolId)
     yield
       afterAgain.migration should be(after.migration)
@@ -393,7 +393,7 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
 
       task <- taskForEnrolled(poolId)
-      _ <- pumpUntilStoresMoved(poolId, setA, 1, Duration(30000, MILLISECONDS))
+      _ <- pumpUntilStoresMoved(poolId, setA, 1, Duration(120000, MILLISECONDS))
       midPool <- client.getStoragePoolState(poolId)
 
       // Retarget the same running task. It holds only the pool id and re-reads the target
@@ -405,7 +405,7 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       // Both sets get pumped: a transfer toward setA may still be in flight at the moment of
       // the retarget, and the task starts nothing new until it clears.
       _ <- driveUntilCompleteAcross(task, List(setA, bootstrapSetId),
-             Duration(30000, MILLISECONDS))
+             Duration(120000, MILLISECONDS))
 
       poolState <- client.getStoragePoolState(poolId)
     yield

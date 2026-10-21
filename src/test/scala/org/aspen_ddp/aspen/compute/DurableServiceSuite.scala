@@ -70,7 +70,9 @@ class DurableServiceSuite extends IntegrationTestSuite:
   def makeExecutor(): SimpleDurableServiceExecutor =
     new SimpleDurableServiceExecutor(
       client, testHostId, client.backgroundTaskManager,
-      leaseDuration        = Duration(200, MILLISECONDS),
+      // No test here depends on a lease expiring, so keep it far longer than any scheduling
+      // stall: a lease lost to a starved process shuts the service down mid-test.
+      leaseDuration        = Duration(30000, MILLISECONDS),
       renewalInterval      = Duration(50, MILLISECONDS),
       minScanInterval      = Duration(50, MILLISECONDS),
       maxScanInterval      = Duration(100, MILLISECONDS),
@@ -125,24 +127,33 @@ class DurableServiceSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val svcUUID = UUID.randomUUID()
     val exec = makeExecutor()
-    val delayPromise = Promise[Unit]()
-    for
-      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
-      _  <- claimedPromise.future                // wait for initial claim
-      v0 <- exec.servicesTkvl.get(Key(svcUUID)) // capture first TKVL entry
-      _  <- {                                    // non-blocking delay via background scheduler
-              client.backgroundTaskManager.schedule(Duration(300, MILLISECONDS)):
-                delayPromise.trySuccess(())
-              delayPromise.future
-            }
-      v1 <- exec.servicesTkvl.get(Key(svcUUID)) // check entry was updated
-    yield
-      exec.shutdown()
-      v0 shouldBe defined
-      v1 shouldBe defined
-      val e0 = ServiceEntry.decode(v0.get.value.bytes)
-      val e1 = ServiceEntry.decode(v1.get.value.bytes)
-      e1.leaseExpiry > e0.leaseExpiry shouldBe true
+    val deadline = System.nanoTime() + Duration(120000, MILLISECONDS).toNanos
+
+    def leaseExpiry(): Future[HLCTimestamp] =
+      exec.servicesTkvl.get(Key(svcUUID)).map(v => ServiceEntry.decode(v.get.value.bytes).leaseExpiry)
+
+    // Poll until the expiry moves past `first`. The renewal interval is 50ms but a starved
+    // process can run it arbitrarily late, so wait on the condition rather than a fixed delay.
+    def awaitRenewal(first: HLCTimestamp): Future[HLCTimestamp] =
+      leaseExpiry().flatMap: current =>
+        if current > first then
+          Future.successful(current)
+        else if System.nanoTime() > deadline then
+          Future.failed(new AssertionError(s"lease was not renewed; expiry stayed at $first"))
+        else
+          val p = Promise[Unit]()
+          client.backgroundTaskManager.schedule(Duration(50, MILLISECONDS))(p.trySuccess(()))
+          p.future.flatMap(_ => awaitRenewal(first))
+
+    val test =
+      for
+        _      <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+        _      <- claimedPromise.future                // wait for initial claim
+        first  <- leaseExpiry()
+        second <- awaitRenewal(first)
+      yield second > first shouldBe true
+
+    test.andThen(_ => exec.shutdown())
 
   atest("executor calls shutdown when another host overwrites the TKVL entry"):
     given ExecutionContext = executionContext

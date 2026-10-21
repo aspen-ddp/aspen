@@ -19,7 +19,14 @@ object TestSteppedTask extends DurableTaskFactory:
 
   private val DataPointerKey = Key(2)
 
-  @volatile private var delayStep: Boolean = false
+  /** Holds step0 open: `started` completes when step0 begins, and step0 then blocks until
+   *  `release` completes. Lets a test act while the task is provably mid-step, with no
+   *  dependence on wall-clock timing. */
+  case class StepGate(started: Promise[Unit], release: Promise[Unit])
+
+  @volatile private var gate: Option[StepGate] = None
+
+  def currentGate: Option[StepGate] = gate
 
   def createTask(client: AspenClient,
                  pointer: DurableTaskPointer,
@@ -42,8 +49,14 @@ object TestSteppedTask extends DurableTaskFactory:
     )
     executor.prepareTask(TestSteppedTask, istate)
 
-  def setDelayStep(delay: Boolean): Unit =
-    delayStep = delay
+  def holdStep0(): StepGate =
+    val g = StepGate(Promise[Unit](), Promise[Unit]())
+    gate = Some(g)
+    g
+
+  def clearGate(): Unit =
+    gate.foreach(_.release.trySuccess(()))
+    gate = None
 
 class TestSteppedTask(
   taskPointer: DurableTaskPointer,
@@ -55,11 +68,12 @@ class TestSteppedTask(
     Some(new String(state("result"), StandardCharsets.UTF_8))
 
   def step0(tx: Transaction, state: Map[String, Array[Byte]], stepRevision: ObjectRevision): Future[Map[String, Array[Byte]]] =
-    val delay = if TestSteppedTask.delayStep then
-      Future:
-        Thread.sleep(500)
-    else
-      Future.successful(())
+    val delay = TestSteppedTask.currentGate match
+      case Some(g) =>
+        g.started.trySuccess(())
+        g.release.future
+      case None =>
+        Future.successful(())
 
     delay.flatMap: _ =>
       client.read(dataPointer).map: dos =>
@@ -121,7 +135,7 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
   atest("stopping a running stepped task completes with TaskStopped"):
     given ExecutionContext = executionContext
 
-    for
+    val test = for
       kvos <- client.read(radicle)
       rootPool <- client.getStoragePool(kvos.pointer.poolId)
       allocator = new PoolObjectAllocator(client, rootPool)
@@ -135,8 +149,8 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
 
       executor <- SimpleTaskExecutor(client, allocator, executorRoot)
 
-      // Enable delay in step0 to ensure task is running when we call shutdown
-      _ = TestSteppedTask.setDelayStep(true)
+      // Hold step0 open so the task is provably running when we call shutdown
+      gate = TestSteppedTask.holdStep0()
 
       kvos2 <- client.read(radicle)
       tx1 = client.newTransaction()
@@ -144,19 +158,17 @@ class SteppedDurableTaskSuite extends IntegrationTestSuite:
       _ = tx1.bumpVersion(radicle, kvos2.revision)
       _ <- tx1.commit()
 
-      // Schedule shutdown after task starts executing
-      shutdownPromise = Promise[Unit]()
-      _ = client.backgroundTaskManager.schedule(Duration(250, MILLISECONDS)):
-        executor.shutdown()
-        shutdownPromise.success(())
-
-      _ <- shutdownPromise.future
+      _ <- gate.started.future
+      _ = executor.shutdown()
+      _ = gate.release.trySuccess(())
 
       // The task should fail with TaskStopped
       result <- outerTaskFuture.failed
     yield
-      TestSteppedTask.setDelayStep(false)  // Reset for other tests
       result shouldBe a[TaskStopped]
+
+    // Reset for other tests, even when the test failed
+    test.andThen(_ => TestSteppedTask.clearGate())
 
 class DurableTaskStopSuite extends IntegrationTestSuite:
 

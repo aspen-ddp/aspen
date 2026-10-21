@@ -120,28 +120,31 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     Remaining failures in those runs are item 4 (timeouts under saturation).
 
 
-[ ] 4. Lease-timing tests fail under full load
+[x] 4. Lease-timing tests fail under full load  (FIXED 2026-10-20, test-only changes)
 
-    DurableServiceSuite "executor renews lease before expiry" (DurableServiceSuite.scala:145)
-    failed in every loaded run. These also failed intermittently under load:
-      SystemTaskExecutorServiceSuite  (line 75, "service reassigns a task whose heartbeat stalls")
-      FailedStorageDeviceSuite        (line 185, "a failing pass does not wedge the task")
-      MigratePoolToSetSuite           ("a level-1 target set works by the same path",
-                                       "level-0 migration moves every store ...")
-    RebalancingServiceSuite's own 20s awaitUntil / driveUntilActiveEmpty deadlines also expired
-    under full saturation ("Boxed Exception" at lines 97 and 126).
-
-    These may be correct behaviour under artificial starvation rather than bugs: a 2s lease
-    cannot be renewed when the process gets little CPU.
-
-    Approach:
-      - Decide per test whether it is checking timing the system genuinely promises, or just
-        borrowing short production timeouts. Timeouts in test fixtures (leaseDuration,
-        renewalInterval, awaitUntil budgets) can be lengthened; assertions about ordering
-        should not depend on wall-clock.
-      - Prefer condition-based waiting (poll for the state with a generous deadline) over
-        fixed sleeps, and check the item 2 fix first -- some of these may be the same problem.
-      - Use item 1's moderate-load runs to decide whether these happen at realistic load at all.
+    Baseline, full `sbt test` at 24 busy loops, 3 runs: 3, 3 and 4 failures per run. Besides the
+    tests originally listed, "rebalanceStorageDeviceSet drains pendingTransfers ..." failed in
+    all 3 and "stopping a running stepped task completes with TaskStopped" in 1. Two kinds:
+      - Fixed wall-clock windows asserting a count: "executor renews lease before expiry"
+        (300ms delay, 200ms lease -- the lease itself was lost under starvation), "service
+        reassigns a task whose heartbeat stalls" (>= 2 dispatches in 5s), "a failing pass does
+        not wedge the task" (>= 2 passes in 5 poll periods). Now they wait on the condition with
+        a 60-120s deadline (DurableServiceSuite's executor also got a 30s lease; no test there
+        depends on a lease expiring).
+      - "stopping a running stepped task" raced a 250ms shutdown timer against a 500ms
+        Thread.sleep in step0; a late timer let the task finish first. Now step0 signals when it
+        starts and waits on a Promise (not a blocked thread: a latch deadlocked the serial test
+        executor), and the test shuts down only after that signal. Cleanup runs on failure too.
+      - Own-deadline expiry (RebalancingServiceSuite, MigratePoolToSetSuite,
+        FailedStorageDeviceSuite): the 20s/30s budgets were raised to 120s. They only matter on
+        failure, so healthy runs are unaffected. The tasks did complete given the time; whether
+        any is slow for a reason other than CPU starvation was not separately examined.
+    After: 3 loaded runs gave 0, 0 and 1 failures (941 tests each). The one failure was
+    "executor renews lease before expiry" timing out at 30s in a run where that test itself took
+    ~46s of wall-clock (the whole JVM was crawling); the deadline is now 120s. No renewal defect
+    was found, but that single failure was not traced, so treat it as starvation, not proven.
+    Not done: the "Use item 1's moderate-load runs" step; these tests were fixed rather than
+    measured at realistic load.
 
 
 [ ] 5. Global test seams are reset only when a test succeeds

@@ -190,7 +190,11 @@ class MainSuite extends AnyFunSuite with Matchers:
   // bootstrap config on the command line, so bootstrap must leave both of them behind.
   test("bootstrap writes host and bootstrap config files into the host directory"):
     withTempDir("aspen-bootstrap"): tmp =>
-      Main.bootstrap(Replication(3, 2), tmp, "10.0.0.5", 4750, 4751, 4752) shouldBe 0
+      val stdout = java.io.ByteArrayOutputStream()
+      val result = Console.withOut(stdout):
+        Main.bootstrap(Replication(3, 2), tmp, "10.0.0.5", 4750, 4751, 4752)
+      result shouldBe 0
+      stdout.toString should include ("# Aspen Radicle Pointer Definition")
 
       val hostDir = tmp.resolve("bootstrap-host")
 

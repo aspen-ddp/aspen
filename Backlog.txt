@@ -43,11 +43,11 @@ How handle changing Host IP?
     heard from in a long time?
   - Wait for gossip protocol implementation?
 
-Design proper certificate management for the CLI and other client applications
-  - Intentional technical debt: the CLI certificate and private key live in
-    aspen-bootstrap-config.yaml, which is copied to every host and stored in the
-    Radicle. They are generated once at bootstrap and carried forward unchanged
-    whenever the config is regenerated.
+Mint per-client certificates for the CLI and other client applications
+  - Intentional technical debt: every client currently shares the single
+    certificate and private key written to aspen-client-config.yaml at bootstrap,
+    and TLS is not enforced yet. The shared key no longer lives in the bootstrap
+    yaml, the host directories, or the Radicle.
 
 TLS certificate rotation, renewal and revocation
   - CA and entity certificates are issued with ~100 year lifetimes and are never

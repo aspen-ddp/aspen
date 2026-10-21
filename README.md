@@ -259,6 +259,11 @@ and the "not reachable from other machines" warning it prints is expected. A sys
 will have hosts added to it later needs an address those hosts can route to — an external
 IP or a DNS name — since the value given here is what they will dial.
 
+Bootstrap also writes `aspen-client-config.yaml` into the target directory (`/tmp/aspen-test`).
+Every client command starts from this file. It holds the system id, the client credentials, and the
+address of the bootstrap host, so it is created owner-only and should be treated as a secret.
+Clients use it to fetch the current `aspen-bootstrap-config.yaml` over HTTP from a running host.
+
 The host directory is self-describing: bootstrap writes both `aspen-host-config.yaml` and
 `aspen-bootstrap-config.yaml` into it, so starting the storage host needs nothing more than
 the directory itself.
@@ -271,7 +276,7 @@ storage pool, `aspen-bootstrap`, so that is what to allocate it in. Any number o
 filesystems may coexist, each under its own name; `./aspen list-filesystems <config>` shows
 them.
 ```
-./aspen create-filesystem /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs aspen-bootstrap
+./aspen create-filesystem /tmp/aspen-test/aspen-client-config.yaml myfs aspen-bootstrap
 ```
 
 Then launch the AmoebaFS NFS server process to allow clients to attach to the file system via the
@@ -279,7 +284,7 @@ normal NFS mounting process for the client machine. Note that on MacOS you need 
 first run `sudo launchctl start com.apple.rpcbind` to allow the NFS server to register with
 the local RPC daemon. On Linux, ensure you have the rpcbind service running.
 ```
-./aspen amoebafs /tmp/aspen-test/bootstrap-host/aspen-bootstrap-config.yaml myfs
+./aspen amoebafs /tmp/aspen-test/aspen-client-config.yaml myfs
 ```
 
 To use the AmoebaFS file system, just mount it like you would any other NFS filesystem. On Linux,

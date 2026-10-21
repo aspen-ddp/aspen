@@ -315,7 +315,7 @@ object Main {
       // Unlike every other directory argument in this parser, the target is not required
       // to exist: bootstrap creates it. Bootstrapping over an existing system is caught
       // later by the bootstrap-host check in bootstrap() itself.
-      arg[File]("<target-directory>").text("Directory the bootstrap host and its stores are created under").
+      arg[File]("<target-directory>").text("Directory the bootstrap host, its stores, and aspen-client-config.yaml are created under").
         action((x, c) => c.copy(targetDirectory = x)).
         validate { x =>
           if !x.exists() || x.isDirectory then

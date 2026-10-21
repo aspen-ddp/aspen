@@ -1,5 +1,7 @@
 # TLS Certificate Support — Design
 
+> Note: the CLI identity described here has since moved out of the bootstrap yaml into `aspen-client-config.yaml`; see the HTTP bootstrap and client config design (`2026-10-21-http-bootstrap-and-client-config-design.md`).
+
 ## Intent
 
 Lay the groundwork for authenticated, encrypted communication between every entity in an Aspen

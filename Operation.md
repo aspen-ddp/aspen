@@ -33,11 +33,12 @@ device will be created. All the DataStore instances backing the `aspen-bootstrap
 are initially stored on the single storage device. This is the basis from which the
 deployment will grow. To expand the system, add new hosts and new storage devices.
 
-The `<address>` argument is needed to facilitate the expansion of the system. To add a
-new host, copy the `bootstrap-host/aspen-bootstrap-config.yaml` file to the machine to
-be added and invoke the `aspen add-host` command. The CLI will use the config yaml file to
-look up the address provided to the `bootstrap` command and connect to the Aspen host
-process on the bootstrap machine. It'll then create the metadata for the new host inside
+The `<address>` argument is needed to facilitate the expansion of the system. It is combined with
+the host's `http-port` (default 4751, `--http-port`) to form the first entry in the client config's
+list of bootstrap hosts. To add a new host, copy `aspen-client-config.yaml` (see below) to the
+machine to be added and invoke the `aspen add-host` command. The CLI fetches the current bootstrap
+config from the bootstrap host and connects to the Aspen host process on that machine. It'll then
+create the metadata for the new host inside
 the Aspen system and set up the local directories and files to support the new host.
 
 Once a new host is added, `aspen create-storage-device` can be used to add storage devices.
@@ -48,21 +49,45 @@ ensure that at most one DataStore per pool is stored on a single storage device 
 machine. It will only double-up on devices and hosts if insufficient devices or hosts are
 available.
 
-One important point to note is that `aspen-bootstrap-config.yaml` file is **not** static.
-Each host maintains a writeable copy of this config file in the root host directory and
-updates the file as the DataStores backing the `aspen-bootsrap` pool are migrated throughout
-the system. An up-to-date copy of this file is needed to invoke CLI commands and, currently,
-this must be managed by hand. This is an obvious pain point and a more convenient mechanism, 
-such as an API to obtain a copy of the current config from a running host, will need to 
-be added in the near future.
+## The Client Config and the Bootstrap Config
+
+The `aspen-bootstrap-config.yaml` file is **not** static. Each host maintains a writeable copy in
+its root host directory and updates it as the DataStores backing the `aspen-bootsrap` pool are
+migrated throughout the system. Every host serves the current copy over plain HTTP on its
+`http-port` (default 4751, `--http-port`): `GET /bootstrap` returns the Radicle copy, falling back
+to the host's on-disk copy if the Radicle cannot be read within two seconds, and responds 503 if
+both fail. This endpoint is unauthenticated, which is an accepted risk for now.
+
+Clients never need a hand-maintained copy of the bootstrap config. Instead, every client command
+(everything except `bootstrap` and `host`, including `amoebafs`) takes an
+`aspen-client-config.yaml` file. `bootstrap` writes it to `<target-directory>/aspen-client-config.yaml`
+with owner-only (0600) permissions. It contains:
+
+- `aspen-system-id`: the system the client belongs to
+- `certificate` and `private-key`: the client's TLS identity. They are loaded and validated, but
+  not yet used for connections, as TLS is not enforced yet.
+- `bootstrap-hosts`: a list of `address:port` entries for hosts to fetch the bootstrap config from.
+  Initially this is only the bootstrap host.
+
+Because it holds a private key, the client config must be treated as a secret: anyone who obtains
+it can act as the CLI. To use Aspen from another machine, copy the same file there. All clients
+currently share this one identity; minting per-client certificates is future work. The certificate's
+UUID identifies the client to network plugins that use TLS; it is not the client id. Each CLI
+process, including `amoebafs`, connects under its own randomly generated client id.
+
+A client tries the cached hosts in order. `--bootstrap-host <host[:port]>` (default port 4751)
+puts one more host at the front of the list, which is useful when every cached host is gone. If no
+host answers, the command fails with "No cached hosts could be reached" and lists each attempt. A
+config fetched from a different `aspen-system-id` is a hard error. When the fetched set of hosts
+differs from the cache, the client config is rewritten if it is writable; otherwise a warning is
+printed to stderr. Long-running `amoebafs` mounts update the cache whenever they refresh.
 
 Bootstrapping also creates the Aspen certificate authority (CA). Each host's config file
-(`aspen-host-config.yaml`) contains that host's TLS certificate and private key, signed by
-the CA. The `aspen-bootstrap-config.yaml` file contains the CA certificate along with the
-CLI's certificate and private key, so it must be treated as a secret: anyone who obtains it
-can act as the CLI. The certificate's UUID identifies the CLI to network plugins that use TLS;
-it is not the client id. Each CLI process, including `amoebafs`, connects under its own randomly
-generated client id.
+(`aspen-host-config.yaml`) contains that host's TLS certificate and private key, signed by the CA.
+The bootstrap yaml holds only the CA certificate. The client key is not stored in the bootstrap
+yaml, in the host directories, or in the Radicle.
+
+Systems bootstrapped by earlier versions are not supported: a fresh bootstrap is required.
 
 ## Operation
 

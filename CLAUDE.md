@@ -81,7 +81,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Most other aspects of Aspen are built on top of distributed objects stored in the Aspen system. Such as:
     - Logging of object update errors
     - System Metadata such as the available StoragePools, DataStores, network endpoints, physical media, etc
-  - Creating an Aspen Client requires an offline configuration of the bootstrap StoragePool and network endpoints
+  - Clients start from a local `aspen-client-config.yaml` (system id, credentials, and a cached list of bootstrap hosts)
+    and fetch the current bootstrap yaml (bootstrap StoragePool and network endpoints) from any host via `GET /bootstrap`
     - From this, the "Radicle Object", with a zeroed UUID, is loaded
       - This object serves as the ultimate root for locating all data stored within an Aspen system
       - It contains embedded ObjectPointers to the roots of all critical distributed data structures used
@@ -116,7 +117,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 ### Host and StorageDevice Management
 - Most administration is done by reading and writing host and device objects containing the desired state
 - Hosts will poll these instances and act on changes
-  - This approach is preferred over direct Command and Control messaging since those messages could be lost
+  - This approach is preferred over sending messages directly to the host, since those messages could be lost
   - An example is seeing that a DataStore is marked for transfer in or out. When seen, the hoste will start the process
 
 ### Hybrid Logical Clock (HLC) Timestamps

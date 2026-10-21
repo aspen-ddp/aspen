@@ -232,6 +232,12 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
     assert(i.crl.currentStreamNumber == 0)
 
+    // The save's completion handler can fire before the delete has been written, and shutdown
+    // does not flush an unwritten entry. Requests are processed in order, so a save that completes
+    // after the delete proves the delete is durable.
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)

@@ -104,9 +104,15 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     under load, SimpleCRLSuite 3/3 under load + idle). Not changed: the handlers-before-
     WriteComplete order in Stream.writeEntry. It is harmless for correctness; swapping it would
     make batching deterministic for callers, but it is a CRL main-path change.
-    Unresolved: the earlier "Recycle Streams" failure may be the same mechanism (the test has
-    back-to-back save/delete calls at ~line 230) but was not reproduced. The test also calls
-    i.crl.save() after i.crl.shutdown() (~line 291, probably meant i2); left alone.
+    "SimpleCRL Recycle Streams" (INVESTIGATED, test bug, CRL is correct): same family. The test
+    does save(tx2); delete(tx2); take(); shutdown(). When the save is written alone, the delete
+    sits in the next, unwritten entry, and shutdown() does not flush it, so recovery returns tx1
+    and tx2 (2 txs, expected 1). Repro of the scenario: 1/400 idle, 30-31/400 under saturation;
+    with a 50ms pause before shutdown 0/400. Fix: save again after the delete and wait for it
+    (FIFO order means its entry holds the delete), then shut down. Dropping an unwritten delete
+    at shutdown is fine for a crash-only design: recovery just re-offers the transaction.
+    SimpleCRLSuite 31/31 on 3 loaded runs and 1 idle run after the fix (small sample).
+    The test also calls i.crl.save() after i.crl.shutdown() (~line 291, probably meant i2); left alone.
     Remaining failures in those runs are item 4 (timeouts under saturation).
 
 

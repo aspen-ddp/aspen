@@ -67,8 +67,19 @@ class DurableServiceSuite extends IntegrationTestSuite:
     shutdownPromise = Promise[Unit]()
     receivedPromise = Promise[ServiceMessage]()
 
+  // Executors made by the running test. Tests shut theirs down on success, but a failed or timed
+  // out test never reaches that, and its executor would keep scanning and renewing for the life
+  // of the process, loading every test after it. Teardown runs on every outcome.
+  private val executors = new java.util.concurrent.ConcurrentLinkedQueue[SimpleDurableServiceExecutor]()
+
+  override def subFixtureTeardown(): Unit =
+    var exec = executors.poll()
+    while exec != null do
+      exec.shutdown()
+      exec = executors.poll()
+
   def makeExecutor(): SimpleDurableServiceExecutor =
-    new SimpleDurableServiceExecutor(
+    val exec = new SimpleDurableServiceExecutor(
       client, testHostId, client.backgroundTaskManager,
       // No test here depends on a lease expiring, so keep it far longer than any scheduling
       // stall: a lease lost to a starved process shuts the service down mid-test.
@@ -78,6 +89,8 @@ class DurableServiceSuite extends IntegrationTestSuite:
       maxScanInterval      = Duration(100, MILLISECONDS),
       claimDelayPerService = Duration(0, MILLISECONDS)
     )
+    executors.add(exec)
+    exec
 
   atest("registerService creates a claimable TKVL entry"):
     given ExecutionContext = executionContext

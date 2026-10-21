@@ -190,5 +190,7 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     Verified: 8 saturated full runs, 941/941 each; idle 47/47 on the four executor suites.
     Not verified: no deterministic regression test for either fix (both need a failing
     transaction / a shutdown racing a scan). The first sat run after the fix is a small sample.
-    Not changed: DurableServiceSuite still calls exec.shutdown() only in the success path
-    (the item 5 pattern), and the test network read driver spawns a thread per read.
+    Also fixed: DurableServiceSuite shut executors down only in the success path (the item 5
+    pattern). makeExecutor now records each executor and subFixtureTeardown shuts them all down,
+    so a failed or timed-out test no longer leaves one scanning. 13/13 pass idle.
+    Not changed: the test network read driver spawns a thread per read.

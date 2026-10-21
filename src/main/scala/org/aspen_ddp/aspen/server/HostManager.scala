@@ -51,14 +51,14 @@ object HostManager:
   /** Register a new host with the running Aspen system and initialize `hostDirectory` as that
    *  host's root directory.
    *
-   *  `bootstrapConfigFile` is copied into the host directory because that is where the `host`
+   *  `bootstrapYaml` is written into the host directory because that is where the `host`
    *  command reads it from -- MetadataManager rewrites the file in place as the bootstrap pool
-   *  moves, so each host owns its own copy rather than sharing the operator's.
+   *  moves, so each host owns its own copy.
    *
    *  The new host owns no storage devices. create-storage-device adds those afterwards, and
    *  until it does the host is registered but has nothing to serve.
    *
-   *  Ordering is deliberate. The directory is created and the bootstrap config copied in
+   *  Ordering is deliberate. The directory is created and the bootstrap config written in
    *  *before* the transaction, so an unwritable or mistyped path fails without registering
    *  anything; the leftover empty directory is inert and is reused by a later attempt. The
    *  host's TLS key pair is generated and its certificate signed by the cluster CA before the
@@ -73,7 +73,7 @@ object HostManager:
    */
   def createHost(client: AspenClient,
                  hostDirectory: Path,
-                 bootstrapConfigFile: Path,
+                 bootstrapYaml: String,
                  aspenSystemId: UUID,
                  name: String,
                  address: String,
@@ -98,8 +98,8 @@ object HostManager:
           // REPLACE_EXISTING: reaching here means the directory holds no host config, so it is
           // not an initialized host, and a bootstrap config left behind by an aborted earlier
           // run is residue rather than something worth preserving.
-          // The bootstrap config holds the CLI private key, so the copy is owner-only.
-          SecretFile.copy(bootstrapConfigFile, hostDir.resolve(BootstrapConfig.configFilename))
+          SecretFile.write(hostDir.resolve(BootstrapConfig.configFilename),
+                           bootstrapYaml.getBytes(StandardCharsets.UTF_8))
           None
         catch
           case t: Throwable => Some(new DirectorySetupFailed(hostDir, t))

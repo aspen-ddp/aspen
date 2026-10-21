@@ -3,7 +3,10 @@ package org.aspen_ddp.aspen.cmdline
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import org.aspen_ddp.aspen.TestTLS
+import org.aspen_ddp.aspen.client.BootstrapFetcher
 import org.aspen_ddp.aspen.common.metadata.*
+import org.aspen_ddp.aspen.common.metadata.ClientConfig.BootstrapEndpoint
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -11,7 +14,7 @@ import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
-import org.aspen_ddp.aspen.server.HostConfig
+import org.aspen_ddp.aspen.server.{BootstrapHttpServer, HostConfig}
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.yaml.snakeyaml.parser.ParserException
 
@@ -230,6 +233,30 @@ class MainSuite extends AnyFunSuite with Matchers:
       CertificateVerifier.verify(Pem.decodeCertificate(hostCfg.tlsCertificate), ca) shouldBe hostCfg.hostId.uuid
       ca.getSubjectX500Principal.getName should include (bsCfg.aspenSystemId.toString)
 
+  test("bootstrap writes an owner-only client config caching the bootstrap host"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      val stdout = java.io.ByteArrayOutputStream()
+      Console.withOut(stdout):
+        Main.bootstrap(Replication(3, 2), tmp, "10.0.0.5", 4750, 4751, 4752) shouldBe 0
+
+      val clientCfgFile = tmp.resolve("aspen-client-config.yaml")
+      Files.exists(clientCfgFile) shouldBe true
+      Files.getPosixFilePermissions(clientCfgFile) shouldBe
+        java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
+      stdout.toString should include (s"Client configuration written to $clientCfgFile")
+
+      val hostDir = tmp.resolve("bootstrap-host")
+      val hostCfg = HostConfig.loadHostConfig(hostDir.resolve(HostConfig.configFilename).toFile)
+      val bsCfg = BootstrapConfig.loadBootstrapConfig(hostDir.resolve(BootstrapConfig.configFilename).toFile)
+
+      val clientCfg = ClientConfig.load(clientCfgFile)
+      clientCfg.bootstrapHosts shouldBe List(BootstrapEndpoint("10.0.0.5", 4751))
+      clientCfg.aspenSystemId shouldBe hostCfg.aspenSystemId
+
+      val ca = Pem.decodeCertificate(bsCfg.caCertificate)
+      noException should be thrownBy
+        CertificateVerifier.verify(Pem.decodeCertificate(clientCfg.credentials.certificate), ca)
+
   test("validateHostAddress accepts IPv4, DNS names, and bracketed IPv6"):
     Main.validateHostAddress("10.0.0.5") shouldBe None
     Main.validateHostAddress("node-a.example.com") shouldBe None
@@ -285,6 +312,50 @@ class MainSuite extends AnyFunSuite with Matchers:
     Main.commandErrorMessage(new Main.ConfigError("no such pool")) should include("no such pool")
     Main.commandErrorMessage(new TimeoutException()) should include("timed out")
     Main.commandErrorMessage(new IllegalArgumentException("bad width")) should include("bad width")
+
+  test("commandErrorMessage reports unreachable cached hosts"):
+    val e = new BootstrapFetcher.NoReachableHosts(List(BootstrapEndpoint("h", 1) -> "refused"))
+    Main.commandErrorMessage(e) should include("No cached hosts could be reached")
+    Main.commandErrorMessage(e) should startWith("Error: ")
+
+  test("commandErrorMessage reports a bootstrap config for another Aspen system"):
+    val e = new BootstrapFetcher.SystemIdMismatch(BootstrapEndpoint("h", 1), new UUID(0, 1), new UUID(0, 2))
+    Main.commandErrorMessage(e) shouldBe "Error: " + e.getMessage
+
+  test("openClientSession warns but succeeds when the client config is read-only"):
+    withTempDir("aspen-session"): dir =>
+      val systemId = UUID.randomUUID()
+      val hs = HostState(HostId(UUID.randomUUID()), "node_0", "served-host", 4750, 4751, 4752, Set())
+      val yaml = BootstrapConfig.generateBootstrapConfig(
+        systemId, Replication(1, 1), List(hs),
+        List(StoreId(PoolId.BootstrapPoolId, 0.toByte) -> hs.hostId), TestTLS.caCertificatePem)
+
+      val server = new BootstrapHttpServer(0, () => Future.successful(yaml), () => yaml)
+      server.start()
+      val cfgDir = dir.resolve("client")
+      Files.createDirectories(cfgDir)
+      val cfgFile = cfgDir.resolve(ClientConfig.configFilename)
+      try
+        // The cached list names only the server, so the fetched list ("served-host") differs
+        // and the session tries to rewrite the file.
+        ClientConfig.write(cfgFile, ClientConfig.Config(systemId, TestTLS.client,
+          List(BootstrapEndpoint("127.0.0.1", server.boundPort))))
+        Files.setPosixFilePermissions(cfgDir,
+          java.nio.file.attribute.PosixFilePermissions.fromString("r-x------"))
+
+        val stderr = java.io.ByteArrayOutputStream()
+        val session = Console.withErr(stderr):
+          Main.openClientSession(cfgFile, None)
+
+        session.bootstrapConfig.aspenSystemId shouldBe systemId
+        session.bootstrapYaml shouldBe yaml
+        session.clientConfigFile shouldBe cfgFile
+        stderr.toString should include(s"Warning: could not update cached bootstrap hosts in $cfgFile")
+        ClientConfig.load(cfgFile).bootstrapHosts shouldBe List(BootstrapEndpoint("127.0.0.1", server.boundPort))
+      finally
+        server.stop()
+        Files.setPosixFilePermissions(cfgDir,
+          java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"))
 
   test("commandErrorMessage leaves an unexpected exception unhandled"):
     // The clause set is the set of ways a user can get it wrong. Anything else is a bug and
@@ -503,6 +574,44 @@ class MainSuite extends AnyFunSuite with Matchers:
       parsed.dataPort shouldBe 5000
       parsed.httpPort shouldBe 5001
       parsed.storeTransferPort shouldBe 5002
+
+  test("client commands take a client config and --bootstrap-host"):
+    withTempDir("parse-bshost"): dir =>
+      val cfg = Files.createFile(dir.resolve("aspen-client-config.yaml")).toFile.getPath
+      val parsed = Main.buildParser.parse(
+        Seq("list-pools", cfg, "--bootstrap-host", "[fd00::5]:4800"), Main.Args()).
+        getOrElse(fail("list-pools did not parse"))
+      parsed.clientConfigFile.getPath shouldBe cfg
+      parsed.bootstrapHost shouldBe Some(BootstrapEndpoint("[fd00::5]", 4800))
+
+      // The default port is the HTTP port a host is created with.
+      Main.buildParser.parse(Seq("show-pool", cfg, "mypool", "--bootstrap-host", "node-a"),
+        Main.Args()).flatMap(_.bootstrapHost) shouldBe Some(BootstrapEndpoint("node-a", Main.DefaultHttpPort))
+
+      val help = Main.helpRequest(Seq("list-pools", "--help")).get
+      help should include("<client-config-file>")
+      help should include("Client configuration file (aspen-client-config.yaml)")
+      help should include("Host to fetch the bootstrap config from, tried before the cached hosts (default port: 4751)")
+
+  test("every command but bootstrap and host takes --bootstrap-host"):
+    Main.Commands.foreach: c =>
+      val help = Main.helpRequest(Seq(c.name, "--help")).get
+      withClue(s"command '${c.name}':\n$help\n"):
+        if c.name == "bootstrap" || c.name == "host" then
+          help should not include "--bootstrap-host"
+          help should not include "<client-config-file>"
+        else
+          help should include("--bootstrap-host")
+          help should include("<client-config-file>")
+
+  test("--bootstrap-host with a bad port is a usage error"):
+    withTempDir("parse-bshost-bad"): dir =>
+      val cfg = Files.createFile(dir.resolve("aspen-client-config.yaml")).toFile.getPath
+      val sink = new java.io.ByteArrayOutputStream
+      val parsed = Console.withErr(sink):
+        Main.buildParser.parse(Seq("list-pools", cfg, "--bootstrap-host", "node-a:abc"), Main.Args())
+      parsed shouldBe None
+      sink.toString should include("port must be an integer")
 
   test("a command's validation still rejects a bad argument"):
     withTempDir("parse-reject"): dir =>

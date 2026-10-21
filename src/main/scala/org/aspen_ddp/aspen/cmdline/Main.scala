@@ -47,6 +47,7 @@ import java.nio.file.{FileAlreadyExistsException, Files, Path}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeoutException}
+import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.{DAYS, Duration, HOURS, MILLISECONDS, MINUTES, SECONDS}
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
@@ -82,7 +83,8 @@ object Main {
   case class Args(mode:String="",
                   hostDirectory:File=null,
                   targetDirectory:File=null,
-                  bootstrapConfigFile:File=null,
+                  clientConfigFile:File=null,
+                  bootstrapHost:Option[ClientConfig.BootstrapEndpoint]=None,
                   hostName:String="",
                   storeName:String="",
                   deviceId:String="",
@@ -190,7 +192,8 @@ object Main {
    *  and a bug should reach the user as a stack trace rather than as a tidy sentence. What is
    *  in the set is the set of ways a user can get it wrong -- a config that does not parse, a
    *  config that parses but does not validate, an argument naming something that is not there,
-   *  a storage system that does not answer.
+   *  a storage system that does not answer, a client config whose cached bootstrap hosts are
+   *  all unreachable or belong to another system.
    *
    *  YAMLException is the SnakeYAML side of a bad config: ScannerException for a tab indent,
    *  ParserException for an unclosed flow sequence, ComposerException for an undefined alias.
@@ -206,6 +209,8 @@ object Main {
     case e: ConfigError              => s"Error: $e"
     case _: TimeoutException         => "Error: operation timed out waiting for the storage system to respond"
     case e: IllegalArgumentException => s"Error: ${e.getMessage}"
+    case e: BootstrapFetcher.NoReachableHosts => "Error: " + e.getMessage
+    case e: BootstrapFetcher.SystemIdMismatch => "Error: " + e.getMessage
 
   val Version: String = "0.1"
 
@@ -235,15 +240,25 @@ object Main {
   // results into scope, which is what lets these read the same as they did when they were
   // written inline in the parser body.
 
-  /** The bootstrap config file, named identically by every command that reaches a running
+  /** The client config file, named identically by every command that reaches a running
    *  system. Only bootstrap and host do not: bootstrap has no system to reach yet, and host
-   *  reads the file from its own directory so MetadataManager can keep it up to date.
+   *  reads the bootstrap config from its own directory so MetadataManager can keep it up to date.
    */
-  private def bootstrapConfigArg(p: ArgParser): OptionDef[File, Args] =
+  private def clientConfigArg(p: ArgParser): OptionDef[File, Args] =
     import p.*
-    arg[File]("<bootstrap-config-file>").text("Bootstrap Configuration File").
-      action((x, c) => c.copy(bootstrapConfigFile = x)).
+    arg[File]("<client-config-file>").text("Client configuration file (aspen-client-config.yaml)").
+      action((x, c) => c.copy(clientConfigFile = x)).
       validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x"))
+
+  /** Accompanies clientConfigArg on every command that takes it. Lets the user reach a system
+   *  whose cached bootstrap hosts have all moved or gone.
+   */
+  private def bootstrapHostOption(p: ArgParser): OptionDef[String, Args] =
+    import p.*
+    opt[String]("bootstrap-host").valueName("<host[:port]>").
+      text(s"Host to fetch the bootstrap config from, tried before the cached hosts (default port: $DefaultHttpPort)").
+      validate(x => ClientConfig.BootstrapEndpoint.parse(x, DefaultHttpPort).map(_ => ())).
+      action((x, c) => c.copy(bootstrapHost = ClientConfig.BootstrapEndpoint.parse(x, DefaultHttpPort).toOption))
 
   /** The listening ports of a host being created. Shared by every subcommand that creates
    *  one so the ports a host is given do not depend on which command created it.
@@ -341,7 +356,8 @@ object Main {
   private def amoebafsArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<filesystem-name>").text("Name of the filesystem to serve. It must already exist; create one with create-filesystem").
         action( (x, c) => c.copy(fsName=x)).
@@ -351,7 +367,8 @@ object Main {
   private def createPoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<pool-name>").text("Name of the new Pool").
         action((x, c) => c.copy(newPoolName = x)),
@@ -379,7 +396,8 @@ object Main {
   private def createDeviceSetArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<name>").text("Name of the new storage device set").
         action((x, c) => c.copy(newSetName = x)),
@@ -395,7 +413,8 @@ object Main {
   private def createAllocationGroupArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<name>").text("Name of the new allocation group").
         action((x, c) => c.copy(newGroupName = x)),
@@ -408,7 +427,8 @@ object Main {
   private def createFilesystemArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<filesystem-name>").text("Name of the new filesystem").
         action((x, c) => c.copy(fsName = x)).
@@ -421,7 +441,8 @@ object Main {
   private def addPoolToGroupArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<pool-name>").text("Name of the pool to add").
         action((x, c) => c.copy(poolName = x)),
@@ -433,7 +454,8 @@ object Main {
   private def addGroupToGroupArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<source-group-name>").text("Name of the source (lower-level) allocation group").
         action((x, c) => c.copy(srcGroupName = x)),
@@ -445,7 +467,8 @@ object Main {
   private def moveDeviceToSetArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<device-uuid>").text("UUID of the storage device to move").
         action((x, c) => c.copy(deviceId = x)).
@@ -458,7 +481,8 @@ object Main {
   private def failStorageDeviceArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<device-uuid>").text("UUID of the storage device to declare failed").
         action((x, c) => c.copy(deviceId = x)).
@@ -468,9 +492,10 @@ object Main {
   private def addHostArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      // Copied from an existing host by the operator. add-host needs it to reach the
-      // running system, and leaves a copy in <host-directory> for the host command.
-      bootstrapConfigArg(p),
+      // add-host needs it to reach the running system, and leaves a copy of the bootstrap
+      // config it fetches in <host-directory> for the host command.
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       // Unlike the <host-directory> of host and create-storage-device, this one is not
       // required to exist: add-host creates it. An already-initialized directory is
@@ -497,7 +522,8 @@ object Main {
   private def createStorageDeviceArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[File]("<host-directory>").text("Host Directory").
         action((x, c) => c.copy(hostDirectory = x)).
@@ -518,7 +544,8 @@ object Main {
   private def transferStoreArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<store-identifier>").text("Data Store Identifier. Format is \"pool-uuid:storeNumber\"").
         action((x, c) => c.copy(storeName = x)).
@@ -544,7 +571,8 @@ object Main {
   private def rebalanceArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<storage-device-set-id>").text("UUID of the storage device set to rebalance").
         action((x, c) => c.copy(setId = x)).
@@ -554,7 +582,8 @@ object Main {
   private def systemRebalancePeriodArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<period>").optional().
         text("Interval between automatic rebalance sweeps, or \"disabled\". " +
@@ -568,7 +597,8 @@ object Main {
   private def migratePoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<pool-name-or-uuid>").text("Name or UUID of the pool to migrate").
         action((x, c) => c.copy(poolName = x)),
@@ -579,12 +609,13 @@ object Main {
 
   /** The list-* commands, which take nothing beyond the config file. */
   private def configOnlyArgs(p: ArgParser): List[OptionDef[?, Args]] =
-    List(bootstrapConfigArg(p))
+    List(clientConfigArg(p), bootstrapHostOption(p))
 
   private def listDevicesArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<hostname>").text("Name of the host whose devices to list").
         action((x, c) => c.copy(hostName = x)),
@@ -596,7 +627,8 @@ object Main {
   private def showArgs(entityName: String)(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<name-or-uuid>").text(entityName).
         action((x, c) => c.copy(entityRef = x)),
@@ -605,7 +637,8 @@ object Main {
   private def showDeviceArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      bootstrapConfigArg(p),
+      clientConfigArg(p),
+      bootstrapHostOption(p),
 
       arg[String]("<uuid>").text("Storage device UUID").
         action((x, c) => c.copy(entityRef = x)).
@@ -749,18 +782,15 @@ object Main {
 
     val exitCode = parser.parse(args, Args()) match
       case Some(cfg) =>
-        def bootstrapConfig: BootstrapConfig.Config =
-          println(s"Loading BootstrapConfig ${cfg.bootstrapConfigFile}")
-          BootstrapConfig.loadBootstrapConfig(cfg.bootstrapConfigFile)
-
         // Path arguments are resolved by the JVM against the process cwd, which is the
         // directory the user invoked the CLI from, so they arrive here still relative.
         // os.Path rejects relative paths outright, and the commands taking a directory
         // resolve further paths beneath it. Normalize once here rather than at each use.
         def absPath(f: File): Path = f.toPath.toAbsolutePath.normalize
 
-        def bootstrapConfigPath: os.Path =
-          os.Path(absPath(cfg.bootstrapConfigFile))
+        // A def so that only the commands that reach a running system fetch the bootstrap config.
+        def session: ClientSession =
+          openClientSession(absPath(cfg.clientConfigFile), cfg.bootstrapHost)
 
         try
           //println(s"Config file: $config")
@@ -768,40 +798,40 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
                                           cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
             case "host" => run_host(absPath(cfg.hostDirectory))
-            case "amoebafs" => run_amoebafs(bootstrapConfigPath, cfg.fsName)
+            case "amoebafs" => run_amoebafs(session, cfg.fsName)
             // OBSOLETE: see the commented-out "debug" parser entry above.
-            //case "debug" => run_debug_code(bootstrapConfigPath)
-            case "create-pool" => create_pool(bootstrapConfigPath, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
-            case "create-device-set" => create_device_set(bootstrapConfigPath, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
-            case "create-allocation-group" => create_allocation_group(bootstrapConfigPath, cfg.newGroupName, cfg.newGroupLevel)
-            case "create-filesystem" => create_filesystem(bootstrapConfigPath, cfg.fsName, cfg.poolName)
-            case "add-pool-to-group" => add_pool_to_group(bootstrapConfigPath, cfg.poolName, cfg.newGroupName)
-            case "add-group-to-group" => add_group_to_group(bootstrapConfigPath, cfg.srcGroupName, cfg.newGroupName)
-            case "move-device-to-set" => move_device_to_set(bootstrapConfigPath, cfg.deviceId, cfg.deviceSetName)
-            case "fail-storage-device" => fail_storage_device(bootstrapConfigPath, cfg.deviceId)
-            case "add-host" => add_host(bootstrapConfig, bootstrapConfigPath,
+            //case "debug" => run_debug_code(session)
+            case "create-pool" => create_pool(session, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
+            case "create-device-set" => create_device_set(session, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
+            case "create-allocation-group" => create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel)
+            case "create-filesystem" => create_filesystem(session, cfg.fsName, cfg.poolName)
+            case "add-pool-to-group" => add_pool_to_group(session, cfg.poolName, cfg.newGroupName)
+            case "add-group-to-group" => add_group_to_group(session, cfg.srcGroupName, cfg.newGroupName)
+            case "move-device-to-set" => move_device_to_set(session, cfg.deviceId, cfg.deviceSetName)
+            case "fail-storage-device" => fail_storage_device(session, cfg.deviceId)
+            case "add-host" => add_host(session,
                                         absPath(cfg.hostDirectory), cfg.hostName, cfg.address,
                                         cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
-            case "create-storage-device" => create_storage_device(bootstrapConfig, bootstrapConfigPath,
+            case "create-storage-device" => create_storage_device(session,
                                                                   absPath(cfg.hostDirectory), cfg.deviceName,
                                                                   cfg.deviceSetName)
-            case "transfer-store" => transfer_store(bootstrapConfigPath, cfg.storeName, cfg.host)
-            case "rebalance" => rebalance(bootstrapConfigPath, cfg.setId)
+            case "transfer-store" => transfer_store(session, cfg.storeName, cfg.host)
+            case "rebalance" => rebalance(session, cfg.setId)
             case "system-rebalance-period" =>
-              systemRebalancePeriod(bootstrapConfigPath, cfg.rebalancePeriod, cfg.rebalancePeriodUnit)
-            case "migrate-pool" => migrate_pool(bootstrapConfigPath, cfg.poolName, cfg.deviceSetName)
-            case "list-pools"             => list_entries(bootstrapConfigPath, "Storage Pools",     _.listStoragePools(),      _.uuid)
-            case "list-hosts"             => list_entries(bootstrapConfigPath, "Hosts",             _.listHosts(),             _.uuid)
-            case "list-allocation-groups" => list_entries(bootstrapConfigPath, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
-            case "list-device-sets"       => list_entries(bootstrapConfigPath, "Device Sets",       _.listStorageDeviceSets(), _.uuid)
-            case "list-filesystems"       => list_entries(bootstrapConfigPath, "Filesystems",
+              systemRebalancePeriod(session, cfg.rebalancePeriod, cfg.rebalancePeriodUnit)
+            case "migrate-pool" => migrate_pool(session, cfg.poolName, cfg.deviceSetName)
+            case "list-pools"             => list_entries(session, "Storage Pools",     _.listStoragePools(),      _.uuid)
+            case "list-hosts"             => list_entries(session, "Hosts",             _.listHosts(),             _.uuid)
+            case "list-allocation-groups" => list_entries(session, "Allocation Groups", _.listAllocationGroups(),  _.uuid)
+            case "list-device-sets"       => list_entries(session, "Device Sets",       _.listStorageDeviceSets(), _.uuid)
+            case "list-filesystems"       => list_entries(session, "Filesystems",
                                                           _.listRegisteredIds(FileSystem.RegistryNamespace), identity)
-            case "list-devices"           => list_devices(bootstrapConfigPath, cfg.hostName)
-            case "show-host"              => show_host(bootstrapConfigPath, cfg.entityRef)
-            case "show-device"            => show_device(bootstrapConfigPath, cfg.entityRef)
-            case "show-pool"              => show_pool(bootstrapConfigPath, cfg.entityRef)
-            case "show-device-set"        => show_device_set(bootstrapConfigPath, cfg.entityRef)
-            case "show-allocation-group"  => show_allocation_group(bootstrapConfigPath, cfg.entityRef)
+            case "list-devices"           => list_devices(session, cfg.hostName)
+            case "show-host"              => show_host(session, cfg.entityRef)
+            case "show-device"            => show_device(session, cfg.entityRef)
+            case "show-pool"              => show_pool(session, cfg.entityRef)
+            case "show-device-set"        => show_device_set(session, cfg.entityRef)
+            case "show-allocation-group"  => show_allocation_group(session, cfg.entityRef)
         catch
           // Rethrowing from applyOrElse's default is what keeps an unrecognized exception
           // loud. It still unwinds out of main and still skips the drain, which is the right
@@ -840,10 +870,52 @@ object Main {
     (b, net)
   }
 
-  // Temporary: the client commands still take a bootstrap config path. They have no host
-  // directory, so a refreshed config is not persisted anywhere.
-  private def createAspenClient(bootstrapConfigFile: os.Path): (AspenClient, ZMQNet, KeyValueObjectPointer) =
-    createAspenClient(BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO), (_, _) => ())
+  /** What a client command starts from: its client config and the bootstrap config fetched
+   *  with it. `clientConfig` is the config as last written, cached host list included.
+   */
+  case class ClientSession(clientConfigFile: Path,
+                           clientConfig: ClientConfig.Config,
+                           bootstrapYaml: String,
+                           bootstrapConfig: BootstrapConfig.Config)
+
+  /** Loads the client config, fetches the bootstrap config, and refreshes the cached bootstrap
+   *  hosts from it. A cache that cannot be written is a warning, not a failure: the fetched
+   *  config is just as usable.
+   */
+  def openClientSession(clientConfigFile: Path,
+                        bootstrapHost: Option[ClientConfig.BootstrapEndpoint]): ClientSession =
+    val clientConfig = ClientConfig.load(clientConfigFile)
+    val fetched = BootstrapFetcher.fetch(clientConfig, bootstrapHost)
+    val current = refreshCachedHosts(clientConfigFile, clientConfig, fetched.config)
+    ClientSession(clientConfigFile, current, fetched.yaml, fetched.config)
+
+  /** Returns the client config as last written: `current` unless this call wrote a new one. */
+  private def refreshCachedHosts(clientConfigFile: Path,
+                                 current: ClientConfig.Config,
+                                 fetched: BootstrapConfig.Config): ClientConfig.Config =
+    ClientConfig.updateCachedHosts(clientConfigFile, current, fetched) match
+      case ClientConfig.CacheUpdate.Unchanged => current
+      case ClientConfig.CacheUpdate.Updated =>
+        current.copy(bootstrapHosts = ClientConfig.endpointsOf(fetched))
+      case ClientConfig.CacheUpdate.Failed(t) =>
+        Console.err.println(
+          s"Warning: could not update cached bootstrap hosts in $clientConfigFile: ${t.getMessage}")
+        current
+
+  /** Builds the client every client command uses. Bootstrap configs the network refreshes while
+   *  the client runs -- amoebafs runs indefinitely -- keep the cached host list current too.
+   */
+  def createAspenClient(session: ClientSession): (AspenClient, ZMQNet, KeyValueObjectPointer) =
+    // Compared against what was last written rather than what the session started with, so a
+    // host set that moves and then moves back is written both times. Refreshes are serialized
+    // on the reference so two cannot both compare against the same stale config.
+    val latest = AtomicReference(session.clientConfig)
+
+    val onRefresh: (String, BootstrapConfig.Config) => Unit = (_, fetched) =>
+      latest.synchronized:
+        latest.set(refreshCachedHosts(session.clientConfigFile, latest.get, fetched))
+
+    createAspenClient(session.bootstrapConfig, onRefresh)
 
   def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
@@ -877,13 +949,13 @@ object Main {
     ret
   }
 
-  def create_filesystem(bootstrapConfigFile: os.Path,
+  def create_filesystem(session: ClientSession,
                         fsName: String,
                         poolName: String): Int = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -917,10 +989,10 @@ object Main {
   }
 
   /** OBSOLETE: not reachable from the CLI. Retained for reference; needs rework. */
-  def run_debug_code(bootstrapConfigFile: os.Path): Unit = {
+  def run_debug_code(session: ClientSession): Unit = {
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -974,10 +1046,10 @@ object Main {
       ()
   }
 
-  def run_amoebafs(bootstrapConfigFile: os.Path, fsName: String): Int = {
+  def run_amoebafs(session: ClientSession, fsName: String): Int = {
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1259,6 +1331,15 @@ object Main {
       bootstrapStores.toList,
       ca)
 
+    // Every other command starts from this file, fetching the bootstrap config from the hosts
+    // it caches. It holds the client's private key and is written owner-only.
+    val clientConfigFile = baseDirectory.resolve(ClientConfig.configFilename)
+    ClientConfig.write(clientConfigFile, ClientConfig.Config(
+      aspenSystemId,
+      ClientConfig.ClientCredentials.generate(ca),
+      List(ClientConfig.BootstrapEndpoint(address, httpPort))))
+    println(s"Client configuration written to $clientConfigFile")
+
     // Print yaml representation of Radicle Pointer
     println("# Aspen Radicle Pointer Definition")
     println("radicle:")
@@ -1269,7 +1350,7 @@ object Main {
     0
   }
 
-  def create_pool(bootstrapConfigFile: os.Path,
+  def create_pool(session: ClientSession,
                   poolName: String,
                   ida: IDA,
                   deviceSetName: String,
@@ -1277,7 +1358,7 @@ object Main {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1309,14 +1390,14 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
-  def create_device_set(bootstrapConfigFile: os.Path,
+  def create_device_set(session: ClientSession,
                         name: String,
                         level: Int,
                         parentSetName: String): Int = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1357,13 +1438,13 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
-  def create_allocation_group(bootstrapConfigFile: os.Path,
+  def create_allocation_group(session: ClientSession,
                               name: String,
                               level: Int): Int = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1389,13 +1470,13 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
-  def add_pool_to_group(bootstrapConfigFile: os.Path,
+  def add_pool_to_group(session: ClientSession,
                         poolName: String,
                         groupName: String): Int = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1417,13 +1498,13 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
-  def add_group_to_group(bootstrapConfigFile: os.Path,
+  def add_group_to_group(session: ClientSession,
                          sourceGroupName: String,
                          destGroupName: String): Int = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1448,13 +1529,13 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
-  def move_device_to_set(bootstrapConfigFile: os.Path,
+  def move_device_to_set(session: ClientSession,
                          deviceIdStr: String,
                          setRef: String): Int = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1484,12 +1565,12 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
-  def fail_storage_device(bootstrapConfigFile: os.Path,
+  def fail_storage_device(session: ClientSession,
                           deviceIdStr: String): Int = {
 
     configureLogging()
 
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1517,17 +1598,17 @@ object Main {
         println("slices that lived on this device are unavailable until it is. The tombstone")
         println("is one-way.")
         println("Watch the marks with:")
-        println(s"  show-device $bootstrapConfigFile $deviceIdStr")
+        println(s"  show-device <client-config-file> $deviceIdStr")
       case Failure(err) => reportError(err)
   }
 
-  def migrate_pool(bootstrapConfigFile: os.Path,
+  def migrate_pool(session: ClientSession,
                    poolRef: String,
                    setRef: String): Int =
 
     configureLogging()
 
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1553,8 +1634,7 @@ object Main {
           s"Track progress with: show-pool $poolRef")
       case Failure(err) => reportError(err)
 
-  def add_host(bootstrapCfg: BootstrapConfig.Config,
-               bootstrapConfigFile: os.Path,
+  def add_host(session: ClientSession,
                hostDirectory: Path,
                hostName: String,
                address: String,
@@ -1570,14 +1650,14 @@ object Main {
 
     val hostDir = hostDirectory.toAbsolutePath.normalize
 
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
 
     network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
 
     val f = HostManager.createHost(
-      client, hostDir, bootstrapConfigFile.toNIO, bootstrapCfg.aspenSystemId,
+      client, hostDir, session.bootstrapYaml, session.bootstrapConfig.aspenSystemId,
       hostName, address, dataPort, httpPort, storeTransferPort)
 
     def reportError(cause: Throwable): Unit = cause match
@@ -1617,8 +1697,7 @@ object Main {
       case Failure(err) => reportError(err)
   }
 
-  def create_storage_device(bootstrapCfg: BootstrapConfig.Config,
-                            bootstrapConfigFile: os.Path,
+  def create_storage_device(session: ClientSession,
                             hostDirectory: Path,
                             deviceName: String,
                             setRef: String): Int = {
@@ -1639,7 +1718,7 @@ object Main {
       // a second line of defence for its non-CLI callers rather than the mechanism here.
       val deviceDirectory = StorageDeviceManager.deviceDirectory(hostDirectory, deviceName)
 
-      val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+      val (client, network, radicle) = createAspenClient(session)
 
       network.startIoThread(client)
 
@@ -1649,7 +1728,7 @@ object Main {
         setId    <- resolveRef(setRef, StorageDeviceSetId(_), client.getStorageDeviceSetId)
         deviceId <- StorageDeviceManager.createStorageDevice(
                       client, hostCfg, hostDirectory, deviceDirectory,
-                      setId, bootstrapCfg.aspenSystemId)
+                      setId, session.bootstrapConfig.aspenSystemId)
       yield deviceId
 
       def reportError(cause: Throwable): Unit = cause match
@@ -1684,7 +1763,7 @@ object Main {
           println(s"Check whether ${e.configFile} exists. If it exists and does not name device")
           println(s"${e.storageDeviceId.uuid}, it belongs to another device: leave it alone.")
           println("Otherwise create or replace it with exactly these contents:")
-          print(StorageDeviceConfig(e.storageDeviceId, bootstrapCfg.aspenSystemId).yamlConfig)
+          print(StorageDeviceConfig(e.storageDeviceId, session.bootstrapConfig.aspenSystemId).yamlConfig)
           println(s"If you do not, device ${e.storageDeviceId.uuid} remains a member of set '$setRef' with no")
           println("directory and may be selected for pool placement. Quarantine it with:")
           println(s"  move-device-to-set ${e.storageDeviceId.uuid} <quarantine-level-0-set>")
@@ -1712,13 +1791,13 @@ object Main {
         case Failure(err) => reportError(err)
   }
 
-  def transfer_store(bootstrapConfigFile: os.Path,
+  def transfer_store(session: ClientSession,
                      storeName: String,
                      targetDeviceIdStr: String): Int = {
 
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -1784,10 +1863,10 @@ object Main {
         1
   }
 
-  def rebalance(bootstrapConfigFile: os.Path, setIdStr: String): Int =
+  def rebalance(session: ClientSession, setIdStr: String): Int =
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
     network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
@@ -1804,12 +1883,12 @@ object Main {
 
   /** Display the automatic rebalancing period, or set it. checkConfig has already rejected a
    *  malformed period, so the Left branch here is belt and braces. */
-  def systemRebalancePeriod(bootstrapConfigFile: os.Path,
+  def systemRebalancePeriod(session: ClientSession,
                             period: Option[String],
                             unit: Option[String]): Int =
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(bootstrapConfigFile)
+    val (client, network, radicle) = createAspenClient(session)
     network.startIoThread(client)
 
     given ExecutionContext = client.clientContext
@@ -2089,11 +2168,11 @@ object Main {
       s.parentGroups.foreach(p => lines += s"    ${p.uuid}")
     lines.mkString("\n")
 
-  def list_devices(bootstrapConfigFile: os.Path, hostname: String): Int =
+  def list_devices(session: ClientSession, hostname: String): Int =
 
     configureLogging()
 
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
 
     network.startIoThread(client)
 
@@ -2141,9 +2220,9 @@ object Main {
       case Failure(err) =>
         println(s"Error listing devices: ${err.getMessage}")
 
-  def show_host(bootstrapConfigFile: os.Path, ref: String): Int =
+  def show_host(session: ClientSession, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2159,9 +2238,9 @@ object Main {
       case Failure(e: EntityNotFound)   => println(s"Error: ${e.getMessage}")
       case Failure(err)                 => println(s"Error showing host: ${err.getMessage}")
 
-  def show_device(bootstrapConfigFile: os.Path, uuidStr: String): Int =
+  def show_device(session: ClientSession, uuidStr: String): Int =
     configureLogging()
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2180,9 +2259,9 @@ object Main {
       case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
       case Failure(err)               => println(s"Error showing storage device: ${err.getMessage}")
 
-  def show_pool(bootstrapConfigFile: os.Path, ref: String): Int =
+  def show_pool(session: ClientSession, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2199,9 +2278,9 @@ object Main {
       case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
       case Failure(err)               => println(s"Error showing pool: ${err.getMessage}")
 
-  def show_device_set(bootstrapConfigFile: os.Path, ref: String): Int =
+  def show_device_set(session: ClientSession, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2220,9 +2299,9 @@ object Main {
       case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
       case Failure(err)               => println(s"Error showing device set: ${err.getMessage}")
 
-  def show_allocation_group(bootstrapConfigFile: os.Path, ref: String): Int =
+  def show_allocation_group(session: ClientSession, ref: String): Int =
     configureLogging()
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
@@ -2238,14 +2317,14 @@ object Main {
       case Failure(e: EntityNotFound) => println(s"Error: ${e.getMessage}")
       case Failure(err)               => println(s"Error showing allocation group: ${err.getMessage}")
 
-  def list_entries[A](bootstrapConfigFile: os.Path,
+  def list_entries[A](session: ClientSession,
                       title: String,
                       fetch: AspenClient => Future[List[(String, A)]],
                       idToUuid: A => UUID): Int =
 
     configureLogging()
 
-    val (client, network, _) = createAspenClient(bootstrapConfigFile)
+    val (client, network, _) = createAspenClient(session)
 
     network.startIoThread(client)
 

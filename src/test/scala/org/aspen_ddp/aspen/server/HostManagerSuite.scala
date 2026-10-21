@@ -55,8 +55,8 @@ class HostManagerSuite extends IntegrationTestSuite:
     catch
       case _: Throwable => ()
 
-  /** A real bootstrap config for the operator's copy, so tests can assert the copy is not
-   *  merely byte-identical but still loadable by the host command. */
+  /** A real bootstrap config, as fetched by the CLI, so tests can assert the written copy is
+   *  not merely byte-identical but still loadable by the host command. */
   private val bootstrapConfigYaml: String =
     val hs = HostState(HostId(UUID.randomUUID()), "some_other_host", "10.0.0.5",
                        4750, 4751, 4752, Set())
@@ -67,28 +67,21 @@ class HostManagerSuite extends IntegrationTestSuite:
       storeMap = List(StoreId(PoolId.BootstrapPoolId, 0.toByte) -> hs.hostId),
       caCertificate = TestTLS.caCertificatePem)
 
-  /** Writes the operator's bootstrap config somewhere outside the new host's directory,
-   *  which is where it comes from in practice. */
-  private def newBootstrapConfigFile(): Path =
-    val f = newTempDir("aspen-operator").resolve(BootstrapConfig.configFilename)
-    Files.write(f, bootstrapConfigYaml.getBytes(StandardCharsets.UTF_8))
-    f
-
   /** A host directory path that does not yet exist, as add-host expects. */
   private def unusedHostDir(): Path =
     newTempDir("aspen-hm-test").resolve("node_b")
 
   private def createHost(hostDir: Path,
-                         bsCfg: Path,
+                         bsCfg: String,
                          name: String = "node_b",
                          via: AspenClient = client)
                         (using ExecutionContext): Future[HostId] =
     HostManager.createHost(via, hostDir, bsCfg, systemId, name, "10.0.0.7", 5750, 5751, 5752)
 
-  atest("creates the directory tree, copies the bootstrap config, and writes the host config"):
+  atest("creates the directory tree, writes the bootstrap config, and writes the host config"):
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     for
       hostId <- createHost(hostDir, bsCfg)
       _      <- waitForTransactionsToComplete()
@@ -99,6 +92,7 @@ class HostManagerSuite extends IntegrationTestSuite:
 
       val copied = hostDir.resolve(BootstrapConfig.configFilename)
       Files.isRegularFile(copied) should be(true)
+      Files.readAllBytes(copied) should be(bootstrapConfigYaml.getBytes(StandardCharsets.UTF_8))
       val bs = BootstrapConfig.loadBootstrapConfig(copied.toFile)
       bs.aspenSystemId should be(systemId)
 
@@ -127,7 +121,7 @@ class HostManagerSuite extends IntegrationTestSuite:
   atest("rejects a directory that is already an initialized host"):
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     Files.createDirectories(hostDir)
     Files.write(hostDir.resolve(HostConfig.configFilename),
                 "host-id: x\n".getBytes(StandardCharsets.UTF_8))
@@ -145,7 +139,7 @@ class HostManagerSuite extends IntegrationTestSuite:
 
   atest("reports DirectorySetupFailed, and registers nothing, when the directory cannot be made"):
     given ExecutionContext = executionContext
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     // An existing regular file where the host directory should go: createDirectories fails.
     val hostDir = newTempDir("aspen-hm-test").resolve("node_b")
     Files.write(hostDir, "not a directory".getBytes(StandardCharsets.UTF_8))
@@ -163,7 +157,7 @@ class HostManagerSuite extends IntegrationTestSuite:
   atest("reuses a directory left behind by an aborted earlier run"):
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     // Exactly what a run that failed between the copy and the commit leaves behind.
     Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
     Files.write(hostDir.resolve(BootstrapConfig.configFilename),
@@ -182,7 +176,7 @@ class HostManagerSuite extends IntegrationTestSuite:
 
   atest("a name already in use fails after the directory has been prepared"):
     given ExecutionContext = executionContext
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     val firstDir = unusedHostDir()
     val secondDir = unusedHostDir()
     for
@@ -203,7 +197,7 @@ class HostManagerSuite extends IntegrationTestSuite:
   atest("reports ConfigWriteFailed, carrying the config text, when the final write fails"):
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     Files.createDirectories(hostDir)
     // Files.exists follows symlinks so the guard sees no host config; the CREATE_NEW write
     // opens with O_EXCL, which fails on the link itself.
@@ -224,7 +218,7 @@ class HostManagerSuite extends IntegrationTestSuite:
   atest("writes a host config with a certificate signed for the new host id and a matching key"):
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     for
       hostId <- createHost(hostDir, bsCfg)
     yield
@@ -260,7 +254,7 @@ class HostManagerSuite extends IntegrationTestSuite:
   atest("registers nothing when certificate signing fails"):
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
-    val bsCfg = newBootstrapConfigFile()
+    val bsCfg = bootstrapConfigYaml
     val boom = new RuntimeException("signing exploded")
     for
       before <- client.listHosts()

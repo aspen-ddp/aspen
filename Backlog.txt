@@ -43,7 +43,17 @@ How handle changing Host IP?
     heard from in a long time?
   - Wait for gossip protocol implementation?
 
-Add TLS Cert generation for hosts
+Design proper certificate management for the CLI and other client applications
+  - Intentional technical debt: the CLI certificate and private key live in
+    aspen-bootstrap-config.yaml, which is copied to every host and stored in the
+    Radicle. They are generated once at bootstrap and carried forward unchanged
+    whenever the config is regenerated.
+  - Every CLI process uses the same fixed client id taken from that certificate,
+    so concurrent CLI invocations share one identity.
+
+TLS certificate rotation, renewal and revocation
+  - CA and entity certificates are issued with ~100 year lifetimes and are never
+    renewed or revoked.
 
 Add a Quic/Netty Network implementation
 

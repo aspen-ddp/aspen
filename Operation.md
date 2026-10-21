@@ -56,6 +56,12 @@ this must be managed by hand. This is an obvious pain point and a more convenien
 such as an API to obtain a copy of the current config from a running host, will need to 
 be added in the near future.
 
+Bootstrapping also creates the Aspen certificate authority (CA). Each host's config file
+(`aspen-host-config.yaml`) contains that host's TLS certificate and private key, signed by
+the CA. The `aspen-bootstrap-config.yaml` file contains the CA certificate along with the
+CLI's certificate and private key, so it must be treated as a secret: anyone who obtains it
+can act as the CLI.
+
 ## Operation
 
 Once the system is bootstrapped, the storage pools, allocation groups, and storage device

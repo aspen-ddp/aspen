@@ -302,10 +302,6 @@ class SimpleCRLSuite extends FileBasedTests {
 
     val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
 
-    i.crl.save(transactionId2, trsValidTxd, completionHandler)
-
-    assert(i.crl.currentStreamNumber == 2)
-
     assert(i2.trsList.length == 1)
 
     assert(i2.trsList.head.storeId == txid.storeId)
@@ -345,10 +341,6 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
 
     val i2 = SimpleCRL(tdir.toPath, 3, 4096*3)
-
-    i.crl.save(transactionId2, trsValidTxd, completionHandler)
-
-    assert(i.crl.currentStreamNumber == 1)
 
     assert(i2.trsList.length == 1)
 

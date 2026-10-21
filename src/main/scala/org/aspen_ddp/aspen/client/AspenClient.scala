@@ -173,12 +173,16 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *
    *  The host is created with no storage devices. Devices are added afterwards by
    *  createStorageDevice, which is also what makes the host useful for anything. Nothing here
-   *  touches the new machine's filesystem -- see server.HostManager.createHost for that. */
+   *  touches the new machine's filesystem -- see server.HostManager.createHost for that.
+   *
+   *  `hostId` is supplied by the caller so that anything bound to the id beforehand, such as
+   *  the host's TLS certificate, can be prepared before this registration commits. */
   def createHost(name: String,
                  address: String,
                  dataPort: Int,
                  cncPort: Int,
-                 storeTransferPort: Int): Future[HostId]
+                 storeTransferPort: Int,
+                 hostId: HostId = HostId(UUID.randomUUID())): Future[HostId]
 
   /** Register a new storage device on `hostId` and place it in the level-0 device set
    *  `deviceSetId`, in a single atomic transaction: a new StorageDeviceState object is

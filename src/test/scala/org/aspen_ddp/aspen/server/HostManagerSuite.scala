@@ -4,11 +4,15 @@ import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState}
+import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
 import org.aspen_ddp.aspen.common.objects.KeyAlreadyExists
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.client.AspenClient
 
 import java.io.IOException
+import java.lang.reflect.{InvocationTargetException, Proxy}
+import java.security.Signature
 import java.nio.charset.StandardCharsets
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.{Files, LinkOption, Path, SimpleFileVisitor, FileVisitResult}
@@ -77,9 +81,10 @@ class HostManagerSuite extends IntegrationTestSuite:
 
   private def createHost(hostDir: Path,
                          bsCfg: Path,
-                         name: String = "node_b")
+                         name: String = "node_b",
+                         via: AspenClient = client)
                         (using ExecutionContext): Future[HostId] =
-    HostManager.createHost(client, hostDir, bsCfg, systemId, name, "10.0.0.7", 5750, 5751, 5752)
+    HostManager.createHost(via, hostDir, bsCfg, systemId, name, "10.0.0.7", 5750, 5751, 5752)
 
   atest("creates the directory tree, copies the bootstrap config, and writes the host config"):
     given ExecutionContext = executionContext
@@ -211,3 +216,56 @@ class HostManagerSuite extends IntegrationTestSuite:
         waitForTransactionsToComplete().flatMap: _ =>
           client.getHostState(err.hostId).map: hs =>
             hs.name should be("node_b")
+
+  atest("writes a host config with a certificate signed for the new host id and a matching key"):
+    given ExecutionContext = executionContext
+    val hostDir = unusedHostDir()
+    val bsCfg = newBootstrapConfigFile()
+    for
+      hostId <- createHost(hostDir, bsCfg)
+    yield
+      val cfg = HostConfig.loadHostConfig(hostDir.resolve(HostConfig.configFilename).toFile)
+      val cert = Pem.decodeCertificate(cfg.tlsCertificate)
+      CertificateVerifier.verify(cert, TestTLS.ca.certificate) should be(hostId.uuid)
+
+      // The private key must be the one whose public half was certified.
+      val nonce = "nonce".getBytes(StandardCharsets.UTF_8)
+      val signer = Signature.getInstance("SHA256withECDSA")
+      signer.initSign(Pem.decodePrivateKey(cfg.tlsPrivateKey))
+      signer.update(nonce)
+      val sig = signer.sign()
+      val verifier = Signature.getInstance("SHA256withECDSA")
+      verifier.initVerify(cert.getPublicKey)
+      verifier.update(nonce)
+      verifier.verify(sig) should be(true)
+
+  /** A client that behaves as `client` in every respect except that certificate signing fails. */
+  private def clientWithFailingSigning(cause: Throwable): AspenClient =
+    val real = client
+    Proxy.newProxyInstance(
+      classOf[AspenClient].getClassLoader,
+      Array[Class[?]](classOf[AspenClient]),
+      (_, method, args) =>
+        if method.getName == "createTLSCertificate" then
+          Future.failed(cause)
+        else
+          try method.invoke(real, Option(args).getOrElse(Array.empty[AnyRef])*)
+          catch case e: InvocationTargetException => throw e.getCause
+    ).asInstanceOf[AspenClient]
+
+  atest("registers nothing when certificate signing fails"):
+    given ExecutionContext = executionContext
+    val hostDir = unusedHostDir()
+    val bsCfg = newBootstrapConfigFile()
+    val boom = new RuntimeException("signing exploded")
+    for
+      before <- client.listHosts()
+      err    <- createHost(hostDir, bsCfg, via = clientWithFailingSigning(boom)).failed
+      _      <- waitForTransactionsToComplete()
+      after  <- client.listHosts()
+      _      <- client.getHostId("node_b").failed  // the name is not registered
+    yield
+      err shouldBe a[HostManager.CertificateCreationFailed]
+      err.getCause should be theSameInstanceAs boom
+      after should be(before)
+      Files.exists(hostDir.resolve(HostConfig.configFilename)) should be(false)

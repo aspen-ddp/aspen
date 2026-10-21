@@ -43,6 +43,11 @@ object HostManager:
       s"Host ${hostId.uuid} was registered but writing $configFile failed: ${cause.getMessage}",
       cause)
 
+  /** Raised when the CA could not sign the new host's certificate. This happens before the
+   *  registration transaction, so no host was registered and the command can simply be re-run. */
+  class CertificateCreationFailed(cause: Throwable)
+    extends Exception(s"Could not create a TLS certificate for the new host: ${cause.getMessage}", cause)
+
   /** Register a new host with the running Aspen system and initialize `hostDirectory` as that
    *  host's root directory.
    *
@@ -56,6 +61,9 @@ object HostManager:
    *  Ordering is deliberate. The directory is created and the bootstrap config copied in
    *  *before* the transaction, so an unwritable or mistyped path fails without registering
    *  anything; the leftover empty directory is inert and is reused by a later attempt. The
+   *  host's TLS key pair is generated and its certificate signed by the cluster CA before the
+   *  transaction too, using a HostId minted here and passed to the registration, so a signing
+   *  failure (CertificateCreationFailed) likewise registers nothing. The
    *  host config file is written last, after the commit, because it is both the only artifact
    *  that needs the committed HostId and the marker that says this directory is an initialized
    *  host: writing it earlier would let a `host` process start against a registration that
@@ -101,11 +109,18 @@ object HostManager:
         case Some(err) => Future.failed(err)
 
         case None =>
-          client.createHost(name, address, dataPort, cncPort, storeTransferPort).map: hostId =>
-            // replaced in a later task: throwaway CA signs a cert for this host
-            val tlsCa = CertificateAuthority.create(aspenSystemId)
-            val tlsKeyPair = CertificateAuthority.generateKeyPair()
-            val tlsCert = tlsCa.signCertificate(hostId.uuid, tlsKeyPair.getPublic)
+          val hostId = HostId(UUID.randomUUID())
+          val tlsKeyPair = CertificateAuthority.generateKeyPair()
+
+          val registered =
+            for
+              tlsCert <- client.createTLSCertificate(hostId.uuid, tlsKeyPair.getPublic)
+                           .recoverWith:
+                             case t => Future.failed(new CertificateCreationFailed(t))
+              _       <- client.createHost(name, address, dataPort, cncPort, storeTransferPort, hostId)
+            yield tlsCert
+
+          registered.map: tlsCert =>
             val hostConfig = HostConfig(
               hostId,
               aspenSystemId,

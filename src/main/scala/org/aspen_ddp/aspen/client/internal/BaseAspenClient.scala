@@ -275,10 +275,10 @@ abstract class BaseAspenClient(
                           address: String,
                           dataPort: Int,
                           cncPort: Int,
-                          storeTransferPort: Int): Future[HostId] =
-    // Minted outside runCreate for the same reason createStorageDevice mints its device id
-    // there: a retried attempt must reuse the id rather than leak a fresh UUID per attempt.
-    val hostId = HostId(UUID.randomUUID())
+                          storeTransferPort: Int,
+                          hostId: HostId): Future[HostId] =
+    // The id is fixed outside runCreate, as createStorageDevice does for its device id, so a
+    // retried attempt reuses it rather than leaking a fresh UUID per attempt.
     val state = HostState(hostId, name, address, dataPort, cncPort, storeTransferPort, Set())
 
     // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the

@@ -1575,6 +1575,9 @@ object Main {
       case e: HostManager.DirectorySetupFailed =>
         println(s"Error: could not prepare host directory ${e.directory}: ${e.getCause.getMessage}")
         println("No host was registered.")
+      case e: HostManager.CertificateCreationFailed =>
+        println(s"Error: could not create a TLS certificate for the new host: ${e.getCause.getMessage}")
+        println("No host was registered. Re-run this command to try again.")
       // KeyAlreadyExists is how a taken name arrives from the registry's transactional
       // registration path; DuplicateRegistration comes only from Registry.register.
       case _: KeyAlreadyExists =>

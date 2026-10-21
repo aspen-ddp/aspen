@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.common.metadata
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.objects.KeyAlreadyExists
 
+import java.util.UUID
 import scala.concurrent.ExecutionContext
 
 class HostCreationSuite extends IntegrationTestSuite:
@@ -72,3 +73,9 @@ class HostCreationSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     recoverToSucceededIf[KeyAlreadyExists](
       client.createHost("testhost", "10.0.0.7", 5750, 5751, 5752))
+
+  atest("createHost uses a caller-supplied host id"):
+    val id = HostId(UUID.randomUUID())
+    client.createHost("node_b", "10.0.0.7", 5750, 5751, 5752, id).flatMap: created =>
+      created shouldBe id
+      client.getHostState(id).map(_.name shouldBe "node_b")

@@ -1155,6 +1155,7 @@ object Main {
     // replaced in a later task: throwaway CA signs a cert for the bootstrap host
     val bootstrapHostId = HostId(UUID.randomUUID())
     val tlsCa = CertificateAuthority.create(aspenSystemId)
+    val tlsCli = BootstrapConfig.CLICredentials.generate(tlsCa)
     val tlsKeyPair = CertificateAuthority.generateKeyPair()
     val tlsCert = tlsCa.signCertificate(bootstrapHostId.uuid, tlsKeyPair.getPublic)
 
@@ -1233,7 +1234,7 @@ object Main {
         storeMap = bootstrapStores.map(backend => backend.storeId -> hostConfig.hostId).toList,
         // replaced in a later task: shares the throwaway CA created above
         caCertificate = Pem.encodeCertificate(tlsCa.certificate),
-        cli = BootstrapConfig.CLICredentials.generate(tlsCa)
+        cli = tlsCli
       ).getBytes(StandardCharsets.UTF_8)
     )
 
@@ -1242,7 +1243,9 @@ object Main {
       bootstrapIda,
       bootstrapHost,
       bootstrapStorageDevice,
-      bootstrapStores.toList)
+      bootstrapStores.toList,
+      tlsCa,
+      tlsCli)
 
     // Print yaml representation of Radicle Pointer
     println("# Aspen Radicle Pointer Definition")

@@ -24,5 +24,7 @@ object Radicle:
   private[aspen] val StorageDevicesTreeKey = Key(Array[Byte](7))
   private[aspen] val StorageDeviceSetsTreeKey = Key(Array[Byte](8))
   private[aspen] val ServicesTreeKey = Key(Array[Byte](9))
+  private[aspen] val CACertificateKey = Key(Array[Byte](10))
+  private[aspen] val CAPrivateKeyKey = Key(Array[Byte](11))
 
 

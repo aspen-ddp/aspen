@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets
 import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -24,20 +25,19 @@ object Bootstrap:
                  ida: IDA,
                  bootstrapHostState: HostState,
                  bootstrapStorageDeviceState: StorageDeviceState,
-                 stores: List[Backend]): KeyValueObjectPointer = {
+                 stores: List[Backend],
+                 ca: CertificateAuthority,
+                 cli: BootstrapConfig.CLICredentials): KeyValueObjectPointer = {
 
     require( ida.width == stores.length )
-
-    // replaced in a later task: throwaway CA and CLI credentials
-    val throwawayCa = org.aspen_ddp.aspen.common.network.tls.CertificateAuthority.create(aspenSystemId)
 
     val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
       aspenSystemId = aspenSystemId,
       ida = ida,
       hostStates = List(bootstrapHostState),
       storeMap = stores.map(backend => backend.storeId -> bootstrapHostState.hostId),
-      caCertificate = org.aspen_ddp.aspen.common.network.tls.Pem.encodeCertificate(throwawayCa.certificate),
-      cli = BootstrapConfig.CLICredentials.generate(throwawayCa)
+      caCertificate = Pem.encodeCertificate(ca.certificate),
+      cli = cli
     )
 
     val bootstrapMetadata = Metadata(
@@ -212,6 +212,9 @@ object Bootstrap:
       Key(SystemTaskExecutorService.ServiceUUID) -> systemTaskServiceEntry.encode()
     )
 
+    val caCertificatePtr = allocateData(Pem.encodeCertificate(ca.certificate).getBytes(StandardCharsets.UTF_8))
+    val caPrivateKeyPtr = allocateData(Pem.encodePrivateKey(ca.privateKey).getBytes(StandardCharsets.UTF_8))
+
     val radicleContent: List[(Key, Array[Byte])] = List(
       Radicle.BootstrapConfigKey -> bootstrapConfig.getBytes(StandardCharsets.UTF_8),
       Radicle.SystemIdKey -> uuid2byte(aspenSystemId),
@@ -223,6 +226,8 @@ object Bootstrap:
       Radicle.StorageDevicesTreeKey -> storageDevicesTree.encode(),
       Radicle.StorageDeviceSetsTreeKey -> storageDeviceSetsTree.encode(),
       Radicle.ServicesTreeKey -> servicesTree.encode(),
+      Radicle.CACertificateKey -> caCertificatePtr.toArray,
+      Radicle.CAPrivateKeyKey -> caPrivateKeyPtr.toArray,
     )
  
     val radicle = allocate(radicleContent, Some(Radicle.objectId))

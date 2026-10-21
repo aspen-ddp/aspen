@@ -130,7 +130,9 @@ class TestNetwork(executionContext: ExecutionContext,
     ida,
     bootstrapHost,
     bootstrapSD,
-    stores)
+    stores,
+    TestTLS.ca,
+    TestTLS.cli)
 
   // All transactions will miss the third store. Don't wait long before updating the
   // error tree

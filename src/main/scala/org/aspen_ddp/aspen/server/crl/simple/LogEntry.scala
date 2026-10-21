@@ -39,10 +39,14 @@ class LogEntry(val previousEntryLocation: StreamLocation,
 
   def addTx(tx: Tx, completionHandler: () => Unit): Unit =
     // Do not check if txs already contains the transaction. Allow the duplicate insert so we queue
-    // the oompletion handler for the subsequent insert attempts
+    // the completion handler for the subsequent insert attempts.
+    //
+    // Deletions are final. A save of a transaction deleted earlier in this same entry is a timing
+    // artifact and is skipped, but it still reports success once the entry (and thus the delete)
+    // is durable.
     if !txDelSet.contains(tx.id) then
       txs += (tx.id -> tx)
-      completionHandlers = completionHandler :: completionHandlers
+    completionHandlers = completionHandler :: completionHandlers
 
   def deleteTx(txid: TxId): Unit =
     txDeletions = txid :: txDeletions

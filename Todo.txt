@@ -61,18 +61,19 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     Not explained: the earlier "Recycle Streams" failure (seen once under saturation). It may be
     the same family (recovery of deletes/recycling); re-check whether it still appears.
 
-[ ] 2b. SimpleCRL drops a re-save of a deleted id inside one unwritten entry
+[x] 2b. SimpleCRL dropped a re-save of a deleted id without running its handler  (FIXED 2026-10-20)
 
-    LogEntry.addTx ignores a save whose id is in txDelSet (deleted earlier in the same entry) and
-    does NOT call or queue its completion handler. Reproduced: save(tx2) [writer held], save(tx1),
-    delete(tx1), save(tx1) -> the last save's handler never fires and tx1 is not on disk after
-    restart. A caller waiting on the handler hangs.
-    Approach: the entry format only encodes saves then deletes, so delete-then-save cannot be
-    expressed in one entry. Options: (a) when onSaveTransaction sees the id in the current entry's
-    deletion set, finish the current entry first and put the save in the next one; (b) drop the
-    stale pre-delete save from the entry and keep the delete, then write the new save in the next
-    entry. Either way the handler must always run. Check whether production code can actually
-    re-save a deleted (storeId, txid); if never, at least make it fail loudly instead of hanging.
+    LogEntry.addTx skipped a save whose id was deleted earlier in the same unwritten entry, but
+    the completion-handler registration was inside the same `if`, so the caller never got a
+    callback. Deletions are final, so the skip is right; the handler now always queues and fires
+    when the entry holding the delete is durable.
+    Test: SimpleCRLSuite "Save after a delete in the same unwritten entry is skipped but reports
+    success" (fails without the change).
+    Note: only the same-entry case is skipped. A save of a deleted id that arrives after the delete
+    entry was written is still logged (the CRL keeps no memory of deleted ids), and recovery now
+    keeps it (item 2's fix) so recovery matches the live state. Tests "Delete and re-save same
+    transaction ID" and "Re-saved transaction survives recovery ..." pin that behaviour; if
+    deletions should be final across entries, they and that behaviour should be reconsidered.
 
 [ ] 3. The service executor can run two instances of one service at once
 

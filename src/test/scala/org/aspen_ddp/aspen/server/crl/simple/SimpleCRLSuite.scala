@@ -15,7 +15,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.{Path, StandardOpenOption}
 import java.util.UUID
-import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue}
+import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
 import scala.concurrent.Await
 import scala.concurrent.duration.*
 import scala.language.implicitConversions
@@ -903,6 +903,33 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i2.trsList.length == 2)
     assert(i2.trsList.exists(_.storeId == storeId))
     assert(i2.trsList.exists(_.storeId == storeId2))
+
+    i2.crl.shutdown()
+  }
+
+  test("Save after a delete in the same unwritten entry is skipped but reports success") {
+    val queue = new LinkedBlockingQueue[String]()
+    val gate = new CountDownLatch(1)
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    // Hold the writer so that everything below is batched into a single log entry
+    i.crl.save(transactionId2, trsValidTxd2, () => { queue.put("first"); gate.await() })
+    queue.take()
+    i.crl.save(transactionId, trsValidTxd, () => queue.put("save"))
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId, trsValidTxd, () => queue.put("late save"))
+    gate.countDown()
+
+    val completed = Set(queue.poll(5, TimeUnit.SECONDS), queue.poll(5, TimeUnit.SECONDS))
+    assert(completed == Set("save", "late save"))
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.storeId == storeId2)
 
     i2.crl.shutdown()
   }

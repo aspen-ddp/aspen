@@ -1107,6 +1107,12 @@ object Main {
 
     network.startIoThread(client)
 
+    // Serve the bootstrap config to new hosts and clients. A BindException here propagates
+    // and ends the command, which is preferable to running a host that cannot be bootstrapped from.
+    new BootstrapHttpServer(hostCfg.httpPort,
+                            () => client.getBootstrapConfig(),
+                            () => Files.readString(bsCfgFile)).start()
+
     host.start()
 
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO

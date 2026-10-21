@@ -29,6 +29,8 @@ lazy val root = (project in file(".")).
       "org.zeromq"                       %  "jeromq"                  % "0.6.0",
       "com.thesamet.scalapb"             %% "scalapb-runtime"         % scalapbVersion % "protobuf",
       "com.lihaoyi"                      %% "os-lib"                  % "0.11.5",
+      "org.bouncycastle"                 %  "bcprov-jdk18on"          % "1.80",
+      "org.bouncycastle"                 %  "bcpkix-jdk18on"          % "1.80",
     ),
 
     // Include the Backblaze Java source files during compilation

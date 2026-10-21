@@ -62,10 +62,10 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     catch
       case _: Throwable => ()
 
-  /** A HostConfig for the TestNetwork's bootstrap host. Only hostId and aspenSystemId
-   *  are consulted by createStorageDevice; the rest is filler. */
   private val (tlsCert, tlsKey) = TestTLS.credentials(HostId.BootstrapHostId.uuid)
 
+  /** A HostConfig for the TestNetwork's bootstrap host. Only hostId and aspenSystemId
+   *  are consulted by createStorageDevice; the rest is filler. */
   private def hostConfig(sysId: UUID = systemId) = HostConfig(
     HostId.BootstrapHostId,
     sysId,

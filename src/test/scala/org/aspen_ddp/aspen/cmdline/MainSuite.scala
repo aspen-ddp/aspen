@@ -199,6 +199,11 @@ class MainSuite extends AnyFunSuite with Matchers:
 
       val hostDir = tmp.resolve("bootstrap-host")
 
+      // Both files hold private keys, so neither may be readable by anyone but the owner.
+      val ownerOnly = java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
+      Files.getPosixFilePermissions(hostDir.resolve(HostConfig.configFilename)) shouldBe ownerOnly
+      Files.getPosixFilePermissions(hostDir.resolve(BootstrapConfig.configFilename)) shouldBe ownerOnly
+
       val hostCfg = HostConfig.loadHostConfig(
         hostDir.resolve(HostConfig.configFilename).toFile)
 

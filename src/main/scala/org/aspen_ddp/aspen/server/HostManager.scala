@@ -2,10 +2,10 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
-import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
+import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, SecretFile}
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, StandardCopyOption, StandardOpenOption}
+import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -98,9 +98,8 @@ object HostManager:
           // REPLACE_EXISTING: reaching here means the directory holds no host config, so it is
           // not an initialized host, and a bootstrap config left behind by an aborted earlier
           // run is residue rather than something worth preserving.
-          Files.copy(bootstrapConfigFile,
-                     hostDir.resolve(BootstrapConfig.configFilename),
-                     StandardCopyOption.REPLACE_EXISTING)
+          // The bootstrap config holds the CLI private key, so the copy is owner-only.
+          SecretFile.copy(bootstrapConfigFile, hostDir.resolve(BootstrapConfig.configFilename))
           None
         catch
           case t: Throwable => Some(new DirectorySetupFailed(hostDir, t))
@@ -137,9 +136,9 @@ object HostManager:
               // CREATE_NEW rather than the default CREATE|TRUNCATE_EXISTING: a full distributed
               // transaction separates the guard above from this write, so a host config that
               // appeared in that window belongs to another caller and must not be clobbered.
-              Files.write(hostConfigFile,
-                          hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8),
-                          StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
+              SecretFile.write(hostConfigFile,
+                               hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8),
+                               createNew = true)
             catch
               case t: Throwable =>
                 throw new ConfigWriteFailed(hostId, hostConfigFile, hostConfig, t)

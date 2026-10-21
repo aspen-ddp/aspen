@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
 import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
-import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
+import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, SecretFile}
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
@@ -1177,7 +1177,7 @@ object Main {
       Pem.encodePrivateKey(tlsKeyPair.getPrivate)
     )
 
-    Files.write(
+    SecretFile.write(
       hostDirectory.resolve(HostConfig.configFilename),
       hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
     )
@@ -1230,7 +1230,7 @@ object Main {
     // The bootstrap config lives with the host it describes rather than being handed to the
     // host process on the command line: MetadataManager rewrites this file in place as the
     // bootstrap pool moves.
-    Files.write(
+    SecretFile.write(
       hostDirectory.resolve(BootstrapConfig.configFilename),
       BootstrapConfig.generateBootstrapConfig(
         aspenSystemId = aspenSystemId,
@@ -1593,6 +1593,8 @@ object Main {
         println("cannot be started until it is finished. Re-running this command will not fix it:")
         println(s"the name '$hostName' is now taken, so a second run fails. Instead, create")
         println(s"${e.configFile} with exactly these contents:")
+        println("WARNING: the contents below include the host's TLS private key. Do not paste them")
+        println("into logs or tickets, and create the file with owner-only permissions (chmod 600).")
         print(e.hostConfig.yamlConfig)
       case e =>
         println(s"Error adding host: ${e.getMessage}")

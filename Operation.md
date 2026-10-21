@@ -60,7 +60,9 @@ Bootstrapping also creates the Aspen certificate authority (CA). Each host's con
 (`aspen-host-config.yaml`) contains that host's TLS certificate and private key, signed by
 the CA. The `aspen-bootstrap-config.yaml` file contains the CA certificate along with the
 CLI's certificate and private key, so it must be treated as a secret: anyone who obtains it
-can act as the CLI.
+can act as the CLI. All CLI invocations share that one identity, so only one process using it
+can be connected at a time; a long-running command such as `amoebafs` blocks other CLI commands,
+which may stall or receive the wrong replies while it runs.
 
 ## Operation
 

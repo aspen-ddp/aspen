@@ -104,6 +104,11 @@ class HostManagerSuite extends IntegrationTestSuite:
       bs.aspenSystemId should be(systemId)
 
       val cfg = HostConfig.loadHostConfig(hostDir.resolve(HostConfig.configFilename).toFile)
+      // Both files hold private keys, so neither may be readable by anyone but the owner.
+      val ownerOnly = java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
+      Files.getPosixFilePermissions(copied) should be(ownerOnly)
+      Files.getPosixFilePermissions(hostDir.resolve(HostConfig.configFilename)) should be(ownerOnly)
+
       cfg.hostId should be(hostId)
       cfg.aspenSystemId should be(systemId)
       cfg.name should be("node_b")

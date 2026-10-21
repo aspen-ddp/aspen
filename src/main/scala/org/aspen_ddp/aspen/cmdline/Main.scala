@@ -1230,7 +1230,10 @@ object Main {
         aspenSystemId = aspenSystemId,
         ida = bootstrapIda,
         hostStates = List(bootstrapHost),
-        storeMap = bootstrapStores.map(backend => backend.storeId -> hostConfig.hostId).toList
+        storeMap = bootstrapStores.map(backend => backend.storeId -> hostConfig.hostId).toList,
+        // replaced in a later task: shares the throwaway CA created above
+        caCertificate = Pem.encodeCertificate(tlsCa.certificate),
+        cli = BootstrapConfig.CLICredentials.generate(tlsCa)
       ).getBytes(StandardCharsets.UTF_8)
     )
 

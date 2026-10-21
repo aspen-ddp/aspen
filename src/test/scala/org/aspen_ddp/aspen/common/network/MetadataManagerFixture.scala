@@ -317,7 +317,8 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
   protected def bootstrapConfigYaml(ida: Replication,
                                     hostStates: List[HostState],
                                     storeMap: List[(StoreId, HostId)]): String =
-    BootstrapConfig.generateBootstrapConfig(systemId, ida, hostStates, storeMap)
+    BootstrapConfig.generateBootstrapConfig(systemId, ida, hostStates, storeMap,
+      org.aspen_ddp.aspen.TestTLS.caCertificatePem, org.aspen_ddp.aspen.TestTLS.cli)
 
   /** newManager, plus the path of the config file that manager was handed.
    *

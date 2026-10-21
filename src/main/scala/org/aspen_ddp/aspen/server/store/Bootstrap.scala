@@ -28,11 +28,16 @@ object Bootstrap:
 
     require( ida.width == stores.length )
 
+    // replaced in a later task: throwaway CA and CLI credentials
+    val throwawayCa = org.aspen_ddp.aspen.common.network.tls.CertificateAuthority.create(aspenSystemId)
+
     val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
       aspenSystemId = aspenSystemId,
       ida = ida,
       hostStates = List(bootstrapHostState),
-      storeMap = stores.map(backend => backend.storeId -> bootstrapHostState.hostId)
+      storeMap = stores.map(backend => backend.storeId -> bootstrapHostState.hostId),
+      caCertificate = org.aspen_ddp.aspen.common.network.tls.Pem.encodeCertificate(throwawayCa.certificate),
+      cli = BootstrapConfig.CLICredentials.generate(throwawayCa)
     )
 
     val bootstrapMetadata = Metadata(

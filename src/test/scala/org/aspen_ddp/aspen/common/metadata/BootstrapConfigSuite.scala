@@ -1,6 +1,8 @@
 package org.aspen_ddp.aspen.common.metadata
 
+import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.FormatError
@@ -29,7 +31,9 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       systemId,
       Replication(1, 1),
       List(hostState),
-      List(storeId -> hostId))
+      List(storeId -> hostId),
+      TestTLS.caCertificatePem,
+      TestTLS.cli)
 
   private def assertMatchesGenerated(cfg: BootstrapConfig.Config): Unit =
     cfg.aspenSystemId should be(systemId)
@@ -87,7 +91,9 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       systemId,
       Replication(4, 2),
       List(host1, host2, host3),
-      storeMap)
+      storeMap,
+      TestTLS.caCertificatePem,
+      TestTLS.cli)
 
     val f = Files.createTempFile("aspen-bootstrap-multi-host", ".yaml")
     try
@@ -142,6 +148,19 @@ bootstrap-hosts:
     store-transfer-port: 5002
     stores:
       - 00000000-0000-0000-0000-000000000000:0
+ca-certificate: |
+  -----BEGIN CERTIFICATE-----
+  Q0E=
+  -----END CERTIFICATE-----
+cli-id: CC1049AD-D2A8-4D17-8080-E01A4678C8B3
+cli-certificate: |
+  -----BEGIN CERTIFICATE-----
+  Q0xJ
+  -----END CERTIFICATE-----
+cli-private-key: |
+  -----BEGIN PRIVATE KEY-----
+  S0VZ
+  -----END PRIVATE KEY-----
 """
 
     val f = Files.createTempFile("aspen-bootstrap-docexample", ".yaml")
@@ -182,6 +201,19 @@ bootstrap-hosts:
       - 00000000-0000-0000-0000-000000000000:0
       - 00000000-0000-0000-0000-000000000000:1
       - 00000000-0000-0000-0000-000000000000:2
+ca-certificate: |
+  -----BEGIN CERTIFICATE-----
+  Q0E=
+  -----END CERTIFICATE-----
+cli-id: CC1049AD-D2A8-4D17-8080-E01A4678C8B3
+cli-certificate: |
+  -----BEGIN CERTIFICATE-----
+  Q0xJ
+  -----END CERTIFICATE-----
+cli-private-key: |
+  -----BEGIN PRIVATE KEY-----
+  S0VZ
+  -----END PRIVATE KEY-----
 """
 
     val f = Files.createTempFile("aspen-bootstrap-single-host", ".yaml")
@@ -217,6 +249,19 @@ bootstrap-hosts:
     store-transfer-port: 5005
     stores:
       - 44444444-4444-4444-4444-444444444444:1
+ca-certificate: |
+  -----BEGIN CERTIFICATE-----
+  Q0E=
+  -----END CERTIFICATE-----
+cli-id: CC1049AD-D2A8-4D17-8080-E01A4678C8B3
+cli-certificate: |
+  -----BEGIN CERTIFICATE-----
+  Q0xJ
+  -----END CERTIFICATE-----
+cli-private-key: |
+  -----BEGIN PRIVATE KEY-----
+  S0VZ
+  -----END PRIVATE KEY-----
 """
 
     val f = Files.createTempFile("aspen-bootstrap-mismatch", ".yaml")
@@ -288,8 +333,24 @@ bootstrap-hosts:
       systemId,
       Replication(1, 1),
       List(hostState),
-      List(storeId -> hostId, StoreId(poolId, 1.toByte) -> hostId))
+      List(storeId -> hostId, StoreId(poolId, 1.toByte) -> hostId),
+      TestTLS.caCertificatePem,
+      TestTLS.cli)
 
     val ex = intercept[FormatError]:
       BootstrapConfig.parseBootstrapConfig(mismatched)
     ex.getMessage should include("Number of bootstrap stores (2) must exactly match")
+
+  test("round trip preserves the CA certificate and CLI credentials exactly"):
+    val cfg = BootstrapConfig.parseBootstrapConfig(generated)
+    cfg.caCertificate shouldBe TestTLS.caCertificatePem
+    cfg.cli shouldBe TestTLS.cli
+
+  test("parseBootstrapConfig rejects a config without cli-private-key"):
+    val stripped = generated.split("\n", -1).takeWhile(!_.startsWith("cli-private-key:")).mkString("\n") + "\n"
+    stripped should not include "cli-private-key"
+    a [FormatError] should be thrownBy BootstrapConfig.parseBootstrapConfig(stripped)
+
+  test("CLICredentials.generate signs a certificate for cliId"):
+    val c = BootstrapConfig.CLICredentials.generate(TestTLS.ca)
+    CertificateVerifier.verify(Pem.decodeCertificate(c.certificate), TestTLS.ca.certificate) shouldBe c.cliId

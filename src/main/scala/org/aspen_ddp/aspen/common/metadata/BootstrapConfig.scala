@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.aspen_ddp.aspen.common.objects.Insert
+import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -31,6 +32,19 @@ bootstrap-hosts:
     store-transfer-port: 5002
     stores:
       - 00000000-0000-0000-0000-000000000000:0
+ca-certificate: |
+  -----BEGIN CERTIFICATE-----
+  ...
+  -----END CERTIFICATE-----
+cli-id: CC1049AD-D2A8-4D17-8080-E01A4678C8B3
+cli-certificate: |
+  -----BEGIN CERTIFICATE-----
+  ...
+  -----END CERTIFICATE-----
+cli-private-key: |
+  -----BEGIN PRIVATE KEY-----
+  ...
+  -----END PRIVATE KEY-----
 */
 
 object BootstrapConfig:
@@ -99,7 +113,22 @@ object BootstrapConfig:
       stores.get(o)
     )
 
-  case class Config(aspenSystemId: UUID, bootstrapIDA: IDA, hosts: List[BootstrapHost]):
+  /** Credentials the command line tool uses to authenticate to the system. Generated once at
+   *  bootstrap and carried forward unchanged whenever the bootstrap config is regenerated. */
+  case class CLICredentials(cliId: UUID, certificate: String, privateKey: String)
+
+  object CLICredentials:
+    def generate(ca: CertificateAuthority): CLICredentials =
+      val cliId = UUID.randomUUID()
+      val keyPair = CertificateAuthority.generateKeyPair()
+      val cert = ca.signCertificate(cliId, keyPair.getPublic)
+      CLICredentials(cliId, Pem.encodeCertificate(cert), Pem.encodePrivateKey(keyPair.getPrivate))
+
+  case class Config(aspenSystemId: UUID,
+                    bootstrapIDA: IDA,
+                    hosts: List[BootstrapHost],
+                    caCertificate: String,
+                    cli: CLICredentials):
     // Validate config. The bootstrap pool has exactly one store per IDA element, but those
     // stores may sit on any number of hosts: a freshly bootstrapped system puts all of them
     // on the single bootstrap host and they spread out from there as hosts are added. So it
@@ -115,9 +144,20 @@ object BootstrapConfig:
     val bootstrapIDA: Required[IDA]          = Required("bootstrap-ida",   Choice("type", IDAOptions))
     val hosts: Required[List[BootstrapHost]] = Required("bootstrap-hosts", YList(BootstrapHost))
 
-    val attrs: List[Attr] = aspenSystemId :: bootstrapIDA :: hosts :: Nil
+    val caCertificate: Required[String]      = Required("ca-certificate", YString)
+    val cliId: Required[UUID]                = Required("cli-id", YUUID)
+    val cliCertificate: Required[String]     = Required("cli-certificate", YString)
+    val cliPrivateKey: Required[String]      = Required("cli-private-key", YString)
 
-    def create(o: Object): Config = Config( aspenSystemId.get(o), bootstrapIDA.get(o), hosts.get(o) )
+    val attrs: List[Attr] = aspenSystemId :: bootstrapIDA :: hosts :: caCertificate :: cliId ::
+                            cliCertificate :: cliPrivateKey :: Nil
+
+    def create(o: Object): Config = Config(
+      aspenSystemId.get(o),
+      bootstrapIDA.get(o),
+      hosts.get(o),
+      caCertificate.get(o),
+      CLICredentials(cliId.get(o), cliCertificate.get(o), cliPrivateKey.get(o)))
 
 
   def loadBootstrapConfig(file: File): Config =
@@ -135,7 +175,9 @@ object BootstrapConfig:
   def generateBootstrapConfig(aspenSystemId: UUID,
                               ida: IDA,
                               hostStates: List[HostState],
-                              storeMap: List[(StoreId, HostId)]): String =
+                              storeMap: List[(StoreId, HostId)],
+                              caCertificate: String,
+                              cli: CLICredentials): String =
     val hostIdSet = hostStates.map(_.hostId).toSet
 
     storeMap.foreach: (_, hostId) =>
@@ -167,6 +209,11 @@ object BootstrapConfig:
       sb.append(f"    stores:\n")
       storesOnHost.foreach: storeId =>
         sb.append(f"      - $storeId\n")
+
+    sb.append(yamlBlockScalar("ca-certificate", caCertificate))
+    sb.append(s"cli-id: ${cli.cliId}\n")
+    sb.append(yamlBlockScalar("cli-certificate", cli.certificate))
+    sb.append(yamlBlockScalar("cli-private-key", cli.privateKey))
 
     sb.toString
 
@@ -217,7 +264,13 @@ object BootstrapConfig:
 
         val aspenSystemId = byte2uuid(radicleKvos.contents(Radicle.SystemIdKey).value.bytes)
 
-        val yaml = generateBootstrapConfig(aspenSystemId, poolCfg.ida, hostsList, storeMap)
+        // The CA certificate and CLI credentials are generated once at bootstrap; carry them
+        // forward unchanged from the radicle's current config.
+        val current = parseBootstrapConfig(
+          new String(radicleKvos.contents(Radicle.BootstrapConfigKey).value.bytes, StandardCharsets.UTF_8))
+
+        val yaml = generateBootstrapConfig(aspenSystemId, poolCfg.ida, hostsList, storeMap,
+          current.caCertificate, current.cli)
 
         val reqs = List(KeyRevision(Radicle.BootstrapConfigKey,
           radicleKvos.contents(Radicle.BootstrapConfigKey).revision))

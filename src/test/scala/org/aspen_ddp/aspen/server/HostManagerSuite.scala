@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState}
@@ -59,7 +60,9 @@ class HostManagerSuite extends IntegrationTestSuite:
       aspenSystemId = systemId,
       ida = Replication(1, 1),
       hostStates = List(hs),
-      storeMap = List(StoreId(PoolId.BootstrapPoolId, 0.toByte) -> hs.hostId))
+      storeMap = List(StoreId(PoolId.BootstrapPoolId, 0.toByte) -> hs.hostId),
+      caCertificate = TestTLS.caCertificatePem,
+      cli = TestTLS.cli)
 
   /** Writes the operator's bootstrap config somewhere outside the new host's directory,
    *  which is where it comes from in practice. */

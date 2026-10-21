@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientResponse, HostMessage, ServiceMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -16,6 +17,8 @@ import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 import scribe.Logging
 
 import java.nio.charset.StandardCharsets
+import java.security.PublicKey
+import java.security.cert.X509Certificate
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -400,6 +403,29 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
     client.read(radicle).map: radicleKvos =>
       new String(radicleKvos.contents(Radicle.BootstrapConfigKey).value.bytes, StandardCharsets.UTF_8)
+
+  /** Signs a certificate binding `id` to `publicKey` using the cluster CA stored in the radicle.
+   *
+   *  There is no access control: any client able to read the radicle can read the CA private
+   *  key and therefore sign certificates for arbitrary UUIDs.
+   */
+  def createTLSCertificate(id: UUID, publicKey: PublicKey): Future[X509Certificate] =
+    given ExecutionContext = this.clientContext
+
+    def readPem(kvos: KeyValueObjectState, key: Key): Future[String] =
+      val ptr = DataObjectPointer(kvos.contents(key).value.bytes)
+      client.read(ptr).map: dos =>
+        new String(dos.data.getByteArray, StandardCharsets.UTF_8)
+
+    client.read(radicle).flatMap: kvos =>
+      val fCert = readPem(kvos, Radicle.CACertificateKey)
+      val fKey = readPem(kvos, Radicle.CAPrivateKeyKey)
+      for
+        certPem <- fCert
+        keyPem <- fKey
+      yield
+        CertificateAuthority(Pem.decodeCertificate(certPem), Pem.decodePrivateKey(keyPem))
+          .signCertificate(id, publicKey)
 
   def retryStrategy: RetryStrategy
 

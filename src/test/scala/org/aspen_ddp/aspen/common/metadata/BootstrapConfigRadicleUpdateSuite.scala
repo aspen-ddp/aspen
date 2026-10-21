@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.metadata
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, TestTLS}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -28,6 +28,23 @@ class BootstrapConfigRadicleUpdateSuite extends IntegrationTestSuite:
       val hostOfStore0 = cfg.hosts.find(_.stores.contains(storeId)).map(_.hostId)
       hostOfStore0 should be(Some(newHostId))
       cfg.hosts.map(_.stores.length).sum should be(3)
+
+  atest("prepRadicleUpdate preserves the CA certificate and CLI credentials"):
+    given ExecutionContext = executionContext
+    val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+    for
+      newHostId <- client.createHost("tls-host", "127.0.0.1", 5300, 5301, 5302)
+      _ <- waitForTransactionsToComplete()
+      poolCfg <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, newHostId)
+      _ <- waitForTransactionsToComplete()
+      yaml <- client.getBootstrapConfig()
+    yield
+      val cfg = BootstrapConfig.parseBootstrapConfig(yaml)
+      cfg.caCertificate should be(TestTLS.caCertificatePem)
+      cfg.cli should be(TestTLS.cli)
 
   atest("prepRadicleUpdate drops a host its store map no longer references"):
     given ExecutionContext = executionContext

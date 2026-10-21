@@ -842,7 +842,11 @@ object Main {
   def createAspenClient(bootstrapConfigFile: os.Path,
                         onnet: Option[(NetworkBridge, ZMQNet)]=None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
 
-    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfigFile, None, None))
+    val bootstrapConfig = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO)
+
+    // The CLI always connects under the client id baked into its certificate
+    val (networkBridge, nnet) = onnet.getOrElse(
+      createNetwork(bootstrapConfigFile, None, Some(ClientId(bootstrapConfig.cli.cliId))))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
     val initialReadDelay = Duration(10, SECONDS)
@@ -855,7 +859,7 @@ object Main {
 
     // Supplied offline because the bootstrap pool's own configuration object cannot be read
     // without it. See SimpleAspenClient.resolveIda.
-    val bootstrapIda = BootstrapConfig.loadBootstrapConfig(bootstrapConfigFile.toIO).bootstrapIDA
+    val bootstrapIda = bootstrapConfig.bootstrapIDA
 
     val ret = (new SimpleAspenClient(nnet.clientMessenger, nnet.clientId, ec, Radicle.pointer,
       bootstrapIda,
@@ -1152,12 +1156,13 @@ object Main {
 
     val aspenSystemId = UUID.randomUUID()
 
-    // replaced in a later task: throwaway CA signs a cert for the bootstrap host
+    val ca = CertificateAuthority.create(aspenSystemId)
+    val cli = BootstrapConfig.CLICredentials.generate(ca)
+
+    // The host id is minted first because the certificate's subject is the host id
     val bootstrapHostId = HostId(UUID.randomUUID())
-    val tlsCa = CertificateAuthority.create(aspenSystemId)
-    val tlsCli = BootstrapConfig.CLICredentials.generate(tlsCa)
     val tlsKeyPair = CertificateAuthority.generateKeyPair()
-    val tlsCert = tlsCa.signCertificate(bootstrapHostId.uuid, tlsKeyPair.getPublic)
+    val tlsCert = ca.signCertificate(bootstrapHostId.uuid, tlsKeyPair.getPublic)
 
     val hostConfig = HostConfig(
       bootstrapHostId,
@@ -1232,9 +1237,8 @@ object Main {
         ida = bootstrapIda,
         hostStates = List(bootstrapHost),
         storeMap = bootstrapStores.map(backend => backend.storeId -> hostConfig.hostId).toList,
-        // replaced in a later task: shares the throwaway CA created above
-        caCertificate = Pem.encodeCertificate(tlsCa.certificate),
-        cli = tlsCli
+        caCertificate = Pem.encodeCertificate(ca.certificate),
+        cli = cli
       ).getBytes(StandardCharsets.UTF_8)
     )
 
@@ -1244,8 +1248,8 @@ object Main {
       bootstrapHost,
       bootstrapStorageDevice,
       bootstrapStores.toList,
-      tlsCa,
-      tlsCli)
+      ca,
+      cli)
 
     // Print yaml representation of Radicle Pointer
     println("# Aspen Radicle Pointer Definition")

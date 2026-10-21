@@ -10,6 +10,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.common.HLCTimestamp
+import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
 import org.aspen_ddp.aspen.server.HostConfig
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.yaml.snakeyaml.parser.ParserException
@@ -219,6 +220,11 @@ class MainSuite extends AnyFunSuite with Matchers:
       // value rather than just that the two agree is what catches only one of them being wired up.
       hostCfg.address shouldBe "10.0.0.5"
       bsHost.address shouldBe "10.0.0.5"
+
+      val ca = Pem.decodeCertificate(bsCfg.caCertificate)
+      CertificateVerifier.verify(Pem.decodeCertificate(hostCfg.tlsCertificate), ca) shouldBe hostCfg.hostId.uuid
+      CertificateVerifier.verify(Pem.decodeCertificate(bsCfg.cli.certificate), ca) shouldBe bsCfg.cli.cliId
+      ca.getSubjectX500Principal.getName should include (bsCfg.aspenSystemId.toString)
 
   test("validateHostAddress accepts IPv4, DNS names, and bracketed IPv6"):
     Main.validateHostAddress("10.0.0.5") shouldBe None

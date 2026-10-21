@@ -1,30 +1,149 @@
 TODO
 ====
 
-[ ] Track down and fix the cause of the flaky test suite
+Ordered by priority, most important first. Items 1-5 come out of the flaky-test investigation
+that produced cc74578. Read "Background" before starting any of them.
 
-    `sbt test` fails intermittently with a single failure in a timing-sensitive suite.
-    Measured 2026-09-15: RebalancingServiceSuite failed 2 of 4 full runs on unmodified
-    main (e8891c0), and 2 of 4 on a feature branch off it. Same suite, same rate on both
-    trees. Measured 2026-09-02: SimpleCRLSuite failed 1 of 4 on merged main;
-    RebalancingServiceSuite failed 1 of 4 on 4e6a828. Every one of these passes 100% when
-    the suite is run standalone.
+Background
+----------
+Intermittent `sbt test` failures (RebalancingServiceSuite, SimpleCRLSuite) were measured at
+~50% per full run in Sept 2026 on an otherwise idle machine. Two causes were found and fixed in
+cc74578, both confirmed from instrumented logs:
 
-    Passing standalone but failing under a full run points at cross-suite interference
-    rather than a bug inside the suite itself -- either load-sensitivity in the timing
-    assertions, or state leaking from a suite that ran earlier. There is precedent for
-    the latter: a leaked BackgroundTaskManager from a repair suite once broke
-    RebalancingServiceSuite deterministically, and the fix was sequencing cleanup in
-    .andThen rather than onComplete.
+  - testSweptSetsCount was a JVM-wide static. sbt runs suites in parallel in one JVM and every
+    test system carries its own RebalancingDurableService, so sweeps from DurableServiceSuite
+    etc. were counted by RebalancingServiceSuite. Now keyed per service state object.
+  - RebalancingDurableService.reconcile() checked "is a sweep due" against state read before
+    it claimed the sweep. A reconcile that read state while the previous sweep was recording
+    itself could claim after that sweep finished and sweep a second time. Now re-reads after
+    claiming.
 
-    Worth doing properly. The current cost is that every full-suite failure needs a
-    baseline comparison against an unmodified tree before it can be believed, which is
-    both slow and an invitation to wave off a real regression as "just the flake."
+What is NOT known: whether those two fixes account for the whole original flake. Four idle
+runs on the pre-fix tree passed 4/4, so the original rate could not be re-measured.
 
-    Suggested first steps:
-      - Capture the actual assertion failure. `sbt test | tail` truncates it; redirect the
-        whole run to a file and grep for the suite name.
-      - Run RebalancingServiceSuite immediately after each other suite in turn to find
-        which predecessor triggers it.
-      - Audit BackgroundTaskManager and any other shared scheduler for cleanup that isn't
-        sequenced before the next suite starts.
+Reproducing under load: saturate the cores with busy loops, then run the full suite, e.g.
+    PIDS=""; for i in $(seq 24); do sh -c 'while :; do :; done' >/dev/null 2>&1 & PIDS="$PIDS $!"; done
+    sbt test > run.log 2>&1 ; kill $PIDS
+Track the PIDs and kill by PID. `pkill -f` matching the loop's own command line also kills the
+invoking shell. Full saturation (24 loops on 24 cores) is much harsher than the original flake
+conditions and produces failures that may not be bugs (see item 3). Redirect the whole run to
+a file and grep for FAILED; `sbt test | tail` truncates the assertion text.
+
+Method that worked: add a temporary System.err.println at the suspect point (include the
+service state pointer, System.identityHashCode of the instance, and thread name), reproduce
+under load, group the log lines by state pointer. Revert the instrumentation afterwards.
+
+
+[x] 1. Re-measure the flake rate with the fixes in place  (DONE 2026-10-20)
+
+    Results, full `sbt test` (~15s per run), same tree as cc74578:
+      idle              10 runs: 10 pass, 0 failures
+      12 busy loops     10 runs:  9 pass, 1 failure
+    The one failure was SimpleCRLSuite "Delete and re-save same transaction ID"
+    (SimpleCRLSuite.scala:872, `had length 1 instead of expected length 2`).
+    RebalancingServiceSuite did not fail in any of the 20 runs, so the original flake is
+    plausibly fixed there. Items below are re-prioritised accordingly. Logs were in the session
+    scratchpad (m_idle_*.log, m_mod_*.log) and are not preserved.
+
+
+[x] 2. SimpleCRL: a delete in an older log entry erased a newer re-save  (FIXED 2026-10-20)
+
+    Root cause: LogEntry.loadStaticEntryContent did `rstate.txs -= txid` for each deletion.
+    Recovery loads entries newest to oldest, so an older entry's delete removed a re-save already
+    loaded from a newer entry. The backward walk only reaches the delete's entry when it shares an
+    entry with a live transaction (oldestEntryNeeded points there), and that batching depends on
+    whether the IO thread has processed WriteComplete before the delete arrives -- hence
+    intermittent (1 in ~1000 idle, more under load). A production bug: a transaction re-saved
+    after deletion could vanish on restart.
+    Fix: deletes apply only to saves in the same entry and in older entries.
+    Test: SimpleCRLSuite "Re-saved transaction survives recovery ..." forces the batching by
+    holding the writer thread in a completion handler (deterministic; failed 3/3 before the fix).
+    Not explained: the earlier "Recycle Streams" failure (seen once under saturation). It may be
+    the same family (recovery of deletes/recycling); re-check whether it still appears.
+
+[ ] 2b. SimpleCRL drops a re-save of a deleted id inside one unwritten entry
+
+    LogEntry.addTx ignores a save whose id is in txDelSet (deleted earlier in the same entry) and
+    does NOT call or queue its completion handler. Reproduced: save(tx2) [writer held], save(tx1),
+    delete(tx1), save(tx1) -> the last save's handler never fires and tx1 is not on disk after
+    restart. A caller waiting on the handler hangs.
+    Approach: the entry format only encodes saves then deletes, so delete-then-save cannot be
+    expressed in one entry. Options: (a) when onSaveTransaction sees the id in the current entry's
+    deletion set, finish the current entry first and put the save in the next one; (b) drop the
+    stale pre-delete save from the entry and keep the delete, then write the new save in the next
+    entry. Either way the handler must always run. Check whether production code can actually
+    re-save a deleted (storeId, txid); if never, at least make it fail loudly instead of hanging.
+
+[ ] 3. The service executor can run two instances of one service at once
+
+    Evidence (logs from loaded runs, not yet isolated to a single mechanism): a single
+    executor created up to 6+ separate RebalancingDurableService instances for one state
+    object inside one test. Each instance has its own `sweeping` flag, so two live instances
+    can sweep concurrently and RebalancingServiceSuite's "sweep skips a level-1 set" test
+    still failed with `2 was not equal to 1` after the fixes in cc74578.
+
+    Suspected mechanism (inferred, NOT verified): with the test's 2s lease and 200ms renewal,
+    a late renewal makes doRenewal call handleLeaseLoss, which shuts the instance down; the
+    next scan re-claims and builds a replacement. The old instance's in-flight sweep is not
+    cancelled and keeps running. Also in SimpleDurableServiceExecutor.attemptClaim,
+    `ownedServices += svcUUID -> ...` overwrites any existing entry without shutting the old
+    instance down, and several claimAttempts for the same revision are scheduled before the
+    first claim lands.
+
+    Approach:
+      - First confirm the mechanism. Add logging to SimpleDurableServiceExecutor at
+        handleLeaseLoss, scan-driven removal, and service creation (keyed by service UUID,
+        not state pointer -- the earlier pass keyed leaseLoss by UUID and create by state
+        pointer, which made them hard to join) and look at the sequence for one state that
+        got 2+ instances.
+      - If lease loss is the trigger: decide whether a shut-down instance must stop its
+        in-flight work (check `stopped` at every step of a sweep, not only per set), and
+        whether attemptClaim should shut down any instance it replaces.
+      - If a duplicate claim is the trigger: guard attemptClaim against creating a service
+        for a UUID that is already owned or has a claim in flight.
+      - Decide separately whether a cross-instance guard is wanted for sweeps. Production
+        tolerates two instances (enrollment is revision-checked and idempotent); the test's
+        exact-count assertion does not.
+
+
+[ ] 4. Lease-timing tests fail under full load
+
+    DurableServiceSuite "executor renews lease before expiry" (DurableServiceSuite.scala:145)
+    failed in every loaded run. These also failed intermittently under load:
+      SystemTaskExecutorServiceSuite  (line 75, "service reassigns a task whose heartbeat stalls")
+      FailedStorageDeviceSuite        (line 185, "a failing pass does not wedge the task")
+      MigratePoolToSetSuite           ("a level-1 target set works by the same path",
+                                       "level-0 migration moves every store ...")
+    RebalancingServiceSuite's own 20s awaitUntil / driveUntilActiveEmpty deadlines also expired
+    under full saturation ("Boxed Exception" at lines 97 and 126).
+
+    These may be correct behaviour under artificial starvation rather than bugs: a 2s lease
+    cannot be renewed when the process gets little CPU.
+
+    Approach:
+      - Decide per test whether it is checking timing the system genuinely promises, or just
+        borrowing short production timeouts. Timeouts in test fixtures (leaseDuration,
+        renewalInterval, awaitUntil budgets) can be lengthened; assertions about ordering
+        should not depend on wall-clock.
+      - Prefer condition-based waiting (poll for the state with a generous deadline) over
+        fixed sleeps, and check the item 2 fix first -- some of these may be the same problem.
+      - Use item 1's moderate-load runs to decide whether these happen at realistic load at all.
+
+
+[ ] 5. Global test seams are reset only when a test succeeds
+
+    RebalancingDurableService.pollPeriod (and the same pattern in FailedStorageDeviceDurableTask
+    and MigratePoolToSetDurableTask) is a @volatile static that tests set and reset. In
+    RebalancingServiceSuite the reset and exec.shutdown() sit in the `yield`, so a failed or
+    timed-out test leaves the executor running and pollPeriod changed, which can cascade into
+    later tests. Because suites run in parallel in one JVM, one suite's pollPeriod also leaks
+    into every other suite's services while it is set.
+
+    There is precedent: a leaked BackgroundTaskManager once broke RebalancingServiceSuite
+    deterministically, and the fix was sequencing cleanup in .andThen rather than onComplete.
+
+    Approach:
+      - Move executor shutdown and the pollPeriod reset into an .andThen / equivalent that
+        runs on failure too.
+      - Better: pass pollPeriod through the factory or client instead of a static, as was
+        done for the sweep counter, so concurrent suites cannot see each other's value.

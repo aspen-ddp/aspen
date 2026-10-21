@@ -162,15 +162,18 @@ object LogEntry:
                              bb: ByteBuffer,
                              rstate: RecoveringState): Unit =
 
-    for (_ <- 0 until header.numTransactions)
-      val ltx = Tx.loadTx(bb)
-      if !rstate.txDeletions.contains(ltx.id) && !rstate.txs.contains(ltx.id) then
+    // Entries are loaded newest to oldest, so rstate already holds the content of every newer
+    // entry. A deletion therefore applies only to saves in this entry (a save is never added
+    // after a delete of the same id within one entry) and to saves in older entries. It must
+    // not remove a save from a newer entry: that is a re-save of a previously deleted id.
+    val loaded = List.fill(header.numTransactions)(Tx.loadTx(bb))
+    val deletedHere = List.fill(header.numDeletedTransactions)(Tx.getTxId(bb)).toSet
+
+    loaded.foreach: ltx =>
+      if !rstate.txDeletions.contains(ltx.id) && !deletedHere.contains(ltx.id) && !rstate.txs.contains(ltx.id) then
         rstate.txs += (ltx.id -> ltx)
 
-    for (_ <- 0 until header.numDeletedTransactions)
-      val txid = Tx.getTxId(bb)
-      rstate.txs -= txid
-      rstate.txDeletions += txid
+    rstate.txDeletions ++= deletedHere
 
 
   def padTo4k(offset: Long): Int =

@@ -15,7 +15,7 @@ import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.file.{Path, StandardOpenOption}
 import java.util.UUID
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue}
 import scala.concurrent.Await
 import scala.concurrent.duration.*
 import scala.language.implicitConversions
@@ -862,6 +862,37 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
 
     // Re-save tx1 with the same TxId
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+    queue.take()
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 2)
+    assert(i2.trsList.exists(_.storeId == storeId))
+    assert(i2.trsList.exists(_.storeId == storeId2))
+
+    i2.crl.shutdown()
+  }
+
+  test("Re-saved transaction survives recovery when its earlier delete shares an entry with a live transaction") {
+    val queue = new LinkedBlockingQueue[String]()
+    def completionHandler(): Unit = queue.put("")
+    val gate = new CountDownLatch(1)
+
+    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+
+    // Completion handlers run on the writer thread before the IO thread sees the write finish.
+    // Holding the writer inside tx1's handler guarantees that the delete of tx1 and the save of
+    // tx2 are batched into the same log entry, and the re-save of tx1 lands in a later one.
+    i.crl.save(transactionId, trsValidTxd, () => { queue.put(""); gate.await() })
+    queue.take()
+    i.crl.deleteTransaction(storeId, transactionId)
+    i.crl.save(transactionId2, trsValidTxd2, completionHandler)
+    gate.countDown()
+    queue.take()
+
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
 

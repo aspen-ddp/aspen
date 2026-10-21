@@ -19,19 +19,31 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
 
   override def userTypeFactories: List[RegisteredTypeFactory] = List(RebalancingDurableService)
 
+  private var executors: List[SimpleDurableServiceExecutor] = Nil
+
+  // Runs on failure and timeout too, so a failed test cannot leave an executor running.
+  override def subFixtureSetup(): Unit =
+    executors = Nil
+    RebalancingDurableService.setTestPollPeriod(client, Duration(100, MILLISECONDS))
+
+  override def subFixtureTeardown(): Unit =
+    executors.foreach(_.shutdown())
+    executors = Nil
+
   private def makeExecutor(): SimpleDurableServiceExecutor =
-    new SimpleDurableServiceExecutor(
+    val exec = new SimpleDurableServiceExecutor(
       client, HostId.BootstrapHostId, client.backgroundTaskManager,
       leaseDuration        = Duration(30000, MILLISECONDS),
       renewalInterval      = Duration(1000, MILLISECONDS),
       minScanInterval      = Duration(40, MILLISECONDS),
       maxScanInterval      = Duration(80, MILLISECONDS),
       claimDelayPerService = Duration(0, MILLISECONDS))
+    executors ::= exec
+    exec
 
   atest("rebalanceStorageDeviceSet drains pendingTransfers and empties ActiveRebalancingTasks"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
     // The RebalancingDurableService entry is created by Bootstrap (see TestNetwork), so the
     // executor only needs to scan and claim it — no explicit registration here.
     val exec = makeExecutor()
@@ -41,8 +53,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
       finalSet <- client.getStorageDeviceSetState(setId)
     yield
-      exec.shutdown()
-      RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       finalSet.pendingTransfers shouldBe empty
 
   /** Look up the service's KV state object via the services TKVL. */
@@ -148,7 +158,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
   atest("the sweep enrolls an unbalanced level-0 set once the period has elapsed"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
     val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
@@ -159,8 +168,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       lastSweep <- readLastAutoRebalance()
       finalSet <- client.getStorageDeviceSetState(setId)
     yield
-      exec.shutdown()
-      RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       finalSet.pendingTransfers shouldBe empty
       // recordSweep stamped it; asserted as "not Zero" rather than an ordering comparison,
       // since HLCTimestamp is an AnyVal and ScalaTest's `be >` needs an Ordering in scope.
@@ -168,7 +175,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
 
   atest("a zero period disables the sweep even when a set is unbalanced"):
     given ExecutionContext = executionContext
-    RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
     for
       _ <- net.createSecondDevice()
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration.Zero)
@@ -177,14 +183,11 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       quiet <- nothingEnrolledAfterSeveralPolls()
       lastSweep <- readLastAutoRebalance()
     yield
-      exec.shutdown()
-      RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       quiet shouldBe true
       lastSweep shouldBe HLCTimestamp.Zero
 
   atest("a recent sweep defers the next one until the period elapses"):
     given ExecutionContext = executionContext
-    RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
     for
       _ <- net.createSecondDevice()
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration(8, HOURS))
@@ -192,14 +195,11 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       exec = makeExecutor()
       quiet <- nothingEnrolledAfterSeveralPolls()
     yield
-      exec.shutdown()
-      RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       quiet shouldBe true
 
   atest("the sweep skips a level-1 set instead of failing on it"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
     val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
@@ -222,8 +222,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       statePtr <- readServiceStatePointer()
       _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
     yield
-      exec.shutdown()
-      RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       active.map(_._1) should not contain upper
       // The filter kept the level-1 set out of the sweep: only the bootstrap set was taken up.
       RebalancingDurableService.testSweptSetsCount(statePtr) shouldBe 1
@@ -231,7 +229,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
   atest("a set already being rebalanced is not enrolled twice by the sweep"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
     val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
@@ -244,14 +241,11 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       duringSweep <- readActiveTasks()
       _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
     yield
-      exec.shutdown()
-      RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       duringSweep.count(_._1 == setId) shouldBe 1
 
   atest("a set whose planning fails does not abort the sweep"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
     val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
@@ -266,8 +260,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       _ <- driveUntilActiveEmpty(setId, Duration(120000, MILLISECONDS))
       lastSweep <- readLastAutoRebalance()
     yield
-      exec.shutdown()
-      RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       lastSweep should not be HLCTimestamp.Zero
 
   /** Append a member device id that has no StorageDeviceState object, so that

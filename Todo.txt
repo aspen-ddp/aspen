@@ -147,20 +147,19 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     measured at realistic load.
 
 
-[ ] 5. Global test seams are reset only when a test succeeds
+[x] 5. Global test seams are reset only when a test succeeds  (FIXED 2026-10-21)
 
-    RebalancingDurableService.pollPeriod (and the same pattern in FailedStorageDeviceDurableTask
-    and MigratePoolToSetDurableTask) is a @volatile static that tests set and reset. In
-    RebalancingServiceSuite the reset and exec.shutdown() sit in the `yield`, so a failed or
-    timed-out test leaves the executor running and pollPeriod changed, which can cascade into
-    later tests. Because suites run in parallel in one JVM, one suite's pollPeriod also leaks
-    into every other suite's services while it is set.
-
-    There is precedent: a leaked BackgroundTaskManager once broke RebalancingServiceSuite
-    deterministically, and the fix was sequencing cleanup in .andThen rather than onComplete.
-
-    Approach:
-      - Move executor shutdown and the pollPeriod reset into an .andThen / equivalent that
-        runs on failure too.
-      - Better: pass pollPeriod through the factory or client instead of a static, as was
-        done for the sweep counter, so concurrent suites cannot see each other's value.
+    RebalancingDurableService.pollPeriod was a @volatile static that tests set and reset in the
+    `yield`, so a failed test skipped the reset and exec.shutdown(), and parallel suites saw
+    each other's value.
+    Fix: the static is gone. setTestPollPeriod(client, period) keeps a per-client (weak-keyed)
+    override that createService reads, so concurrent suites cannot see each other's value and
+    nothing needs resetting. RebalancingServiceSuite sets it in subFixtureSetup and tracks
+    every executor from makeExecutor(), shutting them down in subFixtureTeardown, which runs
+    on failure and timeout too.
+    Verified: RebalancingServiceSuite + DurableServiceSuite pass (21 tests), idle only; not
+    re-run under load.
+    Not changed: MigratePoolToSetDurableTask.pollPeriod and FailedStorageDeviceDurableTask.
+    pollPeriod are the same static pattern but no test sets them (the FailedStorageDevice
+    harness passes the period explicitly), so they are inert; remove or convert if a test ever
+    needs them.

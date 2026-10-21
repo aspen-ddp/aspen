@@ -28,8 +28,18 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
 
   val DefaultPollPeriod: Duration = Duration(2, MINUTES)
 
-  /** Overridable poll period (test seam; mirrors MissedUpdateFinalizationAction.errorTimeout). */
-  @volatile var pollPeriod: Duration = DefaultPollPeriod
+  /** Test seam: per-client poll period overrides. Keyed by client rather than held in a single
+   *  static because suites run in parallel in one JVM; a shared value leaks one suite's period
+   *  into every other suite's services and into later tests if a reset is skipped. The weak
+   *  keys let an entry vanish with its client, so no reset is needed. */
+  private val testPollPeriods =
+    java.util.Collections.synchronizedMap(new java.util.WeakHashMap[AspenClient, Duration]())
+
+  private[aspen] def setTestPollPeriod(client: AspenClient, period: Duration): Unit =
+    testPollPeriods.put(client, period)
+
+  private def pollPeriodFor(client: AspenClient): Duration =
+    Option(testPollPeriods.get(client)).getOrElse(DefaultPollPeriod)
 
   /** Test-only hook: counts the sets sweepOneSet carried past the level-0 filter, per service
    *  state object. Note that this counts sets the sweep took up, not sets it planned -- a set
@@ -54,7 +64,7 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
   override def createService(client: AspenClient,
                              statePointer: KeyValueObjectPointer,
                              state: KeyValueObjectState): DurableService =
-    new RebalancingDurableService(client, statePointer, pollPeriod)
+    new RebalancingDurableService(client, statePointer, pollPeriodFor(client))
 
   /** The initial contents of the service's KV state object. Written into the services tree by
    *  the Bootstrap process (the service is a system-critical singleton that must always exist).

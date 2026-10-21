@@ -80,6 +80,10 @@ class BootstrapFetcherSuite extends AnyFunSuite with Matchers:
     e.getMessage should include (d1.toString)
     e.getMessage should include (d2.toString)
     e.attempts.map(_._1) should be (List(d2, d1))
+    val lines = e.getMessage.split("\n").toList
+    lines.filter(_.contains("(--bootstrap-host)")) should be (List(lines.find(_.contains(d2.toString)).get))
+    lines.count(_.contains(d1.toString)) should be (1)
+    lines.find(_.contains(d1.toString)).get should not include "(--bootstrap-host)"
 
   test("rejects a bootstrap config from a different Aspen system"):
     withServer(serving(yamlFor(otherId, "host-a"))): a =>

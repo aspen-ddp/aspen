@@ -6,6 +6,7 @@ import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}
 import java.time.Duration as JDuration
 import java.util.UUID
+import scala.annotation.tailrec
 import scala.concurrent.duration.{Duration, SECONDS}
 import scala.util.control.NonFatal
 
@@ -14,10 +15,13 @@ object BootstrapFetcher:
 
   case class Fetched(from: ClientConfig.BootstrapEndpoint, yaml: String, config: BootstrapConfig.Config)
 
-  class NoReachableHosts(val attempts: List[(ClientConfig.BootstrapEndpoint, String)])
+  class NoReachableHosts(val attempts: List[(ClientConfig.BootstrapEndpoint, String)],
+                         val bootstrapHost: Option[ClientConfig.BootstrapEndpoint] = None)
     extends Exception(
       ("No cached hosts could be reached:" ::
-        attempts.map((ep, reason) => s"  $ep: $reason")).mkString("\n"))
+        attempts.map: (ep, reason) =>
+          val label = if bootstrapHost.contains(ep) then " (--bootstrap-host)" else ""
+          s"  $ep$label: $reason").mkString("\n"))
 
   class SystemIdMismatch(val from: ClientConfig.BootstrapEndpoint, val expected: UUID, val actual: UUID)
     extends Exception(
@@ -33,17 +37,20 @@ object BootstrapFetcher:
     val http = HttpClient.newBuilder().connectTimeout(jtimeout).build()
     val candidates = (bootstrapHost.toList ++ clientConfig.bootstrapHosts).distinct
 
-    var attempts = List[(ClientConfig.BootstrapEndpoint, String)]()
+    @tailrec
+    def loop(remaining: List[ClientConfig.BootstrapEndpoint],
+             attempts: List[(ClientConfig.BootstrapEndpoint, String)]): Fetched =
+      remaining match
+        case Nil => throw NoReachableHosts(attempts.reverse, bootstrapHost)
+        case ep :: rest =>
+          attempt(http, ep, jtimeout) match
+            case Left(reason) => loop(rest, (ep, reason) :: attempts)
+            case Right((yaml, config)) =>
+              if config.aspenSystemId != clientConfig.aspenSystemId then
+                throw SystemIdMismatch(ep, clientConfig.aspenSystemId, config.aspenSystemId)
+              Fetched(ep, yaml, config)
 
-    for ep <- candidates do
-      attempt(http, ep, jtimeout) match
-        case Left(reason) => attempts = (ep, reason) :: attempts
-        case Right((yaml, config)) =>
-          if config.aspenSystemId != clientConfig.aspenSystemId then
-            throw SystemIdMismatch(ep, clientConfig.aspenSystemId, config.aspenSystemId)
-          return Fetched(ep, yaml, config)
-
-    throw NoReachableHosts(attempts.reverse)
+    loop(candidates, Nil)
 
   private def attempt(http: HttpClient,
                       ep: ClientConfig.BootstrapEndpoint,

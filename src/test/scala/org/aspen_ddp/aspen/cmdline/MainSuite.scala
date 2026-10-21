@@ -357,6 +357,21 @@ class MainSuite extends AnyFunSuite with Matchers:
         Files.setPosixFilePermissions(cfgDir,
           java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"))
 
+  test("openClientSession reports an unreadable client config as a ConfigError"):
+    withTempDir("aspen-session-unreadable"): dir =>
+      val cfgFile = dir.resolve(ClientConfig.configFilename)
+      Files.writeString(cfgFile, "placeholder")
+      try
+        Files.setPosixFilePermissions(cfgFile, java.nio.file.attribute.PosixFilePermissions.fromString("---------"))
+        assume(!Files.isReadable(cfgFile), "process can read a mode 000 file (running as root?)")
+        val e = intercept[Main.ConfigError]:
+          Main.openClientSession(cfgFile, None)
+        e.getMessage should include(cfgFile.toString)
+        e.getMessage should include("Cannot read client config")
+      finally
+        Files.setPosixFilePermissions(cfgFile,
+          java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"))
+
   test("commandErrorMessage leaves an unexpected exception unhandled"):
     // The clause set is the set of ways a user can get it wrong. Anything else is a bug and
     // must stay loud, so widening this to NonFatal is what this assertion is here to catch.

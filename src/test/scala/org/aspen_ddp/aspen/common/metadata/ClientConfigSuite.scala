@@ -71,6 +71,13 @@ class ClientConfigSuite extends AnyFunSuite with Matchers:
       r.isLeft shouldBe true
       r.left.toOption.get should include(s)
 
+  test("BootstrapEndpoint.parse rejects unbracketed IPv6 literals"):
+    List("fd00::5", "::1").foreach: s =>
+      val r = BootstrapEndpoint.parse(s, 4751)
+      r.isLeft shouldBe true
+      r.left.toOption.get should include("IPv6 literals must be bracketed")
+      r.left.toOption.get should include(s)
+
   test("write creates an owner-only file"):
     val path = tempFile()
     ClientConfig.write(path, cfg)

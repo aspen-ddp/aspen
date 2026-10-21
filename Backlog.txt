@@ -262,5 +262,10 @@ rebalanceStorageDeviceSet now walks the services TKVL on its no-op path
     the wasted read is not. Reordering the short-circuit above the lookup fixes
     both
 
+BootstrapConfig.generateBootstrapConfig does not quote host addresses
+  - Host addresses are written unquoted, so a bracketed IPv6 address produces a bootstrap yaml
+    that fails to parse; quote the address (pre-existing bug)
 
-
+Main.validateHostAddress accepts characters that cannot appear in a host address
+  - It should reject '"' and other such characters (they break the ZMQ endpoint, the bootstrap
+    yaml and the client config yaml)

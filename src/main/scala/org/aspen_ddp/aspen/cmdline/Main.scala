@@ -884,7 +884,11 @@ object Main {
    */
   def openClientSession(clientConfigFile: Path,
                         bootstrapHost: Option[ClientConfig.BootstrapEndpoint]): ClientSession =
-    val clientConfig = ClientConfig.load(clientConfigFile)
+    val clientConfig =
+      try ClientConfig.load(clientConfigFile)
+      catch
+        case e: java.io.IOException =>
+          throw ConfigError(s"Cannot read client config $clientConfigFile: ${e.getMessage}")
     val fetched = BootstrapFetcher.fetch(clientConfig, bootstrapHost)
     val current = refreshCachedHosts(clientConfigFile, clientConfig, fetched.config)
     ClientSession(clientConfigFile, current, fetched.yaml, fetched.config)

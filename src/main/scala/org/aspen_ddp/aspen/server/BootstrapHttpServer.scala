@@ -27,6 +27,8 @@ class BootstrapHttpServer(port: Int,
 
   /** Binds 0.0.0.0:port. Throws java.net.BindException if the port is taken. */
   def start(): Unit =
+    // The handler pool is daemon but the JDK's HTTP-Dispatcher thread is not. That is harmless:
+    // run_host never returns and main always exits via System.exit.
     val s = HttpServer.create(new InetSocketAddress(port), 0)
     s.createContext("/", handle)
     s.setExecutor(executor)
@@ -55,6 +57,8 @@ class BootstrapHttpServer(port: Int,
       else if ex.getRequestMethod != "GET" then
         respond(ex, 405, "", "text/plain; charset=utf-8")
       else
+        // A primary read that times out keeps running in the background. Acceptable: clients
+        // fetch only at startup.
         val content: Option[String] =
           try Some(Await.result(primary(), primaryTimeout))
           catch

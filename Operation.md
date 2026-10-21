@@ -52,7 +52,7 @@ available.
 ## The Client Config and the Bootstrap Config
 
 The `aspen-bootstrap-config.yaml` file is **not** static. Each host maintains a writeable copy in
-its root host directory and updates it as the DataStores backing the `aspen-bootsrap` pool are
+its root host directory and updates it as the DataStores backing the `aspen-bootstrap` pool are
 migrated throughout the system. Every host serves the current copy over plain HTTP on its
 `http-port` (default 4751, `--http-port`): `GET /bootstrap` returns the Radicle copy, falling back
 to the host's on-disk copy if the Radicle cannot be read within two seconds, and responds 503 if

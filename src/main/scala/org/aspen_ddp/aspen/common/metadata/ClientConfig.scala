@@ -84,7 +84,11 @@ object ClientConfig:
         if colon < 0 then
           build(s, None)
         else
-          build(s.substring(0, colon), Some(s.substring(colon + 1)))
+          val address = s.substring(0, colon)
+          if address.contains(':') then
+            bad("IPv6 literals must be bracketed, e.g. [fd00::5]")
+          else
+            build(address, Some(s.substring(colon + 1)))
 
     /** Accepts `name`, `name:port`, `[ipv6]` and `[ipv6]:port`. A missing port uses `defaultPort`. */
     def parse(s: String, defaultPort: Int): Either[String, BootstrapEndpoint] =

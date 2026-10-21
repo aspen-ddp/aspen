@@ -278,6 +278,14 @@ class SimpleCRLSuite extends FileBasedTests {
     queue.take()
     assert(i.crl.currentStreamNumber == 1)
 
+    // Fill stream 1 so the delete+save below must move to stream 2 whether or not the CRL thread
+    // batches them into one entry. The completion handler runs before the CRL thread sees the
+    // write-complete event, so the batching of back-to-back requests depends on thread timing.
+    i.crl.save(transactionId, trsValidTxd, completionHandler)
+
+    queue.take()
+    assert(i.crl.currentStreamNumber == 1)
+
     i.crl.deleteTransaction(storeId, transactionId2)
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 

@@ -92,8 +92,21 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     Change: RebalancingServiceSuite's executor fixture now uses a 30s lease / 1s renewal (the
     suite does not test lease timing). "sweep skips a level-1 set" failed 1 of 5 loaded runs
     before and 0 of 5 after -- a small sample, so treat as likely rather than proven.
-    Other things seen under load: "SimpleCRL Recovery From Multiple Streams" failed once in
-    f3 runs (not investigated; same family as the "Recycle Streams" note in item 2).
+    "SimpleCRL Recovery From Multiple Streams" under load (INVESTIGATED, test bug, CRL is correct):
+    the test calls deleteTransaction() then save() back to back and expects them in separate log
+    entries (stream 2). Stream.writeEntry runs the entry's completion handlers BEFORE it posts
+    WriteComplete to the CRL thread, so the test thread can enqueue both requests first; the CRL
+    thread then batches them into one entry, which still fits in stream 1 (assert at line 285 saw
+    1, not 2). Repro loop of the scenario: 0/400 failures idle, 30-36/400 under saturation, all
+    failures were the batched ordering. Recovery was checked after every run and was correct in
+    all 400, including the batched ones. Fix: the test now fills stream 1 with an extra
+    save+take first, so the stream-2 outcome holds whether or not the pair is batched (0/400
+    under load, SimpleCRLSuite 3/3 under load + idle). Not changed: the handlers-before-
+    WriteComplete order in Stream.writeEntry. It is harmless for correctness; swapping it would
+    make batching deterministic for callers, but it is a CRL main-path change.
+    Unresolved: the earlier "Recycle Streams" failure may be the same mechanism (the test has
+    back-to-back save/delete calls at ~line 230) but was not reproduced. The test also calls
+    i.crl.save() after i.crl.shutdown() (~line 291, probably meant i2); left alone.
     Remaining failures in those runs are item 4 (timeouts under saturation).
 
 

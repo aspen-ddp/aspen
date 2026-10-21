@@ -75,36 +75,26 @@ under load, group the log lines by state pointer. Revert the instrumentation aft
     transaction ID" and "Re-saved transaction survives recovery ..." pin that behaviour; if
     deletions should be final across entries, they and that behaviour should be reconsidered.
 
-[ ] 3. The service executor can run two instances of one service at once
+[x] 3. The service executor can run two instances of one service at once  (INVESTIGATED 2026-10-20)
 
-    Evidence (logs from loaded runs, not yet isolated to a single mechanism): a single
-    executor created up to 6+ separate RebalancingDurableService instances for one state
-    object inside one test. Each instance has its own `sweeping` flag, so two live instances
-    can sweep concurrently and RebalancingServiceSuite's "sweep skips a level-1 set" test
-    still failed with `2 was not equal to 1` after the fixes in cc74578.
-
-    Suspected mechanism (inferred, NOT verified): with the test's 2s lease and 200ms renewal,
-    a late renewal makes doRenewal call handleLeaseLoss, which shuts the instance down; the
-    next scan re-claims and builds a replacement. The old instance's in-flight sweep is not
-    cancelled and keeps running. Also in SimpleDurableServiceExecutor.attemptClaim,
-    `ownedServices += svcUUID -> ...` overwrites any existing entry without shutting the old
-    instance down, and several claimAttempts for the same revision are scheduled before the
-    first claim lands.
-
-    Approach:
-      - First confirm the mechanism. Add logging to SimpleDurableServiceExecutor at
-        handleLeaseLoss, scan-driven removal, and service creation (keyed by service UUID,
-        not state pointer -- the earlier pass keyed leaseLoss by UUID and create by state
-        pointer, which made them hard to join) and look at the sequence for one state that
-        got 2+ instances.
-      - If lease loss is the trigger: decide whether a shut-down instance must stop its
-        in-flight work (check `stopped` at every step of a sweep, not only per set), and
-        whether attemptClaim should shut down any instance it replaces.
-      - If a duplicate claim is the trigger: guard attemptClaim against creating a service
-        for a UUID that is already owned or has a claim in flight.
-      - Decide separately whether a cross-instance guard is wanted for sweeps. Production
-        tolerates two instances (enrollment is revision-checked and idempotent); the test's
-        exact-count assertion does not.
+    Instrumented create / lease-loss in SimpleDurableServiceExecutor (since reverted) and ran
+    the full suite 11 times at 24 busy loops. Findings:
+      - Every duplicate is lease expiry, not a duplicate claim. doRenewal sees the entry expired
+        (by 1-160ms) because a 2s lease with a 200ms renewal cannot be kept when the process is
+        starved -> handleLeaseLoss shuts the instance down -> the next scan re-claims and builds
+        a replacement. ~20 executors per loaded run did this.
+      - The attemptClaim overwrite hypothesis is REFUTED: 0 of 781 creates found an existing
+        owned instance. No guard is needed there.
+      - The old instance is shut down at loss, so two instances overlap only while a sweep that
+        began before shutdown is still in flight (sweepOneSet checks `stopped` only at its
+        start). A cross-instance guard would be needed to remove that entirely; production
+        tolerates it (enrollment is revision-checked and idempotent).
+    Change: RebalancingServiceSuite's executor fixture now uses a 30s lease / 1s renewal (the
+    suite does not test lease timing). "sweep skips a level-1 set" failed 1 of 5 loaded runs
+    before and 0 of 5 after -- a small sample, so treat as likely rather than proven.
+    Other things seen under load: "SimpleCRL Recovery From Multiple Streams" failed once in
+    f3 runs (not investigated; same family as the "Recycle Streams" note in item 2).
+    Remaining failures in those runs are item 4 (timeouts under saturation).
 
 
 [ ] 4. Lease-timing tests fail under full load

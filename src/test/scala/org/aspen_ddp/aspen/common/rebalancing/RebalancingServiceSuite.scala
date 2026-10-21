@@ -22,8 +22,8 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
   private def makeExecutor(): SimpleDurableServiceExecutor =
     new SimpleDurableServiceExecutor(
       client, HostId.BootstrapHostId, client.backgroundTaskManager,
-      leaseDuration        = Duration(2000, MILLISECONDS),
-      renewalInterval      = Duration(200, MILLISECONDS),
+      leaseDuration        = Duration(30000, MILLISECONDS),
+      renewalInterval      = Duration(1000, MILLISECONDS),
       minScanInterval      = Duration(40, MILLISECONDS),
       maxScanInterval      = Duration(80, MILLISECONDS),
       claimDelayPerService = Duration(0, MILLISECONDS))

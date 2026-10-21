@@ -1150,7 +1150,6 @@ object Main {
     val aspenSystemId = UUID.randomUUID()
 
     val ca = CertificateAuthority.create(aspenSystemId)
-    val cli = BootstrapConfig.CLICredentials.generate(ca)
 
     // The host id is minted first because the certificate's subject is the host id
     val bootstrapHostId = HostId(UUID.randomUUID())
@@ -1230,8 +1229,7 @@ object Main {
         ida = bootstrapIda,
         hostStates = List(bootstrapHost),
         storeMap = bootstrapStores.map(backend => backend.storeId -> hostConfig.hostId).toList,
-        caCertificate = Pem.encodeCertificate(ca.certificate),
-        cli = cli
+        caCertificate = Pem.encodeCertificate(ca.certificate)
       ).getBytes(StandardCharsets.UTF_8)
     )
 
@@ -1241,8 +1239,7 @@ object Main {
       bootstrapHost,
       bootstrapStorageDevice,
       bootstrapStores.toList,
-      ca,
-      cli)
+      ca)
 
     // Print yaml representation of Radicle Pointer
     println("# Aspen Radicle Pointer Definition")

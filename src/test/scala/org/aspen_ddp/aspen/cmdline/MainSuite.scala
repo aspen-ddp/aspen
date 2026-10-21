@@ -228,7 +228,6 @@ class MainSuite extends AnyFunSuite with Matchers:
 
       val ca = Pem.decodeCertificate(bsCfg.caCertificate)
       CertificateVerifier.verify(Pem.decodeCertificate(hostCfg.tlsCertificate), ca) shouldBe hostCfg.hostId.uuid
-      CertificateVerifier.verify(Pem.decodeCertificate(bsCfg.cli.certificate), ca) shouldBe bsCfg.cli.cliId
       ca.getSubjectX500Principal.getName should include (bsCfg.aspenSystemId.toString)
 
   test("validateHostAddress accepts IPv4, DNS names, and bracketed IPv6"):

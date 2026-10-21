@@ -36,15 +36,6 @@ ca-certificate: |
   -----BEGIN CERTIFICATE-----
   ...
   -----END CERTIFICATE-----
-cli-id: CC1049AD-D2A8-4D17-8080-E01A4678C8B3
-cli-certificate: |
-  -----BEGIN CERTIFICATE-----
-  ...
-  -----END CERTIFICATE-----
-cli-private-key: |
-  -----BEGIN PRIVATE KEY-----
-  ...
-  -----END PRIVATE KEY-----
 */
 
 object BootstrapConfig:
@@ -113,22 +104,10 @@ object BootstrapConfig:
       stores.get(o)
     )
 
-  /** Credentials the command line tool uses to authenticate to the system. Generated once at
-   *  bootstrap and carried forward unchanged whenever the bootstrap config is regenerated. */
-  case class CLICredentials(cliId: UUID, certificate: String, privateKey: String)
-
-  object CLICredentials:
-    def generate(ca: CertificateAuthority): CLICredentials =
-      val cliId = UUID.randomUUID()
-      val keyPair = CertificateAuthority.generateKeyPair()
-      val cert = ca.signCertificate(cliId, keyPair.getPublic)
-      CLICredentials(cliId, Pem.encodeCertificate(cert), Pem.encodePrivateKey(keyPair.getPrivate))
-
   case class Config(aspenSystemId: UUID,
                     bootstrapIDA: IDA,
                     hosts: List[BootstrapHost],
-                    caCertificate: String,
-                    cli: CLICredentials):
+                    caCertificate: String):
     // Validate config. The bootstrap pool has exactly one store per IDA element, but those
     // stores may sit on any number of hosts: a freshly bootstrapped system puts all of them
     // on the single bootstrap host and they spread out from there as hosts are added. So it
@@ -145,19 +124,14 @@ object BootstrapConfig:
     val hosts: Required[List[BootstrapHost]] = Required("bootstrap-hosts", YList(BootstrapHost))
 
     val caCertificate: Required[String]      = Required("ca-certificate", YString)
-    val cliId: Required[UUID]                = Required("cli-id", YUUID)
-    val cliCertificate: Required[String]     = Required("cli-certificate", YString)
-    val cliPrivateKey: Required[String]      = Required("cli-private-key", YString)
 
-    val attrs: List[Attr] = aspenSystemId :: bootstrapIDA :: hosts :: caCertificate :: cliId ::
-                            cliCertificate :: cliPrivateKey :: Nil
+    val attrs: List[Attr] = aspenSystemId :: bootstrapIDA :: hosts :: caCertificate :: Nil
 
     def create(o: Object): Config = Config(
       aspenSystemId.get(o),
       bootstrapIDA.get(o),
       hosts.get(o),
-      caCertificate.get(o),
-      CLICredentials(cliId.get(o), cliCertificate.get(o), cliPrivateKey.get(o)))
+      caCertificate.get(o))
 
 
   def loadBootstrapConfig(file: File): Config =
@@ -176,8 +150,7 @@ object BootstrapConfig:
                               ida: IDA,
                               hostStates: List[HostState],
                               storeMap: List[(StoreId, HostId)],
-                              caCertificate: String,
-                              cli: CLICredentials): String =
+                              caCertificate: String): String =
     val hostIdSet = hostStates.map(_.hostId).toSet
 
     storeMap.foreach: (_, hostId) =>
@@ -211,9 +184,6 @@ object BootstrapConfig:
         sb.append(f"      - $storeId\n")
 
     sb.append(yamlBlockScalar("ca-certificate", caCertificate))
-    sb.append(s"cli-id: ${cli.cliId}\n")
-    sb.append(yamlBlockScalar("cli-certificate", cli.certificate))
-    sb.append(yamlBlockScalar("cli-private-key", cli.privateKey))
 
     sb.toString
 
@@ -264,13 +234,13 @@ object BootstrapConfig:
 
         val aspenSystemId = byte2uuid(radicleKvos.contents(Radicle.SystemIdKey).value.bytes)
 
-        // The CA certificate and CLI credentials are generated once at bootstrap; carry them
-        // forward unchanged from the radicle's current config.
+        // The CA certificate is generated once at bootstrap; carry it forward unchanged from
+        // the radicle's current config.
         val current = parseBootstrapConfig(
           new String(radicleKvos.contents(Radicle.BootstrapConfigKey).value.bytes, StandardCharsets.UTF_8))
 
         val yaml = generateBootstrapConfig(aspenSystemId, poolCfg.ida, hostsList, storeMap,
-          current.caCertificate, current.cli)
+          current.caCertificate)
 
         val reqs = List(KeyRevision(Radicle.BootstrapConfigKey,
           radicleKvos.contents(Radicle.BootstrapConfigKey).revision))

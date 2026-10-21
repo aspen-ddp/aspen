@@ -26,8 +26,7 @@ object Bootstrap:
                  bootstrapHostState: HostState,
                  bootstrapStorageDeviceState: StorageDeviceState,
                  stores: List[Backend],
-                 ca: CertificateAuthority,
-                 cli: BootstrapConfig.CLICredentials): KeyValueObjectPointer = {
+                 ca: CertificateAuthority): KeyValueObjectPointer = {
 
     require( ida.width == stores.length )
 
@@ -36,8 +35,7 @@ object Bootstrap:
       ida = ida,
       hostStates = List(bootstrapHostState),
       storeMap = stores.map(backend => backend.storeId -> bootstrapHostState.hostId),
-      caCertificate = Pem.encodeCertificate(ca.certificate),
-      cli = cli
+      caCertificate = Pem.encodeCertificate(ca.certificate)
     )
 
     val bootstrapMetadata = Metadata(

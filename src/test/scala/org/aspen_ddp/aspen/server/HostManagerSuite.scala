@@ -65,8 +65,7 @@ class HostManagerSuite extends IntegrationTestSuite:
       ida = Replication(1, 1),
       hostStates = List(hs),
       storeMap = List(StoreId(PoolId.BootstrapPoolId, 0.toByte) -> hs.hostId),
-      caCertificate = TestTLS.caCertificatePem,
-      cli = TestTLS.cli)
+      caCertificate = TestTLS.caCertificatePem)
 
   /** Writes the operator's bootstrap config somewhere outside the new host's directory,
    *  which is where it comes from in practice. */

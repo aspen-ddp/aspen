@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen
 
-import org.aspen_ddp.aspen.common.metadata.BootstrapConfig
+import org.aspen_ddp.aspen.common.metadata.ClientConfig
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 
 import java.util.UUID
@@ -13,7 +13,7 @@ object TestTLS:
 
   val caCertificatePem: String = Pem.encodeCertificate(ca.certificate)
 
-  val cli: BootstrapConfig.CLICredentials = BootstrapConfig.CLICredentials.generate(ca)
+  val client: ClientConfig.ClientCredentials = ClientConfig.ClientCredentials.generate(ca)
 
   /** Returns (certificatePem, privateKeyPem) for a fresh key pair signed by `ca` */
   def credentials(id: UUID): (String, String) =

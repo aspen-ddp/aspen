@@ -44,7 +44,6 @@ class BootstrapConfigRadicleUpdateSuite extends IntegrationTestSuite:
     yield
       val cfg = BootstrapConfig.parseBootstrapConfig(yaml)
       cfg.caCertificate should be(TestTLS.caCertificatePem)
-      cfg.cli should be(TestTLS.cli)
 
   atest("prepRadicleUpdate drops a host its store map no longer references"):
     given ExecutionContext = executionContext

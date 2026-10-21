@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceSetId, StorageDeviceSetState}
 import org.aspen_ddp.aspen.common.network.ServiceMessage
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -15,6 +15,7 @@ import org.aspen_ddp.aspen.compute.{DurableService, DurableServiceFactory, Durab
 import scribe.Logging
 
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.{Duration, FiniteDuration, HOURS, MINUTES}
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -30,11 +31,21 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
   /** Overridable poll period (test seam; mirrors MissedUpdateFinalizationAction.errorTimeout). */
   @volatile var pollPeriod: Duration = DefaultPollPeriod
 
-  /** Test-only hook: counts the sets sweepOneSet carried past the level-0 filter. Note that
-   *  this counts sets the sweep took up, not sets it planned -- a set skipped downstream for
-   *  pending transfers or an active task still increments it. Exists solely to allow tests to
-   *  detect removal of the filter; not for production use. */
-  @volatile private[rebalancing] var testSweptSetsCount = 0
+  /** Test-only hook: counts the sets sweepOneSet carried past the level-0 filter, per service
+   *  state object. Note that this counts sets the sweep took up, not sets it planned -- a set
+   *  skipped downstream for pending transfers or an active task still increments it. Exists
+   *  solely to allow tests to detect removal of the filter; not for production use.
+   *
+   *  Keyed by the service's state object rather than held in a single counter because suites
+   *  run in parallel in one JVM and every Bootstrap-created system carries its own copy of
+   *  this service: a shared counter picks up the sweeps of unrelated suites. */
+  private val testSweptSetsCounts = new java.util.concurrent.ConcurrentHashMap[ObjectId, AtomicInteger]()
+
+  private[rebalancing] def testSweptSetsCount(statePointer: KeyValueObjectPointer): Int =
+    Option(testSweptSetsCounts.get(statePointer.id)).fold(0)(_.get)
+
+  private def recordSweptSet(statePointer: KeyValueObjectPointer): Unit =
+    testSweptSetsCounts.computeIfAbsent(statePointer.id, _ => new AtomicInteger).incrementAndGet()
 
   /** Default interval between automatic rebalance sweeps. Distinct from DefaultPollPeriod,
    *  which is how often reconcile() runs. */
@@ -258,17 +269,20 @@ class RebalancingDurableService(val client: AspenClient,
               if !tasks.contains(setId) && !completing.contains(setId) then
                 startTask(setId, taskStatePtr)
 
-        val period = RebalancingServiceState.decodeAutoRebalancePeriod(
-                       kvos.contents(RebalancingServiceState.AutoRebalancePeriodKey).value.bytes)
-        val lastSweep = RebalancingServiceState.decodeLastAutoRebalance(
-                          kvos.contents(RebalancingServiceState.LastAutoRebalanceKey).value.bytes)
-
-        if !sweepIsDue(period, lastSweep) || !beginSweep() then
+        if !sweepIsDue(kvos) || !beginSweep() then
           Future.unit
         else
-          // Wrap sweep() in a flatMap so a synchronous throw in the first call (e.g.,
+          // The check above ran against state read before this sweep was claimed. If it was
+          // read while an earlier sweep was still recording itself, it is stale: that sweep
+          // has since finished and released the claim, so acting on it would sweep twice.
+          // Sweeps are serialized by the claim and recordSweep completes before it is
+          // released, so a fresh read taken now sees every earlier sweep.
+          //
+          // Wrap in a flatMap so a synchronous throw in the first call (e.g.,
           // listStorageDeviceSets()) becomes a failed future that .andThen still sees.
-          Future.unit.flatMap(_ => sweep())
+          Future.unit.flatMap(_ => client.read(statePointer))
+            .flatMap: fresh =>
+              if sweepIsDue(fresh) then sweep() else Future.unit
             .andThen { case _ => endSweep() }
             .recover:
               case err => logger.warn(s"RebalancingDurableService sweep failed: $err")
@@ -280,7 +294,11 @@ class RebalancingDurableService(val client: AspenClient,
    *
    *  A lastSweep in the future -- clock skew, or an HLC advanced by a peer -- yields a negative
    *  difference and simply defers the sweep until wall time catches up. */
-  private def sweepIsDue(period: Duration, lastSweep: HLCTimestamp): Boolean =
+  private def sweepIsDue(kvos: KeyValueObjectState): Boolean =
+    val period = RebalancingServiceState.decodeAutoRebalancePeriod(
+                   kvos.contents(RebalancingServiceState.AutoRebalancePeriodKey).value.bytes)
+    val lastSweep = RebalancingServiceState.decodeLastAutoRebalance(
+                      kvos.contents(RebalancingServiceState.LastAutoRebalanceKey).value.bytes)
     period > Duration.Zero && (HLCTimestamp.now - lastSweep) >= period
 
   /** Claim the sweep, returning false if one is already running. scheduleNonConcurrentPollingTask
@@ -319,7 +337,7 @@ class RebalancingDurableService(val client: AspenClient,
         if setState.level != 0 then
           Future.unit
         else
-          RebalancingDurableService.testSweptSetsCount += 1
+          RebalancingDurableService.recordSweptSet(statePointer)
           RebalancingDurableService.rebalanceReadSet(client, setId, setState, statePointer)
       .recover:
         case err =>

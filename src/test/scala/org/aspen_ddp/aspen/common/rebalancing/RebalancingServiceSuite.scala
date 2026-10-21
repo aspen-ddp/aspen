@@ -200,7 +200,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
     RebalancingDurableService.pollPeriod = Duration(100, MILLISECONDS)
-    RebalancingDurableService.testSweptSetsCount = 0
     val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
@@ -220,13 +219,14 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       _ <- awaitUntil("the sweep to enroll the level-0 set")(
              readActiveTasks().map(_.exists(_._1 == setId)))
       active <- readActiveTasks()
+      statePtr <- readServiceStatePointer()
       _ <- driveUntilActiveEmpty(setId, Duration(20000, MILLISECONDS))
     yield
       exec.shutdown()
       RebalancingDurableService.pollPeriod = RebalancingDurableService.DefaultPollPeriod
       active.map(_._1) should not contain upper
       // The filter kept the level-1 set out of the sweep: only the bootstrap set was taken up.
-      RebalancingDurableService.testSweptSetsCount shouldBe 1
+      RebalancingDurableService.testSweptSetsCount(statePtr) shouldBe 1
 
   atest("a set already being rebalanced is not enrolled twice by the sweep"):
     given ExecutionContext = executionContext

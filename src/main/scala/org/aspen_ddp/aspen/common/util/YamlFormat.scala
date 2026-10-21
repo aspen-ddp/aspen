@@ -61,6 +61,18 @@ object YamlFormat {
     doc
   }
 
+  /** Emits a YAML literal block scalar using the clip (`|`) style, which preserves line breaks
+    * and keeps exactly one trailing newline. `text` must therefore end with a newline.
+    */
+  def yamlBlockScalar(key: String, text: String, indent: String = ""): String = {
+    require(text.endsWith("\n"), "block scalar text must end with a newline")
+    val sb = new StringBuilder(s"$indent$key: |\n")
+    text.stripSuffix("\n").split("\n", -1).foreach { line =>
+      sb.append(indent).append("  ").append(line).append("\n")
+    }
+    sb.toString
+  }
+
   trait Format[T] {
     def format(o: Object): T
   }

@@ -14,6 +14,7 @@ import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
 import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
@@ -1151,15 +1152,23 @@ object Main {
 
     val aspenSystemId = UUID.randomUUID()
 
+    // replaced in a later task: throwaway CA signs a cert for the bootstrap host
+    val bootstrapHostId = HostId(UUID.randomUUID())
+    val tlsCa = CertificateAuthority.create(aspenSystemId)
+    val tlsKeyPair = CertificateAuthority.generateKeyPair()
+    val tlsCert = tlsCa.signCertificate(bootstrapHostId.uuid, tlsKeyPair.getPublic)
+
     val hostConfig = HostConfig(
-      HostId(UUID.randomUUID()),
+      bootstrapHostId,
       aspenSystemId,
       "bootstrap-host",
       address,
       dataPort,
       cncPort,
       storeTransferPort,
-      HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300)
+      HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300),
+      Pem.encodeCertificate(tlsCert),
+      Pem.encodePrivateKey(tlsKeyPair.getPrivate)
     )
 
     Files.write(

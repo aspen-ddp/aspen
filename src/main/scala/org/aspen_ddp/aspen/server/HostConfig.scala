@@ -19,6 +19,14 @@ crl:
   storage-engine: simple-crl
   num-streams: 3
   max-file-size-mb: 300
+tls-certificate: |
+  -----BEGIN CERTIFICATE-----
+  ...
+  -----END CERTIFICATE-----
+tls-private-key: |
+  -----BEGIN PRIVATE KEY-----
+  ...
+  -----END PRIVATE KEY-----
 */
 case class HostConfig(hostId: HostId,
                       aspenSystemId: UUID,
@@ -27,7 +35,9 @@ case class HostConfig(hostId: HostId,
                       dataPort: Int,
                       cncPort: Int,
                       storeTransferPort: Int,
-                      crl: HostConfig.CRLBackend):
+                      crl: HostConfig.CRLBackend,
+                      tlsCertificate: String,
+                      tlsPrivateKey: String):
   def yamlConfig: String =
     val base = s"""host-id: ${hostId.uuid}
        |aspen-system-id: $aspenSystemId
@@ -46,7 +56,9 @@ case class HostConfig(hostId: HostId,
            |  max-file-size-mb: ${s.fileSizeMb}
            |""".stripMargin
 
-    base + crlCfg
+    base + crlCfg +
+      yamlBlockScalar("tls-certificate", tlsCertificate) +
+      yamlBlockScalar("tls-private-key", tlsPrivateKey)
 
 
 object HostConfig extends YObject[HostConfig]:
@@ -76,6 +88,9 @@ object HostConfig extends YObject[HostConfig]:
   val storeTransferPort: Required[Int] = Required("store-transfer-port", YInt)
   val crl: Required[SimpleCRL]         = Required("crl", Choice("storage-engine", Map("simple-crl" -> SimpleCRL)))
 
+  val tlsCertificate: Required[String] = Required("tls-certificate", YString)
+  val tlsPrivateKey: Required[String]  = Required("tls-private-key", YString)
+
   val attrs: List[Attr] = List(
     hostId,
     aspenSystemId,
@@ -84,7 +99,9 @@ object HostConfig extends YObject[HostConfig]:
     dataPort,
     cncPort,
     storeTransferPort,
-    crl
+    crl,
+    tlsCertificate,
+    tlsPrivateKey
   )
 
   def create(o: Object): HostConfig = HostConfig(
@@ -95,7 +112,9 @@ object HostConfig extends YObject[HostConfig]:
     dataPort.get(o),
     cncPort.get(o),
     storeTransferPort.get(o),
-    crl.get(o)
+    crl.get(o),
+    tlsCertificate.get(o),
+    tlsPrivateKey.get(o)
   )
 
   def loadHostConfig(file: File): HostConfig =

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, TestTLS}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
@@ -45,6 +45,8 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
 
   /** A HostConfig for the TestNetwork's bootstrap host. Only hostId and aspenSystemId are
    *  consulted by createStorageDevice; the rest is filler. */
+  private val (tlsCert, tlsKey) = TestTLS.credentials(HostId.BootstrapHostId.uuid)
+
   private def hostConfig() = HostConfig(
     HostId.BootstrapHostId,
     systemId,
@@ -53,7 +55,9 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
     1234,
     1235,
     1236,
-    HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300))
+    HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300),
+    tlsCert,
+    tlsKey)
 
   /** Creates `<tmp>/host/storage-devices` and returns the host directory. */
   private def newHostDir(): Path =

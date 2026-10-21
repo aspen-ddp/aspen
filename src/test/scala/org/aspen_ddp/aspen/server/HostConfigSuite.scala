@@ -1,6 +1,9 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
+import org.aspen_ddp.aspen.common.util.YamlFormat.FormatError
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -12,15 +15,20 @@ class HostConfigSuite extends AnyFunSuite with Matchers:
 
   private val zero = UUID.fromString("00000000-0000-0000-0000-000000000000")
 
+  private val hostUuid = UUID.fromString("11111111-1111-1111-1111-111111111111")
+  private val (sampleCert, sampleKey) = TestTLS.credentials(hostUuid)
+
   private val sample = HostConfig(
-    HostId(UUID.fromString("11111111-1111-1111-1111-111111111111")),
+    HostId(hostUuid),
     UUID.fromString("22222222-2222-2222-2222-222222222222"),
     "node_a",
     "127.0.0.1",
     4750,
     4751,
     4752,
-    HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300))
+    HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300),
+    sampleCert,
+    sampleKey)
 
   test("configFilename is aspen-host-config.yaml"):
     HostConfig.configFilename should be("aspen-host-config.yaml")
@@ -37,6 +45,28 @@ class HostConfigSuite extends AnyFunSuite with Matchers:
     finally
       Files.deleteIfExists(f)
 
+  test("round trip preserves the TLS certificate and private key exactly"):
+    val f = Files.createTempFile("aspen-host-config-tls", ".yaml")
+    try
+      Files.write(f, sample.yamlConfig.getBytes(StandardCharsets.UTF_8))
+      val loaded = HostConfig.loadHostConfig(f.toFile)
+      loaded.tlsCertificate shouldBe sample.tlsCertificate
+      loaded.tlsPrivateKey shouldBe sample.tlsPrivateKey
+      CertificateVerifier.verify(Pem.decodeCertificate(loaded.tlsCertificate), TestTLS.ca.certificate) shouldBe sample.hostId.uuid
+    finally
+      Files.deleteIfExists(f)
+
+  test("loadHostConfig rejects a config without tls-certificate"):
+    val yaml = sample.yamlConfig
+    val start = yaml.indexOf("tls-certificate: |")
+    val end = yaml.indexOf("tls-private-key:")
+    val f = Files.createTempFile("aspen-host-config-notls", ".yaml")
+    try
+      Files.write(f, (yaml.substring(0, start) + yaml.substring(end)).getBytes(StandardCharsets.UTF_8))
+      a [FormatError] should be thrownBy HostConfig.loadHostConfig(f.toFile)
+    finally
+      Files.deleteIfExists(f)
+
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """host-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000
@@ -49,6 +79,14 @@ crl:
   storage-engine: simple-crl
   num-streams: 3
   max-file-size-mb: 300
+tls-certificate: |
+  -----BEGIN CERTIFICATE-----
+  AAAA
+  -----END CERTIFICATE-----
+tls-private-key: |
+  -----BEGIN PRIVATE KEY-----
+  BBBB
+  -----END PRIVATE KEY-----
 """
 
     val f = Files.createTempFile("aspen-host-docexample", ".yaml")
@@ -64,6 +102,9 @@ crl:
       cfg.cncPort should be(4751)
       cfg.storeTransferPort should be(4752)
       cfg.crl should be(HostConfig.SimpleCRL(numStreams = 3, fileSizeMb = 300))
+
+      cfg.tlsCertificate should be("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+      cfg.tlsPrivateKey should be("-----BEGIN PRIVATE KEY-----\nBBBB\n-----END PRIVATE KEY-----\n")
 
       cfg.yamlConfig should be(docExampleYaml)
     finally

@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
+import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, StandardCopyOption, StandardOpenOption}
@@ -101,6 +102,10 @@ object HostManager:
 
         case None =>
           client.createHost(name, address, dataPort, cncPort, storeTransferPort).map: hostId =>
+            // replaced in a later task: throwaway CA signs a cert for this host
+            val tlsCa = CertificateAuthority.create(aspenSystemId)
+            val tlsKeyPair = CertificateAuthority.generateKeyPair()
+            val tlsCert = tlsCa.signCertificate(hostId.uuid, tlsKeyPair.getPublic)
             val hostConfig = HostConfig(
               hostId,
               aspenSystemId,
@@ -109,7 +114,9 @@ object HostManager:
               dataPort,
               cncPort,
               storeTransferPort,
-              HostConfig.SimpleCRL(DefaultCrlNumStreams, DefaultCrlFileSizeMb)
+              HostConfig.SimpleCRL(DefaultCrlNumStreams, DefaultCrlFileSizeMb),
+              Pem.encodeCertificate(tlsCert),
+              Pem.encodePrivateKey(tlsKeyPair.getPrivate)
             )
             try
               // CREATE_NEW rather than the default CREATE|TRUNCATE_EXISTING: a full distributed

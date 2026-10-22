@@ -952,6 +952,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       t <- startTransferIn()
       first = takeStartTransfers(t.movingStore).last
       _ = t.transfers.failTransferIn(t.movingStore)
+      // The restart waits out a delay that never elapses under NoBackgroundTaskManager, so fire it
+      _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.contains(t.movingStore))
+      _ = t.host.testingOnlyRetryTransferIns()
       _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2))
     yield
       val attempts = t.transfers.transfersIn
@@ -988,3 +991,51 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       beforeCompletion.size should be(1)
       t.host.transferOutcomes.contains(t.movingStore) should be(true)
       takeStartTransfers(t.movingStore) should be(Nil)
+
+  atest("failed transfer in waits before restarting"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = takeStartTransfers(t.movingStore)
+      _ = t.transfers.failTransferIn(t.movingStore)
+      _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2), rounds = 3)
+
+      // A device check during the wait must not start a parallel attempt either
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2), rounds = 3)
+      _ = t.host.retransmitPendingStartTransfers(force = true)
+    yield
+      t.transfers.transfersIn.size should be(1)
+      t.host.testingOnlyTransferringIn should contain(t.movingStore)
+      t.host.testingOnlyScheduledTransferInRetries should contain(t.movingStore)
+      // The failed attempt's request is no longer retransmitted while the retry waits
+      takeStartTransfers(t.movingStore) should be(Nil)
+
+  atest("transfer in stays registered until the metadata outcome is handled"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      gate = t.host.holdTransferOutcomes()
+      promoted = os.Path(t.deviceDir) / t.movingStore.directoryName
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(os.exists(promoted))
+      heldTransferringIn = t.host.testingOnlyTransferringIn
+
+      // With the outcome still pending, a device check must neither start a second attempt nor
+      // (once promoted) report the arrived copy as a conflicting store directory
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
+      attemptsWhileHeld = t.transfers.transfersIn.size
+
+      _ = gate.success(())
+      _ <- pumpUntil(t.host.transferOutcomes.contains(t.movingStore) &&
+                     !t.host.testingOnlyTransferringIn.contains(t.movingStore))
+    yield
+      os.exists(promoted) should be(true)
+      heldTransferringIn should contain(t.movingStore)
+      attemptsWhileHeld should be(1)
+      t.host.transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      t.host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
+      t.host.testingOnlyTransferringIn should not contain t.movingStore

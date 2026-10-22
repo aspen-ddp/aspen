@@ -17,7 +17,7 @@ import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
 import java.util.UUID
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
@@ -362,11 +362,26 @@ private class RecordingHost(mgrClient: AspenClient,
   lazy val transferOutcomes: mutable.Map[StoreId, Host.TransferOutcome] =
     mutable.Map[StoreId, Host.TransferOutcome]()
 
+  /** When set, updateStateForTransferredStore waits for this promise before doing anything, holding
+   *  a completed transfer between promotion and its metadata outcome. Lazy for the same
+   *  initialization-order reason as storeLoadAttempts. */
+  private lazy val transferOutcomeGate = new AtomicReference[Option[Promise[Unit]]](None)
+
+  /** Holds every later post-transfer metadata update until the returned promise is completed. */
+  def holdTransferOutcomes(): Promise[Unit] =
+    val p = Promise[Unit]()
+    transferOutcomeGate.set(Some(p))
+    p
+
   override protected def updateStateForTransferredStore(
       storeId: StoreId,
       fromDeviceId: StorageDeviceId,
       toDeviceId: StorageDeviceId): Future[Host.TransferOutcome] =
-    val f = super.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
+    given ExecutionContext = ec
+    val f = transferOutcomeGate.get match
+      case None => super.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
+      case Some(gate) =>
+        gate.future.flatMap(_ => super.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId))
     f.foreach: outcome =>
       synchronized:
         transferOutcomes += storeId -> outcome

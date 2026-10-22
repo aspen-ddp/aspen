@@ -108,6 +108,9 @@ object Host:
 
   class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
 
+  /** How long a failed transfer in waits before it is restarted */
+  val TransferInRetryDelay: Duration = Duration(30, SECONDS)
+
 
 class Host(val client: AspenClient,
                    val hostId: HostId,
@@ -163,6 +166,9 @@ class Host(val client: AspenClient,
   private var transferringIn: Map[StoreId, UUID] = Map()
   private var abandoningTransferIns: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
+  // The restart of each failed transfer in that is waiting out TransferInRetryDelay. Its store
+  // stays in transferringIn meanwhile, so device checks do not start a parallel attempt.
+  private var transferInRetries: Map[StoreId, () => Unit] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
   private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
 
@@ -599,6 +605,31 @@ class Host(val client: AspenClient,
     discardStoreDirectory(storeId, toDeviceId,
       "The pool still names the transfer source, which kept its copy, so this one belongs to nobody")
 
+  /** Restarts a failed transfer in after TransferInRetryDelay rather than at once. A deterministic
+   *  failure (the sender's archiver exiting non-zero, a full disk here) would otherwise loop hot,
+   *  re-shipping the store each time, since every restart supersedes the sender's attempt at once.
+   *
+   *  The store stays in transferringIn until the retry fires, so device checks in the meantime
+   *  do not start a parallel attempt. `transferUUID` is the failed attempt's: the retry does
+   *  nothing if that attempt is no longer the store's current one.
+   */
+  private def scheduleTransferInRetry(storeId: StoreId,
+                                      transferUUID: UUID,
+                                      fromHostId: HostId,
+                                      fromDeviceId: StorageDeviceId,
+                                      toDeviceid: StorageDeviceId): Unit = synchronized {
+    def retry(): Unit = synchronized {
+      if transferInRetries.contains(storeId) && transferringIn.get(storeId).contains(transferUUID) then
+        transferInRetries -= storeId
+        transferringIn -= storeId
+        startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+    }
+
+    logger.info(s"Retrying the transfer in of store $storeId in $TransferInRetryDelay")
+    transferInRetries += storeId -> (() => retry())
+    backgroundTasks.schedule(TransferInRetryDelay)(retry())
+  }
+
   private def startStoreTransferIn(storeId: StoreId,
                                    fromHostId: HostId,
                                    fromDeviceId: StorageDeviceId,
@@ -631,14 +662,21 @@ class Host(val client: AspenClient,
           // Retransmission stops on completion, success or failure, not on first data: the
           // sender needs the request until it has finished, and a failure restarts with a new
           // message below.
-          def cleanup(): Unit = synchronized {
-            transferringIn -= storeId
+          def stopRetransmitting(): Unit = synchronized {
             pendingStartTransfers -= storeId
+          }
+
+          // transferringIn is dropped only once nothing more can happen to the arrived copy.
+          // Dropped any earlier, a device check could start a second attempt that re-ships the
+          // whole store, or, after promotion, log the promoted copy as a conflicting directory.
+          def finished(): Unit = synchronized {
+            if transferringIn.get(storeId).contains(transferUUID) then
+              transferringIn -= storeId
           }
 
           fcomplete.onComplete:
             case Success(_) =>
-              cleanup()
+              stopRetransmitting()
 
               // The marker was archived along with the source's store directory. Left in place
               // it would keep the arrived copy offline on every restart.
@@ -661,7 +699,7 @@ class Host(val client: AspenClient,
                 // no different from a transfer that failed in flight. The restart's extraction
                 // replaces the staged copy, and if the failure left a directory at finalPath the
                 // restart refuses with an error rather than retrying forever.
-                startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+                scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid)
               else
                 // Loading is downstream of the metadata decision, not ahead of it. An
                 // unconditional load hands a live copy of the store to a device that
@@ -670,28 +708,35 @@ class Host(val client: AspenClient,
                 //
                 // Waiting costs no availability: the pool goes on naming the source until that
                 // transaction commits, so nothing routes here before then anyway.
-                updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid).onComplete:
-                  case Success(TransferOutcome.PoolRepointed) =>
-                    loadStoreById(toDeviceid, storeId)
+                val foutcome =
+                  try updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid)
+                  catch case t: Throwable => Future.failed(t)
+                foutcome.onComplete: outcome =>
+                  try
+                    outcome match
+                      case Success(TransferOutcome.PoolRepointed) =>
+                        loadStoreById(toDeviceid, storeId)
 
-                  case Success(TransferOutcome.SourceRestored) =>
-                    discardArrivedTransferIn(storeId, toDeviceid)
+                      case Success(TransferOutcome.SourceRestored) =>
+                        discardArrivedTransferIn(storeId, toDeviceid)
 
-                  case Failure(t) =>
-                    // The only observer this Future has. Its onFail routes the permanent errors
-                    // to StopRetrying, which fails the promise -- and an unobserved failed Promise
-                    // is not reported by the ExecutionContext, so without this line a permanent
-                    // give-up is exactly as silent as the infinite retry loop it replaced. What is
-                    // left behind matters: the source's entry stays TransferringOut, which the
-                    // abandoned transfer-out pass will not reinstate because it requires Active,
-                    // so the source's copy stays offline behind its marker with nothing to say
-                    // why.
-                    logger.error(s"Failed to record the completed transfer of store $storeId " +
-                                 s"from device $fromDeviceId to device $toDeviceid. The store is " +
-                                 s"not loaded here and the pool still names the source", t)
+                      case Failure(t) =>
+                        // The only observer this Future has. Its onFail routes the permanent errors
+                        // to StopRetrying, which fails the promise -- and an unobserved failed Promise
+                        // is not reported by the ExecutionContext, so without this line a permanent
+                        // give-up is exactly as silent as the infinite retry loop it replaced. What is
+                        // left behind matters: the source's entry stays TransferringOut, which the
+                        // abandoned transfer-out pass will not reinstate because it requires Active,
+                        // so the source's copy stays offline behind its marker with nothing to say
+                        // why.
+                        logger.error(s"Failed to record the completed transfer of store $storeId " +
+                                     s"from device $fromDeviceId to device $toDeviceid. The store is " +
+                                     s"not loaded here and the pool still names the source", t)
+                  finally
+                    finished()
             case Failure(_) =>
-              cleanup()
-              startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+              stopRetransmitting()
+              scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid)
 
           val msg = StartStoreTransfer(
             fromHostId,
@@ -1615,6 +1660,18 @@ class Host(val client: AspenClient,
                                                                fromDeviceId: StorageDeviceId,
                                                                toDeviceId: StorageDeviceId): Future[TransferOutcome] =
     updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
+
+  /** Testing hook: the stores with a transfer in under way, including one waiting out its retry delay. */
+  private[aspen] def testingOnlyTransferringIn: Set[StoreId] =
+    synchronized(transferringIn.keySet)
+
+  /** Testing hook: the stores whose failed transfer in is waiting out its retry delay. */
+  private[aspen] def testingOnlyScheduledTransferInRetries: Set[StoreId] =
+    synchronized(transferInRetries.keySet)
+
+  /** Testing hook: runs every scheduled transfer-in retry now rather than after its delay. */
+  private[aspen] def testingOnlyRetryTransferIns(): Unit =
+    synchronized(transferInRetries.values.toList).foreach(_())
 
   /** Testing hook: the storage devices with a state lookup currently in flight. */
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =

@@ -31,6 +31,9 @@ lazy val root = (project in file(".")).
       "com.lihaoyi"                      %% "os-lib"                  % "0.11.5",
       "org.bouncycastle"                 %  "bcprov-jdk18on"          % "1.80",
       "org.bouncycastle"                 %  "bcpkix-jdk18on"          % "1.80",
+      "io.netty"                         %  "netty-codec-classes-quic" % "4.2.19.Final",
+      "io.netty"                         %  "netty-codec-native-quic" % "4.2.19.Final" classifier "linux-x86_64",
+      "io.netty"                         %  "netty-transport-native-epoll" % "4.2.19.Final" classifier "linux-x86_64",
     ),
 
     // Include the Backblaze Java source files during compilation

@@ -139,7 +139,7 @@ class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
              val oclientId: Option[ClientId],
              val ohost: Option[(HostId, Int)],
              val heartbeatPeriod: Duration,
-             val messageHandler: MessageHandler) extends Logging:
+             val messageHandler: MessageHandler) extends NetworkPlugin with Logging:
 
   import ZMQNet.*
 

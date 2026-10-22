@@ -69,8 +69,8 @@ object Main {
   // drift.
   val CheckStorageDevicesPeriod: Duration = Duration(1, HOURS)
 
-  // How long a terminating command waits for outbound messages to leave ZMQNet, and how long
-  // ZMQ is then given to put them on the wire before the process exits.
+  // How long a terminating command waits for outbound messages to leave the network plugin, and
+  // how long the transport is then given to put them on the wire before the process exits.
   val NotificationDrainTimeout: Duration = Duration(5, SECONDS)
   val NotificationSendLinger: Duration = Duration(1, SECONDS)
 
@@ -78,7 +78,7 @@ object Main {
   // than volatile because it is thread-confined: every command builds its network by a direct
   // call on the main thread, and main reads it back on that same thread. A command that built
   // one from a callback would need this made volatile, or the drain would see None and skip.
-  private var onetwork: Option[ZMQNet] = None
+  private var onetwork: Option[NetworkPlugin] = None
 
   case class Args(mode:String="",
                   hostDirectory:File=null,
@@ -861,7 +861,7 @@ object Main {
   def createNetwork(bootstrapConfig: BootstrapConfig.Config,
                     onRefresh: (String, BootstrapConfig.Config) => Unit,
                     ohost: Option[(HostId, Int)],
-                    oclientId: Option[ClientId]): (NetworkBridge, ZMQNet) = {
+                    oclientId: Option[ClientId]): (NetworkBridge, NetworkPlugin) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
@@ -909,7 +909,7 @@ object Main {
   /** Builds the client every client command uses. Bootstrap configs the network refreshes while
    *  the client runs -- amoebafs runs indefinitely -- keep the cached host list current too.
    */
-  def createAspenClient(session: ClientSession): (AspenClient, ZMQNet, KeyValueObjectPointer) =
+  def createAspenClient(session: ClientSession): (AspenClient, NetworkPlugin, KeyValueObjectPointer) =
     // Compared against what was last written rather than what the session started with, so a
     // host set that moves and then moves back is written both times. Refreshes are serialized
     // on the reference so two cannot both compare against the same stale config.
@@ -923,7 +923,7 @@ object Main {
 
   def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
-                        onnet: Option[(NetworkBridge, ZMQNet)] = None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
+                        onnet: Option[(NetworkBridge, NetworkPlugin)] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
 
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None))
 

@@ -1,31 +1,79 @@
 TODO
 ====
 
-- Store transfer cannot tolerate lost or reordered messages. Investigate, and develop a new
-  implementation if confirmed.
+- A destination crash between promoting a transferred store and the pool metadata commit leaves
+  the store offline until an operator intervenes.
 
-  TransferringOut pipes `jar --create` output to the destination as a series of 1 MiB
-  StoreTransferData host messages over the data port. A zero-length chunk marks the end.
-  TransferringIn writes each chunk straight into the stdin of the `jar` extraction process, in
-  the order the chunks arrive. There are no sequence numbers, acknowledgements or
-  retransmissions. Aspen's network layer is allowed to drop messages, so:
+  On a successful transfer in, Host.startStoreTransferIn removes the transfer-out marker from the
+  staged copy, os.moves it from <device>/transferring-in/<store> to <device>/<store>, and only
+  then runs updateStateForTransferredStore to repoint the pool. If the destination host dies in
+  that window (crash-only, so this is a normal event):
 
-    - A dropped data chunk silently corrupts or truncates the extracted store.
-    - A dropped end marker leaves the transfer hanging until some timeout notices.
-    - The QUIC plugin round-robins large messages across several streams. The 1-byte end marker
-      would also travel as a datagram. So chunks can arrive out of order, which ZMQ's single
-      TCP connection never allowed. That corrupts the archive even when nothing is dropped.
-    - A chunk is dropped whenever the sender outruns the connection's buffer budget, which is
-      exactly what a bulk transfer does.
+    - On restart tryLoadStore finds a complete store directory with no marker at the final path
+      and loads it, even though the pool still names the source as the owner. Nothing routes
+      to it, but the copy is live on a device the metadata says does not own it.
+    - The device check still sees the store as TransferringIn, but startStoreTransferIn refuses
+      to start because finalPath already exists, logging "store path already exists" on every
+      check. The metadata step is never retried.
+    - The source's copy stays offline behind its own transfer-out marker, and the abandoned
+      transfer-out pass will not reinstate it because the entry is not Active.
 
-  Separately, TransferringOut.readThread reuses one `buff` array for every full chunk, so a
-  chunk still queued for sending can be overwritten by the next read. ZMQNet races on this
-  today, and the QUIC plugin's zero-copy send makes it far more likely. Use a fresh array for
-  each chunk.
+  This ordering predates the TLS/TCP transfer work (the old TransferringIn did the same), but it is
+  now the main remaining crash hole in transfers. Recommended fix: promote with a distinct
+  "transferred-in" marker instead of no marker. tryLoadStore skips directories carrying it (like
+  the transfer-out marker). startStoreTransferIn, on finding finalPath with that marker, skips
+  the byte transfer and resumes at updateStateForTransferredStore. The marker is removed only on
+  TransferOutcome.PoolRepointed, immediately before loadStoreById; on SourceRestored the whole
+  directory is discarded as today. Add a Host test that injects a "crash" after promotion (fresh
+  Host over the same root) and checks that the store is not loaded and the metadata step resumes.
 
-  The unused `storeTransferPort`, present in host config, HostState and the CLI, suggests a
-  dedicated transfer channel was intended. That is one option for the new implementation, along
-  with a sequenced, acknowledged, flow-controlled protocol over the data port.
+- An abandoned transfer in is never cleaned up on the receiving host.
+
+  When the source device is declared failed mid-transfer, Host.abandonTransferIn rewrites the
+  device entry but does not touch transferringIn, pendingStartTransfers or the
+  StoreTransferManager registration for that store. Since a receiver registration has no timeout
+  of its own (the old 30 s no-data timer is gone), the consequences last for the life of the
+  process:
+
+    - The pending-start retransmit task keeps sending StartStoreTransfer to the dead source host
+      every 30 s.
+    - transferringIn still holds the store, so startStoreTransferIn will never start a new
+      transfer of that store onto this host until a restart.
+    - A partial staging directory under transferring-in/ may be left behind until a later transfer
+      of the same store replaces it.
+
+  Recommended fix: when abandonTransferIn's transaction commits, drop the store's
+  pendingStartTransfers and transferringIn entries, cancel any scheduled transfer-in retry, and
+  have the service drop the registration (add a StoreTransferService.cancelTransferIn(storeId)
+  that fails the pending future, aborts any live connection/extractor and removes the staged
+  directory). Also have the delayed retry re-read the device entry and give up if the store is no
+  longer TransferringIn, so a retry scheduled before the abandon does not send one more request.
+  Separately, consider sweeping stale transferring-in/ directories at device load.
+
+- Store-transfer trailer could carry the archive length.
+
+  The receiver's only completeness check is the 17-byte StoreId trailer
+  (StoreTransferManager.TrailerSize), held back from the extractor and compared on EOF, plus the
+  extractor's exit code. JDK SSLSocket treats a TCP FIN without close_notify as a normal EOF, so a
+  sender crash looks like a clean end of stream. A false accept would need the archive to end with
+  the StoreId bytes at exactly the point the connection dropped and jar --extract to exit 0 on
+  the truncated input -- astronomically unlikely, and the design deliberately chose no
+  length/checksum. Closing it is cheap, though: make the trailer the StoreId followed by an
+  8-byte big-endian count of archive bytes sent (TrailerSize = 25); the receiver counts the bytes
+  it forwards to the extractor and requires both to match. Optionally add a CRC32 of the archive.
+  Update the wire-protocol section of
+  docs/superpowers/specs/2026-10-22-store-transfer-tcp-design.md and the truncation tests.
+
+- QUIC test cleanups left over from removing StoreTransferData.
+
+    - Unused DataBuffer imports in QuicTlsSuite.scala:5, QuicNetFlushSuite.scala:4 and
+      QuicNetLivenessSuite.scala:4 (in Liveness only HLCTimestamp is still used).
+    - The helper is still named transferData in QuicNetFlushSuite, QuicNetLivenessSuite and
+      QuicNetRoutingSuite though it now builds an OpportunisticRebuild; rename to rebuildData or
+      inline the fixture's rebuild(...).
+    - No test sends a large host-addressed message any more (large payloads now go store-routed
+      over the same transport path). Add one small host-addressed case to the concurrent-senders
+      test in QuicNetRoutingSuite so host routing under load stays covered.
 
 - Client read completion does O(object size) work inline on the network thread. Move it off the
   QUIC event loop, or make it cheap.

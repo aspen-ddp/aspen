@@ -1,3 +1,52 @@
 TODO
 ====
 
+- For StoreMoved and HostEndpointChanged, the lack of the updated information in the message means that network
+  state reads will need to be made by every Host. That would man 10,000 reads for large networks containing
+  10,000 hosts. To avoid this, we can track the HLCTimestamp of the StoragePoolState ConfigKey value that
+  provides the StoreId -> HostId mapping and the timestamp of the HostState that gives the connection information.
+  The gossip messages can include the HLCTimestamp of the transaction they used to successfully update those
+  objects. Thus, when receiving the message, the Hosts can look to see whether the new state provided in
+  the gossip message is newer than what it had previously. If so, apply the changes. If not, ignore the
+  message.
+
+- Add a NetworkCache class
+  - Abstract, pluggable interface
+  - Implementations:
+    - NoCache implementation - Always returns nothing
+      - Good for CLI where a local cache doesn't make sense
+    - RocksDB implementation (it's already a dependency)
+      - Good for Hosts
+        - use <host-root>/cache/network as the directory
+      - Also good for long-lived clients like AmoebaFS
+      - No explicit flushes on write
+        - it's a cache
+  - Used to reduce the number of network reads and speed things up
+  - Updated whenever the network updates its internal state
+    - From Gossip message
+    - From fallback network read
+  - Maps:
+    - StoreId -> HostId, timestamp
+    - HostId -> address,ports, timestamp
+
+- Need a slow-path to avoid reliance on gossip messages that can be missed for Store/Host changes.
+  - NetworkCachingService
+    - Runs every 24 hours
+    - Reads every host and every storage pool
+    - Outputs two zstd compressed DataObjects
+      - List: hostid,address,3ports,HostState object timestamp
+      - List: StoreId, HostId, timestamp of the StoragePoolState's ConfigKey key-value object
+    - Hosts read these objects every 24 hours (randomized throughout the day)
+    - Update any out-of-date connection state
+    - Add method to NetworkCache to do bulk updates given the content of those objects
+      - NoCache simply does nothing
+      - RocksDB can read the entire cache into memory at once rather than looking up each entry individually
+        (should be dramatically faster). Only update behind items
+
+- To further improve reliability of Gossip messages:
+  - Hosts retransmit their host/store state change gossip messages every 30 minutes for 24 hours
+    - Thus if a host was offline for the initial gossip, it can get one later
+    - minimal cost as these moves are relatively rare
+    - May want a <host-dir>/cache/retransmitting-gossip-messages.yaml file
+      - Read on startup so retransmits can be resumed after a process restart
+      - Not needed for correctness so loosing it is okay (hence cache directory)

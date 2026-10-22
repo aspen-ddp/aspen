@@ -1,0 +1,187 @@
+package org.aspen_ddp.aspen.common.network.implementations.quic
+
+import io.netty.buffer.{ByteBuf, ByteBufAllocator, PooledByteBufAllocator, Unpooled}
+import io.netty.channel.embedded.EmbeddedChannel
+import io.netty.util.ResourceLeakDetector
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
+import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.objects.*
+import org.aspen_ddp.aspen.common.paxos.ProposalId
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.*
+import org.scalatest.BeforeAndAfterAll
+import org.scalatest.funsuite.AnyFunSuite
+import org.scalatest.matchers.should.Matchers
+
+import java.util.UUID
+import scala.collection.mutable.ArrayBuffer
+
+class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll:
+
+  private val alloc: ByteBufAllocator = PooledByteBufAllocator.DEFAULT
+  private var previousLevel: ResourceLeakDetector.Level = scala.compiletime.uninitialized
+
+  override def beforeAll(): Unit =
+    previousLevel = ResourceLeakDetector.getLevel
+    ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID)
+
+  override def afterAll(): Unit =
+    ResourceLeakDetector.setLevel(previousLevel)
+
+  private def uuid(n: Int): UUID = new UUID(n.toLong << 32 | n.toLong, n.toLong)
+  private def storeId(n: Int): StoreId = StoreId(PoolId(uuid(n)), n.toByte)
+  private def dataPtr(n: Int): DataObjectPointer = DataObjectPointer(ObjectId(uuid(n)), PoolId(uuid(n + 100)), Array[Byte](n.toByte))
+  private def rev(n: Int): ObjectRevision = ObjectRevision(TransactionId(uuid(n)))
+  private def bytes(n: Int, seed: Int = 0): Array[Byte] = Array.tabulate[Byte](n)(i => (i * 7 + seed).toByte)
+  private def meta(n: Int) = Metadata(rev(n), ObjectRefcount(n, n + 1), HLCTimestamp(1000L + n))
+
+  private val ida: IDA = Replication(3, 2)
+  private def txd = TransactionDescription(
+    TransactionId(uuid(1)), HLCTimestamp(1000L), dataPtr(2), 1.toByte,
+    List(DataUpdate(dataPtr(4), rev(5), DataUpdateOperation.Overwrite)), Nil, None, Nil, Nil, ida,
+    Map(dataPtr(2).poolId -> ida))
+
+  private def prepare: TxPrepare =
+    val updates = (1 to 2).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(bytes(10 * i, i))))
+    val rebuilds = List(PreTransactionOpportunisticRebuild(ObjectId(uuid(8)), meta(8), DataBuffer(bytes(40))))
+    TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, rebuilds)
+
+  private def heartbeat = HostHeartbeat(HostId(uuid(1)))
+
+  private def frameBytes(m: Message): Array[Byte] =
+    val frame = QuicMessageCodec.encode(m, alloc).toStreamFrame(alloc)
+    val arr = new Array[Byte](frame.readableBytes())
+    frame.readBytes(arr)
+    frame.release()
+    arr
+
+  private class Harness:
+    val msgs = ArrayBuffer.empty[Message]
+    val errs = ArrayBuffer.empty[String]
+    val fed = ArrayBuffer.empty[ByteBuf]
+    val channel = new EmbeddedChannel(new StreamFrameDecoder(msgs += _, errs += _))
+
+    def feed(buf: ByteBuf): Unit =
+      fed += buf
+      channel.writeInbound(buf)
+
+    def feed(arr: Array[Byte], from: Int, until: Int): Unit =
+      feed(alloc.buffer(until - from).writeBytes(arr, from, until - from))
+
+    def finish(): Unit =
+      channel.finishAndReleaseAll()
+      fed.foreach(_.refCnt() shouldBe 0)
+
+  test("single whole frame dispatches one message"):
+    val h = new Harness
+    h.feed(frameBytes(prepare), 0, frameBytes(prepare).length)
+    h.msgs.toList shouldBe List(prepare)
+    h.errs shouldBe empty
+    h.finish()
+
+  test("two frames in one buffer dispatch two messages in order"):
+    val h = new Harness
+    val a = frameBytes(prepare) ++ frameBytes(heartbeat) ++ frameBytes(prepare)
+    h.feed(a, 0, a.length)
+    h.msgs.toList shouldBe List(prepare, heartbeat, prepare)
+    h.finish()
+
+  test("every split point of a TxPrepare frame decodes identically"):
+    val arr = frameBytes(prepare)
+    (0 to arr.length).foreach: k =>
+      val h = new Harness
+      h.feed(arr, 0, k)
+      h.feed(arr, k, arr.length)
+      withClue(s"split at $k: "):
+        h.msgs.toList shouldBe List(prepare)
+        h.errs shouldBe empty
+      h.finish()
+
+  test("one-byte-at-a-time delivery decodes"):
+    val arr = frameBytes(prepare) ++ frameBytes(heartbeat)
+    val h = new Harness
+    arr.indices.foreach(i => h.feed(arr, i, i + 1))
+    h.msgs.toList shouldBe List(prepare, heartbeat)
+    h.finish()
+
+  test("large payload arrives in many chunks"):
+    val size = 64 * 1024 * 1024
+    val payload = bytes(size, 3)
+    val m = StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(payload))
+    val frame = QuicMessageCodec.encode(m, alloc).toStreamFrame(alloc)
+    val h = new Harness
+    def used = PooledByteBufAllocator.DEFAULT.metric().usedHeapMemory() +
+      PooledByteBufAllocator.DEFAULT.metric().usedDirectMemory()
+    val baseline = used
+    var peak = 0L
+    val chunk = 64 * 1024
+    while frame.isReadable do
+      val c = alloc.buffer(chunk)
+      c.writeBytes(frame, Math.min(chunk, frame.readableBytes()))
+      h.feed(c)
+      peak = Math.max(peak, used - baseline)
+    frame.release()
+    peak should be < (4L * 1024 * 1024)
+    h.msgs.size shouldBe 1
+    val got = h.msgs.head.asInstanceOf[StoreTransferData]
+    got.data.size shouldBe size
+    java.util.Arrays.equals(got.data.getByteArray, payload) should be (true)
+    h.finish()
+
+  private def corrupt(mutate: Array[Byte] => Unit): Harness =
+    val arr = frameBytes(prepare)
+    mutate(arr)
+    val h = new Harness
+    h.feed(arr, 0, arr.length)
+    h
+
+  test("frameLen inconsistent with section sizes closes the stream"):
+    val h = corrupt(a => a(7) = (a(7) + 1).toByte)
+    h.errs.size shouldBe 1
+    h.channel.isOpen shouldBe false
+    h.msgs shouldBe empty
+    h.finish()
+
+  test("negative section length closes the stream"):
+    val arr = frameBytes(prepare)
+    // the last section length is the final u32 of the prefix: 12 + prefixLen - 4 - (sum of last-section bytes)
+    val prefixLen = java.nio.ByteBuffer.wrap(arr, 8, 4).getInt
+    val pos = 12 + prefixLen - 4
+    arr(pos) = 0x80.toByte
+    val h = new Harness
+    h.feed(arr, 0, arr.length)
+    h.errs.size shouldBe 1
+    h.channel.isOpen shouldBe false
+    h.msgs shouldBe empty
+    h.finish()
+
+  test("input after a protocol error is discarded and released"):
+    val h = corrupt(a => a(7) = (a(7) + 1).toByte)
+    val more = frameBytes(heartbeat)
+    val late = alloc.buffer(more.length).writeBytes(more)
+    h.fed += late
+    h.channel.pipeline().fireChannelRead(late) // writeInbound refuses a closed channel
+    h.errs.size shouldBe 1
+    h.msgs shouldBe empty
+    h.finish()
+
+  test("channelInactive mid-frame releases everything"):
+    val arr = frameBytes(prepare)
+    Seq(5, 20, arr.length - 3).foreach: k =>
+      val h = new Harness
+      h.feed(arr, 0, k)
+      h.channel.close()
+      h.finish()
+      h.msgs shouldBe empty
+
+  test("every inbound buffer is released"):
+    val h = new Harness
+    val arr = frameBytes(prepare) ++ frameBytes(heartbeat)
+    h.feed(arr, 0, 30)
+    h.feed(arr, 30, arr.length)
+    h.fed.foreach(_.refCnt() shouldBe 0)
+    h.msgs.size shouldBe 2
+    h.finish()

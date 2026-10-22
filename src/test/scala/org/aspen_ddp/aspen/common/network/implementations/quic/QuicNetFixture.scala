@@ -85,10 +85,25 @@ object QuicNetFixture:
     val (cert, key) = TestTLS.credentials(UUID.randomUUID())
     TlsCredentials.fromPem(TestTLS.caCertificatePem, cert, key)
 
+  /** Ports for test QuicNets come from 10000-19999: below Linux's ephemeral range (32768-60999), which every QuicNet's
+    * client channels and the OS draw from, and clear of `QuicEndToEndSuite`'s 20000-31999. A JVM-wide counter hands
+    * each port out once per JVM; the random start keeps concurrent JVMs apart.
+    */
+  private val PortBase = 10000
+  private val PortRange = 10000
+  private val nextPort = new java.util.concurrent.atomic.AtomicInteger(scala.util.Random.nextInt(PortRange))
+
+  /** The next port from the test range that a plain UDP socket (no `SO_REUSEPORT`) can bind, skipping busy ones */
   def freeUdpPort(): Int =
-    val s = new DatagramSocket(new InetSocketAddress(InetAddress.getLoopbackAddress, 0))
-    try s.getLocalPort
-    finally s.close()
+    var port = -1
+    while port < 0 do
+      val candidate = PortBase + Math.floorMod(nextPort.getAndIncrement(), PortRange)
+      try
+        val s = new DatagramSocket(new InetSocketAddress(candidate))
+        s.close()
+        port = candidate
+      catch case _: java.io.IOException => ()
+    port
 
   final class Node(val net: QuicNet, val handler: RecordingHandler)
 

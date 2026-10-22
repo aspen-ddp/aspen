@@ -166,6 +166,27 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     entry.connection.get() shouldBe null
     c.net.awaitPendingMessagesSent(Duration(1, SECONDS)) shouldBe true
 
+  test("a second host on a port in use fails clearly and leaves nothing behind"):
+    // Built on a thread of its own ThreadGroup: every thread the failed net starts inherits it, so the group's
+    // emptiness shows the failed net's loops and resolver are gone, regardless of other suites running alongside.
+    val tg = new ThreadGroup("second-host")
+    var thrown: Throwable = null
+    val body: Runnable = () =>
+      try fx.host(HostId(UUID.randomUUID()), fx.portA)
+      catch case e: Throwable => thrown = e
+    val t = new Thread(tg, body)
+    t.setDaemon(true)
+    t.start()
+    t.join(10000)
+    thrown shouldBe a [java.net.BindException]
+    thrown.getMessage shouldBe s"QUIC data port ${fx.portA} is already in use"
+    eventually("the failed net's threads have exited", 5000)(tg.activeCount() == 0)
+    // Host A is unaffected
+    val c = fx.client()
+    val req = read(fx.storesA.head, c.net.clientId)
+    c.net.clientMessenger.sendClientRequest(req)
+    await(fx.a.handler.clientRequests, 1).map(_.message) shouldBe List(req)
+
   test("flush does not wait for messages sent after it was called"):
     val c = fx.client()
     // Connect first, so the sender's messages are written rather than held for the handshake

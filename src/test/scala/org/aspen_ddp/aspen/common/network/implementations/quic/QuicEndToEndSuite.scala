@@ -49,10 +49,9 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
 
   /** Three distinct ports, each free for both UDP and TCP at the time of the call, for data, HTTP and store transfer.
     *
-    * Drawn from below Linux's default ephemeral range (32768-60999) rather than by binding port 0. Every other QUIC
-    * suite finds its ports by binding 0, and every QuicNet binds its client channels to 0, all from that range and
-    * possibly concurrently with this suite. Probing outside it keeps this suite from taking a port another suite has
-    * just probed, and from having its own taken by another suite's ephemeral bind.
+    * Drawn from 20000-31999, below Linux's default ephemeral range (32768-60999) rather than by binding port 0: every
+    * QuicNet binds its client channels to 0, from that range and possibly concurrently with this suite. The other
+    * QUIC suites draw from 10000-19999 (`QuicNetFixture.freeUdpPort`), so the two never overlap.
     */
   private def freePorts(): (Int, Int, Int) =
     val rng = new Random()

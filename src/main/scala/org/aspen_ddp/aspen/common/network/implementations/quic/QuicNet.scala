@@ -131,6 +131,25 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Runs `resolveHost` for host names. Threads are created on demand, so a stuck lookup blocks no other. */
   private val resolverPool: ExecutorService = Executors.newCachedThreadPool(DaemonThreads.factory("aspen-quic-resolve"))
 
+  /** Every datagram channel bound so far, so a failed construction can close them */
+  private val boundChannels = new java.util.concurrent.ConcurrentLinkedQueue[Channel]()
+
+  /** Runs one step of construction. If it throws, everything built since the group was created is torn down (bound
+    * channels closed, resolver stopped, group shut down and awaited) and the exception is rethrown. Every fallible
+    * step after the group's creation goes through this.
+    */
+  private def initOrAbort[T](body: => T): T =
+    try body
+    catch
+      case t: Throwable =>
+        try
+          boundChannels.forEach(ch => ch.close().awaitUninterruptibly(CloseAwaitMillis))
+          resolverPool.shutdownNow()
+          group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS).awaitUninterruptibly(CloseAwaitMillis * 2)
+        catch
+          case NonFatal(e) => t.addSuppressed(e)
+        throw t
+
   /** Set by `shutdown`; every send after that is a silent drop */
   @volatile private var shuttingDown = false
   private val shutdownStarted = new AtomicBoolean(false)
@@ -210,35 +229,49 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     if reusePort then
       // SO_REUSEPORT is declared on UnixChannelOption; EpollChannelOption only inherits it
       b.option(UnixChannelOption.SO_REUSEPORT, java.lang.Boolean.TRUE)
-    b.bind(address).sync().channel()
+    val ch = b.bind(address).sync().channel()
+    boundChannels.add(ch)
+    ch
 
-  private val (clientChannels, serverChannels): (Array[Channel], Array[Channel]) =
+  /** Fails unless `port` can be bound without `SO_REUSEPORT`, i.e. no other socket holds it. The server channels
+    * bind with `SO_REUSEPORT`, which would otherwise let a second process silently share a host's data port.
+    */
+  private def probeDataPort(port: Int): Unit =
+    val probe = java.nio.channels.DatagramChannel.open()
     try
-      val clientSsl = QuicTls.clientContext(tls)
-      val clients = loops.map: loop =>
-        val codec = config.applyTo(new QuicClientCodecBuilder(), idleTimeout).sslContext(clientSsl).build()
-        bind(loop, codec, new InetSocketAddress(0), reusePort = false)
-      val servers = ohost match
-        case None => Array.empty[Channel]
-        case Some((_, port)) =>
-          val serverSsl = QuicTls.serverContext(tls)
-          if useEpoll then
-            // One dispatcher shared by every SO_REUSEPORT channel, so packets reach the codec owning their connection
-            val dispatcher = new QuicCodecDispatcher():
-              override protected def initChannel(ch: Channel, localConnectionIdLength: Int,
-                                                 idGenerator: QuicConnectionIdGenerator): Unit =
-                ch.pipeline().addLast(serverCodecBuilder(serverSsl)
-                  .localConnectionIdLength(localConnectionIdLength)
-                  .connectionIdAddressGenerator(idGenerator)
-                  .build())
-            loops.map(loop => bind(loop, dispatcher, new InetSocketAddress(port), reusePort = true))
-          else
-            Array(bind(loops(0), serverCodecBuilder(serverSsl).build(), new InetSocketAddress(port), reusePort = false))
-      (clients, servers)
+      probe.setOption(java.net.StandardSocketOptions.SO_REUSEADDR, java.lang.Boolean.FALSE)
+      probe.bind(new InetSocketAddress(port))
     catch
-      case t: Throwable =>
-        group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS)
-        throw t
+      case e: java.io.IOException =>
+        val err = new java.net.BindException(s"QUIC data port $port is already in use")
+        err.initCause(e)
+        throw err
+    finally
+      probe.close()
+
+  private val (clientChannels, serverChannels): (Array[Channel], Array[Channel]) = initOrAbort:
+    ohost.foreach((_, port) => probeDataPort(port))
+    val clientSsl = QuicTls.clientContext(tls)
+    val clients = loops.map: loop =>
+      val codec = config.applyTo(new QuicClientCodecBuilder(), idleTimeout).sslContext(clientSsl).build()
+      bind(loop, codec, new InetSocketAddress(0), reusePort = false)
+    val servers = ohost match
+      case None => Array.empty[Channel]
+      case Some((_, port)) =>
+        val serverSsl = QuicTls.serverContext(tls)
+        if useEpoll then
+          // One dispatcher shared by every SO_REUSEPORT channel, so packets reach the codec owning their connection
+          val dispatcher = new QuicCodecDispatcher():
+            override protected def initChannel(ch: Channel, localConnectionIdLength: Int,
+                                               idGenerator: QuicConnectionIdGenerator): Unit =
+              ch.pipeline().addLast(serverCodecBuilder(serverSsl)
+                .localConnectionIdLength(localConnectionIdLength)
+                .connectionIdAddressGenerator(idGenerator)
+                .build())
+          loops.map(loop => bind(loop, dispatcher, new InetSocketAddress(port), reusePort = true))
+        else
+          Array(bind(loops(0), serverCodecBuilder(serverSsl).build(), new InetSocketAddress(port), reusePort = false))
+    (clients, servers)
 
   // ---- MetadataManager -----------------------------------------------------------------------------------------
 
@@ -259,10 +292,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     def storeResolved(hostEntry: QuicHostEntry, storeId: StoreId, queuedMessages: EvictingQueue[Message]): Unit =
       sendQueued(hostEntry, queuedMessages)
 
-  val metadataManager: MetadataManager[QuicHostEntry] =
+  val metadataManager: MetadataManager[QuicHostEntry] = initOrAbort:
     new MetadataManager[QuicHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl)
 
-  private val livenessTask: NFuture[?] =
+  private val livenessTask: NFuture[?] = initOrAbort:
     val ms = math.max(1L, heartbeatPeriod.toMillis)
     loops(0).scheduleAtFixedRate((() => livenessTick()): Runnable, ms, ms, TimeUnit.MILLISECONDS)
 

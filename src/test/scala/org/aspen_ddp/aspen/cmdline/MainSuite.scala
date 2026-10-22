@@ -47,6 +47,18 @@ class MainSuite extends AnyFunSuite with Matchers:
         FileVisitResult.CONTINUE
     )
 
+  test("quicConfigFor gives client commands one event loop and hosts the default"):
+    Main.quicConfigFor(None).eventLoopThreads shouldBe 1
+    Main.quicConfigFor(Some((HostId(UUID.randomUUID()), 5000))) shouldBe
+      org.aspen_ddp.aspen.common.network.implementations.quic.QuicConfig()
+
+  test("requireQuic reports unavailable QUIC as a ConfigError suggesting zmq"):
+    noException should be thrownBy Main.requireQuic(true, fail("cause must not be evaluated"))
+    val e = intercept[Main.ConfigError](Main.requireQuic(false, new UnsatisfiedLinkError("no quiche")))
+    e.getMessage should include("QUIC is not available")
+    e.getMessage should include("no quiche")
+    e.getMessage should include("--network zmq")
+
   test("formatBytes renders sub-KiB values as integer bytes"):
     Main.formatBytes(0L) shouldBe "0 B"
     Main.formatBytes(512L) shouldBe "512 B"

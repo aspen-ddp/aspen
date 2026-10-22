@@ -101,6 +101,7 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
         val (client, network, _) = Main.createAspenClient(session)
         try
           network shouldBe a [QuicNet]
+          network.asInstanceOf[QuicNet].eventLoopsForTests.size shouldBe 1 // a client command's single loop
           network.startIoThread(client)
           fn(client)
         finally

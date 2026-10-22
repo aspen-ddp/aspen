@@ -32,7 +32,12 @@ lazy val root = (project in file(".")).
       "org.bouncycastle"                 %  "bcprov-jdk18on"          % "1.80",
       "org.bouncycastle"                 %  "bcpkix-jdk18on"          % "1.80",
       "io.netty"                         %  "netty-codec-classes-quic" % "4.2.19.Final",
-      "io.netty"                         %  "netty-codec-native-quic" % "4.2.19.Final" classifier "linux-x86_64",
+      // Native QUIC for every platform it is published for except Windows; Quic.isAvailable is false elsewhere
+      "io.netty"                         %  "netty-codec-native-quic" % "4.2.19.Final" classifier "linux-x86_64"
+                                                                                       classifier "linux-aarch_64"
+                                                                                       classifier "osx-x86_64"
+                                                                                       classifier "osx-aarch_64",
+      // Linux only: QuicNet falls back to NIO without it
       "io.netty"                         %  "netty-transport-native-epoll" % "4.2.19.Final" classifier "linux-x86_64",
     ),
 

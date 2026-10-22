@@ -12,7 +12,8 @@ import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
-import org.aspen_ddp.aspen.common.network.implementations.quic.{QuicNet, TlsCredentials}
+import io.netty.handler.codec.quic.Quic
+import org.aspen_ddp.aspen.common.network.implementations.quic.{QuicConfig, QuicNet, TlsCredentials}
 import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, SecretFile}
@@ -891,6 +892,18 @@ object Main {
       case "reed-solomon" => ReedSolomon(args.width, args.readThreshold, args.writeThreshold)
       case _ => throw new Exception(s"Invalid IDA type: ${args.idaType}")
 
+  /** QUIC settings for a host (`ohost` defined) or a client command. A client command gets a single event loop. */
+  def quicConfigFor(ohost: Option[(HostId, Int)]): QuicConfig =
+    if ohost.isEmpty then
+      QuicConfig(eventLoopThreads = 1)
+    else
+      QuicConfig()
+
+  /** Fails with a ConfigError suggesting `--network zmq` when native QUIC cannot load on this platform */
+  def requireQuic(available: Boolean, cause: => Throwable): Unit =
+    if !available then
+      throw ConfigError(s"QUIC is not available on this platform ($cause); use --network zmq instead")
+
   def createNetwork(bootstrapConfig: BootstrapConfig.Config,
                     onRefresh: (String, BootstrapConfig.Config) => Unit,
                     ohost: Option[(HostId, Int)],
@@ -900,7 +913,9 @@ object Main {
 
     val heartbeatPeriod = Duration(10, SECONDS)
     val net: NetworkPlugin = networkKind match
-      case NetworkKind.Quic => new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls)
+      case NetworkKind.Quic =>
+        requireQuic(Quic.isAvailable, Quic.unavailabilityCause())
+        new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls, quicConfigFor(ohost))
       // ZMQ connections are unauthenticated, so the credentials go unused.
       case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
     onetwork = Some(net)

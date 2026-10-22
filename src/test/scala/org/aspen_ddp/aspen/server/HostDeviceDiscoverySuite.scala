@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
-import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StartStoreTransfer}
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StartStoreTransfer, StoreMoved}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -878,6 +878,32 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       poolState.stores(movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
       host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
       Files.exists(arrived) should be(true)
+
+  atest("a committed transfer broadcasts StoreMoved"):
+    given ExecutionContext = executionContext
+
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
+      _ = net.takeCapturedGossip()
+      _ = transfers.finishTransferIn(movingStore)
+      _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
+      _ <- pumpUntil(net.capturedGossip.contains(StoreMoved(movingStore)))
+    yield
+      host.transferOutcomes.get(movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      net.takeCapturedGossip() should be(List(StoreMoved(movingStore)))
 
   /** A host owning the transfer destination, with the receiving half of a transfer of
    *  `movingStore` already begun through the device check, exactly as the two tests above

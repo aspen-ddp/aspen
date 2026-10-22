@@ -1300,6 +1300,9 @@ object Main {
 
     host.start()
 
+    // Not awaited: a failed check retries in the background and must never keep the host down.
+    host.reconcileEndpoint(hostCfg.address, hostCfg.dataPort, hostCfg.httpPort, hostCfg.storeTransferPort)
+
     // Test-only teardown, in dependency order: stop traffic, close the stores while the host's
     // event loop and the CRL can still service the close, then stop the threads they ran on.
     // Each step is attempted even if an earlier one failed.

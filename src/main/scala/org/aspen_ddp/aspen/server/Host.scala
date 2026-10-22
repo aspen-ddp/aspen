@@ -574,6 +574,10 @@ class Host(val client: AspenClient,
               RebalancingMessage.encode(
                 TransferComplete(toDev.storageDeviceSet, storeId, fromDeviceId, toDeviceid)))
 
+            // Tell every other host (and client) that the cached address for this store is
+            // stale. Sent only on this branch: the other outcomes did not repoint the pool.
+            net.broadcastGossip(StoreMoved(storeId))
+
           TransferOutcome.PoolRepointed
 
         else
@@ -581,6 +585,50 @@ class Host(val client: AspenClient,
           // repointed the pool at the destination. The destination owns the arrived copy either
           // way, so this is the same outcome -- just reached by somebody else.
           TransferOutcome.PoolRepointed
+
+  /** Makes this host's HostState endpoint match the configured one, gossiping
+   *  HostEndpointChanged once the change has committed.
+   *
+   *  Completes false, with no transaction, when the stored endpoint already matches. Completes
+   *  true after a committed update. A failure is logged and retried every 5 seconds in the
+   *  background; the returned Future reflects only the first attempt, so callers must not
+   *  depend on it to start the host.
+   */
+  def reconcileEndpoint(address: String,
+                        dataPort: Int,
+                        httpPort: Int,
+                        storeTransferPort: Int): Future[Boolean] =
+    def attempt(): Future[Boolean] =
+      client.getHostState(hostId).flatMap: hs =>
+        if hs.address == address && hs.dataPort == dataPort &&
+           hs.httpPort == httpPort && hs.storeTransferPort == storeTransferPort then
+          Future.successful(false)
+        else
+          client.transactUntilSuccessful: tx =>
+            for
+              hostPtr <- client.getHostPointer(hostId)
+              kvos <- client.read(hostPtr)
+            yield
+              val current = HostState(kvos)
+              tx.update(hostPtr, None, None,
+                List(KeyRevision(HostState.StateKey, kvos.contents(HostState.StateKey).revision)),
+                List(Insert(HostState.StateKey,
+                  current.copy(address = address, dataPort = dataPort, httpPort = httpPort,
+                               storeTransferPort = storeTransferPort).encode())))
+          .map: _ =>
+            logger.info(s"Host endpoint updated to $address:$dataPort")
+            net.broadcastGossip(HostEndpointChanged(hostId))
+            true
+
+    val first = attempt()
+    first.failed.foreach: err =>
+      logger.warn(s"Failed to reconcile host endpoint, retrying in 5 seconds: $err")
+      def retry(): Unit =
+        attempt().failed.foreach: e =>
+          logger.warn(s"Failed to reconcile host endpoint, retrying in 5 seconds: $e")
+          backgroundTasks.schedule(Duration(5, SECONDS))(retry())
+      backgroundTasks.schedule(Duration(5, SECONDS))(retry())
+    first
 
   /** Reclaims the store copy a transfer just delivered onto a device that turned out to be
    *  tombstoned.

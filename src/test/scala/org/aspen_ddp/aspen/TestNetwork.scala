@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, HostMessage, ReadResponse, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Gossip, HostMessage, ReadResponse, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
@@ -115,6 +115,7 @@ class TestNetwork(executionContext: ExecutionContext,
 
   var handleDepth = 0
   var capturedHostMessages: List[HostMessage] = Nil
+  var capturedGossip: List[Gossip] = Nil
 
   val bootstrapSD = StorageDeviceState(
     storageDeviceId,
@@ -283,6 +284,15 @@ class TestNetwork(executionContext: ExecutionContext,
                        (sid, entry.transferDevice.get, ds.storageDeviceId)
       _ <- Future.sequence(inFlight.map((sid, from, to) => simulateTransferComplete(sid, from, to)))
     yield inFlight.size
+
+  override def broadcastGossip(g: Gossip): Unit = synchronized:
+    capturedGossip = capturedGossip :+ g
+
+  /** Remove and return all gossip broadcast so far. */
+  def takeCapturedGossip(): List[Gossip] = synchronized:
+    val gs = capturedGossip
+    capturedGossip = Nil
+    gs
 
   /** Remove and return all currently-captured host messages (best-effort delivery is the
    *  caller's job). Mirrors how transfer tests inspect capturedHostMessages, but drains. */

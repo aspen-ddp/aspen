@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.transfer
 import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.implementations.quic.TlsCredentials
-import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, TLSContext}
+import org.aspen_ddp.aspen.common.network.tls.{AspenTrustManager, CertificateAuthority, TLSContext}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.scalatest.BeforeAndAfterEach
@@ -15,7 +15,8 @@ import org.scalatest.time.{Seconds, Span}
 import java.io.InputStream
 import java.net.{InetSocketAddress, ServerSocket, SocketException}
 import java.util.UUID
-import javax.net.ssl.{SSLException, SSLServerSocket, SSLSocket}
+import java.security.KeyStore
+import javax.net.ssl.{KeyManagerFactory, SSLContext, SSLException, SSLServerSocket, SSLSocket}
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.{Await, Future}
 import scala.concurrent.duration.*
@@ -64,6 +65,59 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
 
   private def connect(m: StoreTransferManager): SSLSocket = rawSender(m.boundPort, credsFrom(TestTLS.ca))
 
+  /** Credentials issued by a CA that is not the test system's */
+  private def foreignCreds(): TlsCredentials = credsFrom(CertificateAuthority.create(UUID.randomUUID()))
+
+  /** Trusts the test CA, so any failure is the server rejecting this client, but presents `creds`'
+   *  certificate, or none at all */
+  private def clientContext(creds: Option[TlsCredentials]): SSLContext =
+    val keyManagers = creds.map: c =>
+      val password = Array.emptyCharArray
+      val ks = KeyStore.getInstance("PKCS12")
+      ks.load(null, null)
+      ks.setKeyEntry("aspen", c.privateKey, password, Array(c.certificate, c.caCertificate))
+      val kmf = KeyManagerFactory.getInstance("PKIX")
+      kmf.init(ks, password)
+      kmf.getKeyManagers
+    val ctx = SSLContext.getInstance("TLSv1.3")
+    ctx.init(keyManagers.orNull, Array(new AspenTrustManager(TestTLS.ca.certificate)), null)
+    ctx
+
+  /** Sends a complete, valid transfer of `archive` for (`sid`, `u`) using `ctx`. True if the server
+   *  rejected the connection: the handshake or a write failed, or the server closed without
+   *  reading it. Under TLS 1.3 a rejected client certificate surfaces only after the client's
+   *  handshake has returned, so every step is attempted. */
+  private def rejectedSending(ctx: SSLContext, port: Int, sid: StoreId, u: UUID): Boolean =
+    Try {
+      val s = ctx.getSocketFactory.createSocket("127.0.0.1", port).asInstanceOf[SSLSocket]
+      sockets += s
+      s.setSoTimeout(5000)
+      s.startHandshake()
+      send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+      s.shutdownOutput()
+      isClosedByPeer(s)
+    }.getOrElse(true)
+
+  /** A client with an untrusted (or no) certificate must not complete a registered transfer, and
+   *  must not disturb it: the legitimate sender that follows succeeds. */
+  private def assertRejectsClient(creds: Option[TlsCredentials]): Unit =
+    val m = newManager()
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val f = m.beginTransferIn(sid, u, dest)
+
+    rejectedSending(clientContext(creds), m.boundPort, sid, u) should be(true)
+    Thread.sleep(500)
+    f.isCompleted should be(false)
+    os.exists(dest / sid.directoryName) should be(false)
+
+    val s = connect(m)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+    s.close()
+    await(f).isSuccess should be(true)
+    assertExtracted(dest / sid.directoryName)
+
   private val bigFile: Array[Byte] =
     val arr = new Array[Byte](3 * 1024 * 1024)
     new Random(42).nextBytes(arr)
@@ -90,13 +144,13 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     os.write(dir / "big", arr)
     dir
 
-  /** Mutual-TLS listener that records each connection's header and then never reads again */
-  private class RecordingServer:
+  /** TLS listener that records each connection's header and then never reads again. Mutual TLS
+   *  unless `needClientAuth` is false. */
+  private class RecordingServer(creds: TlsCredentials = credsFrom(TestTLS.ca), needClientAuth: Boolean = true):
     private val ss =
-      val creds = credsFrom(TestTLS.ca)
       val sctx = TLSContext.create(creds.caCertificate, creds.certificate, creds.privateKey)
       val s = sctx.getServerSocketFactory.createServerSocket().asInstanceOf[SSLServerSocket]
-      s.setNeedClientAuth(true)
+      s.setNeedClientAuth(needClientAuth)
       s.bind(new InetSocketAddress("127.0.0.1", 0))
       s
     private var conns = Vector.empty[(SSLSocket, Option[(StoreId, UUID)])]
@@ -445,3 +499,38 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     a.beginTransferOut(sid, u, src, "127.0.0.1", b.boundPort, ts1)
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
+
+  test("client certificate from a foreign CA is rejected"):
+    assertRejectsClient(Some(foreignCreds()))
+
+  test("client presenting no certificate is rejected"):
+    assertRejectsClient(None)
+
+  test("transfer out to a server with a foreign-CA certificate fails"):
+    val a = newManager()
+    // Does not ask for a client certificate, so only the sender's check of the server's can stop it
+    val r = new RecordingServer(foreignCreds(), needClientAuth = false)
+    servers += r
+    val src = tempDir()
+    mkTree(src)
+    val sid = newStoreId()
+    a.beginTransferOut(sid, UUID.randomUUID(), src, "127.0.0.1", r.port, HLCTimestamp.now)
+    eventually { a.isTransferringOut(sid) should be(false) }
+    Thread.sleep(500)
+    r.headers should be(empty)
+
+  test("archiver exiting non-zero sends no trailer"):
+    val a = newManager()
+    val b = newManager()
+    val src = tempDir()
+    mkTree(src)
+    // `jar --create` exits 1 on a symlink whose target does not exist
+    os.symlink(src / "dangling", src / "no-such-target")
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val dest = tempDir()
+    val f = b.beginTransferIn(sid, u, dest)
+    a.beginTransferOut(sid, u, src, "127.0.0.1", b.boundPort, HLCTimestamp.now)
+    await(f).isFailure should be(true)
+    os.exists(dest / sid.directoryName) should be(false)
+    eventually { a.isTransferringOut(sid) should be(false) }

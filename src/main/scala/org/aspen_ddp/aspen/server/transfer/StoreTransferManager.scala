@@ -250,21 +250,36 @@ class StoreTransferManager(port: Int,
       if p.isAlive() then
         p.destroy()
 
+  /** Never throws: a throw out of a scheduleAtFixedRate task silently cancels every later run, which
+   *  would leave outbound attempts with no send timeout at all. */
   private def checkProgress(): Unit =
-    val now = System.nanoTime()
-    val stalled = synchronized(active.values.filter(o => now - o.lastProgress > ioTimeout.toNanos).toList)
-    stalled.foreach(abortOutbound(_, s"no write progress for $ioTimeout"))
-
-  private def acceptLoop(): Unit =
     try
-      while true do
-        val sock = serverSocket.accept().asInstanceOf[SSLSocket]
-        val t = new Thread(() => handleIncoming(sock), s"store-transfer-in-${sock.getRemoteSocketAddress}")
-        t.setDaemon(true)
-        t.start()
+      val now = System.nanoTime()
+      val stalled = synchronized(active.values.filter(o => now - o.lastProgress > ioTimeout.toNanos).toList)
+      stalled.foreach(abortOutbound(_, s"no write progress for $ioTimeout"))
     catch
-      case _: SocketException if serverSocket.isClosed => ()
-      case t: Throwable => logger.error(s"Store transfer accept loop on port $boundPort died: $t")
+      case t: Throwable => logger.error(s"Store transfer watchdog on port $boundPort failed a progress check: $t")
+
+  /** Runs until the server socket is closed. Any other failure, such as a transient EMFILE from
+   *  accept(), is logged and the loop carries on after a short pause: the socket stays bound, so
+   *  exiting would leave senders connecting to a port nobody serves. */
+  private def acceptLoop(): Unit =
+    while !serverSocket.isClosed do
+      try
+        val sock = serverSocket.accept().asInstanceOf[SSLSocket]
+        try
+          val t = new Thread(() => handleIncoming(sock), s"store-transfer-in-${sock.getRemoteSocketAddress}")
+          t.setDaemon(true)
+          t.start()
+        catch
+          case t: Throwable =>
+            closeQuietly(sock)
+            throw t
+      catch
+        case _: SocketException if serverSocket.isClosed => ()
+        case t: Throwable =>
+          logger.error(s"Store transfer accept loop on port $boundPort failed; continuing: $t")
+          try Thread.sleep(100) catch case _: InterruptedException => ()
 
   private def closeQuietly(sock: SSLSocket): Unit =
     try sock.close() catch case _: Throwable => ()

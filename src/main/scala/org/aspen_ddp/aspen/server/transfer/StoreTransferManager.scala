@@ -8,9 +8,10 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import scribe.Logging
 
 import java.io.InputStream
-import java.net.{InetSocketAddress, SocketException}
+import java.net.{InetSocketAddress, Socket, SocketException}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
+import java.util.concurrent.{Executors, ScheduledExecutorService, TimeUnit}
 import javax.net.ssl.{SSLServerSocket, SSLSocket}
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.*
@@ -48,6 +49,14 @@ object StoreTransferManager:
     var extractor: Option[os.SubProcess] = None
     var done: Boolean = false
 
+  /** One transfer-out attempt. `socket`, `process` and `abortCause` are guarded by the owning
+   *  manager's lock; `lastProgress` (System.nanoTime) is read by the watchdog. */
+  private class Outbound(val transferUUID: UUID, val timestamp: HLCTimestamp):
+    @volatile var lastProgress: Long = System.nanoTime()
+    var socket: Option[Socket] = None
+    var process: Option[os.SubProcess] = None
+    var abortCause: Option[String] = None
+
 /** Sends and receives whole store directories as `jar` archives over one mutual-TLS TCP
  *  connection per transfer attempt.
  *
@@ -80,7 +89,22 @@ class StoreTransferManager(port: Int,
   private val directoryLock = new Object
   private var directoryOwners: Map[os.Path, Registration] = Map()
 
+  /** The current transfer-out attempt per store */
+  private var active: Map[StoreId, Outbound] = Map()
+
+  /** Newest transfer-out timestamp seen per store. Kept after the attempt ends so that a
+   *  retransmitted request cannot start a second send. */
+  private var lastTimestamp: Map[StoreId, HLCTimestamp] = Map()
+
   def boundPort: Int = serverSocket.getLocalPort
+
+  /** Closes the connection of any outbound attempt that has made no write progress within ioTimeout */
+  private val watchdog: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor: r =>
+    val t = new Thread(r, s"store-transfer-watchdog-$boundPort")
+    t.setDaemon(true)
+    t
+  private val watchdogPeriod = math.max(1L, ioTimeout.toMillis / 4)
+  watchdog.scheduleAtFixedRate(() => checkProgress(), watchdogPeriod, watchdogPeriod, TimeUnit.MILLISECONDS)
 
   private val acceptThread = new Thread(() => acceptLoop(), s"store-transfer-accept-$boundPort")
   acceptThread.setDaemon(true)
@@ -89,12 +113,14 @@ class StoreTransferManager(port: Int,
   /** Tests only: closes the server socket and aborts live transfers */
   def close(): Unit =
     try serverSocket.close() catch case _: Throwable => ()
-    val regs = synchronized:
+    watchdog.shutdownNow()
+    val (regs, outs) = synchronized:
       val live = registrations.toList.filter((_, reg) => !reg.done)
       live.foreach((_, reg) => reg.done = true)
       registrations = Map()
-      live
+      (live, active.values.toList)
     regs.foreach((storeId, reg) => abort(storeId, reg, "transfer manager closed"))
+    outs.foreach(abortOutbound(_, "transfer manager closed"))
 
   def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
     val reg = new Registration(transferUUID, destinationDirectory, Promise())
@@ -107,12 +133,116 @@ class StoreTransferManager(port: Int,
     logger.info(s"Awaiting transfer in of store $storeId, transfer $transferUUID")
     reg.promise.future
 
+  /** Starts sending `sourceDirectory` unless a request with the same or a newer timestamp has already
+   *  been seen for this store. A newer request aborts the active attempt for the store. */
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
-                       destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit = ???
+                       destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
+    val out = new Outbound(transferUUID, timestamp)
+    val (started, previous) = synchronized:
+      if lastTimestamp.get(storeId).exists(_ >= timestamp) then
+        (false, None)
+      else
+        lastTimestamp += storeId -> timestamp
+        val prev = active.get(storeId)
+        active += storeId -> out
+        (true, prev)
 
-  def isTransferringOut(storeId: StoreId): Boolean = ???
+    if !started then
+      logger.debug(s"Ignoring transfer out of store $storeId, transfer $transferUUID: not newer than the last request")
+    else
+      previous.foreach(p => abortOutbound(p, s"superseded by transfer $transferUUID"))
+      val t = new Thread(() => send(storeId, out, sourceDirectory, destHost, destPort), s"store-transfer-out-$storeId")
+      t.setDaemon(true)
+      t.start()
 
-  def transferringOutStores: Set[StoreId] = ???
+  def isTransferringOut(storeId: StoreId): Boolean = synchronized(active.contains(storeId))
+
+  def transferringOutStores: Set[StoreId] = synchronized(active.keySet)
+
+  private def send(storeId: StoreId, out: Outbound, sourceDirectory: os.Path, host: String, port: Int): Unit =
+    val raw = new Socket()
+    try
+      out.lastProgress = System.nanoTime()
+      if !attach(out, raw) then
+        throw new Exception("aborted before connecting")
+      raw.connect(new InetSocketAddress(host, port), ioTimeout.toMillis.toInt)
+      val sock = sslContext.getSocketFactory.createSocket(raw, host, port, true).asInstanceOf[SSLSocket]
+      sock.startHandshake()
+      val sockOut = sock.getOutputStream
+
+      def write(arr: Array[Byte], len: Int): Unit =
+        sockOut.write(arr, 0, len)
+        out.lastProgress = System.nanoTime()
+
+      write(encodeHeader(storeId, out.transferUUID), HeaderSize)
+
+      // os.spawn leaks a throwing shutdown hook if the process cannot start, so check the cwd first
+      if !os.isDir(sourceDirectory) then
+        throw new Exception(s"source directory $sourceDirectory does not exist")
+      val p = os.spawn(cmd = ("jar", "--create", "--no-manifest", "."), cwd = sourceDirectory, stderr = os.Pipe)
+      if !attach(out, p) then
+        throw new Exception("aborted before archiving")
+      logger.info(s"Sending store $storeId, transfer ${out.transferUUID}, to $host:$port")
+
+      val buf = new Array[Byte](chunkSize)
+      var n = p.stdout.read(buf)
+      while n != -1 do
+        if n > 0 then
+          write(buf, n)
+        n = p.stdout.read(buf)
+
+      p.waitFor()
+      val exitCode = p.exitCode()
+      if exitCode != 0 then
+        // No trailer, so the receiver rejects what it got
+        logger.warn(s"Transfer out of store $storeId, transfer ${out.transferUUID}, failed: archiver exited " +
+          s"with code $exitCode: ${p.stderr.text().trim}")
+      else
+        val trailer = storeId.toBytes
+        write(trailer, trailer.length)
+        sockOut.flush()
+        sock.close()
+        logger.info(s"Sent store $storeId, transfer ${out.transferUUID}")
+    catch
+      case t: Throwable =>
+        val cause = synchronized(out.abortCause).getOrElse(t.toString)
+        logger.warn(s"Transfer out of store $storeId, transfer ${out.transferUUID}, failed: $cause")
+    finally
+      synchronized:
+        out.process.foreach: p =>
+          if p.isAlive() then
+            p.destroy()
+        if active.get(storeId).exists(_ eq out) then
+          active -= storeId
+      try raw.close() catch case _: Throwable => ()
+
+  /** Records the attempt's socket so it can be aborted. False if the attempt was already aborted. */
+  private def attach(out: Outbound, sock: Socket): Boolean = synchronized:
+    if out.abortCause.isEmpty then
+      out.socket = Some(sock)
+    out.abortCause.isEmpty
+
+  /** Records the attempt's archiver so it can be aborted. False if the attempt was already aborted. */
+  private def attach(out: Outbound, p: os.SubProcess): Boolean = synchronized:
+    out.process = Some(p)
+    out.abortCause.isEmpty
+
+  /** Unblocks the attempt's thread by closing its connection and destroying its archiver. The
+   *  thread then logs the failure and drops its `active` entry. */
+  private def abortOutbound(out: Outbound, cause: String): Unit =
+    val (sock, process) = synchronized:
+      if out.abortCause.isEmpty then
+        out.abortCause = Some(cause)
+      (out.socket, out.process)
+    sock.foreach(s => try s.close() catch case _: Throwable => ())
+    process.foreach: p =>
+      if p.isAlive() then
+        p.destroy()
+
+  private def checkProgress(): Unit =
+    val now = System.nanoTime()
+    val stalled = synchronized(active.values.filter(o => now - o.lastProgress > ioTimeout.toNanos).toList)
+    stalled.foreach(abortOutbound(_, s"no write progress for $ioTimeout"))
 
   private def acceptLoop(): Unit =
     try

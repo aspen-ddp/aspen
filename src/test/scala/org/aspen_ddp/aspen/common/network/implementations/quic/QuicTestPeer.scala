@@ -30,7 +30,8 @@ import scala.concurrent.duration.{Duration, SECONDS}
   *  - `connections`: every `QuicChannel` whose handshake succeeded.
   *
   * `stallStreams = true` sets `autoRead = false` on inbound streams, so nothing is read from them and QUIC flow
-  * control fills. `config` overrides any `QuicConfig` setting; `idle` is the QUIC idle timeout used for both codecs
+  * control fills. `unstallStreams()` resumes them. `inboundStreams` records every inbound stream channel.
+  * `config` overrides any `QuicConfig` setting; `idle` is the QUIC idle timeout used for both codecs
   * (`config.idleTimeout`, else `DefaultIdle`).
   *
   * Sending helpers (`sendDatagram`, `sendStream`) work on any `QuicChannel`, including ones dialed by other code.
@@ -40,13 +41,17 @@ import scala.concurrent.duration.{Duration, SECONDS}
 final class QuicTestPeer private (val isServer: Boolean,
                                   sslContext: QuicSslContext,
                                   val config: QuicConfig,
-                                  val stallStreams: Boolean):
+                                  initialStall: Boolean):
   import QuicTestPeer.*
 
   val received: LinkedBlockingQueue[Received] = new LinkedBlockingQueue[Received]()
   val handshakes: LinkedBlockingQueue[HandshakeOutcome] = new LinkedBlockingQueue[HandshakeOutcome]()
   val protocolErrors: ConcurrentLinkedQueue[String] = new ConcurrentLinkedQueue[String]()
   val connections: ConcurrentLinkedQueue[QuicChannel] = new ConcurrentLinkedQueue[QuicChannel]()
+  val inboundStreams: ConcurrentLinkedQueue[QuicStreamChannel] = new ConcurrentLinkedQueue[QuicStreamChannel]()
+
+  /** Applies to streams opened after it is set; use `unstallStreams()` to resume streams already stalled */
+  @volatile var stallStreams: Boolean = initialStall
 
   val idle: Duration = config.idleTimeout.getOrElse(DefaultIdle)
 
@@ -107,12 +112,19 @@ final class QuicTestPeer private (val isServer: Boolean,
   /** Installs a `StreamFrameDecoder` (recording into `received`) on each inbound stream */
   def inboundStreamInitializer: ChannelHandler = new ChannelInitializer[QuicStreamChannel]:
     override def initChannel(ch: QuicStreamChannel): Unit =
+      inboundStreams.add(ch)
       if stallStreams then
         ch.config().setAutoRead(false)
       val id = ch.streamId()
       ch.pipeline().addLast(new StreamFrameDecoder(
         m => received.add(Received(m, Transport.Stream(id))),
         err => protocolErrors.add(err)))
+
+  /** Stops stalling: new inbound streams read normally and every stalled stream resumes reading */
+  def unstallStreams(): Unit =
+    stallStreams = false
+    inboundStreams.forEach: ch =>
+      ch.eventLoop().execute(() => ch.config().setAutoRead(true))
 
   /** A client bootstrap to `remote` with this peer's codec settings and recording handlers. Client peers only. */
   def bootstrap(remote: InetSocketAddress): QuicChannelBootstrap =

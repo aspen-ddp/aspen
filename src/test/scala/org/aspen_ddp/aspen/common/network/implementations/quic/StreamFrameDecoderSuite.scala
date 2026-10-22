@@ -112,15 +112,17 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     val size = 64 * 1024 * 1024
     val payload = bytes(size, 3)
     val m = StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(payload))
-    val frame = QuicMessageCodec.encode(m, alloc).toStreamFrame(alloc)
+    // A private allocator, so suites running in parallel don't show up in the peak
+    val local = new PooledByteBufAllocator(true)
+    val frame = QuicMessageCodec.encode(m, local).toStreamFrame(local)
     val h = new Harness
-    def used = PooledByteBufAllocator.DEFAULT.metric().usedHeapMemory() +
-      PooledByteBufAllocator.DEFAULT.metric().usedDirectMemory()
+    h.channel.config().setAllocator(local)
+    def used = local.metric().usedHeapMemory() + local.metric().usedDirectMemory()
     val baseline = used
     var peak = 0L
     val chunk = 64 * 1024
     while frame.isReadable do
-      val c = alloc.buffer(chunk)
+      val c = local.buffer(chunk)
       c.writeBytes(frame, Math.min(chunk, frame.readableBytes()))
       h.feed(c)
       peak = Math.max(peak, used - baseline)

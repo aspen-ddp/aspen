@@ -1,8 +1,10 @@
 package org.aspen_ddp.aspen.common.network.implementations.quic
 
-import org.aspen_ddp.aspen.TestTLS
+import org.aspen_ddp.aspen.{TestNetwork, TestTLS}
+import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
+import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -13,14 +15,18 @@ import org.aspen_ddp.aspen.common.store.StoreId
 
 import java.net.{DatagramSocket, InetAddress, InetSocketAddress}
 import java.util.UUID
-import java.util.concurrent.{LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.{ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue, TimeUnit}
 import scala.collection.mutable.ArrayBuffer
+import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 /** Two host-mode `QuicNet`s on loopback sharing a bootstrap config, plus any number of client-mode nets.
   *
   * Host A owns bootstrap stores 0 and 1, host B owns 2 and 3. Every net gets fresh credentials from `TestTLS` and a
   * `RecordingHandler`. `close()` tears down every net it created, including restarted and extra ones.
+  *
+  * Every host-mode net looks hosts up in `directory`, as a real host reads host objects through its `AspenClient`.
+  * It holds A and B; a test adding a host, or moving one, puts its state there. Client-mode nets get no lookup client.
   */
 final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipConfig.ForTests),
                            val heartbeatPeriod: Duration = Duration(500, MILLISECONDS)):
@@ -42,6 +48,11 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipCo
       BootstrapConfig.BootstrapHost(hostIdB, "host_b", "127.0.0.1", portB, 0, 0, storesB)),
     TestTLS.caCertificatePem)
 
+  /** The host objects host-mode nets resolve hosts from */
+  val directory: HostDirectory = new HostDirectory
+  directory.put(HostState(hostIdA, "host_a", "127.0.0.1", portA, 0, 0, Set()))
+  directory.put(HostState(hostIdB, "host_b", "127.0.0.1", portB, 0, 0, Set()))
+
   private val nets = ArrayBuffer.empty[QuicNet]
 
   var a: Node = host(hostIdA, portA)
@@ -58,6 +69,8 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipCo
                    creds: TlsCredentials, resolve: String => InetAddress = QuicNet.blockingResolve): Node =
     val handler = new RecordingHandler
     val net = new QuicNet(bootstrap, (_, _) => (), oclientId, ohost, heartbeatPeriod, handler, creds, cfg, resolve)
+    if ohost.isDefined then
+      net.startIoThread(new DirectoryClient(directory))
     synchronized:
       nets += net
     Node(net, handler)
@@ -123,6 +136,31 @@ object QuicNetFixture:
     port
 
   final class Node(val net: QuicNet, val handler: RecordingHandler)
+
+  /** Host objects by host id, and every lookup made against them */
+  final class HostDirectory:
+    private val states = new ConcurrentHashMap[HostId, HostState]()
+    val lookups = new ConcurrentLinkedQueue[HostId]()
+
+    def put(state: HostState): Unit = states.put(state.hostId, state)
+
+    def lookup(hostId: HostId): Option[HostState] =
+      lookups.add(hostId)
+      Option(states.get(hostId))
+
+  /** An `AspenClient` serving only host lookups, from `directory`. Inherits the rest from `TestNetwork.TClient`; no
+    * read or transaction ever leaves it. A bootstrap refresh fails at once: the fixture has no radicle to read.
+    */
+  final class DirectoryClient(directory: HostDirectory) extends TestNetwork.TClient(
+      ExecutionContext.global, ClientMessenger.None, Radicle.pointer, Replication(1, 1)):
+
+    override def getHostState(hostId: HostId): Future[HostState] =
+      directory.lookup(hostId) match
+        case Some(state) => Future.successful(state)
+        case None => Future.failed(new NoSuchElementException(s"no host object for $hostId"))
+
+    override def getBootstrapConfig(): Future[String] =
+      Future.failed(new UnsupportedOperationException("QuicNetFixture has no bootstrap config to refetch"))
 
   final case class Delivery[M](message: M, threadName: String)
 

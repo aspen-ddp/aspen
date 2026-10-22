@@ -70,7 +70,15 @@ object QuicNet:
 
     def dropCacheForStore(storeId: StoreId): Unit = net.metadataManager.dropStoreMapping(storeId)
 
-    override def broadcastGossip(g: Gossip): Unit = net.membership.foreach(_.broadcast(g))
+    /** Through membership, and for an endpoint change also directly to every host this one has resolved: a host
+      * whose endpoint really changed cannot take part in membership until its peers re-read its host object, since
+      * their replies still go to its old address (see `endpointChangedDirect`)
+      */
+    override def broadcastGossip(g: Gossip): Unit = net.membership.foreach: m =>
+      m.broadcast(g)
+      g match
+        case h: HostEndpointChanged => net.tellResolvedHosts(h)
+        case _: StoreMoved => ()
 
 
 /** A `NetworkPlugin` over Netty QUIC with mutual TLS.
@@ -330,13 +338,25 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
     override def offline(hostId: HostId): Unit = metadataManager.peekHostEntry(hostId).foreach(_.setOffline())
 
+    // Gossip that arrived through membership is never re-broadcast
     override def gossipReceived(g: Gossip): Unit = g match
       case StoreMoved(storeId) => metadataManager.dropStoreMapping(storeId)
-      case HostEndpointChanged(hostId) =>
-        // The next send re-reads the host object and dials the new endpoint
-        metadataManager.dropHostEntry(hostId).foreach: entry =>
-          logger.info(s"Host ${entry.name} changed endpoint; dropping its entry and connection")
-          closeOutbound(entry)
+      case HostEndpointChanged(hostId) => endpointChanged(hostId)
+
+  /** Drops `hostId`'s entry and closes our outbound connection to it, so the next send re-reads the host object and
+    * dials the new endpoint. Our own entry is left alone.
+    */
+  private def endpointChanged(hostId: HostId): Unit =
+    if !ohost.exists(_._1 == hostId) then
+      metadataManager.dropHostEntry(hostId).foreach: entry =>
+        logger.info(s"Host ${entry.name} changed endpoint; dropping its entry and connection")
+        closeOutbound(entry)
+
+  /** Sends `g` as a top-level message to every resolved host but this one. See `SrvMessenger.broadcastGossip`. */
+  private def tellResolvedHosts(g: HostEndpointChanged): Unit =
+    metadataManager.resolvedHostEntries.foreach: entry =>
+      if !ohost.exists(_._1 == entry.hostId) then
+        sendToHost(entry, g)
 
   initOrAbort:
     membership.foreach: m =>
@@ -706,6 +726,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           closeOutbound(entry, establishedOnly = true)
       hm.receive(m)
 
+  /** On a loop. A `HostEndpointChanged` sent to us directly by the host that moved (host mode only): applied as if
+    * gossiped, then gossiped on through our own membership, which (unlike the moved host's) can reach every member.
+    */
+  private def endpointChangedDirect(g: HostEndpointChanged): Unit =
+    membership.foreach: hm =>
+      endpointChanged(g.hostId)
+      hm.broadcast(g)
+
   private def recordRoute(id: ClientId, conn: QuicConnection): Unit =
     if conn != null && !conn.isClosed && (clientRouteMap.get(id) ne conn) then
       clientRouteMap.put(id, conn)
@@ -730,7 +758,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         case m: ClusterTransportMessage =>
           clusterMessage(m)
 
-        case _: HostResponse | _: HostHeartbeat | _: Gossip =>
-          // Not handled: liveness comes from host membership, and Gossip only travels inside scalecube payloads
+        case g: HostEndpointChanged =>
+          endpointChangedDirect(g)
+
+        case _: HostResponse | _: HostHeartbeat | _: StoreMoved =>
+          // Not handled: liveness comes from host membership, and StoreMoved only travels inside scalecube payloads
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)

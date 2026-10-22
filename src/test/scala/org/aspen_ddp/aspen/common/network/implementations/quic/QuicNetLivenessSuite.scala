@@ -167,5 +167,13 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     fx.a.net.undecodableDatagrams shouldBe undecodableBefore
     c.net.connectionCount shouldBe 1
 
+  test("the offline check survives nanoTime wrapping"):
+    val limit = 3000L
+    QuicNet.heartbeatOverdue(5000L, 1000L, limit) shouldBe true
+    QuicNet.heartbeatOverdue(3000L, 1000L, limit) shouldBe false
+    // A heartbeat 1000ns before the counter wraps, checked 999ns after it: 1999ns elapsed, not overdue
+    QuicNet.heartbeatOverdue(Long.MinValue + 999L, Long.MaxValue - 999L, limit) shouldBe false
+    QuicNet.heartbeatOverdue(Long.MinValue + 2999L, Long.MaxValue - 999L, limit) shouldBe true
+
   test("no buffer leaks were reported"):
     leakWatch.leaks() shouldBe Nil

@@ -42,6 +42,12 @@ object QuicNet:
   private[quic] def ipLiteral(address: String): Option[InetAddress] =
     Option(NetUtil.createByteArrayFromIpAddressString(address)).map(InetAddress.getByAddress)
 
+  /** Whether `limitNanos` or more have passed since `lastNanos`. Compares the difference of the two `System.nanoTime`
+    * readings, which stays correct when the counter wraps; comparing the raw values does not.
+    */
+  private[quic] def heartbeatOverdue(nowNanos: Long, lastNanos: Long, limitNanos: Long): Boolean =
+    nowNanos - lastNanos >= limitNanos
+
   /** The default name resolver: the JVM's, which blocks */
   def blockingResolve(name: String): InetAddress = InetAddress.getByName(name)
 
@@ -621,9 +627,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Same rule as `ZMQNet.heartbeat`: no heartbeat for 3 heartbeat periods means offline */
   private def offlineCheck(): Unit =
-    val threshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
+    val now = System.nanoTime()
+    val limit = (heartbeatPeriod * 3).toNanos
     metadataManager.resolvedHostEntries.foreach: host =>
-      if host.lastHeartbeatTime <= threshold then
+      if heartbeatOverdue(now, host.lastHeartbeatTime, limit) then
         host.setOffline()
 
   /** Heartbeats every resolved host, as `ZMQNet` does over the dealer it keeps for each. A ZMQ dealer reconnects by

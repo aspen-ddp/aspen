@@ -10,7 +10,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel
 import io.netty.channel.unix.UnixChannelOption
 import io.netty.handler.codec.quic.{QuicChannel, QuicClientCodecBuilder, QuicCodecDispatcher, QuicConnectionIdGenerator,
   QuicServerCodecBuilder, QuicSslContext, QuicStreamChannel}
-import io.netty.util.AttributeKey
+import io.netty.util.{AttributeKey, NetUtil}
 import io.netty.util.concurrent.Future as NFuture
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
@@ -21,9 +21,10 @@ import org.aspen_ddp.aspen.common.util.{DaemonThreads, EvictingQueue}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import scribe.Logging
 
-import java.net.InetSocketAddress
+import java.net.{InetAddress, InetSocketAddress}
 import java.util.UUID
-import java.util.concurrent.{ConcurrentHashMap, RejectedExecutionException, TimeUnit, TimeoutException}
+import java.util.concurrent.{ConcurrentHashMap, ExecutorService, Executors, RejectedExecutionException, TimeUnit,
+  TimeoutException}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
@@ -36,6 +37,13 @@ object QuicNet:
   private val CloseAwaitMillis: Long = 5000
 
   private val FlushPollMillis: Long = 25
+
+  /** The address of an IP literal, built without any lookup; None for a host name */
+  private[quic] def ipLiteral(address: String): Option[InetAddress] =
+    Option(NetUtil.createByteArrayFromIpAddressString(address)).map(InetAddress.getByAddress)
+
+  /** The default name resolver: the JVM's, which blocks */
+  def blockingResolve(name: String): InetAddress = InetAddress.getByName(name)
 
   private def remoteOf(ch: Channel): Any = ch match
     case q: QuicChannel => q.remoteSocketAddress()
@@ -71,12 +79,16 @@ object QuicNet:
   *  - A connection lives on the loop of the datagram channel it runs over, for its whole life, together with its
   *    streams, decoders and `QuicConnection` state. All receive-side work and every `MessageHandler` call run there.
   *  - Sends run on the caller's thread up to `QuicConnection.submit`: destination lookup, connection get-or-dial
-  *    (CAS on `QuicHostEntry.connection`; only the winner dials), address resolution and encoding.
+  *    (CAS on `QuicHostEntry.connection`; only the winner dials) and encoding. Host names are resolved on the
+  *    resolver pool (see `startDial`); IP literals need no lookup.
   *  - Shared state touched from both sides is lock-free: `clientRouteMap` and `liveConnections` are concurrent
   *    maps, `QuicHostEntry.connection` is an `AtomicReference`.
   *
   * Construction order matters: `MetadataManager`'s constructor calls `createHostEntry` for each bootstrap host, so
   * everything the send path uses (loops, channels, maps) is initialized above `metadataManager`.
+  *
+  * @param resolveHost resolves a host address that is not an IP literal. It may block: it only runs on the
+  *                    plugin's resolver threads, never on a caller or an event loop. Replaceable for tests.
   */
 class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
               onBootstrapConfigRefreshed: (String, BootstrapConfig.Config) => Unit,
@@ -85,7 +97,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
               val heartbeatPeriod: Duration,
               val messageHandler: MessageHandler,
               tls: TlsCredentials,
-              config: QuicConfig = QuicConfig()) extends NetworkPlugin with Logging:
+              config: QuicConfig = QuicConfig(),
+              resolveHost: String => InetAddress = QuicNet.blockingResolve) extends NetworkPlugin with Logging:
 
   import QuicNet.*
 
@@ -114,6 +127,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private val clientRouteMap = new ConcurrentHashMap[ClientId, QuicConnection]()
 
   private val nextDialIndex = new AtomicInteger(0)
+
+  /** Runs `resolveHost` for host names. Threads are created on demand, so a stuck lookup blocks no other. */
+  private val resolverPool: ExecutorService = Executors.newCachedThreadPool(DaemonThreads.factory("aspen-quic-resolve"))
 
   /** Set by `shutdown`; every send after that is a silent drop */
   @volatile private var shuttingDown = false
@@ -356,6 +372,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       val closes = (serverChannels ++ clientChannels).toList.map(_.close())
       if awaitMillis > 0 then
         closes.foreach(_.awaitUninterruptibly(awaitMillis))
+    quietly("shut down resolver"):
+      resolverPool.shutdownNow()
     quietly("shut down event loop group"):
       group.shutdownGracefully(0, 1, TimeUnit.SECONDS)
 
@@ -457,13 +475,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         result = cur
       else
         val parent = clientChannels(Math.floorMod(nextDialIndex.getAndIncrement(), clientChannels.length))
-        // Resolved here, never on a loop
-        val address = new InetSocketAddress(entry.address, entry.dataPort)
         val conn = new QuicConnection(parent.eventLoop(), config, c => outboundClosed(entry, c), outboundActive)
         if entry.connection.compareAndSet(cur, conn) then
           liveConnections.add(conn)
           try
-            parent.eventLoop().execute(() => dial(conn, parent, address))
+            startDial(entry, conn, parent)
           catch
             case e: RejectedExecutionException =>
               liveConnections.remove(conn)
@@ -472,9 +488,48 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           result = conn
     result
 
+  /** Dials `conn` on its loop. An IP literal is used as is. A host name is resolved on `resolverPool` first, never
+    * on the caller (which may hold `MetadataManager`'s lock) or a loop; meanwhile `conn` collects messages in its
+    * pre-handshake queue. A failed resolution, or one that takes longer than the handshake timeout, fails the
+    * handshake: queued messages are dropped and barriers completed.
+    *
+    * @throws RejectedExecutionException if the loop or the resolver pool has shut down
+    */
+  private def startDial(entry: QuicHostEntry, conn: QuicConnection, parent: Channel): Unit =
+    val loop = parent.eventLoop()
+    ipLiteral(entry.address) match
+      case Some(ip) =>
+        val address = new InetSocketAddress(ip, entry.dataPort)
+        loop.execute(() => dial(conn, parent, address))
+      case None =>
+        val name = entry.address
+        val guard = loop.schedule((() =>
+          conn.handshakeFailed(new TimeoutException(s"resolving QUIC host address $name timed out"))): Runnable,
+          config.handshakeTimeout.toMillis, TimeUnit.MILLISECONDS)
+        try
+          resolverPool.execute: () =>
+            val resolved =
+              try Right(new InetSocketAddress(resolveHost(name), entry.dataPort))
+              catch case NonFatal(e) => Left(e)
+            try
+              loop.execute: () =>
+                guard.cancel(false)
+                resolved match
+                  case Right(address) => dial(conn, parent, address)
+                  case Left(e) => conn.handshakeFailed(e)
+            catch case _: RejectedExecutionException => () // the loop is gone and with it the connection
+        catch
+          case e: RejectedExecutionException =>
+            guard.cancel(false)
+            throw e
+
   // ---- Loop side -----------------------------------------------------------------------------------------------
 
   private def dial(conn: QuicConnection, parent: Channel, address: InetSocketAddress): Unit =
+    if !conn.isClosed then
+      connect(conn, parent, address)
+
+  private def connect(conn: QuicConnection, parent: Channel, address: InetSocketAddress): Unit =
     val handler = new ConnectionHandler(conn, inbound = false)
     try
       val f = QuicChannel.newBootstrap(parent)

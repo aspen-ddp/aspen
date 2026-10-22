@@ -129,6 +129,43 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     elapsedMillis(start) should be < 1500L
     result shouldBe Some(false)
 
+  test("a blocking name lookup blocks neither the sender nor flush"):
+    val release = new java.util.concurrent.CountDownLatch(1)
+    val resolving = new java.util.concurrent.CountDownLatch(1)
+    val c = fx.client(resolve = name =>
+      resolving.countDown()
+      release.await(30, TimeUnit.SECONDS)
+      throw new java.net.UnknownHostException(name))
+    try
+      val entry = new QuicHostEntry(HostId(UUID.randomUUID()), "slow_dns", "slow.invalid", fx.portA, 0, 0)
+      val start = System.nanoTime()
+      c.net.sendToHost(entry, read(fx.storesA.head, c.net.clientId))
+      c.net.sendToHost(entry, read(fx.storesA.head, c.net.clientId))
+      elapsedMillis(start) should be < 100L
+      resolving.await(5, TimeUnit.SECONDS) shouldBe true
+      val flushStart = System.nanoTime()
+      c.net.awaitPendingMessagesSent(Duration(300, MILLISECONDS)) shouldBe false
+      elapsedMillis(flushStart) should be < 1300L
+    finally
+      release.countDown()
+
+  test("a failed name lookup drops queued messages and completes barriers"):
+    val c = fx.client(resolve = name => throw new java.net.UnknownHostException(name))
+    val entry = new QuicHostEntry(HostId(UUID.randomUUID()), "no_dns", "nowhere.invalid", fx.portA, 0, 0)
+    val conn = c.net.connectionFor(entry)
+    val encs = (0 until 3).map: i =>
+      val e = QuicMessageCodec.encode(if i == 0 then read(fx.storesA.head, c.net.clientId) else transferData(fx.hostIdA),
+        io.netty.buffer.PooledByteBufAllocator.DEFAULT)
+      conn.submit(e)
+      e
+    val barrier = conn.postBarrier()
+    barrier.await(5000) shouldBe true
+    eventually("the connection closed")(conn.isClosed)
+    conn.drops shouldBe 3
+    encs.foreach(_.prefix.refCnt() shouldBe 0)
+    entry.connection.get() shouldBe null
+    c.net.awaitPendingMessagesSent(Duration(1, SECONDS)) shouldBe true
+
   test("flush does not wait for messages sent after it was called"):
     val c = fx.client()
     // Connect first, so the sender's messages are written rather than held for the handshake

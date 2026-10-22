@@ -139,6 +139,14 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
       java.util.Arrays.equals(g.data.getByteArray, e.data.getByteArray) shouldBe true
     conn.drops shouldBe 0
 
+  test("a host whose address is a name is resolved and reached"):
+    val c = fx.client()
+    val entry = new QuicHostEntry(fx.hostIdB, "host_b_by_name", "localhost", fx.portB, 0, 0)
+    val m = CheckStorageDevice(fx.hostIdB, c.net.clientId,
+      org.aspen_ddp.aspen.common.metadata.StorageDeviceId(UUID.randomUUID()))
+    c.net.sendToHost(entry, m)
+    await(fx.b.handler.hostMessages, 1).map(_.message) shouldBe List(m)
+
   test("two clients sharing one certificate get only their own responses"):
     val creds = credentials()
     val c1 = fx.client(creds = creds)

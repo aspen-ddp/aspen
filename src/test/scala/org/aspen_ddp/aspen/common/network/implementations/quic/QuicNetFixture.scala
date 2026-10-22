@@ -46,13 +46,14 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(),
   def host(hostId: HostId, port: Int, cfg: QuicConfig = config): Node =
     node(None, Some((hostId, port)), cfg, credentials())
 
-  def client(cfg: QuicConfig = config, creds: TlsCredentials = credentials()): Node =
-    node(Some(ClientId(UUID.randomUUID())), None, cfg, creds)
+  def client(cfg: QuicConfig = config, creds: TlsCredentials = credentials(),
+             resolve: String => InetAddress = QuicNet.blockingResolve): Node =
+    node(Some(ClientId(UUID.randomUUID())), None, cfg, creds, resolve)
 
   private def node(oclientId: Option[ClientId], ohost: Option[(HostId, Int)], cfg: QuicConfig,
-                   creds: TlsCredentials): Node =
+                   creds: TlsCredentials, resolve: String => InetAddress = QuicNet.blockingResolve): Node =
     val handler = new RecordingHandler
-    val net = new QuicNet(bootstrap, (_, _) => (), oclientId, ohost, heartbeatPeriod, handler, creds, cfg)
+    val net = new QuicNet(bootstrap, (_, _) => (), oclientId, ohost, heartbeatPeriod, handler, creds, cfg, resolve)
     synchronized:
       nets += net
     Node(net, handler)

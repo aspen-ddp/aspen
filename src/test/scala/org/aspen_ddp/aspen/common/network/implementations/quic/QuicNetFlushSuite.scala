@@ -1,7 +1,6 @@
 package org.aspen_ddp.aspen.common.network.implementations.quic
 
 import io.netty.util.ResourceLeakDetector
-import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.*
@@ -51,7 +50,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
   private def read(to: StoreId, from: ClientId): Read = Read(to, from, UUID.randomUUID(), ptr, FullObject())
 
   /** Stream-sized */
-  private def transferData(to: StoreId): OpportunisticRebuild = rebuild(to, 4096)
+  private def rebuildData(to: StoreId): OpportunisticRebuild = rebuild(to, 4096)
 
   private def checkDevice(to: HostId, from: ClientId): CheckStorageDevice =
     CheckStorageDevice(to, from, StorageDeviceId(UUID.randomUUID()))
@@ -78,7 +77,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     (0 until 25).foreach: i =>
       val store = if i % 2 == 0 then fx.storesA(i % 2) else fx.storesB(i % 2)
       c.net.clientMessenger.sendClientRequest(read(store, c.net.clientId))
-      c.net.clientMessenger.sendClientRequest(transferData(if i % 2 == 0 then fx.storesB.head else fx.storesA.head))
+      c.net.clientMessenger.sendClientRequest(rebuildData(if i % 2 == 0 then fx.storesB.head else fx.storesA.head))
     c.net.awaitPendingMessagesSent(Duration(5, SECONDS)) shouldBe true
     // Host A receives 13 reads and 12 transfers; host B receives 12 reads and 13 transfers
     val gotA = await(fx.a.handler.clientRequests, 25).map(_.message)
@@ -156,7 +155,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val entry = new QuicHostEntry(HostId(UUID.randomUUID()), "no_dns", "nowhere.invalid", fx.portA, 0, 0)
     val conn = c.net.connectionFor(entry)
     val encs = (0 until 3).map: i =>
-      val e = QuicMessageCodec.encode(if i == 0 then read(fx.storesA.head, c.net.clientId) else transferData(fx.storesA.head),
+      val e = QuicMessageCodec.encode(if i == 0 then read(fx.storesA.head, c.net.clientId) else rebuildData(fx.storesA.head),
         io.netty.buffer.PooledByteBufAllocator.DEFAULT)
       conn.submit(e)
       e
@@ -199,7 +198,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val sent = new AtomicLong(0)
     val sender = new Thread(() =>
       while running.get() do
-        c.net.clientMessenger.sendClientRequest(transferData(fx.storesB.head))
+        c.net.clientMessenger.sendClientRequest(rebuildData(fx.storesB.head))
         sent.incrementAndGet())
     sender.setDaemon(true)
     sender.start()

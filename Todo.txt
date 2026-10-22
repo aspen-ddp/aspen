@@ -1,17 +1,6 @@
 TODO
 ====
 
-- QUIC test cleanups left over from removing StoreTransferData.
-
-    - Unused DataBuffer imports in QuicTlsSuite.scala:5, QuicNetFlushSuite.scala:4 and
-      QuicNetLivenessSuite.scala:4 (in Liveness only HLCTimestamp is still used).
-    - The helper is still named transferData in QuicNetFlushSuite, QuicNetLivenessSuite and
-      QuicNetRoutingSuite though it now builds an OpportunisticRebuild; rename to rebuildData or
-      inline the fixture's rebuild(...).
-    - No test sends a large host-addressed message any more (large payloads now go store-routed
-      over the same transport path). Add one small host-addressed case to the concurrent-senders
-      test in QuicNetRoutingSuite so host routing under load stays covered.
-
 - Client read completion does O(object size) work inline on the network thread. Move it off the
   QUIC event loop, or make it cheap.
 

@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.network.implementations.quic
 
 import io.netty.util.ResourceLeakDetector
-import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
@@ -56,7 +56,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     TxHeartbeat(to, from, TransactionId(UUID.randomUUID()))
 
   /** Stream-sized, so delivery is reliable */
-  private def transferData(to: StoreId): OpportunisticRebuild = rebuild(to, 2000)
+  private def rebuildData(to: StoreId): OpportunisticRebuild = rebuild(to, 2000)
 
   private def entryFor(net: QuicNet, hostId: HostId): QuicHostEntry =
     net.metadataManager.peekHostEntry(hostId).getOrElse(fail(s"no host entry for $hostId"))
@@ -125,7 +125,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     eventually("A's connection to the stopped B closes", 3000):
       stale.isClosed
     fx.startB()
-    val m = transferData(fx.storesB.head)
+    val m = rebuildData(fx.storesB.head)
     fx.a.net.clientMessenger.sendClientRequest(m)
     await(fx.b.handler.clientRequests, 1).map(_.message) shouldBe List(m)
 
@@ -146,7 +146,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val deadline = restarted + TimeUnit.MILLISECONDS.toNanos(RecoveryBudgetMillis)
     var delivered = false
     while !delivered && System.nanoTime() - deadline < 0 do
-      fx.a.net.clientMessenger.sendClientRequest(transferData(fx.storesB.head))
+      fx.a.net.clientMessenger.sendClientRequest(rebuildData(fx.storesB.head))
       delivered = fx.b.handler.clientRequests.poll(50, TimeUnit.MILLISECONDS) != null
     info(s"delivered to the restarted B ${(System.nanoTime() - restarted) / 1000000}ms after it was up")
     delivered shouldBe true

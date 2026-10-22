@@ -56,8 +56,6 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   private def txHeartbeat(to: StoreId, from: StoreId): TxHeartbeat =
     TxHeartbeat(to, from, TransactionId(UUID.randomUUID()))
 
-  private def transferData(to: StoreId, size: Int, seed: Int = 0): OpportunisticRebuild = rebuild(to, size, seed)
-
   private def prepare(to: StoreId, from: StoreId, updates: List[ObjectUpdate]): TxPrepare =
     val p = ptr
     val ida = Replication(4, 3)
@@ -129,7 +127,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val entry = entryFor(fx.a.net, fx.hostIdB)
     val conn = fx.a.net.connectionFor(entry)
     eventually("connection active")(conn.isActive)
-    val msgs = (0 until 3).map(i => transferData(fx.storesB.head, 16 * 1024 * 1024, i))
+    val msgs = (0 until 3).map(i => rebuild(fx.storesB.head, 16 * 1024 * 1024, i))
     msgs.foreach(m => fx.a.net.sendToHost(entry, m)) // faster than the loop drains: all three queue at once
     val got = await(fx.b.handler.clientRequests, 3, 30000).map(_.message.asInstanceOf[OpportunisticRebuild])
     got.map(_.pointer.id).toSet shouldBe msgs.map(_.pointer.id).toSet
@@ -190,7 +188,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     c.handler.total shouldBe 0
 
   test("peer restart mid-transfer recovers"):
-    val big = transferData(fx.storesB.head, 64 * 1024 * 1024)
+    val big = rebuild(fx.storesB.head, 64 * 1024 * 1024)
     val enc = QuicMessageCodec.encode(big, PooledByteBufAllocator.DEFAULT)
     val conn = fx.a.net.connectionFor(entryFor(fx.a.net, fx.hostIdB))
     conn.submit(enc) shouldBe true
@@ -203,7 +201,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
     var delivered = false
     while !delivered && System.nanoTime() - deadline < 0 do
-      fx.a.net.clientMessenger.sendClientRequest(transferData(fx.storesB.head, 100))
+      fx.a.net.clientMessenger.sendClientRequest(rebuild(fx.storesB.head, 100))
       delivered = fx.b.handler.clientRequests.poll(200, TimeUnit.MILLISECONDS) != null
     delivered shouldBe true
 
@@ -240,7 +238,11 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
           for i <- 0 until perThread do
             val to = if (i + t) % 2 == 0 then fx.storesA.head else fx.storesB.head
             val size = 1100 + ((i * 7919 + t * 104729) % (16 * 1024))
-            c.net.clientMessenger.sendClientRequest(transferData(to, size, i))
+            c.net.clientMessenger.sendClientRequest(rebuild(to, size, i))
+            // Every tenth send also goes host-routed, so host routing is exercised under the same load
+            if i % 10 == 0 then
+              val toHost = if to == fx.storesA.head then fx.hostIdA else fx.hostIdB
+              c.net.clientMessenger.sendHostMessage(ServiceMessage(toHost, c.net.clientId, UUID.randomUUID(), bytes(size, i)))
         catch case e: Throwable => failures.add(e): Unit)
       th.start()
       th
@@ -252,6 +254,11 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val gotB = await(fx.b.handler.clientRequests, half, 20000)
     gotA.forall(_.message.toStore == fx.storesA.head) shouldBe true
     gotB.forall(_.message.toStore == fx.storesB.head) shouldBe true
+    val halfHost = nThreads * (perThread / 10) / 2
+    val hostA = await(fx.a.handler.hostMessages, halfHost, 20000)
+    val hostB = await(fx.b.handler.hostMessages, halfHost, 20000)
+    hostA.forall(_.message.toHost == fx.hostIdA) shouldBe true
+    hostB.forall(_.message.toHost == fx.hostIdB) shouldBe true
     // A connection that closed would be null here; the client keeps both alive, so require them open
     val connA = entryFor(c.net, fx.hostIdA).connection.get()
     val connB = entryFor(c.net, fx.hostIdB).connection.get()

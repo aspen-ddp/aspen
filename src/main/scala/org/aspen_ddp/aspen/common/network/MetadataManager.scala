@@ -179,6 +179,17 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
               startPoolLookup(storeId, msg)
               None
 
+  /** Removes `hostId`'s resolved entry, so the next send to it starts a fresh lookup, and returns
+   *  the removed entry. A host that has no entry, or whose lookup is still pending, is left
+   *  untouched and None is returned. Never starts a lookup. */
+  def dropHostEntry(hostId: HostId): Option[T] =
+    synchronized:
+      hosts.get(hostId) match
+        case Some(Right(hostEntry)) =>
+          hosts -= hostId
+          Some(hostEntry)
+        case _ => None
+
   def dropStoreMapping(storeId: StoreId): Unit =
     synchronized:
       if isBootstrapStore(storeId) then

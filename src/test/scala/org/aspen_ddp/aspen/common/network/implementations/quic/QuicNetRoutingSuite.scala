@@ -91,7 +91,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.b.net.serverMessenger.sendClientResponse(resp)
     await(c.handler.clientResponses, 1).map(_.message) shouldBe List(resp)
     // B replied over the client's connection rather than dialing anything. B's own count is not checked: as a host
-    // it dials A for heartbeats on its first liveness tick.
+    // its host membership dials A as soon as it starts.
     c.net.connectionCount shouldBe 1
 
   test("TxMessages flow host to host in both directions"):
@@ -191,6 +191,9 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val big = rebuild(fx.storesB.head, 64 * 1024 * 1024)
     val enc = QuicMessageCodec.encode(big, PooledByteBufAllocator.DEFAULT)
     val conn = fx.a.net.connectionFor(entryFor(fx.a.net, fx.hostIdB))
+    // Host membership dials B as soon as A is built, possibly before B is bound; a handshake still retrying then
+    // could complete against the restarted B, so the transfer must start on a connection to the original B
+    eventually("A's connection to B is up")(conn.isActive)
     conn.submit(enc) shouldBe true
     Thread.sleep(100)
     val completedBeforeRestart = !fx.b.handler.clientRequests.isEmpty
@@ -221,7 +224,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     start.countDown()
     threads.foreach(_.join(AwaitMillis))
     await(fx.b.handler.txMessages, n)
-    // A's only possible outbound peer is B (its heartbeats dial B too, through the same CAS)
+    // A's only possible outbound peer is B (its host membership dials B too, through the same CAS)
     fx.a.net.outboundConnectionCount shouldBe 1
 
   test("many threads sending concurrently lose nothing under budget"):
@@ -299,7 +302,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     while h.net.inboundConnectionLoops.size < 2 && clients.size < 16 do
       connectOne()
     info(s"clients needed: ${clients.size}")
-    // Inbound only: as a host, h also dials A and B for heartbeats
+    // Inbound only: as a host, h also dials A and B for host membership
     h.net.inboundConnectionCount shouldBe clients.size
     h.net.inboundConnectionLoops.size shouldBe 2
 

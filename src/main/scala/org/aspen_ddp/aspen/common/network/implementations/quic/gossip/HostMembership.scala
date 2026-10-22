@@ -105,6 +105,20 @@ final class HostMembership(localHost: HostId,
         case NonFatal(err) => logger.warn(s"Host membership shutdown for $localHost: $err")
       executor.shutdownNow()
 
+  /** Test hook simulating a crash. Stops the transport first, so nothing more (in particular no LEAVING gossip)
+    * reaches a peer, then shuts the cluster down in the background. Never blocks.
+    */
+  private[quic] def crashForTests(): Unit =
+    if isShutdown.compareAndSet(false, true) then
+      try
+        // Completes synchronously: the transport's stop is a plain flag flip
+        transport.stop().block()
+        // Starts scalecube's shutdown without waiting for it; its LEAVING gossip dies in the stopped transport
+        cluster.shutdown()
+      catch
+        case NonFatal(err) => logger.warn(s"Host membership crash for $localHost: $err")
+      executor.shutdownNow()
+
   private def spread(bytes: Array[Byte]): Unit =
     try
       cluster.spreadGossip(Message.withData(bytes).qualifier(GossipQualifier).build()).subscribe(

@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicReference
   *
   * `connection` is the current outbound connection to this host, or null. Senders install a new one with a CAS
   * when it is null or closed, so exactly one thread dials; a connection clears itself (CAS from itself to null)
-  * when it closes. The liveness fields are written on event loops and read from other threads, hence volatile.
+  * when it closes. `isOnline` is driven by host membership events and read from other threads, hence volatile.
   */
 class QuicHostEntry(hostId: HostId,
                     name: String,
@@ -21,11 +21,9 @@ class QuicHostEntry(hostId: HostId,
   extends MetadataManager.HostEntry(hostId, name, address, dataPort, httpPort, storeTransferPort) with Logging:
 
   val connection: AtomicReference[QuicConnection | Null] = new AtomicReference[QuicConnection | Null](null)
-  @volatile var lastHeartbeatTime: Long = 0
   @volatile var isOnline: Boolean = false
 
-  def heartbeatReceived(): Unit =
-    lastHeartbeatTime = System.nanoTime()
+  def setOnline(): Unit =
     if !isOnline then
       logger.info(s"Node $name is Online")
     isOnline = true

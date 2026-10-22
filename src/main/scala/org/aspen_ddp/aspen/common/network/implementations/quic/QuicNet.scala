@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.{HostMembership, MembershipListener}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{DaemonThreads, EvictingQueue}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
@@ -41,12 +42,6 @@ object QuicNet:
   /** The address of an IP literal, built without any lookup; None for a host name */
   private[quic] def ipLiteral(address: String): Option[InetAddress] =
     Option(NetUtil.createByteArrayFromIpAddressString(address)).map(InetAddress.getByAddress)
-
-  /** Whether `limitNanos` or more have passed since `lastNanos`. Compares the difference of the two `System.nanoTime`
-    * readings, which stays correct when the counter wraps; comparing the raw values does not.
-    */
-  private[quic] def heartbeatOverdue(nowNanos: Long, lastNanos: Long, limitNanos: Long): Boolean =
-    nowNanos - lastNanos >= limitNanos
 
   /** The default name resolver: the JVM's, which blocks */
   def blockingResolve(name: String): InetAddress = InetAddress.getByName(name)
@@ -75,6 +70,8 @@ object QuicNet:
 
     def dropCacheForStore(storeId: StoreId): Unit = net.metadataManager.dropStoreMapping(storeId)
 
+    override def broadcastGossip(g: Gossip): Unit = net.membership.foreach(_.broadcast(g))
+
 
 /** A `NetworkPlugin` over Netty QUIC with mutual TLS.
   *
@@ -89,9 +86,11 @@ object QuicNet:
   *    resolver pool (see `startDial`); IP literals need no lookup.
   *  - Shared state touched from both sides is lock-free: `clientRouteMap` and `liveConnections` are concurrent
   *    maps, `QuicHostEntry.connection` is an `AtomicReference`.
+  *  - Host membership (host mode only) runs its listeners on its own "aspen-gossip" thread, never on a loop.
   *
   * Construction order matters: `MetadataManager`'s constructor calls `createHostEntry` for each bootstrap host, so
-  * everything the send path uses (loops, channels, maps) is initialized above `metadataManager`.
+  * everything the send path uses (loops, channels, maps) is initialized above `metadataManager`. `membership` is
+  * created before the channels are bound, since `dispatch` reads it, but is only started at the very end.
   *
   * @param resolveHost resolves a host address that is not an IP literal. It may block: it only runs on the
   *                    plugin's resolver threads, never on a caller or an event loop. Replaceable for tests.
@@ -134,10 +133,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private val nextDialIndex = new AtomicInteger(0)
 
-  /** The inbound connection each host's most recent `HostHeartbeat` arrived on, while that connection is open.
-    * Written on loops. See `heartbeatFrom`.
-    */
-  private val heartbeatConnections = new ConcurrentHashMap[HostId, QuicConnection]()
+  /** The last boot id seen from each host in a `ClusterTransportMessage`. Written on loops. See `clusterMessage`. */
+  private val bootIds = new ConcurrentHashMap[HostId, UUID]()
 
   /** Runs `resolveHost` for host names. Threads are created on demand, so a stuck lookup blocks no other. */
   private val resolverPool: ExecutorService = Executors.newCachedThreadPool(DaemonThreads.factory("aspen-quic-resolve"))
@@ -154,6 +151,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     catch
       case t: Throwable =>
         try
+          // Null while membership itself is being constructed. The hard stop never blocks; there is nothing to leave.
+          if membership != null then
+            membership.foreach(_.crashForTests())
           boundChannels.forEach(ch => ch.close().awaitUninterruptibly(CloseAwaitMillis))
           resolverPool.shutdownNow()
           group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS).awaitUninterruptibly(CloseAwaitMillis * 2)
@@ -167,6 +167,15 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private val keepaliveCount = new AtomicLong(0)
   private val undecodableCount = new AtomicLong(0)
+
+  /** Scalecube host membership; None in client mode. Started at the end of construction, after its listener is
+    * registered (listeners added later get no replay of hosts already online). Its traffic goes out through
+    * `sendToHostId`, which drops everything once `shutdown` has begun.
+    */
+  private[quic] val membership: Option[HostMembership] = initOrAbort:
+    ohost.map: (hostId, _) =>
+      new HostMembership(hostId, UUID.randomUUID(), initialBootstrapConfig.hosts.map(_.hostId), config.gossip,
+        m => sendToHostId(m.toHost, m))
 
   // ---- Pipeline handlers ---------------------------------------------------------------------------------------
 
@@ -297,6 +306,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
                         storeTransferPort: Int,
                         queuedMessages: EvictingQueue[Message]): QuicHostEntry =
       val entry = new QuicHostEntry(hostId, name, address, dataPort, httpPort, storeTransferPort)
+      // A host whose online event arrived before its entry existed (or that was dropped and re-read)
+      if membership.exists(_.isOnline(hostId)) then
+        entry.setOnline()
       sendQueued(entry, queuedMessages)
       entry
 
@@ -306,12 +318,27 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   val metadataManager: MetadataManager[QuicHostEntry] = initOrAbort:
     new MetadataManager[QuicHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl)
 
-  private val livenessTask: NFuture[?] = initOrAbort:
-    val ms = math.max(1L, heartbeatPeriod.toMillis)
-    loops(0).scheduleAtFixedRate((() => livenessTick()): Runnable, ms, ms, TimeUnit.MILLISECONDS)
-
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)
+
+  /** Applies membership events and gossip. Runs on the membership's "aspen-gossip" thread. */
+  private val membershipListener = new MembershipListener:
+    override def online(hostId: HostId): Unit = metadataManager.getHostEntry(hostId).foreach(_.setOnline())
+
+    override def offline(hostId: HostId): Unit = metadataManager.getHostEntry(hostId).foreach(_.setOffline())
+
+    override def gossipReceived(g: Gossip): Unit = g match
+      case StoreMoved(storeId) => metadataManager.dropStoreMapping(storeId)
+      case HostEndpointChanged(hostId) =>
+        // The next send re-reads the host object and dials the new endpoint
+        metadataManager.dropHostEntry(hostId).foreach: entry =>
+          logger.info(s"Host ${entry.name} changed endpoint; dropping its entry and connection")
+          closeOutbound(entry)
+
+  initOrAbort:
+    membership.foreach: m =>
+      m.addListener(membershipListener)
+      m.start()
 
   // ---- NetworkPlugin -------------------------------------------------------------------------------------------
 
@@ -372,7 +399,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Stops the network. Idempotent: calls after the first do nothing.
     *
-    *  1. Every send from now on is silently dropped, and the liveness tick is cancelled.
+    *  0. Host membership leaves the cluster gracefully, waiting up to 5 s for scalecube (in the background when
+    *     called on an event loop, which must not block).
+    *  1. Every send from now on is silently dropped.
     *  2. Sleeps the full `linger` on the caller's thread, so quiche can transmit what flush handed it.
     *     `QuicConnectionStats` exposes no "unsent bytes" signal, so it cannot end early.
     *  3. On each connection's own loop, closes it with a QUIC application close (code 0, empty reason).
@@ -384,14 +413,22 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     */
   def shutdown(linger: Duration): Unit =
     if shutdownStarted.compareAndSet(false, true) then
+      quietly("leave cluster"):
+        shutdownMembership()
       shuttingDown = true
-      quietly("cancel liveness tick"):
-        livenessTask.cancel(false)
       quietly("linger"):
         val ms = linger.toMillis
         if ms > 0 then
           Thread.sleep(ms)
       closeAll(awaitMillis = if loops.exists(_.inEventLoop()) then 0L else CloseAwaitMillis)
+
+  /** Graceful `HostMembership.shutdown`, which blocks: on a new daemon thread when called on one of our loops */
+  private def shutdownMembership(): Unit =
+    membership.foreach: m =>
+      if loops.exists(_.inEventLoop()) then
+        DaemonThreads.thread("aspen-gossip-shutdown")(m.shutdown()).start()
+      else
+        m.shutdown()
 
   /** Runs `body`, logging anything it throws at trace. Interrupts are re-asserted. */
   private def quietly(step: String)(body: => Unit): Unit =
@@ -448,20 +485,27 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Datagrams that failed to decode */
   private[quic] def undecodableDatagrams: Long = undecodableCount.get()
 
-  /** `shutdown` without the shutting-down flag or the linger, waiting for the group to terminate: cancels the
-    * liveness tick, closes every connection on its loop (which cancels its timers), closes the datagram channels and
-    * terminates the group
+  /** The last boot id recorded for `hostId` */
+  private[quic] def lastBootIdOf(hostId: HostId): Option[UUID] = Option(bootIds.get(hostId))
+
+  /** Dispatches `m` as if it had arrived on a connection */
+  private[quic] def dispatchForTests(m: Message): Unit = dispatch(null, m)
+
+  /** `shutdown` without the shutting-down flag or the linger, waiting for the group to terminate: leaves the
+    * cluster gracefully, closes every connection on its loop (which cancels its timers), closes the datagram
+    * channels and terminates the group
     */
   private[quic] def closeForTests(): Unit =
-    livenessTask.cancel(false)
+    shutdownMembership()
     closeAll(CloseAwaitMillis)
     group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
-  /** Simulates a crash: closes the datagram channels first, so no QUIC close frame can reach a peer, then terminates
-    * the group. Peers keep their connections to this net until they find out by other means.
+  /** Simulates a crash: stops membership without leaving the cluster (peers must detect the failure), closes the
+    * datagram channels first, so no QUIC close frame can reach a peer, then terminates the group. Peers keep their
+    * connections to this net until they find out by other means.
     */
   private[quic] def crashForTests(): Unit =
-    livenessTask.cancel(false)
+    membership.foreach(_.crashForTests())
     (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
     resolverPool.shutdownNow()
     group.shutdownGracefully(0, 1, TimeUnit.SECONDS)
@@ -606,56 +650,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     catch
       case NonFatal(e) => conn.handshakeFailed(e)
 
-  /** On the connection's loop, once an outbound connection is up: the initial heartbeat (host mode, matching
-    * `ZMQNet`'s heartbeat on dealer creation) and keepalive. Keepalive is driven by the dialing side only, after
-    * `idleTimeout / 2` without an outbound write. Periodic heartbeats come from `livenessTick`.
+  /** On the connection's loop, once an outbound connection is up: starts keepalive, which is driven by the dialing
+    * side only, after `idleTimeout / 2` without an outbound write
     */
   private def outboundActive(conn: QuicConnection): Unit =
-    if !shuttingDown then
-      ohost.foreach: (hostId, _) =>
-        conn.submit(QuicMessageCodec.encode(HostHeartbeat(hostId), PooledByteBufAllocator.DEFAULT))
     conn.startKeepalive(idleTimeout / 2)
-
-  /** Every `heartbeatPeriod` on loop 0: the offline check, then (host mode) heartbeats. */
-  private def livenessTick(): Unit =
-    try
-      offlineCheck()
-      if !shuttingDown then
-        ohost.foreach((hostId, _) => heartbeatAll(hostId))
-    catch
-      case NonFatal(e) => logger.warn(s"QUIC liveness tick failed: $e")
-
-  /** Same rule as `ZMQNet.heartbeat`: no heartbeat for 3 heartbeat periods means offline */
-  private def offlineCheck(): Unit =
-    val now = System.nanoTime()
-    val limit = (heartbeatPeriod * 3).toNanos
-    metadataManager.resolvedHostEntries.foreach: host =>
-      if heartbeatOverdue(now, host.lastHeartbeatTime, limit) then
-        host.setOffline()
-
-  /** Heartbeats every resolved host, as `ZMQNet` does over the dealer it keeps for each. A ZMQ dealer reconnects by
-    * itself; here the send dials any host without a live connection, so an idle host pair re-establishes
-    * connectivity (and online status) within a heartbeat period of a peer restart.
-    *
-    * One heartbeat per host per tick: a connection that is not yet active (being dialed now, or still handshaking)
-    * sends one from `outboundActive` when it activates, so the tick only makes sure it exists. `isActive` turns
-    * true only after `outboundActive` has submitted, so the tick and the activation never both send for the same
-    * tick. (The initial heartbeat can still land shortly before the next tick's; that duplicate is harmless.)
-    *
-    * The local host is not dialed. `ZMQNet` heartbeats its own entry over a loopback dealer, which only marks that
-    * entry online; this does the same directly, without a self-connection.
-    */
-  private def heartbeatAll(hostId: HostId): Unit =
-    metadataManager.resolvedHostEntries.foreach: entry =>
-      if entry.hostId == hostId then
-        entry.heartbeatReceived()
-      else
-        try
-          val conn = connectionFor(entry)
-          if conn.isActive then
-            conn.submit(QuicMessageCodec.encode(HostHeartbeat(hostId), PooledByteBufAllocator.DEFAULT))
-        catch
-          case NonFatal(e) => logger.warn(s"QUIC heartbeat to host ${entry.name} failed: $e")
 
   private def outboundClosed(entry: QuicHostEntry, conn: QuicConnection): Unit =
     entry.connection.compareAndSet(conn, null)
@@ -663,9 +662,6 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private def inboundClosed(conn: QuicConnection): Unit =
     inboundConnections.remove(conn)
-    heartbeatConnections.forEach: (id, c) =>
-      if c eq conn then
-        heartbeatConnections.remove(id, c)
     connectionClosed(conn)
 
   private def connectionClosed(conn: QuicConnection): Unit =
@@ -674,28 +670,38 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       if c eq conn then
         clientRouteMap.remove(id, c)
 
-  /** On `conn`'s loop. Marks the host online and detects a restarted peer.
+  /** Closes `entry`'s outbound connection, if open (and, with `establishedOnly`, past its handshake), on its own
+    * loop, so the next send re-dials
+    */
+  private def closeOutbound(entry: QuicHostEntry, establishedOnly: Boolean = false): Unit =
+    val out = entry.connection.get()
+    if out != null && !out.isClosed && (!establishedOnly || out.isActive) then
+      if out.loop.inEventLoop() then
+        out.close()
+      else
+        try out.loop.execute(() => out.close())
+        catch case _: RejectedExecutionException => () // shutting down
+
+  /** On a loop. Hands scalecube traffic to membership (host mode only), re-dialing a restarted peer first.
     *
     * Netty's stateless-reset key is random per JVM and its server codec does not send resets, so after a peer
-    * restarts our outbound connection to it is black-holed until the idle timeout. A restarted peer heartbeats us
-    * over a new connection, though: when a host's heartbeat arrives on a different inbound connection than the
-    * previous one, our outbound connection to it is closed (on its own loop) so the next send re-dials. If the old
-    * inbound connection closed first, its record is gone and nothing is closed: a peer that closed it, or let it
-    * idle out, has done the same to our outbound connection.
+    * restarts our outbound connection to it is black-holed until the idle timeout, and scalecube cannot see the new
+    * member until our replies get through. The restarted peer's first message reaches us over its own new
+    * connection and carries a new boot id: when a host's boot id differs from the last one recorded, our outbound
+    * connection to it is closed so the next send re-dials. Connection churn never changes a boot id, so an ordinary
+    * re-dial is never mistaken for a restart. The first boot id seen from a host is only recorded.
+    *
+    * Only an established connection is closed. One still handshaking is not black-holed: the restarted peer answers
+    * its retransmitted Initial. Closing it would only drop the messages queued behind its handshake.
     */
-  private def heartbeatFrom(entry: QuicHostEntry, conn: QuicConnection): Unit =
-    entry.heartbeatReceived()
-    if inboundConnections.contains(conn) && !conn.isClosed then
-      val previous = heartbeatConnections.put(entry.hostId, conn)
-      if previous != null && (previous ne conn) then
-        val out = entry.connection.get()
-        if out != null && !out.isClosed then
-          logger.info(s"Host ${entry.name} heartbeats over a new connection; re-dialing it")
-          if out.loop.inEventLoop() then
-            out.close()
-          else
-            try out.loop.execute(() => out.close())
-            catch case _: RejectedExecutionException => () // shutting down
+  private def clusterMessage(m: ClusterTransportMessage): Unit =
+    membership.foreach: hm =>
+      val previous = bootIds.put(m.fromHost, m.fromBootId)
+      if previous != null && previous != m.fromBootId then
+        metadataManager.peekHostEntry(m.fromHost).foreach: entry =>
+          logger.info(s"Host ${entry.name} restarted (new boot id); re-dialing it")
+          closeOutbound(entry, establishedOnly = true)
+      hm.receive(m)
 
   private def recordRoute(id: ClientId, conn: QuicConnection): Unit =
     if conn != null && !conn.isClosed && (clientRouteMap.get(id) ne conn) then
@@ -705,9 +711,6 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private def dispatch(conn: QuicConnection, msg: Message): Unit =
     try
       msg match
-        case hb: HostHeartbeat =>
-          metadataManager.getHostEntry(hb.hostId).foreach(entry => heartbeatFrom(entry, conn))
-
         case req: ClientRequest =>
           recordRoute(req.fromClient, conn)
           messageHandler.onClientRequestReceived(req)
@@ -721,10 +724,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         case hm: HostMessage =>
           messageHandler.onHostMessageReceived(hm)
 
-        case _: HostResponse =>
-          // Not currently handled
+        case m: ClusterTransportMessage =>
+          clusterMessage(m)
 
-        case _: Gossip | _: ClusterTransportMessage =>
-          // Not yet wired up
+        case _: HostResponse | _: HostHeartbeat | _: Gossip =>
+          // Not handled: liveness comes from host membership, and Gossip only travels inside scalecube payloads
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)

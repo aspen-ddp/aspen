@@ -4,6 +4,7 @@ import io.netty.util.ResourceLeakDetector
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.{GossipConfig, MembershipListener}
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -13,15 +14,16 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
-import java.util.concurrent.TimeUnit
+import java.util.concurrent.{ConcurrentLinkedQueue, TimeUnit}
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
+import scala.jdk.CollectionConverters.*
 
 class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with BeforeAndAfterEach:
   import QuicNetFixture.*
 
   private val HeartbeatPeriod = Duration(200, MILLISECONDS)
   private val IdleTimeout = Duration(600, MILLISECONDS)
-  private val RecoveryBudgetMillis = 2000L
+  private val WaitMillis = 5000L
 
   private var previousLevel: ResourceLeakDetector.Level = scala.compiletime.uninitialized
   private var leakWatch: QuicTestPeer.LeakWatch = scala.compiletime.uninitialized
@@ -37,12 +39,24 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     ResourceLeakDetector.setLevel(previousLevel)
 
   override def beforeEach(): Unit =
-    fx = new QuicNetFixture(QuicConfig(idleTimeout = Some(IdleTimeout)), HeartbeatPeriod)
+    fx = new QuicNetFixture(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests), HeartbeatPeriod)
 
   override def afterEach(): Unit =
     fx.close()
 
   // ---------------------------------------------------------------------------------------------------------------
+
+  /** Records every membership event and gossip delivered to it */
+  private class Recorder extends MembershipListener:
+    val restarts = new ConcurrentLinkedQueue[HostId]()
+    val gossip = new ConcurrentLinkedQueue[Gossip]()
+    override def restarted(hostId: HostId): Unit = restarts.add(hostId)
+    override def gossipReceived(g: Gossip): Unit = gossip.add(g)
+
+  private def listen(net: QuicNet): Recorder =
+    val r = new Recorder
+    net.membership.getOrElse(fail("host-mode net has no membership")).addListener(r)
+    r
 
   private def ptr: DataObjectPointer =
     DataObjectPointer(ObjectId(UUID.randomUUID()), PoolId.BootstrapPoolId, Array[Byte](1))
@@ -61,26 +75,21 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
   private def entryFor(net: QuicNet, hostId: HostId): QuicHostEntry =
     net.metadataManager.peekHostEntry(hostId).getOrElse(fail(s"no host entry for $hostId"))
 
-  /** Each host dials the other by sending it a TxMessage */
-  private def connectHosts(): Unit =
-    fx.a.net.serverMessenger.sendTransactionMessage(txHeartbeat(fx.storesB.head, fx.storesA.head))
-    fx.b.net.serverMessenger.sendTransactionMessage(txHeartbeat(fx.storesA.head, fx.storesB.head))
-    await(fx.b.handler.txMessages, 1)
-    await(fx.a.handler.txMessages, 1)
+  private def awaitOnline(): Unit =
+    eventually("each host sees the other online", WaitMillis):
+      entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
 
   // ---------------------------------------------------------------------------------------------------------------
 
-  test("hosts mark each other online after connecting"):
-    connectHosts()
-    eventually("each host sees the other online", 1000):
-      entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
+  test("hosts mark each other online without application traffic"):
+    awaitOnline()
+    fx.a.handler.total shouldBe 0
+    fx.b.handler.total shouldBe 0
 
-  test("a host is marked offline after its peer stops"):
-    connectHosts()
-    eventually("A sees B online"):
-      entryFor(fx.a.net, fx.hostIdB).isOnline
-    fx.stopB()
-    eventually("A sees B offline", 1500):
+  test("a crashed host is marked offline"):
+    awaitOnline()
+    fx.crashB()
+    eventually("A sees the crashed B offline", WaitMillis):
       !entryFor(fx.a.net, fx.hostIdB).isOnline
 
   test("quiet client connection survives beyond the idle timeout"):
@@ -97,28 +106,8 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     await(c.handler.clientResponses, 1).map(_.message) shouldBe List(resp)
     c.net.connectionCount shouldBe connsBefore
 
-  test("idle host pair recovers online status after a peer restart"):
-    connectHosts()
-    eventually("each host sees the other online"):
-      entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
-    // Restart B on the same port with no application traffic. B's down time is however long A takes to notice.
-    fx.stopB()
-    eventually("A sees the stopped B offline", 1500):
-      !entryFor(fx.a.net, fx.hostIdB).isOnline
-    val starting = System.nanoTime()
-    fx.startB()
-    // Timed from when the restarted B is up, so B's construction time (TLS contexts, binds) is not counted
-    val restarted = System.nanoTime()
-    // Recovery waits on quiche's Initial retransmission (PTO) for A's re-dial made while B was down, so its timing
-    // varies (365-590ms observed). 2s still proves recovery without application traffic, far below the
-    // "never recovers" failure this guards against, and stays under the 5s handshake timeout.
-    eventually("A and the restarted B see each other online", RecoveryBudgetMillis):
-      entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
-    info(s"B started in ${(restarted - starting) / 1000000}ms; " +
-      s"recovered ${(System.nanoTime() - restarted) / 1000000}ms after it was up")
-
   test("dead peer's connection is cleaned up and re-dialed"):
-    connectHosts()
+    awaitOnline()
     val stale = entryFor(fx.a.net, fx.hostIdB).connection.get()
     stale should not be null
     fx.stopB()
@@ -129,28 +118,84 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     fx.a.net.clientMessenger.sendClientRequest(m)
     await(fx.b.handler.clientRequests, 1).map(_.message) shouldBe List(m)
 
-  test("a crashed and restarted peer is re-dialed long before the idle timeout"):
-    // A long idle timeout, so only the heartbeat-connection change can make A drop its stale connection in time
+  test("fast restart re-dials and is reported as restarted"):
+    // A long idle timeout, so only the boot-id re-dial can make A drop its black-holed connection in time
     fx.close()
-    fx = new QuicNetFixture(QuicConfig(idleTimeout = Some(Duration(30, SECONDS))), HeartbeatPeriod)
-    connectHosts()
-    eventually("A has heard B's heartbeats"):
-      entryFor(fx.a.net, fx.hostIdB).isOnline
+    fx = new QuicNetFixture(QuicConfig(idleTimeout = Some(Duration(30, SECONDS)), gossip = GossipConfig.ForTests),
+      HeartbeatPeriod)
+    awaitOnline()
+    val rec = listen(fx.a.net)
     val stale = entryFor(fx.a.net, fx.hostIdB).connection.get()
     stale should not be null
     fx.crashB()
-    Thread.sleep(300)
-    stale.isClosed shouldBe false // the crash sent no close frame
     fx.startB()
     val restarted = System.nanoTime()
-    val deadline = restarted + TimeUnit.MILLISECONDS.toNanos(RecoveryBudgetMillis)
+    val deadline = restarted + TimeUnit.MILLISECONDS.toNanos(WaitMillis)
     var delivered = false
-    while !delivered && System.nanoTime() - deadline < 0 do
-      fx.a.net.clientMessenger.sendClientRequest(rebuildData(fx.storesB.head))
-      delivered = fx.b.handler.clientRequests.poll(50, TimeUnit.MILLISECONDS) != null
-    info(s"delivered to the restarted B ${(System.nanoTime() - restarted) / 1000000}ms after it was up")
+    while !(delivered && rec.restarts.contains(fx.hostIdB)) && System.nanoTime() - deadline < 0 do
+      if !delivered then
+        fx.a.net.serverMessenger.sendTransactionMessage(txHeartbeat(fx.storesB.head, fx.storesA.head))
+        delivered = fx.b.handler.txMessages.poll(50, TimeUnit.MILLISECONDS) != null
+      else
+        Thread.sleep(10)
+    info(s"recovered ${(System.nanoTime() - restarted) / 1000000}ms after B was up")
     delivered shouldBe true
+    rec.restarts.asScala.toList shouldBe List(fx.hostIdB)
     stale.isClosed shouldBe true
+
+  test("an ordinary re-dial is not treated as a restart"):
+    awaitOnline()
+    val recA = listen(fx.a.net)
+    val recB = listen(fx.b.net)
+    val bOut = entryFor(fx.b.net, fx.hostIdA).connection.get()
+    bOut should not be null
+    val aOut = entryFor(fx.a.net, fx.hostIdB).connection.get()
+    aOut should not be null
+    aOut.loop.execute(() => aOut.close())
+    eventually("A's outbound connection closes", WaitMillis)(aOut.isClosed)
+    val m = txHeartbeat(fx.storesB.head, fx.storesA.head)
+    fx.a.net.serverMessenger.sendTransactionMessage(m)
+    await(fx.b.handler.txMessages, 1, WaitMillis).map(_.message) shouldBe List(m)
+    Thread.sleep(500)
+    recA.restarts shouldBe empty
+    recB.restarts shouldBe empty
+    entryFor(fx.b.net, fx.hostIdA).connection.get() should be theSameInstanceAs bOut
+
+  test("StoreMoved gossip drops the store mapping on peers"):
+    awaitOnline()
+    val recB = listen(fx.b.net)
+    val g = StoreMoved(fx.storesB.head)
+    fx.a.net.serverMessenger.broadcastGossip(g)
+    eventually("B receives the StoreMoved gossip", WaitMillis):
+      recB.gossip.contains(g)
+
+  test("HostEndpointChanged gossip drops the host entry on peers"):
+    awaitOnline()
+    val bOut = entryFor(fx.b.net, fx.hostIdA).connection.get()
+    bOut should not be null
+    fx.a.net.serverMessenger.broadcastGossip(HostEndpointChanged(fx.hostIdA))
+    eventually("B drops its entry for A", WaitMillis):
+      fx.b.net.metadataManager.peekHostEntry(fx.hostIdA).isEmpty
+    eventually("B's outbound connection to A closes", WaitMillis)(bOut.isClosed)
+
+  test("endpoint gossip for an unknown host starts no lookup"):
+    awaitOnline()
+    val recB = listen(fx.b.net)
+    val unknown = HostId(UUID.randomUUID())
+    val g = HostEndpointChanged(unknown)
+    fx.a.net.serverMessenger.broadcastGossip(g)
+    // QuicNet's own listener was registered first, so it has handled the gossip once the recorder sees it
+    eventually("B receives the gossip", WaitMillis):
+      recB.gossip.contains(g)
+    fx.b.net.metadataManager.peekHostEntry(unknown) shouldBe None
+    fx.b.net.metadataManager.hasParkedMessages shouldBe false
+
+  test("client mode ignores cluster transport messages"):
+    val c = fx.client()
+    c.net.membership shouldBe None
+    val m = ClusterTransportMessage(fx.hostIdA, UUID.randomUUID(), fx.hostIdB, Array[Byte](1, 2, 3))
+    noException should be thrownBy c.net.dispatchForTests(m)
+    c.net.lastBootIdOf(fx.hostIdA) shouldBe None
 
   test("keepalive datagrams are not dispatched"):
     val c = fx.client()
@@ -165,14 +210,6 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     fx.a.handler.total shouldBe totalBefore
     fx.a.net.undecodableDatagrams shouldBe undecodableBefore
     c.net.connectionCount shouldBe 1
-
-  test("the offline check survives nanoTime wrapping"):
-    val limit = 3000L
-    QuicNet.heartbeatOverdue(5000L, 1000L, limit) shouldBe true
-    QuicNet.heartbeatOverdue(3000L, 1000L, limit) shouldBe false
-    // A heartbeat 1000ns before the counter wraps, checked 999ns after it: 1999ns elapsed, not overdue
-    QuicNet.heartbeatOverdue(Long.MinValue + 999L, Long.MaxValue - 999L, limit) shouldBe false
-    QuicNet.heartbeatOverdue(Long.MinValue + 2999L, Long.MaxValue - 999L, limit) shouldBe true
 
   test("no buffer leaks were reported"):
     leakWatch.leaks() shouldBe Nil

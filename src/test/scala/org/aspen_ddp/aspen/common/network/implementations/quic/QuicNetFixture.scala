@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -21,7 +22,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
   * Host A owns bootstrap stores 0 and 1, host B owns 2 and 3. Every net gets fresh credentials from `TestTLS` and a
   * `RecordingHandler`. `close()` tears down every net it created, including restarted and extra ones.
   */
-final class QuicNetFixture(val config: QuicConfig = QuicConfig(),
+final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipConfig.ForTests),
                            val heartbeatPeriod: Duration = Duration(500, MILLISECONDS)):
   import QuicNetFixture.*
 

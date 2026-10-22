@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.network
 
 import org.aspen_ddp.aspen.common.metadata.HostId
-import org.aspen_ddp.aspen.common.network.{ClientResponse, TxMessage}
+import org.aspen_ddp.aspen.common.network.{ClientResponse, Gossip, TxMessage}
 import org.aspen_ddp.aspen.common.store.StoreId
 
 import scala.concurrent.Future
@@ -20,4 +20,7 @@ trait Messenger {
   // layer is still using the old host. This method will cause the network
   // layer to drop its cached value and lookup the new store location
   def dropCacheForStore(storeId: StoreId): Unit
+
+  // Spreads `g` to every other host. Networks without host membership ignore it.
+  def broadcastGossip(g: Gossip): Unit = ()
 }

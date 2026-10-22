@@ -106,3 +106,44 @@ class QuicClusterTransportSuite extends AnyFunSuite with Matchers:
     t.start().block()
     intercept[RuntimeException]:
       t.send(p.addrB, Message.withData("x").build()).block()
+
+  test("send is lazy: nothing happens until subscribed"):
+    val p = new Pair
+    val mono = p.ta.send(p.addrB, Message.withData("x").qualifier("q").build())
+    p.sentByA.size shouldBe 0
+    mono.block()
+    p.sentByA.size shouldBe 1
+
+  test("requestResponse without a correlationId fails fast"):
+    val p = new Pair
+    intercept[IllegalArgumentException]:
+      p.ta.requestResponse(p.addrB, Message.withQualifier("req").build()).block()
+
+  test("concurrent receive from many threads loses nothing"):
+    val p = new Pair
+    val count = new java.util.concurrent.atomic.AtomicInteger(0)
+    p.tb.listen().subscribe(_ => count.incrementAndGet())
+    val threads, per = (8, 1000)
+    val payload =
+      val out = new java.io.ByteArrayOutputStream()
+      io.scalecube.cluster.transport.api.MessageCodec.INSTANCE.serialize(Message.withData("x").qualifier("q").build(), out)
+      out.toByteArray
+    val start = new java.util.concurrent.CountDownLatch(1)
+    val ts = (0 until threads._1).map: _ =>
+      val t = new Thread(() =>
+        start.await()
+        for _ <- 0 until per._2 do p.tb.receive(ClusterTransportMessage(p.a, p.bootA, p.b, payload)))
+      t.start()
+      t
+    start.countDown()
+    ts.foreach(_.join())
+    count.get shouldBe threads._1 * per._2
+
+  test("loopback send from inside a listen() callback does not deadlock"):
+    val p = new Pair
+    val got = collect(p.ta)
+    p.ta.listen().subscribe: m =>
+      if m.qualifier() == "first" then
+        p.ta.send(p.addrA, Message.withQualifier("second").build()).subscribe()
+    p.ta.send(p.addrA, Message.withQualifier("first").build()).block()
+    got.size should be >= 1

@@ -62,34 +62,39 @@ final class QuicClusterTransport(localHost: HostId,
     inbound.synchronized:
       inbound.tryEmitNext(msg)
 
+  /** Lazy, like scalecube's own transport: nothing happens until the Mono is subscribed. */
   override def send(address: String, message: Message): Mono[Void] =
-    if stopped then
-      Mono.error(new IllegalStateException("Transport is stopped"))
-    else
-      QuicClusterTransport.hostIdOf(address) match
-        case None => Mono.error(new IllegalArgumentException(s"Cannot parse address: $address"))
-        case Some(target) if target == localHost =>
-          emit(message)
-          Mono.empty()
-        case Some(target) =>
-          Try:
-            val out = new ByteArrayOutputStream()
-            codec.serialize(message, out)
-            sendFn(ClusterTransportMessage(localHost, bootId, target, out.toByteArray))
-          .fold(err => Mono.error(err), _ => Mono.empty())
+    Mono.defer[Void]: () =>
+      if stopped then
+        Mono.error(new IllegalStateException("Transport is stopped"))
+      else
+        QuicClusterTransport.hostIdOf(address) match
+          case None => Mono.error(new IllegalArgumentException(s"Cannot parse address: $address"))
+          case Some(target) if target == localHost =>
+            emit(message)
+            Mono.empty()
+          case Some(target) =>
+            Try:
+              val out = new ByteArrayOutputStream()
+              codec.serialize(message, out)
+              sendFn(ClusterTransportMessage(localHost, bootId, target, out.toByteArray))
+            .fold(err => Mono.error(err), _ => Mono.empty())
 
   /** Mirrors scalecube's TransportImpl.requestResponse. Adds no timeout; callers apply their own. */
   override def requestResponse(address: String, request: Message): Mono[Message] =
-    Mono.create[Message]: sink =>
-      val receive = listen()
-        .filter(r => r.correlationId() != null && r.correlationId() == request.correlationId())
-        .take(1)
-        .subscribe(m => sink.success(m), err => sink.error(err), () => sink.success())
-      val sending = send(address, request).subscribe(
-        _ => (),
-        err =>
-          receive.dispose()
-          sink.error(err))
-      sink.onDispose(() =>
-        sending.dispose()
-        receive.dispose())
+    if request.correlationId() == null then
+      Mono.error(new IllegalArgumentException("correlationId must not be null"))
+    else
+      Mono.create[Message]: sink =>
+        val receive = listen()
+          .filter(r => r.correlationId() != null && r.correlationId() == request.correlationId())
+          .take(1)
+          .subscribe(m => sink.success(m), err => sink.error(err), () => sink.success())
+        val sending = send(address, request).subscribe(
+          _ => (),
+          err =>
+            receive.dispose()
+            sink.error(err))
+        sink.onDispose(() =>
+          sending.dispose()
+          receive.dispose())

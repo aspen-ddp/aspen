@@ -159,9 +159,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     catch
       case t: Throwable =>
         try
-          // Null while membership itself is being constructed. The hard stop never blocks; there is nothing to leave.
+          // Null while membership itself is being constructed. Membership shutdown never blocks.
           if membership != null then
-            membership.foreach(_.hardStop())
+            membership.foreach(_.shutdown())
           boundChannels.forEach(ch => ch.close().awaitUninterruptibly(CloseAwaitMillis))
           resolverPool.shutdownNow()
           group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS).awaitUninterruptibly(CloseAwaitMillis * 2)
@@ -422,8 +422,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Stops the network. Idempotent: calls after the first do nothing.
     *
-    *  0. Host membership leaves the cluster gracefully, waiting up to 5 s for scalecube (in the background when
-    *     called on an event loop, which must not block).
+    *  0. Host membership stops without leaving the cluster (crash-only: peers detect the failure). Never blocks.
     *  1. Every send from now on is silently dropped.
     *  2. Sleeps the full `linger` on the caller's thread, so quiche can transmit what flush handed it.
     *     `QuicConnectionStats` exposes no "unsent bytes" signal, so it cannot end early.
@@ -436,22 +435,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     */
   def shutdown(linger: Duration): Unit =
     if shutdownStarted.compareAndSet(false, true) then
-      quietly("leave cluster"):
-        shutdownMembership()
+      quietly("stop membership"):
+        membership.foreach(_.shutdown())
       shuttingDown = true
       quietly("linger"):
         val ms = linger.toMillis
         if ms > 0 then
           Thread.sleep(ms)
       closeAll(awaitMillis = if loops.exists(_.inEventLoop()) then 0L else CloseAwaitMillis)
-
-  /** Graceful `HostMembership.shutdown`, which blocks: on a new daemon thread when called on one of our loops */
-  private def shutdownMembership(): Unit =
-    membership.foreach: m =>
-      if loops.exists(_.inEventLoop()) then
-        DaemonThreads.thread("aspen-gossip-shutdown")(m.shutdown()).start()
-      else
-        m.shutdown()
 
   /** Runs `body`, logging anything it throws at trace. Interrupts are re-asserted. */
   private def quietly(step: String)(body: => Unit): Unit =
@@ -514,12 +505,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Dispatches `m` as if it had arrived on a connection */
   private[quic] def dispatchForTests(m: Message): Unit = dispatch(null, m)
 
-  /** `shutdown` without the shutting-down flag or the linger, waiting for the group to terminate: leaves the
-    * cluster gracefully, closes every connection on its loop (which cancels its timers), closes the datagram
+  /** `shutdown` without the shutting-down flag or the linger, waiting for the group to terminate: stops
+    * membership, closes every connection on its loop (which cancels its timers), closes the datagram
     * channels and terminates the group
     */
   private[quic] def closeForTests(): Unit =
-    shutdownMembership()
+    membership.foreach(_.shutdown())
     closeAll(CloseAwaitMillis)
     group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
@@ -528,7 +519,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     * connections to this net until they find out by other means.
     */
   private[quic] def crashForTests(): Unit =
-    membership.foreach(_.hardStop())
+    membership.foreach(_.shutdown())
     (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
     resolverPool.shutdownNow()
     group.shutdownGracefully(0, 1, TimeUnit.SECONDS)

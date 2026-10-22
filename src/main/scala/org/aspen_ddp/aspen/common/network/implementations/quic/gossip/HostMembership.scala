@@ -95,21 +95,12 @@ final class HostMembership(localHost: HostId,
   /** Test hook: spreads arbitrary bytes under the Aspen gossip qualifier. */
   private[gossip] def spreadRawGossip(bytes: Array[Byte]): Unit = spread(bytes)
 
-  /** Stops the cluster and the event thread. Waits up to 5 seconds for scalecube to finish. */
-  def shutdown(): Unit =
-    if isShutdown.compareAndSet(false, true) then
-      try
-        cluster.shutdown()
-        cluster.onShutdown().block(java.time.Duration.ofSeconds(5))
-      catch
-        case NonFatal(err) => logger.warn(s"Host membership shutdown for $localHost: $err")
-      executor.shutdownNow()
-
-  /** Stops without leaving the cluster, as a crash would: peers must detect the failure. Used by `QuicNet` when its
-    * construction fails and by its crash test hook. Stops the transport first, so nothing more (in particular no
-    * LEAVING gossip) reaches a peer, then shuts the cluster down in the background. Never blocks.
+  /** Stops without leaving the cluster, as a crash would: peers detect the failure (Aspen is crash-only). Stops the
+    * transport first, so nothing more (in particular no LEAVING gossip) reaches a peer, then shuts the cluster down
+    * in the background. Never blocks: scalecube's graceful leave only completes once its LEAVING gossip has been
+    * swept, several gossip intervals later.
     */
-  private[quic] def hardStop(): Unit =
+  def shutdown(): Unit =
     if isShutdown.compareAndSet(false, true) then
       try
         // Completes synchronously: the transport's stop is a plain flag flip

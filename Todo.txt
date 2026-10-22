@@ -1,4 +1,28 @@
 TODO
 ====
 
+- Store transfer cannot tolerate lost or reordered messages. Investigate, and develop a new
+  implementation if confirmed.
 
+  TransferringOut pipes `jar --create` output to the destination as a series of 1 MiB
+  StoreTransferData host messages over the data port. A zero-length chunk marks the end.
+  TransferringIn writes each chunk straight into the stdin of the `jar` extraction process, in
+  the order the chunks arrive. There are no sequence numbers, acknowledgements or
+  retransmissions. Aspen's network layer is allowed to drop messages, so:
+
+    - A dropped data chunk silently corrupts or truncates the extracted store.
+    - A dropped end marker leaves the transfer hanging until some timeout notices.
+    - The QUIC plugin round-robins large messages across several streams. The 1-byte end marker
+      would also travel as a datagram. So chunks can arrive out of order, which ZMQ's single
+      TCP connection never allowed. That corrupts the archive even when nothing is dropped.
+    - A chunk is dropped whenever the sender outruns the connection's buffer budget, which is
+      exactly what a bulk transfer does.
+
+  Separately, TransferringOut.readThread reuses one `buff` array for every full chunk, so a
+  chunk still queued for sending can be overwritten by the next read. ZMQNet races on this
+  today, and the QUIC plugin's zero-copy send makes it far more likely. Use a fresh array for
+  each chunk.
+
+  The unused `storeTransferPort`, present in host config, HostState and the CLI, suggests a
+  dedicated transfer channel was intended. That is one option for the new implementation, along
+  with a sequenced, acknowledged, flow-controlled protocol over the data port.

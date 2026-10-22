@@ -426,3 +426,22 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     noException should be thrownBy
       a.beginTransferOut(sid, UUID.randomUUID(), src, "127.0.0.1", freePort(), HLCTimestamp.now)
     eventually { a.isTransferringOut(sid) should be(false) }
+
+  test("same timestamp is retried after a failed attempt"):
+    val a = newManager()
+    val b = newManager()
+    val src = tempDir()
+    mkTree(src)
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val ts1 = HLCTimestamp.now
+    // Fails before any receiver accepts it, so the receiver never fails and never mints a newer
+    // timestamp: the retransmit of this same request is the only thing that can retry it.
+    a.beginTransferOut(sid, u, src, "127.0.0.1", freePort(), ts1)
+    eventually { a.isTransferringOut(sid) should be(false) }
+
+    val f = b.beginTransferIn(sid, u, dest)
+    a.beginTransferOut(sid, u, src, "127.0.0.1", b.boundPort, ts1)
+    await(f).isSuccess should be(true)
+    assertExtracted(dest / sid.directoryName)

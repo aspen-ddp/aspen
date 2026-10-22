@@ -92,8 +92,9 @@ class StoreTransferManager(port: Int,
   /** The current transfer-out attempt per store */
   private var active: Map[StoreId, Outbound] = Map()
 
-  /** Newest transfer-out timestamp seen per store. Kept after the attempt ends so that a
-   *  retransmitted request cannot start a second send. */
+  /** Newest transfer-out timestamp seen per store. Kept after a successful attempt so that a
+   *  retransmitted request cannot start a second send; forgotten after a failed one so that the
+   *  same request can be retried. */
   private var lastTimestamp: Map[StoreId, HLCTimestamp] = Map()
 
   def boundPort: Int = serverSocket.getLocalPort
@@ -161,6 +162,7 @@ class StoreTransferManager(port: Int,
 
   private def send(storeId: StoreId, out: Outbound, sourceDirectory: os.Path, host: String, port: Int): Unit =
     val raw = new Socket()
+    var succeeded = false
     try
       out.lastProgress = System.nanoTime()
       if !attach(out, raw) then
@@ -202,6 +204,7 @@ class StoreTransferManager(port: Int,
         write(trailer, trailer.length)
         sockOut.flush()
         sock.close()
+        succeeded = true
         logger.info(s"Sent store $storeId, transfer ${out.transferUUID}")
     catch
       case t: Throwable =>
@@ -214,6 +217,14 @@ class StoreTransferManager(port: Int,
             p.destroy()
         if active.get(storeId).exists(_ eq out) then
           active -= storeId
+        // A failed attempt forgets its timestamp so the receiver's retransmit of the same request
+        // can retry it. A failure before the receiver accepted the connection never fails the
+        // receiver, so it never sends a newer request, and without this every retransmit would
+        // be ignored. Equality leaves a newer timestamp alone, which is the case for an attempt
+        // aborted by supersession. A successful attempt keeps it, so a late retransmit cannot
+        // start a second send.
+        if !succeeded && lastTimestamp.get(storeId).contains(out.timestamp) then
+          lastTimestamp -= storeId
       try raw.close() catch case _: Throwable => ()
 
   /** Records the attempt's socket so it can be aborted. False if the attempt was already aborted. */

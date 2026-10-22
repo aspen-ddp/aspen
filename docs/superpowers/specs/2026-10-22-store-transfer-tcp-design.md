@@ -179,11 +179,18 @@ second connection with the same pair is also rejected.
 Items marked *(call)* are the designer's judgement calls, not decisions made with the user.
 
 - **Retransmits after an attempt finished** *(call)*. The manager remembers the most recent
-  timestamp it has acted on for each storeId, even after that attempt's thread has finished.
-  A `beginTransferOut` whose timestamp is equal or older is ignored. A retransmit of the
-  same attempt therefore never starts a second `jar --create` that would just be rejected.
-  When an attempt fails, the receiver restarts with a newer timestamp, and that newer
-  timestamp is what starts the next send.
+  timestamp it has acted on for each storeId. A `beginTransferOut` whose timestamp is equal
+  or older is ignored. After a successful send the timestamp is kept, so a retransmit of the
+  same attempt never starts a second `jar --create` that would just be rejected. After a
+  failed send it is forgotten (only if it still equals the failed attempt's timestamp, so a
+  newer one recorded by a superseding request is left alone). This is necessary because a
+  failure before the receiver accepts the connection (connect refused or timed out, TLS
+  handshake failure, a stale address) never fails the receiver, so the receiver never sends a
+  newer timestamp; if the old one were remembered, every retransmit would be ignored and the
+  transfer would stall until a process restarted. When the failure does reach the receiver,
+  it restarts with a newer timestamp and UUID, and that newer timestamp is what starts the
+  next send (a retransmit of the old request in between costs one attempt that the receiver
+  rejects as a stale UUID).
 - **Sender completeness** *(call)*. After stdout reaches EOF, the sender waits for
   `jar --create` to exit and writes the trailer only if the exit code is 0. Otherwise it
   closes the socket without a trailer, and the receiver fails the attempt. An archive that

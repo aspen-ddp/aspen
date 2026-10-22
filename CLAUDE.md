@@ -89,8 +89,13 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
         to store system metadata such as physical storage hosts, netowrk configurations, storage pool
         configurations, etc
 - Aspen uses a Crash-Only architecture. By intentional design, there is no clean shutdown process.
-- The Network Layer is designed to be pluggable. Currently only a simple but inefficient ZeroMQ based network
-  is supported.
+- The Network Layer is designed to be pluggable. Two plugins implement `common.network.NetworkPlugin`:
+  - QUIC (`implementations/quic`, Netty 4.2): the default. Mutual TLS on every connection, datagrams for
+    encoded messages of 1024 bytes or less, a small round-robin pool of streams for larger ones, and messages
+    dropped (never queued) when a connection's buffers are full. Payloads are not copied on send and are
+    copied exactly once on receive.
+  - ZeroMQ (`implementations/zmqnet`): simple but inefficient, selected with `--network zmq`. Slated for
+    removal once QUIC is stable.
 - DataStores are pluggable. Currently only a RocksDB and in-memory Map are supported.
 
 ## Subsystem Details
@@ -137,10 +142,12 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 
 ## Building and Testing
 - `sbt 'testOnly *TestName -- -z "test substring"'` - Run a specific test by substring
+- Tests run in parallel inside sbt's JVM; `.jvmopts` sets a 4 GiB heap for the large-message QUIC tests
 
 ## Key Dependencies
 - **Scaffeine**: Used for all caching operations
 - **os-lib**: Should be used for all filesystem operations. (currently a mix of native java and os-lib)
+- **Netty 4.2 QUIC** (`netty-codec-native-quic`, BoringSSL): Used for the default QUIC network plugin
 - **jeromq**: Used for the ZeroMQ network plugin. Simple but inefficient
 
 ## Development Rules

@@ -134,10 +134,11 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     java.util.Arrays.equals(got.data.getByteArray, payload) should be (true)
     h.finish()
 
-  test("TxPrepare with 4 x 128 MiB updates in 64 KiB chunks decodes intact"):
-    // The four updates share one 128 MiB source array (the send path wraps payloads without copying), so the test
-    // holds 128 MiB of source plus the 512 MiB the receiver copies out, within sbt's 1 GiB test heap.
-    val sectionSize = 128 * 1024 * 1024
+  test("TxPrepare with 4 x 64 MiB updates in 64 KiB chunks decodes intact"):
+    // The four updates share one 64 MiB source array (the send path wraps payloads without copying), so the test
+    // holds 64 MiB of source plus the 256 MiB the receiver copies out. Kept at that size because suites run in
+    // parallel inside sbt's JVM, alongside the other large-message tests.
+    val sectionSize = 64 * 1024 * 1024
     val source = new Array[Byte](sectionSize)
     new java.util.Random(42).nextBytes(source)
     val updates = (1 to 4).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(source)))

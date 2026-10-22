@@ -1521,6 +1521,8 @@ class Host(val client: AspenClient,
 
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     events.put(Exit())
+    // Lets the event loop's thread exit once it has handled Exit; it is not a daemon thread.
+    threadPool.shutdown()
     serviceExecutorPromise.future.foreach(_.shutdown())
     systemTaskRunnerPromise.future.foreach(_.shutdown())
     pendingStartTask.cancel()
@@ -1531,7 +1533,7 @@ class Host(val client: AspenClient,
     shutdownPromise.future
   }
   
-  private def closeStore(storeId: StoreId): Future[Unit] = {
+  private[aspen] def closeStore(storeId: StoreId): Future[Unit] = {
     val p = Promise[Unit]()
     events.put(ShutdownStore(storeId, p))
     p.future

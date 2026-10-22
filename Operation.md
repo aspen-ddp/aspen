@@ -64,8 +64,8 @@ Clients never need a hand-maintained copy of the bootstrap config. Instead, ever
 with owner-only (0600) permissions. It contains:
 
 - `aspen-system-id`: the system the client belongs to
-- `certificate` and `private-key`: the client's TLS identity. They are loaded and validated, but
-  not yet used for connections, as TLS is not enforced yet.
+- `certificate` and `private-key`: the client's TLS identity. The QUIC network plugin (the default,
+  see Networking below) presents them on every connection; the ZeroMQ plugin does not use them.
 - `bootstrap-hosts`: a list of `address:port` entries for hosts to fetch the bootstrap config from.
   Initially this is only the bootstrap host.
 
@@ -88,6 +88,18 @@ The bootstrap yaml holds only the CA certificate. The client key is not stored i
 yaml, in the host directories, or in the Radicle.
 
 Systems bootstrapped by earlier versions are not supported: a fresh bootstrap is required.
+
+## Networking
+
+Every command that talks to a running system, `host` included, takes `--network <quic|zmq>`
+(default `quic`) after the command name, e.g. `aspen host <host-directory> --network zmq`.
+
+- `quic` (default): Netty QUIC over UDP on each host's `data-port`. Every connection is mutual TLS
+  against the Aspen CA: hosts present the certificate in their host config, clients the one in the
+  client config.
+- `zmq`: the original ZeroMQ plugin over TCP on the same `data-port`. It is unauthenticated.
+
+The two are not wire compatible. Every host and client of a system must use the same one.
 
 ## Operation
 

@@ -437,8 +437,9 @@ yield
 
 ### Initializing an AspenClient
 AspenClient accepts several parameters to tweak the timeouts for various internal components. Also,
-the networking backend for Aspen is pluggable and in the following example a ZeroMQ based networking
-backend is used. Both the networking plugin and AspenClient are implemented in terms of each other so
+the networking backend for Aspen is pluggable. The following example builds either the QUIC
+plugin (the default, which needs the TLS credentials from the client config) or the ZeroMQ one,
+as the CLI's `--network` option selects. Both the networking plugin and AspenClient are implemented in terms of each other so
 the initialization process is a touch awkward. The following excerpt is from the Aspen command line
 utility. The `BootstrapConfig.Config` is obtained by fetching the bootstrap yaml from a running host
 (`GET /bootstrap`), starting from the cached hosts in `aspen-client-config.yaml`; `onRefresh` is
@@ -447,20 +448,25 @@ called whenever the network later receives a newer copy.
   def createNetwork(bootstrapConfig: BootstrapConfig.Config,
                     onRefresh: (String, BootstrapConfig.Config) => Unit,
                     ohost: Option[(HostId, Int)],
-                    oclientId: Option[ClientId]): (NetworkBridge, ZMQNet) = {
+                    oclientId: Option[ClientId],
+                    tls: TlsCredentials): (NetworkBridge, NetworkPlugin) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    val net = new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
+    val net: NetworkPlugin = networkKind match
+      case NetworkKind.Quic => new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls)
+      // ZMQ connections are unauthenticated, so the credentials go unused.
+      case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
     onetwork = Some(net)
     (b, net)
   }
 
   def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
-                        onnet: Option[(NetworkBridge, ZMQNet)]=None): (AspenClient, ZMQNet, KeyValueObjectPointer) = {
+                        tls: TlsCredentials,
+                        onnet: Option[(NetworkBridge, NetworkPlugin)] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
 
-    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None))
+    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
     val initialReadDelay = Duration(10, SECONDS)

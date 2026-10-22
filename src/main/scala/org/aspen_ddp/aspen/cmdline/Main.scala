@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
+import org.aspen_ddp.aspen.common.network.implementations.quic.{QuicNet, TlsCredentials}
 import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, SecretFile}
@@ -23,6 +24,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, DaemonThreads, YamlFormat, atomicWrite}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
@@ -70,7 +72,8 @@ object Main {
   val CheckStorageDevicesPeriod: Duration = Duration(1, HOURS)
 
   // How long a terminating command waits for outbound messages to leave the network plugin, and
-  // how long the transport is then given to put them on the wire before the process exits.
+  // how long the plugin's transport is then given to put them on the wire before the process
+  // exits. Both apply whichever NetworkPlugin --network selected.
   val NotificationDrainTimeout: Duration = Duration(5, SECONDS)
   val NotificationSendLinger: Duration = Duration(1, SECONDS)
 
@@ -79,6 +82,15 @@ object Main {
   // call on the main thread, and main reads it back on that same thread. A command that built
   // one from a callback would need this made volatile, or the drain would see None and skip.
   private var onetwork: Option[NetworkPlugin] = None
+
+  /** The network plugin implementations the CLI can run over. */
+  enum NetworkKind:
+    case Quic, Zmq
+
+  // The plugin createNetwork builds, chosen by --network. Set once by main before it dispatches,
+  // on the main thread, and read by createNetwork on that same thread, so it is thread-confined
+  // for the same reason onetwork is. A network built from a callback would need it volatile.
+  private var networkKind: NetworkKind = NetworkKind.Quic
 
   case class Args(mode:String="",
                   hostDirectory:File=null,
@@ -113,7 +125,8 @@ object Main {
                   entityRef:String="",
                   fsName:String="",
                   rebalancePeriod:Option[String]=None,
-                  rebalancePeriodUnit:Option[String]=None)
+                  rebalancePeriodUnit:Option[String]=None,
+                  network:NetworkKind=NetworkKind.Quic)
 
   class ConfigError(msg: String) extends AspenError(msg)
 
@@ -175,9 +188,9 @@ object Main {
    */
   private def drainAndShutdown(): Unit =
     onetwork.foreach: net =>
-      // Nothing here may change the exit code, and shutdown() deliberately races the IO
-      // thread's use of the sockets it closes, so swallow whatever comes back: the command's
-      // result is already decided and the process is on its way out.
+      // Nothing here may change the exit code, and the network plugin's shutdown() may race
+      // its own IO threads' use of the connections it closes, so swallow whatever comes back:
+      // the command's result is already decided and the process is on its way out.
       try
         if !net.awaitPendingMessagesSent(NotificationDrainTimeout) then
           println("Could not confirm all notifications left this process. Affected hosts will " +
@@ -216,6 +229,10 @@ object Main {
 
   /** The flag that asks for help. See helpRequest. */
   private val HelpFlag = "--help"
+
+  /** The network selection option, as top-level help shows it, and its description. */
+  private val NetworkFlag = "--network <quic|zmq>"
+  private val NetworkFlagText = "Network implementation to use (default: quic)"
 
   private type ArgParser = scopt.OptionParser[Args]
 
@@ -686,6 +703,11 @@ object Main {
     Command("show-allocation-group", "Displays the full state of an allocation group", showArgs("Allocation group name or UUID")),
   )
 
+  private def parseNetworkKind(name: String): Option[NetworkKind] = name match
+    case "quic" => Some(NetworkKind.Quic)
+    case "zmq" => Some(NetworkKind.Zmq)
+    case _ => None
+
   private[cmdline] def buildParser: ArgParser = new scopt.OptionParser[Args]("aspen") {
     head("aspen", Version)
 
@@ -695,6 +717,14 @@ object Main {
     // only ends a parse error with "Try --help for more information." when a help option
     // exists. Drop it and every usage error dumps the usage text instead.
     help("help").text("Prints this usage text")
+
+    // Accepted anywhere after the command, like every other option. Not before it: scopt drops
+    // the pending command list once it has consumed any option, so "aspen --network zmq host"
+    // fails with an unknown argument. helpRequest likewise expects the command first.
+    opt[String]("network").valueName("<quic|zmq>").
+      text(NetworkFlagText).
+      validate(x => parseNetworkKind(x).toRight(s"--network must be quic or zmq, not '$x'").map(_ => ())).
+      action((x, c) => c.copy(network = parseNetworkKind(x).get))
 
     Commands.foreach: command =>
       cmd(command.name).text(command.description).
@@ -741,13 +771,14 @@ object Main {
    *  runs to well over a hundred lines. The details now have somewhere better to live.
    */
   private[cmdline] def topLevelHelp: String =
-    val column = (HelpFlag.length :: Commands.map(_.name.length)).max + 2
+    val column = (HelpFlag.length :: NetworkFlag.length :: Commands.map(_.name.length)).max + 2
     def row(left: String, right: String): String = s"  ${left.padTo(column, ' ')}$right"
 
     (s"aspen $Version" ::
      "Usage: aspen <command> [options] <args>..." ::
      "" ::
      row(HelpFlag, "Prints this usage text") ::
+     row(NetworkFlag, NetworkFlagText) ::
      "" ::
      "Commands:" ::
      Commands.map(c => row(c.name, c.description)) :::
@@ -791,6 +822,8 @@ object Main {
         // A def so that only the commands that reach a running system fetch the bootstrap config.
         def session: ClientSession =
           openClientSession(absPath(cfg.clientConfigFile), cfg.bootstrapHost)
+
+        networkKind = cfg.network
 
         try
           //println(s"Config file: $config")
@@ -861,11 +894,15 @@ object Main {
   def createNetwork(bootstrapConfig: BootstrapConfig.Config,
                     onRefresh: (String, BootstrapConfig.Config) => Unit,
                     ohost: Option[(HostId, Int)],
-                    oclientId: Option[ClientId]): (NetworkBridge, NetworkPlugin) = {
+                    oclientId: Option[ClientId],
+                    tls: TlsCredentials): (NetworkBridge, NetworkPlugin) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    val net = new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
+    val net: NetworkPlugin = networkKind match
+      case NetworkKind.Quic => new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls)
+      // ZMQ connections are unauthenticated, so the credentials go unused.
+      case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
     onetwork = Some(net)
     (b, net)
   }
@@ -919,13 +956,18 @@ object Main {
       latest.synchronized:
         latest.set(refreshCachedHosts(session.clientConfigFile, latest.get, fetched))
 
-    createAspenClient(session.bootstrapConfig, onRefresh)
+    val tls = TlsCredentials.fromPem(session.bootstrapConfig.caCertificate,
+                                     session.clientConfig.credentials.certificate,
+                                     session.clientConfig.credentials.privateKey)
+
+    createAspenClient(session.bootstrapConfig, onRefresh, tls)
 
   def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
+                        tls: TlsCredentials,
                         onnet: Option[(NetworkBridge, NetworkPlugin)] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
 
-    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None))
+    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
     val initialReadDelay = Duration(10, SECONDS)
@@ -1116,7 +1158,36 @@ object Main {
 
 
 
+  /** A host started by startHost.
+   *
+   *  `stop` exists for tests that run a host in-process and must not leak its threads, stores, or
+   *  ports into the next test. Production never calls it: Aspen is crash-only, and run_host blocks
+   *  until the process is killed.
+   */
+  final case class RunningHost(host: Host, network: NetworkPlugin, client: AspenClient)
+                              (stopAction: () => Unit):
+    def stop(): Unit = stopAction()
+
+  /** Starts the `host` command: blocks forever once the host is running. */
   def run_host(hostDir: Path): Int = {
+    configureLogging()
+
+    val h = startHost(hostDir)
+
+    // The storage host is meant to run indefinitely. Blocking the main thread on the IO
+    // thread is what keeps the process alive; the IO thread itself is a daemon thread.
+    h.network.joinIoThread()
+
+    0 // unreachable
+  }
+
+  /** Everything run_host does short of blocking: loads the host directory's configs, builds the
+   *  network and the host's client, starts the bootstrap HTTP server, and starts the host.
+   *
+   *  Logging is left alone so an in-process caller (a test) keeps its own configuration;
+   *  run_host configures it first.
+   */
+  def startHost(hostDir: Path): RunningHost = {
 
     val sched = Executors.newScheduledThreadPool(3)
     val ec = ExecutionContext.fromExecutorService(sched)
@@ -1145,8 +1216,6 @@ object Main {
       atomicWrite(bsCfgFile, yaml)
       scribe.info(s"Updated bootstrap config written to $bsCfgFile")
 
-    configureLogging()
-
     val simpleCrl = hostCfg.crl match {
       case b: HostConfig.SimpleCRL =>
         val crlRoot = absHostDir.resolve("crl")
@@ -1155,12 +1224,22 @@ object Main {
         SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024)
     }
 
+    // Remembers the CRL the Host creates so RunningHost.stop can shut down its threads.
+    val createdCrl = AtomicReference[Option[CrashRecoveryLog]](None)
+    val crlFactory = new CrashRecoveryLogFactory:
+      def createCRL(): CrashRecoveryLog =
+        val crl = simpleCrl.createCRL()
+        createdCrl.set(Some(crl))
+        crl
+
+    val tls = TlsCredentials.fromPem(bootstrapCfg.caCertificate, hostCfg.tlsCertificate, hostCfg.tlsPrivateKey)
+
     val objectCacheFactory = () => new SimpleLRUObjectCache(100)
 
     val (networkBridge, nnet) = createNetwork(bootstrapCfg, onBootstrapConfigRefreshed,
-                                              Some((hostCfg.hostId, hostCfg.dataPort)), None)
+                                              Some((hostCfg.hostId, hostCfg.dataPort)), None, tls)
 
-    val (client, network, _) = createAspenClient(bootstrapCfg, onBootstrapConfigRefreshed,
+    val (client, network, _) = createAspenClient(bootstrapCfg, onBootstrapConfigRefreshed, tls,
                                                  Some((networkBridge, nnet)))
 
     networkBridge.oclient = Some(client)
@@ -1184,7 +1263,7 @@ object Main {
       objectCacheFactory,
       nodeNet,
       new BackgroundTaskManager(ec),
-      simpleCrl,
+      crlFactory,
       txFinalizerFactory,
       SimpleTransactionDriver.factory(txRetryDelay, txRetryCap),
       txHeartbeatPeriod,
@@ -1197,17 +1276,33 @@ object Main {
 
     // Serve the bootstrap config to new hosts and clients. A BindException here propagates
     // and ends the command, which is preferable to running a host that cannot be bootstrapped from.
-    new BootstrapHttpServer(hostCfg.httpPort,
-                            () => client.getBootstrapConfig(),
-                            () => Files.readString(bsCfgFile)).start()
+    val httpServer = new BootstrapHttpServer(hostCfg.httpPort,
+                                             () => client.getBootstrapConfig(),
+                                             () => Files.readString(bsCfgFile))
+    httpServer.start()
 
     host.start()
 
-    // The storage host is meant to run indefinitely. Blocking the main thread on the IO
-    // thread is what keeps the process alive; the IO thread itself is a daemon thread.
-    network.joinIoThread()
+    // Test-only teardown, in dependency order: stop traffic, close the stores while the host's
+    // event loop and the CRL can still service the close, then stop the threads they ran on.
+    // Each step is attempted even if an earlier one failed.
+    def stop(): Unit =
+      def step(body: => Unit): Unit =
+        try body
+        catch case t: Throwable => scribe.warn(s"RunningHost.stop: $t")
+      val timeout = Duration(30, SECONDS)
+      step(network.shutdown(Duration.Zero))
+      step(httpServer.stop())
+      step(Await.result(Future.sequence(host.getStoreIds.map(host.closeStore)), timeout))
+      step(Await.result(host.shutdown(), timeout))
+      step(createdCrl.get.foreach { case c: SimpleCRL => c.shutdown(); case _ => () })
+      step(client.shutdown())
+      step(client.clientContext match
+        case es: java.util.concurrent.ExecutorService => es.shutdownNow()
+        case _ => ())
+      step(sched.shutdownNow())
 
-    0 // unreachable
+    RunningHost(host, network, client)(() => stop())
   }
 
   def mkdirectory(p: Path): Unit = {
@@ -1349,6 +1444,9 @@ object Main {
     println("radicle:")
     println(s"    uuid:      ${radicle.id}")
     println(s"    pool-uuid: ${radicle.poolId}")
+
+    // Released so a host started in this same process (as the tests do) can open them.
+    Await.result(Future.sequence(bootstrapStores.map(_.close())), Duration(30, SECONDS))
     sched.shutdownNow()
 
     0

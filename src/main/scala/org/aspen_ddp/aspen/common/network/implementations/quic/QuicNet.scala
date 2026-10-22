@@ -128,6 +128,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private val nextDialIndex = new AtomicInteger(0)
 
+  /** The inbound connection each host's most recent `HostHeartbeat` arrived on, while that connection is open.
+    * Written on loops. See `heartbeatFrom`.
+    */
+  private val heartbeatConnections = new ConcurrentHashMap[HostId, QuicConnection]()
+
   /** Runs `resolveHost` for host names. Threads are created on demand, so a stuck lookup blocks no other. */
   private val resolverPool: ExecutorService = Executors.newCachedThreadPool(DaemonThreads.factory("aspen-quic-resolve"))
 
@@ -446,6 +451,16 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     closeAll(CloseAwaitMillis)
     group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
+  /** Simulates a crash: closes the datagram channels first, so no QUIC close frame can reach a peer, then terminates
+    * the group. Peers keep their connections to this net until they find out by other means.
+    */
+  private[quic] def crashForTests(): Unit =
+    livenessTask.cancel(false)
+    (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
+    resolverPool.shutdownNow()
+    group.shutdownGracefully(0, 1, TimeUnit.SECONDS)
+    group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
+
   // ---- Send path (caller threads) ------------------------------------------------------------------------------
 
   private def sendQueued(entry: QuicHostEntry, queued: EvictingQueue[Message]): Unit =
@@ -641,6 +656,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private def inboundClosed(conn: QuicConnection): Unit =
     inboundConnections.remove(conn)
+    heartbeatConnections.forEach: (id, c) =>
+      if c eq conn then
+        heartbeatConnections.remove(id, c)
     connectionClosed(conn)
 
   private def connectionClosed(conn: QuicConnection): Unit =
@@ -648,6 +666,29 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     clientRouteMap.forEach: (id, c) =>
       if c eq conn then
         clientRouteMap.remove(id, c)
+
+  /** On `conn`'s loop. Marks the host online and detects a restarted peer.
+    *
+    * Netty's stateless-reset key is random per JVM and its server codec does not send resets, so after a peer
+    * restarts our outbound connection to it is black-holed until the idle timeout. A restarted peer heartbeats us
+    * over a new connection, though: when a host's heartbeat arrives on a different inbound connection than the
+    * previous one, our outbound connection to it is closed (on its own loop) so the next send re-dials. If the old
+    * inbound connection closed first, its record is gone and nothing is closed: a peer that closed it, or let it
+    * idle out, has done the same to our outbound connection.
+    */
+  private def heartbeatFrom(entry: QuicHostEntry, conn: QuicConnection): Unit =
+    entry.heartbeatReceived()
+    if inboundConnections.contains(conn) && !conn.isClosed then
+      val previous = heartbeatConnections.put(entry.hostId, conn)
+      if previous != null && (previous ne conn) then
+        val out = entry.connection.get()
+        if out != null && !out.isClosed then
+          logger.info(s"Host ${entry.name} heartbeats over a new connection; re-dialing it")
+          if out.loop.inEventLoop() then
+            out.close()
+          else
+            try out.loop.execute(() => out.close())
+            catch case _: RejectedExecutionException => () // shutting down
 
   private def recordRoute(id: ClientId, conn: QuicConnection): Unit =
     if conn != null && !conn.isClosed && (clientRouteMap.get(id) ne conn) then
@@ -658,7 +699,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     try
       msg match
         case hb: HostHeartbeat =>
-          metadataManager.getHostEntry(hb.hostId).foreach(_.heartbeatReceived())
+          metadataManager.getHostEntry(hb.hostId).foreach(entry => heartbeatFrom(entry, conn))
 
         case req: ClientRequest =>
           recordRoute(req.fromClient, conn)

@@ -66,6 +66,9 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(),
   /** Shuts down B. `b` keeps referring to the stopped net until `startB`. */
   def stopB(): Unit = b.net.closeForTests()
 
+  /** Stops B as a crash would: no QUIC close frame reaches A. `b` keeps referring to the stopped net until `startB`. */
+  def crashB(): Unit = b.net.crashForTests()
+
   /** Starts a fresh B on B's port */
   def startB(): Unit = b = host(hostIdB, portB)
 

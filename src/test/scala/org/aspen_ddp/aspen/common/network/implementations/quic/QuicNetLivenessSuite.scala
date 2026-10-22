@@ -13,7 +13,8 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
-import scala.concurrent.duration.{Duration, MILLISECONDS}
+import java.util.concurrent.TimeUnit
+import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 
 class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with BeforeAndAfterEach:
   import QuicNetFixture.*
@@ -128,6 +129,29 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val m = transferData(fx.hostIdB)
     fx.a.net.clientMessenger.sendHostMessage(m)
     await(fx.b.handler.hostMessages, 1).map(_.message) shouldBe List(m)
+
+  test("a crashed and restarted peer is re-dialed long before the idle timeout"):
+    // A long idle timeout, so only the heartbeat-connection change can make A drop its stale connection in time
+    fx.close()
+    fx = new QuicNetFixture(QuicConfig(idleTimeout = Some(Duration(30, SECONDS))), HeartbeatPeriod)
+    connectHosts()
+    eventually("A has heard B's heartbeats"):
+      entryFor(fx.a.net, fx.hostIdB).isOnline
+    val stale = entryFor(fx.a.net, fx.hostIdB).connection.get()
+    stale should not be null
+    fx.crashB()
+    Thread.sleep(300)
+    stale.isClosed shouldBe false // the crash sent no close frame
+    fx.startB()
+    val restarted = System.nanoTime()
+    val deadline = restarted + TimeUnit.MILLISECONDS.toNanos(RecoveryBudgetMillis)
+    var delivered = false
+    while !delivered && System.nanoTime() - deadline < 0 do
+      fx.a.net.clientMessenger.sendHostMessage(transferData(fx.hostIdB))
+      delivered = fx.b.handler.hostMessages.poll(50, TimeUnit.MILLISECONDS) != null
+    info(s"delivered to the restarted B ${(System.nanoTime() - restarted) / 1000000}ms after it was up")
+    delivered shouldBe true
+    stale.isClosed shouldBe true
 
   test("keepalive datagrams are not dispatched"):
     val c = fx.client()

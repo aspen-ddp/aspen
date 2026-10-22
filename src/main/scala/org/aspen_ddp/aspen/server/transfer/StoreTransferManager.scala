@@ -11,6 +11,7 @@ import java.io.InputStream
 import java.net.{InetSocketAddress, Socket, SocketException}
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
+import java.util.zip.CRC32
 import java.util.concurrent.{Executors, ScheduledExecutorService, TimeUnit}
 import javax.net.ssl.{SSLServerSocket, SSLSocket}
 import scala.concurrent.{Future, Promise}
@@ -23,8 +24,9 @@ object StoreTransferManager:
   /** 17-byte encoded StoreId followed by the 16-byte transfer UUID (msb, lsb; big-endian) */
   val HeaderSize: Int = 33
 
-  /** The 17-byte encoded StoreId, sent only after the whole archive was produced successfully */
-  val TrailerSize: Int = 17
+  /** 17-byte encoded StoreId, the 8-byte archive length, then the 4-byte CRC32 of the archive
+   *  (big-endian). Sent only after the whole archive was produced successfully. */
+  val TrailerSize: Int = 29
 
   def encodeHeader(storeId: StoreId, transferUUID: UUID): Array[Byte] =
     val bb = ByteBuffer.allocate(HeaderSize)
@@ -32,6 +34,14 @@ object StoreTransferManager:
     bb.put(storeId.toBytes)
     bb.putLong(transferUUID.getMostSignificantBits)
     bb.putLong(transferUUID.getLeastSignificantBits)
+    bb.array()
+
+  def encodeTrailer(storeId: StoreId, archiveLength: Long, archiveCrc: Long): Array[Byte] =
+    val bb = ByteBuffer.allocate(TrailerSize)
+    bb.order(ByteOrder.BIG_ENDIAN)
+    bb.put(storeId.toBytes)
+    bb.putLong(archiveLength)
+    bb.putInt(archiveCrc.toInt)
     bb.array()
 
   private def decodeHeader(arr: Array[Byte]): (StoreId, UUID) =
@@ -60,9 +70,10 @@ object StoreTransferManager:
 /** Sends and receives whole store directories as `jar` archives over one mutual-TLS TCP
  *  connection per transfer attempt.
  *
- *  Wire format: 33-byte header, the archive, then the 17-byte StoreId as a trailer. The trailer is
- *  written only after the sender's archiver exits successfully, so a stream that ends without it,
- *  or whose final 17 bytes are not the StoreId, is incomplete.
+ *  Wire format: 33-byte header, the archive, then a 29-byte trailer of the StoreId, the archive
+ *  length and the archive's CRC32. The trailer is written only after the sender's archiver exits
+ *  successfully, so a stream that ends without it, or whose final 29 bytes do not match the
+ *  StoreId and the archive bytes actually received, is incomplete or corrupt.
  */
 class StoreTransferManager(port: Int,
                            tls: TlsCredentials,
@@ -192,10 +203,14 @@ class StoreTransferManager(port: Int,
       logger.info(s"Sending store $storeId, transfer ${out.transferUUID}, to $host:$port")
 
       val buf = new Array[Byte](chunkSize)
+      val crc = new CRC32
+      var length = 0L
       var n = p.stdout.read(buf)
       while n != -1 do
         if n > 0 then
           write(buf, n)
+          crc.update(buf, 0, n)
+          length += n
         n = p.stdout.read(buf)
 
       p.waitFor()
@@ -205,8 +220,7 @@ class StoreTransferManager(port: Int,
         logger.warn(s"Transfer out of store $storeId, transfer ${out.transferUUID}, failed: archiver exited " +
           s"with code $exitCode: ${p.stderr.text().trim}")
       else
-        val trailer = storeId.toBytes
-        write(trailer, trailer.length)
+        write(encodeTrailer(storeId, length, crc.getValue), TrailerSize)
         sockOut.flush()
         sock.close()
         succeeded = true
@@ -348,6 +362,8 @@ class StoreTransferManager(port: Int,
       // Everything but the final TrailerSize bytes goes to the extractor; those are held back
       // until EOF shows whether they are the trailer.
       val buf = new Array[Byte](chunkSize + TrailerSize)
+      val crc = new CRC32
+      var length = 0L
       var held = 0
       var eof = false
       while !eof do
@@ -358,10 +374,12 @@ class StoreTransferManager(port: Int,
           held += n
           if held > TrailerSize then
             extractor.stdin.write(buf, 0, held - TrailerSize)
+            crc.update(buf, 0, held - TrailerSize)
+            length += held - TrailerSize
             System.arraycopy(buf, held - TrailerSize, buf, 0, TrailerSize)
             held = TrailerSize
 
-      if held != TrailerSize || !buf.take(TrailerSize).sameElements(storeId.toBytes) then
+      if held != TrailerSize || !buf.take(TrailerSize).sameElements(encodeTrailer(storeId, length, crc.getValue)) then
         fail(storeId, reg, "stream ended without a valid trailer")
       else
         extractor.stdin.close()

@@ -1,20 +1,6 @@
 TODO
 ====
 
-- Store-transfer trailer could carry the archive length.
-
-  The receiver's only completeness check is the 17-byte StoreId trailer
-  (StoreTransferManager.TrailerSize), held back from the extractor and compared on EOF, plus the
-  extractor's exit code. JDK SSLSocket treats a TCP FIN without close_notify as a normal EOF, so a
-  sender crash looks like a clean end of stream. A false accept would need the archive to end with
-  the StoreId bytes at exactly the point the connection dropped and jar --extract to exit 0 on
-  the truncated input -- astronomically unlikely, and the design deliberately chose no
-  length/checksum. Closing it is cheap, though: make the trailer the StoreId followed by an
-  8-byte big-endian count of archive bytes sent (TrailerSize = 25); the receiver counts the bytes
-  it forwards to the extractor and requires both to match. Optionally add a CRC32 of the archive.
-  Update the wire-protocol section of
-  docs/superpowers/specs/2026-10-22-store-transfer-tcp-design.md and the truncation tests.
-
 - QUIC test cleanups left over from removing StoreTransferData.
 
     - Unused DataBuffer imports in QuicTlsSuite.scala:5, QuicNetFlushSuite.scala:4 and

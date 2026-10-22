@@ -15,6 +15,7 @@ import org.scalatest.time.{Seconds, Span}
 import java.io.InputStream
 import java.net.{InetSocketAddress, ServerSocket, SocketException}
 import java.util.UUID
+import java.util.zip.CRC32
 import java.security.KeyStore
 import javax.net.ssl.{KeyManagerFactory, SSLContext, SSLException, SSLServerSocket, SSLSocket}
 import scala.collection.mutable.ArrayBuffer
@@ -93,7 +94,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
       sockets += s
       s.setSoTimeout(5000)
       s.startHandshake()
-      send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+      send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
       s.shutdownOutput()
       isClosedByPeer(s)
     }.getOrElse(true)
@@ -113,7 +114,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     os.exists(dest / sid.directoryName) should be(false)
 
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
@@ -209,6 +210,26 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
 
   private def newStoreId(): StoreId = StoreId(PoolId(UUID.randomUUID()), 2)
 
+  /** The trailer a well-behaved sender writes after `archive` */
+  private def trailer(sid: StoreId, archive: Array[Byte]): Array[Byte] =
+    val crc = new CRC32
+    crc.update(archive)
+    StoreTransferManager.encodeTrailer(sid, archive.length, crc.getValue)
+
+  /** Sends `archive` followed by `trailerFor`'s trailer for a fresh registration; asserts the transfer
+   *  fails and leaves no store directory behind */
+  private def assertRejectsTrailer(archive: Array[Byte], trailerFor: StoreId => Array[Byte]): Unit =
+    val m = newManager()
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val f = m.beginTransferIn(sid, u, dest)
+    val s = connect(m)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailerFor(sid))
+    s.close()
+    await(f).isFailure should be(true)
+    os.exists(dest / sid.directoryName) should be(false)
+
   private def send(s: SSLSocket, parts: Array[Byte]*): Unit =
     val out = s.getOutputStream
     parts.foreach(p => out.write(p))
@@ -238,7 +259,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val u = UUID.randomUUID()
     val f = m.beginTransferIn(sid, u, dest)
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
@@ -251,7 +272,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     os.write(dest / sid.directoryName / "stale", "old", createFolders = true)
     val f = m.beginTransferIn(sid, u, dest)
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
     await(f).isSuccess should be(true)
     os.exists(dest / sid.directoryName / "stale") should be(false)
@@ -276,10 +297,31 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val u = UUID.randomUUID()
     val f = m.beginTransferIn(sid, u, dest)
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u), archive, newStoreId().toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(newStoreId(), archive))
     s.close()
     await(f).isFailure should be(true)
     os.exists(dest / sid.directoryName) should be(false)
+
+  test("trailer with the wrong archive length fails"):
+    assertRejectsTrailer(archive, sid =>
+      val crc = new CRC32
+      crc.update(archive)
+      StoreTransferManager.encodeTrailer(sid, archive.length + 1, crc.getValue))
+
+  test("trailer with the wrong CRC fails"):
+    assertRejectsTrailer(archive, sid =>
+      val crc = new CRC32
+      crc.update(archive)
+      StoreTransferManager.encodeTrailer(sid, archive.length, crc.getValue ^ 1))
+
+  test("corrupted archive bytes fail the CRC check"):
+    val corrupted = archive.clone()
+    corrupted(corrupted.length / 2) = (corrupted(corrupted.length / 2) ^ 0xff).toByte
+    assertRejectsTrailer(corrupted, trailer(_, archive))
+
+  test("archive cut short before a full trailer fails"):
+    // The stream ends with a trailer that would be valid for the full archive
+    assertRejectsTrailer(archive.take(archive.length - 1000), trailer(_, archive))
 
   test("extractor failure fails the transfer"):
     val m = newManager()
@@ -288,8 +330,10 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val u = UUID.randomUUID()
     val f = m.beginTransferIn(sid, u, dest)
     val s = connect(m)
-    // A cut in the middle of the 3 MiB entry makes `jar --extract` exit 1
-    send(s, StoreTransferManager.encodeHeader(sid, u), archive.take(archive.length / 2), sid.toBytes)
+    // A cut in the middle of the 3 MiB entry makes `jar --extract` exit 1. The trailer matches the
+    // cut archive, so only the extractor can reject it.
+    val cut = archive.take(archive.length / 2)
+    send(s, StoreTransferManager.encodeHeader(sid, u), cut, trailer(sid, cut))
     s.close()
     await(f).isFailure should be(true)
     os.exists(dest / sid.directoryName) should be(false)
@@ -305,7 +349,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     val u = UUID.randomUUID()
     val f = m.beginTransferIn(sid, u, dest)
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
     await(f).isSuccess should be(true)
 
@@ -321,7 +365,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     isClosedByPeer(stale) should be(true)
 
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u2), archive, sid.toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u2), archive, trailer(sid, archive))
     s.close()
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
@@ -342,7 +386,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     send(second, StoreTransferManager.encodeHeader(sid, u))
     isClosedByPeer(second) should be(true)
 
-    send(first, archive.drop(half), sid.toBytes)
+    send(first, archive.drop(half), trailer(sid, archive))
     first.close()
     await(f).isSuccess should be(true)
     assertExtracted(dest / sid.directoryName)
@@ -369,7 +413,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     await(f1).isFailure should be(true)
 
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u2), archive, sid.toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u2), archive, trailer(sid, archive))
     s.close()
     await(f2).isSuccess should be(true)
     f1.value.exists(_.isFailure) should be(true)
@@ -385,7 +429,7 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     f.isCompleted should be(false)
 
     val s = connect(m)
-    send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, trailer(sid, archive))
     s.close()
     await(f).isSuccess should be(true)
 

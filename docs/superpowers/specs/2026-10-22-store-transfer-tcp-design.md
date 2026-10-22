@@ -79,11 +79,15 @@ abandoned-transfer handling).
    (most-significant long, then least-significant long, big-endian).
 3. Sender streams `jar --create` stdout, reading and writing in `CHUNK_SIZE` pieces
    (default 1 MiB).
-4. At end of the jar stream, sender writes the 17-byte `StoreId` as a trailer, then closes the
-   socket.
+4. At end of the jar stream, sender writes a 29-byte trailer, then closes the socket: the
+   17-byte encoded `StoreId`, the 8-byte count of archive bytes sent, then the 4-byte CRC32 of
+   those bytes (big-endian).
 
-The trailer is only the StoreId: the header has already bound the connection to the attempt, so
-the trailer only needs to mark a clean end of stream.
+The header has already bound the connection to the attempt, so the StoreId only marks a clean
+end of stream. The length and CRC32 guard against a sender crash being mistaken for a clean end:
+JDK `SSLSocket` treats a TCP FIN without `close_notify` as a normal EOF, so a truncated stream
+whose last 17 bytes happened to equal the StoreId would otherwise be accepted if `jar --extract`
+also exited 0 on it.
 
 ### `StoreTransferManager`
 
@@ -129,9 +133,11 @@ second connection with the same pair is also rejected.
 - Recursively delete `<destinationDirectory>/<storeId.directoryName>` if it exists, create it,
   spawn `jar --extract` there.
 - Read from the socket with a 90 s read timeout (`setSoTimeout`). Always hold back the most
-  recent 17 bytes; forward everything before them to the extractor's stdin.
-- On end of stream: if the held-back 17 bytes equal the StoreId, close the extractor's stdin and
-  wait for it to exit. Exit code 0 → success. Anything else → failure.
+  recent 29 bytes; forward everything before them to the extractor's stdin, counting them and
+  updating a CRC32 as they go.
+- On end of stream: if the held-back 29 bytes equal the StoreId, the forwarded byte count and
+  the CRC32, close the extractor's stdin and wait for it to exit. Exit code 0 → success.
+  Anything else → failure.
 - Failure cases: header mismatch is handled by the accept path (above); read timeout; trailer
   mismatch or stream shorter than the trailer; socket error; extractor non-zero exit or early
   death. On failure: destroy the extractor, delete the partial directory, fail the future.
@@ -170,7 +176,7 @@ second connection with the same pair is also rejected.
   tests keep working without sockets or subprocesses.
 - `StoreTransferManager` gets its own suite over real loopback TLS (certificates from
   `CertificateAuthority`): successful round-trip of a directory tree; truncated stream (no or
-  wrong trailer) fails and cleans up; stale UUID rejected while the correct one succeeds;
+  wrong trailer, wrong length or CRC32, corrupted archive bytes) fails and cleans up; stale UUID rejected while the correct one succeeds;
   unknown StoreId rejected; read-timeout failure (timeout made injectable so tests don't wait
   90 s); superseding transfer-out by newer timestamp; duplicate timestamp ignored.
 
@@ -194,8 +200,8 @@ Items marked *(call)* are the designer's judgement calls, not decisions made wit
 - **Sender completeness** *(call)*. After stdout reaches EOF, the sender waits for
   `jar --create` to exit and writes the trailer only if the exit code is 0. Otherwise it
   closes the socket without a trailer, and the receiver fails the attempt. An archive that
-  is truncated or failed can therefore never carry a valid trailer. The trailer, together
-  with the extractor's exit code, is the integrity check. No length or checksum is added.
+  is truncated or failed can therefore never carry a valid trailer. The trailer (StoreId,
+  archive length and CRC32), together with the extractor's exit code, is the integrity check.
 - **Source-side lifecycle is unchanged.** Pool repointing in
   `updateStateForTransferredStore` and the existing marker and offline handling decide what
   happens to the source copy, as they do today. `StoreTransferOut` completion only ever

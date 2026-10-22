@@ -64,25 +64,33 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
     }}
   }
 
+  /** Network plugins may deliver messages on their I/O threads (QUIC runs handlers on a Netty event loop).
+    * Decoding store responses and restoring the object is O(object size) work, so it is handed off to the
+    * client's ExecutionContext rather than stalling every other connection sharing that thread.
+    */
   def receive(m: ReadResponse): Unit = {
     synchronized { outstandingReads.get(m.readUUID) } match {
       case None => logger.warn(s"Received ReadResponse for UNKNOWN read ${m.readUUID}")
 
-      case Some(driver) =>
-        val wasCompleted = driver.readResult.isCompleted
-        val allResponded = driver.receiveReadResponse(m)
-        val isCompleted = driver.readResult.isCompleted
+      case Some(driver) => summon[ExecutionContext].execute(() => deliver(driver, m))
+    }
+  }
 
-        if (isCompleted) {
-          synchronized {
-            if (allResponded) {
-              completionTimes -= m.readUUID
-              outstandingReads -= m.readUUID
-            }
-            else if (!wasCompleted)
-              completionTimes += (m.readUUID -> (System.nanoTime()/1000000, driver))
-          }
+  private def deliver(driver: ReadDriver, m: ReadResponse): Unit = {
+    val wasCompleted = driver.readResult.isCompleted
+    val allResponded = driver.receiveReadResponse(m)
+    val isCompleted = driver.readResult.isCompleted
+
+    if (isCompleted) {
+      synchronized {
+        if (allResponded) {
+          completionTimes -= m.readUUID
+          outstandingReads -= m.readUUID
         }
+        // Responses are delivered concurrently so the final one may already have removed the read
+        else if (!wasCompleted && outstandingReads.contains(m.readUUID))
+          completionTimes += (m.readUUID -> (System.nanoTime()/1000000, driver))
+      }
     }
   }
 

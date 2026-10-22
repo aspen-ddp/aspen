@@ -1,22 +1,3 @@
 TODO
 ====
 
-- Client read completion does O(object size) work inline on the network thread. Move it off the
-  QUIC event loop, or make it cheap.
-
-  QuicNet runs every MessageHandler callback on a Netty event loop, so
-  BaseAspenClient.receiveClientResponse -> ReadManager.receive -> BaseReadDriver.receiveReadResponse
-  now runs there, holding the driver's lock, for every ReadResponse:
-
-    - BaseObjectReader.receiveReadResponse decodes each store's state (createObjectState) as its
-      response arrives. For a KeyValue object that is a full decode of the store's slice.
-    - DataObjectReader.restoreObject calls ida.restore. For ReedSolomon that is an erasure decode of
-      the whole object.
-    - On success BaseReadDriver logs `dos.data.hashString` at info. DataBuffer.hash copies the entire
-      payload with getByteArray and then CRC32s it, so a 32 MiB read costs a 32 MiB copy and a
-      32 MiB checksum on the loop just for a log line.
-
-  While that runs, every other connection on the same loop stalls, heartbeats and keepalives
-  included. The TxManager side (TransactionResolved / TransactionFinalized) only completes promises
-  and is fine. Options: hand ReadResponses to the client's ExecutionContext before restoring, drop
-  the hash from the log line or compute it only at trace.

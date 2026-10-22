@@ -61,7 +61,30 @@ backend:
     finally
       Files.deleteIfExists(f)
 
+  /** Open descriptors of this process that refer to `f`, from /proc/self/fd. Entries closing while being listed are
+    * skipped.
+    */
+  private def fdsOpenOn(f: java.nio.file.Path): Int =
+    val target = os.Path(f.toRealPath())
+    os.list(os.root / "proc" / "self" / "fd").count: fd =>
+      try os.readLink.absolute(fd) == target
+      catch case _: Exception => false
+
   test("repeated loads do not leak file descriptors"):
+    if os.isDir(os.root / "proc" / "self" / "fd") then
+      // Linux: only descriptors on this test's file count, so other suites opening sockets and files in parallel
+      // cannot disturb the result
+      val f = Files.createTempFile("aspen-store-fdcheck", ".yaml")
+      try
+        Files.write(f, sample.yamlConfig.getBytes(StandardCharsets.UTF_8))
+        for _ <- 1 to 500 do StoreConfig.loadStoreConfig(f.toFile)
+        fdsOpenOn(f) shouldBe 0
+      finally
+        Files.deleteIfExists(f)
+    else
+      fdCountCheck()
+
+  private def fdCountCheck(): Unit =
     ManagementFactory.getOperatingSystemMXBean match
       case os: com.sun.management.UnixOperatingSystemMXBean =>
         val f = Files.createTempFile("aspen-store-fdcheck", ".yaml")

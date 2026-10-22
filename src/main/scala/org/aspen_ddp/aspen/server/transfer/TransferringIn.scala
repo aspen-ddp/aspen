@@ -12,20 +12,15 @@ import java.util.UUID
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
 
-object TransferringIn:
-  val TransferDirectory = "transferring-in"
-
 class TransferringIn( val client: AspenClient,
                       val storeId: StoreId,
                       val storageDeviceId: StorageDeviceId,
                       val devicePath: Path ) extends StoreTransferIn with Logging:
 
-  import TransferringIn.*
-
   val transferUUID: UUID = UUID.randomUUID()
   
   private val completionPromise: Promise[Unit] = Promise()
-  private val transferInPath = os.Path(devicePath) / TransferDirectory / storeId.directoryName
+  private val transferInPath = os.Path(devicePath) / StoreTransfer.StagingDirectory / storeId.directoryName
   private val finalPath = os.Path(devicePath) / storeId.directoryName
 
   def complete: Future[Unit] = completionPromise.future
@@ -85,7 +80,7 @@ class TransferringIn( val client: AspenClient,
         logger.info(f"Transfer completed for store $storeId")
         extractionProcess.wait() // TODO: Move this to a background thread?
 
-        val tout = transferInPath / TransferringOut.MarkerFile
+        val tout = transferInPath / StoreTransfer.TransferOutMarkerFile
 
         if os.exists(tout) then
           os.remove(tout)

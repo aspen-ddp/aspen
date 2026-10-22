@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringOut}
+import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferFactory, StoreTransferIn, StoreTransferOut}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
@@ -627,7 +627,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   private def writeTransferringOutStore(deviceDir: Path, sid: StoreId = storeId): Path =
     val storeDir = deviceDir.resolve(sid.directoryName)
     Files.createDirectories(storeDir)
-    Files.write(storeDir.resolve(TransferringOut.MarkerFile), Array.emptyByteArray)
+    Files.write(storeDir.resolve(StoreTransfer.TransferOutMarkerFile), Array.emptyByteArray)
     storeDir
 
   /** Stages a store that this host skipped at load time because of its transfer-out marker.
@@ -671,7 +671,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
       // Both representations of "not served" have to go. The marker is the one that survives a
       // restart, so leaving it would make the repair last only until the process bounced.
-      Files.exists(storeDir.resolve(TransferringOut.MarkerFile)) should be(false)
+      Files.exists(storeDir.resolve(StoreTransfer.TransferOutMarkerFile)) should be(false)
 
       // And the load goes back through tryLoadStore rather than a parallel path, which is what
       // clears the two offlineStores sets in production. The recording override does not
@@ -703,8 +703,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       // yieldUntil gives up silently, so assert the condition it waited on.
       host.testingOnlyActiveDeviceChecks should not contain deviceA
 
-      Files.exists(outDir.resolve(TransferringOut.MarkerFile)) should be(true)
-      Files.exists(stagedDir.resolve(TransferringOut.MarkerFile)) should be(true)
+      Files.exists(outDir.resolve(StoreTransfer.TransferOutMarkerFile)) should be(true)
+      Files.exists(stagedDir.resolve(StoreTransfer.TransferOutMarkerFile)) should be(true)
       host.storeLoadAttempts.size should be(before)
 
   /** Zeroes both of `deviceId`'s ids in the storage-devices tree, exactly as

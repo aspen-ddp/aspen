@@ -20,7 +20,7 @@ import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, 
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ReadError, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
-import org.aspen_ddp.aspen.server.transfer.{StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringIn, TransferringOut}
+import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringIn}
 import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, ServiceEntry, TaskExecutor}
@@ -361,7 +361,7 @@ class Host(val client: AspenClient,
     if Files.exists(storeCfgPath) then
       try
         val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath.toFile)
-        if os.exists(os.Path(potentialStoreFile) / TransferringOut.MarkerFile) then
+        if os.exists(os.Path(potentialStoreFile) / StoreTransfer.TransferOutMarkerFile) then
           logger.info(s"Skipping load of offline store marked for transfer out. StoreId ${storeCfg.storeId}. $potentialStoreFile")
           offlineStores += storeCfg.storeId
           sds.offlineStores += storeCfg.storeId
@@ -1137,7 +1137,7 @@ class Host(val client: AspenClient,
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
-        os.exists(os.Path(local.devicePath) / storeId.directoryName / TransferringOut.MarkerFile)
+        os.exists(os.Path(local.devicePath) / storeId.directoryName / StoreTransfer.TransferOutMarkerFile)
       ).foreach: storeId =>
         reinstateAbandonedTransferOut(local, storeId)
 
@@ -1208,7 +1208,7 @@ class Host(val client: AspenClient,
 
     val markerRemoved =
       try
-        os.remove(storePath / TransferringOut.MarkerFile)
+        os.remove(storePath / StoreTransfer.TransferOutMarkerFile)
         true
       catch
         case t: Throwable =>

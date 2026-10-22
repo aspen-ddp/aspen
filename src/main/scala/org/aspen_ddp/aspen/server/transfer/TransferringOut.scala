@@ -11,9 +11,6 @@ import java.nio.file.Path
 import java.util.UUID
 import scala.concurrent.{Future, Promise}
 
-object TransferringOut:
-  val MarkerFile = "transferring-out"
-
 class TransferringOut( val client: AspenClient,
                        val fromDevice: StorageDeviceId,
                        val devicePath: Path,
@@ -23,15 +20,13 @@ class TransferringOut( val client: AspenClient,
                        val timestamp: HLCTimestamp,
                        val transferUUID: UUID ) extends StoreTransferOut with Logging:
 
-  import TransferringOut.*
-
   private val storePath = os.Path(devicePath) / storeId.directoryName
   private val completionPromise: Promise[Unit] = Promise()
 
   def complete: Future[Unit] = completionPromise.future
 
   // Create marker file so the server knows not to load this store
-  os.write.over(storePath / MarkerFile, "")
+  os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
 
   logger.info(s"Beginning transfer of store $storeId on storage device $fromDevice to storage device $toDevice on host $toHost")
 

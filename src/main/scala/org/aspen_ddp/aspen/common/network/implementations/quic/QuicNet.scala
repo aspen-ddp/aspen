@@ -70,15 +70,8 @@ object QuicNet:
 
     def dropCacheForStore(storeId: StoreId): Unit = net.metadataManager.dropStoreMapping(storeId)
 
-    /** Through membership, and for an endpoint change also directly to every host this one has resolved: a host
-      * whose endpoint really changed cannot take part in membership until its peers re-read its host object, since
-      * their replies still go to its old address (see `endpointChangedDirect`)
-      */
-    override def broadcastGossip(g: Gossip): Unit = net.membership.foreach: m =>
-      m.broadcast(g)
-      g match
-        case h: HostEndpointChanged => net.tellResolvedHosts(h)
-        case _: StoreMoved => ()
+    /** Through membership only. A host whose endpoint changed can gossip too: see `sendClusterMessage`. */
+    override def broadcastGossip(g: Gossip): Unit = net.membership.foreach(_.broadcast(g))
 
 
 /** A `NetworkPlugin` over Netty QUIC with mutual TLS.
@@ -139,6 +132,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Most recent connection each client's `ClientRequest`s arrived on. Written on loops, read by any sender. */
   private val clientRouteMap = new ConcurrentHashMap[ClientId, QuicConnection]()
 
+  /** Most recent connection each host's scalecube traffic arrived on. Written on loops, read by membership's sends.
+    * See `sendClusterMessage`.
+    */
+  private val clusterRouteMap = new ConcurrentHashMap[HostId, QuicConnection]()
+
   private val nextDialIndex = new AtomicInteger(0)
 
   /** The last boot id seen from each host in a `ClusterTransportMessage`. Written on loops. See `clusterMessage`. */
@@ -185,7 +183,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       // Seeds are fixed here: scalecube cannot change them after start. They matter only for the first join (later
       // the cluster's own membership finds peers), so a bootstrap refresh need not reach them.
       new HostMembership(hostId, UUID.randomUUID(), initialBootstrapConfig.hosts.map(_.hostId), config.gossip,
-        m => sendToHostId(m.toHost, m))
+        sendClusterMessage)
 
   // ---- Pipeline handlers ---------------------------------------------------------------------------------------
 
@@ -351,12 +349,6 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       metadataManager.dropHostEntry(hostId).foreach: entry =>
         logger.info(s"Host ${entry.name} changed endpoint; dropping its entry and connection")
         closeOutbound(entry)
-
-  /** Sends `g` as a top-level message to every resolved host but this one. See `SrvMessenger.broadcastGossip`. */
-  private def tellResolvedHosts(g: HostEndpointChanged): Unit =
-    metadataManager.resolvedHostEntries.foreach: entry =>
-      if !ohost.exists(_._1 == entry.hostId) then
-        sendToHost(entry, g)
 
   initOrAbort:
     membership.foreach: m =>
@@ -562,6 +554,35 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       catch
         case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to host ${entry.name} failed: $e")
 
+  /** Membership's send path. Scalecube traffic goes back over the connection the peer's own scalecube traffic last
+    * arrived on, and only to a host not heard from yet (or whose connection closed) through its host entry.
+    *
+    * Why: a host whose endpoint changed (its host object updated at startup, see `Host.reconcileEndpoint`) is still
+    * known to every peer by its old address, because a resolved host entry is only replaced when a
+    * `HostEndpointChanged` gossip drops it. The moved host can reach its peers, since its own outbound connections
+    * use fresh addresses, but scalecube answers every message (SYNC_ACK, ping acks, metadata responses) by sending
+    * to the sender's member address, and a send through the stale entry goes to the old address and is lost. The
+    * moved host would then never learn the member list, and its `HostEndpointChanged` gossip, which is what makes
+    * peers re-read its host object, would have nobody to go to. Replying over the connection the moved host dialed
+    * breaks that deadlock: it joins normally, and its gossip spreads to everyone through the cluster.
+    *
+    * This was chosen over having the moved host also send `HostEndpointChanged` directly to every host it had
+    * resolved (which they re-gossiped). That works too, but adds a second delivery path for one message; with reply
+    * routing, endpoint changes travel through gossip alone, as every other gossip does. Nor can a restart drop the
+    * peer's entry to force a re-read: the re-read can wait forever behind the restarted host's own bootstrap stores
+    * (see `clusterMessage`).
+    *
+    * A crashed peer's route stays until its connection idles out; sends to it are lost, which is what failure
+    * detection expects. A restarted peer's first message arrives on its new connection and replaces the route.
+    */
+  private def sendClusterMessage(m: ClusterTransportMessage): Unit =
+    val route = clusterRouteMap.get(m.toHost)
+    if route != null && !route.isClosed && !shuttingDown then
+      try route.submit(QuicMessageCodec.encode(m, PooledByteBufAllocator.DEFAULT))
+      catch case NonFatal(e) => logger.warn(s"QUIC send of cluster traffic to host ${m.toHost} failed: $e")
+    else
+      sendToHostId(m.toHost, m)
+
   private def sendToClient(msg: ClientResponse): Unit =
     if shuttingDown then
       droppedAfterShutdown(msg)
@@ -683,6 +704,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     clientRouteMap.forEach: (id, c) =>
       if c eq conn then
         clientRouteMap.remove(id, c)
+    clusterRouteMap.forEach: (id, c) =>
+      if c eq conn then
+        clusterRouteMap.remove(id, c)
 
   /** Closes `entry`'s outbound connection, if open (and, with `establishedOnly`, past its handshake), on its own
     * loop, so the next send re-dials
@@ -696,7 +720,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         try out.loop.execute(() => out.close())
         catch case _: RejectedExecutionException => () // shutting down
 
-  /** On a loop. Hands scalecube traffic to membership (host mode only), re-dialing a restarted peer first.
+  /** On a loop. Hands scalecube traffic to membership (host mode only), after recording `conn` as the route our
+    * scalecube traffic to the sender goes back over (see `sendClusterMessage`) and re-dialing a restarted peer.
     *
     * Netty's stateless-reset key is random per JVM and its server codec does not send resets, so after a peer
     * restarts our outbound connection to it is black-holed until the idle timeout, and scalecube cannot see the new
@@ -708,25 +733,20 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     * Only an established connection is closed. One still handshaking is not black-holed: the restarted peer answers
     * its retransmitted Initial. Closing it would only drop the messages queued behind its handshake.
     */
-  private def clusterMessage(m: ClusterTransportMessage): Unit =
+  private def clusterMessage(conn: QuicConnection, m: ClusterTransportMessage): Unit =
     membership.foreach: hm =>
+      if conn != null && !conn.isClosed && (clusterRouteMap.get(m.fromHost) ne conn) then
+        clusterRouteMap.put(m.fromHost, conn)
       val previous = bootIds.put(m.fromHost, m.fromBootId)
       if previous != null && previous != m.fromBootId then
         // Deliberately close-only: the entry is kept. Dropping it would force a host-object re-read, which can park
         // forever behind the restarted host's own bootstrap stores (the read's messages to them wait on that very
-        // lookup). A host whose endpoint really moved says so with a direct HostEndpointChanged instead.
+        // lookup). A host whose endpoint really moved rejoins over its own connection (see `sendClusterMessage`)
+        // and gossips HostEndpointChanged, which drops the entry.
         metadataManager.peekHostEntry(m.fromHost).foreach: entry =>
           logger.info(s"Host ${entry.name} restarted (new boot id); re-dialing it")
           closeOutbound(entry, establishedOnly = true)
       hm.receive(m)
-
-  /** On a loop. A `HostEndpointChanged` sent to us directly by the host that moved (host mode only): applied as if
-    * gossiped, then gossiped on through our own membership, which (unlike the moved host's) can reach every member.
-    */
-  private def endpointChangedDirect(g: HostEndpointChanged): Unit =
-    membership.foreach: hm =>
-      endpointChanged(g.hostId)
-      hm.broadcast(g)
 
   private def recordRoute(id: ClientId, conn: QuicConnection): Unit =
     if conn != null && !conn.isClosed && (clientRouteMap.get(id) ne conn) then
@@ -750,12 +770,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           messageHandler.onHostMessageReceived(hm)
 
         case m: ClusterTransportMessage =>
-          clusterMessage(m)
+          clusterMessage(conn, m)
 
-        case g: HostEndpointChanged =>
-          endpointChangedDirect(g)
-
-        case _: HostResponse | _: HostHeartbeat | _: StoreMoved =>
-          // Not handled: liveness comes from host membership, and StoreMoved only travels inside scalecube payloads
+        case _: HostResponse | _: HostHeartbeat | _: Gossip =>
+          // Not handled: liveness comes from host membership, and gossip only travels inside scalecube payloads
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)

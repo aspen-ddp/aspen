@@ -122,6 +122,14 @@ gossip), that runs over the existing QUIC message passing and:
   `QuicNet`'s existing host-message path. The payload is the scalecube `Message` encoded with scalecube's
   `MessageCodec` and is opaque to Aspen.
 - Inbound messages of this type are decoded and pushed into the adapter's `listen()` stream.
+- **Reply routing** *(decided after implementation)*: `QuicNet` sends scalecube traffic back over the
+  connection the peer's own scalecube traffic last arrived on, and uses the host entry only for a host it has
+  not heard from yet.
+  - Without this, a host whose endpoint changed could never join: peers still hold its old address in
+    their cached host entries, so every scalecube reply (SYNC_ACK, ping acks) to it is lost. It would never
+    learn the member list, so its `HostEndpointChanged` gossip would reach no one.
+  - This replaced an interim design in which the moved host also sent `HostEndpointChanged` directly to
+    every host it had resolved. With reply routing, endpoint changes travel through gossip alone.
 - `requestResponse` is implemented on top of `send` plus `listen` by matching `correlationId`, with a
   timeout as scalecube expects.
 - QUIC's existing "drop, never queue, when buffers are full" policy is fine. Scalecube tolerates loss.

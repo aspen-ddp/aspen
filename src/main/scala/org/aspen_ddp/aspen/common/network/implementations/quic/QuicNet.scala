@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.network.implementations.quic
 
 import io.netty.bootstrap.Bootstrap
-import io.netty.buffer.{ByteBuf, PooledByteBufAllocator}
+import io.netty.buffer.{ByteBuf, PooledByteBufAllocator, Unpooled}
 import io.netty.channel.{Channel, ChannelFuture, ChannelHandler, ChannelHandlerContext, ChannelInboundHandlerAdapter,
   ChannelInitializer, EventLoop, IoHandlerFactory, MultiThreadIoEventLoopGroup}
 import io.netty.channel.epoll.{Epoll, EpollDatagramChannel, EpollIoHandler}
@@ -24,7 +24,7 @@ import scribe.Logging
 import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, RejectedExecutionException, TimeUnit, TimeoutException}
-import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
@@ -34,6 +34,8 @@ object QuicNet:
   private val ConnectionKey: AttributeKey[QuicConnection] = AttributeKey.valueOf("aspen-quic-connection")
 
   private val CloseAwaitMillis: Long = 5000
+
+  private val FlushPollMillis: Long = 25
 
   private def remoteOf(ch: Channel): Any = ch match
     case q: QuicChannel => q.remoteSocketAddress()
@@ -112,6 +114,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private val clientRouteMap = new ConcurrentHashMap[ClientId, QuicConnection]()
 
   private val nextDialIndex = new AtomicInteger(0)
+
+  /** Set by `shutdown`; every send after that is a silent drop */
+  @volatile private var shuttingDown = false
+  private val shutdownStarted = new AtomicBoolean(false)
 
   private val keepaliveCount = new AtomicLong(0)
   private val undecodableCount = new AtomicLong(0)
@@ -254,11 +260,111 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   def joinIoThread(): Unit = group.terminationFuture().awaitUninterruptibly()
 
+  /** Blocks the caller until every message submitted before the call has been accepted by QUIC (its datagram or
+    * stream write future has completed) or dropped, or until `timeout`. Returns true only if that happened in time.
+    *
+    * Runs against one deadline:
+    *  1. Polls every 25ms until `MetadataManager` holds no messages parked on a lookup.
+    *  2. Posts a barrier on every live connection, outbound and inbound. A barrier completes once every write handed
+    *     to its connection before it has completed or been dropped; on a connection still handshaking, once the
+    *     pre-handshake messages have been written or dropped.
+    *  3. Waits for all barriers.
+    *
+    * Messages submitted after a barrier was posted are not waited for. Dropped messages (full budgets, failed lookups,
+    * failed handshakes) count as no longer pending. Acceptance by QUIC is not a delivery guarantee: Netty does not
+    * report when quiche has put the packets on the wire, and nothing waits for the peer.
+    *
+    * Known limit: the connections are snapshotted after step 1. A message released from a lookup by step 1 is
+    * covered only if the connection it went to already exists at the snapshot. If the send that the lookup
+    * completion triggered has not yet created its connection by then (the resolution and the dial race the
+    * snapshot), that message is not waited for. Similarly a message whose sender is between installing a new
+    * connection on its host entry and registering it may be missed, though connections on resolved host entries are
+    * included directly to narrow that window.
+    *
+    * Must not be called on one of this plugin's event loops: that would block the loop the barriers need.
+    *
+    * @throws IllegalStateException if called on one of this plugin's event loops
+    */
   def awaitPendingMessagesSent(timeout: Duration): Boolean =
-    throw new NotImplementedError("QuicNet.awaitPendingMessagesSent is not implemented yet")
+    if loops.exists(_.inEventLoop()) then
+      throw new IllegalStateException("QuicNet.awaitPendingMessagesSent must not be called on an event loop")
 
+    val deadline = System.nanoTime() + timeout.toNanos
+    def remainingMillis: Long = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+
+    while metadataManager.hasParkedMessages && remainingMillis > 0 do
+      Thread.sleep(math.min(FlushPollMillis, remainingMillis))
+
+    if metadataManager.hasParkedMessages then
+      false
+    else
+      val conns = new java.util.IdentityHashMap[QuicConnection, Unit]()
+      liveConnections.forEach(c => conns.put(c, ()))
+      metadataManager.resolvedHostEntries.foreach: entry =>
+        val c = entry.connection.get()
+        if c != null then
+          conns.put(c, ())
+      clientRouteMap.values().forEach(c => conns.put(c, ()))
+
+      val barriers = conns.keySet().asScala.toList.map(_.postBarrier())
+      barriers.forall: b =>
+        b.await(math.max(0L, remainingMillis), TimeUnit.MILLISECONDS)
+
+  /** Stops the network. Idempotent: calls after the first do nothing.
+    *
+    *  1. Every send from now on is silently dropped, and the liveness tick is cancelled.
+    *  2. Sleeps the full `linger` on the caller's thread, so quiche can transmit what flush handed it.
+    *     `QuicConnectionStats` exposes no "unsent bytes" signal, so it cannot end early.
+    *  3. On each connection's own loop, closes it with a QUIC application close (code 0, empty reason).
+    *  4. Closes the datagram channels.
+    *  5. Starts `shutdownGracefully(0, 1s)` on the group. `joinIoThread` returns once it has terminated.
+    *
+    * Call `awaitPendingMessagesSent` first: anything still in the plugin's own queues is discarded. The close frame
+    * is a best-effort courtesy (crash-only). Exceptions are swallowed and logged at trace, as in `ZMQNet`.
+    */
   def shutdown(linger: Duration): Unit =
-    throw new NotImplementedError("QuicNet.shutdown is not implemented yet")
+    if shutdownStarted.compareAndSet(false, true) then
+      shuttingDown = true
+      quietly("cancel liveness tick"):
+        livenessTask.cancel(false)
+      quietly("linger"):
+        val ms = linger.toMillis
+        if ms > 0 then
+          Thread.sleep(ms)
+      closeAll(awaitMillis = if loops.exists(_.inEventLoop()) then 0L else CloseAwaitMillis)
+
+  /** Runs `body`, logging anything it throws at trace. Interrupts are re-asserted. */
+  private def quietly(step: String)(body: => Unit): Unit =
+    try body
+    catch
+      case e: InterruptedException =>
+        Thread.currentThread().interrupt()
+        logger.trace(s"QuicNet shutdown ($step) interrupted: $e")
+      case t: Throwable => logger.trace(s"QuicNet shutdown ($step) failed: $t")
+
+  /** Steps 3-5 of `shutdown`, shared with `closeForTests`. Each step is attempted even if an earlier one failed.
+    * `awaitMillis` bounds each wait for the connection closes and channel closes; 0 skips waiting (on a loop).
+    */
+  private def closeAll(awaitMillis: Long): Unit =
+    quietly("close connections"):
+      val closes = liveConnections.toArray(new Array[QuicConnection](0)).toList.flatMap: conn =>
+        try Some(conn.loop.submit((() => closeOnLoop(conn)): Runnable))
+        catch case _: RejectedExecutionException => None
+      if awaitMillis > 0 then
+        closes.foreach(_.awaitUninterruptibly(awaitMillis))
+    quietly("close datagram channels"):
+      val closes = (serverChannels ++ clientChannels).toList.map(_.close())
+      if awaitMillis > 0 then
+        closes.foreach(_.awaitUninterruptibly(awaitMillis))
+    quietly("shut down event loop group"):
+      group.shutdownGracefully(0, 1, TimeUnit.SECONDS)
+
+  /** On `conn`'s loop: QUIC application close of an attached channel, then the connection's own close */
+  private def closeOnLoop(conn: QuicConnection): Unit =
+    val ch = conn.attachedChannel
+    if ch != null && ch.isOpen then
+      ch.close(true, 0, Unpooled.EMPTY_BUFFER)
+    conn.close()
 
   // ---- Test accessors ------------------------------------------------------------------------------------------
 
@@ -272,22 +378,22 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private[quic] def inboundConnectionLoops: Set[EventLoop] = inboundConnections.asScala.map(_.loop).toSet
 
+  private[quic] def eventLoopsForTests: Seq[EventLoop] = loops.toSeq
+
   /** Keepalive datagrams received and discarded */
   private[quic] def keepalivesReceived: Long = keepaliveCount.get()
 
   /** Datagrams that failed to decode */
   private[quic] def undecodableDatagrams: Long = undecodableCount.get()
 
-  /** Cancels the liveness tick, closes every connection on its loop (which cancels its timers), closes the
-    * datagram channels and terminates the group
+  /** `shutdown` without the shutting-down flag or the linger, waiting for the group to terminate: cancels the
+    * liveness tick, closes every connection on its loop (which cancels its timers), closes the datagram channels and
+    * terminates the group
     */
   private[quic] def closeForTests(): Unit =
     livenessTask.cancel(false)
-    liveConnections.toArray(new Array[QuicConnection](0)).foreach: conn =>
-      try conn.loop.submit((() => conn.close()): Runnable).awaitUninterruptibly(CloseAwaitMillis)
-      catch case _: RejectedExecutionException => ()
-    (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
-    group.shutdownGracefully(0, 1, TimeUnit.SECONDS).awaitUninterruptibly(CloseAwaitMillis * 2)
+    closeAll(CloseAwaitMillis)
+    group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
   // ---- Send path (caller threads) ------------------------------------------------------------------------------
 
@@ -298,34 +404,49 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       omsg = queued.dequeue()
 
   private def sendToStore(storeId: StoreId, msg: Message): Unit =
-    try
-      // None: parked on a lookup; storeResolved or createHostEntry sends it later
-      metadataManager.getHostEntryOrQueueMessage(storeId, msg).foreach(sendToHost(_, msg))
-    catch
-      case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to store $storeId failed: $e")
+    if shuttingDown then
+      droppedAfterShutdown(msg)
+    else
+      try
+        // None: parked on a lookup; storeResolved or createHostEntry sends it later
+        metadataManager.getHostEntryOrQueueMessage(storeId, msg).foreach(sendToHost(_, msg))
+      catch
+        case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to store $storeId failed: $e")
 
   private def sendToHostId(hostId: HostId, msg: Message): Unit =
-    try
-      metadataManager.getHostEntryOrQueueMessage(hostId, msg).foreach(sendToHost(_, msg))
-    catch
-      case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to host $hostId failed: $e")
+    if shuttingDown then
+      droppedAfterShutdown(msg)
+    else
+      try
+        metadataManager.getHostEntryOrQueueMessage(hostId, msg).foreach(sendToHost(_, msg))
+      catch
+        case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to host $hostId failed: $e")
 
   private[quic] def sendToHost(entry: QuicHostEntry, msg: Message): Unit =
-    try
-      val conn = connectionFor(entry)
-      conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT))
-    catch
-      case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to host ${entry.name} failed: $e")
+    if shuttingDown then
+      droppedAfterShutdown(msg)
+    else
+      try
+        val conn = connectionFor(entry)
+        conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT))
+      catch
+        case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to host ${entry.name} failed: $e")
 
   private def sendToClient(msg: ClientResponse): Unit =
-    try
-      val conn = clientRouteMap.get(msg.toClient)
-      if conn == null then
-        logger.debug(s"Dropping ${msg.getClass.getSimpleName} for unknown client ${msg.toClient.uuid}")
-      else
-        conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT))
-    catch
-      case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to client ${msg.toClient.uuid} failed: $e")
+    if shuttingDown then
+      droppedAfterShutdown(msg)
+    else
+      try
+        val conn = clientRouteMap.get(msg.toClient)
+        if conn == null then
+          logger.debug(s"Dropping ${msg.getClass.getSimpleName} for unknown client ${msg.toClient.uuid}")
+        else
+          conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT))
+      catch
+        case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to client ${msg.toClient.uuid} failed: $e")
+
+  private def droppedAfterShutdown(msg: Message): Unit =
+    logger.trace(s"QuicNet is shut down; dropping ${msg.getClass.getSimpleName}")
 
   /** The entry's open connection, or a new one installed by CAS and dialed by whichever caller wins */
   private[quic] def connectionFor(entry: QuicHostEntry): QuicConnection =
@@ -381,15 +502,17 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     * `idleTimeout / 2` without an outbound write. Periodic heartbeats come from `livenessTick`.
     */
   private def outboundActive(conn: QuicConnection): Unit =
-    ohost.foreach: (hostId, _) =>
-      conn.submit(QuicMessageCodec.encode(HostHeartbeat(hostId), PooledByteBufAllocator.DEFAULT))
+    if !shuttingDown then
+      ohost.foreach: (hostId, _) =>
+        conn.submit(QuicMessageCodec.encode(HostHeartbeat(hostId), PooledByteBufAllocator.DEFAULT))
     conn.startKeepalive(idleTimeout / 2)
 
   /** Every `heartbeatPeriod` on loop 0: the offline check, then (host mode) heartbeats. */
   private def livenessTick(): Unit =
     try
       offlineCheck()
-      ohost.foreach((hostId, _) => heartbeatAll(hostId))
+      if !shuttingDown then
+        ohost.foreach((hostId, _) => heartbeatAll(hostId))
     catch
       case NonFatal(e) => logger.warn(s"QUIC liveness tick failed: $e")
 

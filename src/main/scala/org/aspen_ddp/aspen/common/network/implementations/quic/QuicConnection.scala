@@ -120,6 +120,9 @@ final class QuicConnection(val loop: EventLoop,
   /** Any thread */
   def isClosed: Boolean = closed
 
+  /** The attached `QuicChannel`, or null before `attach`. Read it on `loop`. */
+  private[quic] def attachedChannel: QuicChannel = channel
+
   /** Any thread. True once `onActive` has returned; stays true after close. */
   def isActive: Boolean = activated
 

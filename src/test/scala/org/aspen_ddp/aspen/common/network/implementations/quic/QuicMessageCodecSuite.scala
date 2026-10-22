@@ -170,6 +170,26 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     frame.release()
     decoded2.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
 
+  private def roundTrip(m: Message): Message =
+    val enc = QuicMessageCodec.encode(m, alloc)
+    val frame = enc.toStreamFrame(alloc)
+    val result = decodeFrame(frame)
+    frame.release()
+    result.toOption.getOrElse(fail(s"$m: $result"))
+
+  test("ClusterTransportMessage round trips"):
+    val m = ClusterTransportMessage(HostId(UUID.randomUUID()), UUID.randomUUID(), HostId(UUID.randomUUID()),
+                                    Array.tabulate[Byte](3000)(_.toByte))
+    roundTrip(m) shouldBe m   // 3000 bytes forces the stream path
+
+  test("StoreMoved round trips through the QUIC codec"):
+    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 1))
+    roundTrip(m) shouldBe m
+
+  test("HostEndpointChanged round trips through the QUIC codec"):
+    val m = HostEndpointChanged(HostId(UUID.randomUUID()))
+    roundTrip(m) shouldBe m
+
   test("empty payloads round-trip"):
     val msgs: List[Message] = List(
       prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer.Empty)), Nil),

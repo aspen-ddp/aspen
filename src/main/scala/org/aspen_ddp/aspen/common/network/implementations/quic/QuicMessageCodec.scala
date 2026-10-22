@@ -116,6 +116,9 @@ object QuicMessageCodec:
     case m: CheckStorageDevice => codec.Message.Msg.CheckStorageDevice(Codec.encode(m))
     case m: ServiceMessage => codec.Message.Msg.ServiceMessage(Codec.encode(m))
     case m: ExecuteSystemTask => codec.Message.Msg.ExecuteSystemTask(Codec.encode(m))
+    case m: StoreMoved => codec.Message.Msg.StoreMoved(Codec.encode(m))
+    case m: HostEndpointChanged => codec.Message.Msg.HostEndpointChanged(Codec.encode(m))
+    case m: ClusterTransportMessage => codec.Message.Msg.ClusterTransport(Codec.encode(m))
 
   private val NoSections: Array[DataBuffer] = Array.empty[DataBuffer]
 
@@ -265,6 +268,9 @@ object QuicMessageCodec:
           case codec.Message.Msg.CheckStorageDevice(r) => Right(Codec.decode(r))
           case codec.Message.Msg.ServiceMessage(r) => Right(Codec.decode(r))
           case codec.Message.Msg.ExecuteSystemTask(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.StoreMoved(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.HostEndpointChanged(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.ClusterTransport(r) => Right(Codec.decode(r))
           case codec.Message.Msg.UnknownStore(r) => Right(Codec.decode(r))
           case codec.Message.Msg.StatusRequest(r) => Right(Codec.decode(r))
           case codec.Message.Msg.StatusResponse(r) => Right(Codec.decode(r))

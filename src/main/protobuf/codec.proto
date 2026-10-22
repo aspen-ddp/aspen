@@ -386,6 +386,21 @@ message StartStoreTransfer {
   UUID transferUUID = 6;
 }
 
+message StoreMoved {
+  StoreId storeId = 1;
+}
+
+message HostEndpointChanged {
+  UUID hostId = 1;
+}
+
+message ClusterTransportMessage {
+  UUID fromHost = 1;
+  UUID fromBootId = 2;
+  UUID toHost = 3;
+  bytes payload = 4;
+}
+
 message CheckStorageDevice {
   UUID toHost = 1;
   UUID fromClient = 2;
@@ -437,6 +452,9 @@ message Message {
     TxUnknownStore unknown_store = 24;
     ServiceMessage service_message = 25;
     ExecuteSystemTask execute_system_task = 26;
+    StoreMoved store_moved = 27;
+    HostEndpointChanged host_endpoint_changed = 28;
+    ClusterTransportMessage cluster_transport = 29;
   }
 }
 

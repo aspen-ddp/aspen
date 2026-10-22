@@ -723,5 +723,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
         case _: HostResponse =>
           // Not currently handled
+
+        case _: Gossip | _: ClusterTransportMessage =>
+          // Not yet wired up
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)

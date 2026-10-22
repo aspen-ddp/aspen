@@ -135,6 +135,8 @@ object ProtobufMessageCodec extends Logging:
     case m: ClientRequest => encodeClientRequest(m)
     case m: ClientResponse => encodeClientResponse(m)
     case m: HostMessage => encodeHostMessage(m)
+    case m: Gossip => Codec.encodeGossip(m)
+    case m: ClusterTransportMessage => codec.Message(msg = codec.Message.Msg.ClusterTransport(Codec.encode(m))).toByteArray
 
   // ============================================================================
   // Decoding Methods
@@ -277,6 +279,15 @@ object ProtobufMessageCodec extends Logging:
           Some(Codec.decode(r))
 
         case codec.Message.Msg.TxFinalized(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.StoreMoved(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.HostEndpointChanged(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.ClusterTransport(r) =>
           Some(Codec.decode(r))
 
         case codec.Message.Msg.Empty =>

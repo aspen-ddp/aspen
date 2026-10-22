@@ -346,6 +346,9 @@ class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
           case _: HostResponse =>
             // Not currently handled
 
+          case _: Gossip | _: ClusterTransportMessage =>
+            // Membership gossip only travels over QUIC; ignored here
+
   private def heartbeat(hostsArray: Array[ZMQHostEntry]): Unit =
     val offlineThreshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
 

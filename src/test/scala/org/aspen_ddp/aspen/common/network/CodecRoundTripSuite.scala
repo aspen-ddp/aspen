@@ -676,3 +676,14 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       Codec.encodeSteppedDurableTaskState(0, emptyState))
     decodedEmptyStep shouldBe 0
     decodedEmptyState shouldBe empty
+
+  test("StoreMoved round trips"):
+    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 3))
+    Codec.decodeGossip(Codec.encodeGossip(m)) shouldBe Right(m)
+
+  test("HostEndpointChanged round trips"):
+    val m = HostEndpointChanged(HostId(UUID.randomUUID()))
+    Codec.decodeGossip(Codec.encodeGossip(m)) shouldBe Right(m)
+
+  test("decodeGossip rejects garbage"):
+    Codec.decodeGossip(Array[Byte](1, 2, 3)).isLeft shouldBe true

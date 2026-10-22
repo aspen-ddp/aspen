@@ -919,6 +919,54 @@ object Codec extends Logging:
     StartStoreTransfer(toHost, fromClient, fromDevice, storeId, timestamp, transferUUID)
 
 
+  def encode(o: StoreMoved): codec.StoreMoved =
+    codec.StoreMoved(storeId = Some(encode(o.storeId)))
+
+  def decode(m: codec.StoreMoved): StoreMoved =
+    StoreMoved(decode(m.storeId.get))
+
+
+  def encode(o: HostEndpointChanged): codec.HostEndpointChanged =
+    codec.HostEndpointChanged(hostId = Some(encodeUUID(o.hostId.uuid)))
+
+  def decode(m: codec.HostEndpointChanged): HostEndpointChanged =
+    HostEndpointChanged(HostId(decodeUUID(m.hostId.get)))
+
+
+  def encode(o: ClusterTransportMessage): codec.ClusterTransportMessage =
+    codec.ClusterTransportMessage(
+      fromHost = Some(encodeUUID(o.fromHost.uuid)),
+      fromBootId = Some(encodeUUID(o.fromBootId)),
+      toHost = Some(encodeUUID(o.toHost.uuid)),
+      payload = com.google.protobuf.ByteString.copyFrom(o.payload)
+    )
+
+  def decode(m: codec.ClusterTransportMessage): ClusterTransportMessage =
+    ClusterTransportMessage(
+      HostId(decodeUUID(m.fromHost.get)),
+      decodeUUID(m.fromBootId.get),
+      HostId(decodeUUID(m.toHost.get)),
+      m.payload.toByteArray
+    )
+
+
+  /** Encodes a gossip message as a codec.Message. Used as the scalecube gossip payload. */
+  def encodeGossip(g: Gossip): Array[Byte] =
+    val msg = g match
+      case m: StoreMoved => codec.Message.Msg.StoreMoved(encode(m))
+      case m: HostEndpointChanged => codec.Message.Msg.HostEndpointChanged(encode(m))
+    codec.Message(msg = msg).toByteArray
+
+  def decodeGossip(bytes: Array[Byte]): Either[String, Gossip] =
+    try
+      codec.Message.parseFrom(bytes).msg match
+        case codec.Message.Msg.StoreMoved(r) => Right(decode(r))
+        case codec.Message.Msg.HostEndpointChanged(r) => Right(decode(r))
+        case other => Left(s"Not a gossip message: $other")
+    catch
+      case t: Throwable => Left(s"Failed to decode gossip: $t")
+
+
   def encode(o: CheckStorageDevice): codec.CheckStorageDevice =
     codec.CheckStorageDevice(
       toHost = Some(encodeUUID(o.toHost.uuid)),

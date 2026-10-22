@@ -13,6 +13,31 @@ sealed abstract class Message
 
 case class HostHeartbeat(hostId: HostId) extends Message
 
+/** Membership gossip. Carried as the scalecube gossip payload, never sent as a direct message */
+sealed abstract class Gossip extends Message
+
+final case class StoreMoved(storeId: StoreId) extends Gossip
+
+final case class HostEndpointChanged(hostId: HostId) extends Gossip
+
+/** Carries an opaque scalecube transport payload between hosts. Handled by QuicNet itself; it is not a
+  * HostMessage and never reaches the MessageHandler.
+  */
+final case class ClusterTransportMessage(
+                                          fromHost: HostId,
+                                          fromBootId: UUID,
+                                          toHost: HostId,
+                                          payload: Array[Byte]
+                                        ) extends Message:
+  override def equals(other: Any): Boolean = other match
+    case o: ClusterTransportMessage =>
+      fromHost == o.fromHost && fromBootId == o.fromBootId && toHost == o.toHost &&
+        java.util.Arrays.equals(payload, o.payload)
+    case _ => false
+
+  override def hashCode(): Int =
+    java.util.Objects.hash(fromHost, fromBootId, toHost, java.util.Arrays.hashCode(payload))
+
 sealed abstract class ClientRequest extends Message {
   val toStore: StoreId
   val fromClient: ClientId

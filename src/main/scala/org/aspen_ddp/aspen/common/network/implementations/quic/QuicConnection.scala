@@ -28,8 +28,8 @@ import scala.util.control.NonFatal
   * `channelActive`, so the owner must add `pipelineHandler` to the `QuicChannel` pipeline at channel init.
   *
   * Liveness hooks (all on `loop`): `onActive` runs once the connection is attached and the pre-handshake queue
-  * has been written, which is where the owner starts heartbeats (`scheduleAtFixedRate`) and keepalive
-  * (`startKeepalive`). Every task scheduled through these is cancelled when the connection closes.
+  * has been written, which is where the owner sends its initial heartbeat and starts keepalive (`startKeepalive`).
+  * The keepalive timer is cancelled when the connection closes.
   */
 final class QuicConnection(val loop: EventLoop,
                            config: QuicConfig,
@@ -58,6 +58,7 @@ final class QuicConnection(val loop: EventLoop,
   // ---- Loop-owned ----------------------------------------------------------------------------------------------
   @volatile private var channel: QuicChannel = null // written on the loop; read off-loop only for drop logging
   private var active = false // attached and the pre-handshake queue has been written
+  @volatile private var activated = false // set after onActive has returned; read by isActive
   private val preHandshake = new java.util.ArrayDeque[AnyRef]()
   private var preHandshakeBytes = 0L
   private var maxDatagramLength = -1 // -1: the peer has not announced datagram support
@@ -68,7 +69,6 @@ final class QuicConnection(val loop: EventLoop,
   private var datagramsTouched = false
   private val touchedStreams = new java.util.ArrayList[QuicStreamChannel](nStreams)
   private var lastWriteNanos = System.nanoTime() // last outbound datagram or stream write, keepalives included
-  private val scheduledTasks = new java.util.ArrayList[NFuture[?]]()
   private var keepaliveNanos = 0L // 0: keepalive not started
   private var keepaliveTask: NFuture[?] = null
 
@@ -119,6 +119,9 @@ final class QuicConnection(val loop: EventLoop,
 
   /** Any thread */
   def isClosed: Boolean = closed
+
+  /** Any thread. True once `onActive` has returned; stays true after close. */
+  def isActive: Boolean = activated
 
   /** Any thread. Messages dropped so far. */
   def drops: Long = dropCount.get()
@@ -227,8 +230,6 @@ final class QuicConnection(val loop: EventLoop,
       preHandshakeBytes = 0
       waitingBarriers.forEach(_.trySuccess(null))
       waitingBarriers.clear()
-      scheduledTasks.forEach(_.cancel(false))
-      scheduledTasks.clear()
       if keepaliveTask != null then
         keepaliveTask.cancel(false)
         keepaliveTask = null
@@ -253,18 +254,7 @@ final class QuicConnection(val loop: EventLoop,
         onActive(this)
       catch
         case NonFatal(e) => logger.warn(s"QUIC onActive callback failed: $e")
-
-  /** Runs `task` on the loop every `period`, starting one `period` from now, until the connection closes */
-  def scheduleAtFixedRate(period: Duration)(task: => Unit): Unit =
-    assert(loop.inEventLoop(), "scheduleAtFixedRate must run on the connection's loop")
-    if !closed then
-      val r: Runnable = () =>
-        if !closed then
-          try task
-          catch case NonFatal(e) => logger.warn(s"QUIC scheduled task failed: $e")
-      val ms = math.max(1L, period.toMillis)
-      try scheduledTasks.add(loop.scheduleAtFixedRate(r, ms, ms, TimeUnit.MILLISECONDS))
-      catch case _: RejectedExecutionException => () // the loop is shutting down
+      activated = true
 
   /** Sends a keepalive whenever nothing has been written for `idle`, until the connection closes.
     *

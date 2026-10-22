@@ -240,9 +240,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   val metadataManager: MetadataManager[QuicHostEntry] =
     new MetadataManager[QuicHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl)
 
-  private val offlineTask: NFuture[?] =
+  private val livenessTask: NFuture[?] =
     val ms = math.max(1L, heartbeatPeriod.toMillis)
-    loops(0).scheduleAtFixedRate((() => offlineCheck()): Runnable, ms, ms, TimeUnit.MILLISECONDS)
+    loops(0).scheduleAtFixedRate((() => livenessTick()): Runnable, ms, ms, TimeUnit.MILLISECONDS)
 
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)
@@ -264,6 +264,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private[quic] def connectionCount: Int = liveConnections.size
 
+  private[quic] def inboundConnectionCount: Int = inboundConnections.size
+
+  private[quic] def outboundConnectionCount: Int = liveConnections.asScala.count(c => !inboundConnections.contains(c))
+
   private[quic] def clientRoutes: Int = clientRouteMap.size
 
   private[quic] def inboundConnectionLoops: Set[EventLoop] = inboundConnections.asScala.map(_.loop).toSet
@@ -274,11 +278,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Datagrams that failed to decode */
   private[quic] def undecodableDatagrams: Long = undecodableCount.get()
 
-  /** Cancels the offline check, closes every connection on its loop (which cancels its timers), closes the
+  /** Cancels the liveness tick, closes every connection on its loop (which cancels its timers), closes the
     * datagram channels and terminates the group
     */
   private[quic] def closeForTests(): Unit =
-    offlineTask.cancel(false)
+    livenessTask.cancel(false)
     liveConnections.toArray(new Array[QuicConnection](0)).foreach: conn =>
       try conn.loop.submit((() => conn.close()): Runnable).awaitUninterruptibly(CloseAwaitMillis)
       catch case _: RejectedExecutionException => ()
@@ -372,29 +376,53 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     catch
       case NonFatal(e) => conn.handshakeFailed(e)
 
-  /** On the connection's loop, once an outbound connection is up: heartbeats (host mode) and keepalive.
-    *
-    * Like `ZMQNet`, which heartbeats over its dealers, a host heartbeats only over the connections it dialed: one
-    * now and one every `heartbeatPeriod`. They go through `submit`, so they obey the budget and drop rules.
-    * Keepalive is driven by the dialing side only, after `idleTimeout / 2` without an outbound write.
+  /** On the connection's loop, once an outbound connection is up: the initial heartbeat (host mode, matching
+    * `ZMQNet`'s heartbeat on dealer creation) and keepalive. Keepalive is driven by the dialing side only, after
+    * `idleTimeout / 2` without an outbound write. Periodic heartbeats come from `livenessTick`.
     */
   private def outboundActive(conn: QuicConnection): Unit =
     ohost.foreach: (hostId, _) =>
-      val hb = HostHeartbeat(hostId)
-      def send(): Unit = conn.submit(QuicMessageCodec.encode(hb, PooledByteBufAllocator.DEFAULT))
-      send()
-      conn.scheduleAtFixedRate(heartbeatPeriod)(send())
+      conn.submit(QuicMessageCodec.encode(HostHeartbeat(hostId), PooledByteBufAllocator.DEFAULT))
     conn.startKeepalive(idleTimeout / 2)
 
-  /** Same rule as `ZMQNet.heartbeat`: no heartbeat for 3 heartbeat periods means offline. Runs on loop 0. */
-  private def offlineCheck(): Unit =
+  /** Every `heartbeatPeriod` on loop 0: the offline check, then (host mode) heartbeats. */
+  private def livenessTick(): Unit =
     try
-      val threshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
-      metadataManager.resolvedHostEntries.foreach: host =>
-        if host.lastHeartbeatTime <= threshold then
-          host.setOffline()
+      offlineCheck()
+      ohost.foreach((hostId, _) => heartbeatAll(hostId))
     catch
-      case NonFatal(e) => logger.warn(s"QUIC offline check failed: $e")
+      case NonFatal(e) => logger.warn(s"QUIC liveness tick failed: $e")
+
+  /** Same rule as `ZMQNet.heartbeat`: no heartbeat for 3 heartbeat periods means offline */
+  private def offlineCheck(): Unit =
+    val threshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
+    metadataManager.resolvedHostEntries.foreach: host =>
+      if host.lastHeartbeatTime <= threshold then
+        host.setOffline()
+
+  /** Heartbeats every resolved host, as `ZMQNet` does over the dealer it keeps for each. A ZMQ dealer reconnects by
+    * itself; here the send dials any host without a live connection, so an idle host pair re-establishes
+    * connectivity (and online status) within a heartbeat period of a peer restart.
+    *
+    * One heartbeat per host per tick: a connection that is not yet active (being dialed now, or still handshaking)
+    * sends one from `outboundActive` when it activates, so the tick only makes sure it exists. `isActive` turns
+    * true only after `outboundActive` has submitted, so the tick and the activation never both send for the same
+    * tick. (The initial heartbeat can still land shortly before the next tick's; that duplicate is harmless.)
+    *
+    * The local host is not dialed. `ZMQNet` heartbeats its own entry over a loopback dealer, which only marks that
+    * entry online; this does the same directly, without a self-connection.
+    */
+  private def heartbeatAll(hostId: HostId): Unit =
+    metadataManager.resolvedHostEntries.foreach: entry =>
+      if entry.hostId == hostId then
+        entry.heartbeatReceived()
+      else
+        try
+          val conn = connectionFor(entry)
+          if conn.isActive then
+            conn.submit(QuicMessageCodec.encode(HostHeartbeat(hostId), PooledByteBufAllocator.DEFAULT))
+        catch
+          case NonFatal(e) => logger.warn(s"QUIC heartbeat to host ${entry.name} failed: $e")
 
   private def outboundClosed(entry: QuicHostEntry, conn: QuicConnection): Unit =
     entry.connection.compareAndSet(conn, null)

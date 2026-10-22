@@ -93,8 +93,9 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val resp = response(c.net.clientId, req.toStore, req.readUUID)
     fx.b.net.serverMessenger.sendClientResponse(resp)
     await(c.handler.clientResponses, 1).map(_.message) shouldBe List(resp)
-    // B replied over the client's connection rather than dialing anything
-    fx.b.net.connectionCount shouldBe 1
+    // B replied over the client's connection rather than dialing anything. B's own count is not checked: as a host
+    // it dials A for heartbeats on its first liveness tick.
+    c.net.connectionCount shouldBe 1
 
   test("TxMessages flow host to host in both directions"):
     val aToB = txHeartbeat(fx.storesB.head, fx.storesA.head)
@@ -191,7 +192,6 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     conn.isClosed shouldBe true
 
   test("many threads sending to an unconnected host create exactly one connection"):
-    val before = fx.a.net.connectionCount
     val start = new CountDownLatch(1)
     val n = 16
     val threads = (0 until n).map: i =>
@@ -203,7 +203,8 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     start.countDown()
     threads.foreach(_.join(AwaitMillis))
     await(fx.b.handler.txMessages, n)
-    fx.a.net.connectionCount shouldBe before + 1
+    // A's only possible outbound peer is B (its heartbeats dial B too, through the same CAS)
+    fx.a.net.outboundConnectionCount shouldBe 1
 
   test("many threads sending concurrently lose nothing under budget"):
     // Stream-sized only: datagrams are unreliable by design, so "nothing lost" cannot be asserted for them
@@ -271,7 +272,8 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     while h.net.inboundConnectionLoops.size < 2 && clients.size < 16 do
       connectOne()
     info(s"clients needed: ${clients.size}")
-    h.net.connectionCount shouldBe clients.size
+    // Inbound only: as a host, h also dials A and B for heartbeats
+    h.net.inboundConnectionCount shouldBe clients.size
     h.net.inboundConnectionLoops.size shouldBe 2
 
   test("no buffer leaks were reported"):

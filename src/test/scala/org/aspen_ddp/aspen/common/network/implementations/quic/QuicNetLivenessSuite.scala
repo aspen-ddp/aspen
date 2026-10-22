@@ -96,6 +96,23 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     await(c.handler.clientResponses, 1).map(_.message) shouldBe List(resp)
     c.net.connectionCount shouldBe connsBefore
 
+  test("idle host pair recovers online status after a peer restart"):
+    connectHosts()
+    eventually("each host sees the other online"):
+      entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
+    // Restart B on the same port with no application traffic. B's down time is however long A takes to notice.
+    fx.stopB()
+    eventually("A sees the stopped B offline", 1500):
+      !entryFor(fx.a.net, fx.hostIdB).isOnline
+    val starting = System.nanoTime()
+    fx.startB()
+    // Timed from when the restarted B is up, so B's construction time (TLS contexts, binds) is not counted
+    val restarted = System.nanoTime()
+    eventually("A and the restarted B see each other online", 3 * HeartbeatPeriod.toMillis):
+      entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
+    info(s"B started in ${(restarted - starting) / 1000000}ms; " +
+      s"recovered ${(System.nanoTime() - restarted) / 1000000}ms after it was up")
+
   test("dead peer's connection is cleaned up and re-dialed"):
     connectHosts()
     val stale = entryFor(fx.a.net, fx.hostIdB).connection.get()

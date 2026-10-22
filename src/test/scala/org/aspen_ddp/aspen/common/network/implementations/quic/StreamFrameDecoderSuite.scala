@@ -58,11 +58,12 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     frame.release()
     arr
 
-  private class Harness:
+  private class Harness(mk: (Message => Unit, String => Unit) => StreamFrameDecoder =
+                          (m, e) => new StreamFrameDecoder(m, e)):
     val msgs = ArrayBuffer.empty[Message]
     val errs = ArrayBuffer.empty[String]
     val fed = ArrayBuffer.empty[ByteBuf]
-    val channel = new EmbeddedChannel(new StreamFrameDecoder(msgs += _, errs += _))
+    val channel = new EmbeddedChannel(mk(msgs += _, errs += _))
 
     def feed(buf: ByteBuf): Unit =
       fed += buf
@@ -147,7 +148,7 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
 
   test("negative section length closes the stream"):
     val arr = frameBytes(prepare)
-    // the last section length is the final u32 of the prefix: 12 + prefixLen - 4 - (sum of last-section bytes)
+    // the last section length is the final u32 of the prefix, which ends at offset 12 + prefixLen
     val prefixLen = java.nio.ByteBuffer.wrap(arr, 8, 4).getInt
     val pos = 12 + prefixLen - 4
     arr(pos) = 0x80.toByte
@@ -165,6 +166,31 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     h.fed += late
     h.channel.pipeline().fireChannelRead(late) // writeInbound refuses a closed channel
     h.errs.size shouldBe 1
+    h.msgs shouldBe empty
+    h.finish()
+
+  test("onMessage throwing does not desync the stream"):
+    val msgs = ArrayBuffer.empty[Message]
+    var first = true
+    val ch = new EmbeddedChannel(new StreamFrameDecoder(m =>
+      if first then
+        first = false
+        throw new RuntimeException("handler failure")
+      msgs += m, _ => fail("unexpected protocol error")))
+    val a = frameBytes(prepare) ++ frameBytes(heartbeat)
+    val buf = alloc.buffer(a.length).writeBytes(a)
+    ch.writeInbound(buf)
+    msgs.toList shouldBe List(heartbeat)
+    ch.isOpen shouldBe true
+    ch.finishAndReleaseAll()
+    buf.refCnt() shouldBe 0
+
+  test("non-codec failure inside decode closes the stream"):
+    val h = new Harness((m, e) => new StreamFrameDecoder(m, e, n => throw new OutOfMemoryError("test")))
+    val arr = frameBytes(prepare)
+    h.feed(arr, 0, arr.length)
+    h.errs.size shouldBe 1
+    h.channel.isOpen shouldBe false
     h.msgs shouldBe empty
     h.finish()
 

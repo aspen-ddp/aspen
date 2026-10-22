@@ -4,6 +4,9 @@ import io.netty.buffer.{ByteBuf, CompositeByteBuf}
 import io.netty.channel.{ChannelHandlerContext, ChannelInboundHandlerAdapter}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.Message
+import scribe.Logging
+
+import scala.util.control.NonFatal
 
 /** Incrementally decodes stream frames (see `QuicMessageCodec`) from an inbound stream.
   *
@@ -11,7 +14,9 @@ import org.aspen_ddp.aspen.common.network.Message
   * copied exactly once, directly from the inbound buffers into plain heap arrays.
   */
 class StreamFrameDecoder(onMessage: Message => Unit,
-                         onProtocolError: String => Unit) extends ChannelInboundHandlerAdapter:
+                         onProtocolError: String => Unit,
+                         private[quic] val allocSection: Int => Array[Byte] = n => new Array[Byte](n))
+  extends ChannelInboundHandlerAdapter with Logging:
 
   private enum State:
     case Lengths, Prefix, Section
@@ -39,6 +44,10 @@ class StreamFrameDecoder(onMessage: Message => Unit,
         try
           if !failed then
             decode(ctx, in)
+        catch
+          case t: Throwable =>
+            if !failed then
+              fail(ctx, s"Unexpected failure decoding stream: $t")
         finally
           in.release()
       case other => ctx.fireChannelRead(other)
@@ -85,7 +94,7 @@ class StreamFrameDecoder(onMessage: Message => Unit,
             fail(ctx, s"Frame length $frameLen does not match prefix ${4L + prefixLen} plus sections $total")
           else
             prefix = p
-            sections = p.sectionSizes.map(n => new Array[Byte](n))
+            sections = p.sectionSizes.map(allocSection)
             sectionIdx = 0
             sectionOffset = 0
             state = State.Section
@@ -111,7 +120,11 @@ class StreamFrameDecoder(onMessage: Message => Unit,
       state = State.Lengths
       QuicMessageCodec.assemble(p, bufs) match
         case Left(err) => fail(ctx, err)
-        case Right(m) => onMessage(m)
+        case Right(m) =>
+          try
+            onMessage(m)
+          catch
+            case NonFatal(t) => logger.error("Message handler failed", t)
 
   private def fail(ctx: ChannelHandlerContext, reason: String): Unit =
     failed = true

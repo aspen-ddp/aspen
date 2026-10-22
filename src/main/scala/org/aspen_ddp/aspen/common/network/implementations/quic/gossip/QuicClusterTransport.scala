@@ -23,12 +23,13 @@ object QuicClusterTransport:
   *
   * Outbound messages are encoded with `codec` and handed to `sendFn`; the owner feeds inbound
   * ClusterTransportMessages to `receive`. No sockets are owned here. Delivery is best-effort,
-  * as it is for the underlying QUIC datagrams.
+  * as it is for the underlying QUIC datagrams. The default codec is `FilteredMessageCodec`:
+  * inbound payloads come from any credentialed peer, so deserialization is allowlisted.
   */
 final class QuicClusterTransport(localHost: HostId,
                                  bootId: UUID,
                                  sendFn: ClusterTransportMessage => Unit,
-                                 codec: MessageCodec = MessageCodec.INSTANCE) extends Transport with Logging:
+                                 codec: MessageCodec = FilteredMessageCodec) extends Transport with Logging:
 
   private val inbound = Sinks.many().multicast().directBestEffort[Message]()
   @volatile private var started = false

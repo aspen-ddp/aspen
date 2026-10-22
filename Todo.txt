@@ -1,29 +1,6 @@
 TODO
 ====
 
-- An abandoned transfer in is never cleaned up on the receiving host.
-
-  When the source device is declared failed mid-transfer, Host.abandonTransferIn rewrites the
-  device entry but does not touch transferringIn, pendingStartTransfers or the
-  StoreTransferManager registration for that store. Since a receiver registration has no timeout
-  of its own (the old 30 s no-data timer is gone), the consequences last for the life of the
-  process:
-
-    - The pending-start retransmit task keeps sending StartStoreTransfer to the dead source host
-      every 30 s.
-    - transferringIn still holds the store, so startStoreTransferIn will never start a new
-      transfer of that store onto this host until a restart.
-    - A partial staging directory under transferring-in/ may be left behind until a later transfer
-      of the same store replaces it.
-
-  Recommended fix: when abandonTransferIn's transaction commits, drop the store's
-  pendingStartTransfers and transferringIn entries, cancel any scheduled transfer-in retry, and
-  have the service drop the registration (add a StoreTransferService.cancelTransferIn(storeId)
-  that fails the pending future, aborts any live connection/extractor and removes the staged
-  directory). Also have the delayed retry re-read the device entry and give up if the store is no
-  longer TransferringIn, so a retry scheduled before the abandon does not send one more request.
-  Separately, consider sweeping stale transferring-in/ directories at device load.
-
 - Store-transfer trailer could carry the archive length.
 
   The receiver's only completeness check is the 17-byte StoreId trailer

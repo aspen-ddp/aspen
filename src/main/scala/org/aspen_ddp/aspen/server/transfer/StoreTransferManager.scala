@@ -134,6 +134,11 @@ class StoreTransferManager(port: Int,
     logger.info(s"Awaiting transfer in of store $storeId, transfer $transferUUID")
     reg.promise.future
 
+  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit =
+    val reg = synchronized:
+      registrations.get(storeId).filter(r => r.transferUUID == transferUUID && !r.done)
+    reg.foreach(fail(storeId, _, "cancelled"))
+
   /** Starts sending `sourceDirectory` unless a request with the same or a newer timestamp has already
    *  been seen for this store. A newer request aborts the active attempt for the store. */
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,

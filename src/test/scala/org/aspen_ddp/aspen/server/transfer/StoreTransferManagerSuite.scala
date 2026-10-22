@@ -375,6 +375,48 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     f1.value.exists(_.isFailure) should be(true)
     assertExtracted(dest / sid.directoryName)
 
+  test("cancelTransferIn ignores another attempt's UUID"):
+    val m = newManager()
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val f = m.beginTransferIn(sid, u, dest)
+    m.cancelTransferIn(sid, UUID.randomUUID())
+    f.isCompleted should be(false)
+
+    val s = connect(m)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive, sid.toBytes)
+    s.close()
+    await(f).isSuccess should be(true)
+
+  test("cancelTransferIn fails a waiting registration and rejects its connection"):
+    val m = newManager()
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val f = m.beginTransferIn(sid, u, dest)
+    m.cancelTransferIn(sid, u)
+    await(f).isFailure should be(true)
+
+    val s = connect(m)
+    send(s, StoreTransferManager.encodeHeader(sid, u))
+    isClosedByPeer(s) should be(true)
+
+  test("cancelTransferIn aborts a live transfer and removes the partial directory"):
+    val m = newManager()
+    val dest = tempDir()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val f = m.beginTransferIn(sid, u, dest)
+    val s = connect(m)
+    send(s, StoreTransferManager.encodeHeader(sid, u), archive.take(archive.length / 2))
+    eventually { os.exists(dest / sid.directoryName) should be(true) }
+
+    m.cancelTransferIn(sid, u)
+    await(f).isFailure should be(true)
+    isClosedByPeer(s) should be(true)
+    eventually { os.exists(dest / sid.directoryName) should be(false) }
+
   test("round trip between two managers"):
     val a = newManager()
     val b = newManager()

@@ -108,6 +108,10 @@ object Host:
 
   class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
 
+  /** A failed transfer in waiting out TransferInRetryDelay. `fromDeviceId` is the source the retry
+   *  would ask for the store again. */
+  class TransferInRetry(val fromDeviceId: StorageDeviceId, val run: () => Unit)
+
   /** How long a failed transfer in waits before it is restarted */
   val TransferInRetryDelay: Duration = Duration(30, SECONDS)
 
@@ -168,7 +172,7 @@ class Host(val client: AspenClient,
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
   // The restart of each failed transfer in that is waiting out TransferInRetryDelay. Its store
   // stays in transferringIn meanwhile, so device checks do not start a parallel attempt.
-  private var transferInRetries: Map[StoreId, () => Unit] = Map()
+  private var transferInRetries: Map[StoreId, TransferInRetry] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
   private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
 
@@ -342,6 +346,13 @@ class Host(val client: AspenClient,
                 logger.warn(s"Storage device ${sdCfg.storageDeviceId} is already loaded from " +
                             s"${existing.devicePath}; ignoring duplicate at $storageDevicePath")
             case None =>
+              // Nothing can be receiving onto a device that is not loaded yet, so whatever is in
+              // its staging directory was left by an attempt that crashed or was abandoned. A copy
+              // that had finished arriving was already moved to its final path.
+              val staging = os.Path(storageDevicePath) / StoreTransfer.StagingDirectory
+              try os.remove.all(staging)
+              catch case t: Throwable =>
+                logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
               sdFile.listFiles match
                 case null =>
                   // Same hazard as the scan in checkForNewDevices: listFiles returns null on
@@ -618,23 +629,85 @@ class Host(val client: AspenClient,
    *  The store stays in transferringIn until the retry fires, so device checks in the meantime
    *  do not start a parallel attempt. `transferUUID` is the failed attempt's: the retry does
    *  nothing if that attempt is no longer the store's current one.
+   *
+   *  The destination's entry is re-read before restarting, since the transfer may have been
+   *  abandoned during the wait. The retry stays scheduled until that read returns, so an abandon
+   *  committing meanwhile still finds it in transferInRetries and cancels it.
    */
   private def scheduleTransferInRetry(storeId: StoreId,
                                       transferUUID: UUID,
                                       fromHostId: HostId,
                                       fromDeviceId: StorageDeviceId,
                                       toDeviceid: StorageDeviceId): Unit = synchronized {
-    def retry(): Unit = synchronized {
-      if transferInRetries.contains(storeId) && transferringIn.get(storeId).contains(transferUUID) then
+    def current: Boolean =
+      transferInRetries.contains(storeId) && transferringIn.get(storeId).contains(transferUUID)
+
+    def restart(entryState: scala.util.Try[StorageDeviceState]): Unit = synchronized {
+      if current then
         transferInRetries -= storeId
         transferringIn -= storeId
-        startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+        val stillWanted = entryState match
+          case Success(state) =>
+            state.stores.get(storeId).exists: entry =>
+              entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+              entry.transferDevice.contains(fromDeviceId)
+          case Failure(t) =>
+            // No worse than restarting blind: an abandoned attempt's restart is cancelled again
+            // once the abandon commits.
+            logger.warn(s"Failed to re-read device $toDeviceid before retrying the transfer in of " +
+                        s"store $storeId. Retrying anyway. Error: $t")
+            true
+        if stillWanted then
+          startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+        else
+          logger.info(s"Not retrying the transfer in of store $storeId: device $toDeviceid no " +
+                      s"longer records it as transferring in from device $fromDeviceId")
+    }
+
+    def retry(): Unit = synchronized {
+      if current then
+        val fstate =
+          try client.getStorageDeviceState(toDeviceid)
+          catch case t: Throwable => Future.failed(t)
+        fstate.onComplete(restart)
     }
 
     logger.info(s"Retrying the transfer in of store $storeId in $TransferInRetryDelay")
-    transferInRetries += storeId -> (() => retry())
+    transferInRetries += storeId -> new TransferInRetry(fromDeviceId, () => retry())
     backgroundTasks.schedule(TransferInRetryDelay)(retry())
   }
+
+  /** Forgets this host's attempt to receive `storeId` from `fromDeviceId`, whose transfer has been
+   *  abandoned. Covers an attempt still waiting on bytes and one waiting out its retry delay; an
+   *  attempt already past promotion is left to recordTransferIn, which drops its own entry.
+   *
+   *  The service's registration is dropped too, failing its future. The completion handler in
+   *  startStoreTransferIn sees the attempt is no longer current and neither retries nor promotes.
+   */
+  private def dropAbandonedTransferIn(storeId: StoreId,
+                                      fromDeviceId: StorageDeviceId,
+                                      toDeviceId: StorageDeviceId): Unit =
+    val cancelled = synchronized {
+      val pending = pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId)
+      val retry = transferInRetries.get(storeId).filter(_.fromDeviceId == fromDeviceId)
+      transferringIn.get(storeId) match
+        case Some(transferUUID) if pending.nonEmpty || retry.nonEmpty =>
+          logger.info(s"Dropping the abandoned transfer in of store $storeId from device $fromDeviceId")
+          pendingStartTransfers -= storeId
+          transferInRetries -= storeId
+          transferringIn -= storeId
+          // A retry waiting on a failed promotion still has the extracted copy in staging, which
+          // the service no longer owns. Nothing else can be receiving this store now.
+          if retry.nonEmpty then
+            storageDevices.get(toDeviceId).foreach: sds =>
+              val staged = os.Path(sds.devicePath) / StoreTransfer.StagingDirectory / storeId.directoryName
+              try os.remove.all(staged)
+              catch case t: Throwable =>
+                logger.error(s"Failed to remove the staged copy of store $storeId at $staged: $t")
+          Some(transferUUID)
+        case _ => None
+    }
+    cancelled.foreach(storeTransferService.cancelTransferIn(storeId, _))
 
   /** Removes the transferred-in marker from a promoted store, returning whether the store may now
    *  be loaded. A store loaded with the marker still in place would be skipped by the next
@@ -751,10 +824,30 @@ class Host(val client: AspenClient,
           // sender needs the request until it has finished, and a failure restarts with a new
           // message below.
           def stopRetransmitting(): Unit = synchronized {
-            pendingStartTransfers -= storeId
+            if pendingStartTransfers.get(storeId).exists(_.msg.transferUUID == transferUUID) then
+              pendingStartTransfers -= storeId
           }
 
+          // False once the attempt has been dropped by dropAbandonedTransferIn, whose cancellation
+          // is what completed the future, or by a supersession.
+          def isCurrent: Boolean = synchronized(transferringIn.get(storeId).contains(transferUUID))
+
           fcomplete.onComplete:
+            case Success(_) if ! isCurrent =>
+              // The bytes landed as the transfer was abandoned. Nobody owns the staged copy now,
+              // and nothing can be receiving this store, since a new attempt needs the
+              // transferringIn entry that dropping this one removed.
+              synchronized {
+                if ! transferringIn.contains(storeId) then
+                  val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
+                  try os.remove.all(stagedPath)
+                  catch case t: Throwable =>
+                    logger.error(s"Failed to remove the staged copy of store $storeId at $stagedPath: $t")
+              }
+
+            case Failure(_) if ! isCurrent =>
+              stopRetransmitting()
+
             case Success(_) =>
               stopRetransmitting()
 
@@ -1430,9 +1523,14 @@ class Host(val client: AspenClient,
       // Cleared on failure as well as success. A StopRetrying means this attempt gave up, and the
       // next device check -- an hour out, and possibly after whatever made the read fail has been
       // repaired -- should be free to try again rather than find the flag stuck forever.
-      fabandon.onComplete: _ =>
+      fabandon.onComplete: result =>
         synchronized:
           abandoningTransferIns -= storeId
+        // Whether or not this transaction was the one to remove the entry, it is gone (or has
+        // moved on to Rebuilding), so nothing will complete this host's attempt. Its registration
+        // has no timeout of its own and its retransmits go to a host that does not exist.
+        if result.isSuccess then
+          dropAbandonedTransferIn(storeId, fromDeviceId, toDeviceId)
   }
 
   /** Requests a check of one storage device.
@@ -1743,7 +1841,7 @@ class Host(val client: AspenClient,
 
   /** Testing hook: runs every scheduled transfer-in retry now rather than after its delay. */
   private[aspen] def testingOnlyRetryTransferIns(): Unit =
-    synchronized(transferInRetries.values.toList).foreach(_())
+    synchronized(transferInRetries.values.toList).foreach(_.run())
 
   /** Testing hook: the storage devices with a state lookup currently in flight. */
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =

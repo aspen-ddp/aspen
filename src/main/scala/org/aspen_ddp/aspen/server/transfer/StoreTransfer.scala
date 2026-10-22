@@ -30,6 +30,11 @@ trait StoreTransferService:
    *  or is superseded by a later call for the same store. */
   def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit]
 
+  /** Drops the registration for attempt `transferUUID` of `storeId`, if it is still the current
+   *  one: any live connection and extractor are aborted, the partially extracted directory is
+   *  removed and the attempt's future fails. Does nothing for any other attempt. */
+  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit
+
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit
 
@@ -43,6 +48,8 @@ object StoreTransferService:
   object Disabled extends StoreTransferService with Logging:
     def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
       Promise[Unit]().future
+
+    def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit = ()
 
     def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                          destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =

@@ -31,6 +31,10 @@ import scala.concurrent.duration.{Duration, SECONDS}
  */
 private class StagedTransferService extends StoreTransferService:
   private val calls = mutable.ArrayBuffer[(StoreId, UUID, os.Path, Promise[Unit])]()
+  private val cancels = mutable.ArrayBuffer[(StoreId, UUID)]()
+
+  /** Every cancelTransferIn call, in order. */
+  def cancelledTransfersIn: Vector[(StoreId, UUID)] = synchronized(cancels.toVector)
 
   /** Every beginTransferIn call, in order. */
   def transfersIn: Vector[(StoreId, UUID, os.Path)] =
@@ -61,6 +65,12 @@ private class StagedTransferService extends StoreTransferService:
       val p = Promise[Unit]()
       calls += ((storeId, transferUUID, destinationDirectory, p))
       p.future
+
+  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit =
+    val p = synchronized:
+      cancels += ((storeId, transferUUID))
+      calls.find(c => c._1 == storeId && c._2 == transferUUID).map(_._4)
+    p.foreach(_.tryFailure(new Exception(s"Cancelled transfer in of $storeId")))
 
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
@@ -1045,6 +1055,105 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       t.host.transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
       t.host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
       t.host.testingOnlyTransferringIn should not contain t.movingStore
+
+  /** Removes `sid`'s entry from `deviceId` in the storage-devices tree, as an abandon running
+   *  elsewhere would, without this host's own abandon path. */
+  private def removeDeviceEntry(deviceId: StorageDeviceId, sid: StoreId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStorageDevicePointer(deviceId)
+        kvos <- client.read(ptr)
+      yield
+        tx.update(ptr, None, None,
+          List(KeyRevision(StorageDeviceState.StateKey,
+            kvos.contents(StorageDeviceState.StateKey).revision)),
+          List(Insert(StorageDeviceState.StateKey, StorageDeviceState(kvos).removeStore(sid).encode())))
+
+  atest("an abandoned transfer in is cancelled and no longer retransmitted"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      List((_, registered, _)) = t.transfers.transfersIn.toList: @unchecked
+
+      // The source dies mid-transfer; the destination's next device check abandons the entry.
+      _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!t.host.testingOnlyTransferringIn.contains(t.movingStore))
+      // The cancellation fails the attempt's future, which must not schedule a restart.
+      _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.nonEmpty, rounds = 3)
+
+      _ = takeStartTransfers(t.movingStore)
+      _ = t.host.retransmitPendingStartTransfers(force = true)
+      dest <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      dest.stores.contains(t.movingStore) should be(false)
+      t.host.testingOnlyTransferringIn should not contain t.movingStore
+      t.transfers.cancelledTransfersIn should be(Vector((t.movingStore, registered)))
+      t.host.testingOnlyScheduledTransferInRetries should be(Set())
+      takeStartTransfers(t.movingStore) should be(Nil)
+
+  atest("an abandon during the retry delay cancels the retry and the staged copy"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = t.transfers.failTransferIn(t.movingStore)
+      _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.contains(t.movingStore))
+      // What a failed promotion leaves behind for the retry to replace.
+      staged = os.Path(t.deviceDir) / StoreTransfer.StagingDirectory / t.movingStore.directoryName
+      _ = os.makeDir.all(staged)
+
+      _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!t.host.testingOnlyTransferringIn.contains(t.movingStore))
+
+      _ = t.host.testingOnlyRetryTransferIns()
+      _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
+      _ = takeStartTransfers(t.movingStore)
+      _ = t.host.retransmitPendingStartTransfers(force = true)
+    yield
+      t.host.testingOnlyTransferringIn should not contain t.movingStore
+      t.host.testingOnlyScheduledTransferInRetries should be(Set())
+      t.transfers.transfersIn.size should be(1)
+      os.exists(staged) should be(false)
+      takeStartTransfers(t.movingStore) should be(Nil)
+
+  atest("a transfer-in retry gives up once the destination no longer records the transfer"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = t.transfers.failTransferIn(t.movingStore)
+      _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.contains(t.movingStore))
+
+      // Removed behind this host's back, so only the retry's own re-read can notice.
+      _ <- removeDeviceEntry(net.secondDeviceId, t.movingStore)
+      _ <- waitForTransactionsToComplete()
+      _ = takeStartTransfers(t.movingStore)
+      _ = t.host.testingOnlyRetryTransferIns()
+      _ <- pumpUntil(!t.host.testingOnlyTransferringIn.contains(t.movingStore))
+    yield
+      t.host.testingOnlyTransferringIn should not contain t.movingStore
+      t.host.testingOnlyScheduledTransferInRetries should be(Set())
+      t.transfers.transfersIn.size should be(1)
+      takeStartTransfers(t.movingStore) should be(Nil)
+
+  atest("a stale transfer staging directory is removed when its device loads"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val staged = deviceDir.resolve(StoreTransfer.StagingDirectory).resolve(storeId.directoryName)
+    Files.createDirectories(staged)
+    Files.write(staged.resolve("partial"), Array[Byte](1, 2, 3))
+
+    val host = newHost(hostRoot)
+
+    Future.successful:
+      host.loadedDevices.keySet should be(Set(deviceA))
+      Files.exists(deviceDir.resolve(StoreTransfer.StagingDirectory)) should be(false)
 
   atest("a destination crash after promotion resumes the pool update instead of loading the copy"):
     given ExecutionContext = executionContext

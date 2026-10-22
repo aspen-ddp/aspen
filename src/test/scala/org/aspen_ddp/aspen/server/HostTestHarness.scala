@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
-import org.aspen_ddp.aspen.server.transfer.StoreTransferFactory
+import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.Host.RebuildOutcome
 
@@ -135,13 +135,13 @@ trait HostTestHarness:
   protected def newHost(hostRoot: Path,
                            failFirstStoreLoad: Boolean = false,
                            ec: ExecutionContext = executionContext,
-                           transferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem,
+                           transferService: StoreTransferService = StoreTransferService.Disabled,
                            storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                            maxConcurrentRebuilds: Int = 2
                           ): RecordingHost =
     new RecordingHost(client, systemId, hostRoot, ec,
                               net.objectCacheFactory, net, net.FinalizerFactory,
-                              failFirstStoreLoad, transferFactory, storeRebuildFactory,
+                              failFirstStoreLoad, transferService, storeRebuildFactory,
                               maxConcurrentRebuilds)
 
   protected val deviceA = StorageDeviceId(UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001"))
@@ -187,7 +187,7 @@ private class RecordingHost(mgrClient: AspenClient,
                             messenger: ServerMessenger,
                             finalizers: TransactionFinalizer.Factory,
                             failFirstStoreLoad: Boolean = false,
-                            transferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem,
+                            transferService: StoreTransferService = StoreTransferService.Disabled,
                             rebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                             maxRebuilds: Int = 2)
   extends Host(
@@ -204,7 +204,7 @@ private class RecordingHost(mgrClient: AspenClient,
     TransactionDriver.noErrorRecoveryFactory,
     Duration(5, SECONDS),
     Duration(60, SECONDS),
-    transferFactory,
+    transferService,
     rebuildFactory,
     maxRebuilds):
 

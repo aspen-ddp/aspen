@@ -91,7 +91,7 @@ class RebuildingStore(client: AspenClient,
   private val failBytes: Set[List[Byte]] = testingOnlyFailKeys.map(_.bytes.toList)
   private val outOfSpaceBytes: Set[List[Byte]] = testingOnlyOutOfSpaceKeys.map(_.bytes.toList)
 
-  // Started from the constructor, mirroring TransferringIn. Host holds its instance
+  // Started from the constructor. Host holds its instance
   // lock across the call, so everything expensive is inside the future.
   start()
 

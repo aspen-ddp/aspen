@@ -31,6 +31,7 @@ import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
+import org.aspen_ddp.aspen.server.transfer.StoreTransferManager
 import org.aspen_ddp.aspen.server.*
 import org.dcache.nfs.ExportFile
 import org.dcache.nfs.v3.xdr.{mount_prot, nfs3_prot}
@@ -1282,7 +1283,8 @@ object Main {
       txFinalizerFactory,
       SimpleTransactionDriver.factory(txRetryDelay, txRetryCap),
       txHeartbeatPeriod,
-      CheckStorageDevicesPeriod
+      CheckStorageDevicesPeriod,
+      new StoreTransferManager(hostCfg.storeTransferPort, tls)
     ) with SimpleDriverRecoveryMixin
 
     networkBridge.ohost = Some(host)

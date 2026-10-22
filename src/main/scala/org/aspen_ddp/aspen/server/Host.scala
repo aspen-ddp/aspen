@@ -20,7 +20,7 @@ import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, 
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ReadError, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
-import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferFactory, StoreTransferIn, StoreTransferOut, TransferringIn}
+import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, ServiceEntry, TaskExecutor}
@@ -122,7 +122,7 @@ class Host(val client: AspenClient,
                    val txDriverFactory: TransactionDriver.Factory,
                    val heartbeatPeriod: Duration,
                    val checkStorageDevicePeriod: Duration,
-                   val storeTransferFactory: StoreTransferFactory = StoreTransferFactory.Filesystem,
+                   val storeTransferService: StoreTransferService = StoreTransferService.Disabled,
                    val storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                    /** A rebuild reads a whole store's worth of data through the client, so an
                     *  eight-store device must not start eight at once. Entries beyond this bound
@@ -158,9 +158,9 @@ class Host(val client: AspenClient,
   private var offlineStores: Set[StoreId] = Set()
   private var creatingStores: Set[StoreId] = Set()
   private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
-  private var transferringOut: Map[StoreId, StoreTransferOut] = Map()
-  private var transferringInUUIDs: Map[UUID, StoreTransferIn] = Map()
-  private var transferringInStoreIds: Set[StoreId] = Set()
+  // The transfer UUID of each store this host is currently receiving. Stores being shipped out
+  // are tracked by storeTransferService, which is what knows when a send has ended.
+  private var transferringIn: Map[StoreId, UUID] = Map()
   private var abandoningTransferIns: Set[StoreId] = Set()
   private var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
@@ -174,13 +174,17 @@ class Host(val client: AspenClient,
   private var usageUpdateTask: Option[ScheduledTask] = None
 
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
-    synchronized {
-      val now = HLCTimestamp.now
-      pendingStartTransfers.valuesIterator.foreach: pt =>
-        if now - pt.lastSend > Duration(30, SECONDS) then
-          pt.lastSend = now
-          client.sendHostMessage(pt.msg)
-    }
+    retransmitPendingStartTransfers()
+
+  /** Re-sends the StartStoreTransfer of every transfer in that has not yet completed and was last
+   *  sent more than 30 s ago. `force` skips the age check so tests need not wait it out. */
+  private[aspen] def retransmitPendingStartTransfers(force: Boolean = false): Unit = synchronized {
+    val now = HLCTimestamp.now
+    pendingStartTransfers.valuesIterator.foreach: pt =>
+      if force || now - pt.lastSend > Duration(30, SECONDS) then
+        pt.lastSend = now
+        client.sendHostMessage(pt.msg)
+  }
 
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
     events.put(HeartbeatEvent())
@@ -560,9 +564,9 @@ class Host(val client: AspenClient,
    *
    *  Only reached with TransferOutcome.SourceRestored, which means the pool still names the
    *  source and the source still holds the data -- so there is nothing here worth keeping. Left
-   *  in place it would be loaded by tryLoadStore on every restart (TransferringIn removes the
-   *  transfer marker from the unpacked copy, so nothing stops it), and if the source happens to
-   *  live on this same host that load would replace the source's entry in `stores`, which is
+   *  in place it would be loaded by tryLoadStore on every restart (startStoreTransferIn removes
+   *  the transfer marker from the unpacked copy, so nothing stops it), and if the source happens
+   *  to live on this same host that load would replace the source's entry in `stores`, which is
    *  keyed by StoreId alone.
    *
    *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision.
@@ -601,150 +605,182 @@ class Host(val client: AspenClient,
                                    toDeviceid: StorageDeviceId): Unit = synchronized {
     require(fromDeviceId != toDeviceid)
 
-    if ! transferringInStoreIds.contains(storeId) then
+    if ! transferringIn.contains(storeId) then
       storageDevices.get(toDeviceid).foreach: toDevice =>
-        val ti = storeTransferFactory.createTransferIn(
-          client,
-          storeId,
-          toDeviceid,
-          toDevice.devicePath
-        )
-        transferringInUUIDs += ti.transferUUID -> ti
-        transferringInStoreIds += storeId
+        val devicePath = os.Path(toDevice.devicePath)
+        val finalPath = devicePath / storeId.directoryName
 
-        def cleanup(): Unit = synchronized {
-          transferringInUUIDs -= ti.transferUUID
-          transferringInStoreIds -= storeId
-        }
+        // Promotion moves the arrived copy here and would fail on an existing directory, after
+        // the whole store had been shipped. Whatever is here is not ours to delete, so refuse
+        // before asking for any bytes.
+        if os.exists(finalPath) then
+          logger.error(s"Cannot transfer store $storeId onto device $toDeviceid: store path " +
+                       s"already exists. $finalPath")
+        else
+          // Fresh per attempt. The sender ignores a request whose timestamp is not newer than the
+          // last one it acted on, and the service accepts a connection only for the UUID it is
+          // currently registered with, so a retry after a failure needs both to be new.
+          val transferUUID = UUID.randomUUID()
+          val timestamp = HLCTimestamp.now
 
-        ti.complete.onComplete:
-          case Success(_) =>
-            cleanup()
+          val fcomplete = storeTransferService.beginTransferIn(
+            storeId, transferUUID, devicePath / StoreTransfer.StagingDirectory)
 
-            // Loading is downstream of the metadata decision, not ahead of it. An unconditional
-            // load hands a live copy of the store to a device that updateStateForTransferredStore
-            // may be about to decide must not own it, and nothing would ever take it back.
-            //
-            // Waiting costs no availability: the pool goes on naming the source until that
-            // transaction commits, so nothing routes here before then anyway.
-            updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid).onComplete:
-              case Success(TransferOutcome.PoolRepointed) =>
-                loadStoreById(toDeviceid, storeId)
+          transferringIn += storeId -> transferUUID
 
-              case Success(TransferOutcome.SourceRestored) =>
-                discardArrivedTransferIn(storeId, toDeviceid)
+          // Retransmission stops on completion, success or failure, not on first data: the
+          // sender needs the request until it has finished, and a failure restarts with a new
+          // message below.
+          def cleanup(): Unit = synchronized {
+            transferringIn -= storeId
+            pendingStartTransfers -= storeId
+          }
 
-              case Failure(t) =>
-                // The only observer this Future has. Its onFail routes the permanent errors to
-                // StopRetrying, which fails the promise -- and an unobserved failed Promise is
-                // not reported by the ExecutionContext, so without this line a permanent give-up
-                // is exactly as silent as the infinite retry loop it replaced. What is left
-                // behind matters: the source's entry stays TransferringOut, which the abandoned
-                // transfer-out pass will not reinstate because it requires Active, so the
-                // source's copy stays offline behind its marker with nothing to say why.
-                logger.error(s"Failed to record the completed transfer of store $storeId from " +
-                             s"device $fromDeviceId to device $toDeviceid. The store is not " +
-                             s"loaded here and the pool still names the source", t)
-          case Failure(_) =>
-            cleanup()
-            startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+          fcomplete.onComplete:
+            case Success(_) =>
+              cleanup()
 
-        val msg = StartStoreTransfer(
-          fromHostId,
-          client.clientId,
-          fromDeviceId,
-          storeId,
-          HLCTimestamp.now,
-          ti.transferUUID
-        )
+              // The marker was archived along with the source's store directory. Left in place
+              // it would keep the arrived copy offline on every restart.
+              val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
+              val promoted =
+                try
+                  val marker = stagedPath / StoreTransfer.TransferOutMarkerFile
+                  if os.exists(marker) then
+                    os.remove(marker)
+                  os.move(stagedPath, finalPath)
+                  true
+                catch
+                  case t: Throwable =>
+                    logger.error(s"Failed to move the transferred store $storeId from " +
+                                 s"$stagedPath to $finalPath. Restarting the transfer. Error: $t")
+                    false
 
-        pendingStartTransfers += storeId -> new PendingTransfer(msg, HLCTimestamp.now)
+              if ! promoted then
+                // Nothing has been recorded yet, so the pool still names the source and this is
+                // no different from a transfer that failed in flight. The restart's extraction
+                // replaces the staged copy, and if the failure left a directory at finalPath the
+                // restart refuses with an error rather than retrying forever.
+                startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+              else
+                // Loading is downstream of the metadata decision, not ahead of it. An
+                // unconditional load hands a live copy of the store to a device that
+                // updateStateForTransferredStore may be about to decide must not own it, and
+                // nothing would ever take it back.
+                //
+                // Waiting costs no availability: the pool goes on naming the source until that
+                // transaction commits, so nothing routes here before then anyway.
+                updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid).onComplete:
+                  case Success(TransferOutcome.PoolRepointed) =>
+                    loadStoreById(toDeviceid, storeId)
 
-        client.sendHostMessage(msg)
+                  case Success(TransferOutcome.SourceRestored) =>
+                    discardArrivedTransferIn(storeId, toDeviceid)
+
+                  case Failure(t) =>
+                    // The only observer this Future has. Its onFail routes the permanent errors
+                    // to StopRetrying, which fails the promise -- and an unobserved failed Promise
+                    // is not reported by the ExecutionContext, so without this line a permanent
+                    // give-up is exactly as silent as the infinite retry loop it replaced. What is
+                    // left behind matters: the source's entry stays TransferringOut, which the
+                    // abandoned transfer-out pass will not reinstate because it requires Active,
+                    // so the source's copy stays offline behind its marker with nothing to say
+                    // why.
+                    logger.error(s"Failed to record the completed transfer of store $storeId " +
+                                 s"from device $fromDeviceId to device $toDeviceid. The store is " +
+                                 s"not loaded here and the pool still names the source", t)
+            case Failure(_) =>
+              cleanup()
+              startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+
+          val msg = StartStoreTransfer(
+            fromHostId,
+            client.clientId,
+            fromDeviceId,
+            storeId,
+            timestamp,
+            transferUUID
+          )
+
+          pendingStartTransfers += storeId -> new PendingTransfer(msg, HLCTimestamp.now)
+
+          client.sendHostMessage(msg)
   }
 
   private def startStoreTransferOut(m: StartStoreTransfer): Unit = synchronized {
-    def startTransfer(): Unit = {
-      def err(msg: String): Nothing =
-        logger.info(msg)
-        throw new Exception(msg)
+    def err(msg: String): Nothing =
+      logger.info(msg)
+      throw new Exception(msg)
 
-      for
-        // getStoragePoolState, not getStoragePool(...).getState(): SimpleStoragePool caches its
-        // StoragePoolState from construction and nothing ever calls dropCachedState(), so the
-        // cached copy is a permanent snapshot of where the stores were when this client first
-        // touched the pool. The source device must be read fresh -- for a store that has already
-        // moved once (a migration retarget, or two successive rebalances) the snapshot names the
-        // device it used to live on, that device no longer lists the store, and the transfer-out
-        // dies below on "Transfer probably completed" without ever starting.
-        pstate <- client.getStoragePoolState(m.storeId.poolId)
-        poolEntry = pstate.stores(m.storeId.poolIndex)
-        fromDevice <- client.getStorageDeviceState(poolEntry.storageDeviceId)
-        devEntry = fromDevice.stores.get(m.storeId) match
-          case None => err(s"Store ${m.storeId} missing from device. Transfer probably completed")
-          case Some(e) => e
-        toDeviceId = devEntry.transferDevice match
-          case None => err(s"Store ${m.storeId} not in transfer state. Transfer probably completed")
-          case Some(sid) => sid
-        toDevice <- client.getStorageDeviceState(toDeviceId)
-        // The destination was declared failed while the transfer was in flight, so both its ids
-        // read as zero. There is no fresher source for them -- unlike the source device's id
-        // below, which the pool entry carries -- so the only safe thing is to refuse. Shipping
-        // bytes to HostId(0,0) would run indefinitely against a host that does not exist.
-        _ = if toDevice.isFailed then
-              err(s"Destination device $toDeviceId for transfer of store ${m.storeId} has been " +
-                  s"declared failed")
-        // Keyed off the pool entry, not fromDevice.storageDeviceId: those are the same value in
-        // the healthy case, but a tombstoned source zeroes its own copy, and the lookup would
-        // then miss and blame a removed disk for a device that is loaded and present.
-        sourceDs = storageDevices.get(poolEntry.storageDeviceId) match
-          case None => err(s"Source storage device for transfer ${poolEntry.storageDeviceId} not loaded. Disk removed?")
-          case Some(sds) => sds
-      yield
-        synchronized {
-          if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
-            if ! transferringOut.contains(m.storeId) then
-              val fclosed = stores.get(m.storeId) match
-                case None => Future.unit
-                case Some(_) => closeStore(m.storeId)
+    // Any failure here, including a destination HostState that cannot be read, drops this
+    // request; the receiver's retransmit is what tries again. Retransmits and superseded
+    // requests are not filtered here either: storeTransferService ignores a request whose
+    // timestamp is not newer than the last one it acted on for the store, and a newer one
+    // replaces the send in progress.
+    //
+    // This path reads pool and device state fresh and closes the store itself, so a request
+    // that arrives before this host's own device check has noticed the transfer needs no
+    // separate scan.
+    for
+      // getStoragePoolState, not getStoragePool(...).getState(): SimpleStoragePool caches its
+      // StoragePoolState from construction and nothing ever calls dropCachedState(), so the
+      // cached copy is a permanent snapshot of where the stores were when this client first
+      // touched the pool. The source device must be read fresh -- for a store that has already
+      // moved once (a migration retarget, or two successive rebalances) the snapshot names the
+      // device it used to live on, that device no longer lists the store, and the transfer-out
+      // dies below on "Transfer probably completed" without ever starting.
+      pstate <- client.getStoragePoolState(m.storeId.poolId)
+      poolEntry = pstate.stores(m.storeId.poolIndex)
+      fromDevice <- client.getStorageDeviceState(poolEntry.storageDeviceId)
+      devEntry = fromDevice.stores.get(m.storeId) match
+        case None => err(s"Store ${m.storeId} missing from device. Transfer probably completed")
+        case Some(e) => e
+      toDeviceId = devEntry.transferDevice match
+        case None => err(s"Store ${m.storeId} not in transfer state. Transfer probably completed")
+        case Some(sid) => sid
+      toDevice <- client.getStorageDeviceState(toDeviceId)
+      // The destination was declared failed while the transfer was in flight, so both its ids
+      // read as zero. There is no fresher source for them -- unlike the source device's id
+      // below, which the pool entry carries -- so the only safe thing is to refuse. Shipping
+      // bytes to HostId(0,0) would run indefinitely against a host that does not exist.
+      _ = if toDevice.isFailed then
+            err(s"Destination device $toDeviceId for transfer of store ${m.storeId} has been " +
+                s"declared failed")
+      // Keyed off the pool entry, not fromDevice.storageDeviceId: those are the same value in
+      // the healthy case, but a tombstoned source zeroes its own copy, and the lookup would
+      // then miss and blame a removed disk for a device that is loaded and present.
+      sourceDs = storageDevices.get(poolEntry.storageDeviceId) match
+        case None => err(s"Source storage device for transfer ${poolEntry.storageDeviceId} not loaded. Disk removed?")
+        case Some(sds) => sds
+      // Resolved fresh on every request, so a destination that has moved since the last
+      // attempt is reached at its current address.
+      toHostState <- client.getHostState(toDevice.hostId).recover:
+        case t =>
+          logger.warn(s"Failed to read the HostState of host ${toDevice.hostId}, destination of " +
+                      s"transfer ${m.transferUUID} of store ${m.storeId}. Error: $t")
+          throw t
+    yield
+      synchronized {
+        if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
+          val fclosed = stores.get(m.storeId) match
+            case None => Future.unit
+            case Some(_) => closeStore(m.storeId)
 
-              fclosed.foreach: _ =>
-                synchronized {
-                  if ! transferringOut.contains(m.storeId) then
-                    val to = storeTransferFactory.createTransferOut(
-                      client,
-                      sourceDs.storageDeviceId,
-                      sourceDs.devicePath,
-                      m.storeId,
-                      toDevice.hostId,
-                      toDevice.storageDeviceId,
-                      m.timestamp,
-                      m.transferUUID
-                    )
-                    transferringOut += m.storeId -> to
-
-                    to.complete.foreach: _ =>
-                      synchronized {
-                        transferringOut -= m.storeId
-                      }
-                }
-        }
-    }
-
-    transferringOut.get(m.storeId) match
-      case None => startTransfer()
-      case Some(to) =>
-        if to.transferUUID != m.transferUUID && to.timestamp < m.timestamp then
-          to.abort()
-          transferringOut -= m.storeId
-          startTransfer()
-  }
-
-  private def transferDataReceived(m: StoreTransferData): Unit = synchronized {
-    transferringInUUIDs.get(m.transferUUID).foreach: ti =>
-      if pendingStartTransfers.contains(ti.storeId) then
-        pendingStartTransfers -= ti.storeId
-      ti.dataReceived(m.data)
+          fclosed.foreach: _ =>
+            synchronized {
+              val storePath = os.Path(sourceDs.devicePath) / m.storeId.directoryName
+              try
+                // Written before archiving, so it travels with the store and keeps this copy
+                // offline across restarts until the transfer is resolved one way or the other.
+                os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
+                storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
+                  toHostState.address, toHostState.storeTransferPort, m.timestamp)
+              catch
+                case t: Throwable =>
+                  logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
+                              s"${m.transferUUID}. Error: $t")
+            }
+      }
   }
 
   // protected so a test subclass can record the claim instead of transacting against a host
@@ -1109,12 +1145,12 @@ class Host(val client: AspenClient,
       //----------------------
       // Abandoned Transfers Out
       //
-      // Nothing else ever clears a transfer-out marker from the source. TransferringIn deletes
-      // it only from the destination's unpacked copy, and a transfer that completes normally
-      // has the source's whole store directory deleted by the pass above -- the marker goes with
-      // it. So a transfer that ends without completing, which is what a destination declared
-      // failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads it on
-      // every restart and puts the store straight back into offlineStores.
+      // Nothing else ever clears a transfer-out marker from the source. startStoreTransferIn
+      // deletes it only from the destination's unpacked copy, and a transfer that completes
+      // normally has the source's whole store directory deleted by the pass above -- the marker
+      // goes with it. So a transfer that ends without completing, which is what a destination
+      // declared failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads
+      // it on every restart and puts the store straight back into offlineStores.
       //
       // That pairs badly with the metadata repair for the same event. That repair puts this
       // entry back to Active and leaves the pool naming this device, so afterwards the metadata
@@ -1129,11 +1165,11 @@ class Host(val client: AspenClient,
       //
       // The guard is narrow on purpose. Active *and* no transferDevice is the only combination
       // that says no transfer is outstanding; an entry still TransferringOut, or Active with a
-      // destination still named, means the marker is doing its job. transferringOut is the same
-      // question asked of this process rather than the tree, and covers the window where the
-      // drain restores the entry while this host is still shipping bytes.
+      // destination still named, means the marker is doing its job. isTransferringOut is the
+      // same question asked of this process rather than the tree, and covers the window where
+      // the drain restores the entry while this host is still shipping bytes.
       local.offlineStores.filter(storeId =>
-        !transferringOut.contains(storeId) &&
+        !storeTransferService.isTransferringOut(storeId) &&
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
@@ -1239,7 +1275,7 @@ class Host(val client: AspenClient,
     // The entry that triggers this stands until the transaction commits, so every device check
     // in the meantime calls here again. Without the guard each one starts its own retry loop,
     // all writing the same key and losing to each other on KeyRevision. Same shape as
-    // createNewStore's creatingStores and startStoreTransferIn's transferringInStoreIds.
+    // createNewStore's creatingStores and startStoreTransferIn's transferringIn.
     if ! abandoningTransferIns.contains(storeId) then
       abandoningTransferIns += storeId
 
@@ -1467,7 +1503,8 @@ class Host(val client: AspenClient,
     * load budget on work that will be redone or discarded.
     */
   def repairableStoreIds: List[StoreId] = synchronized {
-    (stores.keySet -- offlineStores -- rebuildingStores.keySet -- transferringOut.keySet).toList
+    (stores.keySet -- offlineStores -- rebuildingStores.keySet --
+      storeTransferService.transferringOutStores).toList
   }
 
   /** O(1) per-entry counterpart to `repairableStoreIds`: whether the given store is currently
@@ -1475,7 +1512,7 @@ class Host(val client: AspenClient,
     */
   def isRepairable(storeId: StoreId): Boolean = synchronized {
     stores.contains(storeId) && !offlineStores.contains(storeId) &&
-      !rebuildingStores.contains(storeId) && !transferringOut.contains(storeId)
+      !rebuildingStores.contains(storeId) && !storeTransferService.isTransferringOut(storeId)
   }
 
   def hasTransactions: Boolean = synchronized {
@@ -1572,7 +1609,7 @@ class Host(val client: AspenClient,
 
   /** Testing hook: runs the post-transfer metadata update synchronously.
    *
-   *  In production this is driven by a StoreTransferIn completing, which needs a real device
+   *  In production this is driven by a transfer in completing, which needs a real device
    *  directory and a real byte stream. The metadata half is what the tests are about. */
   private[aspen] def testingOnlyUpdateStateForTransferredStore(storeId: StoreId,
                                                                fromDeviceId: StorageDeviceId,
@@ -1643,7 +1680,10 @@ class Host(val client: AspenClient,
 
       case HostMsg(msg) => msg match
         case m: StartStoreTransfer => startStoreTransferOut(m)
-        case m: StoreTransferData => transferDataReceived(m)
+        // Store data now travels over storeTransferService's own TLS connections. The message
+        // type is still part of the sealed HostMessage hierarchy, so it is matched and dropped
+        // rather than left to a MatchError.
+        case _: StoreTransferData => ()
         case m: CheckStorageDevice =>
           // A device id we do not know may simply be one that has appeared on disk since
           // our last scan -- create-storage-device sends this message as a discovery nudge

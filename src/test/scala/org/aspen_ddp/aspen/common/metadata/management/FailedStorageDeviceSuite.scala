@@ -514,7 +514,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       // The transfer completes anyway: the source is alive and sending, and the destination's
-      // StoreTransferIn was created before the tombstone. withTimeout because the pre-fix
+      // transfer in was begun before the tombstone. withTimeout because the pre-fix
       // failure mode is not a wrong answer but a never-completing future -- prepRadicleUpdate
       // looks up HostId(0,0), which is absent from the host tree, and the bare retry loop
       // re-runs it every 60 s forever.

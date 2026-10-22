@@ -1,15 +1,14 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
-import org.aspen_ddp.aspen.common.network.CheckStorageDevice
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StartStoreTransfer}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferFactory, StoreTransferIn, StoreTransferOut}
+import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
@@ -18,47 +17,54 @@ import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 
-/** A StoreTransferFactory whose transfers move no bytes and finish only when the test says so.
+/** A StoreTransferService whose transfers move no bytes and finish only when the test says so.
  *
- *  The real TransferringIn needs a live sending host and a `jar` subprocess, neither of which
- *  exists here, but the interesting half of a transfer for these tests is what Host does
- *  once `complete` resolves. createTransferOut is unimplemented on purpose: nothing in this
- *  suite ships a store out, and a silently-working stub would hide it if something started to.
+ *  The real StoreTransferManager needs a live sending host, a TLS socket and a `jar` subprocess,
+ *  none of which exists here, but the interesting half of a transfer for these tests is what Host
+ *  does once the Future from beginTransferIn resolves. beginTransferOut is unimplemented on
+ *  purpose: nothing in this suite ships a store out, and a silently-working stub would hide it if
+ *  something started to.
  */
-private class StagedTransferFactory extends StoreTransferFactory:
-  private val transfersIn = mutable.Map[StoreId, Promise[Unit]]()
+private class StagedTransferService extends StoreTransferService:
+  private val calls = mutable.ArrayBuffer[(StoreId, UUID, os.Path, Promise[Unit])]()
 
-  /** The stores a transfer in has been created for. */
-  def startedTransfersIn: Set[StoreId] = synchronized(transfersIn.keySet.toSet)
+  /** Every beginTransferIn call, in order. */
+  def transfersIn: Vector[(StoreId, UUID, os.Path)] =
+    synchronized(calls.map((sid, uuid, dir, _) => (sid, uuid, dir)).toVector)
 
-  /** Resolves `storeId`'s transfer as if every byte had arrived. */
+  /** The stores a transfer in has been begun for. */
+  def startedTransfersIn: Set[StoreId] = transfersIn.map(_._1).toSet
+
+  private def latest(storeId: StoreId): Option[(StoreId, UUID, os.Path, Promise[Unit])] =
+    synchronized(calls.findLast(_._1 == storeId))
+
+  /** Resolves `storeId`'s latest transfer as if every byte had arrived. Leaves behind what
+   *  extraction would have: `<dir>/<storeId.directoryName>`, still carrying the source's
+   *  transfer-out marker, for Host's promotion step to move into place. */
   def finishTransferIn(storeId: StoreId): Unit =
-    synchronized(transfersIn.get(storeId)).foreach(_.success(()))
+    latest(storeId).foreach: (sid, _, dir, p) =>
+      val staged = dir / sid.directoryName
+      os.makeDir.all(staged)
+      os.write.over(staged / StoreTransfer.TransferOutMarkerFile, "")
+      p.success(())
 
-  def createTransferIn(client: AspenClient,
-                       sid: StoreId,
-                       storageDeviceId: StorageDeviceId,
-                       devicePath: Path): StoreTransferIn =
-    val p = synchronized:
-      val promise = Promise[Unit]()
-      transfersIn += sid -> promise
-      promise
+  /** Fails `storeId`'s latest transfer, as a timed-out or truncated stream would. */
+  def failTransferIn(storeId: StoreId): Unit =
+    latest(storeId).foreach(_._4.failure(new Exception(s"Simulated failure of transfer in of $storeId")))
 
-    new StoreTransferIn:
-      val storeId: StoreId = sid
-      val transferUUID: UUID = UUID.randomUUID()
-      def complete: Future[Unit] = p.future
-      def dataReceived(db: DataBuffer): Unit = ()
+  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
+    synchronized:
+      val p = Promise[Unit]()
+      calls += ((storeId, transferUUID, destinationDirectory, p))
+      p.future
 
-  def createTransferOut(client: AspenClient,
-                        fromDevice: StorageDeviceId,
-                        devicePath: Path,
-                        storeId: StoreId,
-                        toHost: HostId,
-                        toDevice: StorageDeviceId,
-                        timestamp: HLCTimestamp,
-                        transferUUID: UUID): StoreTransferOut =
-    throw new UnsupportedOperationException("StagedTransferFactory does not send stores")
+  def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
+                       destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
+    throw new UnsupportedOperationException("StagedTransferService does not send stores")
+
+  def isTransferringOut(storeId: StoreId): Boolean = false
+
+  def transferringOutStores: Set[StoreId] = Set.empty
 
 
 /** Delegates execution to `underlying`, and records every reportFailure call instead of
@@ -623,7 +629,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       host.testingOnlyActiveDeviceChecks should not contain deviceA
 
   /** Creates `<deviceDir>/<sid.directoryName>` holding a transfer-out marker file, which is what
-   *  TransferringOut leaves in the source's store directory the moment a transfer begins. */
+   *  startStoreTransferOut leaves in the source's store directory the moment a transfer begins. */
   private def writeTransferringOutStore(deviceDir: Path, sid: StoreId = storeId): Path =
     val storeDir = deviceDir.resolve(sid.directoryName)
     Files.createDirectories(storeDir)
@@ -750,15 +756,15 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     // This host owns the transfer's destination, which the operator is about to declare dead.
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
-    val transfers = new StagedTransferFactory
-    val host = newHost(hostRoot, transferFactory = transfers)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
 
     val sourceId = StorageDeviceId.BootstrapStorageDeviceId
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
 
-    // What TransferringIn leaves behind: an unpacked store directory with no transfer marker,
-    // so tryLoadStore would happily load it. Created only when the bytes "arrive", to keep it
-    // out of the construction scan.
+    // Where Host promotes the staged copy once the bytes "arrive": an unpacked store directory
+    // with the transfer marker removed, so tryLoadStore would happily load it. It appears only
+    // on completion, which keeps it out of the construction scan.
     val arrived = deviceDir.resolve(movingStore.directoryName)
 
     for
@@ -780,7 +786,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       _ <- tombstoneDevice(net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
 
-      _ = Files.createDirectories(arrived)
       // Everything captured from here on belongs to the completion path.
       _ = net.takeCapturedHostMessages()
       _ = transfers.finishTransferIn(movingStore)
@@ -814,6 +819,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
       // And the directory goes too, or the next restart's scan loads exactly what this refused.
       Files.exists(arrived) should be(false)
+      // Gone from staging as well, so the absence above is the promoted copy being discarded
+      // rather than a copy that was never moved into place.
+      Files.exists(deviceDir.resolve(StoreTransfer.StagingDirectory).resolve(movingStore.directoryName)) should be(false)
 
       // This runs on the destination host, so the source is a different Host and reads
       // nothing of the restore above. Its copy stays offline behind the transfer-out marker
@@ -829,8 +837,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     // arrived store would pass the test above.
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
-    val transfers = new StagedTransferFactory
-    val host = newHost(hostRoot, transferFactory = transfers)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
 
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
     val arrived = deviceDir.resolve(movingStore.directoryName)
@@ -845,7 +853,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
       _ = transfers.startedTransfersIn should contain(movingStore)
 
-      _ = Files.createDirectories(arrived)
       _ = transfers.finishTransferIn(movingStore)
       _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
 
@@ -857,3 +864,127 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       poolState.stores(movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
       host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
       Files.exists(arrived) should be(true)
+
+  /** A host owning the transfer destination, with the receiving half of a transfer of
+   *  `movingStore` already begun through the device check, exactly as the two tests above
+   *  drive it. */
+  private case class TransferInStarted(deviceDir: Path,
+                                       host: RecordingHost,
+                                       transfers: StagedTransferService,
+                                       movingStore: StoreId)
+
+  private def startTransferIn(): Future[TransferInStarted] =
+    given ExecutionContext = executionContext
+
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(startTransferSent(transfers, movingStore, 1))
+    yield
+      // pumpUntil gives up silently, so assert what it waited on.
+      startTransferSent(transfers, movingStore, 1) should be(true)
+      TransferInStarted(deviceDir, host, transfers, movingStore)
+
+  /** True once the `attempt`th beginTransferIn for `sid` has been made and the StartStoreTransfer
+   *  for it captured. The service records the call before Host sends the message, so waiting on
+   *  the call alone would let a test drain the captured messages before the send. Peeks rather
+   *  than drains. */
+  private def startTransferSent(transfers: StagedTransferService, sid: StoreId, attempt: Int): Boolean =
+    val attempts = transfers.transfersIn.filter(_._1 == sid)
+    attempts.size >= attempt && net.synchronized(net.capturedHostMessages).exists:
+      case m: StartStoreTransfer => m.storeId == sid && m.transferUUID == attempts(attempt - 1)._2
+      case _ => false
+
+  /** Drains the captured host messages and returns the StartStoreTransfers for `sid`. */
+  private def takeStartTransfers(sid: StoreId): List[StartStoreTransfer] =
+    net.takeCapturedHostMessages().collect:
+      case m: StartStoreTransfer if m.storeId == sid => m
+
+  atest("transfer in stages under the transferring-in directory"):
+    given ExecutionContext = executionContext
+
+    startTransferIn().map: t =>
+      t.transfers.transfersIn.map(_._3) should be(
+        Vector(os.Path(t.deviceDir) / "transferring-in"))
+
+  atest("successful transfer in promotes the staged store and drops the marker"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(t.host.transferOutcomes.contains(t.movingStore))
+    yield
+      val dirName = t.movingStore.directoryName
+      val promoted = os.Path(t.deviceDir) / dirName
+
+      t.host.transferOutcomes.get(t.movingStore) should be(
+        Some(Host.TransferOutcome.PoolRepointed))
+      os.exists(promoted) should be(true)
+      // Left in place, the marker would keep the promoted store offline on every restart.
+      os.exists(promoted / "transferring-out") should be(false)
+      os.exists(os.Path(t.deviceDir) / "transferring-in" / dirName) should be(false)
+
+  atest("StartStoreTransfer carries the UUID registered with the service"):
+    given ExecutionContext = executionContext
+
+    startTransferIn().map: t =>
+      val sent = takeStartTransfers(t.movingStore)
+      val List((_, registered, _)) = t.transfers.transfersIn.toList: @unchecked
+
+      sent should not be empty
+      sent.map(_.transferUUID).toSet should be(Set(registered))
+
+  atest("failed transfer in restarts with a fresh UUID"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      first = takeStartTransfers(t.movingStore).last
+      _ = t.transfers.failTransferIn(t.movingStore)
+      _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2))
+    yield
+      val attempts = t.transfers.transfersIn
+      attempts.size should be(2)
+      val retryUUID = attempts(1)._2
+      retryUUID should not be attempts(0)._2
+      first.transferUUID should be(attempts(0)._2)
+
+      val newest = takeStartTransfers(t.movingStore).last
+      newest.transferUUID should be(retryUUID)
+      newest.timestamp > first.timestamp should be(true)
+
+      // The retry's message replaced the failed attempt's in the retransmit set, so the old
+      // UUID is never sent again.
+      t.host.retransmitPendingStartTransfers(force = true)
+      takeStartTransfers(t.movingStore).map(_.transferUUID) should be(List(retryUUID))
+
+  atest("retransmit stops once the transfer in completes"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = takeStartTransfers(t.movingStore)
+
+      // Pins the forced retransmit itself, so the empty result below is not vacuous.
+      _ = t.host.retransmitPendingStartTransfers(force = true)
+      beforeCompletion = takeStartTransfers(t.movingStore)
+
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(t.host.transferOutcomes.contains(t.movingStore))
+      _ = takeStartTransfers(t.movingStore)
+      _ = t.host.retransmitPendingStartTransfers(force = true)
+    yield
+      beforeCompletion.size should be(1)
+      t.host.transferOutcomes.contains(t.movingStore) should be(true)
+      takeStartTransfers(t.movingStore) should be(Nil)

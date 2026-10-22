@@ -73,6 +73,13 @@ class StoreTransferManager(port: Int,
 
   private var registrations: Map[StoreId, Registration] = Map()
 
+  /** Serializes creation and removal of store directories. Guards `directoryOwners`, which maps each
+   *  store directory to the registration that last created it. A registration removes a directory
+   *  only while it is still the owner, so a settled attempt can never delete the directory a newer
+   *  attempt has set up at the same path. Never acquired while holding the manager lock. */
+  private val directoryLock = new Object
+  private var directoryOwners: Map[os.Path, Registration] = Map()
+
   def boundPort: Int = serverSocket.getLocalPort
 
   private val acceptThread = new Thread(() => acceptLoop(), s"store-transfer-accept-$boundPort")
@@ -94,11 +101,9 @@ class StoreTransferManager(port: Int,
     val previous = synchronized:
       val prev = registrations.get(storeId).filter(!_.done)
       prev.foreach(_.done = true)
-      registrations -= storeId
+      registrations += storeId -> reg
       prev
     previous.foreach(p => abort(storeId, p, s"superseded by transfer $transferUUID"))
-    synchronized:
-      registrations += storeId -> reg
     logger.info(s"Awaiting transfer in of store $storeId, transfer $transferUUID")
     reg.promise.future
 
@@ -162,18 +167,20 @@ class StoreTransferManager(port: Int,
 
   private def receive(storeId: StoreId, reg: Registration, sock: SSLSocket, in: InputStream): Unit =
     val storeDir = storeDirectory(storeId, reg)
-    os.remove.all(storeDir)
-    os.makeDir.all(storeDir)
-
-    val extractor = os.spawn(cmd = ("jar", "--extract"), cwd = storeDir, stderr = os.Pipe)
-    val aborted = synchronized:
-      if !reg.done then
-        reg.extractor = Some(extractor)
-      reg.done
+    val (extractor, aborted) = directoryLock.synchronized:
+      os.remove.all(storeDir)
+      os.makeDir.all(storeDir)
+      directoryOwners += storeDir -> reg
+      val p = os.spawn(cmd = ("jar", "--extract"), cwd = storeDir, stderr = os.Pipe)
+      val aborted = synchronized:
+        if !reg.done then
+          reg.extractor = Some(p)
+        reg.done
+      (p, aborted)
     if aborted then
       // Aborted between matching and spawning; abort() could not see this extractor or directory
       extractor.destroy()
-      os.remove.all(storeDir)
+      removeOwnedDirectory(storeId, reg)
     else
       logger.info(s"Receiving store $storeId, transfer ${reg.transferUUID}, from ${sock.getRemoteSocketAddress}")
 
@@ -203,6 +210,9 @@ class StoreTransferManager(port: Int,
           fail(storeId, reg, s"extractor exited with code $exitCode: ${extractor.stderr.text().trim}")
         else
           if claim(storeId, reg) then
+            directoryLock.synchronized:
+              if directoryOwners.get(storeDir).exists(_ eq reg) then
+                directoryOwners -= storeDir
             closeQuietly(sock)
             logger.info(s"Received store $storeId, transfer ${reg.transferUUID}")
             reg.promise.success(())
@@ -221,6 +231,17 @@ class StoreTransferManager(port: Int,
     if claim(storeId, reg) then
       abort(storeId, reg, cause)
 
+  /** Removes the store directory `reg` created, unless a newer attempt has since recreated it */
+  private def removeOwnedDirectory(storeId: StoreId, reg: Registration): Unit =
+    val storeDir = storeDirectory(storeId, reg)
+    directoryLock.synchronized:
+      if directoryOwners.get(storeDir).exists(_ eq reg) then
+        directoryOwners -= storeDir
+        try
+          os.remove.all(storeDir)
+        catch
+          case t: Throwable => logger.error(s"Failed to remove partial store directory for $storeId: $t")
+
   /** Tears down a settled registration: closes its connection, destroys its extractor, removes the
    *  partially extracted directory and fails its future. */
   private def abort(storeId: StoreId, reg: Registration, cause: String): Unit =
@@ -229,11 +250,7 @@ class StoreTransferManager(port: Int,
     extractor.foreach: p =>
       if p.isAlive() then
         p.destroy()
-    if sock.isDefined then
-      try
-        os.remove.all(storeDirectory(storeId, reg))
-      catch
-        case t: Throwable => logger.error(s"Failed to remove partial store directory for $storeId: $t")
+    removeOwnedDirectory(storeId, reg)
     val msg = s"Transfer in of store $storeId, transfer ${reg.transferUUID}, failed: $cause"
     logger.warn(msg)
     reg.promise.tryFailure(new Exception(msg))

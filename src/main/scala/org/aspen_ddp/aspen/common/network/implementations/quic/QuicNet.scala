@@ -721,6 +721,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     membership.foreach: hm =>
       val previous = bootIds.put(m.fromHost, m.fromBootId)
       if previous != null && previous != m.fromBootId then
+        // Deliberately close-only: the entry is kept. Dropping it would force a host-object re-read, which can park
+        // forever behind the restarted host's own bootstrap stores (the read's messages to them wait on that very
+        // lookup). A host whose endpoint really moved says so with a direct HostEndpointChanged instead.
         metadataManager.peekHostEntry(m.fromHost).foreach: entry =>
           logger.info(s"Host ${entry.name} restarted (new boot id); re-dialing it")
           closeOutbound(entry, establishedOnly = true)

@@ -4,6 +4,7 @@ import io.netty.util.ResourceLeakDetector
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -20,8 +21,14 @@ import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with BeforeAndAfterEach:
   import QuicNetFixture.*
 
-  /** Long relative to every test, so liveness-tick dials do not disturb the timing assertions */
+  /** Sets the idle timeout (3x, so 6 s): long relative to every test, so no connection idles out mid-test */
   private val HeartbeatPeriod = Duration(2, SECONDS)
+
+  /** Host membership's background traffic (pings, syncs, gossip rounds) kept out of the timing windows: after the
+    * initial join, nothing runs more often than every few seconds, and nothing is declared dead within a test
+    */
+  private val SlowGossip = GossipConfig(pingInterval = Duration(5, SECONDS), pingTimeout = Duration(2, SECONDS),
+    syncInterval = Duration(10, SECONDS), gossipInterval = Duration(2, SECONDS), suspicionMult = 5)
 
   private var previousLevel: ResourceLeakDetector.Level = scala.compiletime.uninitialized
   private var leakWatch: QuicTestPeer.LeakWatch = scala.compiletime.uninitialized
@@ -37,7 +44,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     ResourceLeakDetector.setLevel(previousLevel)
 
   override def beforeEach(): Unit =
-    fx = new QuicNetFixture(heartbeatPeriod = HeartbeatPeriod)
+    fx = new QuicNetFixture(QuicConfig(gossip = SlowGossip), HeartbeatPeriod)
 
   override def afterEach(): Unit =
     fx.close()

@@ -153,7 +153,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         try
           // Null while membership itself is being constructed. The hard stop never blocks; there is nothing to leave.
           if membership != null then
-            membership.foreach(_.crashForTests())
+            membership.foreach(_.hardStop())
           boundChannels.forEach(ch => ch.close().awaitUninterruptibly(CloseAwaitMillis))
           resolverPool.shutdownNow()
           group.shutdownGracefully(0, 0, TimeUnit.MILLISECONDS).awaitUninterruptibly(CloseAwaitMillis * 2)
@@ -174,6 +174,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     */
   private[quic] val membership: Option[HostMembership] = initOrAbort:
     ohost.map: (hostId, _) =>
+      // Seeds are fixed here: scalecube cannot change them after start. They matter only for the first join (later
+      // the cluster's own membership finds peers), so a bootstrap refresh need not reach them.
       new HostMembership(hostId, UUID.randomUUID(), initialBootstrapConfig.hosts.map(_.hostId), config.gossip,
         m => sendToHostId(m.toHost, m))
 
@@ -323,9 +325,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Applies membership events and gossip. Runs on the membership's "aspen-gossip" thread. */
   private val membershipListener = new MembershipListener:
-    override def online(hostId: HostId): Unit = metadataManager.getHostEntry(hostId).foreach(_.setOnline())
+    // Peek, never look up: an entry created later seeds its online state from membership (see createHostEntry)
+    override def online(hostId: HostId): Unit = metadataManager.peekHostEntry(hostId).foreach(_.setOnline())
 
-    override def offline(hostId: HostId): Unit = metadataManager.getHostEntry(hostId).foreach(_.setOffline())
+    override def offline(hostId: HostId): Unit = metadataManager.peekHostEntry(hostId).foreach(_.setOffline())
 
     override def gossipReceived(g: Gossip): Unit = g match
       case StoreMoved(storeId) => metadataManager.dropStoreMapping(storeId)
@@ -505,7 +508,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     * connections to this net until they find out by other means.
     */
   private[quic] def crashForTests(): Unit =
-    membership.foreach(_.crashForTests())
+    membership.foreach(_.hardStop())
     (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
     resolverPool.shutdownNow()
     group.shutdownGracefully(0, 1, TimeUnit.SECONDS)

@@ -78,7 +78,7 @@ final class HostMembership(localHost: HostId,
   def start(): Unit =
     cluster.start().subscribe(
       _ => logger.info(s"Host membership started for $localHost, boot id $bootId"),
-      err => logger.error(s"Host membership failed to start for $localHost: $err"))
+      err => logger.error(s"Host membership failed to start for $localHost: $err", err))
 
   /** Inbound scalecube traffic from another host. */
   def receive(m: ClusterTransportMessage): Unit = transport.receive(m)
@@ -105,10 +105,11 @@ final class HostMembership(localHost: HostId,
         case NonFatal(err) => logger.warn(s"Host membership shutdown for $localHost: $err")
       executor.shutdownNow()
 
-  /** Test hook simulating a crash. Stops the transport first, so nothing more (in particular no LEAVING gossip)
-    * reaches a peer, then shuts the cluster down in the background. Never blocks.
+  /** Stops without leaving the cluster, as a crash would: peers must detect the failure. Used by `QuicNet` when its
+    * construction fails and by its crash test hook. Stops the transport first, so nothing more (in particular no
+    * LEAVING gossip) reaches a peer, then shuts the cluster down in the background. Never blocks.
     */
-  private[quic] def crashForTests(): Unit =
+  private[quic] def hardStop(): Unit =
     if isShutdown.compareAndSet(false, true) then
       try
         // Completes synchronously: the transport's stop is a plain flag flip
@@ -168,4 +169,4 @@ final class HostMembership(localHost: HostId,
     listeners.asScala.foreach: l =>
       try call(l)
       catch
-        case NonFatal(err) => logger.error(s"Membership listener failed on $localHost: $err")
+        case NonFatal(err) => logger.error(s"Membership listener failed on $localHost: $err", err)

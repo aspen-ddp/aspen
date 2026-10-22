@@ -1,32 +1,6 @@
 TODO
 ====
 
-- A destination crash between promoting a transferred store and the pool metadata commit leaves
-  the store offline until an operator intervenes.
-
-  On a successful transfer in, Host.startStoreTransferIn removes the transfer-out marker from the
-  staged copy, os.moves it from <device>/transferring-in/<store> to <device>/<store>, and only
-  then runs updateStateForTransferredStore to repoint the pool. If the destination host dies in
-  that window (crash-only, so this is a normal event):
-
-    - On restart tryLoadStore finds a complete store directory with no marker at the final path
-      and loads it, even though the pool still names the source as the owner. Nothing routes
-      to it, but the copy is live on a device the metadata says does not own it.
-    - The device check still sees the store as TransferringIn, but startStoreTransferIn refuses
-      to start because finalPath already exists, logging "store path already exists" on every
-      check. The metadata step is never retried.
-    - The source's copy stays offline behind its own transfer-out marker, and the abandoned
-      transfer-out pass will not reinstate it because the entry is not Active.
-
-  This ordering predates the TLS/TCP transfer work (the old TransferringIn did the same), but it is
-  now the main remaining crash hole in transfers. Recommended fix: promote with a distinct
-  "transferred-in" marker instead of no marker. tryLoadStore skips directories carrying it (like
-  the transfer-out marker). startStoreTransferIn, on finding finalPath with that marker, skips
-  the byte transfer and resumes at updateStateForTransferredStore. The marker is removed only on
-  TransferOutcome.PoolRepointed, immediately before loadStoreById; on SourceRestored the whole
-  directory is discarded as today. Add a Host test that injects a "crash" after promotion (fresh
-  Host over the same root) and checks that the store is not loaded and the metadata step resumes.
-
 - An abandoned transfer in is never cleaned up on the receiving host.
 
   When the source device is declared failed mid-transfer, Host.abandonTransferIn rewrites the

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StartStoreTransfer}
@@ -8,6 +8,9 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
+import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
+import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 
 import java.nio.charset.StandardCharsets
@@ -15,6 +18,7 @@ import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.duration.{Duration, SECONDS}
 
 
 /** A StoreTransferService whose transfers move no bytes and finish only when the test says so.
@@ -868,7 +872,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   /** A host owning the transfer destination, with the receiving half of a transfer of
    *  `movingStore` already begun through the device check, exactly as the two tests above
    *  drive it. */
-  private case class TransferInStarted(deviceDir: Path,
+  private case class TransferInStarted(hostRoot: Path,
+                                       deviceDir: Path,
                                        host: RecordingHost,
                                        transfers: StagedTransferService,
                                        movingStore: StoreId)
@@ -893,7 +898,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     yield
       // pumpUntil gives up silently, so assert what it waited on.
       startTransferSent(transfers, movingStore, 1) should be(true)
-      TransferInStarted(deviceDir, host, transfers, movingStore)
+      TransferInStarted(hostRoot, deviceDir, host, transfers, movingStore)
 
   /** True once the `attempt`th beginTransferIn for `sid` has been made and the StartStoreTransfer
    *  for it captured. The service records the call before Host sends the message, so waiting on
@@ -931,8 +936,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       t.host.transferOutcomes.get(t.movingStore) should be(
         Some(Host.TransferOutcome.PoolRepointed))
       os.exists(promoted) should be(true)
-      // Left in place, the marker would keep the promoted store offline on every restart.
+      // Left in place, either marker would keep the promoted store offline on every restart.
       os.exists(promoted / "transferring-out") should be(false)
+      os.exists(promoted / "transferred-in") should be(false)
       os.exists(os.Path(t.deviceDir) / "transferring-in" / dirName) should be(false)
 
   atest("StartStoreTransfer carries the UUID registered with the service"):
@@ -1039,3 +1045,95 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       t.host.transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
       t.host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
       t.host.testingOnlyTransferringIn should not contain t.movingStore
+
+  atest("a destination crash after promotion resumes the pool update instead of loading the copy"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      // Holding the metadata step leaves the first host exactly where a crash after promotion
+      // would: the copy is at its final path and the pool still names the source. Crash-only, so
+      // the "restart" is simply a fresh Host over the same root; the held one never proceeds.
+      _ = t.host.holdTransferOutcomes()
+      promoted = os.Path(t.deviceDir) / t.movingStore.directoryName
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(os.exists(promoted))
+      markedAtCrash = os.exists(promoted / StoreTransfer.TransferredInMarkerFile)
+      poolAtCrash <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+
+      transfers2 = new StagedTransferService
+      host2 = newHost(t.hostRoot, transferService = transfers2)
+      _ = host2.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(host2.transferOutcomes.contains(t.movingStore) &&
+                     !host2.testingOnlyTransferringIn.contains(t.movingStore))
+
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield
+      markedAtCrash should be(true)
+      poolAtCrash.stores(t.movingStore.poolIndex).storageDeviceId should not be net.secondDeviceId
+
+      // The device check resumed the metadata step rather than refusing the existing directory
+      // or shipping the store again.
+      transfers2.transfersIn should be(Vector())
+      host2.transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      poolState.stores(t.movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
+
+      // Loaded only once the pool names this device, and the marker goes with it.
+      host2.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
+      os.exists(promoted / StoreTransfer.TransferredInMarkerFile) should be(false)
+
+  atest("a store carrying the transferred-in marker is not loaded at startup"):
+    // A real Host rather than RecordingHost, whose tryLoadStore records every candidate and
+    // honours no marker.
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val storeDir = deviceDir.resolve(storeId.directoryName)
+    Files.createDirectories(storeDir)
+    Files.write(storeDir.resolve(StoreConfig.configFilename),
+                StoreConfig(storeId, StoreConfig.RocksDB()).yamlConfig.getBytes(StandardCharsets.UTF_8))
+    Files.write(storeDir.resolve(StoreTransfer.TransferredInMarkerFile), Array.emptyByteArray)
+
+    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+      net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
+      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
+
+    Future.successful:
+      host.testingOnlyOfflineStores should contain(storeId)
+      host.getStoreIds should not contain storeId
+      // Nothing was opened in the copy's directory.
+      Files.list(storeDir).toArray.length should be(2)
+
+  atest("an Active store still carrying the transferred-in marker is loaded; a TransferringIn one is not"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newHost(hostRoot)
+
+    // Written after construction and marked offline by hand, as stageOfflineTransferringOutStore
+    // does, because the recording tryLoadStore neither honours the marker nor keeps the sets.
+    val List(activeDir, pendingDir) = List(storeId, storeIdB).map: sid =>
+      val dir = deviceDir.resolve(sid.directoryName)
+      Files.createDirectories(dir)
+      Files.write(dir.resolve(StoreTransfer.TransferredInMarkerFile), Array.emptyByteArray)
+      dir
+    val local = host.loadedDevices(deviceA)
+    local.offlineStores = local.offlineStores ++ Set(storeId, storeIdB)
+    val before = host.storeLoadAttempts.size
+
+    val armed = host.armLookup(deviceA)
+    host.testingOnlyCheckAllDevices()
+
+    // Active: the pool update committed and the destination crashed before removing the marker.
+    // TransferringIn with no source named keeps the other out of startStoreTransferIn, so it
+    // isolates the guard: the pool update for it has not committed.
+    armed.success(deviceState(
+      deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None),
+          storeIdB -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringIn, None))))
+
+    yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+      host.testingOnlyActiveDeviceChecks should not contain deviceA
+
+      Files.exists(activeDir.resolve(StoreTransfer.TransferredInMarkerFile)) should be(false)
+      Files.exists(pendingDir.resolve(StoreTransfer.TransferredInMarkerFile)) should be(true)
+      host.storeLoadAttempts.toList.drop(before) should be(List((deviceA, activeDir)))

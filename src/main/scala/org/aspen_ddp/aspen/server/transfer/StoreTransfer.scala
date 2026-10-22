@@ -13,6 +13,11 @@ object StoreTransfer:
    *  hosts do not load a store carrying this marker. */
   val TransferOutMarkerFile: String = "transferring-out"
 
+  /** Present in a store directory that has arrived and been moved into place, but whose pool
+   *  metadata has not yet been confirmed to name the receiving device; hosts do not load a store
+   *  carrying this marker. Removed only once the pool has been repointed. */
+  val TransferredInMarkerFile: String = "transferred-in"
+
   /** Per-device directory that incoming stores are extracted into before being moved into place */
   val StagingDirectory: String = "transferring-in"
 

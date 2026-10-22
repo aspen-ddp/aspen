@@ -9,6 +9,7 @@ import scribe.Logging
 
 import java.util.concurrent.{ConcurrentLinkedQueue, RejectedExecutionException, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
+import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
 
 /** The send side of one QUIC connection: a lock-free handoff from caller threads to the connection's event loop,
@@ -25,8 +26,15 @@ import scala.util.control.NonFatal
   * outbound connection `attach`, called from the connect future, installs it in time: Netty completes the connect
   * promise and then fires the event in the same call. On an inbound connection the event fires before
   * `channelActive`, so the owner must add `pipelineHandler` to the `QuicChannel` pipeline at channel init.
+  *
+  * Liveness hooks (all on `loop`): `onActive` runs once the connection is attached and the pre-handshake queue
+  * has been written, which is where the owner starts heartbeats (`scheduleAtFixedRate`) and keepalive
+  * (`startKeepalive`). Every task scheduled through these is cancelled when the connection closes.
   */
-final class QuicConnection(val loop: EventLoop, config: QuicConfig, onClosed: QuicConnection => Unit) extends Logging:
+final class QuicConnection(val loop: EventLoop,
+                           config: QuicConfig,
+                           onClosed: QuicConnection => Unit,
+                           onActive: QuicConnection => Unit = _ => ()) extends Logging:
   import QuicConnection.*
 
   private val budget = config.connectionBudgetBytes
@@ -59,6 +67,10 @@ final class QuicConnection(val loop: EventLoop, config: QuicConfig, onClosed: Qu
   private val waitingBarriers = new java.util.HashSet[Promise[Void]]()
   private var datagramsTouched = false
   private val touchedStreams = new java.util.ArrayList[QuicStreamChannel](nStreams)
+  private var lastWriteNanos = System.nanoTime() // last outbound datagram or stream write, keepalives included
+  private val scheduledTasks = new java.util.ArrayList[NFuture[?]]()
+  private var keepaliveNanos = 0L // 0: keepalive not started
+  private var keepaliveTask: NFuture[?] = null
 
   private val drainTask: Runnable = () => drain()
   private val activateTask: Runnable = () => activate()
@@ -215,6 +227,11 @@ final class QuicConnection(val loop: EventLoop, config: QuicConfig, onClosed: Qu
       preHandshakeBytes = 0
       waitingBarriers.forEach(_.trySuccess(null))
       waitingBarriers.clear()
+      scheduledTasks.forEach(_.cancel(false))
+      scheduledTasks.clear()
+      if keepaliveTask != null then
+        keepaliveTask.cancel(false)
+        keepaliveTask = null
       inFlight.clear() // Netty fails and releases these as the channel closes
       if channel != null then
         channel.close()
@@ -232,6 +249,56 @@ final class QuicConnection(val loop: EventLoop, config: QuicConfig, onClosed: Qu
         item = preHandshake.poll()
       preHandshakeBytes = 0
       flushTouched()
+      try
+        onActive(this)
+      catch
+        case NonFatal(e) => logger.warn(s"QUIC onActive callback failed: $e")
+
+  /** Runs `task` on the loop every `period`, starting one `period` from now, until the connection closes */
+  def scheduleAtFixedRate(period: Duration)(task: => Unit): Unit =
+    assert(loop.inEventLoop(), "scheduleAtFixedRate must run on the connection's loop")
+    if !closed then
+      val r: Runnable = () =>
+        if !closed then
+          try task
+          catch case NonFatal(e) => logger.warn(s"QUIC scheduled task failed: $e")
+      val ms = math.max(1L, period.toMillis)
+      try scheduledTasks.add(loop.scheduleAtFixedRate(r, ms, ms, TimeUnit.MILLISECONDS))
+      catch case _: RejectedExecutionException => () // the loop is shutting down
+
+  /** Sends a keepalive whenever nothing has been written for `idle`, until the connection closes.
+    *
+    * Netty QUIC 4.2.19 exposes no way to send a QUIC PING frame (`QuicChannel` has no ping or keep-alive method),
+    * so the keepalive is a 1-byte datagram holding `KeepaliveByte` (0). DATAGRAM frames are ack-eliciting, so it
+    * resets both sides' idle timers. A real message datagram is at least 4 bytes (its u32 prefixLen), so a single
+    * 0 byte is never a message (read as a prefixLen it is invalid); the receiver checks `isKeepalive` and discards
+    * it, silently, before decode. It is written directly rather than through `submit`: it is loop-side, carries no
+    * payload, and must not count against or be dropped by the message budget.
+    */
+  def startKeepalive(idle: Duration): Unit =
+    assert(loop.inEventLoop(), "startKeepalive must run on the connection's loop")
+    if !closed && keepaliveNanos == 0 then
+      keepaliveNanos = math.max(1L, idle.toNanos)
+      scheduleKeepalive()
+
+  private def scheduleKeepalive(): Unit =
+    val delay = math.max(0L, lastWriteNanos + keepaliveNanos - System.nanoTime())
+    try keepaliveTask = loop.schedule((() => keepaliveCheck()): Runnable, delay, TimeUnit.NANOSECONDS)
+    catch case _: RejectedExecutionException => () // the loop is shutting down
+
+  private def keepaliveCheck(): Unit =
+    if !closed then
+      if System.nanoTime() - lastWriteNanos >= keepaliveNanos then
+        sendKeepalive()
+      scheduleKeepalive()
+
+  private def sendKeepalive(): Unit =
+    val ch = channel
+    if maxDatagramLength >= 1 && ch != null then
+      val buf = ch.alloc().buffer(1).writeByte(KeepaliveByte)
+      ch.writeAndFlush(buf) // Netty releases buf if the write fails
+    // Counted even when not sent, so a peer without datagram support is not retried in a tight loop
+    lastWriteNanos = System.nanoTime()
 
   private def drain(): Unit =
     drainCount.incrementAndGet()
@@ -285,6 +352,7 @@ final class QuicConnection(val loop: EventLoop, config: QuicConfig, onClosed: Qu
     else
       val ch = channel
       val f = ch.write(enc.toDatagram(ch.alloc()))
+      lastWriteNanos = System.nanoTime()
       datagramsTouched = true
       track(f, null, 0)
 
@@ -296,6 +364,7 @@ final class QuicConnection(val loop: EventLoop, config: QuicConfig, onClosed: Qu
       val s = slot.stream
       val size = enc.size
       val f = s.write(enc.toStreamFrame(s.alloc()))
+      lastWriteNanos = System.nanoTime()
       if !touchedStreams.contains(s) then
         touchedStreams.add(s)
       track(f, slot, size)
@@ -386,6 +455,13 @@ final class QuicConnection(val loop: EventLoop, config: QuicConfig, onClosed: Qu
 
 object QuicConnection:
   private val DropLogIntervalNanos: Long = TimeUnit.SECONDS.toNanos(1)
+
+  /** The single byte of a keepalive datagram. See `startKeepalive`. */
+  val KeepaliveByte: Int = 0
+
+  /** Whether a received datagram is a keepalive. Does not consume or release `buf`. */
+  def isKeepalive(buf: io.netty.buffer.ByteBuf): Boolean =
+    buf.readableBytes() == 1 && buf.getByte(buf.readerIndex()) == KeepaliveByte
 
   private final class Barrier(val promise: Promise[Void])
 

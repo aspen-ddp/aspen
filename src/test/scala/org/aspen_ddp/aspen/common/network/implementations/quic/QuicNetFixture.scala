@@ -59,8 +59,14 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(),
 
   /** Shuts down B and starts a fresh B on the same port */
   def restartB(): Unit =
-    b.net.closeForTests()
-    b = host(hostIdB, portB)
+    stopB()
+    startB()
+
+  /** Shuts down B. `b` keeps referring to the stopped net until `startB`. */
+  def stopB(): Unit = b.net.closeForTests()
+
+  /** Starts a fresh B on B's port */
+  def startB(): Unit = b = host(hostIdB, portB)
 
   def close(): Unit =
     val all = synchronized:

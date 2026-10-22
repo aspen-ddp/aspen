@@ -231,8 +231,13 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val gotB = await(fx.b.handler.hostMessages, half, 20000)
     gotA.forall(_.message.toHost == fx.hostIdA) shouldBe true
     gotB.forall(_.message.toHost == fx.hostIdB) shouldBe true
-    entryFor(c.net, fx.hostIdA).connection.get().drops shouldBe 0
-    entryFor(c.net, fx.hostIdB).connection.get().drops shouldBe 0
+    // A connection that closed would be null here; the client keeps both alive, so require them open
+    val connA = entryFor(c.net, fx.hostIdA).connection.get()
+    val connB = entryFor(c.net, fx.hostIdB).connection.get()
+    connA should not be null
+    connB should not be null
+    connA.drops shouldBe 0
+    connB.drops shouldBe 0
 
   test("MessageHandler callbacks run on event loop threads"):
     val c = fx.client()

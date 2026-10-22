@@ -24,7 +24,7 @@ import scribe.Logging
 import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, RejectedExecutionException, TimeUnit, TimeoutException}
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
@@ -113,6 +113,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private val nextDialIndex = new AtomicInteger(0)
 
+  private val keepaliveCount = new AtomicLong(0)
+  private val undecodableCount = new AtomicLong(0)
+
   // ---- Pipeline handlers ---------------------------------------------------------------------------------------
 
   /** Installs a `StreamFrameDecoder` on every inbound stream of every connection, both directions */
@@ -141,13 +144,19 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
     override def channelRead(ctx: ChannelHandlerContext, msg: Any): Unit =
       msg match
+        case buf: ByteBuf if QuicConnection.isKeepalive(buf) =>
+          // Sent by the dialing side of a quiet connection; see QuicConnection.startKeepalive
+          buf.release()
+          keepaliveCount.incrementAndGet()
         case buf: ByteBuf =>
           val decoded =
             try QuicMessageCodec.decodeDatagram(buf)
             finally buf.release()
           decoded match
             case Right(m) => dispatch(conn, m)
-            case Left(err) => logger.warn(s"Undecodable QUIC datagram from ${remoteOf(ctx.channel())}: $err")
+            case Left(err) =>
+              undecodableCount.incrementAndGet()
+              logger.warn(s"Undecodable QUIC datagram from ${remoteOf(ctx.channel())}: $err")
         case other => ctx.fireChannelRead(other)
 
     override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable): Unit =
@@ -231,6 +240,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   val metadataManager: MetadataManager[QuicHostEntry] =
     new MetadataManager[QuicHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl)
 
+  private val offlineTask: NFuture[?] =
+    val ms = math.max(1L, heartbeatPeriod.toMillis)
+    loops(0).scheduleAtFixedRate((() => offlineCheck()): Runnable, ms, ms, TimeUnit.MILLISECONDS)
+
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)
 
@@ -255,8 +268,17 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private[quic] def inboundConnectionLoops: Set[EventLoop] = inboundConnections.asScala.map(_.loop).toSet
 
-  /** Closes every connection on its loop, closes the datagram channels and terminates the group */
+  /** Keepalive datagrams received and discarded */
+  private[quic] def keepalivesReceived: Long = keepaliveCount.get()
+
+  /** Datagrams that failed to decode */
+  private[quic] def undecodableDatagrams: Long = undecodableCount.get()
+
+  /** Cancels the offline check, closes every connection on its loop (which cancels its timers), closes the
+    * datagram channels and terminates the group
+    */
   private[quic] def closeForTests(): Unit =
+    offlineTask.cancel(false)
     liveConnections.toArray(new Array[QuicConnection](0)).foreach: conn =>
       try conn.loop.submit((() => conn.close()): Runnable).awaitUninterruptibly(CloseAwaitMillis)
       catch case _: RejectedExecutionException => ()
@@ -312,7 +334,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         val parent = clientChannels(Math.floorMod(nextDialIndex.getAndIncrement(), clientChannels.length))
         // Resolved here, never on a loop
         val address = new InetSocketAddress(entry.address, entry.dataPort)
-        val conn = new QuicConnection(parent.eventLoop(), config, c => outboundClosed(entry, c))
+        val conn = new QuicConnection(parent.eventLoop(), config, c => outboundClosed(entry, c), outboundActive)
         if entry.connection.compareAndSet(cur, conn) then
           liveConnections.add(conn)
           try
@@ -349,6 +371,30 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           conn.handshakeFailed(r.cause())
     catch
       case NonFatal(e) => conn.handshakeFailed(e)
+
+  /** On the connection's loop, once an outbound connection is up: heartbeats (host mode) and keepalive.
+    *
+    * Like `ZMQNet`, which heartbeats over its dealers, a host heartbeats only over the connections it dialed: one
+    * now and one every `heartbeatPeriod`. They go through `submit`, so they obey the budget and drop rules.
+    * Keepalive is driven by the dialing side only, after `idleTimeout / 2` without an outbound write.
+    */
+  private def outboundActive(conn: QuicConnection): Unit =
+    ohost.foreach: (hostId, _) =>
+      val hb = HostHeartbeat(hostId)
+      def send(): Unit = conn.submit(QuicMessageCodec.encode(hb, PooledByteBufAllocator.DEFAULT))
+      send()
+      conn.scheduleAtFixedRate(heartbeatPeriod)(send())
+    conn.startKeepalive(idleTimeout / 2)
+
+  /** Same rule as `ZMQNet.heartbeat`: no heartbeat for 3 heartbeat periods means offline. Runs on loop 0. */
+  private def offlineCheck(): Unit =
+    try
+      val threshold = System.nanoTime() - (heartbeatPeriod * 3).toNanos
+      metadataManager.resolvedHostEntries.foreach: host =>
+        if host.lastHeartbeatTime <= threshold then
+          host.setOffline()
+    catch
+      case NonFatal(e) => logger.warn(s"QUIC offline check failed: $e")
 
   private def outboundClosed(entry: QuicHostEntry, conn: QuicConnection): Unit =
     entry.connection.compareAndSet(conn, null)

@@ -20,6 +20,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
 
   private val HeartbeatPeriod = Duration(200, MILLISECONDS)
   private val IdleTimeout = Duration(600, MILLISECONDS)
+  private val RecoveryBudgetMillis = 2000L
 
   private var previousLevel: ResourceLeakDetector.Level = scala.compiletime.uninitialized
   private var leakWatch: QuicTestPeer.LeakWatch = scala.compiletime.uninitialized
@@ -108,7 +109,10 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     fx.startB()
     // Timed from when the restarted B is up, so B's construction time (TLS contexts, binds) is not counted
     val restarted = System.nanoTime()
-    eventually("A and the restarted B see each other online", 3 * HeartbeatPeriod.toMillis):
+    // Recovery waits on quiche's Initial retransmission (PTO) for A's re-dial made while B was down, so its timing
+    // varies (365-590ms observed). 2s still proves recovery without application traffic, far below the
+    // "never recovers" failure this guards against, and stays under the 5s handshake timeout.
+    eventually("A and the restarted B see each other online", RecoveryBudgetMillis):
       entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
     info(s"B started in ${(restarted - starting) / 1000000}ms; " +
       s"recovered ${(System.nanoTime() - restarted) / 1000000}ms after it was up")

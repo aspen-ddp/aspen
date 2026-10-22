@@ -599,7 +599,7 @@ class Host(val client: AspenClient,
                         httpPort: Int,
                         storeTransferPort: Int): Future[Boolean] =
     def attempt(): Future[Boolean] =
-      client.getHostState(hostId).flatMap: hs =>
+      readHostStateForEndpoint().flatMap: hs =>
         if hs.address == address && hs.dataPort == dataPort &&
            hs.httpPort == httpPort && hs.storeTransferPort == storeTransferPort then
           Future.successful(false)
@@ -620,15 +620,23 @@ class Host(val client: AspenClient,
             net.broadcastGossip(HostEndpointChanged(hostId))
             true
 
-    val first = attempt()
-    first.failed.foreach: err =>
-      logger.warn(s"Failed to reconcile host endpoint, retrying in 5 seconds: $err")
-      def retry(): Unit =
-        attempt().failed.foreach: e =>
-          logger.warn(s"Failed to reconcile host endpoint, retrying in 5 seconds: $e")
-          backgroundTasks.schedule(Duration(5, SECONDS))(retry())
-      backgroundTasks.schedule(Duration(5, SECONDS))(retry())
-    first
+    // Each call is one attempt; a failed one logs and schedules another. The result is the
+    // attempt it was called for, so the first call's Future reflects only the first attempt.
+    def run(): Future[Boolean] =
+      val result = attempt()
+      result.failed.foreach: err =>
+        logger.warn(s"Failed to reconcile host endpoint, retrying in 5 seconds: $err")
+        scheduleEndpointRetry(run())
+      result
+
+    run()
+
+  /** Test seam: the read that decides whether the endpoint needs updating. */
+  protected def readHostStateForEndpoint(): Future[HostState] = client.getHostState(hostId)
+
+  /** Test seam: runs a failed reconcileEndpoint attempt's retry after the retry delay. */
+  protected def scheduleEndpointRetry(fn: => Unit): Unit =
+    backgroundTasks.schedule(Duration(5, SECONDS))(fn)
 
   /** Reclaims the store copy a transfer just delivered onto a device that turned out to be
    *  tombstoned.

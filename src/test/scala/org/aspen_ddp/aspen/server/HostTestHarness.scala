@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
@@ -207,6 +207,21 @@ private class RecordingHost(mgrClient: AspenClient,
     transferService,
     rebuildFactory,
     maxRebuilds):
+
+  /** Number of upcoming reconcileEndpoint reads to fail. */
+  val failEndpointReads = new AtomicInteger(0)
+  /** Retries reconcileEndpoint has scheduled. They run at once, on execCtx, instead of after 5s. */
+  val endpointRetriesScheduled = new AtomicInteger(0)
+
+  override protected def readHostStateForEndpoint(): Future[HostState] =
+    if failEndpointReads.getAndUpdate(n => math.max(0, n - 1)) > 0 then
+      Future.failed(new Exception("Simulated host state read failure"))
+    else
+      super.readHostStateForEndpoint()
+
+  override protected def scheduleEndpointRetry(fn: => Unit): Unit =
+    endpointRetriesScheduled.incrementAndGet()
+    execCtx.execute(() => fn)
 
   /** (deviceId, path) for every path tryLoadStore was invoked with, in call order.
    *

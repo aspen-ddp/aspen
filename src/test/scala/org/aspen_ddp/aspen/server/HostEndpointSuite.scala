@@ -37,3 +37,41 @@ class HostEndpointSuite extends IntegrationTestSuite with HostTestHarness:
       after.dataPort should be(hs.dataPort + 1)
       after.httpPort should be(hs.httpPort)
       net.takeCapturedGossip() should be(List(HostEndpointChanged(host.hostId)))
+
+  atest("a failed first attempt is retried until the endpoint is updated and gossiped"):
+    given ExecutionContext = executionContext
+
+    val host = newHost(newHostDir())
+    host.failEndpointReads.set(2)
+
+    for
+      hs <- client.getHostState(host.hostId)
+      _ = net.takeCapturedGossip()
+      first = host.reconcileEndpoint("10.9.8.7", hs.dataPort, hs.httpPort, hs.storeTransferPort)
+      // The returned Future reflects only the first attempt, which failed
+      firstFailed <- first.failed
+      _ <- yieldUntil(net.capturedGossip.nonEmpty)
+      _ <- waitForTransactionsToComplete()
+      _ <- yieldUntil(net.capturedGossip.nonEmpty)
+      after <- client.getHostState(host.hostId)
+    yield
+      firstFailed.getMessage should include("Simulated")
+      host.endpointRetriesScheduled.get should be(2)
+      after.address should be("10.9.8.7")
+      net.takeCapturedGossip() should be(List(HostEndpointChanged(host.hostId)))
+
+  atest("a retry that finds the endpoint already matching stops without gossiping"):
+    given ExecutionContext = executionContext
+
+    val host = newHost(newHostDir())
+    host.failEndpointReads.set(1)
+
+    for
+      hs <- client.getHostState(host.hostId)
+      first = host.reconcileEndpoint(hs.address, hs.dataPort, hs.httpPort, hs.storeTransferPort)
+      _ <- first.failed
+      _ <- yieldUntil(false, 50)
+      _ <- waitForTransactionsToComplete()
+    yield
+      host.endpointRetriesScheduled.get should be(1)
+      net.takeCapturedGossip() should be(Nil)

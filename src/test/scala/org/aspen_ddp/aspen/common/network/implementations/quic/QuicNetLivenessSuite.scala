@@ -56,8 +56,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     TxHeartbeat(to, from, TransactionId(UUID.randomUUID()))
 
   /** Stream-sized, so delivery is reliable */
-  private def transferData(to: HostId): StoreTransferData =
-    StoreTransferData(to, ClientId(UUID.randomUUID()), UUID.randomUUID(), DataBuffer(new Array[Byte](2000)))
+  private def transferData(to: StoreId): OpportunisticRebuild = rebuild(to, 2000)
 
   private def entryFor(net: QuicNet, hostId: HostId): QuicHostEntry =
     net.metadataManager.peekHostEntry(hostId).getOrElse(fail(s"no host entry for $hostId"))
@@ -126,9 +125,9 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     eventually("A's connection to the stopped B closes", 3000):
       stale.isClosed
     fx.startB()
-    val m = transferData(fx.hostIdB)
-    fx.a.net.clientMessenger.sendHostMessage(m)
-    await(fx.b.handler.hostMessages, 1).map(_.message) shouldBe List(m)
+    val m = transferData(fx.storesB.head)
+    fx.a.net.clientMessenger.sendClientRequest(m)
+    await(fx.b.handler.clientRequests, 1).map(_.message) shouldBe List(m)
 
   test("a crashed and restarted peer is re-dialed long before the idle timeout"):
     // A long idle timeout, so only the heartbeat-connection change can make A drop its stale connection in time
@@ -147,8 +146,8 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val deadline = restarted + TimeUnit.MILLISECONDS.toNanos(RecoveryBudgetMillis)
     var delivered = false
     while !delivered && System.nanoTime() - deadline < 0 do
-      fx.a.net.clientMessenger.sendHostMessage(transferData(fx.hostIdB))
-      delivered = fx.b.handler.hostMessages.poll(50, TimeUnit.MILLISECONDS) != null
+      fx.a.net.clientMessenger.sendClientRequest(transferData(fx.storesB.head))
+      delivered = fx.b.handler.clientRequests.poll(50, TimeUnit.MILLISECONDS) != null
     info(s"delivered to the restarted B ${(System.nanoTime() - restarted) / 1000000}ms after it was up")
     delivered shouldBe true
     stale.isClosed shouldBe true

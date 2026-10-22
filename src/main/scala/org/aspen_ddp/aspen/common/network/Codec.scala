@@ -919,22 +919,6 @@ object Codec extends Logging:
     StartStoreTransfer(toHost, fromClient, fromDevice, storeId, timestamp, transferUUID)
 
 
-  def encode(o: StoreTransferData): codec.StoreTransferData =
-    codec.StoreTransferData(
-      toHost = Some(encodeUUID(o.toHost.uuid)),
-      fromClient = Some(encodeUUID(o.fromClient.uuid)),
-      transferUUID = Some(encodeUUID(o.transferUUID)),
-      data = ByteString.copyFrom(o.data.asReadOnlyBuffer())
-    )
-
-  def decode(m: codec.StoreTransferData): StoreTransferData =
-    val toHost = HostId(decodeUUID(m.toHost.get))
-    val fromClient = ClientId(decodeUUID(m.fromClient.get))
-    val transferUUID = decodeUUID(m.transferUUID.get)
-    val data = DataBuffer(m.data.toByteArray)
-    StoreTransferData(toHost, fromClient, transferUUID, data)
-
-
   def encode(o: CheckStorageDevice): codec.CheckStorageDevice =
     codec.CheckStorageDevice(
       toHost = Some(encodeUUID(o.toHost.uuid)),

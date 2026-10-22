@@ -40,13 +40,6 @@ final case class StartStoreTransfer(
                                      transferUUID: UUID
                                    ) extends HostMessage
 
-final case class StoreTransferData(
-                                    toHost: HostId,
-                                    fromClient: ClientId,
-                                    transferUUID: UUID,
-                                    data: DataBuffer
-                                  ) extends HostMessage
-
 final case class CheckStorageDevice(
                                      toHost: HostId,
                                      fromClient: ClientId,

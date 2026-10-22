@@ -50,6 +50,11 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       Right(ReadResponse.CurrentState(rev(4), ObjectRefcount(1, 5), HLCTimestamp(2000L), 1024, data,
         Set(TransactionId(uuid(5)), TransactionId(uuid(6))))))
 
+  /** A single-section message (the payload is its only out-of-band data section) */
+  private def rebuildMsg(data: DataBuffer): OpportunisticRebuild =
+    OpportunisticRebuild(storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4), ObjectRefcount(1, 5),
+      HLCTimestamp(1000L), data)
+
   private def fixtures: List[Message] = List(
     HostHeartbeat(HostId(uuid(1))),
     Read(storeId(10), ClientId(uuid(20)), uuid(30), dataPtr(1), FullObject()),
@@ -81,7 +86,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     TxUnknownStore(storeId(1), storeId(2), TransactionId(uuid(3))),
     StartStoreTransfer(HostId(uuid(1)), ClientId(uuid(2)), StorageDeviceId(uuid(3)), storeId(4),
       HLCTimestamp(1000L), uuid(5)),
-    StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(bytes(100))),
+    rebuildMsg(DataBuffer(bytes(100))),
     CheckStorageDevice(HostId(uuid(1)), ClientId(uuid(2)), StorageDeviceId(uuid(3))),
     ServiceMessage(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), bytes(5)),
     ExecuteSystemTask(HostId(uuid(1)), ClientId(uuid(2)), uuid(3),
@@ -149,18 +154,18 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
   test("payload slices with non-zero position encode only their visible bytes"):
     val arr = bytes(40)
     val slice = DataBuffer(arr).slice(5, 10)
-    val m = StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), slice)
+    val m = rebuildMsg(slice)
     val enc = QuicMessageCodec.encode(m, alloc)
     enc.size shouldBe 4 + enc.prefix.readableBytes() + 10
     val dg = enc.toDatagram(alloc)
-    val decoded = QuicMessageCodec.decodeDatagram(dg).toOption.get.asInstanceOf[StoreTransferData]
+    val decoded = QuicMessageCodec.decodeDatagram(dg).toOption.get.asInstanceOf[OpportunisticRebuild]
     dg.release()
     decoded.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
 
     val enc2 = QuicMessageCodec.encode(m, alloc)
     val frame = enc2.toStreamFrame(alloc)
     val view = frame.retainedDuplicate()
-    val decoded2 = decodeFrame(view).toOption.get.asInstanceOf[StoreTransferData]
+    val decoded2 = decodeFrame(view).toOption.get.asInstanceOf[OpportunisticRebuild]
     view.release()
     frame.release()
     decoded2.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
@@ -169,7 +174,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val msgs: List[Message] = List(
       prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer.Empty)), Nil),
       readResponse(None),
-      StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer.Empty))
+      rebuildMsg(DataBuffer.Empty))
     msgs.foreach: m =>
       val enc = QuicMessageCodec.encode(m, alloc)
       val dg = enc.toDatagram(alloc)
@@ -186,7 +191,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
 
   test("send path does not copy payloads"):
     val arr = bytes(2000)
-    val m = StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(arr))
+    val m = rebuildMsg(DataBuffer(arr))
     val enc = QuicMessageCodec.encode(m, alloc)
     val frame = enc.toStreamFrame(alloc)
     frame shouldBe a[CompositeByteBuf]
@@ -250,15 +255,15 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
   test("size picks the transport at the boundary"):
     def sized(target: Int): QuicMessageCodec.Encoded =
       val base = QuicMessageCodec.encode(
-        StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer.Empty), alloc)
+        rebuildMsg(DataBuffer.Empty), alloc)
       // an empty payload still adds a section length entry, so measure with one byte
       base.release()
       val one = QuicMessageCodec.encode(
-        StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(bytes(1))), alloc)
+        rebuildMsg(DataBuffer(bytes(1))), alloc)
       val overhead = one.size - 1
       one.release()
       QuicMessageCodec.encode(
-        StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(bytes((target - overhead).toInt))),
+        rebuildMsg(DataBuffer(bytes((target - overhead).toInt))),
         alloc)
     List((1023, true), (1024, true), (1025, false)).foreach: (target, expectDatagram) =>
       val enc = sized(target)
@@ -279,7 +284,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     finally buf.release()
 
   test("malformed input returns Left"):
-    val good = validPrefixBytes(StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(bytes(8))))
+    val good = validPrefixBytes(rebuildMsg(DataBuffer(bytes(8))))
     parse(good).isRight shouldBe true
 
     // truncated at several points
@@ -321,7 +326,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     QuicMessageCodec.assemble(badSections, Array(DataBuffer(bytes(4)), DataBuffer(bytes(4)))).isLeft shouldBe true
 
     // whole-datagram level: sections shorter than advertised, empty buffer
-    val dgEnc = QuicMessageCodec.encode(StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(bytes(8))), alloc)
+    val dgEnc = QuicMessageCodec.encode(rebuildMsg(DataBuffer(bytes(8))), alloc)
     val dg = dgEnc.toDatagram(alloc)
     val short = dg.retainedSlice(0, dg.readableBytes() - 1)
     QuicMessageCodec.decodeDatagram(short).isLeft shouldBe true

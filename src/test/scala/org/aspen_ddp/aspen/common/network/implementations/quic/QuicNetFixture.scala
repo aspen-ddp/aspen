@@ -4,7 +4,10 @@ import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.store.StoreId
 
 import java.net.{DatagramSocket, InetAddress, InetSocketAddress}
@@ -82,6 +85,16 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(),
       catch case _: Throwable => ()
 
 object QuicNetFixture:
+  /** A single-section message addressed to a store, carrying `size` bytes of seeded data */
+  def rebuild(to: StoreId, size: Int, seed: Int = 0): OpportunisticRebuild =
+    rebuildOf(to, Array.tabulate[Byte](size)(i => (i * 31 + seed).toByte))
+
+  /** A single-section message addressed to a store, carrying exactly `payload` */
+  def rebuildOf(to: StoreId, payload: Array[Byte]): OpportunisticRebuild =
+    val ptr = DataObjectPointer(ObjectId(UUID.randomUUID()), PoolId.BootstrapPoolId, Array[Byte](1))
+    OpportunisticRebuild(to, ClientId(UUID.randomUUID()), ptr, ObjectRevision(TransactionId(UUID.randomUUID())),
+      ObjectRefcount(1, 1), HLCTimestamp(1000L), DataBuffer(payload))
+
   val AwaitMillis: Long = 10000
 
   def credentials(): TlsCredentials =

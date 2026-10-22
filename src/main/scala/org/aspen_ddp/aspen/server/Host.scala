@@ -1680,10 +1680,6 @@ class Host(val client: AspenClient,
 
       case HostMsg(msg) => msg match
         case m: StartStoreTransfer => startStoreTransferOut(m)
-        // Store data now travels over storeTransferService's own TLS connections. The message
-        // type is still part of the sealed HostMessage hierarchy, so it is matched and dropped
-        // rather than left to a MatchError.
-        case _: StoreTransferData => ()
         case m: CheckStorageDevice =>
           // A device id we do not know may simply be one that has appeared on disk since
           // our last scan -- create-storage-device sends this message as a discovery nudge

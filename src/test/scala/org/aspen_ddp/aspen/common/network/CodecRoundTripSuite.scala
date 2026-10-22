@@ -470,13 +470,6 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.timestamp shouldBe original.timestamp
     decoded.transferUUID shouldBe original.transferUUID
 
-  test("StoreTransferData round-trip"):
-    val original = StoreTransferData(HostId(uuid(1)), ClientId(uuid(2)), uuid(3), DataBuffer(Array[Byte](1, 2, 3)))
-    val decoded = Codec.decode(Codec.encode(original))
-    decoded.toHost shouldBe original.toHost
-    decoded.fromClient shouldBe original.fromClient
-    decoded.transferUUID shouldBe original.transferUUID
-
   test("CheckStorageDevice round-trip"):
     val original = CheckStorageDevice(HostId(uuid(1)), ClientId(uuid(2)), StorageDeviceId(uuid(3)))
     val decoded = Codec.decode(Codec.encode(original))

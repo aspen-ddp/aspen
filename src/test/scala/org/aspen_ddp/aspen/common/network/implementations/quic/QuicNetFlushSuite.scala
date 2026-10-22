@@ -51,8 +51,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
   private def read(to: StoreId, from: ClientId): Read = Read(to, from, UUID.randomUUID(), ptr, FullObject())
 
   /** Stream-sized */
-  private def transferData(to: HostId): StoreTransferData =
-    StoreTransferData(to, ClientId(UUID.randomUUID()), UUID.randomUUID(), DataBuffer(new Array[Byte](4096)))
+  private def transferData(to: StoreId): OpportunisticRebuild = rebuild(to, 4096)
 
   private def checkDevice(to: HostId, from: ClientId): CheckStorageDevice =
     CheckStorageDevice(to, from, StorageDeviceId(UUID.randomUUID()))
@@ -79,12 +78,15 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     (0 until 25).foreach: i =>
       val store = if i % 2 == 0 then fx.storesA(i % 2) else fx.storesB(i % 2)
       c.net.clientMessenger.sendClientRequest(read(store, c.net.clientId))
-      c.net.clientMessenger.sendHostMessage(transferData(if i % 2 == 0 then fx.hostIdB else fx.hostIdA))
+      c.net.clientMessenger.sendClientRequest(transferData(if i % 2 == 0 then fx.storesB.head else fx.storesA.head))
     c.net.awaitPendingMessagesSent(Duration(5, SECONDS)) shouldBe true
-    await(fx.a.handler.clientRequests, 13)
-    await(fx.b.handler.clientRequests, 12)
-    await(fx.a.handler.hostMessages, 12)
-    await(fx.b.handler.hostMessages, 13)
+    // Host A receives 13 reads and 12 transfers; host B receives 12 reads and 13 transfers
+    val gotA = await(fx.a.handler.clientRequests, 25).map(_.message)
+    val gotB = await(fx.b.handler.clientRequests, 25).map(_.message)
+    gotA.count(_.isInstanceOf[Read]) shouldBe 13
+    gotA.count(_.isInstanceOf[OpportunisticRebuild]) shouldBe 12
+    gotB.count(_.isInstanceOf[Read]) shouldBe 12
+    gotB.count(_.isInstanceOf[OpportunisticRebuild]) shouldBe 13
 
   test("flush covers pre-handshake messages"):
     val c = fx.client()
@@ -154,7 +156,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val entry = new QuicHostEntry(HostId(UUID.randomUUID()), "no_dns", "nowhere.invalid", fx.portA, 0, 0)
     val conn = c.net.connectionFor(entry)
     val encs = (0 until 3).map: i =>
-      val e = QuicMessageCodec.encode(if i == 0 then read(fx.storesA.head, c.net.clientId) else transferData(fx.hostIdA),
+      val e = QuicMessageCodec.encode(if i == 0 then read(fx.storesA.head, c.net.clientId) else transferData(fx.storesA.head),
         io.netty.buffer.PooledByteBufAllocator.DEFAULT)
       conn.submit(e)
       e
@@ -197,7 +199,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val sent = new AtomicLong(0)
     val sender = new Thread(() =>
       while running.get() do
-        c.net.clientMessenger.sendHostMessage(transferData(fx.hostIdB))
+        c.net.clientMessenger.sendClientRequest(transferData(fx.storesB.head))
         sent.incrementAndGet())
     sender.setDaemon(true)
     sender.start()

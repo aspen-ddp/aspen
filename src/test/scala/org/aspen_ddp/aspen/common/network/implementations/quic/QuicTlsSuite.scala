@@ -4,7 +4,9 @@ import io.netty.util.ResourceLeakDetector
 import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.HostId
-import org.aspen_ddp.aspen.common.network.{ClientId, HostHeartbeat, StoreTransferData}
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.network.{HostHeartbeat, OpportunisticRebuild}
 import org.aspen_ddp.aspen.common.network.tls.CertificateAuthority
 import io.netty.handler.codec.quic.{QuicSslContext, QuicSslContextBuilder}
 import org.aspen_ddp.aspen.common.network.tls.{AspenTrustManager, CertificateVerifier, InvalidPeerCertificate, Pem}
@@ -119,13 +121,12 @@ class QuicTlsSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with
     d.transport shouldBe QuicTestPeer.Transport.Datagram
 
     val payload = Array.tabulate[Byte](64 * 1024)(i => (i * 31).toByte)
-    val big = StoreTransferData(HostId(UUID.randomUUID()), ClientId(UUID.randomUUID()), UUID.randomUUID(),
-      DataBuffer(payload))
+    val big = QuicNetFixture.rebuildOf(StoreId(PoolId.BootstrapPoolId, 0), payload)
     QuicTestPeer.sendStream(ch, big)
     val s = srv.awaitReceived()
     s.transport shouldBe a [QuicTestPeer.Transport.Stream]
     s.message match
-      case m: StoreTransferData => m.data.getByteArray shouldBe payload
+      case m: OpportunisticRebuild => m.data.getByteArray shouldBe payload
       case other => fail(s"unexpected $other")
     srv.protocolErrors.isEmpty shouldBe true
 
@@ -196,8 +197,7 @@ class QuicTlsSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with
     val srv = track(QuicTestPeer.server(QuicTls.serverContext(goodCreds()), config, stallStreams = true))
     val cli = track(QuicTestPeer.client(QuicTls.clientContext(goodCreds()), config))
     val ch = cli.connect(srv.localAddress).fold(t => fail(t), identity)
-    val msg = StoreTransferData(HostId(UUID.randomUUID()), ClientId(UUID.randomUUID()), UUID.randomUUID(),
-      DataBuffer(new Array[Byte]((window * 2).toInt)))
+    val msg = QuicNetFixture.rebuildOf(StoreId(PoolId.BootstrapPoolId, 0), new Array[Byte]((window * 2).toInt))
     val stream = QuicTestPeer.openStream(ch)
     val write = QuicTestPeer.writeFrame(stream, msg)
     write.await(500) shouldBe false

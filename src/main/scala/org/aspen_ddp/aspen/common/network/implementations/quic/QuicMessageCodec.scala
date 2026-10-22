@@ -113,7 +113,6 @@ object QuicMessageCodec:
     case m: TransactionFinalized => codec.Message.Msg.TxFinalized(Codec.encode(m))
     case m: TransactionResolved => codec.Message.Msg.TxResolved(Codec.encode(m))
     case m: StartStoreTransfer => codec.Message.Msg.StartStoreTransfer(Codec.encode(m))
-    case m: StoreTransferData => codec.Message.Msg.StoreTransferData(Codec.encode(m))
     case m: CheckStorageDevice => codec.Message.Msg.CheckStorageDevice(Codec.encode(m))
     case m: ServiceMessage => codec.Message.Msg.ServiceMessage(Codec.encode(m))
     case m: ExecuteSystemTask => codec.Message.Msg.ExecuteSystemTask(Codec.encode(m))
@@ -140,9 +139,6 @@ object QuicMessageCodec:
 
     case m @ ReadResponse(_, _, _, _, Right(cs)) if cs.objectData.exists(!_.isEmpty) =>
       (m.copy(result = Right(cs.copy(objectData = None))), ByteBuffer.allocate(0), Array(cs.objectData.get))
-
-    case m: StoreTransferData =>
-      (m.copy(data = DataBuffer.Empty), ByteBuffer.allocate(0), Array(m.data))
 
     case m: OpportunisticRebuild =>
       (m.copy(data = DataBuffer.Empty), ByteBuffer.allocate(0), Array(m.data))
@@ -249,11 +245,6 @@ object QuicMessageCodec:
                 case (Right(cs), Some(data)) => Right(rr.copy(result = Right(cs.copy(objectData = Some(data)))))
                 case (Left(_), Some(_)) => Left("ReadResponse error result cannot carry a data section")
                 case _ => Right(rr)
-          case codec.Message.Msg.StoreTransferData(r) =>
-            if sections.length != 1 then
-              Left(s"StoreTransferData requires exactly one section, got ${sections.length}")
-            else
-              Right(Codec.decode(r).copy(data = sections(0)))
           case codec.Message.Msg.OpportunisticRebuild(r) =>
             if sections.length != 1 then
               Left(s"OpportunisticRebuild requires exactly one section, got ${sections.length}")

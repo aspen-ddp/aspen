@@ -386,13 +386,6 @@ message StartStoreTransfer {
   UUID transferUUID = 6;
 }
 
-message StoreTransferData {
-  UUID toHost = 1;
-  UUID fromClient = 2;
-  UUID transferUUID = 3;
-  bytes data = 4;
-}
-
 message CheckStorageDevice {
   UUID toHost = 1;
   UUID fromClient = 2;
@@ -418,6 +411,8 @@ message ExecuteSystemTask {
 //- Root Message
 //---------------------------------------------------------------------------
 message Message {
+  reserved 22;
+  reserved "store_transfer_data";
   oneof msg {
     TxPrepare prepare = 1;
     TxPrepareResponse prepare_response = 2;
@@ -438,7 +433,6 @@ message Message {
     TxStatusRequest status_request = 19;
     TxStatusResponse status_response = 20;
     StartStoreTransfer start_store_transfer = 21;
-    StoreTransferData store_transfer_data = 22;
     CheckStorageDevice check_storage_device = 23;
     TxUnknownStore unknown_store = 24;
     ServiceMessage service_message = 25;

@@ -6,9 +6,12 @@ import io.netty.handler.codec.quic.QuicChannel
 import io.netty.util.ResourceLeakDetector
 import io.netty.util.concurrent.{Future as NFuture, GenericFutureListener}
 import org.aspen_ddp.aspen.TestTLS
-import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.metadata.HostId
-import org.aspen_ddp.aspen.common.network.{ClientId, StoreTransferData}
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.network.tls.CertificateAuthority
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
 import org.scalatest.funsuite.AnyFunSuite
@@ -74,7 +77,7 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
         fail(f.cause())
       f.getNow
 
-    def submit(m: StoreTransferData): (Boolean, QuicMessageCodec.Encoded) =
+    def submit(m: OpportunisticRebuild): (Boolean, QuicMessageCodec.Encoded) =
       val enc = QuicMessageCodec.encode(m, PooledByteBufAllocator.DEFAULT)
       (conn.submit(enc), enc)
 
@@ -110,7 +113,7 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
         fail(s"timed out waiting for $what")
       Thread.sleep(5)
 
-  private def seqOf(r: Received): Long = r.message.asInstanceOf[StoreTransferData].transferUUID.getLeastSignificantBits
+  private def seqOf(r: Received): Long = r.message.asInstanceOf[OpportunisticRebuild].pointer.id.uuid.getLeastSignificantBits
 
   private def streamId(r: Received): Long = r.transport match
     case Transport.Stream(id) => id
@@ -242,8 +245,8 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val (ok, enc) = fx.submit(msg)
     ok shouldBe true
     val r = fx.srv.awaitReceived()
-    val got = r.message.asInstanceOf[StoreTransferData]
-    got.transferUUID shouldBe msg.transferUUID
+    val got = r.message.asInstanceOf[OpportunisticRebuild]
+    got.pointer.id shouldBe msg.pointer.id
     got.data.size shouldBe msg.data.size
     java.util.Arrays.equals(got.data.getByteArray, msg.data.getByteArray) shouldBe true
     enc.prefix.refCnt() shouldBe 0
@@ -393,14 +396,17 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     leakWatch.leaks() shouldBe Nil
 
 object QuicConnectionSuite:
-  private val toHost = HostId(UUID.randomUUID())
+  private val toStore = StoreId(PoolId.BootstrapPoolId, 0)
   private val fromClient = ClientId(UUID.randomUUID())
+  private val revision = ObjectRevision(TransactionId(UUID.randomUUID()))
 
-  /** A StoreTransferData carrying `seq` whose encoded size is exactly `total` bytes */
-  def sized(seq: Long, total: Int): StoreTransferData =
-    val id = new UUID(0, seq)
-    val empty = QuicMessageCodec.encode(StoreTransferData(toHost, fromClient, id, DataBuffer.Empty),
-      PooledByteBufAllocator.DEFAULT)
+  private def rebuildOf(seq: Long, data: DataBuffer): OpportunisticRebuild =
+    val ptr = DataObjectPointer(ObjectId(new UUID(0, seq)), PoolId.BootstrapPoolId, Array[Byte](1))
+    OpportunisticRebuild(toStore, fromClient, ptr, revision, ObjectRefcount(1, 1), HLCTimestamp(1000L), data)
+
+  /** An OpportunisticRebuild carrying `seq` (as its object id) whose encoded size is exactly `total` bytes */
+  def sized(seq: Long, total: Int): OpportunisticRebuild =
+    val empty = QuicMessageCodec.encode(rebuildOf(seq, DataBuffer.Empty), PooledByteBufAllocator.DEFAULT)
     val base = empty.size.toInt
     empty.release()
     val payload = new Array[Byte](total - base)
@@ -408,7 +414,7 @@ object QuicConnectionSuite:
     while i < payload.length do
       payload(i) = (i * 31 + seq).toByte
       i += 1
-    StoreTransferData(toHost, fromClient, id, DataBuffer(payload))
+    rebuildOf(seq, DataBuffer(payload))
 
   def runnable(body: => Unit): Runnable = () => body
 

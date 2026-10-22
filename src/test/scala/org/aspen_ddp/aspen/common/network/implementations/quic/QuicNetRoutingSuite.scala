@@ -126,6 +126,19 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
       g.data.size shouldBe e.data.size
       java.util.Arrays.equals(g.data.getByteArray, e.data.getByteArray) shouldBe true
 
+  test("three back-to-back 32 MiB messages to an idle connection all arrive"):
+    val entry = entryFor(fx.a.net, fx.hostIdB)
+    val conn = fx.a.net.connectionFor(entry)
+    eventually("connection active")(conn.isActive)
+    val msgs = (0 until 3).map(i => transferData(fx.hostIdB, 32 * 1024 * 1024, i))
+    msgs.foreach(m => fx.a.net.sendToHost(entry, m)) // faster than the loop drains: all three queue at once
+    val got = await(fx.b.handler.hostMessages, 3, 30000).map(_.message.asInstanceOf[StoreTransferData])
+    got.map(_.transferUUID).toSet shouldBe msgs.map(_.transferUUID).toSet
+    got.foreach: g =>
+      val e = msgs.find(_.transferUUID == g.transferUUID).get
+      java.util.Arrays.equals(g.data.getByteArray, e.data.getByteArray) shouldBe true
+    conn.drops shouldBe 0
+
   test("two clients sharing one certificate get only their own responses"):
     val creds = credentials()
     val c1 = fx.client(creds = creds)

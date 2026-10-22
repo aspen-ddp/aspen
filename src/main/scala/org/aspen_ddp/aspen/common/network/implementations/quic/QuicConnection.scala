@@ -141,14 +141,27 @@ final class QuicConnection(val loop: EventLoop,
   /** The most bytes ever pending on a single stream, sampled after each stream write */
   private[quic] def maxPendingStreamBytes: Long = maxPending
 
+  /** What a message of `size` bytes counts against the handoff and pre-handshake budgets: its size, capped at the
+    * per-stream high-water mark.
+    *
+    * The cap is there because the loop drains the handoff only when it is next scheduled, so back-to-back submits from
+    * one thread see their predecessors still queued. Uncapped, a second message at least as large as the budget would
+    * be dropped on an idle connection whose streams could each take one. Capped, `nStreams` such messages fit, which
+    * is what the stream pool can accept (each stream takes one message past its high-water mark); the per-stream
+    * high-water mark then governs drops. Queued messages only reference the sender's buffers.
+    */
+  private def charge(size: Long): Long = math.min(size, streamHighWater.toLong)
+
+  /** Accepts while the charged bytes queued are below the budget, so they overshoot it by at most one message */
   private def reserve(size: Long): Boolean =
+    val c = charge(size)
     var done = false
     var ok = false
     while !done do
       val cur = queuedBytes.get()
-      if cur != 0 && cur + size > budget then
+      if cur >= budget then
         done = true
-      else if queuedBytes.compareAndSet(cur, cur + size) then
+      else if queuedBytes.compareAndSet(cur, cur + c) then
         ok = true
         done = true
     ok
@@ -170,7 +183,7 @@ final class QuicConnection(val loop: EventLoop,
     while item != null do
       item match
         case enc: Encoded =>
-          queuedBytes.addAndGet(-enc.size)
+          queuedBytes.addAndGet(-charge(enc.size))
           drop(enc, "connection closed")
         case b: Barrier => b.promise.trySuccess(null)
       item = handoff.poll()
@@ -305,7 +318,7 @@ final class QuicConnection(val loop: EventLoop,
       while item != null do
         n += 1
         item match
-          case enc: Encoded => queuedBytes.addAndGet(-enc.size)
+          case enc: Encoded => queuedBytes.addAndGet(-charge(enc.size))
           case _ => ()
         if active then
           process(item)
@@ -317,10 +330,11 @@ final class QuicConnection(val loop: EventLoop,
 
   private def holdUntilAttached(item: AnyRef): Unit = item match
     case enc: Encoded =>
-      if preHandshakeBytes != 0 && preHandshakeBytes + enc.size > budget then
+      // Same rule and charge as the handoff: accepted while below the budget
+      if preHandshakeBytes >= budget then
         drop(enc, "pre-handshake budget exceeded")
       else
-        preHandshakeBytes += enc.size
+        preHandshakeBytes += charge(enc.size)
         preHandshake.add(enc)
     case b: Barrier => preHandshake.add(b)
 

@@ -355,9 +355,12 @@ Every messenger call (`sendTransactionMessage`, `sendClientRequest`, `sendClient
      message, and no timer is ever involved. There is no added latency: the drain task runs as
      soon as the loop is free.
    - The handoff queue is **bounded in bytes**, tracked by an atomic counter, with the same
-     budget as the connection's write high-water mark. A message that would exceed the budget
-     is released and dropped on the caller thread. This keeps the no-queueing rule true even
-     before Netty's own buffers come into play.
+     budget as the connection's write high-water mark. A message is accepted while the counted
+     bytes are below the budget (so they overshoot it by at most one message); otherwise it is
+     released and dropped on the caller thread. Each message counts its size capped at the
+     per-stream high-water mark, so back-to-back messages larger than the budget still fit one
+     per stream before the loop drains them. The pre-handshake queue uses the same rule. This
+     keeps the no-queueing rule true even before Netty's own buffers come into play.
 
 Then, on the owning **event loop**, the drain task:
 

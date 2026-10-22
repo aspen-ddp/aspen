@@ -177,7 +177,9 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.srv.received.isEmpty shouldBe true
 
   test("handoff over budget drops on the caller thread"):
-    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024))
+    // Accepted while the queued bytes are below the budget: 512K + 512K reaches it exactly, so the third is dropped.
+    // One stream, so the per-message charge cap (the stream high-water mark) is the whole budget.
+    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024, streamsPerConnection = 1))
     fx.dialAndWait()
     blockLoop(fx.loop)
     val subs = (0 until 3).map(i => fx.submit(sized(i, 512 * 1024)))
@@ -186,6 +188,52 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.conn.drops shouldBe 1
     cleanups.foreach(f => f())
     awaitAll(fx.srv, 2).map(seqOf).toSet shouldBe Set(0L, 1L)
+
+  test("handoff below budget accepts a message that overshoots it"):
+    // 512K queued is below the 1 MiB budget, so a 4 MiB message is accepted; the queue then exceeds the budget
+    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024, streamsPerConnection = 1))
+    fx.dialAndWait()
+    blockLoop(fx.loop)
+    val first = fx.submit(sized(0, 512 * 1024))
+    val big = fx.submit(sized(1, 4 * 1024 * 1024))
+    val third = fx.submit(sized(2, 1025))
+    (first._1, big._1, third._1) shouldBe (true, true, false)
+    third._2.prefix.refCnt() shouldBe 0
+    fx.conn.drops shouldBe 1
+    cleanups.foreach(f => f())
+    awaitAll(fx.srv, 2).map(seqOf).toSet shouldBe Set(0L, 1L)
+    first._2.prefix.refCnt() shouldBe 0
+    big._2.prefix.refCnt() shouldBe 0
+
+  test("each message counts at most one stream's high-water mark against the handoff budget"):
+    // 1 MiB over 4 streams: 256K high water. Four 512K messages are charged 256K each and fill the budget, one per
+    // stream; the fifth is dropped.
+    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024))
+    fx.dialAndWait()
+    blockLoop(fx.loop)
+    val subs = (0 until 5).map(i => fx.submit(sized(i, 512 * 1024)))
+    subs.map(_._1) shouldBe Seq(true, true, true, true, false)
+    subs(4)._2.prefix.refCnt() shouldBe 0
+    cleanups.foreach(f => f())
+    val got = awaitAll(fx.srv, 4)
+    got.map(seqOf).toSet shouldBe Set(0L, 1L, 2L, 3L)
+    got.map(streamId).toSet.size shouldBe 4
+    fx.conn.drops shouldBe 1
+
+  test("pre-handshake queue accepts while below budget"):
+    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024, streamsPerConnection = 1))
+    // One at a time, so each reaches the pre-handshake queue before the next is submitted
+    val subs = Seq(sized(0, 512 * 1024), sized(1, 4 * 1024 * 1024), sized(2, 512 * 1024)).zipWithIndex.map:
+      (m, i) =>
+        val r = fx.submit(m)
+        eventually(s"drain of $i")(fx.conn.drainedItems == i + 1)
+        r
+    subs.map(_._1).forall(identity) shouldBe true
+    fx.conn.drops shouldBe 1 // the third found 512K + 1 MiB (the capped 4 MiB) held, above the budget
+    subs(2)._2.prefix.refCnt() shouldBe 0
+    fx.dialAndWait()
+    awaitAll(fx.srv, 2).map(seqOf).toSet shouldBe Set(0L, 1L)
+    subs.foreach(_._2.prefix.refCnt() shouldBe 0)
 
   test("message larger than budget is accepted when queue is empty"):
     val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024))

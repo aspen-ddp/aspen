@@ -130,6 +130,8 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
 
     given tx: Transaction = client.newTransaction()
 
+    val start = System.nanoTime()
+    @volatile var committed = 0L
     val f = for
       pool <- client.getStoragePool(Radicle.poolId)
       dp <- pool.allocator.allocateDataObject(DataBuffer(data))
@@ -137,11 +139,14 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
                     List(KeyValueUpdate.DoesNotExist(key)),
                     List(Insert(key, dp.toArray)))
       _ <- tx.commit()
+      _ = committed = System.nanoTime()
       kvos <- client.read(Radicle.pointer)
       dos <- client.read(dp)
     yield (dp, kvos, dos)
 
     val (dp, kvos, dos) = Await.result(f, Timeout)
+    val end = System.nanoTime()
+    info(s"commit ${(committed - start) / 1000000} ms, reads ${(end - committed) / 1000000} ms")
 
     kvos.contents.get(key).map(_.value.bytes.toSeq) shouldBe Some(dp.toArray.toSeq)
     dos.data.size shouldBe size

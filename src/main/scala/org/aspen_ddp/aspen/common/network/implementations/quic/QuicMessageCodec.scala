@@ -144,6 +144,9 @@ object QuicMessageCodec:
     case m: StoreTransferData =>
       (m.copy(data = DataBuffer.Empty), ByteBuffer.allocate(0), Array(m.data))
 
+    case m: OpportunisticRebuild =>
+      (m.copy(data = DataBuffer.Empty), ByteBuffer.allocate(0), Array(m.data))
+
     case m => (m, ByteBuffer.allocate(0), NoSections)
 
   def encode(msg: Message, alloc: ByteBufAllocator): Encoded =
@@ -251,6 +254,11 @@ object QuicMessageCodec:
               Left(s"StoreTransferData requires exactly one section, got ${sections.length}")
             else
               Right(Codec.decode(r).copy(data = sections(0)))
+          case codec.Message.Msg.OpportunisticRebuild(r) =>
+            if sections.length != 1 then
+              Left(s"OpportunisticRebuild requires exactly one section, got ${sections.length}")
+            else
+              Right(Codec.decode(r).copy(data = sections(0)))
           case other if sections.nonEmpty => Left(s"Unexpected ${sections.length} sections for message")
           case codec.Message.Msg.HostHeartbeat(r) => Right(Codec.decode(r))
           case codec.Message.Msg.Read(r) => Right(Codec.decode(r))
@@ -261,7 +269,6 @@ object QuicMessageCodec:
           case codec.Message.Msg.Committed(r) => Right(Codec.decode(r))
           case codec.Message.Msg.Finalized(r) => Right(Codec.decode(r))
           case codec.Message.Msg.Heartbeat(r) => Right(Codec.decode(r))
-          case codec.Message.Msg.OpportunisticRebuild(r) => Right(Codec.decode(r))
           case codec.Message.Msg.TransactionCompletionQuery(r) => Right(Codec.decode(r))
           case codec.Message.Msg.StartStoreTransfer(r) => Right(Codec.decode(r))
           case codec.Message.Msg.CheckStorageDevice(r) => Right(Codec.decode(r))

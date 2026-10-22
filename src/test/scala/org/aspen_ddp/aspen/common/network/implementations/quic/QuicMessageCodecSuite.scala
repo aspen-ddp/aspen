@@ -200,6 +200,53 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     nio.get(1999) shouldBe 77.toByte
     frame.release()
 
+  private def rebuild(data: DataBuffer): OpportunisticRebuild =
+    OpportunisticRebuild(storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4), ObjectRefcount(1, 5),
+      HLCTimestamp(1000L), data)
+
+  test("OpportunisticRebuild data travels as its one section, outside the protobuf header"):
+    val m = rebuild(DataBuffer(bytes(5000)))
+    val enc = QuicMessageCodec.encode(m, alloc)
+    enc.sections.length shouldBe 1
+    enc.sections(0).size shouldBe 5000
+    val p = QuicMessageCodec.parsePrefix(enc.prefix).toOption.get
+    p.sectionSizes.toList shouldBe List(5000)
+    p.header.msg.opportunisticRebuild.get.data.size() shouldBe 0
+    val frame = enc.toStreamFrame(alloc)
+    val result = decodeFrame(frame)
+    frame.release()
+    result shouldBe Right(m)
+
+  test("OpportunisticRebuild with empty data round-trips"):
+    val m = rebuild(DataBuffer.Empty)
+    val enc = QuicMessageCodec.encode(m, alloc)
+    val dg = enc.toDatagram(alloc)
+    val result = QuicMessageCodec.decodeDatagram(dg)
+    dg.release()
+    result shouldBe Right(m)
+
+  test("OpportunisticRebuild send path does not copy its data"):
+    val arr = bytes(2000)
+    val enc = QuicMessageCodec.encode(rebuild(DataBuffer(arr)), alloc)
+    val frame = enc.toStreamFrame(alloc).asInstanceOf[CompositeByteBuf]
+    val last = frame.componentAtOffset(frame.readableBytes() - 1)
+    last.readableBytes() shouldBe 2000
+    arr(0) = 99.toByte
+    arr(1999) = 77.toByte
+    val nio = last.nioBuffer()
+    nio.get(0) shouldBe 99.toByte
+    nio.get(1999) shouldBe 77.toByte
+    frame.release()
+
+  test("OpportunisticRebuild requires exactly one section"):
+    val enc = QuicMessageCodec.encode(rebuild(DataBuffer(bytes(8))), alloc)
+    val p = QuicMessageCodec.parsePrefix(enc.prefix).toOption.get
+    enc.release()
+    val none = p.copy(sectionSizes = Array.empty[Int])
+    QuicMessageCodec.assemble(none, Array.empty[DataBuffer]).isLeft shouldBe true
+    val two = p.copy(sectionSizes = Array(8, 8))
+    QuicMessageCodec.assemble(two, Array(DataBuffer(bytes(8)), DataBuffer(bytes(8)))).isLeft shouldBe true
+
   test("size picks the transport at the boundary"):
     def sized(target: Int): QuicMessageCodec.Encoded =
       val base = QuicMessageCodec.encode(

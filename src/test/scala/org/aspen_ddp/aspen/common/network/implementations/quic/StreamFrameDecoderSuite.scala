@@ -134,6 +134,43 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     java.util.Arrays.equals(got.data.getByteArray, payload) should be (true)
     h.finish()
 
+  test("TxPrepare with 4 x 128 MiB updates in 64 KiB chunks decodes intact"):
+    // The four updates share one 128 MiB source array (the send path wraps payloads without copying), so the test
+    // holds 128 MiB of source plus the 512 MiB the receiver copies out, within sbt's 1 GiB test heap.
+    val sectionSize = 128 * 1024 * 1024
+    val source = new Array[Byte](sectionSize)
+    new java.util.Random(42).nextBytes(source)
+    val updates = (1 to 4).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(source)))
+    val m = TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, Nil)
+    // A private allocator, so suites running in parallel don't show up in the peak
+    val local = new PooledByteBufAllocator(true)
+    val frame = QuicMessageCodec.encode(m, local).toStreamFrame(local)
+    frame.readableBytes().toLong should be > (4L * sectionSize)
+    val h = new Harness
+    h.channel.config().setAllocator(local)
+    def used = local.metric().usedHeapMemory() + local.metric().usedDirectMemory()
+    val baseline = used
+    var peak = 0L
+    val chunk = 64 * 1024
+    while frame.isReadable do
+      val c = local.buffer(chunk)
+      c.writeBytes(frame, Math.min(chunk, frame.readableBytes()))
+      h.feed(c)
+      peak = Math.max(peak, used - baseline)
+    frame.release()
+    peak should be < (4L * 1024 * 1024)
+    h.errs shouldBe empty
+    h.msgs.size shouldBe 1
+    val got = h.msgs.head.asInstanceOf[TxPrepare]
+    h.msgs.clear()
+    got.txd shouldBe m.txd
+    got.objectUpdates.map(_.objectId) shouldBe updates.map(_.objectId)
+    got.objectUpdates.foreach: u =>
+      u.data.size shouldBe sectionSize
+      // Compared in place: getByteArray would copy another 128 MiB
+      (u.data.asReadOnlyBuffer() == java.nio.ByteBuffer.wrap(source)) should be (true)
+    h.finish()
+
   private def corrupt(mutate: Array[Byte] => Unit): Harness =
     val arr = frameBytes(prepare)
     mutate(arr)

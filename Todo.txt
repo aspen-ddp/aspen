@@ -1,6 +1,11 @@
 TODO
 ====
 
+- Now that we have accurate tracking of online/offline status for Hosts, we can remove the hard-coded choice of
+  always store 0 for the designatedLeader on transactions. Instead, we should randomly select a store who's
+  host is online. The store itself may be temporarily offline due to a transfer but we don't currently track
+  that. 
+
 - For StoreMoved and HostEndpointChanged, the lack of the updated information in the message means that network
   state reads will need to be made by every Host. That would man 10,000 reads for large networks containing
   10,000 hosts. To avoid this, we can track the HLCTimestamp of the StoragePoolState ConfigKey value that
@@ -50,3 +55,10 @@ TODO
     - May want a <host-dir>/cache/retransmitting-gossip-messages.yaml file
       - Read on startup so retransmits can be resumed after a process restart
       - Not needed for correctness so loosing it is okay (hence cache directory)
+
+- Add Gossip messages for notifying peers of stores going offline for Transfer/Rebuild
+  - Hosts cache this
+  - Used to skip selecting them as designated leaders
+  - Slow-check every 24hr, read StoragePoolState to verify it's still offline
+  - Moved message clears this state
+  - Add send of Moved message to end of the Rebuild process so other hosts clear the state

@@ -229,7 +229,8 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       c.net.clientMessenger.sendHostMessage(m)
       withClue(s"iteration $i: "):
         c.net.awaitPendingMessagesSent(Duration(5, SECONDS)) shouldBe true
-        c.net.shutdown(Duration(1, SECONDS))
+        // Short linger: on loopback quiche transmits flushed bytes in well under a millisecond
+        c.net.shutdown(Duration(50, MILLISECONDS))
         await(fx.a.handler.hostMessages, 1, 5000).map(_.message) shouldBe List(m)
 
   test("sends after shutdown are dropped without throwing"):

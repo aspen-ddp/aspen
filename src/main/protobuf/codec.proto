@@ -301,6 +301,7 @@ enum ReadType {
   READ_TYPE_LARGEST_KEY_LESS_THAN = 4;
   READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO = 5;
   READ_TYPE_KEY_RANGE = 6;
+  READ_TYPE_KEY_SET = 7;
 }
 
 message Read {
@@ -315,6 +316,7 @@ message Read {
   KeyComparison comparison = 9;
   uint32 offset = 10;
   uint32 length = 11;
+  repeated bytes keys = 12;
 }
 
 message ReadResponse {

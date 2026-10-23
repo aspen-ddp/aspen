@@ -396,6 +396,14 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedKR.maximum.bytes shouldBe Array[Byte](9)
     decodedKR.ordering shouldBe IntegerKeyOrdering
 
+    val keySet = Read(storeId(10), ClientId(uuid(20)), uuid(30), kvPtr(1),
+      KeySet(List(Key(Array[Byte](1)), Key(Array[Byte](2, 3)))))
+    val decodedKS = Codec.decode(Codec.encode(keySet)).readType.asInstanceOf[KeySet]
+    decodedKS.keys.map(_.bytes.toList) shouldBe List(List[Byte](1), List[Byte](2, 3))
+
+    val emptyKeySet = Read(storeId(10), ClientId(uuid(20)), uuid(30), kvPtr(1), KeySet(Nil))
+    Codec.decode(Codec.encode(emptyKeySet)).readType.asInstanceOf[KeySet].keys shouldBe Nil
+
   test("ReadResponse round-trip"):
     val errorResp = ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L),
       Left(ReadError.ObjectNotFound))

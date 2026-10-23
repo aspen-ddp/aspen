@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -708,6 +708,13 @@ object Codec extends Logging:
       case rt: KeyRange =>
         (codec.ReadType.READ_TYPE_KEY_RANGE, ByteString.EMPTY, ByteString.copyFrom(rt.minimum.bytes), ByteString.copyFrom(rt.maximum.bytes),
           encodeKeyComparison(rt.ordering), 0, 0)
+      case _: KeySet =>
+        (codec.ReadType.READ_TYPE_KEY_SET, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
+          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, 0, 0)
+
+    val keys = o.readType match
+      case rt: KeySet => rt.keys.map(k => ByteString.copyFrom(k.bytes))
+      case _ => Nil
 
     codec.Read(
       toStore = Some(encode(o.toStore)),
@@ -720,7 +727,8 @@ object Codec extends Logging:
       max = max,
       comparison = comparison,
       offset = offset,
-      length = length
+      length = length,
+      keys = keys
     )
 
   def decode(m: codec.Read): Read =
@@ -736,6 +744,7 @@ object Codec extends Logging:
       case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN => LargestKeyLessThan(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
       case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO => LargestKeyLessThanOrEqualTo(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
       case codec.ReadType.READ_TYPE_KEY_RANGE => KeyRange(Key(m.min.toByteArray), Key(m.max.toByteArray), decodeKeyComparison(m.comparison))
+      case codec.ReadType.READ_TYPE_KEY_SET => KeySet(m.keys.map(b => Key(b.toByteArray)).toList)
       case codec.ReadType.Unrecognized(v) => throw new EncodingError(f"Invalid Read Type: $v")
 
     Read(toStore, from, readUuid, objPtr, readType)

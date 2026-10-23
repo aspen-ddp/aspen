@@ -22,3 +22,9 @@ duration of the regression. Some increases for reliability are probably allowabl
 relatively small in the common case. If the test can somehow detect that it is running under load and
 increase its timeouts/linger only under those circumstances, that might be reasonable.
 
+RangedWrites - AppendingReedSolomon should be able to efficiently update sections of a large DataObject
+
+Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to
+"appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
+that talks about things like IDA + Backend combinations. AppendingReedSolmon + RocksDB is a poor
+combination.

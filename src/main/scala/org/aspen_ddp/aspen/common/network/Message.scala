@@ -43,6 +43,15 @@ final case class HostEndpointChanged(hostId: HostId,
                                      storeTransferPort: Int,
                                      timestamp: HLCTimestamp) extends Gossip
 
+/** Asks a host for the endpoint it holds for `hostId`. Answered over the connection it arrived on. */
+final case class HostEndpointQuery(hostId: HostId) extends Message
+
+/** None: the answering host holds no resolved, timestamped entry for `hostId` */
+final case class HostEndpointAnswer(hostId: HostId, endpoint: Option[HostEndpointChanged]) extends Message
+
+/** The receiving host is `actualHostId`, not `intendedHostId`; the message was dropped */
+final case class WrongHost(intendedHostId: HostId, actualHostId: HostId) extends Message
+
 /** Sent by a client to each of its gossip relay hosts, starting or renewing a lease under which that host forwards
   * it every gossip message and host online/offline change it sees. Handled by QuicNet itself.
   */

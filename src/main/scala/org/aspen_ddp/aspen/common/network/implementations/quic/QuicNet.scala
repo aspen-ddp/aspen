@@ -595,7 +595,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private[quic] def lastBootIdOf(hostId: HostId): Option[UUID] = Option(bootIds.get(hostId))
 
   /** Dispatches `m` as if it had arrived on a connection */
-  private[quic] def dispatchForTests(m: Message): Unit = dispatch(null, m)
+  private[quic] def dispatchForTests(m: Message): Unit = dispatch(null, QuicMessageCodec.Received(m, None))
 
   /** `shutdown` without the shutting-down flag or the linger, waiting for the group to terminate: stops
     * membership, closes every connection on its loop (which cancels its timers), closes the datagram
@@ -925,7 +925,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       clientRouteMap.put(id, conn)
 
   /** Mirrors `ZMQNet.decodeAndDispatch`. Runs on `conn`'s loop; a throwing handler is logged, never propagated. */
-  private def dispatch(conn: QuicConnection, msg: Message): Unit =
+  private def dispatch(conn: QuicConnection, received: QuicMessageCodec.Received): Unit =
+    val msg = received.msg
     try
       msg match
         case req: ClientRequest =>
@@ -958,5 +959,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
         case _: HostResponse | _: HostHeartbeat =>
           // Not handled: liveness comes from host membership
+
+        case _: HostEndpointQuery | _: HostEndpointAnswer | _: WrongHost =>
+          // Not yet handled
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)

@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen.common.network.implementations.quic
 import io.netty.buffer.{ByteBuf, CompositeByteBuf}
 import io.netty.channel.{ChannelHandlerContext, ChannelInboundHandlerAdapter}
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.network.Message
 import scribe.Logging
 
 import scala.util.control.NonFatal
@@ -13,7 +12,7 @@ import scala.util.control.NonFatal
   * One instance per inbound stream (not sharable). Releases every inbound ByteBuf it is given. Section payloads are
   * copied exactly once, directly from the inbound buffers into plain heap arrays.
   */
-class StreamFrameDecoder(onMessage: Message => Unit,
+class StreamFrameDecoder(onMessage: QuicMessageCodec.Received => Unit,
                          onProtocolError: String => Unit,
                          private[quic] val allocSection: Int => Array[Byte] = n => new Array[Byte](n))
   extends ChannelInboundHandlerAdapter with Logging:

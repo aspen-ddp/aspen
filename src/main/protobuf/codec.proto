@@ -415,6 +415,20 @@ message HostEndpointChanged {
   uint64 timestamp = 6;
 }
 
+message HostEndpointQuery {
+  UUID hostId = 1;
+}
+
+message HostEndpointAnswer {
+  UUID hostId = 1;
+  HostEndpointChanged endpoint = 2; // absent: the answering host holds no resolved entry
+}
+
+message WrongHost {
+  UUID intendedHostId = 1;
+  UUID actualHostId = 2;
+}
+
 message ClusterTransportMessage {
   UUID fromHost = 1;
   UUID fromBootId = 2;
@@ -489,7 +503,11 @@ message Message {
     GossipSubscribe gossip_subscribe = 30;
     HostOnlineStatus host_online_status = 31;
     StoreOffline store_offline = 32;
+    HostEndpointQuery host_endpoint_query = 33;
+    HostEndpointAnswer host_endpoint_answer = 34;
+    WrongHost wrong_host = 35;
   }
+  UUID to_host = 100; // Intended destination HostId. Absent when the sender did not say
 }
 
 //---------------------------------------------------------------------------

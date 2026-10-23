@@ -139,6 +139,9 @@ object ProtobufMessageCodec extends Logging:
     case m: ClusterTransportMessage => codec.Message(msg = codec.Message.Msg.ClusterTransport(Codec.encode(m))).toByteArray
     case m: GossipSubscribe => codec.Message(msg = codec.Message.Msg.GossipSubscribe(Codec.encode(m))).toByteArray
     case m: HostOnlineStatus => codec.Message(msg = codec.Message.Msg.HostOnlineStatus(Codec.encode(m))).toByteArray
+    case m: HostEndpointQuery => codec.Message(msg = codec.Message.Msg.HostEndpointQuery(Codec.encode(m))).toByteArray
+    case m: HostEndpointAnswer => codec.Message(msg = codec.Message.Msg.HostEndpointAnswer(Codec.encode(m))).toByteArray
+    case m: WrongHost => codec.Message(msg = codec.Message.Msg.WrongHost(Codec.encode(m))).toByteArray
 
   // ============================================================================
   // Decoding Methods
@@ -299,6 +302,15 @@ object ProtobufMessageCodec extends Logging:
           Some(Codec.decode(r))
 
         case codec.Message.Msg.HostOnlineStatus(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.HostEndpointQuery(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.HostEndpointAnswer(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.WrongHost(r) =>
           Some(Codec.decode(r))
 
         case codec.Message.Msg.Empty =>

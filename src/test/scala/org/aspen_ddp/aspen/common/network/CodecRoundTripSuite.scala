@@ -696,5 +696,17 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val m = HostEndpointChanged(HostId(UUID.randomUUID()), "10.1.2.3", 4000, 4001, 4002, HLCTimestamp(12345))
     Codec.decodeGossip(Codec.encodeGossip(m)) shouldBe Right(m)
 
+  test("HostEndpointQuery, HostEndpointAnswer and WrongHost round trip"):
+    val h = HostId(UUID.randomUUID())
+    val ep = HostEndpointChanged(h, "10.1.2.3", 4000, 4001, 4002, HLCTimestamp(12345))
+    val q = HostEndpointQuery(h)
+    Codec.decode(Codec.encode(q)) shouldBe q
+    val a = HostEndpointAnswer(h, Some(ep))
+    Codec.decode(Codec.encode(a)) shouldBe a
+    val none = HostEndpointAnswer(h, None)
+    Codec.decode(Codec.encode(none)) shouldBe none
+    val w = WrongHost(h, HostId(UUID.randomUUID()))
+    Codec.decode(Codec.encode(w)) shouldBe w
+
   test("decodeGossip rejects garbage"):
     Codec.decodeGossip(Array[Byte](1, 2, 3)).isLeft shouldBe true

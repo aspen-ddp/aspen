@@ -4,6 +4,7 @@ import io.netty.buffer.{ByteBuf, ByteBufAllocator, ByteBufInputStream, ByteBufOu
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId}
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild}
 
@@ -88,6 +89,9 @@ object QuicMessageCodec:
         consumed = true
         prefix.release()
 
+  /** A decoded message plus the destination HostId the sender stamped on it, if any */
+  final case class Received(msg: Message, toHost: Option[HostId])
+
   final case class Prefix(header: codec.Message, aux: ByteBuffer, sectionSizes: Array[Int])
 
   // ============================================================================
@@ -124,6 +128,9 @@ object QuicMessageCodec:
     case m: ClusterTransportMessage => codec.Message.Msg.ClusterTransport(Codec.encode(m))
     case m: GossipSubscribe => codec.Message.Msg.GossipSubscribe(Codec.encode(m))
     case m: HostOnlineStatus => codec.Message.Msg.HostOnlineStatus(Codec.encode(m))
+    case m: HostEndpointQuery => codec.Message.Msg.HostEndpointQuery(Codec.encode(m))
+    case m: HostEndpointAnswer => codec.Message.Msg.HostEndpointAnswer(Codec.encode(m))
+    case m: WrongHost => codec.Message.Msg.WrongHost(Codec.encode(m))
 
   private val NoSections: Array[DataBuffer] = Array.empty[DataBuffer]
 
@@ -154,9 +161,10 @@ object QuicMessageCodec:
     case m => (m, ByteBuffer.allocate(0), NoSections)
 
   /** `streamOnly`: see `Encoded` */
-  def encode(msg: Message, alloc: ByteBufAllocator, streamOnly: Boolean = false): Encoded =
+  def encode(msg: Message, alloc: ByteBufAllocator, streamOnly: Boolean = false,
+             toHost: Option[HostId] = None): Encoded =
     val (headerMsg, aux, sections) = split(msg)
-    val header = codec.Message(msg = toMsg(headerMsg))
+    val header = codec.Message(msg = toMsg(headerMsg), toHost = toHost.map(h => Codec.encodeUUID(h.uuid)))
     val headerLen = header.serializedSize
     val prefixLen = 4 + headerLen + 4 + aux.remaining() + 4 + 4 * sections.length
     val prefix = alloc.buffer(prefixLen)
@@ -236,7 +244,10 @@ object QuicMessageCodec:
       case t: Throwable => Left(s"Failed to parse prefix: $t")
 
   /** sections.length must equal prefix.sectionSizes.length; reconstructs the Message */
-  def assemble(prefix: Prefix, sections: Array[DataBuffer]): Either[String, Message] =
+  def assemble(prefix: Prefix, sections: Array[DataBuffer]): Either[String, Received] =
+    assembleMessage(prefix, sections).map(m => Received(m, prefix.header.toHost.map(u => HostId(Codec.decodeUUID(u)))))
+
+  private def assembleMessage(prefix: Prefix, sections: Array[DataBuffer]): Either[String, Message] =
     if sections.length != prefix.sectionSizes.length then
       Left(s"Expected ${prefix.sectionSizes.length} sections but got ${sections.length}")
     else if sections.indices.exists(i => sections(i).size != prefix.sectionSizes(i)) then
@@ -280,6 +291,9 @@ object QuicMessageCodec:
           case codec.Message.Msg.ClusterTransport(r) => Right(Codec.decode(r))
           case codec.Message.Msg.GossipSubscribe(r) => Right(Codec.decode(r))
           case codec.Message.Msg.HostOnlineStatus(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.HostEndpointQuery(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.HostEndpointAnswer(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.WrongHost(r) => Right(Codec.decode(r))
           case codec.Message.Msg.UnknownStore(r) => Right(Codec.decode(r))
           case codec.Message.Msg.StatusRequest(r) => Right(Codec.decode(r))
           case codec.Message.Msg.StatusResponse(r) => Right(Codec.decode(r))
@@ -313,7 +327,7 @@ object QuicMessageCodec:
           Right(Codec.decode(p, updates, rebuilds))
 
   /** Whole datagram; copies sections into heap DataBuffers. Does not release `buf`. */
-  def decodeDatagram(buf: ByteBuf): Either[String, Message] =
+  def decodeDatagram(buf: ByteBuf): Either[String, Received] =
     try
       val base = buf.readerIndex()
       val total = buf.readableBytes()

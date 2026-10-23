@@ -104,7 +104,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       case _ => actual shouldBe expected
 
   /** Reads a stream frame the way a receiver would: strip frameLen, parse the prefix, slice the sections */
-  private def decodeFrame(frame: ByteBuf): Either[String, Message] =
+  private def decodeFrame(frame: ByteBuf): Either[String, QuicMessageCodec.Received] =
     val frameLen = frame.readLong()
     frameLen shouldBe frame.readableBytes().toLong
     val prefixLen = frame.readInt()
@@ -123,7 +123,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       val result = QuicMessageCodec.decodeDatagram(dg)
       dg.release()
       enc.prefix.refCnt() shouldBe 0
-      assertSame(result.toOption.getOrElse(fail(s"$m: $result")), m)
+      assertSame(result.toOption.getOrElse(fail(s"$m: $result")).msg, m)
 
   test("every message type round-trips through a stream frame"):
     fixtures.foreach: m =>
@@ -136,7 +136,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       frame.release()
       frame.refCnt() shouldBe 0
       prefix.refCnt() shouldBe 0
-      assertSame(result.toOption.getOrElse(fail(s"$m: $result")), m)
+      assertSame(result.toOption.getOrElse(fail(s"$m: $result")).msg, m)
 
   test("TxPrepare with 3 updates and 2 rebuilds keeps order and metadata"):
     val updates = (1 to 3).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(bytes(10 * i, i))))
@@ -145,7 +145,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val m = prepare(updates, rebuilds)
     val enc = QuicMessageCodec.encode(m, alloc)
     val dg = enc.toDatagram(alloc)
-    val decoded = QuicMessageCodec.decodeDatagram(dg).toOption.get.asInstanceOf[TxPrepare]
+    val decoded = QuicMessageCodec.decodeDatagram(dg).toOption.get.msg.asInstanceOf[TxPrepare]
     dg.release()
     decoded shouldBe m
     decoded.objectUpdates.map(_.objectId) shouldBe updates.map(_.objectId)
@@ -158,14 +158,14 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val enc = QuicMessageCodec.encode(m, alloc)
     enc.size shouldBe 4 + enc.prefix.readableBytes() + 10
     val dg = enc.toDatagram(alloc)
-    val decoded = QuicMessageCodec.decodeDatagram(dg).toOption.get.asInstanceOf[OpportunisticRebuild]
+    val decoded = QuicMessageCodec.decodeDatagram(dg).toOption.get.msg.asInstanceOf[OpportunisticRebuild]
     dg.release()
     decoded.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
 
     val enc2 = QuicMessageCodec.encode(m, alloc)
     val frame = enc2.toStreamFrame(alloc)
     val view = frame.retainedDuplicate()
-    val decoded2 = decodeFrame(view).toOption.get.asInstanceOf[OpportunisticRebuild]
+    val decoded2 = decodeFrame(view).toOption.get.msg.asInstanceOf[OpportunisticRebuild]
     view.release()
     frame.release()
     decoded2.data.getByteArray.toList shouldBe arr.slice(5, 15).toList
@@ -175,7 +175,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val frame = enc.toStreamFrame(alloc)
     val result = decodeFrame(frame)
     frame.release()
-    result.toOption.getOrElse(fail(s"$m: $result"))
+    result.toOption.getOrElse(fail(s"$m: $result")).msg
 
   test("ClusterTransportMessage round trips"):
     val m = ClusterTransportMessage(HostId(UUID.randomUUID()), UUID.randomUUID(), HostId(UUID.randomUUID()),
@@ -229,14 +229,14 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       val dg = enc.toDatagram(alloc)
       val result = QuicMessageCodec.decodeDatagram(dg)
       dg.release()
-      result shouldBe Right(m)
+      result.map(_.msg) shouldBe Right(m)
 
   test("ReadResponse with Some(empty) data decodes as None"):
     val enc = QuicMessageCodec.encode(readResponse(Some(DataBuffer.Empty)), alloc)
     val dg = enc.toDatagram(alloc)
     val result = QuicMessageCodec.decodeDatagram(dg)
     dg.release()
-    result shouldBe Right(readResponse(None))
+    result.map(_.msg) shouldBe Right(readResponse(None))
 
   test("send path does not copy payloads"):
     val arr = bytes(2000)
@@ -269,7 +269,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val frame = enc.toStreamFrame(alloc)
     val result = decodeFrame(frame)
     frame.release()
-    result shouldBe Right(m)
+    result.map(_.msg) shouldBe Right(m)
 
   test("OpportunisticRebuild with empty data round-trips"):
     val m = rebuild(DataBuffer.Empty)
@@ -277,7 +277,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val dg = enc.toDatagram(alloc)
     val result = QuicMessageCodec.decodeDatagram(dg)
     dg.release()
-    result shouldBe Right(m)
+    result.map(_.msg) shouldBe Right(m)
 
   test("OpportunisticRebuild send path does not copy its data"):
     val arr = bytes(2000)
@@ -407,3 +407,47 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     frame.release()
     prefix3.refCnt() shouldBe 0
     System.gc()
+
+  private val toHostId = HostId(uuid(77))
+
+  private def datagramOf(m: Message, toHost: Option[HostId]) =
+    val dg = QuicMessageCodec.encode(m, alloc, toHost = toHost).toDatagram(alloc)
+    try QuicMessageCodec.decodeDatagram(dg)
+    finally dg.release()
+
+  private def frameOf(m: Message, toHost: Option[HostId]) =
+    val frame = QuicMessageCodec.encode(m, alloc, toHost = toHost).toStreamFrame(alloc)
+    try decodeFrame(frame)
+    finally frame.release()
+
+  test("toHost round-trips in datagrams and stream frames"):
+    val msgs = List[Message](
+      prepare(List(ObjectUpdate(ObjectId(uuid(7)), DataBuffer(bytes(30)))), Nil),
+      Read(storeId(10), ClientId(uuid(20)), uuid(30), dataPtr(1), FullObject()))
+    msgs.foreach: m =>
+      val d = datagramOf(m, Some(toHostId)).toOption.get
+      d.toHost shouldBe Some(toHostId)
+      d.msg shouldBe m
+      val f = frameOf(m, Some(toHostId)).toOption.get
+      f.toHost shouldBe Some(toHostId)
+      f.msg shouldBe m
+
+  test("absent toHost decodes as None"):
+    val m = HostHeartbeat(HostId(uuid(1)))
+    datagramOf(m, None).toOption.get.toHost shouldBe None
+    frameOf(m, None).toOption.get.toHost shouldBe None
+
+  test("peer-query and wrong-host messages fit in a datagram"):
+    val ep = HostEndpointChanged(HostId(uuid(2)), "a" * 255, 4000, 4001, 4002, HLCTimestamp(5L))
+    List[Message](
+      HostEndpointQuery(HostId(uuid(2))),
+      HostEndpointAnswer(HostId(uuid(2)), Some(ep)),
+      HostEndpointAnswer(HostId(uuid(2)), None),
+      WrongHost(HostId(uuid(2)), HostId(uuid(3)))
+    ).foreach: m =>
+      val enc = QuicMessageCodec.encode(m, alloc, toHost = Some(toHostId))
+      enc.isDatagram shouldBe true
+      val dg = enc.toDatagram(alloc)
+      val r = QuicMessageCodec.decodeDatagram(dg)
+      dg.release()
+      r.toOption.get.msg shouldBe m

@@ -58,12 +58,12 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     frame.release()
     arr
 
-  private class Harness(mk: (Message => Unit, String => Unit) => StreamFrameDecoder =
+  private class Harness(mk: (QuicMessageCodec.Received => Unit, String => Unit) => StreamFrameDecoder =
                           (m, e) => new StreamFrameDecoder(m, e)):
     val msgs = ArrayBuffer.empty[Message]
     val errs = ArrayBuffer.empty[String]
     val fed = ArrayBuffer.empty[ByteBuf]
-    val channel = new EmbeddedChannel(mk(msgs += _, errs += _))
+    val channel = new EmbeddedChannel(mk(r => msgs += r.msg, errs += _))
 
     def feed(buf: ByteBuf): Unit =
       fed += buf
@@ -212,11 +212,11 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
   test("onMessage throwing does not desync the stream"):
     val msgs = ArrayBuffer.empty[Message]
     var first = true
-    val ch = new EmbeddedChannel(new StreamFrameDecoder(m =>
+    val ch = new EmbeddedChannel(new StreamFrameDecoder(r =>
       if first then
         first = false
         throw new RuntimeException("handler failure")
-      msgs += m, _ => fail("unexpected protocol error")))
+      msgs += r.msg, _ => fail("unexpected protocol error")))
     val a = frameBytes(prepare) ++ frameBytes(heartbeat)
     val buf = alloc.buffer(a.length).writeBytes(a)
     ch.writeInbound(buf)

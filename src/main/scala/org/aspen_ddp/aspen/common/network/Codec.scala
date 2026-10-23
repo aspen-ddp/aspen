@@ -962,6 +962,33 @@ object Codec extends Logging:
     )
 
 
+  def encode(o: HostEndpointQuery): codec.HostEndpointQuery =
+    codec.HostEndpointQuery(hostId = Some(encodeUUID(o.hostId.uuid)))
+
+  def decode(m: codec.HostEndpointQuery): HostEndpointQuery =
+    HostEndpointQuery(HostId(decodeUUID(m.hostId.get)))
+
+
+  def encode(o: HostEndpointAnswer): codec.HostEndpointAnswer =
+    codec.HostEndpointAnswer(
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      endpoint = o.endpoint.map(encode)
+    )
+
+  def decode(m: codec.HostEndpointAnswer): HostEndpointAnswer =
+    HostEndpointAnswer(HostId(decodeUUID(m.hostId.get)), m.endpoint.map(decode))
+
+
+  def encode(o: WrongHost): codec.WrongHost =
+    codec.WrongHost(
+      intendedHostId = Some(encodeUUID(o.intendedHostId.uuid)),
+      actualHostId = Some(encodeUUID(o.actualHostId.uuid))
+    )
+
+  def decode(m: codec.WrongHost): WrongHost =
+    WrongHost(HostId(decodeUUID(m.intendedHostId.get)), HostId(decodeUUID(m.actualHostId.get)))
+
+
   def encode(o: ClusterTransportMessage): codec.ClusterTransportMessage =
     codec.ClusterTransportMessage(
       fromHost = Some(encodeUUID(o.fromHost.uuid)),

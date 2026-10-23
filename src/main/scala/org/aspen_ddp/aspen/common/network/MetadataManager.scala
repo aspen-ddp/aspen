@@ -59,12 +59,19 @@ object MetadataManager:
 
 
 /** `initialBootstrapConfig` seeds the store and host maps at construction.
+ *  `networkCache` then adds what an earlier run learned: its stored store -> host mappings and host endpoints are
+ *  installed with their timestamps, so sends need no lookup and older gossip still loses. Every mutation that
+ *  changes a mapping or endpoint is written through to it afterwards. The cache is best-effort: bootstrap stores
+ *  and hosts (the config is authoritative for them) and `selfHostId` are never seeded or written, and a cache
+ *  call that throws is logged and swallowed, never reaching the retry and containment paths around it.
  *  `onBootstrapConfigRefreshed` receives the fetched yaml and its parsed form after each refresh
  *  has been applied; it is best-effort, see applyBootstrapConfig.
  */
 class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: BootstrapConfig.Config,
                                                       onBootstrapConfigRefreshed: (String, BootstrapConfig.Config) => Unit,
                                                       val networkImplInterface: MetadataManager.NetworkImplInterface[T],
+                                                      networkCache: NetworkCache = NetworkCache.NoCache,
+                                                      selfHostId: Option[HostId] = None,
                                                       val pendingStoreLookupQueueSize: Int = 20,
                                                       // Must be >= pendingStoreLookupQueueSize; see
                                                       // startPoolLookup's rescue of a parked store queue
@@ -83,6 +90,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
   private var storeTimestamps: Map[StoreId, HLCTimestamp] = Map()
   private var hostTimestamps: Map[HostId, HLCTimestamp] = Map()
   private var refreshingBootstrapConfig: Boolean = false
+  private val bootstrapHostIds: Set[HostId] = initialBootstrapConfig.hosts.map(_.hostId).toSet
 
   loadInitialBootstrapConfig()
 
@@ -96,6 +104,42 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
     synchronized:
       bootstrapStores.contains(storeId)
 
+  /** The timestamp held for `hostId`'s entry, if any. Bootstrap hosts have none. */
+  def hostTimestamp(hostId: HostId): Option[HLCTimestamp] =
+    synchronized:
+      hostTimestamps.get(hostId)
+
+  /** `hostId`'s resolved, timestamped entry expressed as the HostEndpointChanged gossip it is equivalent to.
+   *  None for an unresolved host, a bootstrap host (no timestamp) or an unknown host. Never starts a lookup. */
+  def endpointAnswer(hostId: HostId): Option[HostEndpointChanged] =
+    synchronized:
+      hosts.get(hostId) match
+        case Some(Right(e)) =>
+          hostTimestamps.get(hostId).map: ts =>
+            HostEndpointChanged(hostId, e.address, e.dataPort, e.httpPort, e.storeTransferPort, ts)
+        case _ => None
+
+  /** Cache writes. Best-effort: skip bootstrap and self entries, and log and swallow any NonFatal throw so it can
+   *  never escape into the retryability and containment paths of the callers, all of which hold the monitor. */
+  private def cacheStore(storeId: StoreId, hostId: HostId, timestamp: HLCTimestamp): Unit =
+    if !bootstrapStores.contains(storeId) then
+      try networkCache.putStore(CachedStore(storeId, hostId, timestamp))
+      catch
+        case NonFatal(t) => logger.warn(s"Network cache putStore failed for $storeId. Error: $t")
+
+  private def uncacheStore(storeId: StoreId): Unit =
+    if !bootstrapStores.contains(storeId) then
+      try networkCache.removeStore(storeId)
+      catch
+        case NonFatal(t) => logger.warn(s"Network cache removeStore failed for $storeId. Error: $t")
+
+  private def cacheHost(e: HostEntry, timestamp: HLCTimestamp): Unit =
+    if !bootstrapHostIds.contains(e.hostId) && !selfHostId.contains(e.hostId) then
+      try networkCache.putHost(CachedHost(e.hostId, e.name, e.address, e.dataPort, e.httpPort,
+        e.storeTransferPort, timestamp))
+      catch
+        case NonFatal(t) => logger.warn(s"Network cache putHost failed for ${e.hostId}. Error: $t")
+
   def receivedUnknownStoreFromHost(hostId: HostId, storeId: StoreId): Unit =
     synchronized:
       if isBootstrapStore(storeId) then
@@ -106,6 +150,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
           case Some(oldHostId) =>
             if oldHostId == hostId then
               stores -= storeId
+              uncacheStore(storeId)
 
   /** Returns the host entry only if it is already resolved. Unlike getHostEntry, this never
    *  starts a host lookup, so it is side-effect free and safe to call from a polling loop.
@@ -212,6 +257,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         refreshBootstrapConfig()
       else
         stores -= storeId
+        uncacheStore(storeId)
 
   /** Applies StoreMoved gossip: maps `storeId` to `hostId` unless the mapping held is at least as new, so no pool
    *  read is needed. Mapped even if this process has never sent to the store, since it costs nothing.
@@ -227,6 +273,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
       else if storeTimestamps.get(storeId).forall(_ < timestamp) then
         stores += storeId -> hostId
         storeTimestamps += storeId -> timestamp
+        cacheStore(storeId, hostId, timestamp)
 
   /** Applies HostEndpointChanged gossip, unless the entry held is at least as new, and returns the entry it
    *  replaced so the caller can close that entry's connection.
@@ -245,10 +292,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         hosts.get(m.hostId) match
           case Some(Right(old)) =>
             try
-              hosts += m.hostId -> Right(networkImplInterface.createHostEntry(
+              val created = networkImplInterface.createHostEntry(
                 m.hostId, old.name, m.address, m.dataPort, m.httpPort, m.storeTransferPort,
-                new EvictingQueue[Message](1)))
+                new EvictingQueue[Message](1))
+              hosts += m.hostId -> Right(created)
               hostTimestamps += m.hostId -> m.timestamp
+              cacheHost(created, m.timestamp)
             catch
               case NonFatal(t) =>
                 // Back to never-looked-up, so the next send re-reads the host
@@ -405,6 +454,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
    *  carries that host's address -- and the resulting host lookup routes back through the
    *  bootstrap pool it is trying to repair. See TODO.txt.
    *
+   *  After the bootstrap hosts are installed, the networkCache's content is seeded under the same monitor: each
+   *  cached store mapping and host endpoint is installed with its timestamp, skipping bootstrap stores, bootstrap
+   *  hosts and selfHostId, whose truth is the config (or this process). Cached hosts go through createHostEntry
+   *  with an empty queue; a throw there is logged and that host skipped. A cache that cannot be loaded is logged
+   *  and ignored.
+   *
    *  Synchronized despite running before the instance escapes, for two reasons. It keeps
    *  mapBootstrapStores' monitor contract unconditional, so a future caller has one rule rather
    *  than a rule and an exception. And it publishes what this method writes: `stores`,
@@ -430,6 +485,30 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
           bsHost.storeTransferPort,
           new EvictingQueue[Message](1)
         ))
+
+      val cached =
+        try networkCache.load()
+        catch
+          case NonFatal(t) =>
+            logger.warn(s"Network cache load failed; continuing without it. Error: $t")
+            NetworkCacheContent(Nil, Nil)
+
+      cached.stores.foreach: cs =>
+        if !bootstrapStores.contains(cs.storeId) then
+          stores += cs.storeId -> cs.hostId
+          storeTimestamps += cs.storeId -> cs.timestamp
+
+      cached.hosts.foreach: ch =>
+        if !bootstrapHostIds.contains(ch.hostId) && !selfHostId.contains(ch.hostId) then
+          try
+            hosts += ch.hostId -> Right(networkImplInterface.createHostEntry(
+              ch.hostId, ch.name, ch.address, ch.dataPort, ch.httpPort, ch.storeTransferPort,
+              new EvictingQueue[Message](1)))
+            hostTimestamps += ch.hostId -> ch.timestamp
+          catch
+            case NonFatal(t) =>
+              hosts -= ch.hostId
+              logger.warn(s"Failed to create the cached host entry for ${ch.hostId}; skipping it. Error: $t")
 
   private def startHostLookup(hostId: HostId, oMsg: Option[Message]): Unit =
     val phl = new PendingHostLookup(pendingHostLookupQueueSize)
@@ -482,6 +561,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
                       networkImplInterface.createHostEntry(hostId, hostState.name, hostState.address,
                         hostState.dataPort, hostState.httpPort, hostState.storeTransferPort, phl.messageQueue)
                   hosts += hostId -> Right(entry)
+                  cacheHost(entry, hostTimestamps(hostId))
                 catch
                   case NonFatal(t) =>
                     // Retryability rule.
@@ -553,6 +633,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
                     else
                       stores.getOrElse(sid, se.hostId)
                   stores += sid -> hostId
+                  cacheStore(sid, hostId, storeTimestamps.getOrElse(sid, readTimestamp))
                   try
                     ppl.storeQueues.get(sid).foreach: storeQueue =>
                       hosts.get(hostId) match

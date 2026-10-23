@@ -257,6 +257,33 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
         case None => ()
 
 
+/** An in-memory NetworkCache serving a preset load() and recording every write. */
+class RecordingNetworkCache(preset: NetworkCacheContent = NetworkCacheContent(Nil, Nil)) extends NetworkCache:
+  val storePuts: mutable.ListBuffer[CachedStore] = mutable.ListBuffer()
+  val storeRemoves: mutable.ListBuffer[StoreId] = mutable.ListBuffer()
+  val hostPuts: mutable.ListBuffer[CachedHost] = mutable.ListBuffer()
+
+  @volatile var throwOnWrite: Boolean = false
+
+  private def check(): Unit =
+    if throwOnWrite then throw new RuntimeException("cache write failed")
+
+  def load(): NetworkCacheContent = preset
+  def putStore(e: CachedStore): Unit = synchronized:
+    storePuts += e
+    check()
+  def removeStore(storeId: StoreId): Unit = synchronized:
+    storeRemoves += storeId
+    check()
+  def putHost(e: CachedHost): Unit = synchronized:
+    hostPuts += e
+    check()
+  def bulkUpdate(content: NetworkCacheContent): Unit = ()
+  def close(): Unit = ()
+
+  def writeCount: Int = synchronized(storePuts.size + storeRemoves.size + hostPuts.size)
+
+
 /** A MetadataManager over a temp bootstrap config naming exactly one host, plus the ids of a
  *  host and a pool that config does not name -- reaching either requires a lookup. */
 trait MetadataManagerFixture extends BeforeAndAfterAll:
@@ -351,4 +378,18 @@ trait MetadataManagerFixture extends BeforeAndAfterAll:
    *  assert that a message actually reached a host rather than merely that a lookup was started. */
   protected def newManager(): (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl) =
     val (mgr, client, impl, _) = newManagerWithRecorder()
+    (mgr, client, impl)
+
+  /** newManager over `cache`, optionally naming this process's own host */
+  protected def newManager(cache: NetworkCache, selfHostId: Option[HostId] = None):
+      (MetadataManager[MetadataManager.HostEntry], LookupRecordingClient, RecordingNetworkImpl) =
+    val impl = new RecordingNetworkImpl
+    val client = new LookupRecordingClient
+    val mgr = new MetadataManager[MetadataManager.HostEntry](
+      BootstrapConfig.parseBootstrapConfig(templateConfig),
+      (_, _) => (),
+      impl,
+      cache,
+      selfHostId)
+    mgr.setAspenClient(client)
     (mgr, client, impl)

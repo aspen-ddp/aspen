@@ -19,7 +19,7 @@ import scala.concurrent.{ExecutionContext, Future}
 /** Periodically writes two zstd compressed DataObjects listing every host endpoint and every
   * store->host mapping. Nodes read them to catch up on network changes they never heard about.
   */
-object NetworkCachingService extends DurableServiceFactory with Logging:
+object NetworkCachingService extends DurableServiceFactory:
 
   val ServiceTypeUUID: UUID = UUID.fromString("3e8a5c71-94d2-4b06-a7f3-c15d20b9e684")
   val ServiceUUID: UUID     = UUID.fromString("a62f0d93-7b4e-4c18-8d55-0e9b3f71c2a8")

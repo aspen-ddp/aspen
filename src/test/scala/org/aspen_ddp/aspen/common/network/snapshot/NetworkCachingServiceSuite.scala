@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.common.network.snapshot
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{RegisteredTypeFactory, Transaction}
+import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.metadata.HostId
@@ -142,6 +143,10 @@ class NetworkCachingServiceSuite extends IntegrationTestSuite:
       _ <- Future.unit.map(_ => makeExecutor())
       _ <- pause(2000)
       (hosts, stores) <- snapshots()
+      // Positive control: making the run due proves the service was alive and deferral was the cause
+      _ <- writeLastRun(HLCTimestamp.Zero)
+      _ <- awaitUntil("hosts snapshot to be written once due")(
+             snapshots().map(_._1.scanStart > HLCTimestamp.Zero))
     yield
       hosts.scanStart shouldBe HLCTimestamp.Zero
       stores.scanStart shouldBe HLCTimestamp.Zero
@@ -154,6 +159,13 @@ class NetworkCachingServiceSuite extends IntegrationTestSuite:
       _ <- pause(2000)
       (hosts, stores) <- snapshots()
       lastRun <- readLastRun()
+      // Positive control: removing the bogus entry lets a run succeed, so the abort was the cause
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             TieredKeyValueList(client, KVObjectRootManager(client, Radicle.NamespacedRegistryKey, Radicle.pointer))
+               .delete(NamespacedUUIDRegistry.makeKey("host", "bogus-host"))
+      _ <- awaitUntil("hosts snapshot to be written after removing the bogus host")(
+             snapshots().map(_._1.scanStart > HLCTimestamp.Zero))
     yield
       hosts.hosts shouldBe empty
       stores.stores shouldBe empty

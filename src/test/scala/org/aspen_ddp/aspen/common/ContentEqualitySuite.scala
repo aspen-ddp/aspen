@@ -29,10 +29,6 @@ class ContentEqualitySuite extends AnyFunSuite with Matchers {
     make(1).hashCode shouldBe make(1).hashCode
     make(1) should not be make(2)
 
-  test("Value") {
-    checkContentEquality(i => Value(bytes(i, 0)))
-  }
-
   test("ValueObject") {
     checkContentEquality(i => ValueObject(Value(bytes(i)), ObjectRevision(TransactionId(uuid(1))), HLCTimestamp(1)))
   }

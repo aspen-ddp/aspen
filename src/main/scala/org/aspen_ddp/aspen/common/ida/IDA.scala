@@ -10,6 +10,7 @@ import scala.language.implicitConversions
 object IDA {
   val ReplicationCode: Byte = 0
   val ReedSolomonCode: Byte = 1
+  val AppendingReedSolomonCode: Byte = 2
 
   val EncodedIDASize: Int = 4
 
@@ -29,6 +30,13 @@ object IDA {
         val readThreshold = bb.get()
         val writeThreshold = bb.get()
         ReedSolomon(width, readThreshold, writeThreshold)
+
+      case AppendingReedSolomonCode =>
+        val width = bb.get()
+        val readThreshold = bb.get()
+        val writeThreshold = bb.get()
+        val cellSize = bb.getInt()
+        AppendingReedSolomon(width, readThreshold, writeThreshold, cellSize)
 
       case _ => throw new IDAEncodingError
     }
@@ -177,6 +185,74 @@ object ReedSolomon:
   private[ida] def codecFor(dataShards: Int, parityShards: Int): RSCodec =
     codecCache.get((dataShards, parityShards))
 
+  /** Scatters the supplied segments into encoding-index order and recovers any missing data shards.
+    * Returns the shards (the first k of which are all populated) and the common slice length.
+    *
+    * The segment list arrives sparse and in arbitrary order. It may also hold more than
+    * restoreThreshold entries and may repeat an index. Duplicates are tolerated with the first
+    * occurrence winning.
+    */
+  private[ida] def recoverDataShards(
+      segments: List[(Byte, Array[Byte])],
+      width: Int,
+      k: Int): (Array[Array[Byte]], Int) =
+    val shards = new Array[Array[Byte]](width)
+    var nDistinct = 0
+    var shardSize = -1
+
+    segments.foreach { case (encodingIndex, slice) =>
+      // An index outside the valid range means the slice was produced under a different pool
+      // width. That is a configuration error rather than a recoverable loss, so fail loudly
+      // instead of silently discarding the slice
+      val i = encodingIndex.toInt
+
+      if i < 0 || i >= width then
+        throw new IDARestoreError(s"Encoding index $i falls outside the valid range [0, $width)")
+
+      if shardSize < 0 then
+        shardSize = slice.length
+      else if slice.length != shardSize then
+        throw new IDARestoreError(
+          s"Slice $i has length ${slice.length} but a length of $shardSize was expected")
+
+      if shards(i) == null then
+        shards(i) = slice
+        nDistinct += 1
+    }
+
+    if nDistinct < k then
+      throw new IDARestoreError(s"Insufficient slices for restore. Have $nDistinct, need $k")
+
+    if shardSize < 1 then
+      throw new IDARestoreError(s"Invalid slice length $shardSize. Every slice holds at least one pad byte")
+
+    var haveAllDataShards = true
+    var i = 0
+    while i < k do
+      if shards(i) == null then
+        haveAllDataShards = false
+      i += 1
+
+    if !haveAllDataShards then
+      val present = new Array[Boolean](width)
+      i = 0
+      while i < width do
+        if shards(i) == null then
+          shards(i) = new Array[Byte](shardSize)
+        else
+          present(i) = true
+        i += 1
+
+      // decodeMissing only writes to shards flagged absent, so the caller's arrays are left
+      // untouched. It also regenerates the missing parity shards, which we simply discard
+      try
+        codecFor(k, width - k).decodeMissing(shards, present, 0, shardSize)
+      catch
+        case e: IllegalArgumentException =>
+          throw new IDARestoreError(s"Reed-Solomon decode failed: ${e.getMessage}")
+
+    (shards, shardSize)
+
 
 /** Systematic Reed-Solomon erasure code over GF(2^8), implemented in terms of the Backblaze
   * JavaReedSolomon library.
@@ -274,69 +350,8 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
 
     shards
 
-  /** Scatters the supplied segments into encoding-index order, recovers any missing data shards,
-    * and strips the padding.
-    *
-    * The segment list arrives sparse and in arbitrary order. It may also hold more than
-    * restoreThreshold entries and may repeat an index. Duplicates are tolerated with the first
-    * occurrence winning.
-    */
   private def restoreToArray(segments: List[(Byte, Array[Byte])]): Array[Byte] =
-    val shards = new Array[Array[Byte]](width)
-    var nDistinct = 0
-    var shardSize = -1
-
-    segments.foreach { case (encodingIndex, slice) =>
-      // An index outside the valid range means the slice was produced under a different pool
-      // width. That is a configuration error rather than a recoverable loss, so fail loudly
-      // instead of silently discarding the slice
-      val i = encodingIndex.toInt
-
-      if i < 0 || i >= width then
-        throw new IDARestoreError(s"Encoding index $i falls outside the valid range [0, $width)")
-
-      if shardSize < 0 then
-        shardSize = slice.length
-      else if slice.length != shardSize then
-        throw new IDARestoreError(
-          s"Slice $i has length ${slice.length} but a length of $shardSize was expected")
-
-      if shards(i) == null then
-        shards(i) = slice
-        nDistinct += 1
-    }
-
-    if nDistinct < k then
-      throw new IDARestoreError(s"Insufficient slices for restore. Have $nDistinct, need $k")
-
-    if shardSize < 1 then
-      throw new IDARestoreError(s"Invalid slice length $shardSize. Every slice holds at least one pad byte")
-
-    var haveAllDataShards = true
-    var i = 0
-    while i < k do
-      if shards(i) == null then
-        haveAllDataShards = false
-      i += 1
-
-    if !haveAllDataShards then
-      val present = new Array[Boolean](width)
-      i = 0
-      while i < width do
-        if shards(i) == null then
-          shards(i) = new Array[Byte](shardSize)
-        else
-          present(i) = true
-        i += 1
-
-      // decodeMissing only writes to shards flagged absent, so the caller's arrays are left
-      // untouched. It also regenerates the missing parity shards, which we simply discard
-      try
-        codec.decodeMissing(shards, present, 0, shardSize)
-      catch
-        case e: IllegalArgumentException =>
-          throw new IDARestoreError(s"Reed-Solomon decode failed: ${e.getMessage}")
-
+    val (shards, shardSize) = ReedSolomon.recoverDataShards(segments, width, k)
     concatAndStrip(shards, shardSize)
 
   /** Concatenates the data shards and removes the trailing padding */
@@ -369,3 +384,147 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
     bb.put(width.toByte)
     bb.put(restoreThreshold.toByte)
     bb.put(writeThreshold.toByte)
+
+
+object AppendingReedSolomon:
+
+  val DefaultCellSize: Int = 64
+
+  /** Big-endian logical length stored in the last 8 bytes of the final row */
+  val TrailerSize: Int = 8
+
+
+/** Systematic Reed-Solomon code with a row-interleaved layout that supports appending without
+  * rewriting existing data.
+  *
+  * The logical stream is the content, then zeros, then an 8-byte big-endian content length in
+  * the last 8 bytes of the final row. The stream is laid out in rows of rowBytes = k * cellSize
+  * bytes. Stream byte p lands in data shard (p % rowBytes) / cellSize at slice offset
+  * (p / rowBytes) * cellSize + p % cellSize. Appending therefore only extends the slices and
+  * rewrites the tail. The trailer ends up in the last 8 bytes of data shard k-1's slice. Parity
+  * shards are computed independently over each column of the slices.
+  *
+  * Unlike ReedSolomon, the slice length is always a multiple of cellSize.
+  */
+case class AppendingReedSolomon(
+    width: Int,
+    restoreThreshold: Int,
+    writeThreshold: Int,
+    cellSize: Int = AppendingReedSolomon.DefaultCellSize) extends IDA:
+
+  require(restoreThreshold >= 1,
+    s"Appending Reed-Solomon restoreThreshold must be at least 1. Got $restoreThreshold")
+  require(restoreThreshold <= width,
+    s"Appending Reed-Solomon restoreThreshold ($restoreThreshold) may not exceed width ($width)")
+  require(width <= ReedSolomon.MaxWidth,
+    s"Appending Reed-Solomon width ($width) may not exceed ${ReedSolomon.MaxWidth}")
+  require(writeThreshold >= restoreThreshold && writeThreshold <= width,
+    s"Appending Reed-Solomon writeThreshold ($writeThreshold) must fall within [$restoreThreshold, $width]")
+  require(cellSize >= AppendingReedSolomon.TrailerSize,
+    s"Appending Reed-Solomon cellSize ($cellSize) must be at least ${AppendingReedSolomon.TrailerSize}")
+
+  def name: String = "appending-reed-solomon"
+
+  def consistentRestoreThreshold: Int = restoreThreshold
+
+  private def k: Int = restoreThreshold
+
+  private def nparity: Int = width - restoreThreshold
+
+  /** Number of stream bytes in each row */
+  def rowBytes: Int = restoreThreshold * cellSize
+
+  /** Smallest row count that holds nbytes of content plus the trailer */
+  def rowsFor(nbytes: Int): Int =
+    ((nbytes.toLong + AppendingReedSolomon.TrailerSize + rowBytes - 1) / rowBytes).toInt
+
+  def calculateEncodedSegmentLength(nbytes: Int): Int = rowsFor(nbytes) * cellSize
+
+  def encode(objectContent: Array[Byte]): Array[Array[Byte]] =
+    encodeToShards(objectContent, 0, objectContent.length)
+
+  def encode(objectContent: DataBuffer): Array[DataBuffer] =
+    val arr = objectContent.getByteArray
+    encodeToShards(arr, 0, arr.length).map(shard => DataBuffer(shard))
+
+  def encodeInto(objectContent: DataBuffer, bbArray: Array[ByteBuffer]): Unit =
+    require(bbArray.length == width,
+      s"encodeInto requires exactly $width buffers. Got ${bbArray.length}")
+    val arr = objectContent.getByteArray
+    val shards = encodeToShards(arr, 0, arr.length)
+    var i = 0
+    while i < width do
+      bbArray(i).put(shards(i))
+      i += 1
+
+  def restoreArray(segments: List[(Byte, Array[Byte])]): Array[Byte] =
+    restoreToArray(segments)
+
+  def restore(segments: List[(Byte, DataBuffer)]): DataBuffer =
+    DataBuffer(restoreToArray(segments.map(t => (t._1, t._2.getByteArray))))
+
+  /** Scatters the content into the data shards cell by cell, writes the trailer, and calculates
+    * the parity shards
+    */
+  private def encodeToShards(src: Array[Byte], offset: Int, length: Int): Array[Array[Byte]] =
+    val rows = rowsFor(length)
+    val sliceLength = rows * cellSize
+    val shards = Array.ofDim[Byte](width, sliceLength)
+
+    var row = 0
+    while row < rows do
+      var i = 0
+      while i < k do
+        val streamPos = row * rowBytes + i * cellSize
+        val nReal = math.min(cellSize, length - streamPos)
+        if nReal > 0 then
+          System.arraycopy(src, offset + streamPos, shards(i), row * cellSize, nReal)
+        i += 1
+      row += 1
+
+    ByteBuffer.wrap(shards(k - 1)).putLong(sliceLength - AppendingReedSolomon.TrailerSize, length.toLong)
+
+    if nparity > 0 then
+      ReedSolomon.codecFor(k, nparity).encodeParity(shards, 0, sliceLength)
+
+    shards
+
+  /** Recovers any missing data shards, validates the trailer, and gathers the content */
+  private def restoreToArray(segments: List[(Byte, Array[Byte])]): Array[Byte] =
+    val (shards, sliceLength) = ReedSolomon.recoverDataShards(segments, width, k)
+
+    if sliceLength % cellSize != 0 then
+      throw new IDARestoreError(s"Invalid slice length $sliceLength. Expected a multiple of $cellSize")
+
+    val rows = sliceLength / cellSize
+    val nbytes = ByteBuffer.wrap(shards(k - 1)).getLong(sliceLength - AppendingReedSolomon.TrailerSize)
+
+    // Checked as a long so a corrupt trailer cannot overflow the row arithmetic
+    if nbytes < 0 || nbytes + AppendingReedSolomon.TrailerSize > rows.toLong * rowBytes ||
+        rowsFor(nbytes.toInt) != rows then
+      throw new IDARestoreError(s"Invalid trailer length $nbytes for a slice of $rows rows")
+
+    val length = nbytes.toInt
+    val arr = new Array[Byte](length)
+
+    var row = 0
+    while row < rows do
+      var i = 0
+      while i < k do
+        val streamPos = row * rowBytes + i * cellSize
+        val nCopy = math.min(cellSize, length - streamPos)
+        if nCopy > 0 then
+          System.arraycopy(shards(i), row * cellSize, arr, streamPos, nCopy)
+        i += 1
+      row += 1
+
+    arr
+
+  def getSerializedIDATypeLength: Int = 8 // <type><width><restoreThreshold><writeThreshold><cellSize:4>
+
+  def serializeIDAType(bb: ByteBuffer): Unit =
+    bb.put(IDA.AppendingReedSolomonCode)
+    bb.put(width.toByte)
+    bb.put(restoreThreshold.toByte)
+    bb.put(writeThreshold.toByte)
+    bb.putInt(cellSize)

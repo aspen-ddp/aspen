@@ -6,7 +6,14 @@ case class MetadataOnly() extends ReadType
 
 case class FullObject() extends ReadType
 
+/** Byte ranges are expressed in slice coordinates: offsets into the slice held by each store */
 case class ByteRange(offset: Int, length: Int) extends ReadType
+
+/** Everything from offset to the end of the slice */
+case class ByteRangeToEnd(offset: Int) extends ReadType
+
+/** The last length bytes of the slice, or the whole slice when it is shorter */
+case class SliceTail(length: Int) extends ReadType
 
 case class SingleKey(key: Key, ordering: KeyOrdering) extends ReadType
 

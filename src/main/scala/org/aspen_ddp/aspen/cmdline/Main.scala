@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.client.*
-import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
 import io.netty.handler.codec.quic.Quic
@@ -104,6 +104,7 @@ object Main {
                   width:Int=0,
                   readThreshold:Int=0,
                   writeThreshold:Int=0,
+                  cellSize:Int=AppendingReedSolomon.DefaultCellSize,
                   deviceSetName:String="",
                   maximumStoreSize:Long=0L,
                   setId:String="",
@@ -297,10 +298,17 @@ object Main {
   /** Shared by the <ida-type> arguments of bootstrap and create-pool. */
   private val validateIdaType: String => Either[String, Unit] = x =>
     val xl = x.toLowerCase
-    if xl == "replication" || xl == "reed-solomon" then
+    if xl == "replication" || xl == "reed-solomon" || xl == "appending-reed-solomon" then
       Right(())
     else
-      Left("IDA type must be Replication or Reed-Solomon")
+      Left("IDA type must be Replication, Reed-Solomon, or Appending-Reed-Solomon")
+
+  /** Row cell size for appending-reed-solomon pools; ignored by the other IDA types. */
+  private def cellSizeOption(p: ArgParser): OptionDef[?, Args] =
+    import p.*
+    opt[Int]("cell-size").valueName("<bytes>").
+      text(s"Cell size for appending-reed-solomon (default: ${AppendingReedSolomon.DefaultCellSize})").
+      action((x, c) => c.copy(cellSize = x))
 
   /** Shared by every argument that names an entity by UUID. The message varies because the
    *  entity does; what it rejects does not.
@@ -337,7 +345,7 @@ object Main {
         action((x, c) => c.copy(address = x)).
         validate(x => validateHostAddress(x).fold(success)(failure)),
 
-      arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
+      arg[String]("<ida-type>").text("IDA type. Must be Replication, Reed-Solomon, or Appending-Reed-Solomon").
         action((x, c) => c.copy(idaType = x.toLowerCase())).
         validate(validateIdaType),
 
@@ -349,6 +357,8 @@ object Main {
 
       arg[Int]("<width>").text("Number of hosts holding slices/replicas").
         action((x, c) => c.copy(width = x)),
+
+      cellSizeOption(p),
     ) ::: portOptions(p)
 
   private def hostArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -385,7 +395,7 @@ object Main {
       arg[String]("<pool-name>").text("Name of the new Pool").
         action((x, c) => c.copy(newPoolName = x)),
 
-      arg[String]("<ida-type>").text("IDA type. Must be Replication or Reed-Solomon").
+      arg[String]("<ida-type>").text("IDA type. Must be Replication, Reed-Solomon, or Appending-Reed-Solomon").
         action((x, c) => c.copy(idaType = x.toLowerCase())).
         validate(validateIdaType),
 
@@ -400,6 +410,8 @@ object Main {
 
       arg[String]("<device-set-name>").text("Name of the storage device set that will host the pool's stores").
         action((x, c) => c.copy(deviceSetName = x)),
+
+      cellSizeOption(p),
 
       arg[Long]("<maximum-store-size>").optional().text("Maximum per-store size in bytes (0 = default/unbounded)").
         action((x, c) => c.copy(maximumStoreSize = x)),
@@ -862,6 +874,8 @@ object Main {
     args.idaType match
       case "replication" => Replication(args.width, args.writeThreshold)
       case "reed-solomon" => ReedSolomon(args.width, args.readThreshold, args.writeThreshold)
+      case "appending-reed-solomon" =>
+        AppendingReedSolomon(args.width, args.readThreshold, args.writeThreshold, args.cellSize)
       case _ => throw new Exception(s"Invalid IDA type: ${args.idaType}")
 
   /** QUIC settings for a host (`ohost` defined) or a client command. A client command gets a single event loop. */

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.common.network
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.*
@@ -44,6 +44,12 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val original = ReedSolomon(5, 3, 4)
     val decoded = Codec.decode(Codec.encode(original))
     decoded shouldBe original
+
+  test("AppendingReedSolomon round-trip"):
+    val original = AppendingReedSolomon(5, 3, 4)
+    Codec.decode(Codec.encode(original)) shouldBe original
+    val big: IDA = AppendingReedSolomon(5, 3, 4, cellSize = 4096)
+    Codec.decode(Codec.encode(big)) shouldBe big
 
   test("IDA round-trip"):
     val rep: IDA = Replication(3, 2)
@@ -383,6 +389,15 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decodedBR = Codec.decode(Codec.encode(byteRange)).readType.asInstanceOf[ByteRange]
     decodedBR.offset shouldBe 100
     decodedBR.length shouldBe 200
+
+    val range = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, ByteRange(5, 10))
+    Codec.decode(Codec.encode(range)).readType shouldBe ByteRange(5, 10)
+
+    val toEnd = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, ByteRangeToEnd(64))
+    Codec.decode(Codec.encode(toEnd)).readType shouldBe ByteRangeToEnd(64)
+
+    val tail = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, SliceTail(64))
+    Codec.decode(Codec.encode(tail)).readType shouldBe SliceTail(64)
 
     val singleKey = Read(storeId(10), ClientId(uuid(20)), uuid(30), kvPtr(1), SingleKey(Key(Array[Byte](1, 2)), LexicalKeyOrdering))
     val decodedSK = Codec.decode(Codec.encode(singleKey)).readType.asInstanceOf[SingleKey]

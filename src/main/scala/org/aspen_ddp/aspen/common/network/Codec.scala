@@ -5,10 +5,10 @@ import org.aspen_ddp.aspen.client.StoragePool
 import scribe.Logging
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, ByteRangeToEnd, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey, SliceTail}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -65,16 +65,30 @@ object Codec extends Logging:
     ReedSolomon(m.width, m.restoreThreshold, m.writeThreshold)
 
 
+  def encode(o: AppendingReedSolomon): codec.AppendingReedSolomon =
+    codec.AppendingReedSolomon(
+      width = o.width,
+      restoreThreshold = o.restoreThreshold,
+      writeThreshold = o.writeThreshold,
+      cellSize = o.cellSize
+    )
+
+  def decode(m: codec.AppendingReedSolomon): AppendingReedSolomon =
+    AppendingReedSolomon(m.width, m.restoreThreshold, m.writeThreshold, m.cellSize)
+
+
   def encode(o: IDA): codec.IDA =
     val ida = o match
       case r: Replication => codec.IDA.Ida.Replication(encode(r))
       case r: ReedSolomon => codec.IDA.Ida.ReedSolomon(encode(r))
+      case r: AppendingReedSolomon => codec.IDA.Ida.AppendingReedSolomon(encode(r))
     codec.IDA(ida = ida)
 
   def decode(m: codec.IDA): IDA =
     m.ida match
       case codec.IDA.Ida.Replication(r) => decode(r)
       case codec.IDA.Ida.ReedSolomon(r) => decode(r)
+      case codec.IDA.Ida.AppendingReedSolomon(r) => decode(r)
       case codec.IDA.Ida.Empty => throw new EncodingError("Unknown IDA")
 
 
@@ -696,6 +710,12 @@ object Codec extends Logging:
       case rt: ByteRange =>
         (codec.ReadType.READ_TYPE_BYTE_RANGE, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
           codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, rt.offset, rt.length)
+      case rt: ByteRangeToEnd =>
+        (codec.ReadType.READ_TYPE_BYTE_RANGE_TO_END, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
+          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, rt.offset, 0)
+      case rt: SliceTail =>
+        (codec.ReadType.READ_TYPE_SLICE_TAIL, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
+          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, 0, rt.length)
       case rt: SingleKey =>
         (codec.ReadType.READ_TYPE_SINGLE_KEY, ByteString.copyFrom(rt.key.bytes), ByteString.EMPTY, ByteString.EMPTY,
           encodeKeyComparison(rt.ordering), 0, 0)
@@ -740,6 +760,8 @@ object Codec extends Logging:
       case codec.ReadType.READ_TYPE_METADATA_ONLY => MetadataOnly()
       case codec.ReadType.READ_TYPE_FULL_OBJECT => FullObject()
       case codec.ReadType.READ_TYPE_BYTE_RANGE => ByteRange(m.offset, m.length)
+      case codec.ReadType.READ_TYPE_BYTE_RANGE_TO_END => ByteRangeToEnd(m.offset)
+      case codec.ReadType.READ_TYPE_SLICE_TAIL => SliceTail(m.length)
       case codec.ReadType.READ_TYPE_SINGLE_KEY => SingleKey(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
       case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN => LargestKeyLessThan(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
       case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO => LargestKeyLessThanOrEqualTo(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))

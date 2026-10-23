@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -59,9 +59,22 @@ object BootstrapConfig:
 
     def create(o: Object): IDA = ReedSolomon(width.get(o), readThreshold.get(o), writeThreshold.get(o))
 
+  object AppendingReedSolomonFormat extends YObject[IDA]:
+    val readThreshold: Required[Int]  = Required("read-threshold", YInt)
+    val writeThreshold: Required[Int] = Required("write-threshold", YInt)
+    val width: Required[Int]          = Required("width", YInt)
+    val cellSize: Optional[Int]       = Optional("cell-size", YInt)
+
+    val attrs: List[Attr] = readThreshold :: writeThreshold :: width :: cellSize :: Nil
+
+    def create(o: Object): IDA =
+      AppendingReedSolomon(width.get(o), readThreshold.get(o), writeThreshold.get(o),
+        cellSize.get(o).getOrElse(AppendingReedSolomon.DefaultCellSize))
+
   val IDAOptions =  Map(
     "replication" -> ReplicationFormat,
-    "reed-solomon" -> ReedSolomonFormat
+    "reed-solomon" -> ReedSolomonFormat,
+    "appending-reed-solomon" -> AppendingReedSolomonFormat
   )
 
   case class BootstrapIDA(ida: IDA, maxObjectSize: Option[Int])
@@ -164,6 +177,9 @@ object BootstrapConfig:
       case _:Replication =>
       case _:ReedSolomon =>
         sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
+      case a:AppendingReedSolomon =>
+        sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
+        sb.append(s"  cell-size: ${a.cellSize}\n")
     sb.append(s"  write-threshold: ${ida.writeThreshold}\n")
     sb.append(s"  width: ${ida.width}\n")
     sb.append("bootstrap-hosts:\n")

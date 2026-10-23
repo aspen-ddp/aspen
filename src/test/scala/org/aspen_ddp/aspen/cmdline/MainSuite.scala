@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.metadata.ClientConfig.BootstrapEndpoint
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
@@ -582,6 +582,25 @@ class MainSuite extends AnyFunSuite with Matchers:
       parsed.writeThreshold shouldBe 2
       parsed.deviceSetName shouldBe "myset"
       parsed.maximumStoreSize shouldBe 4096L
+
+  test("createIDA builds AppendingReedSolomon with the requested cell size"):
+    val parsed = Main.buildParser.parse(
+      Seq("bootstrap", "/tmp/target", "10.0.0.1", "appending-reed-solomon", "3", "4", "5",
+          "--cell-size", "4096"),
+      Main.Args()).getOrElse(fail("bootstrap did not parse"))
+    Main.createIDA(parsed) shouldBe AppendingReedSolomon(5, 3, 4, 4096)
+    Main.createIDA(parsed.copy(cellSize = 64)) shouldBe AppendingReedSolomon(5, 3, 4)
+
+  test("validateIdaType accepts appending-reed-solomon"):
+    withTempDir("parse-ida"): dir =>
+      val cfgs = emptyFile(dir / "bootstrap.yaml")
+      val parsed = Main.buildParser.parse(
+        Seq("create-pool", cfgs, "mypool", "Appending-Reed-Solomon", "5", "3", "4", "myset", "--cell-size", "128"),
+        Main.Args()).getOrElse(fail("create-pool did not parse"))
+      parsed.idaType shouldBe "appending-reed-solomon"
+      parsed.cellSize shouldBe 128
+      Main.buildParser.parse(
+        Seq("create-pool", cfgs, "mypool", "bogus", "5", "3", "4", "myset"), Main.Args()) shouldBe None
 
   test("the shared port options reach a command that takes them"):
     withTempDir("parse-ports"): dir =>

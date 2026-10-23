@@ -29,10 +29,18 @@ message ReedSolomon {
   uint32 write_threshold = 3;
 }
 
+message AppendingReedSolomon {
+  uint32 width = 1;
+  uint32 restore_threshold = 2;
+  uint32 write_threshold = 3;
+  uint32 cell_size = 4;
+}
+
 message IDA {
   oneof ida {
     Replication replication = 1;
     ReedSolomon reed_solomon = 2;
+    AppendingReedSolomon appending_reed_solomon = 3;
   }
 }
 
@@ -302,6 +310,8 @@ enum ReadType {
   READ_TYPE_LARGEST_KEY_LESS_THAN_OR_EQUAL_TO = 5;
   READ_TYPE_KEY_RANGE = 6;
   READ_TYPE_KEY_SET = 7;
+  READ_TYPE_BYTE_RANGE_TO_END = 8;
+  READ_TYPE_SLICE_TAIL = 9;
 }
 
 message Read {

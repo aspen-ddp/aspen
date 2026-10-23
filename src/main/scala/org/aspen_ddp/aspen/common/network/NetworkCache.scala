@@ -27,8 +27,13 @@ trait NetworkCache:
   /** Unconditionally overwrites any held entry */
   def putHost(e: CachedHost): Unit
 
-  /** Writes each entry only if it is newer than the one held (or none is held) */
-  def bulkUpdate(content: NetworkCacheContent): Unit
+  def removeHost(hostId: HostId): Unit
+
+  /** Writes each entry only if it is newer than the one held (or none is held), then applies the removals
+    * unconditionally. When `content` repeats a key the newest entry wins.
+    */
+  def bulkUpdate(content: NetworkCacheContent, removedStores: Iterable[StoreId] = Nil,
+                 removedHosts: Iterable[HostId] = Nil): Unit
 
   def close(): Unit
 
@@ -39,7 +44,9 @@ object NetworkCache extends Logging:
     def putStore(e: CachedStore): Unit = ()
     def removeStore(storeId: StoreId): Unit = ()
     def putHost(e: CachedHost): Unit = ()
-    def bulkUpdate(content: NetworkCacheContent): Unit = ()
+    def removeHost(hostId: HostId): Unit = ()
+    def bulkUpdate(content: NetworkCacheContent, removedStores: Iterable[StoreId] = Nil,
+                   removedHosts: Iterable[HostId] = Nil): Unit = ()
     def close(): Unit = ()
 
   /** RocksDB at `dir`, scoped to `systemId`; NoCache (with a logged warning) if it cannot be opened */

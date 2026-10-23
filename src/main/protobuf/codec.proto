@@ -742,3 +742,20 @@ message NetworkCacheHost {
   uint32 store_transfer_port = 6;
   uint64 timestamp = 7;
 }
+
+message NetworkSnapshotStore {
+  UUID pool_id = 1;
+  uint32 pool_index = 2;
+  UUID host_id = 3;
+  uint64 timestamp = 4;
+}
+
+message NetworkHostSnapshot {
+  uint64 scan_start = 1;
+  repeated NetworkCacheHost hosts = 2;
+}
+
+message NetworkStoreSnapshot {
+  uint64 scan_start = 1;
+  repeated NetworkSnapshotStore stores = 2;
+}

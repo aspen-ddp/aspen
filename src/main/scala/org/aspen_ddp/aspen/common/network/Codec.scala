@@ -1428,3 +1428,32 @@ object Codec extends Logging:
     val m = codec.NetworkCacheHost.parseFrom(data)
     CachedHost(HostId(decodeUUID(m.hostId.get)), m.name, m.address, m.dataPort, m.httpPort,
       m.storeTransferPort, HLCTimestamp(m.timestamp))
+
+  def encodeHostSnapshot(hosts: List[CachedHost], scanStart: HLCTimestamp): Array[Byte] =
+    codec.NetworkHostSnapshot(
+      scanStart = scanStart.asLong,
+      hosts = hosts.map(h => codec.NetworkCacheHost.parseFrom(encode(h)))
+    ).toByteArray
+
+  def decodeHostSnapshot(data: Array[Byte]): (List[CachedHost], HLCTimestamp) =
+    val m = codec.NetworkHostSnapshot.parseFrom(data)
+    (m.hosts.map(h => decodeCachedHost(h.toByteArray)).toList, HLCTimestamp(m.scanStart))
+
+  def encodeStoreSnapshot(stores: List[CachedStore], scanStart: HLCTimestamp): Array[Byte] =
+    codec.NetworkStoreSnapshot(
+      scanStart = scanStart.asLong,
+      stores = stores.map: s =>
+        codec.NetworkSnapshotStore(
+          poolId = Some(encodeUUID(s.storeId.poolId.uuid)),
+          poolIndex = s.storeId.poolIndex,
+          hostId = Some(encodeUUID(s.hostId.uuid)),
+          timestamp = s.timestamp.asLong
+        )
+    ).toByteArray
+
+  def decodeStoreSnapshot(data: Array[Byte]): (List[CachedStore], HLCTimestamp) =
+    val m = codec.NetworkStoreSnapshot.parseFrom(data)
+    val stores = m.stores.map: s =>
+      CachedStore(StoreId(PoolId(decodeUUID(s.poolId.get)), s.poolIndex.toByte),
+        HostId(decodeUUID(s.hostId.get)), HLCTimestamp(s.timestamp))
+    (stores.toList, HLCTimestamp(m.scanStart))

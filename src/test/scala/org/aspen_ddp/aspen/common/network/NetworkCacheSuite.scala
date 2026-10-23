@@ -109,3 +109,34 @@ class NetworkCacheSuite extends AnyFunSuite with Matchers:
     val second = NetworkCache.open(dir, sysA)
     second should be theSameInstanceAs NetworkCache.NoCache
     first.close()
+
+  test("removeHost deletes the host"):
+    val dir = os.temp.dir()
+    val c = NetworkCache.open(dir, sysA)
+    c.putHost(host(host1, "a", 1))
+    c.removeHost(host1)
+    c.close()
+    val c2 = NetworkCache.open(dir, sysA)
+    c2.load().hosts should be (Nil)
+    c2.close()
+
+  test("bulkUpdate applies removals"):
+    val dir = os.temp.dir()
+    val s1 = store(0, host1, 1)
+    val h1 = host(host1, "a", 1)
+    val c = NetworkCache.open(dir, sysA)
+    c.putStore(s1)
+    c.putHost(h1)
+    c.bulkUpdate(NetworkCacheContent(Nil, Nil), List(s1.storeId), List(h1.hostId))
+    c.close()
+    val c2 = NetworkCache.open(dir, sysA)
+    c2.load() should be (NetworkCacheContent(Nil, Nil))
+    c2.close()
+
+  test("bulkUpdate keeps the newest of duplicate keys"):
+    val c = NetworkCache.open(os.temp.dir(), sysA)
+    c.bulkUpdate(NetworkCacheContent(
+      List(store(0, host1, 9), store(0, host2, 5)),
+      List(host(host1, "new", 9), host(host1, "old", 5))))
+    c.load() should be (NetworkCacheContent(List(store(0, host1, 9)), List(host(host1, "new", 9))))
+    c.close()

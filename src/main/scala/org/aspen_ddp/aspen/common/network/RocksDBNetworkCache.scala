@@ -104,7 +104,12 @@ class RocksDBNetworkCache(dir: os.Path, systemId: UUID) extends NetworkCache wit
     try db.put(hostKey(e.hostId), Codec.encode(e))
     catch case NonFatal(t) => logger.warn(s"Network cache putHost failed: $t")
 
-  def bulkUpdate(content: NetworkCacheContent): Unit =
+  def removeHost(hostId: HostId): Unit =
+    try db.delete(hostKey(hostId))
+    catch case NonFatal(t) => logger.warn(s"Network cache removeHost failed: $t")
+
+  def bulkUpdate(content: NetworkCacheContent, removedStores: Iterable[StoreId] = Nil,
+                 removedHosts: Iterable[HostId] = Nil): Unit =
     try
       val held = load()
       val heldStores = mutable.HashMap.from(held.stores.map(s => s.storeId -> s))
@@ -112,10 +117,14 @@ class RocksDBNetworkCache(dir: os.Path, systemId: UUID) extends NetworkCache wit
       val batch = new WriteBatch()
       val wo = new WriteOptions()
       try
-        for s <- content.stores if heldStores.get(s.storeId).forall(_.timestamp < s.timestamp) do
+        val newestStores = content.stores.groupBy(_.storeId).values.map(_.maxBy(_.timestamp))
+        val newestHosts = content.hosts.groupBy(_.hostId).values.map(_.maxBy(_.timestamp))
+        for s <- newestStores if heldStores.get(s.storeId).forall(_.timestamp < s.timestamp) do
           batch.put(storeKey(s.storeId), Codec.encode(s))
-        for h <- content.hosts if heldHosts.get(h.hostId).forall(_.timestamp < h.timestamp) do
+        for h <- newestHosts if heldHosts.get(h.hostId).forall(_.timestamp < h.timestamp) do
           batch.put(hostKey(h.hostId), Codec.encode(h))
+        for s <- removedStores do batch.delete(storeKey(s))
+        for h <- removedHosts do batch.delete(hostKey(h))
         if batch.count() > 0 then
           db.write(wo, batch)
       finally

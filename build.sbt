@@ -21,6 +21,7 @@ lazy val root = (project in file(".")).
       "org.scalatest"                    %% "scalatest"               % "3.2.18" % "test",
       "com.github.blemale"               %% "scaffeine"               % "5.2.1" % "compile",
       "org.rocksdb"                      %  "rocksdbjni"              % "8.11.3",
+      "com.github.luben"                 %  "zstd-jni"                % "1.5.6-4",
       "com.github.scopt"                 %% "scopt"                   % "4.1.0",
       "com.outr"                         %% "scribe"                  % "3.19.0",
       "com.outr"                         %% "scribe-slf4j"            % "3.19.0",

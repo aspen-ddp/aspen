@@ -289,6 +289,9 @@ object ProtobufMessageCodec extends Logging:
         case codec.Message.Msg.HostEndpointChanged(r) =>
           Some(Codec.decode(r))
 
+        case codec.Message.Msg.StoreOffline(r) =>
+          Some(Codec.decode(r))
+
         case codec.Message.Msg.ClusterTransport(r) =>
           Some(Codec.decode(r))
 

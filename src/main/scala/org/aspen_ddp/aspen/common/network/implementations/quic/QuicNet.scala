@@ -75,11 +75,13 @@ object QuicNet:
     def dropCacheForStore(storeId: StoreId): Unit = net.metadataManager.dropStoreMapping(storeId)
 
     /** Through membership to the other hosts, and directly to this host's own subscribers: scalecube does not hand a
-      * member its own gossip. A host whose endpoint changed can gossip too: see `sendClusterMessage`.
+      * member its own gossip, so store availability is applied here too. A host whose endpoint changed can gossip
+      * too: see `sendClusterMessage`.
       */
     override def broadcastGossip(g: Gossip): Unit =
       net.membership.foreach(_.broadcast(g))
       net.forwardToSubscribers(g)
+      net.storeAvailability.gossipReceived(g)
 
 
 /** A `NetworkPlugin` over Netty QUIC with mutual TLS.
@@ -109,8 +111,13 @@ object QuicNet:
   * everything the send path uses (loops, channels, maps) is initialized above `metadataManager`. `membership` is
   * created before the channels are bound, since `dispatch` reads it, but is only started at the very end.
   *
+  * Store availability (`storeAvailability`) is learned from StoreOffline and StoreMoved gossip, from the snapshot
+  * a relay sends when a subscription starts, and from a recheck run when the IO thread starts and every
+  * `StoreAvailabilityTracker.RecheckPeriod` after.
+  *
   * @param resolveHost resolves a host address that is not an IP literal. It may block: it only runs on the
   *                    plugin's resolver threads, never on a caller or an event loop. Replaceable for tests.
+  * @param storeAvailabilityCacheFile host mode: where store availability is saved across restarts
   */
 class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
               onBootstrapConfigRefreshed: (String, BootstrapConfig.Config) => Unit,
@@ -120,7 +127,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
               val messageHandler: MessageHandler,
               tls: TlsCredentials,
               config: QuicConfig = QuicConfig(),
-              resolveHost: String => InetAddress = QuicNet.blockingResolve) extends NetworkPlugin with Logging:
+              resolveHost: String => InetAddress = QuicNet.blockingResolve,
+              storeAvailabilityCacheFile: Option[os.Path] = None) extends NetworkPlugin with Logging:
 
   import QuicNet.*
 
@@ -155,6 +163,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Host mode: the clients subscribed to this host's gossip. Written on loops, read by forwarding threads. */
   private val subscribers = new ConcurrentHashMap[ClientId, Subscription]()
+
+  /** Which stores are offline for a transfer or rebuild. Thread-safe. */
+  private[quic] val storeAvailability = new StoreAvailabilityTracker(storeAvailabilityCacheFile)
+
+  /** Rechecks offline stores. Set once, by `startIoThread`. */
+  @volatile private var recheckTask: Option[NFuture[?]] = None
 
   /** Client mode: the hosts our relays last reported online. Written on loops, read by `createHostEntry`. */
   private val relayedOnline = ConcurrentHashMap.newKeySet[HostId]()
@@ -380,9 +394,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Gossip from membership (host mode) or a relay (client mode). Idempotent: every message carries the timestamp
     * of the state it announces, and a message no newer than what we hold is ignored.
     */
-  private def applyGossip(g: Gossip): Unit = g match
-    case m: StoreMoved => metadataManager.storeMoved(m.storeId, m.hostId, m.timestamp)
-    case m: HostEndpointChanged => endpointChanged(m)
+  private def applyGossip(g: Gossip): Unit =
+    g match
+      case m: StoreMoved => metadataManager.storeMoved(m.storeId, m.hostId, m.timestamp)
+      case m: HostEndpointChanged => endpointChanged(m)
+      case _: StoreOffline => ()
+    storeAvailability.gossipReceived(g)
 
   /** Replaces `m.hostId`'s entry with one for the new endpoint, unless ours is at least as new, and closes our
     * outbound connection to the old one so the next send dials the new endpoint. Our own entry is left alone.
@@ -408,8 +425,20 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   // ---- NetworkPlugin -------------------------------------------------------------------------------------------
 
-  /** The loops started with the group; this only supplies the client used for metadata lookups */
-  def startIoThread(client: AspenClient): Unit = metadataManager.setAspenClient(client)
+  /** The loops started with the group; this only supplies the client used for metadata lookups and starts the
+    * offline store recheck, which first runs now
+    */
+  def startIoThread(client: AspenClient): Unit =
+    metadataManager.setAspenClient(client)
+    if recheckTask.isEmpty then
+      val ms = StoreAvailabilityTracker.RecheckPeriod.toMillis
+      val recheck: Runnable = () =>
+        if !shuttingDown then
+          try storeAvailability.recheck(client)
+          catch case NonFatal(e) => logger.warn(s"Offline store recheck failed: $e")
+      recheckTask = Some(loops(0).scheduleAtFixedRate(recheck, 0, ms, TimeUnit.MILLISECONDS))
+
+  override def isStoreOffline(storeId: StoreId): Boolean = storeAvailability.isOffline(storeId)
 
   def joinIoThread(): Unit = group.terminationFuture().awaitUninterruptibly()
 
@@ -483,6 +512,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       shuttingDown = true
       quietly("stop relay renewal"):
         relayTask.foreach(_.cancel(false))
+        recheckTask.foreach(_.cancel(false))
       quietly("linger"):
         val ms = linger.toMillis
         if ms > 0 then
@@ -563,6 +593,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private[quic] def closeForTests(): Unit =
     membership.foreach(_.shutdown())
     relayTask.foreach(_.cancel(false))
+    recheckTask.foreach(_.cancel(false))
     closeAll(CloseAwaitMillis)
     group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
@@ -573,6 +604,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private[quic] def crashForTests(): Unit =
     membership.foreach(_.shutdown())
     relayTask.foreach(_.cancel(false))
+    recheckTask.foreach(_.cancel(false))
     (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
     resolverPool.shutdownNow()
     group.shutdownGracefully(0, 1, TimeUnit.SECONDS)
@@ -831,7 +863,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Host mode, on `conn`'s loop. Starts or renews `m.fromClient`'s lease. A subscription that is new, or renewed
     * over a different connection or after lapsing, starts with a snapshot of the hosts we see online, ourselves
-    * included.
+    * included, and of the store availability we hold.
     */
   private def subscribe(conn: QuicConnection, m: GossipSubscribe): Unit =
     for hm <- membership; (hostId, _) <- ohost do
@@ -839,7 +871,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         val now = System.nanoTime()
         val previous = subscribers.put(m.fromClient, Subscription(conn, now + config.gossip.relayLease.toNanos))
         if previous == null || (previous.conn ne conn) || now - previous.expiresNanos >= 0 then
-          forward(conn, HostOnlineStatus(hostId :: hm.onlineHosts.toList, Nil))
+          forward(conn, HostOnlineStatus(hostId :: hm.onlineHosts.toList, Nil, storeAvailability.snapshot))
 
   /** Client mode, on `loops(0)`. Keeps `relayCount` relays among the hosts we have resolved and renews each one's
     * subscription. With `rotate`, one relay is first swapped for a host not currently a relay, when there is one.
@@ -862,6 +894,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Client mode, on a loop. Applies a relay's liveness report; a relay reported offline is replaced at once. */
   private def hostOnlineStatus(m: HostOnlineStatus): Unit =
+    storeAvailability.merge(m.stores)
     m.online.foreach: h =>
       relayedOnline.add(h)
       metadataManager.peekHostEntry(h).foreach(_.setOnline())

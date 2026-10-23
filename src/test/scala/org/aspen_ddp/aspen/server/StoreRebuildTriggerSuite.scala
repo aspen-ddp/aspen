@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
-import org.aspen_ddp.aspen.common.network.StoreMoved
+import org.aspen_ddp.aspen.common.network.{StoreMoved, StoreOffline}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -224,9 +224,15 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       host.loadStoreByIdRequests should contain((realDeviceId, rebuilt))
       finalState.stores.get(rebuilt).map(_.status) should be(
         Some(StorageDeviceState.StoreStatus.Active))
-      // The pool's current host for the store, as of the pool config's timestamp
-      net.takeCapturedGossip() should contain(
-        StoreMoved(rebuilt, poolState.stores(rebuilt.poolIndex).hostId, poolTimestamp))
+      // The pool's current host for the store, as of the pool config's timestamp, and online
+      // after the rebuild took it offline
+      val gossip = net.takeCapturedGossip()
+      val offline = gossip.collect { case m: StoreOffline if m.storeId == rebuilt => m }
+      val moved = gossip.collect { case m: StoreMoved if m.storeId == rebuilt => m }
+      offline should have size 1
+      moved.map(m => (m.hostId, m.timestamp)) should be(
+        List((poolState.stores(rebuilt.poolIndex).hostId, poolTimestamp)))
+      moved.head.onlineTimestamp should be > offline.head.timestamp
 
   atest("a rebuild on a tombstoned device is discarded, not loaded"):
     val hostRoot = newHostDir()

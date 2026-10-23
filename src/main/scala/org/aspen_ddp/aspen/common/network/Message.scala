@@ -19,10 +19,19 @@ case class HostHeartbeat(hostId: HostId) extends Message
   */
 sealed abstract class Gossip extends Message
 
-/** `storeId` is now hosted by `hostId`. `timestamp` is that of the StoragePoolState config value naming the new host,
-  * so receivers can ignore a message older than the mapping they already hold.
+/** `storeId` is now hosted, and served, by `hostId`. `timestamp` is that of the StoragePoolState config value naming
+  * the new host, so receivers can ignore a message older than the mapping they already hold. `onlineTimestamp` is
+  * when the store came online there, which clears any older StoreOffline (see `StoreAvailabilityTracker`). A
+  * rebuilt store, or one whose transfer was abandoned, comes back online under an unchanged mapping, so the two
+  * timestamps are compared separately.
   */
-final case class StoreMoved(storeId: StoreId, hostId: HostId, timestamp: HLCTimestamp) extends Gossip
+final case class StoreMoved(storeId: StoreId,
+                            hostId: HostId,
+                            timestamp: HLCTimestamp,
+                            onlineTimestamp: HLCTimestamp) extends Gossip
+
+/** `storeId` went offline at `timestamp` for a transfer out or a rebuild. A later StoreMoved brings it back. */
+final case class StoreOffline(storeId: StoreId, timestamp: HLCTimestamp) extends Gossip
 
 /** `hostId`'s new endpoint. `timestamp` is that of the HostState value holding it, so receivers can ignore a message
   * older than the entry they already hold.
@@ -40,10 +49,13 @@ final case class HostEndpointChanged(hostId: HostId,
 final case class GossipSubscribe(fromClient: ClientId) extends Message
 
 /** Host liveness forwarded by a relay host to its gossip subscribers: hosts that came online and hosts that went
-  * offline. The snapshot sent when a subscription starts lists every host the relay sees online, and none offline.
-  * Handled by QuicNet itself.
+  * offline. The snapshot sent when a subscription starts lists every host the relay sees online, and none offline,
+  * plus the relay's store availability (`stores`); changes after that carry no `stores`, since store availability
+  * travels as gossip. Handled by QuicNet itself.
   */
-final case class HostOnlineStatus(online: List[HostId], offline: List[HostId]) extends Message
+final case class HostOnlineStatus(online: List[HostId],
+                                  offline: List[HostId],
+                                  stores: Map[StoreId, StoreAvailability] = Map()) extends Message
 
 /** Carries an opaque scalecube transport payload between hosts. Handled by QuicNet itself; it is not a
   * HostMessage and never reaches the MessageHandler.

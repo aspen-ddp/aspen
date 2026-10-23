@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.common.network
 
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 
 import scala.concurrent.duration.Duration
@@ -24,6 +25,11 @@ trait NetworkPlugin:
    *  done. Long-running processes keep themselves alive by blocking in joinIoThread().
    */
   def startIoThread(client: AspenClient): Unit
+
+  /** True if `storeId` is believed offline for a transfer or rebuild, and so a poor choice of designated leader.
+   *  Advisory: see StoreAvailabilityTracker. Networks without gossip know of no offline stores.
+   */
+  def isStoreOffline(storeId: StoreId): Boolean = false
 
   /** Blocks until the plugin's network IO has terminated. */
   def joinIoThread(): Unit

@@ -924,11 +924,21 @@ object Codec extends Logging:
     codec.StoreMoved(
       storeId = Some(encode(o.storeId)),
       hostId = Some(encodeUUID(o.hostId.uuid)),
-      timestamp = o.timestamp.asLong
+      timestamp = o.timestamp.asLong,
+      onlineTimestamp = o.onlineTimestamp.asLong
     )
 
   def decode(m: codec.StoreMoved): StoreMoved =
-    StoreMoved(decode(m.storeId.get), HostId(decodeUUID(m.hostId.get)), HLCTimestamp(m.timestamp))
+    val onlineTimestamp = if m.onlineTimestamp == 0 then m.timestamp else m.onlineTimestamp
+    StoreMoved(decode(m.storeId.get), HostId(decodeUUID(m.hostId.get)), HLCTimestamp(m.timestamp),
+      HLCTimestamp(onlineTimestamp))
+
+
+  def encode(o: StoreOffline): codec.StoreOffline =
+    codec.StoreOffline(storeId = Some(encode(o.storeId)), timestamp = o.timestamp.asLong)
+
+  def decode(m: codec.StoreOffline): StoreOffline =
+    StoreOffline(decode(m.storeId.get), HLCTimestamp(m.timestamp))
 
 
   def encode(o: HostEndpointChanged): codec.HostEndpointChanged =
@@ -979,11 +989,17 @@ object Codec extends Logging:
   def encode(o: HostOnlineStatus): codec.HostOnlineStatus =
     codec.HostOnlineStatus(
       online = o.online.map(h => encodeUUID(h.uuid)),
-      offline = o.offline.map(h => encodeUUID(h.uuid))
+      offline = o.offline.map(h => encodeUUID(h.uuid)),
+      stores = o.stores.toList.map: (storeId, a) =>
+        codec.StoreAvailability(storeId = Some(encode(storeId)), offline = a.offline, timestamp = a.timestamp.asLong)
     )
 
   def decode(m: codec.HostOnlineStatus): HostOnlineStatus =
-    HostOnlineStatus(m.online.map(u => HostId(decodeUUID(u))).toList, m.offline.map(u => HostId(decodeUUID(u))).toList)
+    HostOnlineStatus(
+      m.online.map(u => HostId(decodeUUID(u))).toList,
+      m.offline.map(u => HostId(decodeUUID(u))).toList,
+      m.stores.map(a => decode(a.storeId.get) -> StoreAvailability(a.offline, HLCTimestamp(a.timestamp))).toMap
+    )
 
 
   /** Encodes a gossip message as a codec.Message. Used as the scalecube gossip payload. */
@@ -991,6 +1007,7 @@ object Codec extends Logging:
     val msg = g match
       case m: StoreMoved => codec.Message.Msg.StoreMoved(encode(m))
       case m: HostEndpointChanged => codec.Message.Msg.HostEndpointChanged(encode(m))
+      case m: StoreOffline => codec.Message.Msg.StoreOffline(encode(m))
     codec.Message(msg = msg).toByteArray
 
   def decodeGossip(bytes: Array[Byte]): Either[String, Gossip] =
@@ -998,6 +1015,7 @@ object Codec extends Logging:
       codec.Message.parseFrom(bytes).msg match
         case codec.Message.Msg.StoreMoved(r) => Right(decode(r))
         case codec.Message.Msg.HostEndpointChanged(r) => Right(decode(r))
+        case codec.Message.Msg.StoreOffline(r) => Right(decode(r))
         case other => Left(s"Not a gossip message: $other")
     catch
       case t: Throwable => Left(s"Failed to decode gossip: $t")

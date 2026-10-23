@@ -200,7 +200,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
   test("StoreMoved gossip reaches peers"):
     awaitOnline()
     val recB = listen(fx.b.net)
-    val g = StoreMoved(fx.storesB.head, fx.hostIdB, HLCTimestamp.now)
+    val g = StoreMoved(fx.storesB.head, fx.hostIdB, HLCTimestamp.now, HLCTimestamp.now)
     fx.a.net.serverMessenger.broadcastGossip(g)
     eventually("B receives the StoreMoved gossip", WaitMillis):
       recB.gossip.contains(g)
@@ -298,6 +298,34 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     eventually("the client replaces its entry for B", WaitMillis)(replaced(c.net, fx.hostIdB, old))
     fx.directory.lookups.asScala.toList should not contain fx.hostIdB
 
+  test("StoreOffline gossip marks the store offline on peers, the originator, and clients; StoreMoved clears it"):
+    awaitOnline()
+    val c = fx.client()
+    eventually("A and B hold the client's subscription", WaitMillis):
+      fx.a.net.subscribersForTests.contains(c.net.clientId) && fx.b.net.subscribersForTests.contains(c.net.clientId)
+    val store = fx.storesA.head
+    val wentOffline = HLCTimestamp.now
+    fx.a.net.serverMessenger.broadcastGossip(StoreOffline(store, wentOffline))
+    eventually("every node sees the store offline", WaitMillis):
+      fx.a.net.isStoreOffline(store) && fx.b.net.isStoreOffline(store) && c.net.isStoreOffline(store)
+    fx.a.net.serverMessenger.broadcastGossip(StoreMoved(store, fx.hostIdA, HLCTimestamp.now, HLCTimestamp.now))
+    eventually("every node sees the store online", WaitMillis):
+      !fx.a.net.isStoreOffline(store) && !fx.b.net.isStoreOffline(store) && !c.net.isStoreOffline(store)
+    // A retransmit of the StoreOffline is older than the StoreMoved, so it changes nothing
+    fx.a.net.serverMessenger.broadcastGossip(StoreOffline(store, wentOffline))
+    Thread.sleep(300)
+    fx.b.net.isStoreOffline(store) shouldBe false
+    c.net.isStoreOffline(store) shouldBe false
+
+  test("a new subscriber learns the stores its relay holds offline"):
+    awaitOnline()
+    val store = fx.storesB.head
+    fx.a.net.serverMessenger.broadcastGossip(StoreOffline(store, HLCTimestamp.now))
+    eventually("B sees the store offline", WaitMillis)(fx.b.net.isStoreOffline(store))
+    // Subscribed after the gossip spread, so only the snapshot can tell it
+    val c = fx.client()
+    eventually("the client sees the store offline", WaitMillis)(c.net.isStoreOffline(store))
+
   test("a client learns host liveness from its relays and replaces a relay that goes offline"):
     awaitOnline()
     val c = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 1)))
@@ -329,7 +357,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val old = entryFor(fx.b.net, fx.hostIdA)
     fx.b.net.dispatchForTests(HostOnlineStatus(Nil, List(fx.hostIdA)))
     entryFor(fx.b.net, fx.hostIdA).isOnline shouldBe true
-    fx.b.net.dispatchForTests(StoreMoved(fx.storesA.head, fx.hostIdB, HLCTimestamp.now))
+    fx.b.net.dispatchForTests(StoreMoved(fx.storesA.head, fx.hostIdB, HLCTimestamp.now, HLCTimestamp.now))
     fx.b.net.metadataManager.peekHostEntry(fx.hostIdA).exists(_ eq old) shouldBe true
 
   test("keepalive datagrams are not dispatched"):

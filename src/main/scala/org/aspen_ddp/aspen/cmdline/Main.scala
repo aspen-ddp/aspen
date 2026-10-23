@@ -909,14 +909,16 @@ object Main {
                     onRefresh: (String, BootstrapConfig.Config) => Unit,
                     ohost: Option[(HostId, Int)],
                     oclientId: Option[ClientId],
-                    tls: TlsCredentials): (NetworkBridge, NetworkPlugin) = {
+                    tls: TlsCredentials,
+                    ohostDir: Option[Path] = None): (NetworkBridge, NetworkPlugin) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
     val net: NetworkPlugin = networkKind match
       case NetworkKind.Quic =>
         requireQuic(Quic.isAvailable, Quic.unavailabilityCause())
-        new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls, quicConfigFor(ohost))
+        new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls, quicConfigFor(ohost),
+          storeAvailabilityCacheFile = ohostDir.map(StoreAvailabilityTracker.cacheFile))
       // ZMQ connections are unauthenticated, so the credentials go unused.
       case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
     onetwork = Some(net)
@@ -1253,7 +1255,8 @@ object Main {
     val objectCacheFactory = () => new SimpleLRUObjectCache(100)
 
     val (networkBridge, nnet) = createNetwork(bootstrapCfg, onBootstrapConfigRefreshed,
-                                              Some((hostCfg.hostId, hostCfg.dataPort)), None, tls)
+                                              Some((hostCfg.hostId, hostCfg.dataPort)), None, tls,
+                                              Some(absHostDir))
 
     val (client, network, _) = createAspenClient(bootstrapCfg, onBootstrapConfigRefreshed, tls,
                                                  Some((networkBridge, nnet)))

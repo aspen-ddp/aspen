@@ -18,7 +18,7 @@ class GossipRetransmitterSuite extends AnyFunSuite with Matchers:
   private val storeId = StoreId(PoolId(UUID.fromString("11111111-1111-1111-1111-111111111111")), 3.toByte)
   private val hostId = HostId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
 
-  private val moved = StoreMoved(storeId, hostId, HLCTimestamp(1000))
+  private val moved = StoreMoved(storeId, hostId, HLCTimestamp(1000), HLCTimestamp(1000))
   private val changed = HostEndpointChanged(hostId, "10.1.2.3", 4000, 4001, 4002, HLCTimestamp(2000))
 
   private val start = Instant.parse("2026-10-22T12:00:00Z")
@@ -87,7 +87,7 @@ class GossipRetransmitterSuite extends AnyFunSuite with Matchers:
     val r = f.retransmitter()
     r.broadcast(moved)
     f.advance(20.hours)
-    val movedAgain = StoreMoved(storeId, HostId(UUID.randomUUID()), HLCTimestamp(3000))
+    val movedAgain = StoreMoved(storeId, HostId(UUID.randomUUID()), HLCTimestamp(3000), HLCTimestamp(3000))
     r.broadcast(movedAgain)
     f.sent.clear()
 

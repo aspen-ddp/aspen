@@ -183,7 +183,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     roundTrip(m) shouldBe m   // 3000 bytes forces the stream path
 
   test("StoreMoved round trips through the QUIC codec"):
-    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 1), HostId(UUID.randomUUID()), HLCTimestamp(12345))
+    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 1), HostId(UUID.randomUUID()), HLCTimestamp(12345), HLCTimestamp(23456))
     roundTrip(m) shouldBe m
 
   test("HostEndpointChanged round trips through the QUIC codec"):
@@ -198,6 +198,17 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val m = HostOnlineStatus(List(HostId(UUID.randomUUID()), HostId(UUID.randomUUID())), List(HostId(UUID.randomUUID())))
     roundTrip(m) shouldBe m
     roundTrip(HostOnlineStatus(Nil, Nil)) shouldBe HostOnlineStatus(Nil, Nil)
+
+  test("HostOnlineStatus carrying store availability round trips through the QUIC codec"):
+    val poolId = PoolId(UUID.randomUUID())
+    val m = HostOnlineStatus(List(HostId(UUID.randomUUID())), Nil, Map(
+      StoreId(poolId, 0) -> StoreAvailability(offline = true, HLCTimestamp(100)),
+      StoreId(poolId, 1) -> StoreAvailability(offline = false, HLCTimestamp(200))))
+    roundTrip(m) shouldBe m
+
+  test("StoreOffline round trips through the QUIC codec"):
+    val m = StoreOffline(StoreId(PoolId(UUID.randomUUID()), 1), HLCTimestamp(12345))
+    roundTrip(m) shouldBe m
 
   test("a stream-only message is never a datagram"):
     val m = GossipSubscribe(ClientId(UUID.randomUUID()))

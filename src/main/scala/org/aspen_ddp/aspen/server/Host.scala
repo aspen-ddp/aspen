@@ -585,7 +585,7 @@ class Host(val client: AspenClient,
             // Tell every other host (and client) where the store now lives. Sent only on this
             // branch: the other outcomes did not repoint the pool. This transaction wrote the pool
             // config, so its timestamp is the config value's.
-            gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp))
+            gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp, HLCTimestamp.now))
 
           TransferOutcome.PoolRepointed
 
@@ -1021,6 +1021,8 @@ class Host(val client: AspenClient,
     yield
       synchronized {
         if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
+          // A retransmitted request finds the store already closed, and its going offline already gossiped
+          val wasLoaded = stores.contains(m.storeId)
           val fclosed = stores.get(m.storeId) match
             case None => Future.unit
             case Some(_) => closeStore(m.storeId)
@@ -1034,6 +1036,8 @@ class Host(val client: AspenClient,
                 os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
                 storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
                   toHostState.address, toHostState.storeTransferPort, m.timestamp)
+                if wasLoaded then
+                  gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
               catch
                 case t: Throwable =>
                   logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
@@ -1234,6 +1238,10 @@ class Host(val client: AspenClient,
         synchronized:
           rebuildingStores += storeId -> sr
 
+        // The pool already names this device, so peers would otherwise pick a store that cannot
+        // answer until the rebuild completes
+        gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
+
         completeFuture.onComplete:
           case Success(_) =>
             // Loading is downstream of the metadata decision, not ahead of it. An unconditional
@@ -1331,7 +1339,7 @@ class Host(val client: AspenClient,
 
               tx.result.foreach: _ =>
                 logger.info(s"Rebuild of store $storeId complete")
-                gossipRebuiltStoreMoved(storeId)
+                gossipStoreOnline(storeId)
 
               RebuildOutcome.Adopt
 
@@ -1346,20 +1354,23 @@ class Host(val client: AspenClient,
               // produces "healthy device, entry vanished", but it's the wrong default.
               RebuildOutcome.Discard
 
-  /** Gossips StoreMoved for a store whose rebuild has completed.
+  /** Gossips StoreMoved for a store this host has brought back online without repointing the
+   *  pool: one whose rebuild has completed, or whose abandoned transfer out has been reinstated.
    *
-   *  The pool was repointed when the rebuild was assigned, but peers only learn it now, as at
-   *  the end of a transfer. That was a different transaction, so the pool is read for the host
-   *  and timestamp its config value carries. Best-effort: a failed read only means peers find
-   *  the store the slow way.
+   *  For a rebuild, the pool was repointed when the rebuild was assigned, but peers only learn it
+   *  now, as at the end of a transfer. That was a different transaction, so the pool is read for
+   *  the host and timestamp its config value carries. The store came online now, before the read,
+   *  which is what clears its StoreOffline. Best-effort: a failed read only means peers find the
+   *  store the slow way and keep it offline until their next recheck.
    */
-  private def gossipRebuiltStoreMoved(storeId: StoreId): Unit =
+  private def gossipStoreOnline(storeId: StoreId): Unit =
+    val onlineTimestamp = HLCTimestamp.now
     client.getStoragePoolStateAndTimestamp(storeId.poolId).onComplete:
       case Success((poolState, timestamp)) =>
         val hostId = poolState.stores(storeId.poolIndex).hostId
-        gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp))
+        gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp, onlineTimestamp))
       case Failure(err) =>
-        logger.warn(s"Failed to read pool ${storeId.poolId} to gossip the rebuilt store $storeId: $err")
+        logger.warn(s"Failed to read pool ${storeId.poolId} to gossip that store $storeId is online: $err")
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
    *
@@ -1551,6 +1562,8 @@ class Host(val client: AspenClient,
 
     if markerRemoved then
       tryLoadStore(local, storePath.toNIO.toFile)
+      if !local.offlineStores.contains(storeId) then
+        gossipStoreOnline(storeId)
 
   /** Drops a TransferringIn entry whose source device has been declared failed.
    *

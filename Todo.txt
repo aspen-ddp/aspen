@@ -1,18 +1,9 @@
 TODO
 ====
 
-- Add Gossip messages for notifying peers of stores going offline for Transfer/Rebuild
-  - Hosts cache this <host-dir>/cache/offline-stores.yaml so they can restore it on a restart
-  - Used to skip selecting offline stores as designated leaders
-  - Extend the initial message sent to clients that provides the snapshot of offline hosts to
-    also include the offline stores.
-  - Slow-check every 24hr (hosts and long-lived clients should do this), read StoragePoolState to
-    verify it's still offline
-  - StoreMoved message clears this state as it finished the transfer/rebuild process
-
 - Now that we have tracking of offline stores and accurate tracking of online/offline status for Hosts, we can remove
   the hard-coded choice of always store 0 for the designatedLeader on transactions. Instead, we should randomly select
-  a store that isn't offline and who's host is currently online. 
+  a store that isn't offline and who's host is currently online.
 
 - Add a NetworkCache class
   - Abstract, pluggable interface

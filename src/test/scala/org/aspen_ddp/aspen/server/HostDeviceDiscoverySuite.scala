@@ -907,7 +907,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     yield
       host.transferOutcomes.get(movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
       poolState.stores(movingStore.poolIndex).hostId should be(host.hostId)
-      net.takeCapturedGossip() should be(List(StoreMoved(movingStore, host.hostId, poolTimestamp)))
+      val gossip = net.takeCapturedGossip()
+      gossip should have size 1
+      gossip.collect { case m: StoreMoved => (m.storeId, m.hostId, m.timestamp) } should be(
+        List((movingStore, host.hostId, poolTimestamp)))
 
   /** A host owning the transfer destination, with the receiving half of a transfer of
    *  `movingStore` already begun through the device check, exactly as the two tests above

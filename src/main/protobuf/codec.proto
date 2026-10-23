@@ -391,6 +391,19 @@ message StoreMoved {
   StoreId storeId = 1;
   UUID hostId = 2;
   uint64 timestamp = 3;
+  // 0 (absent) in messages from before it existed: decoded as `timestamp`
+  uint64 onlineTimestamp = 4;
+}
+
+message StoreOffline {
+  StoreId storeId = 1;
+  uint64 timestamp = 2;
+}
+
+message StoreAvailability {
+  StoreId storeId = 1;
+  bool offline = 2;
+  uint64 timestamp = 3;
 }
 
 message HostEndpointChanged {
@@ -416,6 +429,7 @@ message GossipSubscribe {
 message HostOnlineStatus {
   repeated UUID online = 1;
   repeated UUID offline = 2;
+  repeated StoreAvailability stores = 3;
 }
 
 message CheckStorageDevice {
@@ -474,6 +488,7 @@ message Message {
     ClusterTransportMessage cluster_transport = 29;
     GossipSubscribe gossip_subscribe = 30;
     HostOnlineStatus host_online_status = 31;
+    StoreOffline store_offline = 32;
   }
 }
 

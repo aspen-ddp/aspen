@@ -679,7 +679,17 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedEmptyState shouldBe empty
 
   test("StoreMoved round trips"):
-    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 3), HostId(UUID.randomUUID()), HLCTimestamp(12345))
+    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 3), HostId(UUID.randomUUID()), HLCTimestamp(12345), HLCTimestamp(23456))
+    Codec.decodeGossip(Codec.encodeGossip(m)) shouldBe Right(m)
+
+  test("StoreMoved from before onlineTimestamp existed decodes it as its timestamp"):
+    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 3), HostId(UUID.randomUUID()), HLCTimestamp(12345), HLCTimestamp(23456))
+    val legacy = org.aspen_ddp.aspen.codec.Message(
+      msg = org.aspen_ddp.aspen.codec.Message.Msg.StoreMoved(Codec.encode(m).withOnlineTimestamp(0))).toByteArray
+    Codec.decodeGossip(legacy) shouldBe Right(m.copy(onlineTimestamp = m.timestamp))
+
+  test("StoreOffline round trips"):
+    val m = StoreOffline(StoreId(PoolId(UUID.randomUUID()), 2), HLCTimestamp(34567))
     Codec.decodeGossip(Codec.encodeGossip(m)) shouldBe Right(m)
 
   test("HostEndpointChanged round trips"):

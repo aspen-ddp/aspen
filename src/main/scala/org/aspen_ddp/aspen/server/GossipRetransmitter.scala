@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.common.network.{Codec, Gossip, HostEndpointChanged, StoreMoved}
+import org.aspen_ddp.aspen.common.network.{Codec, Gossip, HostEndpointChanged, StoreMoved, StoreOffline}
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import scribe.Logging
 
@@ -10,7 +10,7 @@ import java.util.Base64
 import scala.concurrent.duration.*
 import scala.util.control.NonFatal
 
-/** Broadcasts this host's StoreMoved and HostEndpointChanged gossip, then re-broadcasts it every
+/** Broadcasts this host's StoreMoved, StoreOffline and HostEndpointChanged gossip, then re-broadcasts it every
  *  `Period` until `Lifetime` has passed since it was first sent.
  *
  *  Scalecube gossip reaches only the hosts that are members when it spreads, so a host that was
@@ -94,9 +94,11 @@ object GossipRetransmitter extends Logging:
         catch case e: DateTimeParseException => throw new FormatError(s"Invalid timestamp: $e")
       case _ => throw new FormatError("String Required")
 
-  /** What a message is about. A newer message about the same subject supersedes an older one. */
+  /** What a message is about. A newer message about the same subject supersedes an older one: a store coming back
+   *  online supersedes its going offline, and the reverse. */
   private def subject(g: Gossip): Any = g match
     case m: StoreMoved => m.storeId
+    case m: StoreOffline => m.storeId
     case m: HostEndpointChanged => m.hostId
 
   private object YGossip extends Format[Gossip]:

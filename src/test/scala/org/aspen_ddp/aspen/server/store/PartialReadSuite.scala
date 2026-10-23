@@ -54,6 +54,18 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
     assertBoundsKept(r)
   }
 
+  // Integer order differs from byte order here: [1,0] is 256, so it falls inside [2, 256] while [1,1] (257)
+  // and [1] (1) fall outside. A filter that ignored the ordering and compared bytes would get this wrong.
+  test("KeyRange honors a non-lexical ordering at both bounds") {
+    def bk(bytes: Int*): Key = Key(bytes.map(_.toByte).toArray)
+    val keys = List(bk(1), bk(2), bk(3), bk(1, 0), bk(1, 1))
+    val mixed = KVObjectState.encode(None, None, None, None,
+      keys.map(key => key -> new ValueState(Value(Array[Byte](0)), rev, HLCTimestamp(1), None)).toMap)
+
+    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, mixed, KeyRange(bk(2), bk(1, 0), IntegerKeyOrdering)))
+    r.content.keySet shouldBe Set(bk(2), bk(3), bk(1, 0))
+  }
+
   test("KeyRange with min > max is empty") {
     val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, data, KeyRange(k(4), k(2), IntegerKeyOrdering)))
     keysOf(r) shouldBe Set()

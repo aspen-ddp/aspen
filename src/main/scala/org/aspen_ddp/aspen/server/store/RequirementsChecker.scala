@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.common.ida.AppendDelta
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
@@ -45,14 +46,20 @@ object RequirementsChecker extends Logging {
           case r: LocalTimeRequirement => checkLocalTime(r)
 
           case r: DataUpdate =>
-            // Clients are blocked from building these, but the operation is still on the wire so
-            // a peer can send one. Fail it here rather than in apply() so the store votes abort.
-            if r.operation == DataUpdateOperation.Append then
-              throw ObjectErr(r.objectPointer.id, UnsupportedOperation())
-
-            checkRevision(getState(r.objectPointer.id), r.requiredRevision, txTimestamp)
+            val state = getState(r.objectPointer.id)
+            checkRevision(state, r.requiredRevision, txTimestamp)
             if (!objectUpdates.contains(r.objectPointer.id))
               throw ObjectErr(r.objectPointer.id, MissingObjectUpdate())
+
+            if r.operation == DataUpdateOperation.Append then
+              // A payload that cannot be decoded is a mismatch, not an unexpected failure
+              val matches =
+                try
+                  AppendDelta.decode(objectUpdates(r.objectPointer.id)).matches(state.data)
+                catch
+                  case _: IllegalArgumentException => false
+              if !matches then
+                throw ObjectErr(r.objectPointer.id, AppendMismatch())
 
           case r: KeyValueUpdate =>
             checkKVRequirements(getState(r.objectPointer.id), transactionId, r.requiredRevision,

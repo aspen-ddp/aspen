@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
+import org.aspen_ddp.aspen.common.ida.AppendDelta
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -53,12 +54,8 @@ object RequirementsApplyer extends Logging {
             r.operation match {
               case DataUpdateOperation.Overwrite => s.data = objectUpdates(ptr.id)
 
-              // Unreachable: RequirementsChecker rejects Append, so the object is skipped before
-              // reaching here. Kept as defense in depth and as the site of a future IDA-correct
-              // implementation. See the note on DataUpdateOperation.Append.
               case DataUpdateOperation.Append =>
-                throw new UnsupportedOperationException(
-                  s"DataUpdateOperation.Append is not yet supported (object ${ptr.id})")
+                s.data = AppendDelta.decode(objectUpdates(ptr.id)).applyTo(s.data)
             }
 
           case r: KeyValueUpdate =>

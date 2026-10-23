@@ -2,12 +2,12 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, UnsupportedOperation, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -85,29 +85,66 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
-  test("DataUpdate with an Append operation is rejected") {
-    // Append is not yet implemented: a store-local append under a slicing IDA produces a slice
-    // that will not reconstruct. Stores must vote to abort rather than apply it.
-    val o = new ObjectState(
-      oid1,
-      Metadata(rev1, ref1, ts1),
-      ObjectType.Data,
-      DataBuffer(new Array[Byte](0))
-    )
+  // Slice of data store `store` holding `content`, plus a delta appending `more` to it
+  private def appendFixture(content: Array[Byte], more: Array[Byte], store: Int = 0) = {
+    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val slice = ida.encode(DataBuffer(content))(store)
+    val delta = ida.appendDeltas(content.length, more)(store)
+    (slice, delta)
+  }
 
+  private def checkAppend(slice: DataBuffer, payload: Option[DataBuffer], reqRev: ObjectRevision = rev1) = {
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, slice)
     o.lockedToTransaction = Some(tx1)
+    val req = DataUpdate(p1, reqRev, DataUpdateOperation.Append)
+    val updates = payload.map(p => HashMap[ObjectId, DataBuffer](oid1 -> p)).getOrElse(HashMap[ObjectId, DataBuffer]())
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), updates)
+  }
 
-    val req = DataUpdate(p1, rev1, DataUpdateOperation.Append)
+  test("Append with matching revision and delta passes") {
+    val (slice, delta) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array.tabulate[Byte](30)(i => (i + 50).toByte))
+    val (oerrs, errs) = checkAppend(slice, Some(delta.encode))
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
 
-    var objects: HashMap[ObjectId, ObjectState] = new HashMap
-    var updates: HashMap[ObjectId, DataBuffer] = new HashMap
+  test("Append with wrong revision fails with RevisionMismatch") {
+    val (slice, delta) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1, 2, 3))
+    val (oerrs, errs) = checkAppend(slice, Some(delta.encode), rev2)
+    assert(oerrs == Map(oid1 -> RevisionMismatch()))
+    assert(errs.isEmpty)
+  }
 
-    objects += (o.objectId -> o)
-    updates += (o.objectId -> DataBuffer.Empty)
+  test("Append whose expected slice length differs fails with AppendMismatch") {
+    val (slice, delta) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1, 2, 3))
+    val longer = DataBuffer(slice.getByteArray ++ Array.fill[Byte](8)(0))
+    val (oerrs, errs) = checkAppend(longer, Some(delta.encode))
+    assert(oerrs == Map(oid1 -> AppendMismatch()))
+    assert(errs.isEmpty)
+  }
 
-    val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+  test("Append whose expected trailer differs fails with AppendMismatch") {
+    val (slice, delta) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1, 2, 3), store = 2)
+    // Store k-1 holds the trailer, so its delta carries an expected tail
+    assert(delta.expectedTail.isDefined)
+    val changed = slice.getByteArray
+    changed(changed.length - 1) = (changed(changed.length - 1) ^ 0x55).toByte
+    val (oerrs, errs) = checkAppend(DataBuffer(changed), Some(delta.encode))
+    assert(oerrs == Map(oid1 -> AppendMismatch()))
+    assert(errs.isEmpty)
+  }
 
-    assert(oerrs == Map(oid1 -> UnsupportedOperation()))
+  test("Append with an undecodable payload fails with AppendMismatch") {
+    val (slice, _) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1, 2, 3))
+    val (oerrs, errs) = checkAppend(slice, Some(DataBuffer(Array[Byte](1, 2, 3))))
+    assert(oerrs == Map(oid1 -> AppendMismatch()))
+    assert(errs.isEmpty)
+  }
+
+  test("Append without an object update fails with MissingObjectUpdate") {
+    val (slice, _) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1, 2, 3))
+    val (oerrs, errs) = checkAppend(slice, None)
+    assert(oerrs == Map(oid1 -> MissingObjectUpdate()))
     assert(errs.isEmpty)
   }
 

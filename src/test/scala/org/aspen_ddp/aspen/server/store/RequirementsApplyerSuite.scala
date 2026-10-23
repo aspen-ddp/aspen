@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 
+import org.aspen_ddp.aspen.common.ida.AppendingReedSolomon
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -140,21 +141,37 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     assert(o.metadata.refcount == ref1)
   }
 
-  test("an Append DataUpdate is rejected and leaves the object untouched") {
-    val o = mkDataObject()
+  test("Append XORs the delta into the zero-extended slice and bumps the revision") {
+    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val content = Array.tabulate[Byte](20)(_.toByte)
+    val more = Array.tabulate[Byte](30)(i => (i + 50).toByte)
 
-    var objects: HashMap[ObjectId, ObjectState] = new HashMap
-    var updates: HashMap[ObjectId, DataBuffer] = new HashMap
+    for i <- 0 until 5 do
+      val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data,
+        ida.encode(DataBuffer(content))(i))
+      val delta = ida.appendDeltas(content.length, more)(i)
 
-    objects += (o.objectId -> o)
-    updates += (o.objectId -> DataBuffer(Array[Byte](9, 9)))
+      val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(DataUpdate(p1, rev1, DataUpdateOperation.Append)),
+        HashMap(oid1 -> o), HashMap(oid1 -> delta.encode))
 
-    val req = DataUpdate(p1, rev1, DataUpdateOperation.Append)
+      assert(result.uncommittable.isEmpty)
+      assert(o.metadata.revision == ObjectRevision(tx1))
+      assert(o.data.getByteArray sameElements ida.encode(DataBuffer(content ++ more))(i).getByteArray)
+  }
 
-    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(req), objects, updates)
+  test("a mismatched Append leaves state untouched") {
+    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val content = Array.tabulate[Byte](20)(_.toByte)
+    val slice = ida.encode(DataBuffer(content))(0)
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, slice)
+    // Delta computed for a different current length
+    val delta = ida.appendDeltas(content.length + 40, Array[Byte](1, 2, 3))(0)
+
+    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(DataUpdate(p1, rev1, DataUpdateOperation.Append)),
+      HashMap(oid1 -> o), HashMap(oid1 -> delta.encode))
 
     assert(result.uncommittable == Set(oid1))
     assert(o.metadata.revision == rev1)
-    assert(o.data.getByteArray sameElements Array[Byte](1, 2, 3))
+    assert(o.data.getByteArray sameElements slice.getByteArray)
   }
 }

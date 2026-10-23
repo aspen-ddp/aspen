@@ -5,7 +5,13 @@ import org.aspen_ddp.aspen.client.{CorruptedObject, DataObjectState, InvalidObje
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError}
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, ObjectCache, ObjectState}
+import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
+import org.aspen_ddp.aspen.client.internal.network.Messenger
+import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, OpportunisticRebuild, Read, TxMessage}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError, ReadType, Value}
+import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState => StoreValueState}
+import org.aspen_ddp.aspen.common.transaction.PreTransactionOpportunisticRebuild
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
@@ -51,8 +57,9 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
                objectPointer: ObjectPointer = ptr,
                readUUID:UUID = readUUID,
                comment: String = "",
-               disableOpportunisticRebuild: Boolean = false) = {
-    new BaseReadDriver(client, objectPointer, ida, readUUID, comment, disableOpportunisticRebuild) {
+               disableOpportunisticRebuild: Boolean = false,
+               readType: ReadType = FullObject()) = {
+    new BaseReadDriver(client, objectPointer, ida, readUUID, comment, disableOpportunisticRebuild, readType) {
       given ec: ExecutionContext = this.client.clientContext
     }
   }
@@ -185,4 +192,83 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     o should be (DataObjectState(ptr, rev, ref, ts, ts, ida, 5, odata))
   }
 
+
+  /** Records the cache puts, client requests, and repair marks a read driver makes */
+  class RecordingClient extends ReadDriverClient.NoOp(client):
+    var puts: List[ObjectState] = Nil
+    var requests: List[ClientRequest] = Nil
+    var repairMarks: List[Set[Byte]] = Nil
+
+    override private[client] val objectCache: ObjectCache = new ObjectCache:
+      def get(pointer: DataObjectPointer): Option[DataObjectState] = None
+      def get(pointer: KeyValueObjectPointer): Option[KeyValueObjectState] = None
+      private[client] def put(pointer: ObjectPointer, os: ObjectState): Unit = puts = os :: puts
+
+    override private[client] val messenger: Messenger = new Messenger:
+      def sendClientRequest(msg: ClientRequest): Unit = requests = msg :: requests
+      def sendTransactionMessage(msg: TxMessage): Unit = ()
+      def sendTransactionMessages(msg: List[TxMessage]): Unit = ()
+      def sendHostMessage(msg: HostMessage): Unit = ()
+      def dropCacheForStore(storeId: StoreId): Unit = ()
+
+    override private[client] def opportunisticRebuildManager: OpportunisticRebuildManager = new OpportunisticRebuildManager:
+      def markRepairNeeded(os: ObjectState, repairNeeded: Set[Byte]): Unit =
+        repairMarks = repairNeeded :: repairMarks
+      def getPreTransactionOpportunisticRebuild(pointer: ObjectPointer): Map[Byte, PreTransactionOpportunisticRebuild] = Map()
+      def slowReadReplyDuration: Duration = Duration.Zero
+
+  val kvKey = Key(Array[Byte](5))
+
+  def kvData(rev: ObjectRevision, ts: HLCTimestamp): Option[DataBuffer] =
+    Some(KVObjectState.encode(None, None, None, None,
+      Map(kvKey -> new StoreValueState(Value(Array[Byte](1)), rev, ts, None))))
+
+  /** ds1 replies stale first; ds0 and ds2 then complete the read; ds1 replies stale again */
+  def runStaleStoreRead(readType: ReadType): (RecordingClient, KeyValueObjectState) =
+    val m = new RecordingClient
+    val r = mkReader(m, objectPointer = kvptr, readType = readType)
+    val nrev2 = ObjectRevision(TransactionId(new UUID(0,2)))
+    val ts = HLCTimestamp.now
+    val oldTs = HLCTimestamp(ts.asLong - 1000)
+
+    def cs(rv: ObjectRevision, t: HLCTimestamp) = Right(ReadResponse.CurrentState(rv, ref, t, 5, kvData(rv, t), Set()))
+
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, cs(rev, oldTs)))
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, cs(nrev2, ts)))
+    r.receiveReadResponse(ReadResponse(client, ds2, readUUID, ts, cs(nrev2, ts)))
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, cs(rev, oldTs)))
+
+    (m, Await.result(r.readResult, awaitDuration).asInstanceOf[KeyValueObjectState])
+
+  def rebuildsSent(m: RecordingClient): List[OpportunisticRebuild] =
+    m.requests.collect { case o: OpportunisticRebuild => o }
+
+  test("full KV read caches and rebuilds stale stores") {
+    val (m, kvos) = runStaleStoreRead(FullObject())
+    kvos.partial should be (false)
+    m.puts.size should be (1)
+    m.repairMarks should not be empty
+    m.repairMarks.foreach(_ should be (Set[Byte](1)))
+    rebuildsSent(m).map(_.toStore) should be (List(ds1))
+  }
+
+  test("partial KV read neither caches nor rebuilds") {
+    val (m, kvos) = runStaleStoreRead(KeySet(List(kvKey)))
+    kvos.partial should be (true)
+    kvos.contents.contains(kvKey) should be (true)
+    kvos.getRebuildDataForStore(ds1) should be (None)
+    m.puts should be (Nil)
+    m.repairMarks should be (Nil)
+    rebuildsSent(m) should be (Nil)
+  }
+
+  test("partial KV read sends its read type") {
+    val m = new RecordingClient
+    val r = mkReader(m, objectPointer = kvptr, readType = KeySet(List(kvKey)))
+    r.begin()
+    val reads = m.requests.collect { case rd: Read => rd }
+    reads.size should be (3)
+    reads.foreach(_.readType should be (KeySet(List(kvKey))))
+    succeed
+  }
 }

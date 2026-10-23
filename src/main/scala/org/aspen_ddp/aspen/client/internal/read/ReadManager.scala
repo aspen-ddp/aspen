@@ -5,7 +5,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectState}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{ReadResponse, TransactionCompletionQuery, TransactionCompletionResponse}
-import org.aspen_ddp.aspen.common.objects.ObjectPointer
+import org.aspen_ddp.aspen.common.objects.{FullObject, ObjectPointer, ReadType}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -111,11 +111,12 @@ class ReadManager(val client: AspenClient, val driverFactory: ReadDriver.Factory
             ida: IDA,
             comment: String,
             disableOpportunisticRebuild:Boolean=false,
+            readType: ReadType = FullObject()
             ): Future[ObjectState] = {
 
     val readUUID = UUID.randomUUID()
 
-    val driver = driverFactory(client, objectPointer, ida, readUUID, comment, disableOpportunisticRebuild)
+    val driver = driverFactory(client, objectPointer, ida, readUUID, comment, disableOpportunisticRebuild, readType)
 
     synchronized { outstandingReads += (readUUID -> driver) }
 

@@ -4,7 +4,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.client.ReadDriverClient
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.ObjectPointer
+import org.aspen_ddp.aspen.common.objects.{FullObject, ObjectPointer, ReadType}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 
 import scala.concurrent.ExecutionContext
@@ -20,9 +20,10 @@ object SimpleReadDriver {
                ida: IDA,
                readUUID:UUID,
                comment: String,
-               disableOpportunisticRebuild: Boolean): ReadDriver = {
+               disableOpportunisticRebuild: Boolean,
+               readType: ReadType): ReadDriver = {
       new SimpleReadDriver(initialDelay, maxDelay, client,
-        objectPointer, ida, readUUID, comment, disableOpportunisticRebuild)
+        objectPointer, ida, readUUID, comment, disableOpportunisticRebuild, readType)
     }
   }
 }
@@ -39,8 +40,9 @@ class SimpleReadDriver(
                         ida: IDA,
                         readUUID:UUID,
                         comment: String,
-                        disableOpportunisticRebuild: Boolean) extends BaseReadDriver( client,
-  objectPointer, ida, readUUID, comment, disableOpportunisticRebuild) {
+                        disableOpportunisticRebuild: Boolean,
+                        readType: ReadType = FullObject()) extends BaseReadDriver( client,
+  objectPointer, ida, readUUID, comment, disableOpportunisticRebuild, readType) {
 
   given ec: ExecutionContext = client.clientContext
 

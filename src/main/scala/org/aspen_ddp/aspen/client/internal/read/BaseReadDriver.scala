@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.{DataObjectState, KeyValueObjectState, Metadat
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import scribe.Logging
 
@@ -17,21 +17,26 @@ abstract class BaseReadDriver(
                                val ida: IDA,
                                val readUUID:UUID,
                                val comment: String,
-                               val disableOpportunisticRebuild: Boolean = false
+                               val disableOpportunisticRebuild: Boolean = false,
+                               val readType: ReadType = FullObject()
                     ) extends ReadDriver with Logging {
 
   logger.info(s"Read UUID $readUUID: Beginning read of ${objectPointer.objectType} object ${objectPointer.id}. Comment: $comment")
 
-  // TODO: Support multiple read types
-  private val readType: ReadType = FullObject()
+  /** Partial results must never be cached or used for opportunistic rebuilds: the entries they omit would
+    * be mistaken for deletions */
+  private val isPartial: Boolean = readType match
+    case _: KeySet | _: KeyRange => true
+    case _ => false
 
   // Detect invalid combinations
   val objectReader: ObjectReader = (objectPointer, readType) match {
     case (p: KeyValueObjectPointer, _:MetadataOnly) => new KeyValueObjectReader(true, p, ida, readUUID)
-    case (p: KeyValueObjectPointer, _) => new KeyValueObjectReader(false, p, ida, readUUID)
+    case (p: KeyValueObjectPointer, _) => new KeyValueObjectReader(false, p, ida, readUUID, isPartial)
 
     case (p: DataObjectPointer,     _:MetadataOnly) => new DataObjectReader(true, p, ida, readUUID)
     case (p: DataObjectPointer,     _:FullObject) => new DataObjectReader(false, p, ida, readUUID)
+    case (_: DataObjectPointer,     rt) => throw new IllegalArgumentException(s"Read type $rt is not supported for DataObjects")
 
     case _ => throw new AssertionError("Invalid read combination")
   }
@@ -125,7 +130,8 @@ abstract class BaseReadDriver(
                 case mos: MetadataObjectState => HLCTimestamp.update(mos.timestamp)
               }
 
-              client.objectCache.put(objectPointer, os)
+              if !isPartial then
+                client.objectCache.put(objectPointer, os)
 
               Right(os)
           }
@@ -147,7 +153,7 @@ abstract class BaseReadDriver(
           }
         }
 
-        if (promise.isCompleted) {
+        if (promise.isCompleted && !isPartial) {
           e match {
             case Right(os) =>
 
@@ -164,7 +170,7 @@ abstract class BaseReadDriver(
 
         e match {
           case Right(os) =>
-            if (objectReader.rereadCandidates.contains(response.fromStore))
+            if (!isPartial && objectReader.rereadCandidates.contains(response.fromStore))
               sendOpportunisticRebuild(response.fromStore, os)
           case _ =>
         }
@@ -184,9 +190,10 @@ object BaseReadDriver:
                                  ida: IDA,
                                  readUUID:UUID,
                                  comment: String,
-                                 disableOpportunisticRebuild: Boolean): ReadDriver =
+                                 disableOpportunisticRebuild: Boolean,
+                                 readType: ReadType): ReadDriver =
 
-    new BaseReadDriver(client, objectPointer, ida, readUUID, comment):
+    new BaseReadDriver(client, objectPointer, ida, readUUID, comment, readType = readType):
 
       given ec: ExecutionContext = this.client.clientContext
 

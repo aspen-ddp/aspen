@@ -112,7 +112,10 @@ class KeyValueObjectState(
                            val maximum: Option[Key],
                            val left: Option[Value],
                            val right: Option[Value],
-                           val contents: Map[Key, KeyValueObjectState.ValueState]
+                           val contents: Map[Key, KeyValueObjectState.ValueState],
+                           /** True when produced by a partial read (KeySet or KeyRange). `contents` then
+                             * holds only the entries that were requested, not the object's full contents */
+                           val partial: Boolean = false
                          ) extends ObjectState(pointer, revision, refcount, timestamp, readTimestamp) {
 
   def sizeOnStore: Int =
@@ -198,7 +201,7 @@ class KeyValueObjectState(
           case (Some(x), Some(y)) => java.util.Arrays.equals(x.bytes, y.bytes)
 
         (that `canEqual` this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount &&
-          minEq && maxEq && leftEq && rightEq && contents == that.contents
+          minEq && maxEq && leftEq && rightEq && contents == that.contents && partial == that.partial
       case _ => false
   override def hashCode: Int =
     def hk(o: Option[Key]): Int = o match
@@ -232,10 +235,11 @@ class KeyValueObjectState(
     val l = left.map(l => org.aspen_ddp.aspen.common.util.printableArray(l.bytes)).getOrElse("")
     val r = right.map(r => org.aspen_ddp.aspen.common.util.printableArray(r.bytes)).getOrElse("")
 
-    s"KVObjectState(object: ${pointer.id}, revision: $revision, refcount: $refcount, min: $min, max: $max, left: $l, right: $r, contents: $contents"
+    s"KVObjectState(object: ${pointer.id}, revision: $revision, refcount: $refcount, min: $min, max: $max, left: $l, right: $r, partial: $partial, contents: $contents"
 
+  /** None for partial states: rebuilding a store from them would drop the entries that were not read */
   def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] =
-    if storeId.poolId != pointer.poolId || storeId.poolIndex >= ida.width then
+    if partial || storeId.poolId != pointer.poolId || storeId.poolIndex >= ida.width then
       None
     else
       import org.aspen_ddp.aspen.server.store.KVObjectState

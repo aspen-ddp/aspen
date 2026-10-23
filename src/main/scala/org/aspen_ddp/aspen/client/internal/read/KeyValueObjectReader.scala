@@ -18,7 +18,8 @@ object KeyValueObjectReader {
   private case class Restorable(revision: ObjectRevision, timestamp: HLCTimestamp, slices: List[(Byte, Value)])
 }
 
-class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer, ida: IDA, readUUID: UUID)
+class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer, ida: IDA, readUUID: UUID,
+                           partial: Boolean = false)
   extends BaseObjectReader[KeyValueObjectPointer, KeyValueObjectStoreState](metadataOnly, pointer, ida, readUUID) {
 
   import KeyValueObjectReader._
@@ -97,7 +98,7 @@ class KeyValueObjectReader(metadataOnly: Boolean, pointer: KeyValueObjectPointer
     if (debug)
       println(s"Restored Contents: $contents")
 
-    new KeyValueObjectState(pointer, revision, refcount, timestamp, readTime, ida, min, max, left, right, contents)
+    new KeyValueObjectState(pointer, revision, refcount, timestamp, readTime, ida, min, max, left, right, contents, partial)
   }
 
 

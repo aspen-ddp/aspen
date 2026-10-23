@@ -118,8 +118,8 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   }
 
   test("encode/decode round trips") {
-    val withTail = AppendDelta(16, 32, 8, Array[Byte](1, 2, 3), Some(Array[Byte](9, 8, 7, 6, 5, 4, 3, 2)))
-    val without = AppendDelta(0, 8, 0, Array[Byte](5, 6), None)
+    val withTail = AppendDelta(16, 32, 8, Array.tabulate[Byte](24)(_.toByte), Some(Array[Byte](9, 8, 7, 6, 5, 4, 3, 2)))
+    val without = AppendDelta(0, 8, 0, Array.tabulate[Byte](8)(i => (i + 5).toByte), None)
     AppendDelta.decode(withTail.encode) should be (withTail)
     AppendDelta.decode(without.encode) should be (without)
     AppendDelta.decode(withTail.encode).hashCode should be (withTail.hashCode)
@@ -127,7 +127,7 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   }
 
   test("decode rejects truncated input") {
-    val d = AppendDelta(16, 32, 8, Array[Byte](1, 2, 3), Some(Array[Byte](9, 8, 7, 6, 5, 4, 3, 2)))
+    val d = AppendDelta(16, 32, 8, Array.tabulate[Byte](24)(_.toByte), Some(Array[Byte](9, 8, 7, 6, 5, 4, 3, 2)))
     val enc = d.encode.getByteArray
     for n <- 0 until enc.length do
       an [IllegalArgumentException] should be thrownBy AppendDelta.decode(DataBuffer(enc.take(n)))
@@ -141,7 +141,9 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
       (0, -8, 0, Array[Byte](), None),             // negative new length
       (0, 8, -1, Array[Byte](1), None),            // negative offset
       (0, 8, 7, Array[Byte](1, 2), None),          // xor range past new length
-      (2, 8, 0, Array[Byte](1), tail))             // tail longer than expected slice
+      (2, 8, 0, Array[Byte](1), tail),             // tail longer than expected slice
+      (0, 8, 0, Array[Byte](1, 2), None),          // xor range does not end at the new slice length
+      (0, 16, 8, Array.fill[Byte](8)(1), None))    // xor starts beyond the expected slice length
     bad.foreach { (e, n, o, x, t) =>
       val enc = ByteBuffer.allocate(22 + x.length + t.map(_.length).getOrElse(0))
       enc.put(AppendDelta.FormatVersion).putInt(e).putInt(n).putInt(o).putInt(x.length)

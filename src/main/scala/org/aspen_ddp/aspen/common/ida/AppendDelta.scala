@@ -20,8 +20,10 @@ final case class AppendDelta(
   require(expectedSliceLength >= 0 && expectedSliceLength <= newSliceLength,
     s"Invalid slice lengths: expected $expectedSliceLength, new $newSliceLength")
   require(xorOffset >= 0, s"Invalid xorOffset $xorOffset")
-  require(xorOffset.toLong + xorBytes.length <= newSliceLength,
-    s"XOR range ($xorOffset + ${xorBytes.length}) exceeds new slice length $newSliceLength")
+  require(xorOffset <= expectedSliceLength,
+    s"XOR offset $xorOffset begins beyond the expected slice length $expectedSliceLength")
+  require(xorOffset.toLong + xorBytes.length == newSliceLength,
+    s"XOR range ($xorOffset + ${xorBytes.length}) does not end at the new slice length $newSliceLength")
   require(expectedTail.forall(_.length <= expectedSliceLength),
     "Expected tail is longer than the expected slice")
 
@@ -29,9 +31,13 @@ final case class AppendDelta(
     slice.size == expectedSliceLength && (expectedTail match
       case None => true
       case Some(tail) =>
-        val arr = slice.getByteArray
-        tail.length <= arr.length &&
-          Arrays.equals(arr, arr.length - tail.length, arr.length, tail, 0, tail.length))
+        tail.length <= slice.size && {
+          val start = slice.size - tail.length
+          var i = 0
+          while i < tail.length && slice.get(start + i) == tail(i) do
+            i += 1
+          i == tail.length
+        })
 
   def applyTo(slice: DataBuffer): DataBuffer =
     require(matches(slice), "Append delta does not match the current slice")

@@ -62,7 +62,7 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val txd = TransactionDescription(TransactionId(UUID.randomUUID()), HLCTimestamp(1000L), p, 1.toByte,
       List(DataUpdate(p, ObjectRevision(TransactionId(UUID.randomUUID())), DataUpdateOperation.Overwrite)),
       Nil, None, Nil, Nil, ida, Map(p.poolId -> ida))
-    TxPrepare(to, from, txd, ProposalId(1, 1.toByte), updates, Nil)
+    TxPrepare(to, from, txd, ProposalId(1, 1.toByte), updates, Nil, fromClient = false)
 
   private def entryFor(net: QuicNet, hostId: HostId): QuicHostEntry =
     net.metadataManager.peekHostEntry(hostId).getOrElse(fail(s"no host entry for $hostId"))

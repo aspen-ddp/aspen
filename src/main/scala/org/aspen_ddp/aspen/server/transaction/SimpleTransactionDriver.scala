@@ -14,6 +14,10 @@ object SimpleTransactionDriver {
 
   def factory(initialDelay: Duration, maxDelay: Duration): TransactionDriver.Factory =
     new TransactionDriver.Factory:
+      // A live driver re-broadcasts every maxDelay. Two intervals tolerates one late or lost
+      // round before the other stores conclude the driver has failed and start their own.
+      override def failedDriverDuration: Duration = maxDelay * 2
+
       def create(executionContext: ExecutionContext,
                  storeId: StoreId,
                  messenger: Messenger,

@@ -226,7 +226,12 @@ class Tx( trs: TransactionRecoveryState,
   def receivePrepare(m: TxPrepare): Unit = {
     logger.trace(s"*** Got Prepare: ${m.transactionId}")
     lastProposer = m.from
-    updateLastEvent()
+
+    // The client re-sends its prepares until it learns the outcome, whether or not any driver is
+    // making progress. Counting them as activity would keep a transaction whose designated leader
+    // is offline from ever looking idle, so no other store would take it over.
+    if !m.fromClient then
+      updateLastEvent()
 
     if (committed) {
       // Ensure the proposer knows we've successfully committed

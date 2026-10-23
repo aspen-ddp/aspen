@@ -47,7 +47,7 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
   private def prepare: TxPrepare =
     val updates = (1 to 2).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(bytes(10 * i, i))))
     val rebuilds = List(PreTransactionOpportunisticRebuild(ObjectId(uuid(8)), meta(8), DataBuffer(bytes(40))))
-    TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, rebuilds)
+    TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, rebuilds, fromClient = false)
 
   private def heartbeat = HostHeartbeat(HostId(uuid(1)))
 
@@ -142,7 +142,7 @@ class StreamFrameDecoderSuite extends AnyFunSuite with Matchers with BeforeAndAf
     val source = new Array[Byte](sectionSize)
     new java.util.Random(42).nextBytes(source)
     val updates = (1 to 4).toList.map(i => ObjectUpdate(ObjectId(uuid(i)), DataBuffer(source)))
-    val m = TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, Nil)
+    val m = TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, Nil, fromClient = false)
     // A private allocator, so suites running in parallel don't show up in the peak
     val local = new PooledByteBufAllocator(true)
     val frame = QuicMessageCodec.encode(m, local).toStreamFrame(local)

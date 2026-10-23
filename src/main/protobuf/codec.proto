@@ -199,6 +199,7 @@ message TxPrepare {
   StoreId from = 2;
   TransactionDescription txd = 3;
   ProposalId proposal_id = 4;
+  bool from_client = 5;
 }
 
 message TxPrepareResponse {

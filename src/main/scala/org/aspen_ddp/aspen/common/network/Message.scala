@@ -191,11 +191,14 @@ final case class TxPrepare(
                             txd: TransactionDescription,
                             proposalId: ProposalId,
                             objectUpdates: List[ObjectUpdate],
-                            preTxRebuilds: List[PreTransactionOpportunisticRebuild]) extends TxMessage:
+                            preTxRebuilds: List[PreTransactionOpportunisticRebuild],
+                            // True for the originating client's prepares. The client sends them on
+                            // the designated leader's behalf, so `from` names the leader either way.
+                            fromClient: Boolean) extends TxMessage:
 
   override val transactionId: TransactionId = txd.transactionId
 
-  override def toString: String = f"TxPrepare to $to from $from tx $transactionId proposalId $proposalId"
+  override def toString: String = f"TxPrepare to $to from $from tx $transactionId proposalId $proposalId fromClient $fromClient"
 
 
 final case class TxPrepareResponse(

@@ -43,7 +43,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     Map(dataPtr(2).poolId -> ida))
 
   private def prepare(updates: List[ObjectUpdate], rebuilds: List[PreTransactionOpportunisticRebuild]) =
-    TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, rebuilds)
+    TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), updates, rebuilds, fromClient = false)
 
   private def readResponse(data: Option[DataBuffer]) =
     ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L),

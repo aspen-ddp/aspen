@@ -257,11 +257,12 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       TransactionId(uuid(1)), HLCTimestamp(1000L), dataPtr(2), 1.toByte,
       Nil, Nil, None, Nil, Nil, ida, Map(dataPtr(2).poolId -> ida)
     )
-    val original = TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), Nil, Nil)
+    val original = TxPrepare(storeId(10), storeId(11), txd, ProposalId(1, 1.toByte), Nil, Nil, fromClient = true)
     val decoded = Codec.decode(Codec.encode(original), Nil, Nil)
     decoded.to shouldBe original.to
     decoded.from shouldBe original.from
     decoded.proposalId shouldBe original.proposalId
+    decoded.fromClient shouldBe true
 
   test("TxPrepareResponse round-trip"):
     val nack = TxPrepareResponse(

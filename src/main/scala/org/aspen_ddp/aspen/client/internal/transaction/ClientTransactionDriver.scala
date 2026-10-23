@@ -75,7 +75,7 @@ class ClientTransactionDriver(
         val transactionData = updateData.getOrElse(toStore, TransactionData(Nil, Nil))
 
         val initialPrepare = TxPrepare(toStore, fromStore, txd, ProposalId.initialProposal(txd.designatedLeaderUID),
-          transactionData.localUpdates, transactionData.preTransactionRebuilds)
+          transactionData.localUpdates, transactionData.preTransactionRebuilds, fromClient = true)
 
         client.messenger.sendTransactionMessage(initialPrepare)
       }

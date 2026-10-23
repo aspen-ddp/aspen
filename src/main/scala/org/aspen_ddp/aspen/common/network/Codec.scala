@@ -442,14 +442,15 @@ object Codec extends Logging:
       to = Some(encode(o.to)),
       from = Some(encode(o.from)),
       txd = Some(encode(o.txd)),
-      proposalId = Some(encode(o.proposalId))
+      proposalId = Some(encode(o.proposalId)),
+      fromClient = o.fromClient
     )
 
   def decode(m: codec.TxPrepare,
              objectUpdates: List[ObjectUpdate],
              preTxRebuilds: List[PreTransactionOpportunisticRebuild]): TxPrepare =
     TxPrepare(decode(m.to.get), decode(m.from.get), decode(m.txd.get), decode(m.proposalId.get),
-      objectUpdates, preTxRebuilds)
+      objectUpdates, preTxRebuilds, m.fromClient)
 
 
   def encode(o: TxPrepareResponse): codec.TxPrepareResponse =

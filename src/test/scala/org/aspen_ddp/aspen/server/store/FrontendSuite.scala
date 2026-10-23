@@ -89,6 +89,14 @@ object FrontendSuite {
       new TransactionStatusCache())
     (frontend, backend, cache)
 
+  def mkPrepare(txd: TransactionDescription, fromClient: Boolean): TxPrepare =
+    TxPrepare(storeId, StoreId(poolId, txd.designatedLeaderUID), txd,
+      ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient)
+
+  def mktxd(): TransactionDescription =
+    TransactionDescription(txid1, HLCTimestamp(100), op1, 0, Nil, Nil, Some(clientId), Nil, Nil, ida,
+      Map(poolId -> ida))
+
   def mkObjectState(objectId: ObjectId): ObjectState =
     new ObjectState(objectId,
       Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
@@ -128,6 +136,37 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     Await.result(completion.future, Duration(5, SECONDS))
 
     cache.get(oid1) shouldBe None
+  }
+
+  // A client re-sends its prepare until it learns the outcome. If that reset the idle time, a
+  // transaction whose designated leader is offline would never look idle to the other stores, so
+  // none of them would take over and the transaction would hang for as long as the client waited.
+  test("client prepare retransmissions do not reset a transaction's idle time") {
+    val (frontend, _, _) = mkFrontend()
+    val prepare = mkPrepare(mktxd(), fromClient = true)
+
+    frontend.receiveTransactionMessage(prepare)
+    val tx = frontend.transactions(txid1)
+    val firstEvent = tx.lastEventTime
+
+    Thread.sleep(5)
+    frontend.receiveTransactionMessage(prepare)
+
+    tx.lastEventTime shouldBe firstEvent
+  }
+
+  test("prepares from a transaction driver reset a transaction's idle time") {
+    val (frontend, _, _) = mkFrontend()
+    val prepare = mkPrepare(mktxd(), fromClient = false)
+
+    frontend.receiveTransactionMessage(prepare)
+    val tx = frontend.transactions(txid1)
+    val firstEvent = tx.lastEventTime
+
+    Thread.sleep(5)
+    frontend.receiveTransactionMessage(prepare)
+
+    tx.lastEventTime should be > firstEvent
   }
 
   test("repair deletion succeeds when the store does not have the object") {

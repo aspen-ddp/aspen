@@ -86,6 +86,79 @@ class NetworkSnapshotReaderSuite extends AnyFunSuite
     tasks.requested.size should be(1)
     tasks.requested.head.random should be(true)
 
+  private val failed: () => Future[Option[(HostSnapshot, StoreSnapshot)]] =
+    () => Future.failed(new RuntimeException("read failed"))
+
+  private def retries(tasks: RecordingTasks): List[Requested] = tasks.requested.filterNot(_.random).toList
+
+  test("a failed empty-cache startup read retries after 1, 5 and 30 minutes, then leaves it to the schedule"):
+    val (mgr, _, _) = newManager(new RecordingNetworkCache())
+    val fetch = ScriptedFetch(failed)
+    val tasks = new RecordingTasks
+    newReader(mgr, fetch, tasks).start()
+
+    fetch.calls should be(1)
+    retries(tasks).map(_.delay) should be(List(1.minute))
+    retries(tasks).last.fire()
+    retries(tasks).map(_.delay) should be(List(1.minute, 5.minutes))
+    retries(tasks).last.fire()
+    retries(tasks).map(_.delay) should be(List(1.minute, 5.minutes, 30.minutes))
+    retries(tasks).last.fire()
+
+    fetch.calls should be(4)
+    retries(tasks).size should be(3)
+    tasks.requested.count(_.random) should be(1)
+
+  test("startup retries end once a read succeeds"):
+    val (mgr, _, _) = newManager(new RecordingNetworkCache())
+    val fetch = ScriptedFetch(failed,
+      some(HostSnapshot(at(T), List(remote(T))), StoreSnapshot(at(T), List(CachedStore(store0, remoteHostId, at(T))))))
+    val tasks = new RecordingTasks
+    newReader(mgr, fetch, tasks).start()
+
+    retries(tasks).head.fire()
+
+    fetch.calls should be(2)
+    retries(tasks).size should be(1)
+    mgr.peekHostEntry(remoteHostId).map(_.address) should be(Some("1.2.3.4"))
+
+  test("a pending startup retry is skipped once the scheduled read has succeeded"):
+    val (mgr, _, _) = newManager(new RecordingNetworkCache())
+    val fetch = ScriptedFetch(failed, emptySnapshots)
+    val tasks = new RecordingTasks
+    newReader(mgr, fetch, tasks).start()
+    val retry = retries(tasks).head
+
+    tasks.requested.find(_.random).get.fire()
+    fetch.calls should be(2)
+    retry.fire()
+
+    fetch.calls should be(2)
+    retries(tasks).map(_.delay) should be(List(1.minute, period))
+
+  test("a seeded cache does not retry a failed read early"):
+    val (mgr, _, _) = newManager(seeded(T))
+    val fetch = ScriptedFetch(failed)
+    val tasks = new RecordingTasks
+    newReader(mgr, fetch, tasks).start()
+
+    tasks.requested.head.fire()
+
+    retries(tasks).map(_.delay) should be(List(period))
+
+  test("stop cancels a pending startup retry"):
+    val (mgr, _, _) = newManager(new RecordingNetworkCache())
+    val fetch = ScriptedFetch(failed)
+    val tasks = new RecordingTasks
+    val reader = newReader(mgr, fetch, tasks)
+    reader.start()
+
+    reader.stop()
+
+    retries(tasks).head.cancelled should be(true)
+    retries(tasks).head.fire()
+    fetch.calls should be(1)
+
   test("a seeded cache waits for its random slot"):
     val (mgr, _, _) = newManager(seeded(T))
     val fetch = ScriptedFetch(emptySnapshots)
@@ -101,9 +174,6 @@ class NetworkSnapshotReaderSuite extends AnyFunSuite
     // slot anywhere in the day rather than on one of 24 hour boundaries
     slot.delay.unit should be(MILLISECONDS)
     slot.delay.length should be(period.toMillis)
-    // The drawn delay is in [0, window), so always less than the period
-    val drawn = Duration(new java.util.Random().nextInt(slot.delay.length.toInt), slot.delay.unit)
-    drawn should be < period
 
   test("each read schedules the next one period later"):
     val (mgr, _, _) = newManager(seeded(T))

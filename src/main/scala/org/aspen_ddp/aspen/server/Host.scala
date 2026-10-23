@@ -1991,7 +1991,7 @@ class Host(val client: AspenClient,
         case Some(store) => msg match
           case r: Read =>
             if r.objectPointer.poolId == store.storeId.poolId then
-              store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer)
+              store.frontend.readObjectForNetwork(r.fromClient, r.readUUID, r.objectPointer, r.readType)
 
           case op: OpportunisticRebuild => store.frontend.readObjectForOpportunisticRebuild(op)
 

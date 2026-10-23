@@ -3,8 +3,8 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, TxMessage, TxPrepare, TxResolved}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxMessage, TxPrepare, TxResolved}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -89,6 +89,36 @@ object FrontendSuite {
       new TransactionStatusCache())
     (frontend, backend, cache)
 
+  /** Like mkFrontend but also returns the TestNet and routes backend completions to the Frontend */
+  def mkFrontendWithNet(): (Frontend, MapBackend, ObjectCache, TestNet) =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    (frontend, backend, cache, net)
+
+  val kvPtr = KeyValueObjectPointer(oid2, poolId, Array[Byte]())
+  def k(n: Int): Key = Key(Array[Byte](n.toByte))
+
+  def mkKVObjectState(): ObjectState =
+    val contents = (1 to 3).map { n =>
+      k(n) -> new ValueState(Value(Array[Byte](n.toByte)), rev0, HLCTimestamp(n.toLong), None)
+    }.toMap
+    new ObjectState(oid2,
+      Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)),
+      ObjectType.KeyValue,
+      KVObjectState.encode(Some(k(0)), None, None, None, contents))
+
+  /** Content keys of the KV object carried by the next ReadResponse sent to the TestNet */
+  def readResponseKeys(net: TestNet): (Set[Int], Int) =
+    net.clientMessage() match
+      case Some(rr: ReadResponse) =>
+        val cs = rr.result.toOption.get
+        (KVObjectState.decode(cs.objectData.get).content.keySet.map(_.bytes(0).toInt), cs.sizeOnStore)
+      case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+
   def mkPrepare(txd: TransactionDescription, fromClient: Boolean): TxPrepare =
     TxPrepare(storeId, StoreId(poolId, txd.designatedLeaderUID), txd,
       ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient)
@@ -106,6 +136,31 @@ object FrontendSuite {
 
 class FrontendSuite extends AnyFunSuite with Matchers {
   import FrontendSuite._
+
+  def checkPartialRead(preCache: Boolean): Unit =
+    val (frontend, backend, cache, net) = mkFrontendWithNet()
+    val os = mkKVObjectState()
+    val fullSize = os.data.size
+
+    backend.bootstrapAllocate(oid2, os.objectType, os.metadata, os.data)
+    if preCache then
+      cache.insert(os)
+
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, KeySet(List(k(1))))
+    readResponseKeys(net) shouldBe (Set(1), fullSize)
+
+    frontend.readObjectForNetwork(clientId, new UUID(1, 2), kvPtr, FullObject())
+    readResponseKeys(net) shouldBe (Set(1, 2, 3), fullSize)
+
+    KVObjectState.decode(cache.get(oid2).get.data).content.keySet.map(_.bytes(0).toInt) shouldBe Set(1, 2, 3)
+
+  test("partial network read returns only requested keys and leaves the cache intact") {
+    checkPartialRead(preCache = false)
+  }
+
+  test("partial network read of a cached object returns only requested keys and leaves the cache intact") {
+    checkPartialRead(preCache = true)
+  }
 
   test("repair deletion removes the object from the backend") {
     val (frontend, backend, _) = mkFrontend()

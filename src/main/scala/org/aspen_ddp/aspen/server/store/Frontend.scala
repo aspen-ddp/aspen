@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
-import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError}
+import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
@@ -21,7 +21,7 @@ object Frontend {
 
   sealed abstract class ReadKind
 
-  case class NetworkRead(clientId: ClientId, requestUUID: UUID) extends ReadKind
+  case class NetworkRead(clientId: ClientId, requestUUID: UUID, readType: ReadType) extends ReadKind
 
   case class TransactionRead(transactionId: TransactionId) extends ReadKind
 
@@ -98,14 +98,14 @@ class Frontend(val storeId: StoreId,
       }
   }
 
-  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer): Unit = {
+  def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit = {
     val objectId = pointer.id
 
     objectCache.get(objectId) match
       case Some(os) =>
         logger.trace(s"Reading Cached object for read $readUUID. Revision ${os.metadata.revision}")
         val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
-          os.data.size, Some(os.data), os.lockedWriteTransactions )
+          os.data.size, Some(PartialRead.filter(os.objectType, os.data, readType)), os.lockedWriteTransactions )
 
         val rr = ReadResponse(clientId, storeId, readUUID, HLCTimestamp.now, Right(cs) )
         net.sendClientResponse(rr)
@@ -113,7 +113,7 @@ class Frontend(val storeId: StoreId,
       case None =>
         logger.trace(s"Reading uncached object from backing store for read $readUUID")
 
-        val nr = NetworkRead(clientId, readUUID)
+        val nr = NetworkRead(clientId, readUUID, readType)
 
         pendingReads.get(objectId) match
           case Some(lst) =>
@@ -249,7 +249,7 @@ class Frontend(val storeId: StoreId,
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. SUCCESS. Sending read response")
               val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
-                os.data.size, Some(os.data), os.lockedWriteTransactions )
+                os.data.size, Some(PartialRead.filter(os.objectType, os.data, netRead.readType)), os.lockedWriteTransactions )
 
               val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Right(cs) )
               net.sendClientResponse(rr)

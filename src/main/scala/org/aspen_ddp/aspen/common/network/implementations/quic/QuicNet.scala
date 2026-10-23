@@ -122,6 +122,7 @@ object QuicNet:
   * @param resolveHost resolves a host address that is not an IP literal. It may block: it only runs on the
   *                    plugin's resolver threads, never on a caller or an event loop. Replaceable for tests.
   * @param storeAvailabilityCacheFile host mode: where store availability is saved across restarts
+  * @param networkCache persists the store and host maps across restarts; seeds, and is written through by, MetadataManager
   */
 class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
               onBootstrapConfigRefreshed: (String, BootstrapConfig.Config) => Unit,
@@ -132,7 +133,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
               tls: TlsCredentials,
               config: QuicConfig = QuicConfig(),
               resolveHost: String => InetAddress = QuicNet.blockingResolve,
-              storeAvailabilityCacheFile: Option[os.Path] = None) extends NetworkPlugin with Logging:
+              storeAvailabilityCacheFile: Option[os.Path] = None,
+              networkCache: NetworkCache = NetworkCache.NoCache) extends NetworkPlugin with Logging:
 
   import QuicNet.*
 
@@ -367,7 +369,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       sendQueued(hostEntry, queuedMessages)
 
   val metadataManager: MetadataManager[QuicHostEntry] = initOrAbort:
-    new MetadataManager[QuicHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl)
+    new MetadataManager[QuicHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl,
+                                      networkCache, ohost.map(_._1))
 
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)

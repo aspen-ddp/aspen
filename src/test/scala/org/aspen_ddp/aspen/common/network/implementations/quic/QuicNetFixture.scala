@@ -58,17 +58,20 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipCo
   var a: Node = host(hostIdA, portA)
   var b: Node = host(hostIdB, portB)
 
-  def host(hostId: HostId, port: Int, cfg: QuicConfig = config): Node =
-    node(None, Some((hostId, port)), cfg, credentials())
+  def host(hostId: HostId, port: Int, cfg: QuicConfig = config,
+           networkCache: NetworkCache = NetworkCache.NoCache): Node =
+    node(None, Some((hostId, port)), cfg, credentials(), networkCache = networkCache)
 
   def client(cfg: QuicConfig = config, creds: TlsCredentials = credentials(),
              resolve: String => InetAddress = QuicNet.blockingResolve): Node =
     node(Some(ClientId(UUID.randomUUID())), None, cfg, creds, resolve)
 
   private def node(oclientId: Option[ClientId], ohost: Option[(HostId, Int)], cfg: QuicConfig,
-                   creds: TlsCredentials, resolve: String => InetAddress = QuicNet.blockingResolve): Node =
+                   creds: TlsCredentials, resolve: String => InetAddress = QuicNet.blockingResolve,
+                   networkCache: NetworkCache = NetworkCache.NoCache): Node =
     val handler = new RecordingHandler
-    val net = new QuicNet(bootstrap, (_, _) => (), oclientId, ohost, heartbeatPeriod, handler, creds, cfg, resolve)
+    val net = new QuicNet(bootstrap, (_, _) => (), oclientId, ohost, heartbeatPeriod, handler, creds, cfg, resolve,
+      networkCache = networkCache)
     if ohost.isDefined then
       net.startIoThread(new DirectoryClient(directory))
     synchronized:
@@ -143,6 +146,8 @@ object QuicNetFixture:
     val lookups = new ConcurrentLinkedQueue[HostId]()
 
     def put(state: HostState): Unit = states.put(state.hostId, state)
+
+    def remove(hostId: HostId): Unit = states.remove(hostId)
 
     def lookup(hostId: HostId): Option[HostState] =
       lookups.add(hostId)

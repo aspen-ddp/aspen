@@ -128,6 +128,7 @@ object Main {
                   fsName:String="",
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
+                  networkCacheDir:Option[File]=None,
                   network:NetworkKind=NetworkKind.Quic)
 
   class ConfigError(msg: String) extends AspenError(msg)
@@ -377,6 +378,10 @@ object Main {
     List(
       clientConfigArg(p),
       bootstrapHostOption(p),
+
+      p.opt[File]("network-cache-dir").valueName("<dir>").
+        text("Directory in which to cache network lookups across restarts. It must not be shared by two AmoebaFS processes").
+        action((x, c) => c.copy(networkCacheDir = Some(x))),
 
       arg[String]("<filesystem-name>").text("Name of the filesystem to serve. It must already exist; create one with create-filesystem").
         action( (x, c) => c.copy(fsName=x)).
@@ -833,7 +838,7 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
                                           cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
             case "host" => run_host(absPath(cfg.hostDirectory))
-            case "amoebafs" => run_amoebafs(session, cfg.fsName)
+            case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir.map(absPath))
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
             case "create-pool" => create_pool(session, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
@@ -910,17 +915,25 @@ object Main {
                     ohost: Option[(HostId, Int)],
                     oclientId: Option[ClientId],
                     tls: TlsCredentials,
-                    ohostDir: Option[Path] = None): (NetworkBridge, NetworkPlugin) = {
+                    ohostDir: Option[Path] = None,
+                    onetworkCacheDir: Option[Path] = None): (NetworkBridge, NetworkPlugin) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
+    val cache: NetworkCache = (ohostDir, onetworkCacheDir) match
+      case (Some(hostDir), _) =>
+        NetworkCache.open(NetworkCache.directoryFor(os.Path(hostDir.toAbsolutePath)), bootstrapConfig.aspenSystemId)
+      case (None, Some(dir)) =>
+        NetworkCache.open(os.Path(dir.toAbsolutePath), bootstrapConfig.aspenSystemId)
+      case (None, None) => NetworkCache.NoCache
     val net: NetworkPlugin = networkKind match
       case NetworkKind.Quic =>
         requireQuic(Quic.isAvailable, Quic.unavailabilityCause())
         new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls, quicConfigFor(ohost),
-          storeAvailabilityCacheFile = ohostDir.map(StoreAvailabilityTracker.cacheFile))
+          storeAvailabilityCacheFile = ohostDir.map(StoreAvailabilityTracker.cacheFile),
+          networkCache = cache)
       // ZMQ connections are unauthenticated, so the credentials go unused.
-      case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
+      case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, cache)
     onetwork = Some(net)
     (b, net)
   }
@@ -964,7 +977,8 @@ object Main {
   /** Builds the client every client command uses. Bootstrap configs the network refreshes while
    *  the client runs -- amoebafs runs indefinitely -- keep the cached host list current too.
    */
-  def createAspenClient(session: ClientSession): (AspenClient, NetworkPlugin, KeyValueObjectPointer) =
+  def createAspenClient(session: ClientSession,
+                        onetworkCacheDir: Option[Path] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) =
     // Compared against what was last written rather than what the session started with, so a
     // host set that moves and then moves back is written both times. Refreshes are serialized
     // on the reference so two cannot both compare against the same stale config.
@@ -978,14 +992,15 @@ object Main {
                                      session.clientConfig.credentials.certificate,
                                      session.clientConfig.credentials.privateKey)
 
-    createAspenClient(session.bootstrapConfig, onRefresh, tls)
+    createAspenClient(session.bootstrapConfig, onRefresh, tls, None, onetworkCacheDir)
 
   def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
                         tls: TlsCredentials,
-                        onnet: Option[(NetworkBridge, NetworkPlugin)] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
+                        onnet: Option[(NetworkBridge, NetworkPlugin)],
+                        onetworkCacheDir: Option[Path]): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
 
-    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls))
+    val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls, None, onetworkCacheDir))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
     val initialReadDelay = Duration(10, SECONDS)
@@ -1110,10 +1125,10 @@ object Main {
       ()
   }
 
-  def run_amoebafs(session: ClientSession, fsName: String): Int = {
+  def run_amoebafs(session: ClientSession, fsName: String, onetworkCacheDir: Option[Path] = None): Int = {
     configureLogging()
 
-    val (client, network, radicle) = createAspenClient(session)
+    val (client, network, radicle) = createAspenClient(session, onetworkCacheDir)
 
     network.startIoThread(client)
 
@@ -1259,7 +1274,7 @@ object Main {
                                               Some(absHostDir))
 
     val (client, network, _) = createAspenClient(bootstrapCfg, onBootstrapConfigRefreshed, tls,
-                                                 Some((networkBridge, nnet)))
+                                                 Some((networkBridge, nnet)), None)
 
     networkBridge.oclient = Some(client)
 

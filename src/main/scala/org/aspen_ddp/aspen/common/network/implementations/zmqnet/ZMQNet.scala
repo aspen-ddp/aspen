@@ -139,7 +139,8 @@ class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
              val oclientId: Option[ClientId],
              val ohost: Option[(HostId, Int)],
              val heartbeatPeriod: Duration,
-             val messageHandler: MessageHandler) extends NetworkPlugin with Logging:
+             val messageHandler: MessageHandler,
+             networkCache: NetworkCache = NetworkCache.NoCache) extends NetworkPlugin with Logging:
 
   import ZMQNet.*
 
@@ -213,7 +214,8 @@ class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
       wakeIoThread()
 
   val metadataManager: MetadataManager[ZMQHostEntry] =
-    new MetadataManager[ZMQHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl)
+    new MetadataManager[ZMQHostEntry](initialBootstrapConfig, onBootstrapConfigRefreshed, networkImpl,
+                                      networkCache, ohost.map(_._1))
 
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)

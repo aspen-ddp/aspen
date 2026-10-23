@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.{TestNetwork, TestTLS}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState}
+import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -23,7 +23,8 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
 /** Two host-mode `QuicNet`s on loopback sharing a bootstrap config, plus any number of client-mode nets.
   *
   * Host A owns bootstrap stores 0 and 1, host B owns 2 and 3. Every net gets fresh credentials from `TestTLS` (a
-  * host's signed for its HostId, a client's for a random UUID) and a `RecordingHandler`. `close()` tears down every net it created, including restarted and extra ones.
+  * host's signed for its HostId, a client's for a random UUID) and a `RecordingHandler`. `close()` tears down every
+  * net it created, including restarted and extra ones.
   *
   * Every host-mode net looks hosts up in `directory`, as a real host reads host objects through its `AspenClient`.
   * It holds A and B; a test adding a host, or moving one, puts its state there. Client-mode nets get no lookup client.
@@ -142,10 +143,13 @@ object QuicNetFixture:
 
   final class Node(val net: QuicNet, val handler: RecordingHandler)
 
-  /** Host objects by host id, and every lookup made against them */
+  /** Host objects by host id, and every lookup made against them. It holds no pools: every pool lookup is recorded
+    * in `poolLookups` and fails.
+    */
   final class HostDirectory:
     private val states = new ConcurrentHashMap[HostId, HostState]()
     val lookups = new ConcurrentLinkedQueue[HostId]()
+    val poolLookups = new ConcurrentLinkedQueue[PoolId]()
 
     def put(state: HostState): Unit = states.put(state.hostId, state)
 
@@ -166,6 +170,10 @@ object QuicNetFixture:
       directory.lookup(hostId) match
         case Some(state) => Future.successful((state, HLCTimestamp.Zero))
         case None => Future.failed(new NoSuchElementException(s"no host object for $hostId"))
+
+    override def getStoragePoolStateAndTimestamp(poolId: PoolId): Future[(StoragePoolState, HLCTimestamp)] =
+      directory.poolLookups.add(poolId)
+      Future.failed(new NoSuchElementException(s"no pool object for $poolId"))
 
     override def getBootstrapConfig(): Future[String] =
       Future.failed(new UnsupportedOperationException("QuicNetFixture has no bootstrap config to refetch"))

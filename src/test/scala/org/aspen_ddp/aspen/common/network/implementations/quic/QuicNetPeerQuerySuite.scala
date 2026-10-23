@@ -9,6 +9,9 @@ import org.scalatest.BeforeAndAfterEach
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import io.netty.handler.codec.quic.QuicChannel
+
+import java.net.InetSocketAddress
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import scala.concurrent.duration.DurationInt
@@ -18,7 +21,7 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
 
   /** Short peer-query timings. A 1s handshake timeout makes dials to a dead port fail quickly. */
   private val Config = QuicConfig(gossip = GossipConfig.ForTests, handshakeTimeout = 1.second,
-    peerQueryDelay = 300.millis, peerQueryInterval = 300.millis)
+    peerQueryDelay = 300.millis, peerQueryInterval = 300.millis, knownWrongRetryAfter = 1.second)
 
   private val WaitMillis = 15000L
 
@@ -69,11 +72,20 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
     fx.b.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(timestamp)
 
   /** A new host D whose only knowledge of other non-bootstrap hosts comes from `cache` */
-  private def startAsker(cache: NetworkCache): (HostId, Node) =
+  private def startAsker(cache: NetworkCache, cfg: QuicConfig = Config): (HostId, Node) =
     val hostIdD = HostId(UUID.randomUUID())
     val port = freeUdpPort()
     fx.directory.put(HostState(hostIdD, "host_d", "127.0.0.1", port, 0, 0, Set()))
-    (hostIdD, fx.host(hostIdD, port, networkCache = cache))
+    (hostIdD, fx.host(hostIdD, port, cfg, networkCache = cache))
+
+  /** Writes `answer` and then a marker host message for `to` on one new stream of `ch`, and waits for `to` to receive
+    * the marker: frames on one stream are dispatched in order, so the answer has been handled by then
+    */
+  private def sendAnswerThenMarker(ch: QuicChannel, answer: HostEndpointAnswer, to: HostId, node: Node): Unit =
+    val stream = QuicTestPeer.openStream(ch)
+    QuicTestPeer.writeFrame(stream, answer)
+    QuicTestPeer.writeFrame(stream, CheckStorageDevice(to, ClientId(UUID.randomUUID()), StorageDeviceId(UUID.randomUUID())))
+    await(node.handler.hostMessages, 1)
 
   // ---------------------------------------------------------------------------------------------------------------
 
@@ -193,3 +205,53 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
       65535, 65535, 65535, HLCTimestamp.now))), alloc, toHost = Some(HostId(UUID.randomUUID())))
     try answer.isDatagram shouldBe true
     finally answer.release()
+
+  test("an unsolicited answer, or one arriving over an inbound connection, is ignored"):
+    val hostIdC = HostId(UUID.randomUUID())
+    // E is a raw QUIC server with E's host certificate: D dials it through its cached entry, an outbound connection
+    val hostIdE = HostId(UUID.randomUUID())
+    val e = QuicTestPeer.server(QuicTls.serverContext(credentials(hostIdE.uuid)))
+    val inbound = QuicTestPeer.client(QuicTls.clientContext(credentials()))
+    try
+      val cache = cacheWith(cachedHost(hostIdC, freeUdpPort(), ts(1)),
+        CachedHost(hostIdE, "host_e", "127.0.0.1", e.localAddress.getPort, 0, 0, ts(1)))
+      // A long interval: the query below stays outstanding (2 intervals) for the rest of the test
+      val (hostIdD, d) = startAsker(cache, Config.copy(peerQueryInterval = 10.seconds))
+      val dPort = fx.directory.lookup(hostIdD).get.dataPort
+      def answer(n: Long) = HostEndpointAnswer(hostIdC, Some(endpoint(hostIdC, freeUdpPort(), ts(n))))
+
+      send(d, hostIdE)
+      eventually("D connects to E", WaitMillis)(!e.connections.isEmpty)
+      val outbound = e.connections.peek()
+      val inboundCh = inbound.connect(new InetSocketAddress("127.0.0.1", dPort)).fold(throw _, identity)
+
+      // No query outstanding: ignored on either kind of connection
+      sendAnswerThenMarker(outbound, answer(9), hostIdD, d)
+      sendAnswerThenMarker(inboundCh, answer(10), hostIdD, d)
+      d.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(ts(1))
+
+      // A query outstanding: still ignored over an inbound connection
+      d.net.requestPeerQuery(hostIdC)
+      eventually("D queries about C", WaitMillis)(d.net.peerQueriesSentForTests > 0)
+      sendAnswerThenMarker(inboundCh, answer(11), hostIdD, d)
+      d.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(ts(1))
+      cache.synchronized(cache.hostPuts.toList).map(_.hostId) should not contain hostIdC
+
+      // ... and accepted over our own outbound connection
+      sendAnswerThenMarker(outbound, answer(12), hostIdD, d)
+      d.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(ts(12))
+    finally
+      inbound.close()
+      e.close()
+
+  test("a host queries peers it holds entries for before unresolved ones"):
+    // C is online but unresolvable at D, so asking it would start a host object read
+    val (hostIdC, _, _) = startHostC()
+    fx.directory.remove(hostIdC)
+    val (_, d) = startAsker(NetworkCache.NoCache, Config.copy(peerQueryFanout = 2))
+    eventually("D sees C online", WaitMillis)(d.net.membership.exists(_.isOnline(hostIdC)))
+    d.net.metadataManager.peekHostEntry(hostIdC) shouldBe None
+
+    val target = HostId(UUID.randomUUID())
+    (1 to 20).foreach: _ =>
+      d.net.peerQueryPlanForTests(target)._2.toSet shouldBe Set(fx.hostIdA, fx.hostIdB)

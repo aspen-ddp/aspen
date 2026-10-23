@@ -212,8 +212,13 @@ There are two independent detectors. Both produce the same sender-side signal.
   `endpointChanged` path.
 - The actual host's identity (`actualHostId`) is also useful: if we hold an entry for that host at a different
   address, the builder may treat this as a hint, but not as authority.
-- If no peer knows better, the entry stays known-wrong and the peer query keeps repeating until the 24-hour slow
-  path corrects it.
+- If no peer knows better, the entry stays known-wrong and the peer query keeps repeating, but only for
+  `knownWrongRetryAfter` (default 10 minutes). The periodic scan then clears the mark, and the next send re-dials
+  the same address. If it still belongs to another host, the TLS check or a `WrongHost` reply marks it again. This
+  covers an address reused only briefly, and bootstrap hosts, for which peers answer unknown.
+- Only solicited peer answers are applied: one about a host we queried within the last two `peerQueryInterval`s,
+  arriving on one of our outbound connections. Newer-wins makes an applied answer permanent, so an unsolicited one
+  with a far-future timestamp could otherwise block every later correction.
 
 **Scope:** QUIC only. ZMQ is slated for removal, but the envelope design is what any future plugin implements.
 

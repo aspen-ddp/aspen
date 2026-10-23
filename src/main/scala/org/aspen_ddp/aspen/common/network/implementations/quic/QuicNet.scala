@@ -139,12 +139,15 @@ object QuicNet:
   *    the entry's HostId (host certificates are signed for their HostId). It is checked before the connection is
   *    attached, so nothing queued behind the handshake reaches the wrong host.
   *  - `WrongHost` reply: every host-bound message, whether sent through a host entry or over a cluster route (see
-  *    `sendClusterMessage`), carries the intended HostId in its envelope (`Received.toHost`). A host receiving one meant for another HostId drops it and, at most once per connection
-  *    per `config.wrongHostReplyInterval`, replies `WrongHost` over the same connection. Messages without a
-  *    `toHost`, and every message a client receives, are never checked.
+  *    `sendClusterMessage`), carries the intended HostId in its envelope (`Received.toHost`). A host receiving one
+  *    meant for another HostId drops it and, at most once per connection per `config.wrongHostReplyInterval`,
+  *    replies `WrongHost` over the same connection. Messages without a `toHost`, and every message a client
+  *    receives, are never checked.
   * Either signal marks the entry `knownWrong` (see `markWrong`): its connection is closed, sends through it are
   * dropped, and its peers are queried at once and then on every scan, whatever the failure clock and online state,
-  * until an answer replaces the entry. `lastWrongHostReply` is a concurrent map, written on each connection's loop.
+  * until an answer replaces the entry or `config.knownWrongRetryAfter` passes and the scan clears the mark, so the
+  * next send re-dials. Only solicited answers are applied (see `endpointAnswer`). `lastWrongHostReply` is a
+  * concurrent map, written on each connection's loop.
   *
   * @param resolveHost resolves a host address that is not an IP literal. It may block: it only runs on the
   *                    plugin's resolver threads, never on a caller or an event loop. Replaceable for tests.
@@ -972,10 +975,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   // ---- Peer endpoint query ------------------------------------------------------------------------------------
 
-  /** On `loops(0)`, every `peerQueryInterval`. Queries about each host reported online whose dials have been failing
-    * for at least `peerQueryDelay`, and about each host whose entry is known-wrong whatever its failure clock and
-    * online state, unless it was asked about within the last interval. Scheduling jitter is allowed for, so a host
-    * still failing (or still known-wrong) is asked about on every scan.
+  /** On `loops(0)`, every `peerQueryInterval`. First clears the known-wrong mark of each current entry marked at
+    * least `knownWrongRetryAfter` ago, so the next send re-dials it (see `markWrong`). Then queries about each host
+    * reported online whose dials have been failing for at least `peerQueryDelay`, and about each host whose entry is
+    * still known-wrong whatever its failure clock and online state, unless it was asked about within the last
+    * interval. Scheduling jitter is allowed for, so a host still failing (or still known-wrong) is asked about on
+    * every scan.
     */
   private def scanForPeerQueries(): Unit =
     if !shuttingDown then
@@ -983,8 +988,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         val now = System.nanoTime()
         val delay = config.peerQueryDelay.toNanos
         val interval = config.peerQueryInterval.toNanos
+        val retryAfter = config.knownWrongRetryAfter.toNanos
         val failing = failingSince.asScala.collect:
           case (h, since) if now - since >= delay && reportedOnline(h) => h
+        metadataManager.resolvedHostEntries.foreach: entry =>
+          if entry.knownWrongSince.exists(t => now - t >= retryAfter) && isCurrentEntry(entry) then
+            logger.info(s"Retrying host ${entry.name} at ${entry.address}:${entry.dataPort}, known-wrong for " +
+              s"${config.knownWrongRetryAfter}")
+            entry.clearKnownWrong()
         val knownWrong = metadataManager.resolvedHostEntries.filter(_.knownWrong).map(_.hostId)
         val due = (failing.toSet ++ knownWrong).filter: h =>
           Option(lastQueried.get(h)).forall(t => now - t >= interval - interval / 10)
@@ -1012,15 +1023,19 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         case NonFatal(e) => logger.warn(s"Peer endpoint query about host $target failed: $e")
 
   /** On `loops(0)`, which owns `relays`. Up to `peerQueryFanout` random peers to ask about `target`, never `target`
-    * itself. Host mode: hosts membership reports online, ourselves excluded. Client mode: our relays first (the hosts
-    * we already hold connections to), topped up with other resolved hosts our relays report online.
+    * itself. Host mode: hosts membership reports online, ourselves excluded; those we hold a resolved entry for come
+    * first, and the rest only top up, since a send to an unresolved host starts a host object read. Client mode: our
+    * relays first (the hosts we already hold connections to), topped up with other resolved hosts our relays report
+    * online.
     */
   private def queryPeers(target: HostId): List[HostId] =
     val fanout = config.peerQueryFanout
     membership match
       case Some(m) =>
         val self = ohost.map(_._1)
-        Random.shuffle(m.onlineHosts.filterNot(h => h == target || self.contains(h)).toList).take(fanout)
+        val online = Random.shuffle(m.onlineHosts.filterNot(h => h == target || self.contains(h)).toList)
+        val (resolved, unresolved) = online.partition(h => metadataManager.peekHostEntry(h).isDefined)
+        (resolved ++ unresolved).take(fanout)
       case None =>
         val fromRelays = Random.shuffle((relays - target).toList).take(fanout)
         val topUp = metadataManager.resolvedHostEntries.map(_.hostId)
@@ -1035,25 +1050,42 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       val answer = HostEndpointAnswer(m.hostId, metadataManager.endpointAnswer(m.hostId))
       conn.submit(QuicMessageCodec.encode(answer, PooledByteBufAllocator.DEFAULT))
 
-  /** On a loop. An answer newer than our entry is applied as `HostEndpointChanged` gossip would be, which also
-    * writes it through to the network cache. An unknown answer, or one no newer than our entry, is ignored.
+  /** On `conn`'s loop. An answer newer than our entry is applied as `HostEndpointChanged` gossip would be, which
+    * also writes it through to the network cache. An unknown answer, or one no newer than our entry, is ignored.
+    *
+    * Only a solicited answer is considered: we must have asked about `m.hostId` within the last two
+    * `peerQueryInterval`s, and it must arrive on one of our outbound connections, which is where our queries go (in
+    * client mode every connection is). Newer-wins makes an applied answer permanent, so an unsolicited one, from a
+    * client or a buggy peer, with a far-future timestamp would otherwise displace every later correction. An answer
+    * from `dispatchForTests` (no connection) is considered as if solicited.
     */
-  private def endpointAnswer(m: HostEndpointAnswer): Unit =
-    m.endpoint.foreach: e =>
-      if e.hostId == m.hostId && metadataManager.hostTimestamp(e.hostId).forall(_ < e.timestamp) then
-        endpointChanged(e)
+  private def endpointAnswer(conn: QuicConnection, m: HostEndpointAnswer): Unit =
+    val solicited = conn == null || (!inboundConnections.contains(conn) && queryOutstanding(m.hostId))
+    if !solicited then
+      logger.debug(s"Ignoring an unsolicited endpoint answer about host ${m.hostId}")
+    else
+      m.endpoint.foreach: e =>
+        if e.hostId == m.hostId && metadataManager.hostTimestamp(e.hostId).forall(_ < e.timestamp) then
+          endpointChanged(e)
+
+  /** Whether `hostId` was asked about within the last two `peerQueryInterval`s */
+  private def queryOutstanding(hostId: HostId): Boolean =
+    Option(lastQueried.get(hostId)).exists(t => System.nanoTime() - t <= 2 * config.peerQueryInterval.toNanos)
 
   // ---- Wrong-host detection ----------------------------------------------------------------------------------
 
   /** Any thread. `entry`'s address belongs to another host: unless the entry has been replaced (or is already
     * marked), marks it known-wrong, so sends through it are dropped, closes its connection and queries its peers at
-    * once. The scan keeps querying every interval until an answer replaces the entry.
+    * once. The scan keeps querying every interval until an answer replaces the entry, or until
+    * `knownWrongRetryAfter` has passed: the scan then clears the mark, and the next send re-dials the same address
+    * (the address may have been reused only briefly, and peers answer unknown for a bootstrap host). If it is still
+    * wrong, the TLS check or a `WrongHost` reply marks it again.
     */
   private def markWrong(entry: QuicHostEntry, why: String): Unit =
     if !entry.knownWrong && isCurrentEntry(entry) && !ohost.exists(_._1 == entry.hostId) then
       logger.warn(s"Address ${entry.address}:${entry.dataPort} of host ${entry.name} belongs to another host ($why); " +
         "dropping messages to it until a peer knows its endpoint")
-      entry.knownWrong = true
+      entry.markKnownWrong()
       closeOutbound(entry)
       requestPeerQuery(entry.hostId)
 
@@ -1200,7 +1232,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         endpointQuery(conn, m)
 
       case m: HostEndpointAnswer =>
-        endpointAnswer(m)
+        endpointAnswer(conn, m)
 
       case m: WrongHost =>
         wrongHostReceived(conn, m)

@@ -74,7 +74,10 @@ class TransactionBuilder(
       requirements  = RefcountUpdate(ptr, ObjectRefcount.Allocating, ObjectRefcount.Default) :: requirements
       ptr match
         case dptr: DataObjectPointer =>
+          // The DataUpdate is what causes stores to apply the encoded content. Slicing IDAs encode
+          // even empty content to non-empty slices, so without it stores would keep 0-byte slices
           dataObjectUpdates += (dptr -> DataBuffer.Empty)
+          requirements = DataUpdate(dptr, ObjectRevision.Allocating, DataUpdateOperation.Overwrite) :: requirements
         case kvptr: KeyValueObjectPointer =>
           keyValueUpdates += (kvptr -> KVUpdate(kvptr, None, None, Nil, Nil))
 
@@ -158,7 +161,7 @@ class TransactionBuilder(
     val objectPointers = requirements.flatMap {
       case tor: TransactionObjectRequirement => Some(tor.objectPointer)
       case _ => None
-    } ++ keyValueUpdates.values.map(_.pointer)
+    } ++ keyValueUpdates.values.map(_.pointer) ++ allocatingObjects
     objectPointers.map(_.poolId).toSet
   }
 

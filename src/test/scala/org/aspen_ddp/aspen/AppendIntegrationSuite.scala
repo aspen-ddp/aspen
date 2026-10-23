@@ -46,10 +46,7 @@ trait AppendIntegrationTests:
     tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(radicleKey)),
               List(Insert(radicleKey, Array[Byte](1))))
 
-  /** Allocates an empty DataObject linked from the radicle under a key derived from `index`.
-    * The initial content is supplied explicitly (rather than using the bare allocateDataObject())
-    * so that a slicing IDA writes the one-row empty object, trailer included.
-    */
+  /** Allocates an empty DataObject linked from the radicle under a key derived from `index` */
   private def allocate(index: Int): Future[DataObjectPointer] = allocateWith(index, Array[Byte]())
 
   /** Allocates an object already holding `content`, linked from the radicle */
@@ -59,6 +56,16 @@ trait AppendIntegrationTests:
     for
       pool <- client.getStoragePool(Radicle.poolId)
       dp <- pool.allocator.allocateDataObject(DataBuffer(content))
+      _ <- tx.commit()
+    yield dp
+
+  /** Allocates a DataObject with the bare allocateDataObject(), linked from the radicle */
+  private def allocateBare(index: Int): Future[DataObjectPointer] =
+    given tx: Transaction = client.newTransaction()
+    linkToRadicle(tx, index)
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      dp <- pool.allocator.allocateDataObject()
       _ <- tx.commit()
     yield dp
 
@@ -97,6 +104,20 @@ trait AppendIntegrationTests:
       bytesShouldMatch(state.data.getByteArray, expected)
       last.length should be (expected.length)
       finalPos should be (last)
+
+  atest("bare allocation reads as empty and accepts appends"):
+    val chunks = List(Array[Byte](1, 2, 3), Array[Byte](4, 5))
+    for
+      dp <- allocateBare(1)
+      empty <- client.read(dp)
+      pos <- client.readAppendPosition(dp)
+      _ <- appendAll(pos, chunks)
+      state <- client.read(dp)
+    yield
+      empty.data.size should be (0)
+      pos.length should be (0)
+      bytesShouldMatch(state.data.getByteArray, fullContent(chunks))
+      succeed
 
   atest("independent appender learns the position with a tail read"):
     val rnd = new Random(2)
@@ -301,6 +322,16 @@ class ClassicReedSolomonAppendRejectionSuite extends IntegrationTestSuite:
       dp <- pool.allocator.allocateDataObject(DataBuffer(Array.tabulate[Byte](100)(_.toByte)))
       _ <- tx.commit()
     yield dp
+
+  atest("bare allocation reads as empty"):
+    given tx: Transaction = client.newTransaction()
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      dp <- pool.allocator.allocateDataObject()
+      _ <- tx.commit()
+      state <- client.read(dp)
+    yield
+      state.data.size should be (0)
 
   atest("readAppendPosition fails with RangeReadNotSupported"):
     for

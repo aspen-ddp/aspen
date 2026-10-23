@@ -1,5 +1,4 @@
 TODO
 ====
 
-Remove the ZeroMQ network plugin implementation & jeromq dependency
 

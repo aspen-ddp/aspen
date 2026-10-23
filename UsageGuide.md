@@ -437,9 +437,8 @@ yield
 
 ### Initializing an AspenClient
 AspenClient accepts several parameters to tweak the timeouts for various internal components. Also,
-the networking backend for Aspen is pluggable. The following example builds either the QUIC
-plugin (the default, which needs the TLS credentials from the client config) or the ZeroMQ one,
-as the CLI's `--network` option selects. Both the networking plugin and AspenClient are implemented in terms of each other so
+the networking backend for Aspen is pluggable. The following example builds the QUIC plugin,
+which needs the TLS credentials from the client config. Both the networking plugin and AspenClient are implemented in terms of each other so
 the initialization process is a touch awkward. The following excerpt is from the Aspen command line
 utility. The `BootstrapConfig.Config` is obtained by fetching the bootstrap yaml from a running host
 (`GET /bootstrap`), starting from the cached hosts in `aspen-client-config.yaml`; `onRefresh` is
@@ -453,10 +452,7 @@ called whenever the network later receives a newer copy.
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
-    val net: NetworkPlugin = networkKind match
-      case NetworkKind.Quic => new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls)
-      // ZMQ connections are unauthenticated, so the credentials go unused.
-      case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b)
+    val net: NetworkPlugin = new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls)
     onetwork = Some(net)
     (b, net)
   }

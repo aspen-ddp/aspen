@@ -52,12 +52,11 @@ class MainSuite extends AnyFunSuite with Matchers:
     Main.quicConfigFor(Some((HostId(UUID.randomUUID()), 5000))) shouldBe
       org.aspen_ddp.aspen.common.network.implementations.quic.QuicConfig()
 
-  test("requireQuic reports unavailable QUIC as a ConfigError suggesting zmq"):
+  test("requireQuic reports unavailable QUIC as a ConfigError"):
     noException should be thrownBy Main.requireQuic(true, fail("cause must not be evaluated"))
     val e = intercept[Main.ConfigError](Main.requireQuic(false, new UnsatisfiedLinkError("no quiche")))
     e.getMessage should include("QUIC is not available")
     e.getMessage should include("no quiche")
-    e.getMessage should include("--network zmq")
 
   test("formatBytes renders sub-KiB values as integer bytes"):
     Main.formatBytes(0L) shouldBe "0 B"
@@ -639,36 +638,6 @@ class MainSuite extends AnyFunSuite with Matchers:
         Main.buildParser.parse(Seq("list-pools", cfg, "--bootstrap-host", "node-a:abc"), Main.Args())
       parsed shouldBe None
       sink.toString should include("port must be an integer")
-
-  test("network defaults to quic"):
-    withTempDir("parse-network-default"): dir =>
-      val cfg = Files.createFile(dir.resolve("aspen-client-config.yaml")).toFile.getPath
-      Main.buildParser.parse(Seq("list-pools", cfg), Main.Args()).get.network shouldBe Main.NetworkKind.Quic
-
-  test("--network zmq selects ZMQ"):
-    withTempDir("parse-network-zmq"): dir =>
-      val cfg = Files.createFile(dir.resolve("aspen-client-config.yaml")).toFile.getPath
-      Main.buildParser.parse(Seq("list-pools", cfg, "--network", "zmq"), Main.Args()).get.network shouldBe
-        Main.NetworkKind.Zmq
-      Main.buildParser.parse(Seq("list-pools", cfg, "--network", "quic"), Main.Args()).get.network shouldBe
-        Main.NetworkKind.Quic
-
-  test("--network is accepted by the host command and listed in top-level help"):
-    withTempDir("parse-network-host"): dir =>
-      Main.buildParser.parse(Seq("host", dir.toString, "--network", "zmq"), Main.Args()).map(_.network) shouldBe
-        Some(Main.NetworkKind.Zmq)
-    val help = Main.helpRequest(Seq("--help")).get
-    help should include("--network <quic|zmq>")
-    help should include("Network implementation to use (default: quic)")
-
-  test("--network bogus is a usage error"):
-    withTempDir("parse-network-bogus"): dir =>
-      val cfg = Files.createFile(dir.resolve("aspen-client-config.yaml")).toFile.getPath
-      val sink = new java.io.ByteArrayOutputStream
-      val parsed = Console.withErr(sink):
-        Main.buildParser.parse(Seq("list-pools", cfg, "--network", "bogus"), Main.Args())
-      parsed shouldBe None
-      sink.toString should include("--network")
 
   test("a command's validation still rejects a bad argument"):
     withTempDir("parse-reject"): dir =>

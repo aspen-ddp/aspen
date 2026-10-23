@@ -28,7 +28,6 @@ lazy val root = (project in file(".")).
       "org.dcache"                       %  "nfs4j-core"              % "0.24.0",
       "org.yaml"                         %  "snakeyaml"               % "1.25",
       "io.scalecube"                     %  "scalecube-cluster"       % "2.7.12",
-      "org.zeromq"                       %  "jeromq"                  % "0.6.0",
       "com.thesamet.scalapb"             %% "scalapb-runtime"         % scalapbVersion % "protobuf",
       "com.lihaoyi"                      %% "os-lib"                  % "0.11.5",
       "org.bouncycastle"                 %  "bcprov-jdk18on"          % "1.80",

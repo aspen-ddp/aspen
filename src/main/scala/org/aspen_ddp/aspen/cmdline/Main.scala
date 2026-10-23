@@ -14,7 +14,6 @@ import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
 import io.netty.handler.codec.quic.Quic
 import org.aspen_ddp.aspen.common.network.implementations.quic.{QuicConfig, QuicNet, TlsCredentials}
-import org.aspen_ddp.aspen.common.network.implementations.zmqnet.ZMQNet
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, SecretFile}
 import org.aspen_ddp.aspen.common.objects.*
@@ -85,15 +84,6 @@ object Main {
   // one from a callback would need this made volatile, or the drain would see None and skip.
   private var onetwork: Option[NetworkPlugin] = None
 
-  /** The network plugin implementations the CLI can run over. */
-  enum NetworkKind:
-    case Quic, Zmq
-
-  // The plugin createNetwork builds, chosen by --network. Set once by main before it dispatches,
-  // on the main thread, and read by createNetwork on that same thread, so it is thread-confined
-  // for the same reason onetwork is. A network built from a callback would need it volatile.
-  private var networkKind: NetworkKind = NetworkKind.Quic
-
   case class Args(mode:String="",
                   hostDirectory:File=null,
                   targetDirectory:File=null,
@@ -128,8 +118,7 @@ object Main {
                   fsName:String="",
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
-                  networkCacheDir:Option[File]=None,
-                  network:NetworkKind=NetworkKind.Quic)
+                  networkCacheDir:Option[File]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
 
@@ -232,10 +221,6 @@ object Main {
 
   /** The flag that asks for help. See helpRequest. */
   private val HelpFlag = "--help"
-
-  /** The network selection option, as top-level help shows it, and its description. */
-  private val NetworkFlag = "--network <quic|zmq>"
-  private val NetworkFlagText = "Network implementation to use (default: quic)"
 
   private type ArgParser = scopt.OptionParser[Args]
 
@@ -710,11 +695,6 @@ object Main {
     Command("show-allocation-group", "Displays the full state of an allocation group", showArgs("Allocation group name or UUID")),
   )
 
-  private def parseNetworkKind(name: String): Option[NetworkKind] = name match
-    case "quic" => Some(NetworkKind.Quic)
-    case "zmq" => Some(NetworkKind.Zmq)
-    case _ => None
-
   private[cmdline] def buildParser: ArgParser = new scopt.OptionParser[Args]("aspen") {
     head("aspen", Version)
 
@@ -724,14 +704,6 @@ object Main {
     // only ends a parse error with "Try --help for more information." when a help option
     // exists. Drop it and every usage error dumps the usage text instead.
     help("help").text("Prints this usage text")
-
-    // Accepted anywhere after the command, like every other option. Not before it: scopt drops
-    // the pending command list once it has consumed any option, so "aspen --network zmq host"
-    // fails with an unknown argument. helpRequest likewise expects the command first.
-    opt[String]("network").valueName("<quic|zmq>").
-      text(NetworkFlagText).
-      validate(x => parseNetworkKind(x).toRight(s"--network must be quic or zmq, not '$x'").map(_ => ())).
-      action((x, c) => c.copy(network = parseNetworkKind(x).get))
 
     Commands.foreach: command =>
       cmd(command.name).text(command.description).
@@ -778,14 +750,13 @@ object Main {
    *  runs to well over a hundred lines. The details now have somewhere better to live.
    */
   private[cmdline] def topLevelHelp: String =
-    val column = (HelpFlag.length :: NetworkFlag.length :: Commands.map(_.name.length)).max + 2
+    val column = (HelpFlag.length :: Commands.map(_.name.length)).max + 2
     def row(left: String, right: String): String = s"  ${left.padTo(column, ' ')}$right"
 
     (s"aspen $Version" ::
      "Usage: aspen <command> [options] <args>..." ::
      "" ::
      row(HelpFlag, "Prints this usage text") ::
-     row(NetworkFlag, NetworkFlagText) ::
      "" ::
      "Commands:" ::
      Commands.map(c => row(c.name, c.description)) :::
@@ -829,8 +800,6 @@ object Main {
         // A def so that only the commands that reach a running system fetch the bootstrap config.
         def session: ClientSession =
           openClientSession(absPath(cfg.clientConfigFile), cfg.bootstrapHost)
-
-        networkKind = cfg.network
 
         try
           //println(s"Config file: $config")
@@ -905,10 +874,10 @@ object Main {
     else
       QuicConfig()
 
-  /** Fails with a ConfigError suggesting `--network zmq` when native QUIC cannot load on this platform */
+  /** Fails with a ConfigError when native QUIC cannot load on this platform */
   def requireQuic(available: Boolean, cause: => Throwable): Unit =
     if !available then
-      throw ConfigError(s"QUIC is not available on this platform ($cause); use --network zmq instead")
+      throw ConfigError(s"QUIC is not available on this platform ($cause)")
 
   def createNetwork(bootstrapConfig: BootstrapConfig.Config,
                     onRefresh: (String, BootstrapConfig.Config) => Unit,
@@ -926,14 +895,11 @@ object Main {
       case (None, Some(dir)) =>
         NetworkCache.open(os.Path(dir.toAbsolutePath), bootstrapConfig.aspenSystemId)
       case (None, None) => NetworkCache.NoCache
-    val net: NetworkPlugin = networkKind match
-      case NetworkKind.Quic =>
-        requireQuic(Quic.isAvailable, Quic.unavailabilityCause())
-        new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls, quicConfigFor(ohost),
-          storeAvailabilityCacheFile = ohostDir.map(StoreAvailabilityTracker.cacheFile),
-          networkCache = cache)
-      // ZMQ connections are unauthenticated, so the credentials go unused.
-      case NetworkKind.Zmq => new ZMQNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, cache)
+    requireQuic(Quic.isAvailable, Quic.unavailabilityCause())
+    val net: NetworkPlugin = new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls,
+      quicConfigFor(ohost),
+      storeAvailabilityCacheFile = ohostDir.map(StoreAvailabilityTracker.cacheFile),
+      networkCache = cache)
     onetwork = Some(net)
     (b, net)
   }
@@ -2090,9 +2056,8 @@ object Main {
   /** Validates the advertised address of a host being created. Returns None if the address is
    *  usable, or Some(message) explaining why it is not.
    *
-   *  This is the host component of the `tcp://<address>:<port>` endpoints ZMQNet builds,
-   *  so anything that would corrupt that string is rejected here rather
-   *  than surfacing later as an unexplained connect failure. Nothing is resolved: a system may
+   *  This is the host component of the endpoints QuicNet dials, so anything that would
+   *  corrupt it is rejected here rather than surfacing later as an unexplained connect failure. Nothing is resolved: a system may
    *  well be bootstrapped before its DNS entry exists.
    */
   private[cmdline] def validateHostAddress(address: String): Option[String] =

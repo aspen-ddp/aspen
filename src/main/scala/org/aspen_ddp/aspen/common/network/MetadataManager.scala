@@ -192,8 +192,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
   /** Every host entry that has resolved, in no particular order. Excludes hosts whose lookup
    *  is still pending and hosts never looked up at all.
    *
-   *  Exists for ZMQNet.awaitPendingMessagesSent, which has to inspect every host rather than
-   *  one named host: its callers cannot name the hosts a message was addressed to. */
+   *  Exists for callers that have to inspect every host rather than one named host, such as
+   *  QuicNet.awaitPendingMessagesSent: its callers cannot name the hosts a message was addressed to. */
   def resolvedHostEntries: List[T] =
     synchronized:
       hosts.values.collect { case Right(hostEntry) => hostEntry }.toList
@@ -581,7 +581,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
    *  for each named host so those hosts are reachable before any lookup completes.
    *
    *  Only the mapping half is shared with a refresh. A refresh deliberately does not touch
-   *  `hosts`: an existing entry may hold parked messages and a live dealer socket -- ZMQNet's
+   *  `hosts`: an existing entry may hold pending messages and a live connection -- QuicNet's
    *  does -- so recreating it would discard queued work. The cost is that a refresh naming a host
    *  this process has never seen installs the mapping but not the entry, even though the config
    *  carries that host's address -- and the resulting host lookup routes back through the
@@ -664,11 +664,9 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
    *
    *  A synchronous throw from the lookup call is treated as a lookup failure rather than
    *  propagated: the pending entry is removed and phl's messages are dropped, exactly as the
-   *  Failure branch does. No NonFatal throw from that call therefore escapes -- which matters
-   *  because getHostEntryOrQueueMessage runs on ZMQNet's IO thread. That loop guards each item
-   *  too, so an escape would now cost one send rather than the thread; handling it here is what
-   *  makes the host retryable, whereas the send loop's guard is log-only and could not undo the
-   *  pending entry.
+   *  Failure branch does. No NonFatal throw from that call therefore escapes into the network
+   *  implementation's send path, which calls getHostEntryOrQueueMessage. Handling it here is what
+   *  makes the host retryable: a caller catching it could not undo the pending entry.
    *
    *  Caller must hold this object's monitor. */
   private def startHostLookup(hostId: HostId, phl: PendingHostLookup): Unit =

@@ -184,10 +184,10 @@ class LookupRecordingClient extends TestNetwork.TClient(
     Future.failed(new UnsupportedOperationException("LookupRecordingClient has no objects to read"))
 
 
-/** A NetworkImplInterface that drains what MetadataManager hands it, the way ZMQNet does, and
+/** A NetworkImplInterface that drains what MetadataManager hands it, the way QuicNet does, and
  *  records where each message ended up.
  *
- *  Draining rather than peeking is deliberate: ZMQNet's createHostEntry and storeResolved both
+ *  Draining rather than peeking is deliberate: QuicNet's createHostEntry and storeResolved both
  *  empty the EvictingQueue they are given before returning, so a double that left messages in
  *  place would not model the handoff it is here to observe.
  *
@@ -216,15 +216,14 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
       delivered.getOrElse(hostId, Nil)
 
   /** Makes createHostEntry throw for `hostId` -- after draining and recording, because that is
-   *  where the real failure lives: ZMQNet's createHostEntry empties the queue and enqueues
-   *  NewHostAvailable before reaching the wakeIoThread() call that can actually fail. A double
-   *  that threw before draining would model a failure that cannot happen. */
+   *  where the real failure lives: QuicNet's createHostEntry empties the queue into its send
+   *  path, and that is what can actually fail. A double that threw before draining would model
+   *  a failure that cannot happen. */
   def throwOnCreateHostEntry(hostId: HostId, err: Throwable): Unit = synchronized:
     createFailures += hostId -> err
 
-  /** Makes storeResolved throw for `hostId`, after draining and recording. ZMQNet's storeResolved
-   *  empties the queue and enqueues ProcessPendingMessages before its wakeIoThread() call, which
-   *  is the one that can fail -- on a socket closed by CLI teardown. */
+  /** Makes storeResolved throw for `hostId`, after draining and recording. QuicNet's storeResolved
+   *  likewise empties the queue into its send path, which is the part that can fail. */
   def throwOnStoreResolved(hostId: HostId, err: Throwable): Unit = synchronized:
     storeResolvedFailures += hostId -> err
 

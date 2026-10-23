@@ -7,7 +7,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
 
-/** Coverage for the two read-only accessors ZMQNet.awaitPendingMessagesSent polls. */
+/** Coverage for the two read-only accessors QuicNet.awaitPendingMessagesSent polls. */
 class MetadataManagerDrainSuite extends AnyFunSuite
     with Matchers
     with MetadataManagerFixture:

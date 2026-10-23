@@ -581,7 +581,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     *  5. Starts `shutdownGracefully(0, 1s)` on the group. `joinIoThread` returns once it has terminated.
     *
     * Call `awaitPendingMessagesSent` first: anything still in the plugin's own queues is discarded. The close frame
-    * is a best-effort courtesy (crash-only). Exceptions are swallowed and logged at trace, as in `ZMQNet`.
+    * is a best-effort courtesy (crash-only). Exceptions are swallowed and logged at trace.
     */
   def shutdown(linger: Duration): Unit =
     if shutdownStarted.compareAndSet(false, true) then
@@ -1211,7 +1211,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     if conn != null && !conn.isClosed && (clientRouteMap.get(id) ne conn) then
       clientRouteMap.put(id, conn)
 
-  /** Mirrors `ZMQNet.decodeAndDispatch`. Runs on `conn`'s loop; a throwing handler is logged, never propagated.
+  /** Runs on `conn`'s loop; a throwing handler is logged, never propagated.
     * Host mode: a message whose envelope names another host is dropped (see `misaddressed`).
     */
   private def dispatch(conn: QuicConnection, received: QuicMessageCodec.Received): Unit =

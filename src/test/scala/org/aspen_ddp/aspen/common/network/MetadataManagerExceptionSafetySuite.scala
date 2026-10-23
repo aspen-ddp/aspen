@@ -84,7 +84,7 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
     mgr.peekHostEntry(remoteHostId) should be(None)
 
     // Unlike a lookup that throws, this failure loses nothing: createHostEntry drained the queue
-    // before it failed, exactly as ZMQNet's does before wakeIoThread(). Asserted here rather than
+    // before it failed, as QuicNet's does before handing it to the send path. Asserted here rather than
     // at the end because both sends share one promise, already completed above -- the retry below
     // resolves inline and delivers its own message too, which would mask what happened to this one.
     impl.deliveredTo(remoteHostId) should be(List(msg))
@@ -134,17 +134,17 @@ class MetadataManagerExceptionSafetySuite extends AnyFunSuite
 
     // bootstrapHostId is already Right(...) from the constructor, so store 0 takes the
     // storeResolved branch -- the loop's one remaining throw site now that startHostLookup no
-    // longer throws. In ZMQNet the throw comes from wakeIoThread() sending on a socket that CLI
-    // teardown already closed.
-    impl.throwOnStoreResolved(bootstrapHostId, new RuntimeException("wakeIoThread exploded"))
+    // longer throws. A network implementation's storeResolved may throw from its send path, e.g.
+    // after CLI teardown has already shut it down.
+    impl.throwOnStoreResolved(bootstrapHostId, new RuntimeException("send path exploded"))
 
     // Store 0 is listed first so there is a tail to lose. Pre-fix the throw escapes foreach and
     // store 1 gets neither its stores mapping nor its rescued queue.
     client.poolLookupPromise(unknownPoolId).success(
       poolStateWith(unknownPoolId, bootstrapHostId, remoteHostId))
 
-    // Store 0's own messages were consumed before the throw, as they are in ZMQNet: the queue is
-    // drained and ProcessPendingMessages enqueued before the wake fails.
+    // Store 0's own messages were consumed before the throw, as they are in QuicNet: the queue is
+    // drained before the send path can fail.
     impl.deliveredTo(bootstrapHostId) should be(List(msg0))
 
     // Store 1's queue was still rescued onto a host lookup.

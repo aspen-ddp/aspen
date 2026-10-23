@@ -89,13 +89,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
         to store system metadata such as physical storage hosts, netowrk configurations, storage pool
         configurations, etc
 - Aspen uses a Crash-Only architecture. By intentional design, there is no clean shutdown process.
-- The Network Layer is designed to be pluggable. Two plugins implement `common.network.NetworkPlugin`:
-  - QUIC (`implementations/quic`, Netty 4.2): the default. Mutual TLS on every connection, datagrams for
+- The Network Layer is designed to be pluggable via `common.network.NetworkPlugin`. QUIC is the only plugin:
+  - QUIC (`implementations/quic`, Netty 4.2): Mutual TLS on every connection, datagrams for
     encoded messages of 1024 bytes or less, a small round-robin pool of streams for larger ones, and messages
     dropped (never queued) when a connection's buffers are full. Payloads are not copied on send and are
     copied exactly once on receive.
-  - ZeroMQ (`implementations/zmqnet`): simple but inefficient, selected with `--network zmq`. Slated for
-    removal once QUIC is stable.
 - A pluggable `NetworkCache` persists store->host and host->endpoint mappings, scoped to the system id.
   - `NoCache` for the CLI; RocksDB for hosts (`<host-root>/cache/network`) and `amoebafs --network-cache-dir`
   - MetadataManager seeds from it at startup, trusts entries immediately, and writes every change back
@@ -159,8 +157,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 ## Key Dependencies
 - **Scaffeine**: Used for all caching operations
 - **os-lib**: Should be used for all filesystem operations. (currently a mix of native java and os-lib)
-- **Netty 4.2 QUIC** (`netty-codec-native-quic`, BoringSSL): Used for the default QUIC network plugin
-- **jeromq**: Used for the ZeroMQ network plugin. Simple but inefficient
+- **Netty 4.2 QUIC** (`netty-codec-native-quic`, BoringSSL): Used for the QUIC network plugin
 
 ## Development Rules
 - Prefer Scala 3 "quiet mode" syntax. Braces should still be used when they clearly enhance readability

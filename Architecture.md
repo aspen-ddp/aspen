@@ -469,8 +469,7 @@ there’s probably a good dynamic way to do this with jars and classloaders but,
 all hardcoded.
 
 Another point to note is that Aspen’s networking subsystem is pluggable. The initial implementation 
-was built on top of ZeroMQ for simplicity but the right way to go for a real system is probably to 
-build one based on Netty & QUIC.
+was built on top of ZeroMQ for simplicity and has since been replaced by one based on Netty & QUIC.
 
 Most people that have spent much time with real-world, large-scale distributed systems realize that 
 you can’t rely on direct communication with network endpoints for correctness. Machines go offline, 

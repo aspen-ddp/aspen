@@ -42,7 +42,7 @@ class MetadataObjectState(
       case _ => false
 
   override def hashCode: Int =
-    val hashCodes = List(pointer.hashCode, revision.hashCode, refcount.hashCode, timestamp.hashCode)
+    val hashCodes = List(pointer.hashCode, revision.hashCode, refcount.hashCode)
     hashCodes.reduce( (a,b) => a ^ b )
 
   def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] = None
@@ -79,7 +79,7 @@ class DataObjectState(
       case _ => false
 
   override def hashCode: Int =
-    val hashCodes = List(pointer.hashCode, revision.hashCode, refcount.hashCode, timestamp.hashCode, data.hashCode)
+    val hashCodes = List(pointer.hashCode, revision.hashCode, refcount.hashCode, data.hashCode)
     hashCodes.reduce( (a,b) => a ^ b )
 
   def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] =
@@ -176,42 +176,23 @@ class KeyValueObjectState(
 
   def canEqual(other: Any): Boolean = other.isInstanceOf[KeyValueObjectState]
 
+  /** Timestamps are excluded, matching the other ObjectState types */
   override def equals(other: Any): Boolean =
     other match
       case that: KeyValueObjectState =>
-        val minEq = (minimum, that.minimum) match
-          case (None, None) => true
-          case (Some(_), None) => false
-          case (None, Some(_)) => false
-          case (Some(x), Some(y)) => java.util.Arrays.equals(x.bytes, y.bytes)
-        val maxEq = (maximum, that.maximum) match
-          case (None, None) => true
-          case (Some(_), None) => false
-          case (None, Some(_)) => false
-          case (Some(x), Some(y)) => java.util.Arrays.equals(x.bytes, y.bytes)
-        val leftEq = (left, that.left) match
-          case (None, None) => true
-          case (Some(_), None) => false
-          case (None, Some(_)) => false
-          case (Some(x), Some(y)) => java.util.Arrays.equals(x.bytes, y.bytes)
-        val rightEq = (left, that.left) match
-          case (None, None) => true
-          case (Some(_), None) => false
-          case (None, Some(_)) => false
-          case (Some(x), Some(y)) => java.util.Arrays.equals(x.bytes, y.bytes)
-
         (that `canEqual` this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount &&
-          minEq && maxEq && leftEq && rightEq && contents == that.contents && partial == that.partial
+          minimum == that.minimum && maximum == that.maximum &&
+          KeyValueObjectState.cmp(left.map(_.bytes), that.left.map(_.bytes)) &&
+          KeyValueObjectState.cmp(right.map(_.bytes), that.right.map(_.bytes)) &&
+          contents == that.contents && partial == that.partial
       case _ => false
+
   override def hashCode: Int =
-    def hk(o: Option[Key]): Int = o match
+    def ha(o: Option[Value]): Int = o match
       case None => 0
-      case Some(key) => java.util.Arrays.hashCode(key.bytes)
-    def ha(o: Option[Array[Byte]]): Int = o match
-      case None => 0
-      case Some(arr) => java.util.Arrays.hashCode(arr)
-    val hashCodes = List(pointer.hashCode, revision.hashCode, refcount.hashCode, timestamp.hashCode,
-      hk(minimum), hk(maximum), ha(left.map(_.bytes)), ha(right.map(_.bytes)), contents.hashCode)
+      case Some(v) => java.util.Arrays.hashCode(v.bytes)
+    val hashCodes = List(pointer.hashCode, revision.hashCode, refcount.hashCode,
+      minimum.hashCode, maximum.hashCode, ha(left), ha(right), contents.hashCode)
     hashCodes.reduce( (a,b) => a ^ b )
 
   def allUpdates: Set[ObjectRevision] = contents.iterator.map(_._2.revision).toSet + revision
@@ -264,7 +245,7 @@ class KeyValueObjectState(
 object KeyValueObjectState {
 
   final case class ValueState(value: Value, revision: ObjectRevision, timestamp: HLCTimestamp) {
-    override def hashCode = (value, revision, timestamp).##
+    override def hashCode = (java.util.Arrays.hashCode(value.bytes), revision, timestamp).##
 
     override def equals(other: Any) = other match
       case that: ValueState =>

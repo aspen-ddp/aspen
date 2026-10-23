@@ -158,7 +158,8 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA with Appenda
 
   def sliceOffsetFor(offset: Int): Int = offset
 
-  def sliceRangeFor(offset: Int, length: Int): (Int, Int) = (offset, offset + length)
+  def sliceRangeFor(offset: Int, length: Int): (Int, Int) =
+    (offset, math.min(offset.toLong + length, Int.MaxValue.toLong).toInt)
 
   def lengthProbeBytes: Int = 0
 
@@ -633,8 +634,9 @@ case class AppendingReedSolomon(
   def sliceRangeFor(offset: Int, length: Int): (Int, Int) =
     // One extra row so a requested end in the second-to-last row pulls in the final row, whose
     // trailer lets restoreRange truncate the zero fill. Stores clip the end to the slice size.
-    val endRow = ((offset.toLong + length + rowBytes - 1) / rowBytes).toInt + 1
-    (sliceOffsetFor(offset), endRow * cellSize)
+    // Computed in Long and clamped, since the end may exceed Int range (e.g. k=1 with a huge length)
+    val endRow = (offset.toLong + length + rowBytes - 1) / rowBytes + 1
+    (sliceOffsetFor(offset), math.min(endRow * cellSize, Int.MaxValue.toLong).toInt)
 
   def lengthProbeBytes: Int = cellSize
 

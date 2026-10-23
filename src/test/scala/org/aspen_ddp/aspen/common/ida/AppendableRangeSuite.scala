@@ -81,6 +81,28 @@ class AppendableRangeSuite extends AnyFunSuite with Matchers:
         r.data.slice(offset - r.logicalOffset, offset - r.logicalOffset + length) should be (c.slice(offset, offset + length))
   }
 
+  test("sliceRangeFor does not overflow for huge lengths with k=1") {
+    val ida = AppendingReedSolomon(3, 1, 2, 8)
+    val c = content(100)
+    val slices = ida.encode(c)
+    val size = slices(0).length
+    for (offset, length) <- List((0, Int.MaxValue), (50, Int.MaxValue - 50), (Int.MaxValue - 10, 10),
+                                 (Int.MaxValue - 1, 1), (Int.MaxValue, 0), (0, Int.MaxValue - 1)) do
+      val (s, e) = ida.sliceRangeFor(offset, length)
+      s should be >= 0
+      e should be >= s
+    val (s, e) = ida.sliceRangeFor(0, Int.MaxValue)
+    s should be (0)
+    e should be (Int.MaxValue)
+    val r = ida.restoreRange(s, size, window(ida, slices, s, math.min(e, size)))
+    r.objectLength should be (Some(100))
+    r.data.slice(0, 100) should be (c)
+    // Replication shares the hazard
+    val (rs, re) = Replication(3, 2).sliceRangeFor(Int.MaxValue - 5, Int.MaxValue)
+    rs should be (Int.MaxValue - 5)
+    re should be (Int.MaxValue)
+  }
+
   test("Replication range restore is the identity") {
     val ida = Replication(3, 2)
     ida.sliceRangeFor(10, 20) should be ((10, 30))

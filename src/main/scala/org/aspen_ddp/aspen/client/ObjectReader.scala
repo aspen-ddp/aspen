@@ -46,7 +46,12 @@ trait ObjectReader {
   def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int]): Future[DataObjectRangeState] =
     readRange(pointer, offset, length, "")
 
-  /** Reads the position at which the object can currently be appended to */
+  /** Reads the position at which the object can currently be appended to.
+    *
+    * Known limitation: AppendingReedSolomon objects must be allocated with initial content (even empty)
+    * for this to work. A bare allocation leaves 0-byte slices, which fail here with CorruptedObject (see
+    * Todo.txt).
+    */
   def readAppendPosition(pointer: DataObjectPointer, comment: String): Future[AppendPosition]
 
   def readAppendPosition(pointer: DataObjectPointer): Future[AppendPosition] = readAppendPosition(pointer, "")

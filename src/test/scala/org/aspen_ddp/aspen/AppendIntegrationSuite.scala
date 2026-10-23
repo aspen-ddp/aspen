@@ -223,6 +223,9 @@ trait AppendIntegrationTests:
     * has the host install the store's re-encoded content (trailer included). Retried because the
     * errorTree entry is written asynchronously after the transaction.
     */
+  private def storeRevisions(id: ObjectId): List[Option[ObjectRevision]] =
+    net.stores.toList.map(_.m.get(id).map(_.metadata.revision))
+
   private def repairUntilCurrent(id: ObjectId, revision: ObjectRevision, attempts: Int = 100): Future[Unit] =
     def current: Boolean = net.stores.forall(_.m.get(id).map(_.metadata.revision).contains(revision))
     if current then
@@ -251,10 +254,14 @@ trait AppendIntegrationTests:
       pos <- client.readAppendPosition(dp)
       mid <- appendAll(pos, first)
       before <- client.read(dp)
+      _ = withClue("expected a store to be behind before repair: "):
+            storeRevisions(dp.id).exists(!_.contains(mid.revision)) should be (true)
       _ <- repairUntilCurrent(dp.id, mid.revision)
       // Later appends apply as deltas on the repaired slices
       last <- appendAll(mid, second)
       after <- client.read(dp)
+      _ = withClue("expected a store to be behind after the later appends: "):
+            storeRevisions(dp.id).exists(!_.contains(last.revision)) should be (true)
       _ <- repairUntilCurrent(dp.id, last.revision)
       _ <- net.waitForTransactionsToComplete()
       results <- sequentially(silenceableSubsets): silenced =>

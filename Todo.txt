@@ -14,3 +14,11 @@ Generate IDA document to discuss pros and cons of each IDA algorithm and what th
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
 that talks about things like IDA + Backend combinations. AppendingReedSolmon + RocksDB is a poor
 combination.
+
+Bare allocateDataObject() (no initial content) leaves 0-byte slices in slicing pools (ReedSolomon and
+AppendingReedSolomon). The allocating-object pre-pass in TransactionBuilder.buildTranaction adds
+DataBuffer.Empty plus only a RefcountUpdate requirement (no DataUpdate), so RequirementsApplyer never
+applies the encoded empty update. Full reads then fail with a non-NotRestorable exception,
+readAppendPosition fails with CorruptedObject and appends abort with AppendMismatch. Fix direction: add a
+DataUpdate for allocating objects, or have stores apply the update for allocating objects. Until fixed,
+AppendingReedSolomon objects must be allocated with initial content (even empty content that is encoded).

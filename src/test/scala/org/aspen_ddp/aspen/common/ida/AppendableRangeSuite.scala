@@ -31,6 +31,10 @@ class AppendableRangeSuite extends AnyFunSuite with Matchers:
         // A non-final window may extend past the content into zero fill
         val padded = c.padTo(rows * ida.rowBytes, 0.toByte)
         r.data should be (padded.slice(r.logicalOffset, r.logicalOffset + r.data.length))
+        // Trimmed to a request ending at the window end, no zero fill may be accepted as data
+        val reqEnd = math.min(endRow * ida.rowBytes, n)
+        val trimmed = r.data.slice(0, math.max(0, reqEnd - r.logicalOffset))
+        trimmed should be (c.slice(r.logicalOffset, math.max(r.logicalOffset, reqEnd)))
         if endRow == rows then
           r.objectLength should be (Some(n))
         else
@@ -92,4 +96,26 @@ class AppendableRangeSuite extends AnyFunSuite with Matchers:
     val slices = ida.encode(content(100))
     an [IDARestoreError] should be thrownBy
       ida.restoreRange(4, slices(0).length, window(ida, slices, 4, 16))
+  }
+
+  test("bounded reads ending beyond the logical end never return zero fill as data") {
+    for ida <- Configs; n <- List(0, 20, 23, 24, 100, 777) do
+      val c = content(n)
+      val slices = ida.encode(c)
+      val size = slices(0).length
+      for offset <- 0 to n; length <- (n - offset + 1) to (n - offset + ida.rowBytes) do
+        val (s, e) = ida.sliceRangeFor(offset, length)
+        val end = math.min(e, size)
+        val r = ida.restoreRange(s, size, window(ida, slices, s, end))
+        val from = offset - r.logicalOffset
+        val got = r.data.slice(from, from + length)
+        got should be (c.slice(offset, n))
+  }
+
+  test("an empty window at the slice end returns an empty, length-unknown range") {
+    val ida = Configs.head
+    val slices = ida.encode(content(100))
+    val size = slices(0).length
+    val r = ida.restoreRange(size, size, window(ida, slices, size, size))
+    r should be (RestoredRange((size / ida.cellSize) * ida.rowBytes, Array.emptyByteArray, None))
   }

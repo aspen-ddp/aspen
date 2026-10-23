@@ -53,7 +53,10 @@ sealed trait AppendableIDA:
   /** Row-aligned slice offset at which logical byte `offset` begins */
   def sliceOffsetFor(offset: Int): Int
 
-  /** Row-aligned slice range [start, end) covering logical [offset, offset + length) */
+  /** Row-aligned slice range [start, end) covering logical [offset, offset + length). Stores clip the end to the
+    * slice size. A restored window that does not reach the end of the slices may contain zero fill only in its
+    * last row, beyond the requested end, which callers trim to the request.
+    */
   def sliceRangeFor(offset: Int, length: Int): (Int, Int)
 
   /** Bytes from the end of each slice that are needed to learn the logical length: cellSize, or 0 for Replication */
@@ -628,7 +631,9 @@ case class AppendingReedSolomon(
   def sliceOffsetFor(offset: Int): Int = (offset / rowBytes) * cellSize
 
   def sliceRangeFor(offset: Int, length: Int): (Int, Int) =
-    val endRow = ((offset.toLong + length + rowBytes - 1) / rowBytes).toInt
+    // One extra row so a requested end in the second-to-last row pulls in the final row, whose
+    // trailer lets restoreRange truncate the zero fill. Stores clip the end to the slice size.
+    val endRow = ((offset.toLong + length + rowBytes - 1) / rowBytes).toInt + 1
     (sliceOffsetFor(offset), endRow * cellSize)
 
   def lengthProbeBytes: Int = cellSize
@@ -639,6 +644,10 @@ case class AppendingReedSolomon(
 
     if sliceSize % cellSize != 0 then
       throw new IDARestoreError(s"Invalid slice size $sliceSize. Expected a multiple of $cellSize")
+
+    // An empty window means the read began beyond the end of the slices. The length is unknown
+    if sliceStart <= sliceSize && segments.size >= k && segments.forall(_._2.isEmpty) then
+      return RestoredRange((sliceStart / cellSize) * rowBytes, Array.emptyByteArray, None)
 
     val (shards, segmentLength) = ReedSolomon.recoverDataShards(segments, width, k)
 

@@ -17,7 +17,17 @@ import java.util.concurrent.ThreadLocalRandom
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.control.NonFatal
 
+/** Runs DurableServices claimed from the services TKVL.
+ *
+ *  The DurableService scaladoc describes claiming, leases and the scanning strategy. In short: each host scales
+ *  its scan window by `hostCount` so that, across the cluster, a scan happens roughly every
+ *  `clusterScanInterval`, keeping the load on the Radicle and the TKVL independent of cluster size.
+ *
+ *  @param hostCount approximate number of hosts in the system; 0 when unknown, which selects the unscaled window.
+ *                   Read at construction and again every `hostCountRecheckInterval`.
+ */
 class SimpleDurableServiceExecutor(
   val client: AspenClient,
   val hostId: HostId,
@@ -26,7 +36,10 @@ class SimpleDurableServiceExecutor(
   val renewalInterval: Duration      = Duration(5, SECONDS),
   val minScanInterval: Duration      = Duration(10, SECONDS),
   val maxScanInterval: Duration      = Duration(30, SECONDS),
-  val claimDelayPerService: Duration = Duration(500, MILLISECONDS)
+  val claimDelayPerService: Duration = Duration(500, MILLISECONDS),
+  val hostCount: () => Int           = () => 0,
+  val clusterScanInterval: Duration  = Duration(15, SECONDS),
+  val hostCountRecheckInterval: Duration = Duration(1, HOURS)
 ) extends DurableServiceExecutor:
 
   given ExecutionContext = client.clientContext
@@ -37,6 +50,15 @@ class SimpleDurableServiceExecutor(
   // One-shot task for the next scan (rescheduled after each scan completes)
   private var scanTask: ScheduledTask = NoTask
 
+  // Bumped by every scheduleScan. A scan task runs only if its generation is still current, so a task that
+  // a rescheduling cancel() raced with cannot start a second scan chain.
+  private var scanGeneration: Long = 0
+
+  // System.nanoTime at which the pending scan task fires
+  private var nextScanAt: Long = 0
+
+  private var currentHostCount: Int = readHostCount()
+
   @volatile private var isShutdown = false
 
   val servicesTkvl: TieredKeyValueList =
@@ -45,10 +67,14 @@ class SimpleDurableServiceExecutor(
   // Start the first scan on construction
   scheduleScan()
 
+  private val hostCountTask: ScheduledTask = backgroundTasks.schedulePeriodic(hostCountRecheckInterval):
+    recheckHostCount()
+
   /** Cancels all timers and shuts down all owned services. */
   def shutdown(): Unit = synchronized:
     isShutdown = true
     scanTask.cancel()
+    hostCountTask.cancel()
     ownedServices.foreach: (_, pair) =>
       val (service, renewalTimer) = pair
       renewalTimer.cancel()
@@ -59,15 +85,41 @@ class SimpleDurableServiceExecutor(
     ownedServices.get(msg.serviceUUID).foreach: (service, _) =>
       service.receiveMessage(msg)
 
+  private def readHostCount(): Int =
+    try hostCount()
+    catch
+      case NonFatal(_) => 0
+
+  /** Picks up a changed host count, which the next scheduleScan uses. The pending scan is re-armed only when it is
+   *  due later than the new window allows, as after the cluster shrank. Re-arming on every change would let a
+   *  count that drifts each hour keep pushing back a scan whose window starts more than an hour out. */
+  private def recheckHostCount(): Unit =
+    val n = readHostCount()
+    synchronized:
+      if n != currentHostCount then
+        currentHostCount = n
+        val (_, hi) = scanWindowFor(n)
+        if nextScanAt - System.nanoTime() > hi.toNanos then
+          scanTask.cancel()
+          scheduleScan()
+
+  private def scanWindowFor(n: Int): (FiniteDuration, FiniteDuration) =
+    SimpleDurableServiceExecutor.scanWindow(n, minScanInterval, maxScanInterval, clusterScanInterval)
+
   protected def scheduleScan(): Unit =
-    val rangeMillis = maxScanInterval.toMillis - minScanInterval.toMillis
-    val delayMillis = minScanInterval.toMillis + ThreadLocalRandom.current().nextLong(rangeMillis)
     synchronized:
       // A scan that was in flight when shutdown() ran finishes by calling this. Without the
       // check it would re-arm itself and scan for the life of the process.
       if !isShutdown then
+        val (lo, hi) = scanWindowFor(currentHostCount)
+        val rangeMillis = hi.toMillis - lo.toMillis
+        val delayMillis = lo.toMillis + ThreadLocalRandom.current().nextLong(math.max(1L, rangeMillis))
+        nextScanAt = System.nanoTime() + delayMillis * 1000000L
+        scanGeneration += 1
+        val generation = scanGeneration
         scanTask = backgroundTasks.schedule(Duration(delayMillis, MILLISECONDS)):
-          doScan()
+          if synchronized(generation == scanGeneration) then
+            doScan()
 
   private val scanFn: () => Unit = boundedSingleFlight("durable-service-scan"):
     val entries = ListBuffer[(Key, ServiceEntry, ObjectRevision)]()
@@ -235,3 +287,18 @@ class SimpleDurableServiceExecutor(
               given Transaction = tx
               for _ <- servicesTkvl.delete(serviceKey)(using tx) yield
                 tx.setRefcount(entry.statePointer, stateKvos.refcount, stateKvos.refcount.decrement())
+
+object SimpleDurableServiceExecutor:
+
+  /** The window each host draws its next scan delay from, uniformly.
+   *
+   *  With n hosts each scanning on average every M, the cluster scans on average every M/n. M is set to
+   *  n * clusterScanInterval and the window to [M/2, 3M/2], floored at [minScan, maxScan] so small clusters, and
+   *  a host count of 0 (unknown), keep the unscaled window.
+   */
+  def scanWindow(hostCount: Int, minScan: Duration, maxScan: Duration,
+                 clusterScanInterval: Duration): (FiniteDuration, FiniteDuration) =
+    val meanMillis = math.max(0, hostCount).toLong * clusterScanInterval.toMillis
+    val lo = math.max(minScan.toMillis, meanMillis / 2)
+    val hi = math.max(maxScan.toMillis, meanMillis * 3 / 2)
+    (FiniteDuration(lo, MILLISECONDS), FiniteDuration(hi, MILLISECONDS))

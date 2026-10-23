@@ -73,6 +73,13 @@ class MetadataManagerNetworkCacheSuite extends AnyFunSuite
     mgr.peekHostEntry(remoteHostId) should not be None
     cache.hostPuts should be(empty)
 
+  test("knownHostCount counts bootstrap and cached hosts, and self once"):
+    newManager(new RecordingNetworkCache())._1.knownHostCount should be(1)
+    newManager(seeded())._1.knownHostCount should be(2)
+    // Self is never seeded from the cache but is still counted
+    newManager(seeded(), Some(remoteHostId))._1.knownHostCount should be(2)
+    newManager(seeded(), Some(otherHostId))._1.knownHostCount should be(3)
+
   test("write-through: storeMoved"):
     val cache = new RecordingNetworkCache()
     val (mgr, _, _) = newManager(cache)

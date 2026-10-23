@@ -1,14 +1,6 @@
 TODO
 ====
 
-DurableService polling time needs to scale with cluster size
-  - Current impl will place heavy read burden on Radicle & service tree when
-    there are a large number of hosts
-  - Can use the NetworkCache for a cheap and easy way to get host count
-    - if empty, use defaults
-    - calculate based off of host count if non-empty
-    - recheck every hour and adjust check window as needed
-
 Modify RocksDB class to use a shared ENV
   - Causes all RocksDB instances to share a background thread pool
   - Needed for larger scale deployments

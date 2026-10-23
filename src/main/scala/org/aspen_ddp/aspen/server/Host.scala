@@ -177,6 +177,9 @@ class Host(val client: AspenClient,
   private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
+  // Runs the DurableServices this host claims. Every host scans the services TKVL for unclaimed or expired
+  // entries, with its scan interval scaled by the known host count (net.knownHostCount) so the cluster as a whole
+  // scans about every 15 seconds however many hosts there are. See the DurableService scaladoc for details.
   private val serviceExecutorPromise: Promise[SimpleDurableServiceExecutor] = Promise()
   private val systemTaskRunnerPromise: Promise[SystemTaskRunner] = Promise()
   private val poolUsageManager = new StoragePoolUsageManager(client)
@@ -243,7 +246,8 @@ class Host(val client: AspenClient,
                   synchronized:
                     taskExecutorPromise.success(executor)
                     startUsageTracking(executor)
-                    val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
+                    val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks,
+                      hostCount = () => net.knownHostCount)
                     serviceExecutorPromise.success(serviceExec)
                     initializeSystemTaskRunner(executor)
 
@@ -266,7 +270,8 @@ class Host(val client: AspenClient,
                     synchronized:
                       taskExecutorPromise.success(executor)
                       startUsageTracking(executor)
-                      val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks)
+                      val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks,
+                        hostCount = () => net.knownHostCount)
                       serviceExecutorPromise.success(serviceExec)
                       initializeSystemTaskRunner(executor)
 

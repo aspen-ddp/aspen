@@ -12,7 +12,7 @@ import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, HOURS, MILLISECONDS, SECONDS}
 
 class ServiceEntrySpec extends AnyFunSuite with Matchers:
 
@@ -37,6 +37,30 @@ class ServiceEntrySpec extends AnyFunSuite with Matchers:
     decoded.hostId shouldBe new UUID(0, 0)
     decoded.leaseExpiry shouldBe HLCTimestamp.Zero
     decoded.isClaimed shouldBe false
+
+
+class ScanWindowSpec extends AnyFunSuite with Matchers:
+
+  private val min     = Duration(10, SECONDS)
+  private val max     = Duration(30, SECONDS)
+  private val cluster = Duration(15, SECONDS)
+
+  private def window(n: Int): (FiniteDuration, FiniteDuration) =
+    SimpleDurableServiceExecutor.scanWindow(n, min, max, cluster)
+
+  test("an unknown host count keeps the unscaled window"):
+    window(0) shouldBe (Duration(10, SECONDS), Duration(30, SECONDS))
+
+  test("a single host keeps the unscaled window"):
+    window(1) shouldBe (Duration(10, SECONDS), Duration(30, SECONDS))
+
+  test("the window scales so the cluster scans about every clusterScanInterval"):
+    window(2) shouldBe (Duration(15, SECONDS), Duration(45, SECONDS))
+    window(10) shouldBe (Duration(75, SECONDS), Duration(225, SECONDS))
+    val (lo, hi) = window(1000)
+    lo shouldBe Duration(7500, SECONDS)
+    hi shouldBe Duration(22500, SECONDS)
+    ((lo + hi) / 2 / 1000) shouldBe cluster
 
 
 class DurableServiceSuite extends IntegrationTestSuite:
@@ -78,7 +102,8 @@ class DurableServiceSuite extends IntegrationTestSuite:
       exec.shutdown()
       exec = executors.poll()
 
-  def makeExecutor(): SimpleDurableServiceExecutor =
+  def makeExecutor(hostCount: () => Int = () => 0,
+                   hostCountRecheckInterval: Duration = Duration(1, HOURS)): SimpleDurableServiceExecutor =
     val exec = new SimpleDurableServiceExecutor(
       client, testHostId, client.backgroundTaskManager,
       // No test here depends on a lease expiring, so keep it far longer than any scheduling
@@ -87,7 +112,9 @@ class DurableServiceSuite extends IntegrationTestSuite:
       renewalInterval      = Duration(50, MILLISECONDS),
       minScanInterval      = Duration(50, MILLISECONDS),
       maxScanInterval      = Duration(100, MILLISECONDS),
-      claimDelayPerService = Duration(0, MILLISECONDS)
+      claimDelayPerService = Duration(0, MILLISECONDS),
+      hostCount            = hostCount,
+      hostCountRecheckInterval = hostCountRecheckInterval
     )
     executors.add(exec)
     exec
@@ -135,6 +162,41 @@ class DurableServiceSuite extends IntegrationTestSuite:
       val entry = ServiceEntry.decode(vs.get.value.bytes)
       entry.hostId shouldBe testHostId.uuid
       entry.leaseExpiry > HLCTimestamp.Zero shouldBe true
+
+  atest("a host count change re-arms a far-off scan under the new window"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    // A million hosts puts the first scan days away; only the recheck re-arming it can get the claim made
+    @volatile var hosts = 1000000
+    val exec = makeExecutor(hostCount = () => hosts, hostCountRecheckInterval = Duration(50, MILLISECONDS))
+    for
+      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _   = hosts = 0
+      _  <- claimedPromise.future
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+    yield
+      exec.shutdown()
+      ServiceEntry.decode(vs.get.value.bytes).hostId shouldBe testHostId.uuid
+
+  atest("a growing host count does not push back the pending scan"):
+    given ExecutionContext = executionContext
+    val svcUUID = UUID.randomUUID()
+    // Every recheck sees a larger cluster. Re-arming on each change would keep moving the scan into a window
+    // seconds out, so the claim would never be made; the scan already pending must fire as drawn.
+    // The count starts growing only once the service is registered: a scan that ran before then re-arms under
+    // whatever count it sees, and a large one would leave nothing pending to claim the service promptly.
+    val reads = new java.util.concurrent.atomic.AtomicInteger(0)
+    @volatile var growing = false
+    val exec = makeExecutor(hostCount = () => if growing then reads.incrementAndGet() else 0,
+      hostCountRecheckInterval = Duration(10, MILLISECONDS))
+    for
+      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      _   = growing = true
+      _  <- claimedPromise.future
+      vs <- exec.servicesTkvl.get(Key(svcUUID))
+    yield
+      exec.shutdown()
+      ServiceEntry.decode(vs.get.value.bytes).hostId shouldBe testHostId.uuid
 
   atest("executor renews lease before expiry"):
     given ExecutionContext = executionContext

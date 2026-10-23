@@ -82,6 +82,8 @@ object QuicNet:
 
     def dropCacheForStore(storeId: StoreId): Unit = net.metadataManager.dropStoreMapping(storeId)
 
+    override def knownHostCount: Int = net.metadataManager.knownHostCount
+
     /** Through membership to the other hosts, and directly to this host's own subscribers: scalecube does not hand a
       * member its own gossip, so store availability is applied here too. A host whose endpoint changed can gossip
       * too: see `sendClusterMessage`.

@@ -189,6 +189,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
     synchronized:
       stores.get(storeId)
 
+  /** Number of hosts this process knows of: every held host entry, resolved or pending, plus this host itself.
+   *  An approximation of cluster size; 0 only for a process that knows of no hosts at all. */
+  def knownHostCount: Int =
+    synchronized:
+      (hosts.keySet ++ selfHostId).size
+
   /** Every host entry that has resolved, in no particular order. Excludes hosts whose lookup
    *  is still pending and hosts never looked up at all.
    *

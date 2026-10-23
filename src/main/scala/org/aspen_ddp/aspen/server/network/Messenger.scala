@@ -23,4 +23,7 @@ trait Messenger {
 
   // Spreads `g` to every other host. Networks without host membership ignore it.
   def broadcastGossip(g: Gossip): Unit = ()
+
+  // Approximate number of hosts in the system, this one included. 0 when unknown.
+  def knownHostCount: Int = 0
 }

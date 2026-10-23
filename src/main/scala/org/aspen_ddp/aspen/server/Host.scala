@@ -47,7 +47,13 @@ object Host:
   private case class HostMsg(msg: HostMessage) extends Event
   private case class Repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]) extends Event
   private case class RepairDelete(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte],
-                                  completion: Promise[Unit]) extends Event
+                                  completion: Promise[Unit]) extends Event:
+    override def equals(other: Any): Boolean = other match
+      case that: RepairDelete => storeId == that.storeId && objectId == that.objectId &&
+        java.util.Arrays.equals(storePointer, that.storePointer) && completion == that.completion
+      case _ => false
+
+    override def hashCode: Int = (storeId, objectId, java.util.Arrays.hashCode(storePointer), completion).##
   private case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend, completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   private case class Exit() extends Event

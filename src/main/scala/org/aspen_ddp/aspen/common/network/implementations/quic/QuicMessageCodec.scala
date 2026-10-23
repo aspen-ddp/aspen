@@ -92,7 +92,13 @@ object QuicMessageCodec:
   /** A decoded message plus the destination HostId the sender stamped on it, if any */
   final case class Received(msg: Message, toHost: Option[HostId])
 
-  final case class Prefix(header: codec.Message, aux: ByteBuffer, sectionSizes: Array[Int])
+  final case class Prefix(header: codec.Message, aux: ByteBuffer, sectionSizes: Array[Int]):
+    override def equals(other: Any): Boolean = other match
+      case that: Prefix => header == that.header && aux == that.aux &&
+        java.util.Arrays.equals(sectionSizes, that.sectionSizes)
+      case _ => false
+
+    override def hashCode: Int = (header, aux, java.util.Arrays.hashCode(sectionSizes)).##
 
   // ============================================================================
   // Encoding

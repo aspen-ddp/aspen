@@ -122,7 +122,15 @@ final case class ServiceMessage(
                                  fromClient: ClientId,
                                  serviceUUID: UUID,
                                  encodedContent: Array[Byte]
-                               ) extends HostMessage
+                               ) extends HostMessage:
+  override def equals(other: Any): Boolean = other match
+    case o: ServiceMessage =>
+      toHost == o.toHost && fromClient == o.fromClient && serviceUUID == o.serviceUUID &&
+        java.util.Arrays.equals(encodedContent, o.encodedContent)
+    case _ => false
+
+  override def hashCode(): Int =
+    java.util.Objects.hash(toHost, fromClient, serviceUUID, java.util.Arrays.hashCode(encodedContent))
 
 final case class ExecuteSystemTask(
                                     toHost: HostId,
@@ -175,6 +183,9 @@ object ReadResponse {
 
       case _ => false
     }
+
+    /** Excludes timestamp and sizeOnStore, matching equals */
+    override def hashCode: Int = (revision, refcount, objectData, lockedWriteTransactions).##
   }
 }
 

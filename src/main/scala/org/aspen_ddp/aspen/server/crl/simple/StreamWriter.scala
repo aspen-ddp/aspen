@@ -14,7 +14,16 @@ object WriterThread:
   case class Write(streamId: StreamId,
                    offset: Long,
                    buffers: Array[ByteBuffer],
-                   onWriteComplete: () => Unit) extends Command
+                   onWriteComplete: () => Unit) extends Command:
+    // Buffers compare by their remaining content; the callback can only compare by reference
+    override def equals(other: Any): Boolean = other match
+      case that: Write => streamId == that.streamId && offset == that.offset &&
+        java.util.Arrays.equals(buffers.asInstanceOf[Array[AnyRef]], that.buffers.asInstanceOf[Array[AnyRef]]) &&
+        onWriteComplete == that.onWriteComplete
+      case _ => false
+
+    override def hashCode: Int =
+      (streamId, offset, java.util.Arrays.hashCode(buffers.asInstanceOf[Array[AnyRef]]), onWriteComplete).##
 
   case class Shutdown(completionHandler: () => Unit) extends Command
 

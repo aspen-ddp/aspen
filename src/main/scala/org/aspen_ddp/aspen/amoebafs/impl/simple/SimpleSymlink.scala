@@ -8,6 +8,12 @@ import scala.concurrent.Future
 object SimpleSymlink {
   case class SetSymLink(newLink: Array[Byte]) extends SimpleBaseFile.SimpleSet {
     def update(inode: Inode): Inode = inode.asInstanceOf[SymlinkInode].setContents(newLink)
+
+    override def equals(other: Any): Boolean = other match
+      case that: SetSymLink => java.util.Arrays.equals(newLink, that.newLink)
+      case _ => false
+
+    override def hashCode: Int = java.util.Arrays.hashCode(newLink)
   }
 }
 

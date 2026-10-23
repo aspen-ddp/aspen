@@ -52,6 +52,16 @@ final case class StoragePoolState(
 
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
 
+  /** Every field, with `stores` as a Seq so it compares by content */
+  private def contentFields = (poolId, name, ida, maxObjectSize, stores.toSeq, backendConfig, storageDeviceSet,
+    currentUsage, maximumStoreSize, allocationGroups, migration)
+
+  override def equals(other: Any): Boolean = other match
+    case that: StoragePoolState => contentFields == that.contentFields
+    case _ => false
+
+  override def hashCode: Int = contentFields.##
+
   
     
 

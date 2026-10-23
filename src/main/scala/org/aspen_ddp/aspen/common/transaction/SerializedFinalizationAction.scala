@@ -15,4 +15,6 @@ final case class SerializedFinalizationAction(
     case rhs: SerializedFinalizationAction => typeId == rhs.typeId && java.util.Arrays.equals(data, rhs.data)
     case _ => false
   }
+
+  override def hashCode: Int = (typeId, java.util.Arrays.hashCode(data)).##
 }

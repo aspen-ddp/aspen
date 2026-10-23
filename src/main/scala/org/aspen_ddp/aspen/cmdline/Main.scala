@@ -1202,6 +1202,9 @@ object Main {
 
     val hostCfg = HostConfig.loadHostConfig(cfgFile.toFile)
 
+    // Must precede the opening of any store
+    RocksDBBackend.configureResources(hostCfg.rocksdb.resourceConfig)
+
     val bsCfgFile = absHostDir.resolve(BootstrapConfig.configFilename)
 
     if ! Files.exists(bsCfgFile) then

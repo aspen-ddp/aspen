@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.store.backend
 
-import org.rocksdb.{FlushOptions, Options, RocksDB, WriteBatch, WriteOptions}
+import org.rocksdb.{FlushOptions, RocksDB, WriteBatch, WriteOptions}
 import scribe.Logging
 
 import java.nio.file.Path
@@ -35,14 +35,7 @@ class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) ext
 
   import BufferedConsistentRocksDB._
 
-  private val db: RocksDB = {
-    val options = new Options().setCreateIfMissing(true)
-    try {
-      RocksDB.open(options, dbPath.toString)
-    } finally {
-      options.close()
-    }
-  }
+  private val db: RocksDB = RocksDBBackend.openDatabase(dbPath)
 
   private var nextBatch = new WriteBatch()
   private var nextPromise = Promise[Unit]()
@@ -216,7 +209,7 @@ class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) ext
       p.success(())
 
     p.future.andThen{ case _ =>
-      db.close()
+      RocksDBBackend.closeDatabase(db)
       nextBatch.close()
     }
   }

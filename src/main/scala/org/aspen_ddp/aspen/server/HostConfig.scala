@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.aspen_ddp.aspen.server.HostConfig
+import org.aspen_ddp.aspen.server.store.backend.RocksDBBackend
 
 import java.io.File
 import java.util.UUID
@@ -19,6 +20,10 @@ crl:
   storage-engine: simple-crl
   num-streams: 3
   max-file-size-mb: 300
+rocksdb:                      # optional, as is each entry. Shared by all RocksDB stores on the host
+  memory-mb: 4096             # default: 25% of physical RAM
+  write-buffer-mb: 1024       # default: 25% of memory-mb
+  max-background-threads: 8   # default: number of cores
 tls-certificate: |
   -----BEGIN CERTIFICATE-----
   ...
@@ -37,7 +42,8 @@ case class HostConfig(hostId: HostId,
                       storeTransferPort: Int,
                       crl: HostConfig.CRLBackend,
                       tlsCertificate: String,
-                      tlsPrivateKey: String):
+                      tlsPrivateKey: String,
+                      rocksdb: HostConfig.RocksDBResources = HostConfig.RocksDBResources()):
   def yamlConfig: String =
     val base = s"""host-id: ${hostId.uuid}
        |aspen-system-id: $aspenSystemId
@@ -56,7 +62,17 @@ case class HostConfig(hostId: HostId,
            |  max-file-size-mb: ${s.fileSizeMb}
            |""".stripMargin
 
-    base + crlCfg +
+    val rocksdbCfg =
+      val entries = List(
+        rocksdb.memoryMb.map(v => s"  memory-mb: $v\n"),
+        rocksdb.writeBufferMb.map(v => s"  write-buffer-mb: $v\n"),
+        rocksdb.maxBackgroundThreads.map(v => s"  max-background-threads: $v\n")).flatten
+      if entries.isEmpty then
+        ""
+      else
+        "rocksdb:\n" + entries.mkString
+
+    base + crlCfg + rocksdbCfg +
       yamlBlockScalar("tls-certificate", tlsCertificate) +
       yamlBlockScalar("tls-private-key", tlsPrivateKey)
 
@@ -79,6 +95,26 @@ object HostConfig extends YObject[HostConfig]:
       numStreams.get(o).getOrElse(3),
       fileSize.get(o).getOrElse(300))
 
+  /** Host-wide RocksDB limits. Unspecified values are derived from the machine. See RocksDBBackend.ResourceConfig */
+  case class RocksDBResources(memoryMb: Option[Int] = None,
+                              writeBufferMb: Option[Int] = None,
+                              maxBackgroundThreads: Option[Int] = None):
+    def resourceConfig: RocksDBBackend.ResourceConfig = RocksDBBackend.ResourceConfig.resolve(
+      memoryMb.map(_.toLong * 1024 * 1024),
+      writeBufferMb.map(_.toLong * 1024 * 1024),
+      maxBackgroundThreads)
+
+  object RocksDBResources extends YObject[RocksDBResources]:
+    val memoryMb: Optional[Int]             = Optional("memory-mb", YInt)
+    val writeBufferMb: Optional[Int]        = Optional("write-buffer-mb", YInt)
+    val maxBackgroundThreads: Optional[Int] = Optional("max-background-threads", YInt)
+    val attrs: List[Attr] = memoryMb :: writeBufferMb :: maxBackgroundThreads :: Nil
+
+    def create(o: Object): RocksDBResources = RocksDBResources(
+      memoryMb.get(o),
+      writeBufferMb.get(o),
+      maxBackgroundThreads.get(o))
+
   val hostId: Required[HostId]         = Required("host-id", HostId.YHostId)
   val aspenSystemId: Required[UUID]    = Required("aspen-system-id", YUUID)
   val name: Required[String]           = Required("name", YString)
@@ -90,6 +126,7 @@ object HostConfig extends YObject[HostConfig]:
 
   val tlsCertificate: Required[String] = Required("tls-certificate", YString)
   val tlsPrivateKey: Required[String]  = Required("tls-private-key", YString)
+  val rocksdb: Optional[RocksDBResources] = Optional("rocksdb", RocksDBResources)
 
   val attrs: List[Attr] = List(
     hostId,
@@ -101,7 +138,8 @@ object HostConfig extends YObject[HostConfig]:
     storeTransferPort,
     crl,
     tlsCertificate,
-    tlsPrivateKey
+    tlsPrivateKey,
+    rocksdb
   )
 
   def create(o: Object): HostConfig = HostConfig(
@@ -114,7 +152,8 @@ object HostConfig extends YObject[HostConfig]:
     storeTransferPort.get(o),
     crl.get(o),
     tlsCertificate.get(o),
-    tlsPrivateKey.get(o)
+    tlsPrivateKey.get(o),
+    rocksdb.get(o).getOrElse(RocksDBResources())
   )
 
   def loadHostConfig(file: File): HostConfig =

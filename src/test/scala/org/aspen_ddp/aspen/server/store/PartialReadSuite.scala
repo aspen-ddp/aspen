@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -64,6 +64,16 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
 
     val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, mixed, KeyRange(bk(2), bk(1, 0), IntegerKeyOrdering)))
     r.content.keySet shouldBe Set(bk(2), bk(3), bk(1, 0))
+  }
+
+  test("KeyRange over ByteArrayKeyOrdering handles keys of different lengths") {
+    def bk(bytes: Int*): Key = Key(bytes.map(_.toByte).toArray)
+    val keys = List(bk(1), bk(2), bk(2, 0), bk(2, 5), bk(3), bk(3, 0))
+    val mixed = KVObjectState.encode(None, None, None, None,
+      keys.map(key => key -> new ValueState(Value(Array[Byte](0)), rev, HLCTimestamp(1), None)).toMap)
+
+    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, mixed, KeyRange(bk(2, 0), bk(3), ByteArrayKeyOrdering)))
+    r.content.keySet shouldBe Set(bk(2, 0), bk(2, 5), bk(3))
   }
 
   test("KeyRange with min > max is empty") {

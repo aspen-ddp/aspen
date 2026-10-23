@@ -20,6 +20,8 @@ lazy val root = (project in file(".")).
     libraryDependencies ++= Seq(
       "org.scalatest"                    %% "scalatest"               % "3.2.18" % "test",
       "com.github.blemale"               %% "scaffeine"               % "5.2.1" % "compile",
+      // Used only for text ordering (LexicalKeyOrdering). Pinned: a new version can reorder existing trees
+      "com.ibm.icu"                      %  "icu4j"                   % "78.3",
       "org.rocksdb"                      %  "rocksdbjni"              % "8.11.3",
       "com.github.luben"                 %  "zstd-jni"                % "1.5.6-4",
       "com.github.scopt"                 %% "scopt"                   % "4.1.0",

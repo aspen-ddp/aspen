@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 
-import java.io.File
 import java.util.UUID
 
 /*
@@ -32,5 +31,5 @@ object StorageDeviceConfig extends YObject[StorageDeviceConfig]:
     aspenSystemId.get(o)
   )
 
-  def loadStorageDeviceConfig(file: File): StorageDeviceConfig =
+  def loadStorageDeviceConfig(file: os.Path): StorageDeviceConfig =
     create(loadYamlFile(file))

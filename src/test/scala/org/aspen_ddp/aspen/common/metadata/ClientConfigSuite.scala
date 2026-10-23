@@ -9,8 +9,6 @@ import org.aspen_ddp.aspen.common.util.YamlFormat.FormatError
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.file.attribute.PosixFilePermissions
-import java.nio.file.{Files, Path}
 import java.util.UUID
 
 class ClientConfigSuite extends AnyFunSuite with Matchers:
@@ -38,9 +36,8 @@ class ClientConfigSuite extends AnyFunSuite with Matchers:
       BootstrapConfig.generateBootstrapConfig(
         systemId, Replication(hosts.length, 1), states, storeMap, TestTLS.caCertificatePem))
 
-  private def tempFile(): Path =
-    val dir = Files.createTempDirectory("client-config-suite")
-    dir.resolve(ClientConfig.configFilename)
+  private def tempFile(): os.Path =
+    os.temp.dir(prefix = "client-config-suite") / ClientConfig.configFilename
 
   test("generate/parse round-trips and keeps host order"):
     ClientConfig.parse(ClientConfig.generate(cfg)) shouldBe cfg
@@ -81,16 +78,16 @@ class ClientConfigSuite extends AnyFunSuite with Matchers:
   test("write creates an owner-only file"):
     val path = tempFile()
     ClientConfig.write(path, cfg)
-    PosixFilePermissions.toString(Files.getPosixFilePermissions(path)) shouldBe "rw-------"
+    os.perms(path).toString shouldBe "rw-------"
     ClientConfig.load(path) shouldBe cfg
 
   test("updateCachedHosts leaves the file alone when the host set matches in a different order"):
     val path = tempFile()
     ClientConfig.write(path, cached)
-    val before = Files.readAllBytes(path)
+    val before = os.read.bytes(path)
     val f = fetched(List(("node-b", 4800), ("10.0.0.5", 4751)))
     ClientConfig.updateCachedHosts(path, cached, f) shouldBe CacheUpdate.Unchanged
-    Files.readAllBytes(path) shouldBe before
+    os.read.bytes(path) shouldBe before
 
   test("updateCachedHosts rewrites the file when the host set differs"):
     val path = tempFile()
@@ -102,26 +99,26 @@ class ClientConfigSuite extends AnyFunSuite with Matchers:
   test("updateCachedHosts reports Failed rather than throwing when the file is not writable"):
     val path = tempFile()
     ClientConfig.write(path, cached)
-    val dir = path.getParent
+    val dir = path / os.up
     val f = fetched(List(("10.0.0.6", 4751)))
     try
-      Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-x------"))
+      os.perms.set(dir, "r-x------")
       ClientConfig.updateCachedHosts(path, cached, f) match
         case CacheUpdate.Failed(_) =>
         case other => fail(s"expected Failed, got $other")
     finally
-      Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("rwx------"))
+      os.perms.set(dir, "rwx------")
 
   test("updateCachedHosts reports Failed and leaves a read-only client config untouched"):
     val path = tempFile()
     ClientConfig.write(path, cached)
-    val before = Files.readAllBytes(path)
+    val before = os.read.bytes(path)
     val f = fetched(List(("10.0.0.6", 4751)))
     try
-      Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("r--------"))
+      os.perms.set(path, "r--------")
       ClientConfig.updateCachedHosts(path, cached, f) match
         case CacheUpdate.Failed(_) =>
         case other => fail(s"expected Failed, got $other")
-      Files.readAllBytes(path) shouldBe before
+      os.read.bytes(path) shouldBe before
     finally
-      Files.setPosixFilePermissions(path, PosixFilePermissions.fromString("rw-------"))
+      os.perms.set(path, "rw-------")

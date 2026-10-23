@@ -4,7 +4,6 @@ import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.aspen_ddp.aspen.common.util.atomicWrite
 
-import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.util.control.NonFatal
 
@@ -144,11 +143,11 @@ object ClientConfig:
   def parse(yaml: String): Config =
     Config.create(loadYamlString(yaml))
 
-  def load(path: Path): Config =
-    Config.create(loadYamlFile(path.toFile))
+  def load(path: os.Path): Config =
+    Config.create(loadYamlFile(path))
 
   /** Atomic and owner-only: atomicWrite's temp file is created 0600 and then renamed into place. */
-  def write(path: Path, cfg: Config): Unit =
+  def write(path: os.Path, cfg: Config): Unit =
     atomicWrite(path, generate(cfg))
 
   /** The HTTP endpoints of the hosts in a bootstrap config, in the order given. */
@@ -164,7 +163,7 @@ object ClientConfig:
    *  that differs only in order is Unchanged. Never throws NonFatal: a failed write is reported
    *  as Failed so a client can carry on with the config it already has.
    */
-  def updateCachedHosts(path: Path, current: Config, fetched: BootstrapConfig.Config): CacheUpdate =
+  def updateCachedHosts(path: os.Path, current: Config, fetched: BootstrapConfig.Config): CacheUpdate =
     val endpoints = endpointsOf(fetched)
 
     if endpoints.toSet == current.bootstrapHosts.toSet then
@@ -172,7 +171,7 @@ object ClientConfig:
     else
       try
         // atomicWrite renames over the target, which would silently replace a read-only file
-        if Files.exists(path) && !Files.isWritable(path) then
+        if os.exists(path) && !path.toIO.canWrite then
           CacheUpdate.Failed(new java.io.IOException(s"$path is not writable"))
         else
           write(path, current.copy(bootstrapHosts = endpoints))

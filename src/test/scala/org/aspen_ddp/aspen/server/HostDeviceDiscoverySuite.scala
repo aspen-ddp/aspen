@@ -13,8 +13,6 @@ import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 
-import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -111,14 +109,13 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   private val foreignSystemId = UUID.fromString("44444444-4444-4444-4444-444444444444")
 
   /** Overwrites the config file with bytes SnakeYAML cannot parse. */
-  private def writeUnparseableDeviceConfig(deviceDir: Path): Unit =
-    Files.write(deviceDir.resolve(StorageDeviceConfig.configFilename),
-                "this is not: valid: device config yaml".getBytes(StandardCharsets.UTF_8))
+  private def writeUnparseableDeviceConfig(deviceDir: os.Path): Unit =
+    os.write.over(deviceDir / StorageDeviceConfig.configFilename, "this is not: valid: device config yaml")
 
   /** Creates an empty device directory with no config file. */
-  private def newDeviceDirWithoutConfig(hostRoot: Path, name: String): Path =
+  private def newDeviceDirWithoutConfig(hostRoot: os.Path, name: String): os.Path =
     val dir = StorageDeviceManager.deviceDirectory(hostRoot, name)
-    Files.createDirectories(dir)
+    os.makeDir.all(dir)
     dir
 
   /** A second store in the same pool. Used where one test has to pin both halves of the
@@ -145,7 +142,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       // Also pins the recording seam itself: tryLoadStore is offered every child of the
       // device directory, and dev0's only child is the device config file.
       host.storeLoadAttempts.toList should be(
-        List((deviceA, deviceDir.resolve(StorageDeviceConfig.configFilename))))
+        List((deviceA, deviceDir / StorageDeviceConfig.configFilename)))
 
   atest("a device created after construction is discovered on the next CheckAllDevices"):
     val hostRoot = newHostDir()
@@ -168,7 +165,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   atest("an already-loaded device is not reloaded"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    Files.createDirectories(deviceDir.resolve("some-store-dir"))
+    os.makeDir.all(deviceDir / "some-store-dir")
 
     val host = newHost(hostRoot)
     val firstState = host.loadedDevices(deviceA)
@@ -178,10 +175,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     // device config file and some-store-dir. The real tryLoadStore would load neither -- it
     // requires a store config file inside the candidate, and the config file is not a
     // directory while some-store-dir is empty -- but the recording override takes both.
-    // Compared as a set because listFiles() ordering is unspecified.
+    // Compared as a set so the assertion does not depend on listing order.
     attemptsAfterConstruction.map(_._2).toSet should be(Set(
-      deviceDir.resolve(StorageDeviceConfig.configFilename),
-      deviceDir.resolve("some-store-dir")))
+      deviceDir / StorageDeviceConfig.configFilename,
+      deviceDir / "some-store-dir"))
 
     host.testingOnlyCheckAllDevices()
     host.testingOnlyCheckAllDevices()
@@ -249,8 +246,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   atest("an unusable entry under storage-devices does not stop its siblings from loading"):
     val hostRoot = newHostDir()
     // .DS_Store and friends: a plain file where the scan expects a device directory.
-    Files.write(StorageDeviceManager.deviceDirectory(hostRoot, ".DS_Store"),
-                "not a device".getBytes(StandardCharsets.UTF_8))
+    os.write.over(StorageDeviceManager.deviceDirectory(hostRoot, ".DS_Store"), "not a device")
     newDeviceDirWithoutConfig(hostRoot, "unconfigured")
     writeDevice(hostRoot, "dev0", deviceA)
 
@@ -299,8 +295,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     host.storeLoadAttempts should be(empty)
 
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val storeDir = deviceDir.resolve(storeId.directoryName)
-    Files.createDirectories(storeDir)
+    val storeDir = deviceDir / storeId.directoryName
+    os.makeDir.all(storeDir)
 
     host.testingOnlyCheckAllDevices()
 
@@ -549,15 +545,19 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   atest("a throw out of the check callback is not replaced by the re-dispatch's own throw"):
     val hostRoot = newHostDir()
     val recordingEc = new RecordingExecutionContext(executionContext)
-    val host = newHost(hostRoot, ec = recordingEc)
+    // The storage-devices directory is empty, so the constructor's scan never reaches
+    // tryLoadStore and the simulated load failure is still owed when reconcile calls it.
+    val host = newHost(hostRoot, failFirstStoreLoad = true, ec = recordingEc)
 
-    // A device the scan could not produce: devicePath is relative, so reconcileDeviceState's
-    // deleted-stores pass throws at os.Path(local.devicePath) -- the first line on that path
-    // above the try/catch wrapping os.remove.all. local.offlineStores holds the id that makes
-    // the pass iterate at all; the armed remote state below omits it, which is what marks it
-    // deleted.
+    // A device outside storage-devices, so no rescan can load it, holding a store that still
+    // carries its transferred-in marker. Against the Active entry armed below,
+    // reconcileDeviceState's completed-transfers-in pass removes the marker and calls
+    // tryLoadStore with no try/catch around it, and the owed failure throws out of the reconcile.
+    // local.offlineStores holds the id that makes the pass iterate at all.
+    val devDir = hostRoot / "injected-device"
+    os.write(devDir / storeId.directoryName / StoreTransfer.TransferredInMarkerFile, "", createFolders = true)
     val local = new Host.LocalStorageDeviceState(
-      deviceA, Paths.get("relative-device-dir"), hostRoot.toFile)
+      deviceA, devDir, devDir / StorageDeviceConfig.configFilename)
     local.offlineStores = Set(storeId)
     host.injectLoadedDevice(local)
 
@@ -577,9 +577,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       CheckStorageDevice(HostId.BootstrapHostId, client.clientId, deviceA))
     host.testingOnlyDeferredDeviceChecks should be(Set(deviceA))
 
-    // Matching hostId keeps reconcileDeviceState off its host-migration branch; no stores means
-    // storeId counts as deleted and the pass runs.
-    p1.success(deviceState(deviceA))
+    // Matching hostId keeps reconcileDeviceState off its host-migration branch; an Active entry
+    // with no destination named is what the completed-transfers-in pass looks for.
+    p1.success(deviceState(deviceA, Map(storeId -> StorageDeviceState.StoreEntry(
+      StorageDeviceState.StoreStatus.Active, None))))
 
     yieldUntil(host.lookupAttempts.size == 2).map: _ =>
       // yieldUntil gives up silently, so assert its condition first. It also proves the
@@ -594,15 +595,15 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       //
       // Old code records exactly one failure and it is redispatchError, because the throw out
       // of the finally replaced the reconcile's. New code absorbs redispatchError inside the
-      // re-dispatch and lets the reconcile's escape, so the one recorded failure is os-lib's.
+      // re-dispatch and lets the reconcile's escape, so the one recorded failure is the simulated
+      // store load failure.
       //
       // Size before content, because this recorder sees every callback the host runs
       // through its ExecutionContext: a bare non-empty check would also pass on an unrelated
       // failure with the reconcile silently not throwing at all. Matched on the message
-      // fragment rather than IllegalArgumentException, which is too common a class to pin
-      // anything to.
+      // fragment rather than RuntimeException, which is too common a class to pin anything to.
       recordingEc.failures should have size 1
-      recordingEc.failures.head.getMessage should include("is not an absolute path")
+      recordingEc.failures.head.getMessage should include("Simulated store load failure")
 
       // The finally still released, even though the try body threw.
       host.testingOnlyActiveDeviceChecks should be(empty)
@@ -644,10 +645,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
   /** Creates `<deviceDir>/<sid.directoryName>` holding a transfer-out marker file, which is what
    *  startStoreTransferOut leaves in the source's store directory the moment a transfer begins. */
-  private def writeTransferringOutStore(deviceDir: Path, sid: StoreId = storeId): Path =
-    val storeDir = deviceDir.resolve(sid.directoryName)
-    Files.createDirectories(storeDir)
-    Files.write(storeDir.resolve(StoreTransfer.TransferOutMarkerFile), Array.emptyByteArray)
+  private def writeTransferringOutStore(deviceDir: os.Path, sid: StoreId = storeId): os.Path =
+    val storeDir = deviceDir / sid.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
     storeDir
 
   /** Stages a store that this host skipped at load time because of its transfer-out marker.
@@ -658,8 +659,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
    *  recorded attempt, not the state under test.
    */
   private def stageOfflineTransferringOutStore(host: RecordingHost,
-                                               deviceDir: Path,
-                                               sids: StoreId*): List[Path] =
+                                               deviceDir: os.Path,
+                                               sids: StoreId*): List[os.Path] =
     val dirs = sids.map(sid => writeTransferringOutStore(deviceDir, sid)).toList
     val local = host.loadedDevices(deviceA)
     local.offlineStores = local.offlineStores ++ sids
@@ -691,7 +692,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
       // Both representations of "not served" have to go. The marker is the one that survives a
       // restart, so leaving it would make the repair last only until the process bounced.
-      Files.exists(storeDir.resolve(StoreTransfer.TransferOutMarkerFile)) should be(false)
+      os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
 
       // And the load goes back through tryLoadStore rather than a parallel path, which is what
       // clears the two offlineStores sets in production. The recording override does not
@@ -723,8 +724,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       // yieldUntil gives up silently, so assert the condition it waited on.
       host.testingOnlyActiveDeviceChecks should not contain deviceA
 
-      Files.exists(outDir.resolve(StoreTransfer.TransferOutMarkerFile)) should be(true)
-      Files.exists(stagedDir.resolve(StoreTransfer.TransferOutMarkerFile)) should be(true)
+      os.exists(outDir / StoreTransfer.TransferOutMarkerFile) should be(true)
+      os.exists(stagedDir / StoreTransfer.TransferOutMarkerFile) should be(true)
       host.storeLoadAttempts.size should be(before)
 
   /** Zeroes both of `deviceId`'s ids in the storage-devices tree, exactly as
@@ -779,7 +780,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     // Where Host promotes the staged copy once the bytes "arrive": an unpacked store directory
     // with the transfer marker removed, so tryLoadStore would happily load it. It appears only
     // on completion, which keeps it out of the construction scan.
-    val arrived = deviceDir.resolve(movingStore.directoryName)
+    val arrived = deviceDir / movingStore.directoryName
 
     for
       _ <- net.createSecondDevice()
@@ -807,7 +808,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       // Not awaited: the pre-fix hazard in this area is a Future that never completes, and
       // awaiting one would hang the suite rather than fail it.
       _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
-      _ <- pumpUntil(!Files.exists(arrived))
+      _ <- pumpUntil(!os.exists(arrived))
 
       nudges = net.takeCapturedHostMessages().collect:
         case m: CheckStorageDevice => m
@@ -832,10 +833,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       host.loadStoreByIdRequests.toList should be(Nil)
 
       // And the directory goes too, or the next restart's scan loads exactly what this refused.
-      Files.exists(arrived) should be(false)
+      os.exists(arrived) should be(false)
       // Gone from staging as well, so the absence above is the promoted copy being discarded
       // rather than a copy that was never moved into place.
-      Files.exists(deviceDir.resolve(StoreTransfer.StagingDirectory).resolve(movingStore.directoryName)) should be(false)
+      os.exists(deviceDir / StoreTransfer.StagingDirectory / movingStore.directoryName) should be(false)
 
       // This runs on the destination host, so the source is a different Host and reads
       // nothing of the restore above. Its copy stays offline behind the transfer-out marker
@@ -855,7 +856,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     val host = newHost(hostRoot, transferService = transfers)
 
     val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
-    val arrived = deviceDir.resolve(movingStore.directoryName)
+    val arrived = deviceDir / movingStore.directoryName
 
     for
       _ <- net.createSecondDevice()
@@ -877,7 +878,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
       poolState.stores(movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
       host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
-      Files.exists(arrived) should be(true)
+      os.exists(arrived) should be(true)
 
   atest("a committed transfer broadcasts StoreMoved with the new host and the pool config's timestamp"):
     given ExecutionContext = executionContext
@@ -915,8 +916,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   /** A host owning the transfer destination, with the receiving half of a transfer of
    *  `movingStore` already begun through the device check, exactly as the two tests above
    *  drive it. */
-  private case class TransferInStarted(hostRoot: Path,
-                                       deviceDir: Path,
+  private case class TransferInStarted(hostRoot: os.Path,
+                                       deviceDir: os.Path,
                                        host: RecordingHost,
                                        transfers: StagedTransferService,
                                        movingStore: StoreId)
@@ -963,7 +964,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
     startTransferIn().map: t =>
       t.transfers.transfersIn.map(_._3) should be(
-        Vector(os.Path(t.deviceDir) / "transferring-in"))
+        Vector(t.deviceDir / "transferring-in"))
 
   atest("successful transfer in promotes the staged store and drops the marker"):
     given ExecutionContext = executionContext
@@ -974,7 +975,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       _ <- pumpUntil(t.host.transferOutcomes.contains(t.movingStore))
     yield
       val dirName = t.movingStore.directoryName
-      val promoted = os.Path(t.deviceDir) / dirName
+      val promoted = t.deviceDir / dirName
 
       t.host.transferOutcomes.get(t.movingStore) should be(
         Some(Host.TransferOutcome.PoolRepointed))
@@ -982,7 +983,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       // Left in place, either marker would keep the promoted store offline on every restart.
       os.exists(promoted / "transferring-out") should be(false)
       os.exists(promoted / "transferred-in") should be(false)
-      os.exists(os.Path(t.deviceDir) / "transferring-in" / dirName) should be(false)
+      os.exists(t.deviceDir / "transferring-in" / dirName) should be(false)
 
   atest("StartStoreTransfer carries the UUID registered with the service"):
     given ExecutionContext = executionContext
@@ -1067,7 +1068,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     for
       t <- startTransferIn()
       gate = t.host.holdTransferOutcomes()
-      promoted = os.Path(t.deviceDir) / t.movingStore.directoryName
+      promoted = t.deviceDir / t.movingStore.directoryName
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(os.exists(promoted))
       heldTransferringIn = t.host.testingOnlyTransferringIn
@@ -1136,7 +1137,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       _ = t.transfers.failTransferIn(t.movingStore)
       _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.contains(t.movingStore))
       // What a failed promotion leaves behind for the retry to replace.
-      staged = os.Path(t.deviceDir) / StoreTransfer.StagingDirectory / t.movingStore.directoryName
+      staged = t.deviceDir / StoreTransfer.StagingDirectory / t.movingStore.directoryName
       _ = os.makeDir.all(staged)
 
       _ <- tombstoneDevice(StorageDeviceId.BootstrapStorageDeviceId)
@@ -1178,15 +1179,15 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   atest("a stale transfer staging directory is removed when its device loads"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val staged = deviceDir.resolve(StoreTransfer.StagingDirectory).resolve(storeId.directoryName)
-    Files.createDirectories(staged)
-    Files.write(staged.resolve("partial"), Array[Byte](1, 2, 3))
+    val staged = deviceDir / StoreTransfer.StagingDirectory / storeId.directoryName
+    os.makeDir.all(staged)
+    os.write.over(staged / "partial", Array[Byte](1, 2, 3))
 
     val host = newHost(hostRoot)
 
     Future.successful:
       host.loadedDevices.keySet should be(Set(deviceA))
-      Files.exists(deviceDir.resolve(StoreTransfer.StagingDirectory)) should be(false)
+      os.exists(deviceDir / StoreTransfer.StagingDirectory) should be(false)
 
   atest("a destination crash after promotion resumes the pool update instead of loading the copy"):
     given ExecutionContext = executionContext
@@ -1197,7 +1198,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       // would: the copy is at its final path and the pool still names the source. Crash-only, so
       // the "restart" is simply a fresh Host over the same root; the held one never proceeds.
       _ = t.host.holdTransferOutcomes()
-      promoted = os.Path(t.deviceDir) / t.movingStore.directoryName
+      promoted = t.deviceDir / t.movingStore.directoryName
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(os.exists(promoted))
       markedAtCrash = os.exists(promoted / StoreTransfer.TransferredInMarkerFile)
@@ -1229,11 +1230,10 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     // honours no marker.
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
-    val storeDir = deviceDir.resolve(storeId.directoryName)
-    Files.createDirectories(storeDir)
-    Files.write(storeDir.resolve(StoreConfig.configFilename),
-                StoreConfig(storeId, StoreConfig.RocksDB()).yamlConfig.getBytes(StandardCharsets.UTF_8))
-    Files.write(storeDir.resolve(StoreTransfer.TransferredInMarkerFile), Array.emptyByteArray)
+    val storeDir = deviceDir / storeId.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB()).yamlConfig)
+    os.write.over(storeDir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
 
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
@@ -1244,7 +1244,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       host.testingOnlyOfflineStores should contain(storeId)
       host.getStoreIds should not contain storeId
       // Nothing was opened in the copy's directory.
-      Files.list(storeDir).toArray.length should be(2)
+      os.list(storeDir).length should be(2)
 
   atest("an Active store still carrying the transferred-in marker is loaded; a TransferringIn one is not"):
     val hostRoot = newHostDir()
@@ -1254,9 +1254,9 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     // Written after construction and marked offline by hand, as stageOfflineTransferringOutStore
     // does, because the recording tryLoadStore neither honours the marker nor keeps the sets.
     val List(activeDir, pendingDir) = List(storeId, storeIdB).map: sid =>
-      val dir = deviceDir.resolve(sid.directoryName)
-      Files.createDirectories(dir)
-      Files.write(dir.resolve(StoreTransfer.TransferredInMarkerFile), Array.emptyByteArray)
+      val dir = deviceDir / sid.directoryName
+      os.makeDir.all(dir)
+      os.write.over(dir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
       dir
     val local = host.loadedDevices(deviceA)
     local.offlineStores = local.offlineStores ++ Set(storeId, storeIdB)
@@ -1276,6 +1276,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
       host.testingOnlyActiveDeviceChecks should not contain deviceA
 
-      Files.exists(activeDir.resolve(StoreTransfer.TransferredInMarkerFile)) should be(false)
-      Files.exists(pendingDir.resolve(StoreTransfer.TransferredInMarkerFile)) should be(true)
+      os.exists(activeDir / StoreTransfer.TransferredInMarkerFile) should be(false)
+      os.exists(pendingDir / StoreTransfer.TransferredInMarkerFile) should be(true)
       host.storeLoadAttempts.toList.drop(before) should be(List((deviceA, activeDir)))

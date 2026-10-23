@@ -9,7 +9,6 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.aspen_ddp.aspen.server.{HostConfig, StorageDeviceManager}
 
-import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.ExecutionContext
@@ -60,11 +59,11 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
     tlsKey)
 
   /** Creates `<tmp>/host/storage-devices` and returns the host directory. */
-  private def newHostDir(): Path =
-    val base = Files.createTempDirectory("aspen-nudge-test")
-    tempRoots += os.Path(base)
-    val hostDir = base.resolve("host")
-    Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
+  private def newHostDir(): os.Path =
+    val base = os.temp.dir(prefix = "aspen-nudge-test")
+    tempRoots += base
+    val hostDir = base / "host"
+    os.makeDir.all(hostDir / StorageDeviceManager.StorageDevicesDirName)
     hostDir
 
   private def takeNudges(): List[CheckStorageDevice] =
@@ -97,7 +96,7 @@ class DeviceCheckNudgeSuite extends IntegrationTestSuite:
     // TestNetwork ships with a single storage device, so the destination has to be made.
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
-    Files.createDirectories(dir)
+    os.makeDir.all(dir)
     val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
     for
       destId <- StorageDeviceManager.createStorageDevice(

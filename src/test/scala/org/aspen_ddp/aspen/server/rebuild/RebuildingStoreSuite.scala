@@ -60,12 +60,12 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5)
       _ <- rebuild.complete
 
       // Reopen the rebuilt store and verify the objects are actually retrievable.
-      db = new BufferedConsistentRocksDB((dev / storeId.directoryName).toNIO)
+      db = new BufferedConsistentRocksDB(dev / storeId.directoryName)
       // Hand-rolled key encoding: RocksDBBackend.tokey is private and the backend's read path
       // (RocksDBBackend.read) requires a CompletionHandler, which is heavyweight for this check.
       // This couples to the encoding but is the simplest accessible read path. If
@@ -85,7 +85,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       os.exists(dev / RebuildingStore.RebuildDirectory / storeId.directoryName) should be(false)
       os.exists(finalPath / RebuildState.stateFilename) should be(false)
       // A StoreConfig is written up front, so the moved directory is loadable.
-      StoreConfig.loadStoreConfig((finalPath / StoreConfig.configFilename).toIO).storeId should
+      StoreConfig.loadStoreConfig(finalPath / StoreConfig.configFilename).storeId should
         be(storeId)
 
       // Every allocated object was reconstructed and is readable from the rebuilt store.
@@ -109,7 +109,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
     yield
@@ -130,7 +130,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       _ = os.makeDir.all(staging)
       _ = os.write.over(staging / RebuildState.stateFilename, contents)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5,
                                     testingOnlyTrackRestoredKeys = true)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -166,7 +166,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil))
 
       // The rebuild should resume from that key
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5,
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
@@ -190,7 +190,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // A checkpoint every 5 objects rather than every 1000, so the walk actually checkpoints
       // without needing a thousand allocations.
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5)
       _ <- rebuild.complete
     yield
@@ -207,7 +207,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
       doomed = Key(ids.head.toBytes)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5,
                                     testingOnlyFailKeys = Set(doomed))
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -231,7 +231,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Fail enough keys to exceed a low cap
       doomed = ids.take(15).map(id => Key(id.toBytes)).toSet
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5,
                                     testingOnlyFailKeys = doomed,
                                     maxFailedObjects = 10)
@@ -275,7 +275,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
              client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
                pool.allocationTree.set(bogusKey, Value(Array[Byte](-1, -1, -1)))
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5)
       settled <- outcomeOrStalled(rebuild)
     yield
@@ -302,7 +302,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Inject an out-of-space error on the first object
       doomed = Set(Key(ids.head.toBytes))
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev.toNIO,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
                                     checkpointInterval = 5,
                                     testingOnlyOutOfSpaceKeys = doomed)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)

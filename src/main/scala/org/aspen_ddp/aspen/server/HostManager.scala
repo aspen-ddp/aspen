@@ -5,7 +5,6 @@ import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, SecretFile}
 
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -23,20 +22,20 @@ object HostManager:
   val DefaultCrlNumStreams: Int = 3
   val DefaultCrlFileSizeMb: Int = 300
 
-  class HostAlreadyConfigured(val directory: Path)
+  class HostAlreadyConfigured(val directory: os.Path)
     extends Exception(s"$directory already contains ${HostConfig.configFilename}")
 
   /** Raised when the directory could not be prepared. Nothing is registered when this is
    *  thrown: the whole point of preparing the directory first is that this failure comes
    *  before the transaction. */
-  class DirectorySetupFailed(val directory: Path, cause: Throwable)
+  class DirectorySetupFailed(val directory: os.Path, cause: Throwable)
     extends Exception(s"Could not prepare host directory $directory: ${cause.getMessage}", cause)
 
   /** Raised when the host registration committed but its config file could not be written.
    *  Carries the id and the config text because together they are what an operator needs to
    *  finish the job by hand. */
   class ConfigWriteFailed(val hostId: HostId,
-                          val configFile: Path,
+                          val configFile: os.Path,
                           val hostConfig: HostConfig,
                           cause: Throwable)
     extends Exception(
@@ -72,7 +71,7 @@ object HostManager:
    *  and ConfigWriteFailed carries everything needed to complete it by hand.
    */
   def createHost(client: AspenClient,
-                 hostDirectory: Path,
+                 hostDirectory: os.Path,
                  bootstrapYaml: String,
                  aspenSystemId: UUID,
                  name: String,
@@ -82,23 +81,23 @@ object HostManager:
                  storeTransferPort: Int)
                 (using ExecutionContext): Future[HostId] =
 
-    val hostDir = hostDirectory.toAbsolutePath.normalize
-    val hostConfigFile = hostDir.resolve(HostConfig.configFilename)
-    val storageDevicesDir = hostDir.resolve(StorageDeviceManager.StorageDevicesDirName)
+    val hostDir = hostDirectory
+    val hostConfigFile = hostDir / HostConfig.configFilename
+    val storageDevicesDir = hostDir / StorageDeviceManager.StorageDevicesDirName
 
-    if Files.exists(hostConfigFile) then
+    if os.exists(hostConfigFile) then
       Future.failed(new HostAlreadyConfigured(hostDir))
 
     else
       val setupError =
         try
           // Creates hostDir itself as well, so the directory need not exist beforehand.
-          Files.createDirectories(storageDevicesDir)
+          os.makeDir.all(storageDevicesDir)
 
-          // REPLACE_EXISTING: reaching here means the directory holds no host config, so it is
+          // Overwrites any existing file: reaching here means the directory holds no host config, so it is
           // not an initialized host, and a bootstrap config left behind by an aborted earlier
           // run is residue rather than something worth preserving.
-          SecretFile.write(hostDir.resolve(BootstrapConfig.configFilename),
+          SecretFile.write(hostDir / BootstrapConfig.configFilename,
                            bootstrapYaml.getBytes(StandardCharsets.UTF_8))
           None
         catch
@@ -133,8 +132,7 @@ object HostManager:
               Pem.encodePrivateKey(tlsKeyPair.getPrivate)
             )
             try
-              // CREATE_NEW rather than the default CREATE|TRUNCATE_EXISTING: a full distributed
-              // transaction separates the guard above from this write, so a host config that
+              // createNew rather than overwriting: a full distributed transaction separates the guard above from this write, so a host config that
               // appeared in that window belongs to another caller and must not be clobbered.
               SecretFile.write(hostConfigFile,
                                hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8),

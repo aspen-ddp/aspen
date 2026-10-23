@@ -28,7 +28,6 @@ import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache as S
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.common.ida.IDA
 
-import java.nio.file.Path
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.language.implicitConversions
@@ -177,7 +176,7 @@ class TestNetwork(executionContext: ExecutionContext,
     client,
     HostId.BootstrapHostId,
     new UUID(0, 0),
-    Path.of("/"),
+    os.root,
     executionContext,
     objectCacheFactory,
     this,

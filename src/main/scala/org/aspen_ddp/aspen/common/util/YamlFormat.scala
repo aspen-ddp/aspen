@@ -1,6 +1,5 @@
 package org.aspen_ddp.aspen.common.util
 
-import java.io.{File, FileInputStream}
 import java.util.UUID
 
 import scala.util.Using
@@ -28,8 +27,8 @@ object YamlFormat {
     * ParserException, ComposerException -- which are not FormatErrors. A caller guarding this
     * must therefore catch YAMLException too. Main.commandErrorMessage is that caller.
     */
-  def loadYamlFile(file: File): Object = {
-    val doc = Using.resource(new FileInputStream(file)) { in =>
+  def loadYamlFile(file: os.Path): Object = {
+    val doc = Using.resource(os.read.inputStream(file)) { in =>
       new Yaml(new SafeConstructor).load[Object](in)
     }
 
@@ -103,17 +102,6 @@ object YamlFormat {
   object YString extends Format[String] {
     override def format(o: Object): String = o match {
       case v: java.lang.String => v
-      case _ => throw new FormatError(s"String Required")
-    }
-  }
-
-  object YFile extends Format[File] {
-    override def format(o: Object): File = o match {
-      case v: java.lang.String =>
-        val f = new File(v)
-        if (!f.exists())
-          throw new FormatError(s"File Not Found: $v")
-        f
       case _ => throw new FormatError(s"String Required")
     }
   }

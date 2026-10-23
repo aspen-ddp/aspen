@@ -1,14 +1,6 @@
 TODO
 ====
 
-os.Path note:
-  - can convert to java Path via os.Path.toNIO
-  - then to File via java Path.toFile()
-  - Audit the codebase for Java file/path use vs os.Path
-    - Prefer os.Path
-      - But use Java File when it is cleaner and/or easier to understand
-    - Clean up implementation to make it more consistent
-
 Add ability to read subsets of keys
   - readKeys(KeyValueObjectPointer, List[Key]): Future[KeyValueObjectState]
     - Reads just the specified keys

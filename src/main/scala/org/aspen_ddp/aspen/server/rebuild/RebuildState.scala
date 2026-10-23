@@ -5,7 +5,6 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import scribe.Logging
 
-import java.io.File
 import java.util.{HexFormat, UUID}
 import scala.util.control.NonFatal
 
@@ -73,7 +72,7 @@ object RebuildState extends YObject[RebuildState] with Logging:
       lastRestoredKey.get(o).map(s => Key(hex.parseHex(s))),
       failedObjects.get(o).map(u => ObjectId(u)))
 
-  def loadRebuildState(file: File): RebuildState =
+  def loadRebuildState(file: os.Path): RebuildState =
     create(loadYamlFile(file))
 
   /** Write the checkpoint into `path`, replacing any existing one.
@@ -111,7 +110,7 @@ object RebuildState extends YObject[RebuildState] with Logging:
       None
     else
       try
-        Some(loadRebuildState(f.toIO))
+        Some(loadRebuildState(f))
       catch
         case NonFatal(t) =>
           logger.warn(s"Discarding unreadable rebuild checkpoint $f; the rebuild will restart " +

@@ -32,13 +32,11 @@ import org.aspen_ddp.aspen.server.usage.StorageDeviceUsageManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 import org.aspen_ddp.aspen.common.rebalancing.{RebalancingDurableService, RebalancingMessage, TransferComplete}
 
-import java.io.File
 import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Success, Try}
 
 object Host:
   private sealed abstract class Event
@@ -98,13 +96,13 @@ object Host:
       host.events.add(IOCompletion(op))
 
   class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
-                                val devicePath: Path,
-                                val configFile: File):
+                                val devicePath: os.Path,
+                                val configFile: os.Path):
     var loadedStores: Set[StoreId] = Set()
     var offlineStores: Set[StoreId] = Set()
     
-    def totalSize: Long = configFile.getTotalSpace
-    def currentUsage: Long = totalSize - configFile.getFreeSpace
+    def totalSize: Long = configFile.toIO.getTotalSpace
+    def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace
 
   class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
 
@@ -119,7 +117,7 @@ object Host:
 class Host(val client: AspenClient,
                    val hostId: HostId,
                    val aspenSystemId: UUID,
-                   val rootDir: Path,
+                   val rootDir: os.Path,
                    val ec: ExecutionContext,
                    val objectCacheFactory: StoreId => ObjectCache,
                    val net: Messenger,
@@ -153,7 +151,7 @@ class Host(val client: AspenClient,
   protected var shutdownCalled = false
   private val shutdownPromise: Promise[Unit] = Promise()
 
-  val storageDevicesDir: Path = rootDir.resolve(StorageDeviceManager.StorageDevicesDirName)
+  val storageDevicesDir: os.Path = rootDir / StorageDeviceManager.StorageDevicesDirName
 
   // Append-only for the life of the process: tryLoadDevice is the only writer in production and
   // nothing anywhere removes an entry. So a device present here stays present, and a lookup miss
@@ -325,26 +323,24 @@ class Host(val client: AspenClient,
    *  precedes start(), so no event-loop thread exists yet.
    */
   private def checkForNewDevices(): Unit =
-    if ! Files.isDirectory(storageDevicesDir) then
+    if ! os.isDir(storageDevicesDir) then
       logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
     else
-      // listFiles returns null on an IO error even when isDirectory just succeeded. Unguarded
-      // that is an NPE, and the constructor and the event loop fare differently: from the
-      // constructor it would abort Host construction outright, while from the event loop
-      // start()'s catch-all would keep the loop running but report only the event class and the
-      // NPE. Warn here so both name the directory that could not be listed.
-      storageDevicesDir.toFile.listFiles() match
-        case null  => logger.warn(s"Failed to list storage devices directory: $storageDevicesDir")
-        case files => files.foreach(tryLoadDevice)
+      // Listing can fail with an IO error even when isDir just succeeded. Uncaught, the
+      // constructor and the event loop fare differently: from the constructor it would abort
+      // Host construction outright, while from the event loop start()'s catch-all would keep the
+      // loop running but report only the event class and the exception. Warn here so both name
+      // the directory that could not be listed.
+      Try(os.list(storageDevicesDir)) match
+        case Failure(t)     => logger.warn(s"Failed to list storage devices directory: $storageDevicesDir. Error: $t")
+        case Success(paths) => paths.foreach(tryLoadDevice)
 
-  private def tryLoadDevice(sdFile: File): Unit =
-    val storageDevicePath = sdFile.toPath
-    val sdCfgPath = storageDevicePath.resolve(StorageDeviceConfig.configFilename)
+  private def tryLoadDevice(storageDevicePath: os.Path): Unit =
+    val sdCfgPath = storageDevicePath / StorageDeviceConfig.configFilename
 
-    if Files.isDirectory(sdFile.toPath) && Files.exists(sdCfgPath) then
+    if os.isDir(storageDevicePath) && os.exists(sdCfgPath) then
       try
-        val configFile = sdCfgPath.toFile
-        val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(configFile)
+        val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
         if sdCfg.aspenSystemId != aspenSystemId then
           logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
         else
@@ -362,20 +358,21 @@ class Host(val client: AspenClient,
               // Nothing can be receiving onto a device that is not loaded yet, so whatever is in
               // its staging directory was left by an attempt that crashed or was abandoned. A copy
               // that had finished arriving was already moved to its final path.
-              val staging = os.Path(storageDevicePath) / StoreTransfer.StagingDirectory
+              val staging = storageDevicePath / StoreTransfer.StagingDirectory
               try os.remove.all(staging)
               catch case t: Throwable =>
                 logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
-              sdFile.listFiles match
-                case null =>
-                  // Same hazard as the scan in checkForNewDevices: listFiles returns null on
-                  // an IO error even when isDirectory just succeeded. The catch below would
-                  // absorb the resulting NPE and leave the device unregistered and retryable
-                  // just the same; this guard exists to name the directory instead.
-                  logger.warn(s"Failed to list storage device directory $sdFile. Will retry on the next scan")
-                case storeFiles =>
-                  val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, configFile)
-                  logger.info(s"Loading storage device $sdFile. StorageDeviceId ${sds.storageDeviceId}")
+              Try(os.list(storageDevicePath)) match
+                case Failure(t) =>
+                  // Same hazard as the scan in checkForNewDevices: listing can fail with an IO
+                  // error even when isDir just succeeded. The catch below would absorb the
+                  // exception and leave the device unregistered and retryable just the same;
+                  // this guard exists to name the directory instead.
+                  logger.warn(s"Failed to list storage device directory $storageDevicePath. " +
+                              s"Will retry on the next scan. Error: $t")
+                case Success(storeFiles) =>
+                  val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath)
+                  logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
                   storeFiles.foreach: potentialStoreFile =>
                     tryLoadStore(sds, potentialStoreFile)
                   // Registered only after every child has been offered to tryLoadStore. If
@@ -386,20 +383,20 @@ class Host(val client: AspenClient,
                   // resulting duplicate-backend failures.
                   storageDevices += sdCfg.storageDeviceId -> sds
       catch
-        case t: Throwable => logger.warn(s"Failed to load storage device found at path $sdFile. Error: $t")
+        case t: Throwable => logger.warn(s"Failed to load storage device found at path $storageDevicePath. Error: $t")
 
   // protected so tests can subclass with a recording implementation instead of opening a
   // real RocksDB backend. `stores` and `storageDevices` are already protected.
-  protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: File): Unit =
-    val storeCfgPath = potentialStoreFile.toPath.resolve(StoreConfig.configFilename)
-    if Files.exists(storeCfgPath) then
+  protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path): Unit =
+    val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
+    if os.exists(storeCfgPath) then
       try
-        val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath.toFile)
-        if os.exists(os.Path(potentialStoreFile) / StoreTransfer.TransferOutMarkerFile) then
+        val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
+        if os.exists(potentialStoreFile / StoreTransfer.TransferOutMarkerFile) then
           logger.info(s"Skipping load of offline store marked for transfer out. StoreId ${storeCfg.storeId}. $potentialStoreFile")
           offlineStores += storeCfg.storeId
           sds.offlineStores += storeCfg.storeId
-        else if os.exists(os.Path(potentialStoreFile) / StoreTransfer.TransferredInMarkerFile) then
+        else if os.exists(potentialStoreFile / StoreTransfer.TransferredInMarkerFile) then
           // Arrived, but the pool may still name the source. startStoreTransferIn resumes the
           // metadata step for it, and reconcileDeviceState loads it if that step already committed.
           logger.info(s"Skipping load of transferred-in store awaiting its pool update. StoreId ${storeCfg.storeId}. $potentialStoreFile")
@@ -407,7 +404,7 @@ class Host(val client: AspenClient,
           sds.offlineStores += storeCfg.storeId
         else
           val backend = storeCfg.backend match
-            case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile.toPath, storeCfg.storeId, ec)
+            case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile, storeCfg.storeId, ec)
           sds.loadedStores += backend.storeId
           sds.offlineStores -= backend.storeId
           offlineStores -= backend.storeId
@@ -451,7 +448,7 @@ class Host(val client: AspenClient,
             event = events.poll(0, TimeUnit.SECONDS)
     })
 
-  def getDevicePath(storageDeviceId: StorageDeviceId): Option[Path] = synchronized {
+  def getDevicePath(storageDeviceId: StorageDeviceId): Option[os.Path] = synchronized {
     storageDevices.get(storageDeviceId).map(_.devicePath)
   }
 
@@ -678,7 +675,7 @@ class Host(val client: AspenClient,
         logger.warn(s"Cannot discard the copy of store $storeId on unloaded device $deviceId")
 
       case Some(sds) =>
-        val storePath = os.Path(sds.devicePath) / storeId.directoryName
+        val storePath = sds.devicePath / storeId.directoryName
         if os.exists(storePath) then
           logger.warn(s"Discarding the copy of store $storeId on failed device $deviceId. " +
                       s"$reason: $storePath")
@@ -774,7 +771,7 @@ class Host(val client: AspenClient,
           // the service no longer owns. Nothing else can be receiving this store now.
           if retry.nonEmpty then
             storageDevices.get(toDeviceId).foreach: sds =>
-              val staged = os.Path(sds.devicePath) / StoreTransfer.StagingDirectory / storeId.directoryName
+              val staged = sds.devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
               try os.remove.all(staged)
               catch case t: Throwable =>
                 logger.error(s"Failed to remove the staged copy of store $storeId at $staged: $t")
@@ -830,7 +827,7 @@ class Host(val client: AspenClient,
           case Success(TransferOutcome.PoolRepointed) =>
             synchronized {
               storageDevices.get(toDeviceid).foreach: sds =>
-                if clearTransferredInMarker(storeId, os.Path(sds.devicePath) / storeId.directoryName) then
+                if clearTransferredInMarker(storeId, sds.devicePath / storeId.directoryName) then
                   loadStoreById(toDeviceid, storeId)
                 else
                   // Recorded as a restart's scan would have, which is what the transferred-in
@@ -864,7 +861,7 @@ class Host(val client: AspenClient,
 
     if ! transferringIn.contains(storeId) then
       storageDevices.get(toDeviceid).foreach: toDevice =>
-        val devicePath = os.Path(toDevice.devicePath)
+        val devicePath = toDevice.devicePath
         val finalPath = devicePath / storeId.directoryName
 
         // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
@@ -1034,7 +1031,7 @@ class Host(val client: AspenClient,
 
           fclosed.foreach: _ =>
             synchronized {
-              val storePath = os.Path(sourceDs.devicePath) / m.storeId.directoryName
+              val storePath = sourceDs.devicePath / m.storeId.directoryName
               try
                 // Written before archiving, so it travels with the store and keeps this copy
                 // offline across restarts until the transfer is resolved one way or the other.
@@ -1139,7 +1136,7 @@ class Host(val client: AspenClient,
             logger.info(s"Successfully updated host for storage device ${storageDeviceId}")
 
   private def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
-    val storePath = os.Path(local.devicePath) / storeId.directoryName
+    val storePath = local.devicePath / storeId.directoryName
 
     if ! creatingStores.contains(storeId) then
       creatingStores += storeId
@@ -1149,7 +1146,7 @@ class Host(val client: AspenClient,
       else
         client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
           val backend = pstate.backendConfig match
-            case cfg: RocksDBConfig => new RocksDBBackend(storePath.toNIO, storeId, ec)
+            case cfg: RocksDBConfig => new RocksDBBackend(storePath, storeId, ec)
 
           loadStore(local.storageDeviceId, backend)
 
@@ -1278,7 +1275,7 @@ class Host(val client: AspenClient,
                 try
                   logger.error(s"Failed to record the completed rebuild of store $storeId on " +
                                s"device ${local.storageDeviceId}. The store is on disk in " +
-                               s"${os.Path(local.devicePath) / storeId.directoryName} but is not " +
+                               s"${local.devicePath / storeId.directoryName} but is not " +
                                s"loaded, and the device entry still says Rebuilding", t)
                 finally
                   release()
@@ -1425,7 +1422,7 @@ class Host(val client: AspenClient,
       ).foreach: storeId =>
         offlineStores -= storeId
         local.offlineStores -= storeId
-        val storePath = os.Path(local.devicePath) / storeId.directoryName
+        val storePath = local.devicePath / storeId.directoryName
         if os.exists(storePath) then
           logger.info(s"Deleting successfully transferred store $storePath")
           try
@@ -1464,7 +1461,7 @@ class Host(val client: AspenClient,
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
-        os.exists(os.Path(local.devicePath) / storeId.directoryName / StoreTransfer.TransferOutMarkerFile)
+        os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile)
       ).foreach: storeId =>
         reinstateAbandonedTransferOut(local, storeId)
 
@@ -1480,13 +1477,13 @@ class Host(val client: AspenClient,
       local.offlineStores.filter(storeId =>
         !transferringIn.contains(storeId) &&
         remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-        os.exists(os.Path(local.devicePath) / storeId.directoryName / StoreTransfer.TransferredInMarkerFile)
+        os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferredInMarkerFile)
       ).foreach: storeId =>
-        val storePath = os.Path(local.devicePath) / storeId.directoryName
+        val storePath = local.devicePath / storeId.directoryName
         logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
                     s"carries its transferred-in marker. Completing the transfer and loading the store")
         if clearTransferredInMarker(storeId, storePath) then
-          tryLoadStore(local, storePath.toNIO.toFile)
+          tryLoadStore(local, storePath)
 
       //----------------------
       // New Stores
@@ -1547,7 +1544,7 @@ class Host(val client: AspenClient,
    */
   private def reinstateAbandonedTransferOut(local: LocalStorageDeviceState,
                                             storeId: StoreId): Unit =
-    val storePath = os.Path(local.devicePath) / storeId.directoryName
+    val storePath = local.devicePath / storeId.directoryName
 
     logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline behind a " +
                 s"transfer-out marker, but the storage-devices tree records it as Active with " +
@@ -1566,7 +1563,7 @@ class Host(val client: AspenClient,
           false
 
     if markerRemoved then
-      tryLoadStore(local, storePath.toNIO.toFile)
+      tryLoadStore(local, storePath)
       if !local.offlineStores.contains(storeId) then
         gossipStoreOnline(storeId)
 
@@ -2052,17 +2049,17 @@ class Host(val client: AspenClient,
         stores += (backend.storeId -> store)
         offlineStores -= backend.storeId
 
-        if Files.exists(backend.crlSaveFile) then
+        if os.exists(backend.crlSaveFile) then
           val (storeId, trs) = CrashRecoveryLog.loadStoreState(backend.crlSaveFile)
           crl.loadStore(storeId, trs).foreach: _ =>
-            Files.delete(backend.crlSaveFile)
+            os.remove(backend.crlSaveFile)
             p.success(())
         else
           p.success(())
 
       case LoadStoreById(storageDeviceId, storeId) =>
         storageDevices.get(storageDeviceId).foreach: sds =>
-          tryLoadStore(sds, sds.devicePath.resolve(storeId.directoryName).toFile)
+          tryLoadStore(sds, sds.devicePath / storeId.directoryName)
         
       case HeartbeatEvent() =>
         //logger.trace("Main loop got heartbeat event")

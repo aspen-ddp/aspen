@@ -84,8 +84,8 @@ object GossipRetransmitter extends Logging:
   val Lifetime: FiniteDuration = 24.hours
 
   /** `<host-dir>/cache/retransmitting-gossip-messages.yaml` */
-  def stateFile(hostDir: java.nio.file.Path): os.Path =
-    os.Path(hostDir.toAbsolutePath) / "cache" / StateFilename
+  def stateFile(hostDir: os.Path): os.Path =
+    hostDir / "cache" / StateFilename
 
   private object YInstant extends Format[Instant]:
     override def format(o: Object): Instant = o match
@@ -139,7 +139,7 @@ object GossipRetransmitter extends Logging:
       Map()
     else
       try
-        YState.format(loadYamlFile(file.toIO))
+        YState.format(loadYamlFile(file))
       catch
         case NonFatal(t) =>
           logger.warn(s"Discarding unreadable gossip retransmit state $file: $t")

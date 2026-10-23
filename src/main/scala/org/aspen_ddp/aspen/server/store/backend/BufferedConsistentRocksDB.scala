@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen.server.store.backend
 import org.rocksdb.{FlushOptions, RocksDB, WriteBatch, WriteOptions}
 import scribe.Logging
 
-import java.nio.file.Path
 import scala.collection.immutable.ArraySeq
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
@@ -31,7 +30,7 @@ object BufferedConsistentRocksDB {
   *  their batch reaches disk and must not be modified by the caller in the interim.
   *
   */
-class BufferedConsistentRocksDB(val dbPath:Path)(using ec: ExecutionContext) extends Logging {
+class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext) extends Logging {
 
   import BufferedConsistentRocksDB._
 

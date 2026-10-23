@@ -4,8 +4,6 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.charset.StandardCharsets
-import java.nio.file.Files
 import java.util.UUID
 
 class StorageDeviceConfigSuite extends AnyFunSuite with Matchers:
@@ -25,26 +23,26 @@ class StorageDeviceConfigSuite extends AnyFunSuite with Matchers:
     sample.yamlConfig should not include "StorageDeviceId("
 
   test("loadStorageDeviceConfig round-trips yamlConfig"):
-    val f = Files.createTempFile("aspen-storage-device-config", ".yaml")
+    val f = os.temp(prefix = "aspen-storage-device-config", suffix = ".yaml")
     try
-      Files.write(f, sample.yamlConfig.getBytes(StandardCharsets.UTF_8))
-      StorageDeviceConfig.loadStorageDeviceConfig(f.toFile) should be(sample)
+      os.write.over(f, sample.yamlConfig)
+      StorageDeviceConfig.loadStorageDeviceConfig(f) should be(sample)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """storage-device-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000
 """
 
-    val f = Files.createTempFile("aspen-storage-device-docexample", ".yaml")
+    val f = os.temp(prefix = "aspen-storage-device-docexample", suffix = ".yaml")
     try
-      Files.write(f, docExampleYaml.getBytes(StandardCharsets.UTF_8))
-      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(f.toFile)
+      os.write.over(f, docExampleYaml)
+      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(f)
 
       cfg.storageDeviceId should be(StorageDeviceId(zero))
       cfg.aspenSystemId should be(zero)
 
       StorageDeviceConfig(StorageDeviceId(zero), zero).yamlConfig should be(docExampleYaml)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)

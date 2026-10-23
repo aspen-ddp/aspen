@@ -14,7 +14,6 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 
-import java.nio.file.Path
 import scala.concurrent.{Future, Promise}
 
 
@@ -55,7 +54,7 @@ class Frontend(val storeId: StoreId,
 
   def close(): Future[Unit] = backend.close()
 
-  def path: Path = backend.path
+  def path: os.Path = backend.path
 
   def commit(os: ObjectState, cs: CommitState, txid: TransactionId): Unit =
     if os.metadata.refcount.count == 0 then

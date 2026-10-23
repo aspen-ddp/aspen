@@ -12,7 +12,6 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.byte2uuid
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 
-import java.io.File
 import java.nio.charset.StandardCharsets
 import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
@@ -134,7 +133,7 @@ object BootstrapConfig:
       caCertificate.get(o))
 
 
-  def loadBootstrapConfig(file: File): Config =
+  def loadBootstrapConfig(file: os.Path): Config =
     Config.create(loadYamlFile(file))
 
   /** Parses a bootstrap config held in memory, applying the same `Config` validation

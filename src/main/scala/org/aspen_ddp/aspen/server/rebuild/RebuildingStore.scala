@@ -11,7 +11,6 @@ import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
 import scribe.Logging
 
-import java.nio.file.Path
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.control.NonFatal
@@ -43,7 +42,7 @@ object RebuildingStore:
 class RebuildingStore(client: AspenClient,
                       val storeId: StoreId,
                       storageDeviceId: StorageDeviceId,
-                      devicePath: Path,
+                      devicePath: os.Path,
                       checkpointInterval: Int = RebuildingStore.CheckpointInterval,
                       testingOnlyFailKeys: Set[Key] = Set(),
                       testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
@@ -54,8 +53,8 @@ class RebuildingStore(client: AspenClient,
 
   private given ExecutionContext = client.clientContext
 
-  private val stagingPath = os.Path(devicePath) / RebuildDirectory / storeId.directoryName
-  private val finalPath = os.Path(devicePath) / storeId.directoryName
+  private val stagingPath = devicePath / RebuildDirectory / storeId.directoryName
+  private val finalPath = devicePath / storeId.directoryName
 
   private val completionPromise: Promise[Unit] = Promise()
   def complete: Future[Unit] = completionPromise.future
@@ -155,7 +154,7 @@ class RebuildingStore(client: AspenClient,
       pstate <- client.getStoragePoolState(storeId.poolId)
       _ = synchronized:
             backend = pstate.backendConfig match
-              case _: RocksDBConfig => new RocksDBBackend(stagingPath.toNIO, storeId, summon)
+              case _: RocksDBConfig => new RocksDBBackend(stagingPath, storeId, summon)
       pool <- client.getStoragePool(storeId.poolId)
       tree = pool.allocationTree
       _ <- resume.flatMap(_.lastRestoredKey) match

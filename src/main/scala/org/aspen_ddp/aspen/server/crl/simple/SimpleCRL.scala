@@ -5,7 +5,6 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import scribe.Logging
 
-import java.nio.file.Path
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import scala.collection.immutable.HashMap
@@ -36,7 +35,7 @@ object SimpleCRL:
   case class InitialCRLState(crl: SimpleCRL,
                              trsList: List[TransactionRecoveryState])
 
-  case class Factory(streamsDir: Path,
+  case class Factory(streamsDir: os.Path,
                      numStreams: Int,
                      maxSizeInBytes: Long) extends CrashRecoveryLogFactory:
     def createCRL(): CrashRecoveryLog =
@@ -44,9 +43,9 @@ object SimpleCRL:
 
 
 
-  def apply(streamsDir: Path, numStreams: Int, maxSizeInBytes: Long): InitialCRLState =
-    val files: List[(StreamId, Path)] = (0 until numStreams).map(i =>
-      (StreamId(i), streamsDir.resolve(s"$i.crl"))
+  def apply(streamsDir: os.Path, numStreams: Int, maxSizeInBytes: Long): InitialCRLState =
+    val files: List[(StreamId, os.Path)] = (0 until numStreams).map(i =>
+      (StreamId(i), streamsDir / s"$i.crl")
     ).toList
 
     val r = Recovery.recover(files)
@@ -60,7 +59,7 @@ object SimpleCRL:
 
 
 class SimpleCRL private (val maxSizeInBytes: Long,
-                         files: List[(StreamId, Path)],
+                         files: List[(StreamId, os.Path)],
                          r: Recovery.Result) extends CrashRecoveryLog with Logging:
 
   import SimpleCRL._

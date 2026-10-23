@@ -44,9 +44,9 @@ import scopt.OptionDef
 import scribe.Logging
 import scribe.format.{FormatterInterpolator, classNameSimple, dateFull, line, mdc, messages, methodName}
 
-import java.io.{File, StringReader}
+import java.io.StringReader
 import java.nio.charset.StandardCharsets
-import java.nio.file.{FileAlreadyExistsException, Files, Path}
+import java.nio.file.FileAlreadyExistsException
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import java.util.concurrent.{Executors, TimeoutException}
@@ -85,9 +85,9 @@ object Main {
   private var onetwork: Option[NetworkPlugin] = None
 
   case class Args(mode:String="",
-                  hostDirectory:File=null,
-                  targetDirectory:File=null,
-                  clientConfigFile:File=null,
+                  hostDirectory:os.Path=null,
+                  targetDirectory:os.Path=null,
+                  clientConfigFile:os.Path=null,
                   bootstrapHost:Option[ClientConfig.BootstrapEndpoint]=None,
                   hostName:String="",
                   storeName:String="",
@@ -118,7 +118,7 @@ object Main {
                   fsName:String="",
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
-                  networkCacheDir:Option[File]=None)
+                  networkCacheDir:Option[os.Path]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
 
@@ -224,6 +224,9 @@ object Main {
 
   private type ArgParser = scopt.OptionParser[Args]
 
+  // Relative path arguments are resolved against the directory the user invoked the CLI from
+  private given scopt.Read[os.Path] = scopt.Read.reads(os.Path(_, os.pwd))
+
   /** One subcommand of the CLI.
    *
    *  Commands, below, is the single source of truth for the command set: buildParser
@@ -249,11 +252,11 @@ object Main {
    *  system. Only bootstrap and host do not: bootstrap has no system to reach yet, and host
    *  reads the bootstrap config from its own directory so MetadataManager can keep it up to date.
    */
-  private def clientConfigArg(p: ArgParser): OptionDef[File, Args] =
+  private def clientConfigArg(p: ArgParser): OptionDef[os.Path, Args] =
     import p.*
-    arg[File]("<client-config-file>").text("Client configuration file (aspen-client-config.yaml)").
+    arg[os.Path]("<client-config-file>").text("Client configuration file (aspen-client-config.yaml)").
       action((x, c) => c.copy(clientConfigFile = x)).
-      validate(x => if (x.exists()) success else failure(s"Config file does not exist: $x"))
+      validate(x => if (os.exists(x)) success else failure(s"Config file does not exist: $x"))
 
   /** Accompanies clientConfigArg on every command that takes it. Lets the user reach a system
    *  whose cached bootstrap hosts have all moved or gone.
@@ -320,10 +323,10 @@ object Main {
       // Unlike every other directory argument in this parser, the target is not required
       // to exist: bootstrap creates it. Bootstrapping over an existing system is caught
       // later by the bootstrap-host check in bootstrap() itself.
-      arg[File]("<target-directory>").text("Directory the bootstrap host, its stores, and aspen-client-config.yaml are created under").
+      arg[os.Path]("<target-directory>").text("Directory the bootstrap host, its stores, and aspen-client-config.yaml are created under").
         action((x, c) => c.copy(targetDirectory = x)).
         validate { x =>
-          if !x.exists() || x.isDirectory then
+          if !os.exists(x) || os.isDir(x) then
             success
           else
             failure(s"Not a directory: $x")
@@ -353,9 +356,9 @@ object Main {
     List(
       // No bootstrap config argument: the host reads it from its own directory so that
       // MetadataManager can keep the file up to date as the bootstrap pool moves.
-      arg[File]("<host-directory>").text("Host Directory").
+      arg[os.Path]("<host-directory>").text("Host Directory").
         action( (x, c) => c.copy(hostDirectory=x)).
-        validate( x => if (x.exists()) success else failure(s"Host directory does not exist: $x"))
+        validate( x => if (os.exists(x)) success else failure(s"Host directory does not exist: $x"))
     )
 
   private def amoebafsArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -364,7 +367,7 @@ object Main {
       clientConfigArg(p),
       bootstrapHostOption(p),
 
-      p.opt[File]("network-cache-dir").valueName("<dir>").
+      p.opt[os.Path]("network-cache-dir").valueName("<dir>").
         text("Directory in which to cache network lookups across restarts. It must not be shared by two AmoebaFS processes").
         action((x, c) => c.copy(networkCacheDir = Some(x))),
 
@@ -509,10 +512,10 @@ object Main {
       // Unlike the <host-directory> of host and create-storage-device, this one is not
       // required to exist: add-host creates it. An already-initialized directory is
       // caught by the host-config check in HostManager.createHost.
-      arg[File]("<host-directory>").text("Directory to initialize as the new host's root").
+      arg[os.Path]("<host-directory>").text("Directory to initialize as the new host's root").
         action((x, c) => c.copy(hostDirectory = x)).
         validate { x =>
-          if !x.exists() || x.isDirectory then
+          if !os.exists(x) || os.isDir(x) then
             success
           else
             failure(s"Not a directory: $x")
@@ -534,9 +537,9 @@ object Main {
       clientConfigArg(p),
       bootstrapHostOption(p),
 
-      arg[File]("<host-directory>").text("Host Directory").
+      arg[os.Path]("<host-directory>").text("Host Directory").
         action((x, c) => c.copy(hostDirectory = x)).
-        validate(x => if (x.exists()) success else failure(s"Host directory does not exist: $x")),
+        validate(x => if (os.exists(x)) success else failure(s"Host directory does not exist: $x")),
 
       arg[String]("<device-name>").text(s"Name of the already-provisioned device directory under <host-directory>/${StorageDeviceManager.StorageDevicesDirName}").
         action((x, c) => c.copy(deviceName = stripTrailingSlash(x))).
@@ -791,23 +794,17 @@ object Main {
 
     val exitCode = parser.parse(args, Args()) match
       case Some(cfg) =>
-        // Path arguments are resolved by the JVM against the process cwd, which is the
-        // directory the user invoked the CLI from, so they arrive here still relative.
-        // os.Path rejects relative paths outright, and the commands taking a directory
-        // resolve further paths beneath it. Normalize once here rather than at each use.
-        def absPath(f: File): Path = f.toPath.toAbsolutePath.normalize
-
         // A def so that only the commands that reach a running system fetch the bootstrap config.
         def session: ClientSession =
-          openClientSession(absPath(cfg.clientConfigFile), cfg.bootstrapHost)
+          openClientSession(cfg.clientConfigFile, cfg.bootstrapHost)
 
         try
           //println(s"Config file: $config")
           cfg.mode match
-            case "bootstrap" => bootstrap(createIDA(cfg), absPath(cfg.targetDirectory), cfg.address,
+            case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory, cfg.address,
                                           cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
-            case "host" => run_host(absPath(cfg.hostDirectory))
-            case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir.map(absPath))
+            case "host" => run_host(cfg.hostDirectory)
+            case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
             case "create-pool" => create_pool(session, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
@@ -819,10 +816,10 @@ object Main {
             case "move-device-to-set" => move_device_to_set(session, cfg.deviceId, cfg.deviceSetName)
             case "fail-storage-device" => fail_storage_device(session, cfg.deviceId)
             case "add-host" => add_host(session,
-                                        absPath(cfg.hostDirectory), cfg.hostName, cfg.address,
+                                        cfg.hostDirectory, cfg.hostName, cfg.address,
                                         cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
             case "create-storage-device" => create_storage_device(session,
-                                                                  absPath(cfg.hostDirectory), cfg.deviceName,
+                                                                  cfg.hostDirectory, cfg.deviceName,
                                                                   cfg.deviceSetName)
             case "transfer-store" => transfer_store(session, cfg.storeName, cfg.host)
             case "rebalance" => rebalance(session, cfg.setId)
@@ -884,16 +881,16 @@ object Main {
                     ohost: Option[(HostId, Int)],
                     oclientId: Option[ClientId],
                     tls: TlsCredentials,
-                    ohostDir: Option[Path] = None,
-                    onetworkCacheDir: Option[Path] = None): (NetworkBridge, NetworkPlugin) = {
+                    ohostDir: Option[os.Path] = None,
+                    onetworkCacheDir: Option[os.Path] = None): (NetworkBridge, NetworkPlugin) = {
     val b = new NetworkBridge
 
     val heartbeatPeriod = Duration(10, SECONDS)
     val cache: NetworkCache = (ohostDir, onetworkCacheDir) match
       case (Some(hostDir), _) =>
-        NetworkCache.open(NetworkCache.directoryFor(os.Path(hostDir.toAbsolutePath)), bootstrapConfig.aspenSystemId)
+        NetworkCache.open(NetworkCache.directoryFor(hostDir), bootstrapConfig.aspenSystemId)
       case (None, Some(dir)) =>
-        NetworkCache.open(os.Path(dir.toAbsolutePath), bootstrapConfig.aspenSystemId)
+        NetworkCache.open(dir, bootstrapConfig.aspenSystemId)
       case (None, None) => NetworkCache.NoCache
     requireQuic(Quic.isAvailable, Quic.unavailabilityCause())
     val net: NetworkPlugin = new QuicNet(bootstrapConfig, onRefresh, oclientId, ohost, heartbeatPeriod, b, tls,
@@ -907,7 +904,7 @@ object Main {
   /** What a client command starts from: its client config and the bootstrap config fetched
    *  with it. `clientConfig` is the config as last written, cached host list included.
    */
-  case class ClientSession(clientConfigFile: Path,
+  case class ClientSession(clientConfigFile: os.Path,
                            clientConfig: ClientConfig.Config,
                            bootstrapYaml: String,
                            bootstrapConfig: BootstrapConfig.Config)
@@ -916,7 +913,7 @@ object Main {
    *  hosts from it. A cache that cannot be written is a warning, not a failure: the fetched
    *  config is just as usable.
    */
-  def openClientSession(clientConfigFile: Path,
+  def openClientSession(clientConfigFile: os.Path,
                         bootstrapHost: Option[ClientConfig.BootstrapEndpoint]): ClientSession =
     val clientConfig =
       try ClientConfig.load(clientConfigFile)
@@ -928,7 +925,7 @@ object Main {
     ClientSession(clientConfigFile, current, fetched.yaml, fetched.config)
 
   /** Returns the client config as last written: `current` unless this call wrote a new one. */
-  private def refreshCachedHosts(clientConfigFile: Path,
+  private def refreshCachedHosts(clientConfigFile: os.Path,
                                  current: ClientConfig.Config,
                                  fetched: BootstrapConfig.Config): ClientConfig.Config =
     ClientConfig.updateCachedHosts(clientConfigFile, current, fetched) match
@@ -944,7 +941,7 @@ object Main {
    *  the client runs -- amoebafs runs indefinitely -- keep the cached host list current too.
    */
   def createAspenClient(session: ClientSession,
-                        onetworkCacheDir: Option[Path] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) =
+                        onetworkCacheDir: Option[os.Path] = None): (AspenClient, NetworkPlugin, KeyValueObjectPointer) =
     // Compared against what was last written rather than what the session started with, so a
     // host set that moves and then moves back is written both times. Refreshes are serialized
     // on the reference so two cannot both compare against the same stale config.
@@ -964,7 +961,7 @@ object Main {
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
                         tls: TlsCredentials,
                         onnet: Option[(NetworkBridge, NetworkPlugin)],
-                        onetworkCacheDir: Option[Path]): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
+                        onetworkCacheDir: Option[os.Path]): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
 
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls, None, onetworkCacheDir))
 
@@ -1091,7 +1088,7 @@ object Main {
       ()
   }
 
-  def run_amoebafs(session: ClientSession, fsName: String, onetworkCacheDir: Option[Path] = None): Int = {
+  def run_amoebafs(session: ClientSession, fsName: String, onetworkCacheDir: Option[os.Path] = None): Int = {
     configureLogging()
 
     val (client, network, radicle) = createAspenClient(session, onetworkCacheDir)
@@ -1168,7 +1165,7 @@ object Main {
     def stop(): Unit = stopAction()
 
   /** Starts the `host` command: blocks forever once the host is running. */
-  def run_host(hostDir: Path): Int = {
+  def run_host(hostDir: os.Path): Int = {
     configureLogging()
 
     val h = startHost(hostDir)
@@ -1186,31 +1183,28 @@ object Main {
    *  Logging is left alone so an in-process caller (a test) keeps its own configuration;
    *  run_host configures it first.
    */
-  def startHost(hostDir: Path): RunningHost = {
+  def startHost(hostDir: os.Path): RunningHost = {
 
     val sched = Executors.newScheduledThreadPool(3)
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
 
-    // Absolute: os.Path rejects relative paths and <host-directory> is usually given as one.
-    val absHostDir = hostDir.toAbsolutePath
+    val cfgFile = hostDir / HostConfig.configFilename
 
-    val cfgFile = absHostDir.resolve(HostConfig.configFilename)
-
-    if ! Files.exists(cfgFile) then
+    if ! os.exists(cfgFile) then
       throw Exception(s"Host config file not found: $cfgFile")
 
-    val hostCfg = HostConfig.loadHostConfig(cfgFile.toFile)
+    val hostCfg = HostConfig.loadHostConfig(cfgFile)
 
     // Must precede the opening of any store
     RocksDBBackend.configureResources(hostCfg.rocksdb.resourceConfig)
 
-    val bsCfgFile = absHostDir.resolve(BootstrapConfig.configFilename)
+    val bsCfgFile = hostDir / BootstrapConfig.configFilename
 
-    if ! Files.exists(bsCfgFile) then
+    if ! os.exists(bsCfgFile) then
       throw Exception(s"Bootstrap config file not found: $bsCfgFile")
 
-    val bootstrapCfg = BootstrapConfig.loadBootstrapConfig(bsCfgFile.toFile)
+    val bootstrapCfg = BootstrapConfig.loadBootstrapConfig(bsCfgFile)
 
     // Keeps the host directory's copy current, so a restart starts from the refreshed placements.
     // A failed write is logged by the MetadataManager, which calls this.
@@ -1220,9 +1214,8 @@ object Main {
 
     val simpleCrl = hostCfg.crl match {
       case b: HostConfig.SimpleCRL =>
-        val crlRoot = absHostDir.resolve("crl")
-        if ! Files.exists(crlRoot) then
-          mkdirectory(crlRoot)
+        val crlRoot = hostDir / "crl"
+        os.makeDir.all(crlRoot)
         SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024)
     }
 
@@ -1240,7 +1233,7 @@ object Main {
 
     val (networkBridge, nnet) = createNetwork(bootstrapCfg, onBootstrapConfigRefreshed,
                                               Some((hostCfg.hostId, hostCfg.dataPort)), None, tls,
-                                              Some(absHostDir))
+                                              Some(hostDir))
 
     val (client, network, _) = createAspenClient(bootstrapCfg, onBootstrapConfigRefreshed, tls,
                                                  Some((networkBridge, nnet)), None)
@@ -1261,7 +1254,7 @@ object Main {
       client,
       hostCfg.hostId,
       bootstrapCfg.aspenSystemId,
-      absHostDir,
+      hostDir,
       ec,
       objectCacheFactory,
       nodeNet,
@@ -1282,7 +1275,7 @@ object Main {
     // and ends the command, which is preferable to running a host that cannot be bootstrapped from.
     val httpServer = new BootstrapHttpServer(hostCfg.httpPort,
                                              () => client.getBootstrapConfig(),
-                                             () => Files.readString(bsCfgFile))
+                                             () => os.read(bsCfgFile))
     httpServer.start()
 
     host.start()
@@ -1312,12 +1305,8 @@ object Main {
     RunningHost(host, network, client)(() => stop())
   }
 
-  def mkdirectory(p: Path): Unit = {
-    Files.createDirectories(p)
-  }
-
   def bootstrap(bootstrapIda: IDA,
-                baseDirectory: Path, // created if it does not already exist
+                baseDirectory: os.Path, // created if it does not already exist
                 address: String, // advertised to other hosts; never bound to
                 dataPort: Int,
                 httpPort: Int,
@@ -1327,21 +1316,19 @@ object Main {
       println(s"Warning: '$address' is not reachable from other machines. Hosts added to this " +
               "system later will not be able to connect to the bootstrap host.")
 
-    val hostDirectory = baseDirectory.resolve("bootstrap-host")
+    val hostDirectory = baseDirectory / "bootstrap-host"
 
-    if Files.exists(hostDirectory) then
+    if os.exists(hostDirectory) then
       throw new Exception(s"Bootstrap host directory exists: $hostDirectory")
 
     val sched = Executors.newScheduledThreadPool(1)
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
 
-    val storageDevicesDir = hostDirectory.resolve(StorageDeviceManager.StorageDevicesDirName)
-    val bootstrapDevDir = storageDevicesDir.resolve("bootstrap-device")
+    val storageDevicesDir = hostDirectory / StorageDeviceManager.StorageDevicesDirName
+    val bootstrapDevDir = storageDevicesDir / "bootstrap-device"
 
-    Files.createDirectories(hostDirectory)
-    Files.createDirectories(storageDevicesDir)
-    Files.createDirectories(bootstrapDevDir)
+    os.makeDir.all(bootstrapDevDir)
 
     val aspenSystemId = UUID.randomUUID()
 
@@ -1366,16 +1353,13 @@ object Main {
     )
 
     SecretFile.write(
-      hostDirectory.resolve(HostConfig.configFilename),
+      hostDirectory / HostConfig.configFilename,
       hostConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
     )
 
     val storageDevConfig = StorageDeviceConfig(StorageDeviceId(UUID.randomUUID()), aspenSystemId)
 
-    Files.write(
-      bootstrapDevDir.resolve(StorageDeviceConfig.configFilename),
-      storageDevConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
-    )
+    os.write(bootstrapDevDir / StorageDeviceConfig.configFilename, storageDevConfig.yamlConfig)
 
     val bootstrapStores =
       for
@@ -1383,15 +1367,12 @@ object Main {
       yield
 
         val storeId = StoreId(PoolId.BootstrapPoolId, poolIndex.toByte)
-        val storeRoot = bootstrapDevDir.resolve(storeId.toString)
+        val storeRoot = bootstrapDevDir / storeId.toString
         val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB())
 
         println(s"Creating data store $storeId. Path $storeRoot")
-        mkdirectory(storeRoot)
-        Files.write(
-          storeRoot.resolve(StoreConfig.configFilename),
-          storeConfig.yamlConfig.getBytes(StandardCharsets.UTF_8)
-        )
+        os.makeDir.all(storeRoot)
+        os.write(storeRoot / StoreConfig.configFilename, storeConfig.yamlConfig)
         new RocksDBBackend(storeRoot, storeId, ec)
 
     val bootstrapStorageDevice = StorageDeviceState(
@@ -1419,7 +1400,7 @@ object Main {
     // host process on the command line: MetadataManager rewrites this file in place as the
     // bootstrap pool moves.
     SecretFile.write(
-      hostDirectory.resolve(BootstrapConfig.configFilename),
+      hostDirectory / BootstrapConfig.configFilename,
       BootstrapConfig.generateBootstrapConfig(
         aspenSystemId = aspenSystemId,
         ida = bootstrapIda,
@@ -1439,7 +1420,7 @@ object Main {
 
     // Every other command starts from this file, fetching the bootstrap config from the hosts
     // it caches. It holds the client's private key and is written owner-only.
-    val clientConfigFile = baseDirectory.resolve(ClientConfig.configFilename)
+    val clientConfigFile = baseDirectory / ClientConfig.configFilename
     ClientConfig.write(clientConfigFile, ClientConfig.Config(
       aspenSystemId,
       ClientConfig.ClientCredentials.generate(ca),
@@ -1744,7 +1725,7 @@ object Main {
       case Failure(err) => reportError(err)
 
   def add_host(session: ClientSession,
-               hostDirectory: Path,
+               hostDirectory: os.Path,
                hostName: String,
                address: String,
                dataPort: Int,
@@ -1757,7 +1738,7 @@ object Main {
       println(s"Warning: '$address' is not reachable from other machines. Other hosts in this " +
               "system will not be able to connect to this one.")
 
-    val hostDir = hostDirectory.toAbsolutePath.normalize
+    val hostDir = hostDirectory
 
     val (client, network, _) = createAspenClient(session)
 
@@ -1807,19 +1788,19 @@ object Main {
   }
 
   def create_storage_device(session: ClientSession,
-                            hostDirectory: Path,
+                            hostDirectory: os.Path,
                             deviceName: String,
                             setRef: String): Int = {
 
     configureLogging()
 
-    val hostConfigFile = hostDirectory.resolve(HostConfig.configFilename)
+    val hostConfigFile = hostDirectory / HostConfig.configFilename
 
-    if !Files.isRegularFile(hostConfigFile) then
+    if !os.isFile(hostConfigFile) then
       println(s"Error: host configuration file not found: $hostConfigFile")
       1
     else
-      val hostCfg = HostConfig.loadHostConfig(hostConfigFile.toFile)
+      val hostCfg = HostConfig.loadHostConfig(hostConfigFile)
 
       // The device directory is required to sit at a fixed location, so the CLI takes the
       // bare name. The <device-name> validator already rejects everything path-shaped, so

@@ -5,7 +5,6 @@ import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import scribe.Logging
 
-import java.nio.file.Path
 import java.util.UUID
 import scala.annotation.tailrec
 import scala.collection.immutable.HashMap
@@ -20,7 +19,7 @@ object Recovery extends Logging:
                     initialPreviousEntryLocation: StreamLocation,
                     trsList: List[TransactionRecoveryState])
 
-  def recover(files: List[(StreamId, Path)]): Result =
+  def recover(files: List[(StreamId, os.Path)]): Result =
     val readers = files.sortBy(_._1.number).map(t => StreamReader(t._1, t._2)).toArray
     val rs = LogEntry.RecoveringState(HashMap(), Set())
     var highestHead: Option[(StreamId, LogEntry.EntryHeader)] = None

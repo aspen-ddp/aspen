@@ -6,17 +6,15 @@ import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
 
 import java.nio.{ByteBuffer, ByteOrder}
-import java.nio.file.{Files, Path, StandardOpenOption}
 import java.util.UUID
 import scala.concurrent.{Future, Promise}
 
 object CrashRecoveryLog:
   def saveStoreState(storeId: StoreId,
                      trsList: List[TransactionRecoveryState],
-                     saveFilePath: Path): Unit =
+                     saveFilePath: os.Path): Unit =
 
-    val fos = Files.newOutputStream(saveFilePath,
-      StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
+    val fos = os.write.over.outputStream(saveFilePath)
 
     val header = new Array[Byte](17)
 
@@ -43,9 +41,9 @@ object CrashRecoveryLog:
 
     fos.close()
 
-  def loadStoreState(saveFilePath: Path): (StoreId, List[TransactionRecoveryState]) =
+  def loadStoreState(saveFilePath: os.Path): (StoreId, List[TransactionRecoveryState]) =
     var trsList: List[TransactionRecoveryState] = Nil
-    val fc = Files.newByteChannel(saveFilePath)
+    val fc = os.read.channel(saveFilePath)
 
     val header = ByteBuffer.allocate(17)
     header.order(ByteOrder.BIG_ENDIAN)

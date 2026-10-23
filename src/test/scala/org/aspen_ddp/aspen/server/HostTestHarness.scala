@@ -13,9 +13,6 @@ import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.Host.RebuildOutcome
 
-import java.io.File
-import java.nio.charset.StandardCharsets
-import java.nio.file.{Files, Path}
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 import scala.collection.mutable
@@ -35,15 +32,15 @@ trait HostTestHarness:
    *  belong to, so those devices are accepted. */
   protected val systemId = UUID.fromString("33333333-3333-3333-3333-333333333333")
 
-  protected val tempRoots = mutable.ListBuffer[Path]()
+  protected val tempRoots = mutable.ListBuffer[os.Path]()
 
   override def subFixtureTeardown(): Unit =
     tempRoots.foreach(deleteTree)
     tempRoots.clear()
 
   /** Removes a tree. Failures are ignored; these are temp dirs. */
-  protected def deleteTree(root: Path): Unit =
-    try os.remove.all(os.Path(root))
+  protected def deleteTree(root: os.Path): Unit =
+    try os.remove.all(root)
     catch case _: Throwable => ()
 
   /** Returns a Future that completes once `condition` holds, re-testing it after every yield
@@ -104,35 +101,33 @@ trait HostTestHarness:
 
   /** Creates `<tmp>/host/storage-devices` and returns the host root directory. Pass
    *  `withStorageDevicesDir = false` to leave the `storage-devices` child absent. */
-  protected def newHostDir(withStorageDevicesDir: Boolean = true): Path =
-    val base = Files.createTempDirectory("aspen-device-discovery")
+  protected def newHostDir(withStorageDevicesDir: Boolean = true): os.Path =
+    val base = os.temp.dir(prefix = "aspen-device-discovery", deleteOnExit = false)
     tempRoots += base
-    val hostDir = base.resolve("host")
+    val hostDir = base / "host"
     if withStorageDevicesDir then
-      Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
+      os.makeDir.all(hostDir / StorageDeviceManager.StorageDevicesDirName)
     else
-      Files.createDirectories(hostDir)
+      os.makeDir.all(hostDir)
     hostDir
 
   /** Creates `<hostRoot>/storage-devices/<name>` with a device config naming `deviceId`. */
-  protected def writeDevice(hostRoot: Path,
+  protected def writeDevice(hostRoot: os.Path,
                             name: String,
                             deviceId: StorageDeviceId,
-                            sysId: UUID = systemId): Path =
+                            sysId: UUID = systemId): os.Path =
     val dir = StorageDeviceManager.deviceDirectory(hostRoot, name)
-    Files.createDirectories(dir)
+    os.makeDir.all(dir)
     writeDeviceConfig(dir, deviceId, sysId)
     dir
 
   /** Writes only the config file into an existing device directory. */
-  protected def writeDeviceConfig(deviceDir: Path,
+  protected def writeDeviceConfig(deviceDir: os.Path,
                                   deviceId: StorageDeviceId,
                                   sysId: UUID = systemId): Unit =
-    Files.write(
-      deviceDir.resolve(StorageDeviceConfig.configFilename),
-      StorageDeviceConfig(deviceId, sysId).yamlConfig.getBytes(StandardCharsets.UTF_8))
+    os.write.over(deviceDir / StorageDeviceConfig.configFilename, StorageDeviceConfig(deviceId, sysId).yamlConfig)
 
-  protected def newHost(hostRoot: Path,
+  protected def newHost(hostRoot: os.Path,
                            failFirstStoreLoad: Boolean = false,
                            ec: ExecutionContext = executionContext,
                            transferService: StoreTransferService = StoreTransferService.Disabled,
@@ -181,7 +176,7 @@ trait HostTestHarness:
  */
 private class RecordingHost(mgrClient: AspenClient,
                             systemId: UUID,
-                            hostRootDir: Path,
+                            hostRootDir: os.Path,
                             execCtx: ExecutionContext,
                             cacheFactory: StoreId => ObjectCache,
                             messenger: ServerMessenger,
@@ -234,8 +229,8 @@ private class RecordingHost(mgrClient: AspenClient,
    *  plain val would still be null at that point, and tryLoadDevice's catch-all would
    *  silently swallow the resulting NPE.
    */
-  lazy val storeLoadAttempts: mutable.ListBuffer[(StorageDeviceId, Path)] =
-    mutable.ListBuffer[(StorageDeviceId, Path)]()
+  lazy val storeLoadAttempts: mutable.ListBuffer[(StorageDeviceId, os.Path)] =
+    mutable.ListBuffer[(StorageDeviceId, os.Path)]()
 
   /** True while a simulated store-load failure is still owed. The first tryLoadStore call to
    *  see it set clears it and throws, modelling a device that dies part-way through loading
@@ -250,11 +245,11 @@ private class RecordingHost(mgrClient: AspenClient,
   private lazy val storeLoadFailureOwed = new AtomicBoolean(failFirstStoreLoad)
 
   override protected def tryLoadStore(sds: Host.LocalStorageDeviceState,
-                                      potentialStoreFile: File): Unit =
+                                      potentialStoreFile: os.Path): Unit =
     synchronized:
       if storeLoadFailureOwed.getAndSet(false) then
         throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")
-      storeLoadAttempts += ((sds.storageDeviceId, potentialStoreFile.toPath))
+      storeLoadAttempts += ((sds.storageDeviceId, potentialStoreFile))
 
   /** Storage device ids passed to lookupStorageDeviceState, in call order.
    *

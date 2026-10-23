@@ -156,7 +156,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 
 ## Key Dependencies
 - **Scaffeine**: Used for all caching operations
-- **os-lib**: Should be used for all filesystem operations. (currently a mix of native java and os-lib)
+- **os-lib**: Should be used for all filesystem operations. java.nio is used only where os-lib has no equivalent
+  (e.g. DSYNC channels, free-space queries); convert at the boundary with `os.Path.toNIO`
+  (or `toIO` for `java.io.File`)
 - **Netty 4.2 QUIC** (`netty-codec-native-quic`, BoringSSL): Used for the QUIC network plugin
 
 ## Development Rules

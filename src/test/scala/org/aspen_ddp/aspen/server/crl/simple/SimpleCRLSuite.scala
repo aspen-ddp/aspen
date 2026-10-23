@@ -12,8 +12,6 @@ import org.aspen_ddp.aspen.server.crl.simple.{Recovery, StreamId, StreamLocation
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 
 import java.nio.ByteBuffer
-import java.nio.channels.FileChannel
-import java.nio.file.{Path, StandardOpenOption}
 import java.util.UUID
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
 import scala.concurrent.Await
@@ -84,10 +82,10 @@ object SimpleCRLSuite:
 class SimpleCRLSuite extends FileBasedTests {
   import SimpleCRLSuite._
 
-  def streams(numStreams: Int): List[(StreamId, Path)] =
-    var lst: List[(StreamId, Path)] = Nil
+  def streams(numStreams: Int): List[(StreamId, os.Path)] =
+    var lst: List[(StreamId, os.Path)] = Nil
     for i <- 0 until numStreams do
-      lst = (StreamId(i), tdir.toPath.resolve(f"$i.log")) :: lst
+      lst = (StreamId(i), tdir / f"$i.log") :: lst
     lst.reverse
 
   private def saveAndWait(crl: CrashRecoveryLog, txid: TransactionId, trs: TransactionRecoveryState): Unit =
@@ -96,12 +94,12 @@ class SimpleCRLSuite extends FileBasedTests {
     q.take()
 
   test("Save & Recover CRL Saved State File Foo") {
-    val savePath = tdir.toPath.resolve("crl_save_file.log")
+    val savePath = tdir / "crl_save_file.log"
     val queue = new LinkedBlockingQueue[String]()
 
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
@@ -156,7 +154,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
@@ -168,7 +166,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
 
@@ -184,7 +182,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i = SimpleCRL(tdir, 3, 4096 * 3)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
@@ -240,7 +238,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i2 = SimpleCRL(tdir, 3, 4096 * 3)
 
     assert(i2.trsList.length == 1)
 
@@ -257,7 +255,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i = SimpleCRL(tdir, 3, 4096 * 3)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
@@ -300,7 +298,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i2 = SimpleCRL(tdir, 3, 4096 * 3)
 
     assert(i2.trsList.length == 1)
 
@@ -316,7 +314,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 4096*3)
+    val i = SimpleCRL(tdir, 3, 4096*3)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
@@ -340,7 +338,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 4096*3)
+    val i2 = SimpleCRL(tdir, 3, 4096*3)
 
     assert(i2.trsList.length == 1)
 
@@ -356,7 +354,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024*1024)
+    val i = SimpleCRL(tdir, 3, 1024*1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
 
@@ -372,7 +370,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024*1024)
+    val i2 = SimpleCRL(tdir, 3, 1024*1024)
 
     assert(i2.crl.currentEntrySerialNumber == 2)
 
@@ -504,7 +502,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -518,7 +516,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.storeId == storeId2)
@@ -531,13 +529,13 @@ class SimpleCRLSuite extends FileBasedTests {
   // ===== Tier 1: Critical Crash Recovery Correctness =====
 
   test("Recovery after crash without clean shutdown") {
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     saveAndWait(i.crl, transactionId, trsValidTxd)
     saveAndWait(i.crl, transactionId2, trsValidTxd2)
 
     // Simulate crash: do NOT call shutdown
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 2)
     val byStore = i2.trsList.groupBy(_.storeId)
@@ -551,7 +549,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Recovery preserves latest paxos state after multiple saves") {
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     saveAndWait(i.crl, transactionId, trsUndetermined)
     saveAndWait(i.crl, transactionId, trsPromised)
@@ -559,7 +557,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.disposition == TransactionDisposition.VoteCommit)
@@ -573,7 +571,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i = SimpleCRL(tdir, 3, 4096 * 3)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -588,7 +586,7 @@ class SimpleCRLSuite extends FileBasedTests {
     assert(i.crl.currentStreamNumber == 0)
 
     // Simulate crash, then recover
-    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i2 = SimpleCRL(tdir, 3, 4096 * 3)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.storeId == storeId)
@@ -604,7 +602,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -632,7 +630,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.storeId == storeId)
@@ -644,7 +642,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -658,7 +656,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.storeId == storeId)
@@ -671,7 +669,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -694,7 +692,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 2)
     assert(i2.trsList.exists(_.storeId == storeId))
@@ -709,7 +707,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     // Save 4 transactions across 3 stores
     i.crl.save(transactionId, trsValidTxd, completionHandler)
@@ -728,7 +726,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 3)
     assert(!i2.trsList.exists(_.storeId == storeId2))
@@ -746,7 +744,7 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("getFullRecoveryState filters correctly by storeId") {
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     saveAndWait(i.crl, transactionId, trsValidTxd)   // storeId
     saveAndWait(i.crl, transactionId2, trsValidTxd2) // storeId2
@@ -763,7 +761,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i = SimpleCRL(tdir, 3, 4096 * 3)
 
     // Save two transactions — their dynamic data goes to stream 0
     i.crl.save(transactionId, trsValidTxd, completionHandler)
@@ -807,7 +805,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i2 = SimpleCRL(tdir, 3, 4096 * 3)
 
     assert(i2.trsList.length == 2)
     val byStore = i2.trsList.groupBy(_.storeId)
@@ -823,7 +821,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i = SimpleCRL(tdir, 3, 4096 * 3)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -845,7 +843,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 4096 * 3)
+    val i2 = SimpleCRL(tdir, 3, 4096 * 3)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.serializedTxd == trsValidTxd.serializedTxd)
@@ -858,7 +856,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     // Save tx1, then delete it
     i.crl.save(transactionId, trsValidTxd, completionHandler)
@@ -873,7 +871,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 2)
     assert(i2.trsList.exists(_.storeId == storeId))
@@ -887,7 +885,7 @@ class SimpleCRLSuite extends FileBasedTests {
     def completionHandler(): Unit = queue.put("")
     val gate = new CountDownLatch(1)
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     // Completion handlers run on the writer thread before the IO thread sees the write finish.
     // Holding the writer inside tx1's handler guarantees that the delete of tx1 and the save of
@@ -904,7 +902,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 2)
     assert(i2.trsList.exists(_.storeId == storeId))
@@ -917,7 +915,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     val gate = new CountDownLatch(1)
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     // Hold the writer so that everything below is batched into a single log entry
     i.crl.save(transactionId2, trsValidTxd2, () => { queue.put("first"); gate.await() })
@@ -932,7 +930,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.storeId == storeId2)
@@ -946,7 +944,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -956,19 +954,16 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
 
     // Corrupt the trailing UUID of the second entry in stream 0
-    val streamFile = tdir.toPath.resolve("0.crl")
+    val streamFile = tdir / "0.crl"
     val reader = StreamReader(StreamId(0), streamFile)
     val Some((entry1Start, _)) = reader.readEntry(0): @unchecked
     val Some((_, entry1Header)) = reader.readEntry(entry1Start): @unchecked
     val corruptOffset = entry1Start + entry1Header.trailingUUIDOffset
 
-    val fc = FileChannel.open(streamFile, StandardOpenOption.WRITE)
-    fc.position(corruptOffset)
-    fc.write(ByteBuffer.wrap(Array.fill(16)(0xFF.toByte)))
-    fc.close()
+    os.write.over(streamFile, Array.fill(16)(0xFF.toByte), offset = corruptOffset, truncate = false)
 
     // Recovery should only find the first (uncorrupted) entry
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 1)
     assert(i2.trsList.head.storeId == storeId)
@@ -978,10 +973,10 @@ class SimpleCRLSuite extends FileBasedTests {
   }
 
   test("Recovery from fresh empty stream files") {
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
     assert(i2.trsList.isEmpty)
     i2.crl.shutdown()
   }
@@ -990,7 +985,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -1014,7 +1009,7 @@ class SimpleCRLSuite extends FileBasedTests {
     // On recovery, tx1 reappears because closeStore never wrote a deletion to the log.
     // This is expected behavior: the migrate-out process must use deleteTransaction
     // or the store must be re-closed after recovery.
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     val store1Txs = i2.trsList.filter(_.storeId == storeId)
     val store2Txs = i2.trsList.filter(_.storeId == storeId2)
@@ -1051,7 +1046,7 @@ class SimpleCRLSuite extends FileBasedTests {
   test("Rapid-fire saves all recovered") {
     val queue = new LinkedBlockingQueue[String]()
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, () => queue.put("a"))
     i.crl.save(transactionId2, trsValidTxd2, () => queue.put("b"))
@@ -1063,7 +1058,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 3)
     assert(i2.trsList.exists(_.storeId == storeId))
@@ -1076,7 +1071,7 @@ class SimpleCRLSuite extends FileBasedTests {
     val queue = new LinkedBlockingQueue[String]()
     def completionHandler(): Unit = queue.put("")
 
-    val i = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
 
     i.crl.save(transactionId, trsValidTxd, completionHandler)
     queue.take()
@@ -1101,7 +1096,7 @@ class SimpleCRLSuite extends FileBasedTests {
 
     i.crl.shutdown()
 
-    val i2 = SimpleCRL(tdir.toPath, 3, 1024 * 1024)
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
 
     assert(i2.trsList.length == 2)
     assert(i2.trsList.exists(_.storeId == storeId2))

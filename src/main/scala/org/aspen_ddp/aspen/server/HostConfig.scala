@@ -6,7 +6,6 @@ import org.aspen_ddp.aspen.common.util.physicalMemory
 import org.aspen_ddp.aspen.server.HostConfig
 import org.aspen_ddp.aspen.server.store.backend.RocksDBBackend
 
-import java.io.File
 import java.util.UUID
 
 /*
@@ -173,5 +172,5 @@ object HostConfig extends YObject[HostConfig]:
     objectCacheMb.get(o)
   )
 
-  def loadHostConfig(file: File): HostConfig =
+  def loadHostConfig(file: os.Path): HostConfig =
     create(loadYamlFile(file))

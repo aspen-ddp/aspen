@@ -113,8 +113,8 @@ object StoreAvailabilityTracker extends Logging:
   val RecheckPeriod: FiniteDuration = 24.hours
 
   /** `<host-dir>/cache/offline-stores.yaml` */
-  def cacheFile(hostDir: java.nio.file.Path): os.Path =
-    os.Path(hostDir.toAbsolutePath) / "cache" / CacheFilename
+  def cacheFile(hostDir: os.Path): os.Path =
+    hostDir / "cache" / CacheFilename
 
   private def prune(stores: Map[StoreId, StoreAvailability]): Map[StoreId, StoreAvailability] =
     val cutoff = System.currentTimeMillis() - OnlineRetention.toMillis
@@ -163,7 +163,7 @@ object StoreAvailabilityTracker extends Logging:
       Map()
     else
       try
-        YState.format(loadYamlFile(file.toIO))
+        YState.format(loadYamlFile(file))
       catch
         case NonFatal(t) =>
           logger.warn(s"Discarding unreadable offline store state $file: $t")

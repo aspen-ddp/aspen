@@ -1,16 +1,14 @@
 package org.aspen_ddp.aspen.server.crl.simple
 
 import java.nio.ByteBuffer
-import java.nio.channels.FileChannel
-import java.nio.file.{Files, Path, StandardOpenOption}
 import java.util.UUID
 import scala.annotation.tailrec
 
-class StreamReader(val streamId: StreamId, val filePath: Path):
+class StreamReader(val streamId: StreamId, val filePath: os.Path):
 
   private val ochannel =
-    if Files.exists(filePath) then
-      Some(FileChannel.open(filePath, StandardOpenOption.READ))
+    if os.exists(filePath) then
+      Some(os.read.channel(filePath))
     else
       None
 

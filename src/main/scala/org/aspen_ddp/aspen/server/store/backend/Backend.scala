@@ -7,15 +7,14 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import scribe.Logging
 
-import java.nio.file.Path
 import scala.concurrent.{Future, Promise}
 
 trait Backend extends Logging {
   val storeId: StoreId
 
-  def path: Path
+  def path: os.Path
 
-  def crlSaveFile: Path = path.resolve("crl_save.log")
+  def crlSaveFile: os.Path = path / "crl_save.log"
 
   def close(): Future[Unit]
 

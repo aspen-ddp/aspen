@@ -10,7 +10,6 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
 
-import java.nio.file.{Files, Path}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{Future, Promise}
@@ -27,7 +26,7 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
   def createRebuild(client: AspenClient,
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
-                    devicePath: Path): StoreRebuild =
+                    devicePath: os.Path): StoreRebuild =
     val r = new RecordedRebuild(storeId, storageDeviceId)
     synchronized:
       created += r
@@ -204,7 +203,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       _ <- waitForTransactionsToComplete()
       // Inject the device as loaded and trigger reconciliation
       _ = host.injectLoadedDevice(new Host.LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir.resolve(StorageDeviceConfig.configFilename).toFile))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename))
       armed = host.armLookup(realDeviceId)
       _ = host.testingOnlyCheckAllDevices()
       readState = deviceState(realDeviceId, Map(rebuilding(rebuilt)))
@@ -271,12 +270,12 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
           tx.update(ptr, None, None, reqs, ops)
       _ <- waitForTransactionsToComplete()
       // Create the store directory that the rebuild would have placed
-      storePath = os.Path(deviceDir) / storeN(0).directoryName
+      storePath = deviceDir / storeN(0).directoryName
       _ = os.makeDir.all(storePath)
       _ = os.write(storePath / "marker.txt", "rebuilt store")
       // Inject device and trigger rebuild
       _ = host.injectLoadedDevice(new Host.LocalStorageDeviceState(
-        realDeviceId, deviceDir, deviceDir.resolve(StorageDeviceConfig.configFilename).toFile))
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename))
       armed = host.armLookup(realDeviceId)
       _ = host.testingOnlyCheckAllDevices()
       readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
@@ -299,19 +298,19 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     // Use synthetic IDs not registered in the tree - inject manually to avoid auto-scan
     val syntheticA = StorageDeviceId(UUID.fromString("cccccccc-0000-0000-0000-000000000001"))
     val syntheticB = StorageDeviceId(UUID.fromString("dddddddd-0000-0000-0000-000000000002"))
-    val deviceDir = hostRoot.resolve("storage-devices").resolve("synth-a")
-    val deviceDir2 = hostRoot.resolve("storage-devices").resolve("synth-b")
-    Files.createDirectories(deviceDir)
-    Files.createDirectories(deviceDir2)
+    val deviceDir = hostRoot / "storage-devices" / "synth-a"
+    val deviceDir2 = hostRoot / "storage-devices" / "synth-b"
+    os.makeDir.all(deviceDir)
+    os.makeDir.all(deviceDir2)
 
     // syntheticA is NOT registered in the tree, so getStorageDevicePointer will throw NoSuchElementException
     // This exercises the Failure(t) branch in markRebuiltStoreActive's onComplete
 
     // Inject both devices manually (no writeDevice, so auto-scan won't find them)
     host.injectLoadedDevice(new Host.LocalStorageDeviceState(
-      syntheticA, deviceDir, deviceDir.resolve("dummy.file").toFile))
+      syntheticA, deviceDir, deviceDir / "dummy.file"))
     host.injectLoadedDevice(new Host.LocalStorageDeviceState(
-      syntheticB, deviceDir2, deviceDir2.resolve("dummy.file").toFile))
+      syntheticB, deviceDir2, deviceDir2 / "dummy.file"))
 
     val first = host.armLookup(syntheticA)
     host.testingOnlyCheckAllDevices()

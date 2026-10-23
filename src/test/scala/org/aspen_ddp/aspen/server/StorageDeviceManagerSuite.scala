@@ -5,8 +5,8 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceSetId}
 
 import java.io.{IOException, OutputStream}
 import java.net.URI
+import java.nio.ByteBuffer
 import java.nio.channels.SeekableByteChannel
-import java.nio.charset.StandardCharsets
 import java.nio.file.attribute.*
 import java.nio.file.spi.FileSystemProvider
 import java.nio.file.*
@@ -20,11 +20,11 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
   private val bootstrapSet = StorageDeviceSetId.BootstrapStorageDeviceSetId
 
   /** Temp trees created by the current test, removed by subFixtureTeardown. */
-  private val tempRoots = mutable.ListBuffer[Path]()
+  private val tempRoots = mutable.ListBuffer[os.Path]()
 
   /** Creates a tracked temp directory that teardown will remove. */
-  private def newTempDir(prefix: String): Path =
-    val dir = Files.createTempDirectory(prefix)
+  private def newTempDir(prefix: String): os.Path =
+    val dir = os.temp.dir(prefix = prefix, deleteOnExit = false)
     tempRoots += dir
     dir
 
@@ -32,33 +32,14 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     tempRoots.foreach(deleteTree)
     tempRoots.clear()
 
-  /** Removes a tree bottom-up. Symlinks are unlinked rather than followed, and owner
-   *  write/execute is restored on the way down so the read-only device directory left by
-   *  the ConfigWriteFailed test can still be traversed and removed. */
-  private def deleteTree(root: Path): Unit =
+  /** Removes a tree. Symlinks are unlinked rather than followed, and owner write/execute is
+   *  restored first so the read-only device directory left by the ConfigWriteFailed test can
+   *  still be removed. */
+  private def deleteTree(root: os.Path): Unit =
     try
-      Files.walkFileTree(root, new SimpleFileVisitor[Path]:
-        override def preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
-          try
-            val perms = Files.getPosixFilePermissions(dir)
-            perms.add(PosixFilePermission.OWNER_WRITE)
-            perms.add(PosixFilePermission.OWNER_EXECUTE)
-            Files.setPosixFilePermissions(dir, perms)
-          catch
-            case _: Throwable => ()
-          FileVisitResult.CONTINUE
-
-        override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
-          Files.deleteIfExists(file)
-          FileVisitResult.CONTINUE
-
-        override def visitFileFailed(file: Path, exc: IOException): FileVisitResult =
-          FileVisitResult.CONTINUE
-
-        override def postVisitDirectory(dir: Path, exc: IOException): FileVisitResult =
-          Files.deleteIfExists(dir)
-          FileVisitResult.CONTINUE
-      )
+      os.walk(root, includeTarget = true).filter(os.isDir(_, followLinks = false)).foreach: dir =>
+        os.perms.set(dir, os.perms(dir) + PosixFilePermission.OWNER_WRITE + PosixFilePermission.OWNER_EXECUTE)
+      os.remove.all(root)
     catch
       case _: Throwable => ()
 
@@ -79,22 +60,22 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     tlsKey)
 
   /** Creates `<tmp>/host/storage-devices` and returns the host directory. */
-  private def newHostDir(): Path =
+  private def newHostDir(): os.Path =
     val base = newTempDir("aspen-sdm-test")
-    val hostDir = base.resolve("host")
-    Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
+    val hostDir = base / "host"
+    os.makeDir.all(hostDir / StorageDeviceManager.StorageDevicesDirName)
     hostDir
 
   atest("deviceDirectory resolves <host-dir>/storage-devices/<name>"):
     Future.successful(
-      StorageDeviceManager.deviceDirectory(Paths.get("/srv/aspen/node_a"), "dev2") should be(
-        Paths.get("/srv/aspen/node_a/storage-devices/dev2")))
+      StorageDeviceManager.deviceDirectory(os.Path("/srv/aspen/node_a"), "dev2") should be(
+        os.Path("/srv/aspen/node_a/storage-devices/dev2")))
 
   atest("rejects a host config from a different Aspen system"):
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
-    Files.createDirectories(dir)
+    os.makeDir.all(dir)
     recoverToSucceededIf[StorageDeviceManager.WrongAspenSystem](
       StorageDeviceManager.createStorageDevice(
         client, hostConfig(UUID.randomUUID()), hostDir, dir, bootstrapSet, systemId))
@@ -103,7 +84,7 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "foo/bar")
-    Files.createDirectories(dir)
+    os.makeDir.all(dir)
     recoverToSucceededIf[StorageDeviceManager.DeviceDirectoryNotUnderHost](
       StorageDeviceManager.createStorageDevice(
         client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
@@ -112,6 +93,15 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "..")
+    recoverToSucceededIf[StorageDeviceManager.DeviceDirectoryNotUnderHost](
+      StorageDeviceManager.createStorageDevice(
+        client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
+
+  atest("rejects a device name that escapes past the filesystem root"):
+    given ExecutionContext = executionContext
+    val hostDir = newHostDir()
+    val dir = StorageDeviceManager.deviceDirectory(hostDir, List.fill(hostDir.segmentCount + 3)("..").mkString("/"))
+    dir should be(os.root)
     recoverToSucceededIf[StorageDeviceManager.DeviceDirectoryNotUnderHost](
       StorageDeviceManager.createStorageDevice(
         client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
@@ -137,9 +127,8 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
-    Files.createDirectories(dir)
-    Files.write(dir.resolve(StorageDeviceConfig.configFilename),
-                "storage-device-id: x\n".getBytes(StandardCharsets.UTF_8))
+    os.makeDir.all(dir)
+    os.write(dir / StorageDeviceConfig.configFilename, "storage-device-id: x\n")
     recoverToSucceededIf[StorageDeviceManager.DeviceAlreadyConfigured](
       StorageDeviceManager.createStorageDevice(
         client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
@@ -148,16 +137,16 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
-    Files.createDirectories(dir)
+    os.makeDir.all(dir)
     for
       deviceId <- StorageDeviceManager.createStorageDevice(
                     client, hostConfig(), hostDir, dir, bootstrapSet, systemId)
       _        <- waitForTransactionsToComplete()
       ds       <- client.getStorageDeviceState(deviceId)
     yield
-      val written = dir.resolve(StorageDeviceConfig.configFilename)
-      Files.isRegularFile(written) should be(true)
-      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(written.toFile)
+      val written = dir / StorageDeviceConfig.configFilename
+      os.isFile(written) should be(true)
+      val cfg = StorageDeviceConfig.loadStorageDeviceConfig(written)
       cfg.storageDeviceId should be(deviceId)
       cfg.aspenSystemId should be(systemId)
       ds.hostId should be(HostId.BootstrapHostId)
@@ -167,25 +156,25 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val elsewhere = newTempDir("aspen-real-device")
-    val link = hostDir.resolve(StorageDeviceManager.StorageDevicesDirName).resolve("dev2")
-    Files.createSymbolicLink(link, elsewhere)
+    val link = hostDir / StorageDeviceManager.StorageDevicesDirName / "dev2"
+    os.symlink(link, elsewhere)
     for
       deviceId <- StorageDeviceManager.createStorageDevice(
                     client, hostConfig(), hostDir, link, bootstrapSet, systemId)
       _        <- waitForTransactionsToComplete()
     yield
-      val written = elsewhere.resolve(StorageDeviceConfig.configFilename)
-      Files.isRegularFile(written) should be(true)
-      StorageDeviceConfig.loadStorageDeviceConfig(written.toFile).storageDeviceId should be(deviceId)
+      val written = elsewhere / StorageDeviceConfig.configFilename
+      os.isFile(written) should be(true)
+      StorageDeviceConfig.loadStorageDeviceConfig(written).storageDeviceId should be(deviceId)
 
   atest("reports ConfigWriteFailed, naming the device, when the write fails"):
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
-    Files.createDirectories(dir)
-    Files.setPosixFilePermissions(dir, PosixFilePermissions.fromString("r-xr-xr-x"))
+    os.makeDir.all(dir)
+    os.perms.set(dir, "r-xr-xr-x")
     // A process running as root can still write to a read-only directory.
-    assume(!Files.isWritable(dir))
+    assume(!dir.toIO.canWrite)
     recoverToExceptionIf[StorageDeviceManager.ConfigWriteFailed](
       StorageDeviceManager.createStorageDevice(
         client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
@@ -200,8 +189,8 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
-    Files.createDirectories(dir)
-    val configFile = dir.resolve(StorageDeviceConfig.configFilename)
+    os.makeDir.all(dir)
+    val configFile = dir / StorageDeviceConfig.configFilename
     // Only the two paths handed to createStorageDevice live on the failing filesystem;
     // every assertion below is made against the real one.
     val fs = FailAfterCreateFileSystem()
@@ -214,33 +203,33 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
         // nothing to roll back and make the last assertion pass for the wrong reason.
         fs.created should be(List(configFile))
         err.getCause.getMessage should be(FailAfterCreateFileSystem.InjectedWriteFailure)
-        Files.exists(configFile) should be(false)
+        os.exists(configFile) should be(false)
 
   atest("does not remove a config that appeared during the transaction"):
     given ExecutionContext = executionContext
     val hostDir = newHostDir()
     val dir = StorageDeviceManager.deviceDirectory(hostDir, "dev2")
-    Files.createDirectories(dir)
-    // Files.exists follows symlinks so the guard sees no config; the CREATE_NEW write
-    // opens with O_EXCL, which fails on the link itself -- the same arm a lost race takes.
-    val cfg = dir.resolve(StorageDeviceConfig.configFilename)
-    Files.createSymbolicLink(cfg, dir.resolve("no-such-target"))
+    os.makeDir.all(dir)
+    // os.exists follows symlinks so the guard sees no config; os.write creates the file
+    // exclusively, which fails on the link itself -- the same arm a lost race takes.
+    val cfg = dir / StorageDeviceConfig.configFilename
+    os.symlink(cfg, dir / "no-such-target")
     recoverToExceptionIf[StorageDeviceManager.ConfigWriteFailed](
       StorageDeviceManager.createStorageDevice(
         client, hostConfig(), hostDir, dir, bootstrapSet, systemId))
       .map: err =>
         err.getCause shouldBe a[FileAlreadyExistsException]
-        Files.exists(cfg, LinkOption.NOFOLLOW_LINKS) should be(true)
+        os.exists(cfg, followLinks = false) should be(true)
 
 
 /** A filesystem identical to the default one except that a write to a freshly created file
- *  fails after the file exists: newOutputStream performs the real create, honouring the
- *  caller's open options, then hands back a stream that throws on the first write.
+ *  fails after the file exists: newByteChannel performs the real create, honouring the
+ *  caller's open options, then hands back a channel that throws on the first write.
  *
  *  This scaffolding exists because nothing on a real filesystem reaches that arm here. A
  *  read-only directory fails at open, before any file exists, so the rollback has nothing
  *  to remove; a directory or a symlink occupying the config path is either rejected by the
- *  Files.exists guard or fails at open with FileAlreadyExists, which is the one arm that
+ *  os.exists guard or fails at open with FileAlreadyExists, which is the one arm that
  *  deliberately does not delete.
  */
 private class FailAfterCreateFileSystem extends FileSystem:
@@ -248,10 +237,12 @@ private class FailAfterCreateFileSystem extends FileSystem:
   private val prov = FailAfterCreateProvider(this)
 
   /** Real paths this filesystem created before failing the write, in creation order. */
-  var created: List[Path] = Nil
+  var created: List[os.Path] = Nil
 
   /** Presents `p` to the code under test as a path belonging to this filesystem. */
-  def wrap(p: Path): Path = WrappedPath(this, p)
+  def wrap(p: os.Path): os.Path = os.Path(wrapNIO(p.toNIO))
+
+  private def wrapNIO(p: Path): Path = WrappedPath(this, p)
 
   override def provider(): FileSystemProvider = prov
   override def close(): Unit = ()
@@ -261,7 +252,7 @@ private class FailAfterCreateFileSystem extends FileSystem:
   override def getRootDirectories(): java.lang.Iterable[Path] = throw new UnsupportedOperationException
   override def getFileStores(): java.lang.Iterable[FileStore] = throw new UnsupportedOperationException
   override def supportedFileAttributeViews(): java.util.Set[String] = delegate.supportedFileAttributeViews()
-  override def getPath(first: String, more: String*): Path = wrap(delegate.getPath(first, more*))
+  override def getPath(first: String, more: String*): Path = wrapNIO(delegate.getPath(first, more*))
   override def getPathMatcher(syntaxAndPattern: String): PathMatcher = throw new UnsupportedOperationException
   override def getUserPrincipalLookupService(): UserPrincipalLookupService = throw new UnsupportedOperationException
   override def newWatchService(): WatchService = throw new UnsupportedOperationException
@@ -282,24 +273,29 @@ private class FailAfterCreateProvider(fs: FailAfterCreateFileSystem) extends Fil
 
   private def delegate = FileSystems.getDefault.provider()
 
-  override def newOutputStream(path: Path, options: OpenOption*): OutputStream =
-    val real = unwrap(path)
-    // A real create with the caller's options, so CREATE_NEW still means CREATE_NEW, and
-    // what survives a swallowed rollback is an empty file rather than a fabricated one.
-    Files.newOutputStream(real, options*).close()
-    fs.created = fs.created :+ real
-    new OutputStream:
-      override def write(b: Int): Unit =
-        throw new IOException(FailAfterCreateFileSystem.InjectedWriteFailure)
-      override def write(b: Array[Byte], off: Int, len: Int): Unit =
-        throw new IOException(FailAfterCreateFileSystem.InjectedWriteFailure)
-
-  // Files.write routes through newOutputStream above. Anything arriving here is a
-  // different write path and must fail loudly rather than pass for the injected failure.
   override def newByteChannel(path: Path,
                               options: java.util.Set[? <: OpenOption],
                               attrs: FileAttribute[?]*): SeekableByteChannel =
-    throw new UnsupportedOperationException("newByteChannel")
+    val real = unwrap(path)
+    // A real create with the caller's options, so CREATE_NEW still means CREATE_NEW, and
+    // what survives a swallowed rollback is an empty file rather than a fabricated one.
+    Files.newByteChannel(real, options, attrs*).close()
+    fs.created = fs.created :+ os.Path(real)
+    new SeekableByteChannel:
+      override def write(src: ByteBuffer): Int =
+        throw new IOException(FailAfterCreateFileSystem.InjectedWriteFailure)
+      override def read(dst: ByteBuffer): Int = throw new UnsupportedOperationException("read")
+      override def position(): Long = 0
+      override def position(newPosition: Long): SeekableByteChannel = this
+      override def size(): Long = 0
+      override def truncate(size: Long): SeekableByteChannel = this
+      override def isOpen(): Boolean = true
+      override def close(): Unit = ()
+
+  // os.write routes through newByteChannel above. Anything arriving here is a different
+  // write path and must fail loudly rather than pass for the injected failure.
+  override def newOutputStream(path: Path, options: OpenOption*): OutputStream =
+    throw new UnsupportedOperationException("newOutputStream")
 
   override def getScheme(): String = "fail-after-create"
   override def newFileSystem(uri: URI, env: java.util.Map[String, ?]): FileSystem =
@@ -331,7 +327,7 @@ private class FailAfterCreateProvider(fs: FailAfterCreateFileSystem) extends Fil
 
 
 /** A Path that delegates to `real` but reports `fs` as its filesystem, so every
- *  java.nio.file.Files call the code under test makes routes through fs's provider. */
+ *  filesystem call the code under test makes routes through fs's provider. */
 private class WrappedPath(fs: FailAfterCreateFileSystem, val real: Path) extends Path:
   import FailAfterCreateFileSystem.unwrap
 

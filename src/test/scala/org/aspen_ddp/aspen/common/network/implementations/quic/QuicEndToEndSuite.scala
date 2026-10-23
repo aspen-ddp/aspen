@@ -13,8 +13,6 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.net.{DatagramSocket, ServerSocket}
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{FileVisitResult, Files, Path, SimpleFileVisitor}
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import scala.concurrent.duration.{Duration, SECONDS}
@@ -74,30 +72,19 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       ports = (pick(), pick(), pick())
     ports
 
-  private def deleteTree(root: Path): Unit =
-    Files.walkFileTree(root, new SimpleFileVisitor[Path]:
-      override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
-        Files.deleteIfExists(file)
-        FileVisitResult.CONTINUE
-
-      override def postVisitDirectory(dir: Path, err: java.io.IOException): FileVisitResult =
-        Files.deleteIfExists(dir)
-        FileVisitResult.CONTINUE
-    )
-
   /** Bootstraps a system into a temp directory, starts its host, opens a client, runs `fn`, and tears it all down */
   private def withSystem(fn: AspenClient => Unit): Unit =
-    val tmp = Files.createTempDirectory("aspen-quic-e2e")
+    val tmp = os.temp.dir(prefix = "aspen-quic-e2e")
     try
       val (dataPort, httpPort, storeTransferPort) = freePorts()
       Console.withOut(new java.io.ByteArrayOutputStream):
         Main.bootstrap(Replication(3, 2), tmp, "127.0.0.1", dataPort, httpPort, storeTransferPort) shouldBe 0
 
-      val host = Main.startHost(tmp.resolve("bootstrap-host"))
+      val host = Main.startHost(tmp / "bootstrap-host")
       try
         host.network shouldBe a [QuicNet]
 
-        val session = Main.openClientSession(tmp.resolve("aspen-client-config.yaml"), None)
+        val session = Main.openClientSession(tmp / "aspen-client-config.yaml", None)
         val (client, network, _) = Main.createAspenClient(session)
         try
           network shouldBe a [QuicNet]
@@ -109,7 +96,7 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       finally
         host.stop()
     finally
-      deleteTree(tmp)
+      os.remove.all(tmp)
 
   private def stopClient(client: AspenClient, network: NetworkPlugin): Unit =
     network.shutdown(Duration.Zero)

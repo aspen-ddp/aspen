@@ -11,8 +11,6 @@ import org.scalatest.matchers.should.Matchers
 import org.yaml.snakeyaml.error.YAMLException
 import org.yaml.snakeyaml.parser.ParserException
 
-import java.nio.charset.StandardCharsets
-import java.nio.file.Files
 import java.util.UUID
 import scala.util.control.NonFatal
 
@@ -64,13 +62,13 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     cfg.hosts.head.name should be("node: #a \"b\" \\c")
 
   test("loadBootstrapConfig round-trips generateBootstrapConfig"):
-    val f = Files.createTempFile("aspen-bootstrap-config", ".yaml")
+    val f = os.temp(prefix = "aspen-bootstrap-config", suffix = ".yaml")
     try
-      Files.write(f, generated.getBytes(StandardCharsets.UTF_8))
-      val cfg = BootstrapConfig.loadBootstrapConfig(f.toFile)
+      os.write.over(f, generated)
+      val cfg = BootstrapConfig.loadBootstrapConfig(f)
       assertMatchesGenerated(cfg)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("loadBootstrapConfig round-trips multi-host configuration"):
     val hostId1 = HostId(UUID.fromString("aaaa0001-0001-0001-0001-000000000001"))
@@ -103,10 +101,10 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       storeMap,
       TestTLS.caCertificatePem)
 
-    val f = Files.createTempFile("aspen-bootstrap-multi-host", ".yaml")
+    val f = os.temp(prefix = "aspen-bootstrap-multi-host", suffix = ".yaml")
     try
-      Files.write(f, yaml.getBytes(StandardCharsets.UTF_8))
-      val cfg = BootstrapConfig.loadBootstrapConfig(f.toFile)
+      os.write.over(f, yaml)
+      val cfg = BootstrapConfig.loadBootstrapConfig(f)
 
       cfg.aspenSystemId should be(systemId)
       cfg.bootstrapIDA should be(Replication(4, 2))
@@ -139,7 +137,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       h3.storeTransferPort should be(5022)
       h3.stores should be(List(store3))
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """aspen-system-id:  BF1049AD-D2A8-4D17-8080-E01A4678C8B3
@@ -162,10 +160,10 @@ ca-certificate: |
   -----END CERTIFICATE-----
 """
 
-    val f = Files.createTempFile("aspen-bootstrap-docexample", ".yaml")
+    val f = os.temp(prefix = "aspen-bootstrap-docexample", suffix = ".yaml")
     try
-      Files.write(f, docExampleYaml.getBytes(StandardCharsets.UTF_8))
-      val cfg = BootstrapConfig.loadBootstrapConfig(f.toFile)
+      os.write.over(f, docExampleYaml)
+      val cfg = BootstrapConfig.loadBootstrapConfig(f)
 
       cfg.aspenSystemId should be(UUID.fromString("BF1049AD-D2A8-4D17-8080-E01A4678C8B3"))
       cfg.bootstrapIDA should be(Replication(1, 1))
@@ -180,7 +178,7 @@ ca-certificate: |
       h.storeTransferPort should be(5002)
       h.stores should be(List(StoreId(PoolId(UUID.fromString("00000000-0000-0000-0000-000000000000")), 0.toByte)))
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("loadBootstrapConfig accepts every bootstrap store on a single host"):
     // This is what "./aspen bootstrap <dir> replication 2 3 3" produces: one host, three stores.
@@ -206,15 +204,15 @@ ca-certificate: |
   -----END CERTIFICATE-----
 """
 
-    val f = Files.createTempFile("aspen-bootstrap-single-host", ".yaml")
+    val f = os.temp(prefix = "aspen-bootstrap-single-host", suffix = ".yaml")
     try
-      Files.write(f, singleHostYaml.getBytes(StandardCharsets.UTF_8))
-      val cfg = BootstrapConfig.loadBootstrapConfig(f.toFile)
+      os.write.over(f, singleHostYaml)
+      val cfg = BootstrapConfig.loadBootstrapConfig(f)
 
       cfg.hosts.length should be(1)
       cfg.hosts.head.stores.length should be(3)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("loadBootstrapConfig rejects config with store count mismatch"):
     val mismatchYaml = """aspen-system-id: 22222222-2222-2222-2222-222222222222
@@ -245,41 +243,41 @@ ca-certificate: |
   -----END CERTIFICATE-----
 """
 
-    val f = Files.createTempFile("aspen-bootstrap-mismatch", ".yaml")
+    val f = os.temp(prefix = "aspen-bootstrap-mismatch", suffix = ".yaml")
     try
-      Files.write(f, mismatchYaml.getBytes(StandardCharsets.UTF_8))
+      os.write.over(f, mismatchYaml)
       val ex = intercept[FormatError]:
-        BootstrapConfig.loadBootstrapConfig(f.toFile)
+        BootstrapConfig.loadBootstrapConfig(f)
       ex.getMessage should include("Number of bootstrap stores (2) must exactly match the Bootstrap IDA width (3)")
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("loadBootstrapConfig rejects a document that is not a mapping"):
     // The file-path mirror of the parseBootstrapConfig case below. loadYamlFile used to load
     // the document as a map, so a bare string or an HTML error page came back as a
     // ClassCastException from the checkcast at that call site rather than as a FormatError --
     // and Main's catch, which knows about FormatError, let it unwind out of main.
-    val f = Files.createTempFile("aspen-bootstrap-nonmapping", ".yaml")
+    val f = os.temp(prefix = "aspen-bootstrap-nonmapping", suffix = ".yaml")
     try
-      Files.write(f, "<html><body>404</body></html>".getBytes(StandardCharsets.UTF_8))
+      os.write.over(f, "<html><body>404</body></html>")
       val ex = intercept[FormatError]:
-        BootstrapConfig.loadBootstrapConfig(f.toFile)
+        BootstrapConfig.loadBootstrapConfig(f)
       ex.getMessage should include("Object Required")
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("loadBootstrapConfig lets SnakeYAML's own parse failure out"):
     // Same as the parseBootstrapConfig case below: malformed YAML never reaches Config's
     // validation, so a guarding caller has to know about YAMLException as well as FormatError.
     // Main.commandErrorMessage is that caller for this overload.
-    val f = Files.createTempFile("aspen-bootstrap-malformed", ".yaml")
+    val f = os.temp(prefix = "aspen-bootstrap-malformed", suffix = ".yaml")
     try
-      Files.write(f, "bootstrap-hosts: [unclosed\n".getBytes(StandardCharsets.UTF_8))
+      os.write.over(f, "bootstrap-hosts: [unclosed\n")
       val ex = intercept[ParserException]:
-        BootstrapConfig.loadBootstrapConfig(f.toFile)
+        BootstrapConfig.loadBootstrapConfig(f)
       ex shouldBe a[YAMLException]
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("parseBootstrapConfig round-trips generateBootstrapConfig"):
     val cfg = BootstrapConfig.parseBootstrapConfig(generated)

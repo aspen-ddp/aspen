@@ -7,8 +7,6 @@ import org.aspen_ddp.aspen.common.util.YamlFormat.FormatError
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import java.nio.charset.StandardCharsets
-import java.nio.file.Files
 import java.util.UUID
 
 class HostConfigSuite extends AnyFunSuite with Matchers:
@@ -38,34 +36,34 @@ class HostConfigSuite extends AnyFunSuite with Matchers:
     sample.yamlConfig should not include "hostState"
 
   test("loadHostConfig round-trips yamlConfig"):
-    val f = Files.createTempFile("aspen-host-config", ".yaml")
+    val f = os.temp(prefix = "aspen-host-config", suffix = ".yaml")
     try
-      Files.write(f, sample.yamlConfig.getBytes(StandardCharsets.UTF_8))
-      HostConfig.loadHostConfig(f.toFile) should be(sample)
+      os.write.over(f, sample.yamlConfig)
+      HostConfig.loadHostConfig(f) should be(sample)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("round trip preserves the TLS certificate and private key exactly"):
-    val f = Files.createTempFile("aspen-host-config-tls", ".yaml")
+    val f = os.temp(prefix = "aspen-host-config-tls", suffix = ".yaml")
     try
-      Files.write(f, sample.yamlConfig.getBytes(StandardCharsets.UTF_8))
-      val loaded = HostConfig.loadHostConfig(f.toFile)
+      os.write.over(f, sample.yamlConfig)
+      val loaded = HostConfig.loadHostConfig(f)
       loaded.tlsCertificate shouldBe sample.tlsCertificate
       loaded.tlsPrivateKey shouldBe sample.tlsPrivateKey
       CertificateVerifier.verify(Pem.decodeCertificate(loaded.tlsCertificate), TestTLS.ca.certificate) shouldBe sample.hostId.uuid
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("loadHostConfig rejects a config without tls-certificate"):
     val yaml = sample.yamlConfig
     val start = yaml.indexOf("tls-certificate: |")
     val end = yaml.indexOf("tls-private-key:")
-    val f = Files.createTempFile("aspen-host-config-notls", ".yaml")
+    val f = os.temp(prefix = "aspen-host-config-notls", suffix = ".yaml")
     try
-      Files.write(f, (yaml.substring(0, start) + yaml.substring(end)).getBytes(StandardCharsets.UTF_8))
-      a [FormatError] should be thrownBy HostConfig.loadHostConfig(f.toFile)
+      os.write.over(f, (yaml.substring(0, start) + yaml.substring(end)))
+      a [FormatError] should be thrownBy HostConfig.loadHostConfig(f)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """host-id: 00000000-0000-0000-0000-000000000000
@@ -89,10 +87,10 @@ tls-private-key: |
   -----END PRIVATE KEY-----
 """
 
-    val f = Files.createTempFile("aspen-host-docexample", ".yaml")
+    val f = os.temp(prefix = "aspen-host-docexample", suffix = ".yaml")
     try
-      Files.write(f, docExampleYaml.getBytes(StandardCharsets.UTF_8))
-      val cfg = HostConfig.loadHostConfig(f.toFile)
+      os.write.over(f, docExampleYaml)
+      val cfg = HostConfig.loadHostConfig(f)
 
       cfg.hostId should be(HostId(zero))
       cfg.aspenSystemId should be(zero)
@@ -108,18 +106,18 @@ tls-private-key: |
 
       cfg.yamlConfig should be(docExampleYaml)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("rocksdb resource limits round-trip, including partially specified ones"):
     val full = sample.copy(rocksdb = HostConfig.RocksDBResources(Some(4096), Some(1024), Some(8)))
     val partial = sample.copy(rocksdb = HostConfig.RocksDBResources(maxBackgroundThreads = Some(6)))
     for cfg <- List(full, partial) do
-      val f = Files.createTempFile("aspen-host-config-rocksdb", ".yaml")
+      val f = os.temp(prefix = "aspen-host-config-rocksdb", suffix = ".yaml")
       try
-        Files.write(f, cfg.yamlConfig.getBytes(StandardCharsets.UTF_8))
-        HostConfig.loadHostConfig(f.toFile) should be(cfg)
+        os.write.over(f, cfg.yamlConfig)
+        HostConfig.loadHostConfig(f) should be(cfg)
       finally
-        Files.deleteIfExists(f)
+        os.remove(f)
 
   test("rocksdb section is omitted when no limits are set"):
     sample.yamlConfig should not include "rocksdb:"
@@ -133,12 +131,12 @@ tls-private-key: |
   test("object cache size round-trips and converts megabytes to bytes"):
     val cfg = sample.copy(objectCacheMb = Some(2048))
     cfg.objectCacheBytes should be(2048L * 1024 * 1024)
-    val f = Files.createTempFile("aspen-host-config-objcache", ".yaml")
+    val f = os.temp(prefix = "aspen-host-config-objcache", suffix = ".yaml")
     try
-      Files.write(f, cfg.yamlConfig.getBytes(StandardCharsets.UTF_8))
-      HostConfig.loadHostConfig(f.toFile) should be(cfg)
+      os.write.over(f, cfg.yamlConfig)
+      HostConfig.loadHostConfig(f) should be(cfg)
     finally
-      Files.deleteIfExists(f)
+      os.remove(f)
 
   test("object cache defaults to a quarter of physical RAM and is omitted from the yaml"):
     sample.yamlConfig should not include "object-cache-mb"

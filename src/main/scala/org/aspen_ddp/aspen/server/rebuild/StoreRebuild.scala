@@ -4,7 +4,6 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 
-import java.nio.file.Path
 import scala.concurrent.Future
 
 /** Reconstruction of one store from the rest of its pool.
@@ -23,12 +22,12 @@ trait StoreRebuildFactory:
   def createRebuild(client: AspenClient,
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
-                    devicePath: Path): StoreRebuild
+                    devicePath: os.Path): StoreRebuild
 
 object StoreRebuildFactory:
   object Filesystem extends StoreRebuildFactory:
     def createRebuild(client: AspenClient,
                       storeId: StoreId,
                       storageDeviceId: StorageDeviceId,
-                      devicePath: Path): StoreRebuild =
+                      devicePath: os.Path): StoreRebuild =
       new RebuildingStore(client, storeId, storageDeviceId, devicePath)

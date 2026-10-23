@@ -18,8 +18,6 @@ import org.aspen_ddp.aspen.server.{BootstrapHttpServer, HostConfig}
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.yaml.snakeyaml.parser.ParserException
 
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{FileVisitResult, Files, Path, SimpleFileVisitor}
 import java.util.UUID
 import java.util.concurrent.TimeoutException
 import scala.collection.mutable
@@ -29,23 +27,17 @@ import scala.concurrent.duration.{DAYS, Duration, HOURS, MINUTES, SECONDS}
 class MainSuite extends AnyFunSuite with Matchers:
 
   /** Temp trees created by the current test, removed by withTempDir. */
-  private def withTempDir[T](prefix: String)(fn: Path => T): T =
-    val dir = Files.createTempDirectory(prefix)
+  private def withTempDir[T](prefix: String)(fn: os.Path => T): T =
+    val dir = os.temp.dir(prefix = prefix, deleteOnExit = false)
     try
       fn(dir)
     finally
-      deleteTree(dir)
+      os.remove.all(dir)
 
-  private def deleteTree(root: Path): Unit =
-    Files.walkFileTree(root, new SimpleFileVisitor[Path]:
-      override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
-        Files.deleteIfExists(file)
-        FileVisitResult.CONTINUE
-
-      override def postVisitDirectory(dir: Path, err: java.io.IOException): FileVisitResult =
-        Files.deleteIfExists(dir)
-        FileVisitResult.CONTINUE
-    )
+  /** Creates an empty file and returns its path as a command-line argument */
+  private def emptyFile(p: os.Path): String =
+    os.write(p, "")
+    p.toString
 
   test("quicConfigFor gives client commands one event loop and hosts the default"):
     Main.quicConfigFor(None).eventLoopThreads shouldBe 1
@@ -211,18 +203,18 @@ class MainSuite extends AnyFunSuite with Matchers:
       result shouldBe 0
       stdout.toString should include ("# Aspen Radicle Pointer Definition")
 
-      val hostDir = tmp.resolve("bootstrap-host")
+      val hostDir = tmp / "bootstrap-host"
 
       // Both files hold private keys, so neither may be readable by anyone but the owner.
-      val ownerOnly = java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
-      Files.getPosixFilePermissions(hostDir.resolve(HostConfig.configFilename)) shouldBe ownerOnly
-      Files.getPosixFilePermissions(hostDir.resolve(BootstrapConfig.configFilename)) shouldBe ownerOnly
+      val ownerOnly = os.PermSet.fromString("rw-------")
+      os.perms(hostDir / HostConfig.configFilename) shouldBe ownerOnly
+      os.perms(hostDir / BootstrapConfig.configFilename) shouldBe ownerOnly
 
       val hostCfg = HostConfig.loadHostConfig(
-        hostDir.resolve(HostConfig.configFilename).toFile)
+        hostDir / HostConfig.configFilename)
 
       val bsCfg = BootstrapConfig.loadBootstrapConfig(
-        hostDir.resolve(BootstrapConfig.configFilename).toFile)
+        hostDir / BootstrapConfig.configFilename)
 
       bsCfg.aspenSystemId shouldBe hostCfg.aspenSystemId
       bsCfg.bootstrapIDA shouldBe Replication(3, 2)
@@ -250,15 +242,15 @@ class MainSuite extends AnyFunSuite with Matchers:
       Console.withOut(stdout):
         Main.bootstrap(Replication(3, 2), tmp, "10.0.0.5", 4750, 4751, 4752) shouldBe 0
 
-      val clientCfgFile = tmp.resolve("aspen-client-config.yaml")
-      Files.exists(clientCfgFile) shouldBe true
-      Files.getPosixFilePermissions(clientCfgFile) shouldBe
-        java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
+      val clientCfgFile = tmp / "aspen-client-config.yaml"
+      os.exists(clientCfgFile) shouldBe true
+      os.perms(clientCfgFile) shouldBe
+        os.PermSet.fromString("rw-------")
       stdout.toString should include (s"Client configuration written to $clientCfgFile")
 
-      val hostDir = tmp.resolve("bootstrap-host")
-      val hostCfg = HostConfig.loadHostConfig(hostDir.resolve(HostConfig.configFilename).toFile)
-      val bsCfg = BootstrapConfig.loadBootstrapConfig(hostDir.resolve(BootstrapConfig.configFilename).toFile)
+      val hostDir = tmp / "bootstrap-host"
+      val hostCfg = HostConfig.loadHostConfig(hostDir / HostConfig.configFilename)
+      val bsCfg = BootstrapConfig.loadBootstrapConfig(hostDir / BootstrapConfig.configFilename)
 
       val clientCfg = ClientConfig.load(clientCfgFile)
       clientCfg.bootstrapHosts shouldBe List(BootstrapEndpoint("10.0.0.5", 4751))
@@ -343,16 +335,15 @@ class MainSuite extends AnyFunSuite with Matchers:
 
       val server = new BootstrapHttpServer(0, () => Future.successful(yaml), () => yaml)
       server.start()
-      val cfgDir = dir.resolve("client")
-      Files.createDirectories(cfgDir)
-      val cfgFile = cfgDir.resolve(ClientConfig.configFilename)
+      val cfgDir = dir / "client"
+      os.makeDir.all(cfgDir)
+      val cfgFile = cfgDir / ClientConfig.configFilename
       try
         // The cached list names only the server, so the fetched list ("served-host") differs
         // and the session tries to rewrite the file.
         ClientConfig.write(cfgFile, ClientConfig.Config(systemId, TestTLS.client,
           List(BootstrapEndpoint("127.0.0.1", server.boundPort))))
-        Files.setPosixFilePermissions(cfgDir,
-          java.nio.file.attribute.PosixFilePermissions.fromString("r-x------"))
+        os.perms.set(cfgDir, "r-x------")
 
         val stderr = java.io.ByteArrayOutputStream()
         val session = Console.withErr(stderr):
@@ -365,23 +356,21 @@ class MainSuite extends AnyFunSuite with Matchers:
         ClientConfig.load(cfgFile).bootstrapHosts shouldBe List(BootstrapEndpoint("127.0.0.1", server.boundPort))
       finally
         server.stop()
-        Files.setPosixFilePermissions(cfgDir,
-          java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"))
+        os.perms.set(cfgDir, "rwx------")
 
   test("openClientSession reports an unreadable client config as a ConfigError"):
     withTempDir("aspen-session-unreadable"): dir =>
-      val cfgFile = dir.resolve(ClientConfig.configFilename)
-      Files.writeString(cfgFile, "placeholder")
+      val cfgFile = dir / ClientConfig.configFilename
+      os.write.over(cfgFile, "placeholder")
       try
-        Files.setPosixFilePermissions(cfgFile, java.nio.file.attribute.PosixFilePermissions.fromString("---------"))
-        assume(!Files.isReadable(cfgFile), "process can read a mode 000 file (running as root?)")
+        os.perms.set(cfgFile, "---------")
+        assume(!cfgFile.toIO.canRead, "process can read a mode 000 file (running as root?)")
         val e = intercept[Main.ConfigError]:
           Main.openClientSession(cfgFile, None)
         e.getMessage should include(cfgFile.toString)
         e.getMessage should include("Cannot read client config")
       finally
-        Files.setPosixFilePermissions(cfgFile,
-          java.nio.file.attribute.PosixFilePermissions.fromString("rw-------"))
+        os.perms.set(cfgFile, "rw-------")
 
   test("commandErrorMessage leaves an unexpected exception unhandled"):
     // The clause set is the set of ways a user can get it wrong. Anything else is a bug and
@@ -566,9 +555,13 @@ class MainSuite extends AnyFunSuite with Matchers:
     val names = Main.Commands.map(_.name)
     names.distinct.size shouldBe names.size
 
+  test("an unparseable path argument is a usage error"):
+    Console.withErr(new java.io.ByteArrayOutputStream):
+      Main.buildParser.parse(Seq("list-pools", "bad\u0000path"), Main.Args()) shouldBe None
+
   test("a command sets the mode its handler is dispatched on"):
     withTempDir("parse-mode"): dir =>
-      val cfg = Files.createFile(dir.resolve("bootstrap.yaml")).toFile.getPath
+      val cfg = emptyFile(dir / "bootstrap.yaml")
       Main.buildParser.parse(Seq("list-pools", cfg), Main.Args()).map(_.mode) shouldBe
         Some("list-pools")
       Main.buildParser.parse(Seq("show-pool", cfg, "mypool"), Main.Args()).map(_.mode) shouldBe
@@ -576,8 +569,8 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   test("positional arguments bind in their declared order"):
     withTempDir("parse-order"): dir =>
-      val cfg = Files.createFile(dir.resolve("bootstrap.yaml")).toFile
-      val cfgs = cfg.getPath
+      val cfgs = emptyFile(dir / "bootstrap.yaml")
+      val cfg = os.Path(cfgs)
       val parsed = Main.buildParser.parse(
         Seq("create-pool", cfgs, "mypool", "Replication", "3", "2", "2", "myset", "4096"),
         Main.Args()).getOrElse(fail("create-pool did not parse"))
@@ -593,7 +586,7 @@ class MainSuite extends AnyFunSuite with Matchers:
   test("the shared port options reach a command that takes them"):
     withTempDir("parse-ports"): dir =>
       val parsed = Main.buildParser.parse(
-        Seq("bootstrap", dir.resolve("target").toString, "10.0.0.1", "Replication", "2", "2", "3",
+        Seq("bootstrap", (dir / "target").toString, "10.0.0.1", "Replication", "2", "2", "3",
             "--data-port", "5000", "--http-port", "5001", "--store-transfer-port", "5002"),
         Main.Args()).getOrElse(fail("bootstrap did not parse"))
 
@@ -603,11 +596,11 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   test("client commands take a client config and --bootstrap-host"):
     withTempDir("parse-bshost"): dir =>
-      val cfg = Files.createFile(dir.resolve("aspen-client-config.yaml")).toFile.getPath
+      val cfg = emptyFile(dir / "aspen-client-config.yaml")
       val parsed = Main.buildParser.parse(
         Seq("list-pools", cfg, "--bootstrap-host", "[fd00::5]:4800"), Main.Args()).
         getOrElse(fail("list-pools did not parse"))
-      parsed.clientConfigFile.getPath shouldBe cfg
+      parsed.clientConfigFile.toString shouldBe cfg
       parsed.bootstrapHost shouldBe Some(BootstrapEndpoint("[fd00::5]", 4800))
 
       // The default port is the HTTP port a host is created with.
@@ -632,7 +625,7 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   test("--bootstrap-host with a bad port is a usage error"):
     withTempDir("parse-bshost-bad"): dir =>
-      val cfg = Files.createFile(dir.resolve("aspen-client-config.yaml")).toFile.getPath
+      val cfg = emptyFile(dir / "aspen-client-config.yaml")
       val sink = new java.io.ByteArrayOutputStream
       val parsed = Console.withErr(sink):
         Main.buildParser.parse(Seq("list-pools", cfg, "--bootstrap-host", "node-a:abc"), Main.Args())
@@ -641,7 +634,7 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   test("a command's validation still rejects a bad argument"):
     withTempDir("parse-reject"): dir =>
-      val cfg = Files.createFile(dir.resolve("bootstrap.yaml")).toFile.getPath
+      val cfg = emptyFile(dir / "bootstrap.yaml")
       // scopt reports the rejection on stderr; swallowed so a passing run stays quiet.
       val sink = new java.io.ByteArrayOutputStream
       val parsed = Console.withErr(sink):

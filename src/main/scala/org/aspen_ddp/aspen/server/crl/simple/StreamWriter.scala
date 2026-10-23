@@ -4,7 +4,7 @@ import scribe.Logging
 
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
-import java.nio.file.{Path, StandardOpenOption}
+import java.nio.file.StandardOpenOption
 import java.util.concurrent.LinkedBlockingQueue
 
 object WriterThread:
@@ -20,11 +20,12 @@ object WriterThread:
 
 
 class StreamWriter(val maxSizeInBytes: Long,
-                   files: List[(StreamId, Path)]) extends Logging:
+                   files: List[(StreamId, os.Path)]) extends Logging:
   
   private val queue = new LinkedBlockingQueue[WriterThread.Command]()
   private val streams = files.map(t =>
-    val channel = FileChannel.open(t._2,
+    // FileChannel rather than os-lib: os-lib cannot open with DSYNC
+    val channel = FileChannel.open(t._2.toNIO,
       StandardOpenOption.CREATE,
       StandardOpenOption.DSYNC,
       StandardOpenOption.WRITE)

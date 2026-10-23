@@ -10,12 +10,9 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.client.AspenClient
 
-import java.io.IOException
 import java.lang.reflect.{InvocationTargetException, Proxy}
 import java.security.Signature
 import java.nio.charset.StandardCharsets
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{Files, LinkOption, Path, SimpleFileVisitor, FileVisitResult}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future}
@@ -25,10 +22,10 @@ class HostManagerSuite extends IntegrationTestSuite:
   private val systemId = UUID.fromString("33333333-3333-3333-3333-333333333333")
 
   /** Temp trees created by the current test, removed by subFixtureTeardown. */
-  private val tempRoots = mutable.ListBuffer[Path]()
+  private val tempRoots = mutable.ListBuffer[os.Path]()
 
-  private def newTempDir(prefix: String): Path =
-    val dir = Files.createTempDirectory(prefix)
+  private def newTempDir(prefix: String): os.Path =
+    val dir = os.temp.dir(prefix = prefix, deleteOnExit = false)
     tempRoots += dir
     dir
 
@@ -36,24 +33,10 @@ class HostManagerSuite extends IntegrationTestSuite:
     tempRoots.foreach(deleteTree)
     tempRoots.clear()
 
-  /** Removes a tree bottom-up, unlinking symlinks rather than following them. */
-  private def deleteTree(root: Path): Unit =
-    try
-      Files.walkFileTree(root, new SimpleFileVisitor[Path]:
-        override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult =
-          Files.deleteIfExists(file)
-          FileVisitResult.CONTINUE
-
-        override def visitFileFailed(file: Path, exc: IOException): FileVisitResult =
-          Files.deleteIfExists(file)
-          FileVisitResult.CONTINUE
-
-        override def postVisitDirectory(dir: Path, exc: IOException): FileVisitResult =
-          Files.deleteIfExists(dir)
-          FileVisitResult.CONTINUE
-      )
-    catch
-      case _: Throwable => ()
+  /** Removes a tree, unlinking symlinks rather than following them. */
+  private def deleteTree(root: os.Path): Unit =
+    try os.remove.all(root)
+    catch case _: Throwable => ()
 
   /** A real bootstrap config, as fetched by the CLI, so tests can assert the written copy is
    *  not merely byte-identical but still loadable by the host command. */
@@ -68,10 +51,10 @@ class HostManagerSuite extends IntegrationTestSuite:
       caCertificate = TestTLS.caCertificatePem)
 
   /** A host directory path that does not yet exist, as add-host expects. */
-  private def unusedHostDir(): Path =
-    newTempDir("aspen-hm-test").resolve("node_b")
+  private def unusedHostDir(): os.Path =
+    newTempDir("aspen-hm-test") / "node_b"
 
-  private def createHost(hostDir: Path,
+  private def createHost(hostDir: os.Path,
                          bsCfg: String,
                          name: String = "node_b",
                          via: AspenClient = client)
@@ -88,19 +71,19 @@ class HostManagerSuite extends IntegrationTestSuite:
       hs     <- client.getHostState(hostId)
     yield
       // Host scans this directory at startup, so an empty one is still required.
-      Files.isDirectory(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName)) should be(true)
+      os.isDir(hostDir / StorageDeviceManager.StorageDevicesDirName) should be(true)
 
-      val copied = hostDir.resolve(BootstrapConfig.configFilename)
-      Files.isRegularFile(copied) should be(true)
-      Files.readAllBytes(copied) should be(bootstrapConfigYaml.getBytes(StandardCharsets.UTF_8))
-      val bs = BootstrapConfig.loadBootstrapConfig(copied.toFile)
+      val copied = hostDir / BootstrapConfig.configFilename
+      os.isFile(copied) should be(true)
+      os.read.bytes(copied) should be(bootstrapConfigYaml.getBytes(StandardCharsets.UTF_8))
+      val bs = BootstrapConfig.loadBootstrapConfig(copied)
       bs.aspenSystemId should be(systemId)
 
-      val cfg = HostConfig.loadHostConfig(hostDir.resolve(HostConfig.configFilename).toFile)
+      val cfg = HostConfig.loadHostConfig(hostDir / HostConfig.configFilename)
       // Both files hold private keys, so neither may be readable by anyone but the owner.
-      val ownerOnly = java.nio.file.attribute.PosixFilePermissions.fromString("rw-------")
-      Files.getPosixFilePermissions(copied) should be(ownerOnly)
-      Files.getPosixFilePermissions(hostDir.resolve(HostConfig.configFilename)) should be(ownerOnly)
+      val ownerOnly = os.PermSet.fromString("rw-------")
+      os.perms(copied) should be(ownerOnly)
+      os.perms(hostDir / HostConfig.configFilename) should be(ownerOnly)
 
       cfg.hostId should be(hostId)
       cfg.aspenSystemId should be(systemId)
@@ -122,9 +105,8 @@ class HostManagerSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
     val bsCfg = bootstrapConfigYaml
-    Files.createDirectories(hostDir)
-    Files.write(hostDir.resolve(HostConfig.configFilename),
-                "host-id: x\n".getBytes(StandardCharsets.UTF_8))
+    os.makeDir.all(hostDir)
+    os.write.over(hostDir / HostConfig.configFilename, "host-id: x\n")
     for
       before <- client.listHosts()
       err    <- createHost(hostDir, bsCfg).failed
@@ -135,14 +117,14 @@ class HostManagerSuite extends IntegrationTestSuite:
       after should be(before)
       // The guard must fire before anything is copied in, or a rejected run would overwrite
       // the bootstrap config of a host that is already running.
-      Files.exists(hostDir.resolve(BootstrapConfig.configFilename)) should be(false)
+      os.exists(hostDir / BootstrapConfig.configFilename) should be(false)
 
   atest("reports DirectorySetupFailed, and registers nothing, when the directory cannot be made"):
     given ExecutionContext = executionContext
     val bsCfg = bootstrapConfigYaml
     // An existing regular file where the host directory should go: createDirectories fails.
-    val hostDir = newTempDir("aspen-hm-test").resolve("node_b")
-    Files.write(hostDir, "not a directory".getBytes(StandardCharsets.UTF_8))
+    val hostDir = newTempDir("aspen-hm-test") / "node_b"
+    os.write.over(hostDir, "not a directory")
     for
       before <- client.listHosts()
       err    <- createHost(hostDir, bsCfg).failed
@@ -159,9 +141,8 @@ class HostManagerSuite extends IntegrationTestSuite:
     val hostDir = unusedHostDir()
     val bsCfg = bootstrapConfigYaml
     // Exactly what a run that failed between the copy and the commit leaves behind.
-    Files.createDirectories(hostDir.resolve(StorageDeviceManager.StorageDevicesDirName))
-    Files.write(hostDir.resolve(BootstrapConfig.configFilename),
-                "stale residue, not a valid config\n".getBytes(StandardCharsets.UTF_8))
+    os.makeDir.all(hostDir / StorageDeviceManager.StorageDevicesDirName)
+    os.write.over(hostDir / BootstrapConfig.configFilename, "stale residue, not a valid config\n")
     for
       hostId <- createHost(hostDir, bsCfg)
       _      <- waitForTransactionsToComplete()
@@ -169,9 +150,9 @@ class HostManagerSuite extends IntegrationTestSuite:
     yield
       // The stale copy is replaced rather than preserved or tripped over.
       BootstrapConfig.loadBootstrapConfig(
-        hostDir.resolve(BootstrapConfig.configFilename).toFile).aspenSystemId should be(systemId)
+        hostDir / BootstrapConfig.configFilename).aspenSystemId should be(systemId)
       HostConfig.loadHostConfig(
-        hostDir.resolve(HostConfig.configFilename).toFile).hostId should be(hostId)
+        hostDir / HostConfig.configFilename).hostId should be(hostId)
       hs.name should be("node_b")
 
   atest("a name already in use fails after the directory has been prepared"):
@@ -191,21 +172,21 @@ class HostManagerSuite extends IntegrationTestSuite:
       hosts.count(_._1 == "node_b") should be(1)
       // The directory is prepared before the transaction, so it survives; the host config is
       // not, which keeps the failed directory from looking like an initialized host.
-      Files.isDirectory(secondDir.resolve(StorageDeviceManager.StorageDevicesDirName)) should be(true)
-      Files.exists(secondDir.resolve(HostConfig.configFilename)) should be(false)
+      os.isDir(secondDir / StorageDeviceManager.StorageDevicesDirName) should be(true)
+      os.exists(secondDir / HostConfig.configFilename) should be(false)
 
   atest("reports ConfigWriteFailed, carrying the config text, when the final write fails"):
     given ExecutionContext = executionContext
     val hostDir = unusedHostDir()
     val bsCfg = bootstrapConfigYaml
-    Files.createDirectories(hostDir)
-    // Files.exists follows symlinks so the guard sees no host config; the CREATE_NEW write
-    // opens with O_EXCL, which fails on the link itself.
-    val cfgPath = hostDir.resolve(HostConfig.configFilename)
-    Files.createSymbolicLink(cfgPath, hostDir.resolve("no-such-target"))
+    os.makeDir.all(hostDir)
+    // os.exists follows symlinks so the guard sees no host config; the createNew write
+    // creates the file exclusively, which fails on the link itself.
+    val cfgPath = hostDir / HostConfig.configFilename
+    os.symlink(cfgPath, hostDir / "no-such-target")
     recoverToExceptionIf[HostManager.ConfigWriteFailed](createHost(hostDir, bsCfg))
       .flatMap: err =>
-        Files.exists(cfgPath, LinkOption.NOFOLLOW_LINKS) should be(true)
+        os.exists(cfgPath, followLinks = false) should be(true)
         err.getMessage should include(err.hostId.uuid.toString)
         // The config text is the operator's only route to finishing by hand, so it has to
         // describe the host that really was registered.
@@ -222,7 +203,7 @@ class HostManagerSuite extends IntegrationTestSuite:
     for
       hostId <- createHost(hostDir, bsCfg)
     yield
-      val cfg = HostConfig.loadHostConfig(hostDir.resolve(HostConfig.configFilename).toFile)
+      val cfg = HostConfig.loadHostConfig(hostDir / HostConfig.configFilename)
       val cert = Pem.decodeCertificate(cfg.tlsCertificate)
       CertificateVerifier.verify(cert, TestTLS.ca.certificate) should be(hostId.uuid)
 
@@ -266,4 +247,4 @@ class HostManagerSuite extends IntegrationTestSuite:
       err shouldBe a[HostManager.CertificateCreationFailed]
       err.getCause should be theSameInstanceAs boom
       after should be(before)
-      Files.exists(hostDir.resolve(HostConfig.configFilename)) should be(false)
+      os.exists(hostDir / HostConfig.configFilename) should be(false)

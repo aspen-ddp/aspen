@@ -84,15 +84,15 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       // On disk, each store's final directory exists with a loadable StoreConfig, holds flushed
       // object data (not just scaffolding), and its staging directory under rebuilding/ is gone.
       expectedStores.foreach: sid =>
-        val finalPath = os.Path(deviceDir) / sid.directoryName
+        val finalPath = deviceDir / sid.directoryName
         os.exists(finalPath) should be(true)
-        StoreConfig.loadStoreConfig((finalPath / StoreConfig.configFilename).toIO).storeId should
+        StoreConfig.loadStoreConfig(finalPath / StoreConfig.configFilename).storeId should
           be(sid)
 
         // The store holds flushed object data, not just a config file.
         os.list(finalPath).count(_.last.endsWith(".sst")) should be > 0
 
-        val stagingPath = os.Path(deviceDir) / RebuildingStore.RebuildDirectory / sid.directoryName
+        val stagingPath = deviceDir / RebuildingStore.RebuildDirectory / sid.directoryName
         os.exists(stagingPath) should be(false)
 
       // A read-back assertion against the pool is not valid in this harness: RecordingHost

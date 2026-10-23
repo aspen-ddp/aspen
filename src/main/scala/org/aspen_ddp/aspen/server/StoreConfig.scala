@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 
-import java.io.File
 import java.util.UUID
 
 /*
@@ -42,6 +41,6 @@ object StoreConfig extends YObject[StoreConfig]:
 
   def create(o: Object): StoreConfig = StoreConfig(storeId.get(o), backend.get(o))
   
-  def loadStoreConfig(file: File): StoreConfig =
+  def loadStoreConfig(file: os.Path): StoreConfig =
     create(loadYamlFile(file))
 

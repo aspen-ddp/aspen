@@ -3,7 +3,6 @@ package org.aspen_ddp.aspen.server.store.backend
 import org.aspen_ddp.aspen.FileBasedTests
 import org.rocksdb.{WriteBatch, WriteOptions}
 
-import java.nio.file.Path
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.*
@@ -13,7 +12,7 @@ object BufferedConsistentRocksDBSuite:
   case class InjectedWriteFailure() extends Throwable
 
   /** Allows tests to make the underlying RocksDB write fail on demand */
-  class FailableRocksDB(path: Path)(using ExecutionContext) extends BufferedConsistentRocksDB(path):
+  class FailableRocksDB(path: os.Path)(using ExecutionContext) extends BufferedConsistentRocksDB(path):
     @volatile var failWrites = false
 
     override protected def writeBatch(writeOpts: WriteOptions, batch: WriteBatch): Unit =
@@ -63,7 +62,7 @@ class BufferedConsistentRocksDBSuite extends FileBasedTests:
 
   private def withDB(fn: (FailableRocksDB, ManualExecutionContext) => Unit): Unit =
     val ec = new ManualExecutionContext
-    val db = new FailableRocksDB(Path.of(tdir.getPath, "rocksdb"))(using ec)
+    val db = new FailableRocksDB(tdir / "rocksdb")(using ec)
     try
       fn(db, ec)
     finally

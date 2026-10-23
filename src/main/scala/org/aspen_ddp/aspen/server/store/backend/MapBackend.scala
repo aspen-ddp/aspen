@@ -6,7 +6,6 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.server.store.ObjectState
 
-import java.nio.file.Path
 import scala.concurrent.{Future, Promise}
 
 class MapBackend(val storeId: StoreId) extends Backend {
@@ -19,7 +18,7 @@ class MapBackend(val storeId: StoreId) extends Backend {
   
   override def estimateSize(): Long = 0
   
-  override def path: Path = Path.of("/")
+  override def path: os.Path = os.root
 
   override def setCompletionHandler(handler: CompletionHandler): Unit = {
     chandler = Some(handler)

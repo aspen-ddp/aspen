@@ -10,7 +10,6 @@ import org.aspen_ddp.aspen.common.util.physicalMemory
 import org.rocksdb.{BlockBasedTableConfig, Cache, Env, LRUCache, Options, Priority, RocksDB, WriteBufferManager}
 import scribe.Logging
 
-import java.nio.file.Path
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 import scala.language.implicitConversions
@@ -146,7 +145,7 @@ object RocksDBBackend extends Logging {
   /** Opens, creating if necessary, a database that uses the host-wide shared resources. The database must be
     * closed via closeDatabase so that the background thread pools shrink accordingly.
     */
-  def openDatabase(dbPath: Path): RocksDB = {
+  def openDatabase(dbPath: os.Path): RocksDB = {
     val (cache, wbm) = getSharedMemory()
     val options = new Options()
       .setCreateIfMissing(true)
@@ -187,7 +186,7 @@ object RocksDBBackend extends Logging {
   }
 }
 
-class RocksDBBackend(dbPath:Path,
+class RocksDBBackend(dbPath: os.Path,
                      override val storeId: StoreId,
                      val executionContext: ExecutionContext) extends Backend {
 
@@ -204,7 +203,7 @@ class RocksDBBackend(dbPath:Path,
   
   override def estimateSize(): Long = db.estimateSize()
   
-  override def path: Path = dbPath
+  override def path: os.Path = dbPath
 
   override def setCompletionHandler(handler: CompletionHandler): Unit = {
     chandler = Some(handler)

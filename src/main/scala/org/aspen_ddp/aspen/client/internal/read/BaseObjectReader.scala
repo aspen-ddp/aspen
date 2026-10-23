@@ -165,8 +165,11 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
 
       val readTime = matchingStoreStates.foldLeft(HLCTimestamp.now)((maxts, ss) => if (ss.readTimestamp > maxts) ss.readTimestamp else maxts)
 
-      if (metadataOnly)
-        Some(Right(MetadataObjectState(pointer, revision, refcount, timestamp, readTime)))
+      if metadataOnly then
+        if refcount.count > 0 then
+          Some(Right(MetadataObjectState(pointer, revision, refcount, timestamp, readTime)))
+        else
+          Some(Left(InvalidObject(pointer)))
       else
         try
           val restoredObject = restoreObject(revision, refcount, timestamp, readTime, matchingStoreStates, allStoreStates, debug)

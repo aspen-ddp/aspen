@@ -1,10 +1,6 @@
 TODO
 ====
 
-Add readMetadata(pointer: ObjectPointer): Future[Metadata]
-  - Reads just the object metadata, not the content
-  - Good for when we just need the current metadata and don't want to read a potentially large object
-
 QUIC tests seem to fail randomly. Likely due to load. The test suite needs to pass correctly under load.
 Investigate the causes of these failures and see what can be done to improve reliability. Note simply
 increasing timeouts/linger and the like is generally not acceptable as it can dramatically increase the

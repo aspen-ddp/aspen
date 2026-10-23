@@ -5,11 +5,11 @@ import org.aspen_ddp.aspen.client.{CorruptedObject, DataObjectState, InvalidObje
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.client.{KeyValueObjectState, ObjectCache, ObjectState}
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, MetadataObjectState, ObjectCache, ObjectState}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, OpportunisticRebuild, Read, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError, ReadType, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError, ReadType, Value}
 import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState => StoreValueState}
 import org.aspen_ddp.aspen.common.transaction.PreTransactionOpportunisticRebuild
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -18,7 +18,7 @@ import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, Transacti
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import scala.concurrent.{Await, ExecutionContext}
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.*
 import scala.language.implicitConversions
 
@@ -223,22 +223,33 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     Some(KVObjectState.encode(None, None, None, None,
       Map(kvKey -> new StoreValueState(Value(Array[Byte](1)), rev, ts, None))))
 
-  /** ds1 replies stale first; ds0 and ds2 then complete the read; ds1 replies stale again */
-  def runStaleStoreRead(readType: ReadType): (RecordingClient, KeyValueObjectState) =
+  /** ds1 replies stale first; ds0 and ds2 then complete the read; ds1 replies stale again.
+    * Stores send no object data for metadata-only reads */
+  def runStaleStoreReadOf(readType: ReadType, pointer: ObjectPointer,
+                          refcount: ObjectRefcount = ref): (RecordingClient, Future[ObjectState]) =
     val m = new RecordingClient
-    val r = mkReader(m, objectPointer = kvptr, readType = readType)
+    val r = mkReader(m, objectPointer = pointer, readType = readType)
     val nrev2 = ObjectRevision(TransactionId(new UUID(0,2)))
     val ts = HLCTimestamp.now
     val oldTs = HLCTimestamp(ts.asLong - 1000)
 
-    def cs(rv: ObjectRevision, t: HLCTimestamp) = Right(ReadResponse.CurrentState(rv, ref, t, 5, kvData(rv, t), Set()))
+    def data(rv: ObjectRevision, t: HLCTimestamp): Option[DataBuffer] = (readType, pointer) match
+      case (_: MetadataOnly, _) => None
+      case (_, _: KeyValueObjectPointer) => kvData(rv, t)
+      case _ => Some(odata)
+
+    def cs(rv: ObjectRevision, t: HLCTimestamp) = Right(ReadResponse.CurrentState(rv, refcount, t, 5, data(rv, t), Set()))
 
     r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, cs(rev, oldTs)))
     r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, cs(nrev2, ts)))
     r.receiveReadResponse(ReadResponse(client, ds2, readUUID, ts, cs(nrev2, ts)))
     r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, cs(rev, oldTs)))
 
-    (m, Await.result(r.readResult, awaitDuration).asInstanceOf[KeyValueObjectState])
+    (m, r.readResult)
+
+  def runStaleStoreRead(readType: ReadType): (RecordingClient, KeyValueObjectState) =
+    val (m, result) = runStaleStoreReadOf(readType, kvptr)
+    (m, Await.result(result, awaitDuration).asInstanceOf[KeyValueObjectState])
 
   def rebuildsSent(m: RecordingClient): List[OpportunisticRebuild] =
     m.requests.collect { case o: OpportunisticRebuild => o }
@@ -270,5 +281,29 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     reads.size should be (3)
     reads.foreach(_.readType should be (KeySet(List(kvKey))))
     succeed
+  }
+
+  def checkMetadataOnlyRead(pointer: ObjectPointer) =
+    val (m, result) = runStaleStoreReadOf(MetadataOnly(), pointer)
+    Await.result(result, awaitDuration) match
+      case mos: MetadataObjectState =>
+        mos.revision should be (ObjectRevision(TransactionId(new UUID(0,2))))
+        mos.refcount should be (ref)
+      case other => fail(s"Expected a MetadataObjectState, got $other")
+    m.puts should be (Nil)
+    m.repairMarks should be (Nil)
+    rebuildsSent(m) should be (Nil)
+
+  test("metadata-only KV read neither caches nor rebuilds") {
+    checkMetadataOnlyRead(kvptr)
+  }
+
+  test("metadata-only Data read neither caches nor rebuilds") {
+    checkMetadataOnlyRead(ptr)
+  }
+
+  test("metadata-only read of a deleted object fails with invalid object") {
+    val (m, result) = runStaleStoreReadOf(MetadataOnly(), ptr, refcount = ObjectRefcount(2, 0))
+    recoverToSucceededIf[InvalidObject](result)
   }
 }

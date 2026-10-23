@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxMessage, TxPrepare, TxResolved}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -160,6 +160,33 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   test("partial network read of a cached object returns only requested keys and leaves the cache intact") {
     checkPartialRead(preCache = true)
+  }
+
+  def checkMetadataOnlyRead(preCache: Boolean): Unit =
+    val (frontend, backend, cache, net) = mkFrontendWithNet()
+    val os = mkKVObjectState()
+
+    backend.bootstrapAllocate(oid2, os.objectType, os.metadata, os.data)
+    if preCache then
+      cache.insert(os)
+
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, MetadataOnly())
+    net.clientMessage() match
+      case Some(rr: ReadResponse) =>
+        val cs = rr.result.toOption.get
+        cs.objectData shouldBe None
+        cs.sizeOnStore shouldBe os.data.size
+        (cs.revision, cs.refcount, cs.timestamp) shouldBe (os.metadata.revision, os.metadata.refcount, os.metadata.timestamp)
+      case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+
+    cache.get(oid2).get.data.getByteArray shouldBe os.data.getByteArray
+
+  test("metadata-only network read returns no object data") {
+    checkMetadataOnlyRead(preCache = false)
+  }
+
+  test("metadata-only network read of a cached object returns no object data") {
+    checkMetadataOnlyRead(preCache = true)
   }
 
   test("repair deletion removes the object from the backend") {

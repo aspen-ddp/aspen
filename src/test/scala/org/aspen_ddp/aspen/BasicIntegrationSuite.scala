@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen
 
-import org.aspen_ddp.aspen.client.{KeyValueObjectState, Transaction}
+import org.aspen_ddp.aspen.client.{InvalidObject, KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, KeyValueObjectPointer, ObjectRevision, Value}
@@ -52,6 +52,48 @@ class BasicIntegrationSuite extends IntegrationTestSuite {
     yield
       range.contents.keySet should be (Set(k(2), k(3), k(4)))
       range.partial should be (true)
+  }
+
+  atest("Read metadata of KeyValue object") {
+    for
+      kp <- allocateFiveKeyObject(k(103))
+      meta <- client.readMetadata(kp)
+      full <- client.read(kp)
+    yield
+      meta.pointer should be (kp)
+      meta.revision should be (full.revision)
+      meta.refcount should be (full.refcount)
+      meta.timestamp should be (full.timestamp)
+  }
+
+  atest("Read metadata of data object") {
+    given tx: Transaction = client.newTransaction()
+    tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(k(104))), List(Insert(k(104), Array[Byte](1))))
+
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      dp <- pool.allocator.allocateDataObject(Array[Byte](1, 2, 3))
+      _ <- tx.commit()
+      meta <- client.readMetadata(dp)
+      full <- client.read(dp)
+    yield
+      meta.pointer should be (dp)
+      meta.revision should be (full.revision)
+      meta.refcount should be (full.refcount)
+  }
+
+  atest("Read metadata of deleted object") {
+    for
+      kp <- allocateFiveKeyObject(k(105))
+      meta <- client.readMetadata(kp)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(kp, meta.refcount, meta.refcount.decrement())
+      _ <- tx.commit()
+      optional <- client.readMetadataOptional(kp)
+      failed <- recoverToSucceededIf[InvalidObject](client.readMetadata(kp))
+    yield
+      optional should be (None)
+      failed
   }
 
   atest("Read radicle") {

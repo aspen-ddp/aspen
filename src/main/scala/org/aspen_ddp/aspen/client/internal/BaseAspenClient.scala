@@ -123,6 +123,11 @@ abstract class BaseAspenClient(
       rmgr.read(pointer, ida, comment, readType = KeyRange(startKey, endKey, ordering)).map(_.asInstanceOf[KeyValueObjectState])
     }
 
+  override def readMetadata(pointer: ObjectPointer, comment: String): Future[MetadataObjectState] =
+    resolveIda(pointer).flatMap { ida =>
+      rmgr.read(pointer, ida, comment, readType = MetadataOnly()).map(_.asInstanceOf[MetadataObjectState])
+    }
+
   // ---- Transactions ----
 
   override def newTransaction(): Transaction =

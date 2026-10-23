@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -32,11 +32,20 @@ trait ObjectReader {
                    ordering: KeyOrdering): Future[KeyValueObjectState] =
     readKeyRange(pointer, startKey, endKey, ordering, "")
 
+  /** Reads only the object's metadata. The object's content is neither transferred nor restored */
+  def readMetadata(pointer: ObjectPointer, comment: String): Future[MetadataObjectState]
+
+  def readMetadata(pointer: ObjectPointer): Future[MetadataObjectState] = readMetadata(pointer, "")
+
   def readOptional(pointer: DataObjectPointer)(implicit ec: ExecutionContext): Future[Option[DataObjectState]] =
     read(pointer, "").map(Some(_)).recover:
       case e: InvalidObject => None
 
   def readOptional(pointer: KeyValueObjectPointer)(implicit ec: ExecutionContext): Future[Option[KeyValueObjectState]] =
     read(pointer, "").map(Some(_)).recover:
+      case e: InvalidObject => None
+
+  def readMetadataOptional(pointer: ObjectPointer)(implicit ec: ExecutionContext): Future[Option[MetadataObjectState]] =
+    readMetadata(pointer, "").map(Some(_)).recover:
       case e: InvalidObject => None
 }

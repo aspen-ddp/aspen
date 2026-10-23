@@ -105,7 +105,7 @@ class Frontend(val storeId: StoreId,
       case Some(os) =>
         logger.trace(s"Reading Cached object for read $readUUID. Revision ${os.metadata.revision}")
         val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
-          os.data.size, Some(PartialRead.filter(os.objectType, os.data, readType)), os.lockedWriteTransactions )
+          os.data.size, PartialRead.filter(os.objectType, os.data, readType), os.lockedWriteTransactions )
 
         val rr = ReadResponse(clientId, storeId, readUUID, HLCTimestamp.now, Right(cs) )
         net.sendClientResponse(rr)
@@ -249,7 +249,7 @@ class Frontend(val storeId: StoreId,
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. SUCCESS. Sending read response")
               val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
-                os.data.size, Some(PartialRead.filter(os.objectType, os.data, netRead.readType)), os.lockedWriteTransactions )
+                os.data.size, PartialRead.filter(os.objectType, os.data, netRead.readType), os.lockedWriteTransactions )
 
               val rr = ReadResponse(netRead.clientId, storeId, netRead.requestUUID, HLCTimestamp.now, Right(cs) )
               net.sendClientResponse(rr)

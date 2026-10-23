@@ -2,7 +2,8 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, MetadataOnly, ObjectRevision, ObjectType, ReadType, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -23,6 +24,10 @@ object PartialReadSuite {
 
   val data = KVObjectState.encode(Some(min), Some(max), Some(left), Some(right), contents)
 
+  /** Filters data a test expects to be returned */
+  def filtered(objectType: ObjectType.Value, data: DataBuffer, readType: ReadType): DataBuffer =
+    PartialRead.filter(objectType, data, readType).get
+
   def keysOf(kvos: KVObjectState): Set[Int] = kvos.content.keySet.map(_.bytes(0).toInt)
 
   def assertBoundsKept(kvos: KVObjectState): Unit =
@@ -36,20 +41,20 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
   import PartialReadSuite._
 
   test("KeySet keeps only requested keys") {
-    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, data, KeySet(List(k(2), k(4), k(9)))))
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, KeySet(List(k(2), k(4), k(9)))))
     keysOf(r) shouldBe Set(2, 4)
     r.content(k(2)).value.bytes shouldBe Array[Byte](2, 0)
     assertBoundsKept(r)
   }
 
   test("empty KeySet keeps no keys") {
-    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, data, KeySet(Nil)))
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, KeySet(Nil)))
     keysOf(r) shouldBe Set()
     assertBoundsKept(r)
   }
 
   test("KeyRange is inclusive at both ends") {
-    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, data, KeyRange(k(2), k(4), IntegerKeyOrdering)))
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, KeyRange(k(2), k(4), IntegerKeyOrdering)))
     keysOf(r) shouldBe Set(2, 3, 4)
     assertBoundsKept(r)
   }
@@ -62,7 +67,7 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
     val mixed = KVObjectState.encode(None, None, None, None,
       keys.map(key => key -> new ValueState(Value(Array[Byte](0)), rev, HLCTimestamp(1), None)).toMap)
 
-    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, mixed, KeyRange(bk(2), bk(1, 0), IntegerKeyOrdering)))
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, mixed, KeyRange(bk(2), bk(1, 0), IntegerKeyOrdering)))
     r.content.keySet shouldBe Set(bk(2), bk(3), bk(1, 0))
   }
 
@@ -72,17 +77,22 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
     val mixed = KVObjectState.encode(None, None, None, None,
       keys.map(key => key -> new ValueState(Value(Array[Byte](0)), rev, HLCTimestamp(1), None)).toMap)
 
-    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, mixed, KeyRange(bk(2, 0), bk(3), ByteArrayKeyOrdering)))
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, mixed, KeyRange(bk(2, 0), bk(3), ByteArrayKeyOrdering)))
     r.content.keySet shouldBe Set(bk(2, 0), bk(2, 5), bk(3))
   }
 
   test("KeyRange with min > max is empty") {
-    val r = KVObjectState.decode(PartialRead.filter(ObjectType.KeyValue, data, KeyRange(k(4), k(2), IntegerKeyOrdering)))
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, KeyRange(k(4), k(2), IntegerKeyOrdering)))
     keysOf(r) shouldBe Set()
   }
 
   test("non-partial read types and Data objects are unchanged") {
-    PartialRead.filter(ObjectType.KeyValue, data, FullObject()).getByteArray shouldBe data.getByteArray
-    PartialRead.filter(ObjectType.Data, data, KeySet(Nil)).getByteArray shouldBe data.getByteArray
+    filtered(ObjectType.KeyValue, data, FullObject()).getByteArray shouldBe data.getByteArray
+    filtered(ObjectType.Data, data, KeySet(Nil)).getByteArray shouldBe data.getByteArray
+  }
+
+  test("MetadataOnly returns no data for either object type") {
+    PartialRead.filter(ObjectType.KeyValue, data, MetadataOnly()) shouldBe None
+    PartialRead.filter(ObjectType.Data, data, MetadataOnly()) shouldBe None
   }
 }

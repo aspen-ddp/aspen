@@ -24,9 +24,9 @@ abstract class BaseReadDriver(
   logger.info(s"Read UUID $readUUID: Beginning read of ${objectPointer.objectType} object ${objectPointer.id}. Comment: $comment")
 
   /** Partial results must never be cached or used for opportunistic rebuilds: the entries they omit would
-    * be mistaken for deletions */
+    * be mistaken for deletions. Metadata-only results carry no content at all */
   private val isPartial: Boolean = readType match
-    case _: KeySet | _: KeyRange => true
+    case _: KeySet | _: KeyRange | _: MetadataOnly => true
     case _ => false
 
   // Detect invalid combinations

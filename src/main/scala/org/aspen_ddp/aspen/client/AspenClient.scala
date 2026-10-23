@@ -63,6 +63,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
                    comment: String): Future[KeyValueObjectState]
 
+  def readMetadata(pointer: ObjectPointer, comment: String): Future[MetadataObjectState]
+
   def newTransaction(): Transaction
 
   /** A transaction for the repair service's errorTree deletes.

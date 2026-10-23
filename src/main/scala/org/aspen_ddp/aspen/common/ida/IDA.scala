@@ -50,6 +50,30 @@ sealed trait AppendableIDA:
   /** One delta per encoding index, for appending `data` (non-empty) to an object of logical length `currentLength` */
   def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta]
 
+  /** Row-aligned slice offset at which logical byte `offset` begins */
+  def sliceOffsetFor(offset: Int): Int
+
+  /** Row-aligned slice range [start, end) covering logical [offset, offset + length) */
+  def sliceRangeFor(offset: Int, length: Int): (Int, Int)
+
+  /** Bytes from the end of each slice that are needed to learn the logical length: cellSize, or 0 for Replication */
+  def lengthProbeBytes: Int
+
+  /** Decodes equal-length slice segments that start at slice offset `sliceStart`, where `sliceSize` is the full slice length */
+  def restoreRange(sliceStart: Int, sliceSize: Int, segments: List[(Byte, Array[Byte])]): RestoredRange
+
+/** Result of restoring a slice range. `data` begins at logical byte `logicalOffset`. `objectLength` is
+  * known only when the range included the end of the slices.
+  */
+final case class RestoredRange(logicalOffset: Int, data: Array[Byte], objectLength: Option[Int]):
+  override def equals(that: Any): Boolean = that match
+    case r: RestoredRange =>
+      logicalOffset == r.logicalOffset && objectLength == r.objectLength && java.util.Arrays.equals(data, r.data)
+    case _ => false
+
+  override def hashCode(): Int =
+    31 * (31 * logicalOffset + objectLength.hashCode()) + java.util.Arrays.hashCode(data)
+
 sealed abstract class IDA extends Ordered[IDA] {
 
   /** Algorithm name like "replication" or "reed-solomon" */
@@ -128,6 +152,17 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA with Appenda
   def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta] =
     require(data.length > 0, "Append data must not be empty")
     Array.fill(width)(AppendDelta(currentLength, currentLength + data.length, currentLength, data, None))
+
+  def sliceOffsetFor(offset: Int): Int = offset
+
+  def sliceRangeFor(offset: Int, length: Int): (Int, Int) = (offset, offset + length)
+
+  def lengthProbeBytes: Int = 0
+
+  def restoreRange(sliceStart: Int, sliceSize: Int, segments: List[(Byte, Array[Byte])]): RestoredRange =
+    if segments.size < restoreThreshold then
+      throw new IDARestoreError
+    RestoredRange(sliceStart, segments.head._2, Some(sliceSize))
 
   def name: String = "replication"
   
@@ -554,28 +589,76 @@ case class AppendingReedSolomon(
       throw new IDARestoreError(s"Invalid slice length $sliceLength. Expected a multiple of $cellSize")
 
     val rows = sliceLength / cellSize
-    val nbytes = ByteBuffer.wrap(shards(k - 1)).getLong(sliceLength - AppendingReedSolomon.TrailerSize)
-
-    // Checked as a long so a corrupt trailer cannot overflow the row arithmetic
-    if nbytes < 0 || nbytes + AppendingReedSolomon.TrailerSize > rows.toLong * rowBytes ||
-        rowsFor(nbytes.toInt) != rows then
-      throw new IDARestoreError(s"Invalid trailer length $nbytes for a slice of $rows rows")
-
-    val length = nbytes.toInt
+    val length = trailerLength(shards, sliceLength, rows)
     val arr = new Array[Byte](length)
 
+    gather(shards, 0, rows, arr, 0)
+
+    arr
+
+  /** Reads the logical length from the trailer in the last 8 bytes of the final segment of data
+    * shard k-1 and validates it against the total row count of the full slices
+    */
+  private def trailerLength(shards: Array[Array[Byte]], segmentLength: Int, totalRows: Int): Int =
+    val nbytes = ByteBuffer.wrap(shards(k - 1)).getLong(segmentLength - AppendingReedSolomon.TrailerSize)
+
+    // Checked as a long so a corrupt trailer cannot overflow the row arithmetic
+    if nbytes < 0 || nbytes + AppendingReedSolomon.TrailerSize > totalRows.toLong * rowBytes ||
+        rowsFor(nbytes.toInt) != totalRows then
+      throw new IDARestoreError(s"Invalid trailer length $nbytes for a slice of $totalRows rows")
+
+    nbytes.toInt
+
+  /** Copies the stream bytes held by the data shards into dest. Shard row 0 corresponds to stream
+    * row firstRow and dest index 0 to stream position firstRow * rowBytes - destBase. Bytes at or
+    * beyond dest.length are not copied.
+    */
+  private def gather(shards: Array[Array[Byte]], firstRow: Int, rows: Int, dest: Array[Byte], destBase: Int): Unit =
     var row = 0
     while row < rows do
       var i = 0
       while i < k do
-        val streamPos = row * rowBytes + i * cellSize
-        val nCopy = math.min(cellSize, length - streamPos)
+        val streamPos = (firstRow + row) * rowBytes + i * cellSize
+        val nCopy = math.min(cellSize, dest.length + destBase - streamPos)
         if nCopy > 0 then
-          System.arraycopy(shards(i), row * cellSize, arr, streamPos, nCopy)
+          System.arraycopy(shards(i), row * cellSize, dest, streamPos - destBase, nCopy)
         i += 1
       row += 1
 
-    arr
+  def sliceOffsetFor(offset: Int): Int = (offset / rowBytes) * cellSize
+
+  def sliceRangeFor(offset: Int, length: Int): (Int, Int) =
+    val endRow = ((offset.toLong + length + rowBytes - 1) / rowBytes).toInt
+    (sliceOffsetFor(offset), endRow * cellSize)
+
+  def lengthProbeBytes: Int = cellSize
+
+  def restoreRange(sliceStart: Int, sliceSize: Int, segments: List[(Byte, Array[Byte])]): RestoredRange =
+    if sliceStart < 0 || sliceStart % cellSize != 0 then
+      throw new IDARestoreError(s"Invalid slice start $sliceStart. Expected a multiple of $cellSize")
+
+    if sliceSize % cellSize != 0 then
+      throw new IDARestoreError(s"Invalid slice size $sliceSize. Expected a multiple of $cellSize")
+
+    val (shards, segmentLength) = ReedSolomon.recoverDataShards(segments, width, k)
+
+    if segmentLength % cellSize != 0 || sliceStart.toLong + segmentLength > sliceSize then
+      throw new IDARestoreError(
+        s"Invalid segment length $segmentLength at slice start $sliceStart for a slice of $sliceSize bytes")
+
+    val firstRow = sliceStart / cellSize
+    val rows = segmentLength / cellSize
+    val logicalOffset = firstRow * rowBytes
+
+    if sliceStart + segmentLength == sliceSize then
+      val length = trailerLength(shards, segmentLength, sliceSize / cellSize)
+      val arr = new Array[Byte](math.max(0, length - logicalOffset))
+      gather(shards, firstRow, rows, arr, logicalOffset)
+      RestoredRange(logicalOffset, arr, Some(length))
+    else
+      val arr = new Array[Byte](rows * rowBytes)
+      gather(shards, firstRow, rows, arr, logicalOffset)
+      RestoredRange(logicalOffset, arr, None)
 
   def getSerializedIDATypeLength: Int = 8 // <type><width><restoreThreshold><writeThreshold><cellSize:4>
 

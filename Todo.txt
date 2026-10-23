@@ -1,25 +1,6 @@
 TODO
 ====
 
-- Add a NetworkCache class
-  - Abstract, pluggable interface
-  - Implementations:
-    - NoCache implementation - Always returns nothing
-      - Good for CLI where a local cache doesn't make sense
-    - RocksDB implementation (it's already a dependency)
-      - Good for Hosts
-        - use <host-root>/cache/network as the directory
-      - Also good for long-lived clients like AmoebaFS
-      - No explicit flushes on write
-        - it's a cache
-  - Used to reduce the number of network reads and speed things up
-  - Updated whenever the network updates its internal state
-    - From Gossip message
-    - From fallback network read
-  - Maps:
-    - StoreId -> HostId, timestamp
-    - HostId -> address,ports, timestamp
-
 - Need a slow-path to avoid reliance on gossip messages that can be missed for Store/Host changes.
   - NetworkCachingService
     - Runs every 24 hours

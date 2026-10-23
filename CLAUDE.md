@@ -96,6 +96,14 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     copied exactly once on receive.
   - ZeroMQ (`implementations/zmqnet`): simple but inefficient, selected with `--network zmq`. Slated for
     removal once QUIC is stable.
+- A pluggable `NetworkCache` persists store->host and host->endpoint mappings, scoped to the system id.
+  - `NoCache` for the CLI; RocksDB for hosts (`<host-root>/cache/network`) and `amoebafs --network-cache-dir`
+  - MetadataManager seeds from it at startup, trusts entries immediately, and writes every change back
+- QUIC repairs stale host endpoints: after `peerQueryDelay` (2 min) of failed dials to a host reported online,
+  it asks `peerQueryFanout` (3) peers (clients ask their relays) over a datagram. Newer answers replace the entry.
+- QUIC envelopes carry the intended HostId. A host receiving one meant for another HostId drops it and replies
+  `WrongHost` (rate-limited per connection). A handshake certificate UUID mismatch is treated the same way.
+  Either marks the entry known-wrong, drops sends to it, and starts the peer query immediately.
 - DataStores are pluggable. Currently only a RocksDB and in-memory Map are supported.
 
 ## Subsystem Details

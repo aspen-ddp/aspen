@@ -31,6 +31,9 @@ class ObjectState(val objectId: ObjectId,
           s += txid
         }
       }
+      s ++= kvs.noExistenceLocks.values
+      kvs.contentLocked.foreach { t => s += t }
+      s ++= kvs.rangeLocks
     }
     s
   }

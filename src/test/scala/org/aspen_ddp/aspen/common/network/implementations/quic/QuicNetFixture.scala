@@ -63,8 +63,9 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipCo
     node(None, Some((hostId, port)), cfg, credentials(), networkCache = networkCache)
 
   def client(cfg: QuicConfig = config, creds: TlsCredentials = credentials(),
-             resolve: String => InetAddress = QuicNet.blockingResolve): Node =
-    node(Some(ClientId(UUID.randomUUID())), None, cfg, creds, resolve)
+             resolve: String => InetAddress = QuicNet.blockingResolve,
+             networkCache: NetworkCache = NetworkCache.NoCache): Node =
+    node(Some(ClientId(UUID.randomUUID())), None, cfg, creds, resolve, networkCache)
 
   private def node(oclientId: Option[ClientId], ohost: Option[(HostId, Int)], cfg: QuicConfig,
                    creds: TlsCredentials, resolve: String => InetAddress = QuicNet.blockingResolve,

@@ -119,6 +119,18 @@ object QuicNet:
   * a relay sends when a subscription starts, and from a recheck run when the IO thread starts and every
   * `StoreAvailabilityTracker.RecheckPeriod` after.
   *
+  * Peer endpoint query: a host entry can be stale (the host moved while we were not listening, or a cached address is
+  * out of date). When dials to a host's current entry have been failing for `config.peerQueryDelay` and the host is
+  * reported online (by membership, or by our relays in client mode), a small `HostEndpointQuery` datagram goes to
+  * `config.peerQueryFanout` peers, repeating every `config.peerQueryInterval` until a dial succeeds or the entry is
+  * replaced. A peer answers from its `MetadataManager` alone; an answer newer than our entry is applied exactly as
+  * `HostEndpointChanged` gossip is. The failure clock is per HostId, starts when a dial to the host's current entry
+  * closes without completing its handshake, and is cleared when an outbound handshake to the current entry completes
+  * or the entry is replaced, so a new address gets a full delay. A query about a host never goes to that host, so
+  * the design's "a host asked about itself answers with its own endpoint" never arises: every host just answers from
+  * `MetadataManager`. `failingSince` and `lastQueried` are concurrent maps; the scan and every query run on
+  * `loops(0)`, which owns `relays`.
+  *
   * @param resolveHost resolves a host address that is not an IP literal. It may block: it only runs on the
   *                    plugin's resolver threads, never on a caller or an event loop. Replaceable for tests.
   * @param storeAvailabilityCacheFile host mode: where store availability is saved across restarts
@@ -181,6 +193,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Client mode: our current gossip relay hosts. Only touched on `loops(0)`. See `renewRelays`. */
   private var relays: Set[HostId] = Set()
+
+  /** When (System.nanoTime) dials to each host's current entry started failing. Written on loops. */
+  private val failingSince = new ConcurrentHashMap[HostId, java.lang.Long]()
+
+  /** When (System.nanoTime) each host was last asked about. Written on `loops(0)`, cleared by `endpointChanged`. */
+  private val lastQueried = new ConcurrentHashMap[HostId, java.lang.Long]()
+
+  private val peerQueriesSent = new AtomicLong(0)
 
   private val nextDialIndex = new AtomicInteger(0)
 
@@ -415,6 +435,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     if !ohost.exists(_._1 == m.hostId) then
       metadataManager.endpointChanged(m).foreach: old =>
         logger.info(s"Host ${old.name} changed endpoint to ${m.address}:${m.dataPort}; closing the old connection")
+        // A new address to try: restart the failure clock. The old entry's closing dial is not counted against it
+        // (see outboundClosed).
+        failingSince.remove(m.hostId)
+        lastQueried.remove(m.hostId)
         closeOutbound(old)
 
   initOrAbort:
@@ -429,6 +453,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     else
       val ms = math.max(1L, config.gossip.relayRenewal.toMillis)
       Some(loops(0).scheduleAtFixedRate((() => renewRelays(rotate = true)): Runnable, 0, ms, TimeUnit.MILLISECONDS))
+
+  /** Starts peer endpoint queries every `peerQueryInterval`. See `scanForPeerQueries`. */
+  private val peerQueryTask: NFuture[?] = initOrAbort:
+    val ms = math.max(1L, config.peerQueryInterval.toMillis)
+    loops(0).scheduleAtFixedRate((() => scanForPeerQueries()): Runnable, ms, ms, TimeUnit.MILLISECONDS)
 
   // ---- NetworkPlugin -------------------------------------------------------------------------------------------
 
@@ -524,6 +553,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       quietly("stop relay renewal"):
         relayTask.foreach(_.cancel(false))
         recheckTask.foreach(_.cancel(false))
+        peerQueryTask.cancel(false)
       quietly("linger"):
         val ms = linger.toMillis
         if ms > 0 then
@@ -594,6 +624,16 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** The last boot id recorded for `hostId` */
   private[quic] def lastBootIdOf(hostId: HostId): Option[UUID] = Option(bootIds.get(hostId))
 
+  /** `HostEndpointQuery` messages sent so far, counting each peer separately */
+  private[quic] def peerQueriesSentForTests: Long = peerQueriesSent.get()
+
+  /** When (System.nanoTime) dials to `hostId`'s current entry started failing, if they are */
+  private[quic] def failingSinceForTests(hostId: HostId): Option[Long] = Option(failingSince.get(hostId)).map(_.longValue)
+
+  /** Our relays (client mode) and the peers a query about `target` would go to now. Blocks until `loops(0)` answers. */
+  private[quic] def peerQueryPlanForTests(target: HostId): (Set[HostId], List[HostId]) =
+    loops(0).submit(() => (relays, queryPeers(target))).get()
+
   /** Dispatches `m` as if it had arrived on a connection */
   private[quic] def dispatchForTests(m: Message): Unit = dispatch(null, QuicMessageCodec.Received(m, None))
 
@@ -605,6 +645,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     membership.foreach(_.shutdown())
     relayTask.foreach(_.cancel(false))
     recheckTask.foreach(_.cancel(false))
+    peerQueryTask.cancel(false)
     closeAll(CloseAwaitMillis)
     group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
@@ -616,6 +657,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     membership.foreach(_.shutdown())
     relayTask.foreach(_.cancel(false))
     recheckTask.foreach(_.cancel(false))
+    peerQueryTask.cancel(false)
     (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
     resolverPool.shutdownNow()
     group.shutdownGracefully(0, 1, TimeUnit.SECONDS)
@@ -712,7 +754,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         result = cur
       else
         val parent = clientChannels(Math.floorMod(nextDialIndex.getAndIncrement(), clientChannels.length))
-        val conn = new QuicConnection(parent.eventLoop(), config, c => outboundClosed(entry, c), outboundActive)
+        val conn = new QuicConnection(parent.eventLoop(), config, c => outboundClosed(entry, c), c => outboundActive(entry, c))
         if entry.connection.compareAndSet(cur, conn) then
           liveConnections.add(conn)
           try
@@ -790,14 +832,24 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       case NonFatal(e) => conn.handshakeFailed(e)
 
   /** On the connection's loop, once an outbound connection is up: starts keepalive, which is driven by the dialing
-    * side only, after `idleTimeout / 2` without an outbound write
+    * side only, after `idleTimeout / 2` without an outbound write, and stops the host's failure clock
     */
-  private def outboundActive(conn: QuicConnection): Unit =
+  private def outboundActive(entry: QuicHostEntry, conn: QuicConnection): Unit =
     conn.startKeepalive(idleTimeout / 2)
+    if isCurrentEntry(entry) then
+      failingSince.remove(entry.hostId)
 
+  /** On the connection's loop. A dial that closed before its handshake completed starts the host's failure clock,
+    * unless `entry` has since been replaced: the replacement is a new address, with a clock of its own.
+    */
   private def outboundClosed(entry: QuicHostEntry, conn: QuicConnection): Unit =
     entry.connection.compareAndSet(conn, null)
+    if !conn.isActive && isCurrentEntry(entry) then
+      failingSince.putIfAbsent(entry.hostId, System.nanoTime())
     connectionClosed(conn)
+
+  private def isCurrentEntry(entry: QuicHostEntry): Boolean =
+    metadataManager.peekHostEntry(entry.hostId).exists(_ eq entry)
 
   private def inboundClosed(conn: QuicConnection): Unit =
     inboundConnections.remove(conn)
@@ -854,6 +906,76 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           logger.info(s"Host ${entry.name} restarted (new boot id); re-dialing it")
           closeOutbound(entry, establishedOnly = true)
       hm.receive(m)
+
+  // ---- Peer endpoint query ------------------------------------------------------------------------------------
+
+  /** On `loops(0)`, every `peerQueryInterval`. Queries about each host reported online whose dials have been failing
+    * for at least `peerQueryDelay` and that was not asked about within the last interval. Scheduling jitter is allowed
+    * for, so a host still failing is asked about on every scan.
+    */
+  private def scanForPeerQueries(): Unit =
+    if !shuttingDown then
+      try
+        val now = System.nanoTime()
+        val delay = config.peerQueryDelay.toNanos
+        val interval = config.peerQueryInterval.toNanos
+        val due = failingSince.asScala.collect:
+          case (h, since) if now - since >= delay && reportedOnline(h) &&
+              Option(lastQueried.get(h)).forall(t => now - t >= interval - interval / 10) => h
+        due.toList.foreach(sendQuery)
+      catch
+        case NonFatal(e) => logger.warn(s"Peer endpoint query scan failed: $e")
+
+  /** Starts an immediate query about `hostId`, whatever its failure clock and online state. Any thread. */
+  private[quic] def requestPeerQuery(hostId: HostId): Unit =
+    if !shuttingDown then
+      try loops(0).execute(() => sendQuery(hostId))
+      catch case _: RejectedExecutionException => () // shutting down
+
+  /** On `loops(0)`. Sends `HostEndpointQuery(target)` to the peers `queryPeers` picks. */
+  private def sendQuery(target: HostId): Unit =
+    if !shuttingDown then
+      try
+        lastQueried.put(target, System.nanoTime())
+        val peers = queryPeers(target)
+        logger.debug(s"Dials to host $target are failing; asking ${peers.size} peers for its endpoint")
+        peers.foreach: peer =>
+          peerQueriesSent.incrementAndGet()
+          sendToHostId(peer, HostEndpointQuery(target))
+      catch
+        case NonFatal(e) => logger.warn(s"Peer endpoint query about host $target failed: $e")
+
+  /** On `loops(0)`, which owns `relays`. Up to `peerQueryFanout` random peers to ask about `target`, never `target`
+    * itself. Host mode: hosts membership reports online, ourselves excluded. Client mode: our relays first (the hosts
+    * we already hold connections to), topped up with other resolved hosts our relays report online.
+    */
+  private def queryPeers(target: HostId): List[HostId] =
+    val fanout = config.peerQueryFanout
+    membership match
+      case Some(m) =>
+        val self = ohost.map(_._1)
+        Random.shuffle(m.onlineHosts.filterNot(h => h == target || self.contains(h)).toList).take(fanout)
+      case None =>
+        val fromRelays = Random.shuffle((relays - target).toList).take(fanout)
+        val topUp = metadataManager.resolvedHostEntries.map(_.hostId)
+          .filter(h => h != target && !fromRelays.contains(h) && reportedOnline(h))
+        (fromRelays ++ Random.shuffle(topUp)).take(fanout)
+
+  /** On `conn`'s loop. Answers from `MetadataManager` alone, never starting a lookup. A query with nowhere to send
+    * the answer (from `dispatchForTests`) is ignored.
+    */
+  private def endpointQuery(conn: QuicConnection, m: HostEndpointQuery): Unit =
+    if conn != null && !conn.isClosed then
+      val answer = HostEndpointAnswer(m.hostId, metadataManager.endpointAnswer(m.hostId))
+      conn.submit(QuicMessageCodec.encode(answer, PooledByteBufAllocator.DEFAULT))
+
+  /** On a loop. An answer newer than our entry is applied as `HostEndpointChanged` gossip would be, which also
+    * writes it through to the network cache. An unknown answer, or one no newer than our entry, is ignored.
+    */
+  private def endpointAnswer(m: HostEndpointAnswer): Unit =
+    m.endpoint.foreach: e =>
+      if e.hostId == m.hostId && metadataManager.hostTimestamp(e.hostId).forall(_ < e.timestamp) then
+        endpointChanged(e)
 
   // ---- Gossip relaying -----------------------------------------------------------------------------------------
 
@@ -960,7 +1082,13 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         case _: HostResponse | _: HostHeartbeat =>
           // Not handled: liveness comes from host membership
 
-        case _: HostEndpointQuery | _: HostEndpointAnswer | _: WrongHost =>
+        case m: HostEndpointQuery =>
+          endpointQuery(conn, m)
+
+        case m: HostEndpointAnswer =>
+          endpointAnswer(m)
+
+        case _: WrongHost =>
           // Not yet handled
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)

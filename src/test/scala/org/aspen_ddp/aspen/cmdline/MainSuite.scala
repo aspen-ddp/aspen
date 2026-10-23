@@ -602,6 +602,15 @@ class MainSuite extends AnyFunSuite with Matchers:
       Main.buildParser.parse(
         Seq("create-pool", cfgs, "mypool", "bogus", "5", "3", "4", "myset"), Main.Args()) shouldBe None
 
+  test("--cell-size below 8 is rejected"):
+    def parse(size: String) = Main.buildParser.parse(
+      Seq("bootstrap", "/tmp/target", "10.0.0.1", "appending-reed-solomon", "3", "4", "5", "--cell-size", size),
+      Main.Args())
+    parse("7") shouldBe None
+    parse("0") shouldBe None
+    parse("-1") shouldBe None
+    parse("8").map(_.cellSize) shouldBe Some(8)
+
   test("the shared port options reach a command that takes them"):
     withTempDir("parse-ports"): dir =>
       val parsed = Main.buildParser.parse(

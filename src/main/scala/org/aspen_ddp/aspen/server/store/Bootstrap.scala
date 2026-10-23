@@ -15,6 +15,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.common.util.uuid2byte
+import org.aspen_ddp.aspen.common.network.snapshot.NetworkCachingService
 import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
 import org.aspen_ddp.aspen.compute.ServiceEntry
 import org.aspen_ddp.aspen.compute.systemtask.SystemTaskExecutorService
@@ -204,10 +205,23 @@ object Bootstrap:
       HLCTimestamp.Zero,
       systemTaskServicePtr)
 
+    // The NetworkCachingService writes the daily host/store snapshots into two DataObjects that
+    // are allocated here, empty, so the service only ever overwrites them.
+    val hostSnapshotPtr = allocateData(NetworkCachingService.emptyHostSnapshot)
+    val storeSnapshotPtr = allocateData(NetworkCachingService.emptyStoreSnapshot)
+    val networkCachingServicePtr = allocate(
+      NetworkCachingService.initialServiceState(hostSnapshotPtr, storeSnapshotPtr).toList)
+    val networkCachingServiceEntry = ServiceEntry(
+      NetworkCachingService.ServiceTypeUUID,
+      ServiceEntry.UnclaimedHostId,
+      HLCTimestamp.Zero,
+      networkCachingServicePtr)
+
     val servicesTree = allocateTree(
       ByteArrayKeyOrdering,
       Key(RebalancingDurableService.ServiceUUID) -> rebalancingServiceEntry.encode(),
-      Key(SystemTaskExecutorService.ServiceUUID) -> systemTaskServiceEntry.encode()
+      Key(SystemTaskExecutorService.ServiceUUID) -> systemTaskServiceEntry.encode(),
+      Key(NetworkCachingService.ServiceUUID) -> networkCachingServiceEntry.encode()
     )
 
     val caCertificatePtr = allocateData(Pem.encodeCertificate(ca.certificate).getBytes(StandardCharsets.UTF_8))

@@ -138,8 +138,8 @@ object QuicNet:
   *  - TLS identity (`config.verifyPeerIdentity`): when the handshake completes, the peer certificate's UUID must be
   *    the entry's HostId (host certificates are signed for their HostId). It is checked before the connection is
   *    attached, so nothing queued behind the handshake reaches the wrong host.
-  *  - `WrongHost` reply: every message sent through a host entry carries the intended HostId in its envelope
-  *    (`Received.toHost`). A host receiving one meant for another HostId drops it and, at most once per connection
+  *  - `WrongHost` reply: every host-bound message, whether sent through a host entry or over a cluster route (see
+  *    `sendClusterMessage`), carries the intended HostId in its envelope (`Received.toHost`). A host receiving one meant for another HostId drops it and, at most once per connection
   *    per `config.wrongHostReplyInterval`, replies `WrongHost` over the same connection. Messages without a
   *    `toHost`, and every message a client receives, are never checked.
   * Either signal marks the entry `knownWrong` (see `markWrong`): its connection is closed, sends through it are
@@ -654,6 +654,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private[quic] def peerQueryPlanForTests(target: HostId): (Set[HostId], List[HostId]) =
     loops(0).submit(() => (relays, queryPeers(target))).get()
 
+  /** Whether `hostId`'s scalecube traffic has a recorded route back (see `sendClusterMessage`) */
+  private[quic] def hasClusterRouteForTests(hostId: HostId): Boolean = clusterRouteMap.containsKey(hostId)
+
+  /** Membership's send path, as scalecube would call it */
+  private[quic] def sendClusterMessageForTests(m: ClusterTransportMessage): Unit = sendClusterMessage(m)
+
   /** `WrongHost` replies sent so far */
   private[quic] def wrongHostRepliesSentForTests: Long = wrongHostRepliesSent.get()
 
@@ -751,7 +757,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private def sendClusterMessage(m: ClusterTransportMessage): Unit =
     val route = clusterRouteMap.get(m.toHost)
     if route != null && !route.isClosed && !shuttingDown then
-      try route.submit(QuicMessageCodec.encode(m, PooledByteBufAllocator.DEFAULT))
+      try route.submit(QuicMessageCodec.encode(m, PooledByteBufAllocator.DEFAULT, toHost = Some(m.toHost)))
       catch case NonFatal(e) => logger.warn(s"QUIC send of cluster traffic to host ${m.toHost} failed: $e")
     else
       sendToHostId(m.toHost, m)
@@ -869,12 +875,20 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       case NonFatal(e) => conn.handshakeFailed(e)
 
   /** On the connection's loop, once an outbound connection is up: starts keepalive, which is driven by the dialing
-    * side only, after `idleTimeout / 2` without an outbound write, and stops the host's failure clock
+    * side only, after `idleTimeout / 2` without an outbound write, and stops the host's failure clock.
+    *
+    * A connection to an entry already marked known-wrong is closed instead. A sender that passed `sendToHost`'s
+    * `knownWrong` check just before `markWrong` can dial after `markWrong` closed the old connection. Nothing else
+    * would close that connection: a `WrongHost` reply on it finds the entry already marked, and keepalive would hold
+    * it open until the entry is replaced.
     */
   private def outboundActive(entry: QuicHostEntry, conn: QuicConnection): Unit =
-    conn.startKeepalive(idleTimeout / 2)
-    if isCurrentEntry(entry) then
-      failingSince.remove(entry.hostId)
+    if entry.knownWrong then
+      conn.close()
+    else
+      conn.startKeepalive(idleTimeout / 2)
+      if isCurrentEntry(entry) then
+        failingSince.remove(entry.hostId)
 
   /** On the connection's loop. A dial that closed before its handshake completed starts the host's failure clock,
     * unless `entry` has since been replaced: the replacement is a new address, with a clock of its own.

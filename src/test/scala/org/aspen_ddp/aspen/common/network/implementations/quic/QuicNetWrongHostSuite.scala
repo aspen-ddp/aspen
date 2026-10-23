@@ -173,6 +173,35 @@ class QuicNetWrongHostSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     finally
       peer.close()
 
+  test("cluster traffic sent over a recorded route carries toHost"):
+    val hostIdX = HostId(UUID.randomUUID())
+    val (peer, ch) = rawClientTo(fx.portB)
+    try
+      // B records this connection as its route back to X
+      QuicTestPeer.sendStream(ch, ClusterTransportMessage(hostIdX, UUID.randomUUID(), fx.hostIdB, Array[Byte](1, 2, 3)))
+      eventually("B records its route to X", WaitMillis)(fx.b.net.hasClusterRouteForTests(hostIdX))
+
+      fx.b.net.sendClusterMessageForTests(
+        ClusterTransportMessage(fx.hostIdB, UUID.randomUUID(), hostIdX, Array[Byte](4, 5, 6)))
+
+      val r = peer.awaitReceived()
+      r.message shouldBe a[ClusterTransportMessage]
+      r.toHost shouldBe Some(hostIdX)
+    finally
+      peer.close()
+
+  test("a connection that comes up after its entry was marked known-wrong is closed"):
+    // The race: a sender passed the knownWrong check just before the mark, and dials after the old connection closed
+    val hostIdC = HostId(UUID.randomUUID())
+    val d = startAskerWithEntryAtB(hostIdC, verifyPeerIdentity = false)
+    val entry = d.net.metadataManager.peekHostEntry(hostIdC).get
+    entry.knownWrong = true
+
+    val conn = d.net.connectionFor(entry)
+
+    eventually("the late connection is closed", WaitMillis)(conn.isClosed)
+    fx.b.net.wrongHostRepliesSentForTests shouldBe 0
+
   test("messages without toHost, and client-mode receivers, are never rejected"):
     val (peer, ch) = rawClientTo(fx.portB)
     try

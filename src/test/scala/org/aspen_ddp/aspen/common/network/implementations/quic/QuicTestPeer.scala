@@ -91,7 +91,7 @@ final class QuicTestPeer private (val isServer: Boolean,
         case buf: ByteBuf =>
           try
             QuicMessageCodec.decodeDatagram(buf) match
-              case Right(r) => received.add(Received(r.msg, Transport.Datagram))
+              case Right(r) => received.add(Received(r.msg, Transport.Datagram, r.toHost))
               case Left(err) => protocolErrors.add(err)
           finally
             buf.release()
@@ -118,7 +118,7 @@ final class QuicTestPeer private (val isServer: Boolean,
         ch.config().setAutoRead(false)
       val id = ch.streamId()
       ch.pipeline().addLast(new StreamFrameDecoder(
-        r => received.add(Received(r.msg, Transport.Stream(id))),
+        r => received.add(Received(r.msg, Transport.Stream(id), r.toHost)),
         err => protocolErrors.add(err)))
 
   /** Stops stalling: new inbound streams read normally and every stalled stream resumes reading */
@@ -171,7 +171,8 @@ object QuicTestPeer:
     case Datagram
     case Stream(streamId: Long)
 
-  final case class Received(message: Message, transport: Transport)
+  /** `toHost` is the intended destination from the message envelope, if it carried one */
+  final case class Received(message: Message, transport: Transport, toHost: Option[HostId] = None)
 
   enum HandshakeOutcome:
     case Succeeded

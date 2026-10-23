@@ -389,10 +389,17 @@ message StartStoreTransfer {
 
 message StoreMoved {
   StoreId storeId = 1;
+  UUID hostId = 2;
+  uint64 timestamp = 3;
 }
 
 message HostEndpointChanged {
   UUID hostId = 1;
+  string address = 2;
+  uint32 dataPort = 3;
+  uint32 httpPort = 4;
+  uint32 storeTransferPort = 5;
+  uint64 timestamp = 6;
 }
 
 message ClusterTransportMessage {

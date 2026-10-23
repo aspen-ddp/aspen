@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.{Gossip, HostEndpointChanged, StoreMoved}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -14,8 +15,11 @@ import scala.concurrent.duration.*
 
 class GossipRetransmitterSuite extends AnyFunSuite with Matchers:
 
-  private val moved = StoreMoved(StoreId(PoolId(UUID.fromString("11111111-1111-1111-1111-111111111111")), 3.toByte))
-  private val changed = HostEndpointChanged(HostId(UUID.fromString("22222222-2222-2222-2222-222222222222")))
+  private val storeId = StoreId(PoolId(UUID.fromString("11111111-1111-1111-1111-111111111111")), 3.toByte)
+  private val hostId = HostId(UUID.fromString("22222222-2222-2222-2222-222222222222"))
+
+  private val moved = StoreMoved(storeId, hostId, HLCTimestamp(1000))
+  private val changed = HostEndpointChanged(hostId, "10.1.2.3", 4000, 4001, 4002, HLCTimestamp(2000))
 
   private val start = Instant.parse("2026-10-22T12:00:00Z")
 
@@ -78,18 +82,30 @@ class GossipRetransmitterSuite extends AnyFunSuite with Matchers:
     r.pendingMessages should be(Map())
     os.exists(f.stateFile) should be(false)
 
-  test("broadcasting a pending message again restarts its lifetime"):
+  test("a newer message about the same store replaces the pending one with a fresh lifetime"):
     val f = new Fixture
     val r = f.retransmitter()
     r.broadcast(moved)
     f.advance(20.hours)
-    r.broadcast(moved)
+    val movedAgain = StoreMoved(storeId, HostId(UUID.randomUUID()), HLCTimestamp(3000))
+    r.broadcast(movedAgain)
     f.sent.clear()
 
     f.advance(10.hours)
     r.retransmit()
 
-    f.sent.toList should be(List(moved))
+    f.sent.toList should be(List(movedAgain))
+    r.pendingMessages.keySet should be(Set(movedAgain))
+
+  test("a newer message about the same host replaces the pending one"):
+    val f = new Fixture
+    val r = f.retransmitter()
+    r.broadcast(moved)
+    r.broadcast(changed)
+    val changedAgain = changed.copy(dataPort = 5000, timestamp = HLCTimestamp(3000))
+    r.broadcast(changedAgain)
+
+    r.pendingMessages.keySet should be(Set(moved, changedAgain))
 
   test("a new retransmitter resumes the messages saved by a previous one"):
     val f = new Fixture

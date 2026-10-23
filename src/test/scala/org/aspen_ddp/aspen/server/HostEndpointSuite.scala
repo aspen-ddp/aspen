@@ -30,15 +30,18 @@ class HostEndpointSuite extends IntegrationTestSuite with HostTestHarness:
       hs <- client.getHostState(host.hostId)
       _ = net.takeCapturedGossip()
       changed <- host.reconcileEndpoint("10.9.8.7", hs.dataPort + 1, hs.httpPort, hs.storeTransferPort)
-      after <- client.getHostState(host.hostId)
+      (after, timestamp) <- client.getHostStateAndTimestamp(host.hostId)
     yield
       changed should be(true)
       after.address should be("10.9.8.7")
       after.dataPort should be(hs.dataPort + 1)
       after.httpPort should be(hs.httpPort)
-      net.takeCapturedGossip() should be(List(HostEndpointChanged(host.hostId)))
+      // Carries the new endpoint and the timestamp of the HostState value holding it
+      val expected = HostEndpointChanged(host.hostId, "10.9.8.7", hs.dataPort + 1, hs.httpPort,
+                                         hs.storeTransferPort, timestamp)
+      net.takeCapturedGossip() should be(List(expected))
       // Saved so the retransmits survive a restart
-      host.gossipRetransmitter.pendingMessages.keySet should be(Set(HostEndpointChanged(host.hostId)))
+      host.gossipRetransmitter.pendingMessages.keySet should be(Set(expected))
       os.exists(GossipRetransmitter.stateFile(host.rootDir)) should be(true)
 
   atest("a failed first attempt is retried until the endpoint is updated and gossiped"):
@@ -56,14 +59,16 @@ class HostEndpointSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- yieldUntil(net.capturedGossip.nonEmpty)
       _ <- waitForTransactionsToComplete()
       _ <- yieldUntil(net.capturedGossip.nonEmpty)
-      after <- client.getHostState(host.hostId)
+      (after, timestamp) <- client.getHostStateAndTimestamp(host.hostId)
     yield
       firstFailed.getMessage should include("Simulated")
       host.endpointRetriesScheduled.get should be(2)
       after.address should be("10.9.8.7")
-      net.takeCapturedGossip() should be(List(HostEndpointChanged(host.hostId)))
+      val expected = HostEndpointChanged(host.hostId, "10.9.8.7", hs.dataPort, hs.httpPort,
+                                         hs.storeTransferPort, timestamp)
+      net.takeCapturedGossip() should be(List(expected))
       // Saved so the retransmits survive a restart
-      host.gossipRetransmitter.pendingMessages.keySet should be(Set(HostEndpointChanged(host.hostId)))
+      host.gossipRetransmitter.pendingMessages.keySet should be(Set(expected))
       os.exists(GossipRetransmitter.stateFile(host.rootDir)) should be(true)
 
   atest("a retry that finds the endpoint already matching stops without gossiping"):

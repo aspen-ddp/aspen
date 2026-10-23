@@ -338,17 +338,17 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
     // Gossip that arrived through membership is never re-broadcast
     override def gossipReceived(g: Gossip): Unit = g match
-      case StoreMoved(storeId) => metadataManager.dropStoreMapping(storeId)
-      case HostEndpointChanged(hostId) => endpointChanged(hostId)
+      case m: StoreMoved => metadataManager.storeMoved(m.storeId, m.hostId, m.timestamp)
+      case m: HostEndpointChanged => endpointChanged(m)
 
-  /** Drops `hostId`'s entry and closes our outbound connection to it, so the next send re-reads the host object and
-    * dials the new endpoint. Our own entry is left alone.
+  /** Replaces `m.hostId`'s entry with one for the new endpoint, unless ours is at least as new, and closes our
+    * outbound connection to the old one so the next send dials the new endpoint. Our own entry is left alone.
     */
-  private def endpointChanged(hostId: HostId): Unit =
-    if !ohost.exists(_._1 == hostId) then
-      metadataManager.dropHostEntry(hostId).foreach: entry =>
-        logger.info(s"Host ${entry.name} changed endpoint; dropping its entry and connection")
-        closeOutbound(entry)
+  private def endpointChanged(m: HostEndpointChanged): Unit =
+    if !ohost.exists(_._1 == m.hostId) then
+      metadataManager.endpointChanged(m).foreach: old =>
+        logger.info(s"Host ${old.name} changed endpoint to ${m.address}:${m.dataPort}; closing the old connection")
+        closeOutbound(old)
 
   initOrAbort:
     membership.foreach: m =>
@@ -558,12 +558,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     * arrived on, and only to a host not heard from yet (or whose connection closed) through its host entry.
     *
     * Why: a host whose endpoint changed (its host object updated at startup, see `Host.reconcileEndpoint`) is still
-    * known to every peer by its old address, because a resolved host entry is only replaced when a
-    * `HostEndpointChanged` gossip drops it. The moved host can reach its peers, since its own outbound connections
+    * known to every peer by its old address, because a resolved host entry is only replaced by
+    * `HostEndpointChanged` gossip. The moved host can reach its peers, since its own outbound connections
     * use fresh addresses, but scalecube answers every message (SYNC_ACK, ping acks, metadata responses) by sending
     * to the sender's member address, and a send through the stale entry goes to the old address and is lost. The
     * moved host would then never learn the member list, and its `HostEndpointChanged` gossip, which is what makes
-    * peers re-read its host object, would have nobody to go to. Replying over the connection the moved host dialed
+    * peers replace its entry, would have nobody to go to. Replying over the connection the moved host dialed
     * breaks that deadlock: it joins normally, and its gossip spreads to everyone through the cluster.
     *
     * This was chosen over having the moved host also send `HostEndpointChanged` directly to every host it had
@@ -742,7 +742,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         // Deliberately close-only: the entry is kept. Dropping it would force a host-object re-read, which can park
         // forever behind the restarted host's own bootstrap stores (the read's messages to them wait on that very
         // lookup). A host whose endpoint really moved rejoins over its own connection (see `sendClusterMessage`)
-        // and gossips HostEndpointChanged, which drops the entry.
+        // and gossips HostEndpointChanged, which replaces the entry.
         metadataManager.peekHostEntry(m.fromHost).foreach: entry =>
           logger.info(s"Host ${entry.name} restarted (new boot id); re-dialing it")
           closeOutbound(entry, establishedOnly = true)

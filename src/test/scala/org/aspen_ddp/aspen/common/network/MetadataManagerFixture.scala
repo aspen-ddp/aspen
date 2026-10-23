@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.network
 
 import org.aspen_ddp.aspen.TestNetwork
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
-import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -19,7 +19,7 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
  *  about and hands back a Promise the test completes when it chooses.
  *
  *  The recording is what makes "this call started no lookup" observable without reaching into
- *  MetadataManager's private state -- getHostState and getStoragePoolState are the only things
+ *  MetadataManager's private state -- getHostStateAndTimestamp and getStoragePoolStateAndTimestamp are the only things
  *  startHostLookup and startPoolLookup do that a caller can see.
  *
  *  ExecutionContext.parasitic runs the continuation inline rather than on a pool thread: on the
@@ -43,15 +43,17 @@ class LookupRecordingClient extends TestNetwork.TClient(
     Radicle.pointer,
     Replication(1, 1)):
 
-  /** Every hostId getHostState was called with, in call order. */
+  /** Every hostId getHostStateAndTimestamp was called with, in call order. */
   val lookups: mutable.ListBuffer[HostId] = mutable.ListBuffer[HostId]()
 
-  /** Every poolId getStoragePoolState was called with, in call order. */
+  /** Every poolId getStoragePoolStateAndTimestamp was called with, in call order. */
   val poolLookups: mutable.ListBuffer[PoolId] = mutable.ListBuffer[PoolId]()
 
   private var promises: Map[HostId, Promise[HostState]] = Map()
   private var poolPromises: Map[PoolId, Promise[StoragePoolState]] = Map()
   private var lookupFailures: Map[HostId, Throwable] = Map()
+  private var lookupTimestamps: Map[HostId, HLCTimestamp] = Map()
+  private var poolLookupTimestamps: Map[PoolId, HLCTimestamp] = Map()
   private var poolLookupFailures: Map[PoolId, Throwable] = Map()
   private var bootstrapConfigAttempts: Int = 0
   private var bootstrapConfigPromises: Map[Int, Promise[String]] = Map()
@@ -77,7 +79,7 @@ class LookupRecordingClient extends TestNetwork.TClient(
         poolPromises += poolId -> p
         p
 
-  /** Makes getHostState throw `err` synchronously for `hostId` rather than returning a future.
+  /** Makes getHostStateAndTimestamp throw `err` synchronously for `hostId` rather than returning a future.
    *
    *  The call is still recorded in `lookups` before the throw, which is what lets a test tell a
    *  retried lookup from a wedged one: both leave the host unresolved, and only the call count
@@ -88,7 +90,7 @@ class LookupRecordingClient extends TestNetwork.TClient(
   def clearLookupFailure(hostId: HostId): Unit = synchronized:
     lookupFailures -= hostId
 
-  /** Makes getStoragePoolState throw `err` synchronously for `poolId`. Recorded in `poolLookups`
+  /** Makes getStoragePoolStateAndTimestamp throw `err` synchronously for `poolId`. Recorded in `poolLookups`
    *  before the throw, for the same reason failLookupWith records first. */
   def failPoolLookupWith(poolId: PoolId, err: Throwable): Unit = synchronized:
     poolLookupFailures += poolId -> err
@@ -96,17 +98,29 @@ class LookupRecordingClient extends TestNetwork.TClient(
   def clearPoolLookupFailure(poolId: PoolId): Unit = synchronized:
     poolLookupFailures -= poolId
 
-  override def getHostState(hostId: HostId): Future[HostState] = synchronized:
+  /** The timestamp `hostId`'s lookup reports its host object was written at. Zero unless set. */
+  def setLookupTimestamp(hostId: HostId, timestamp: HLCTimestamp): Unit = synchronized:
+    lookupTimestamps += hostId -> timestamp
+
+  /** The timestamp `poolId`'s lookup reports its pool object was written at. Zero unless set. */
+  def setPoolLookupTimestamp(poolId: PoolId, timestamp: HLCTimestamp): Unit = synchronized:
+    poolLookupTimestamps += poolId -> timestamp
+
+  override def getHostStateAndTimestamp(hostId: HostId): Future[(HostState, HLCTimestamp)] = synchronized:
     lookups += hostId
     lookupFailures.get(hostId) match
       case Some(err) => throw err
-      case None => lookupPromise(hostId).future
+      case None =>
+        lookupPromise(hostId).future.map(state => (state, synchronized(lookupTimestamps.getOrElse(hostId, HLCTimestamp.Zero))))(
+          using ExecutionContext.parasitic)
 
-  override def getStoragePoolState(poolId: PoolId): Future[StoragePoolState] = synchronized:
+  override def getStoragePoolStateAndTimestamp(poolId: PoolId): Future[(StoragePoolState, HLCTimestamp)] = synchronized:
     poolLookups += poolId
     poolLookupFailures.get(poolId) match
       case Some(err) => throw err
-      case None => poolLookupPromise(poolId).future
+      case None =>
+        poolLookupPromise(poolId).future.map(state => (state, synchronized(poolLookupTimestamps.getOrElse(poolId, HLCTimestamp.Zero))))(
+          using ExecutionContext.parasitic)
 
   /** How many times getBootstrapConfig has been called.
    *

@@ -16,9 +16,20 @@ case class HostHeartbeat(hostId: HostId) extends Message
 /** Membership gossip. Carried as the scalecube gossip payload, never sent as a direct message */
 sealed abstract class Gossip extends Message
 
-final case class StoreMoved(storeId: StoreId) extends Gossip
+/** `storeId` is now hosted by `hostId`. `timestamp` is that of the StoragePoolState config value naming the new host,
+  * so receivers can ignore a message older than the mapping they already hold.
+  */
+final case class StoreMoved(storeId: StoreId, hostId: HostId, timestamp: HLCTimestamp) extends Gossip
 
-final case class HostEndpointChanged(hostId: HostId) extends Gossip
+/** `hostId`'s new endpoint. `timestamp` is that of the HostState value holding it, so receivers can ignore a message
+  * older than the entry they already hold.
+  */
+final case class HostEndpointChanged(hostId: HostId,
+                                     address: String,
+                                     dataPort: Int,
+                                     httpPort: Int,
+                                     storeTransferPort: Int,
+                                     timestamp: HLCTimestamp) extends Gossip
 
 /** Carries an opaque scalecube transport payload between hosts. Handled by QuicNet itself; it is not a
   * HostMessage and never reaches the MessageHandler.

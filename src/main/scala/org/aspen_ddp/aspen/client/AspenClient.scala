@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
-import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
@@ -98,6 +98,20 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     getHostPointer(hostId).flatMap: pointer =>
       read(pointer).map: kvos =>
         HostState(kvos)
+
+  /** The pool's state and the timestamp of the transaction that last wrote it */
+  def getStoragePoolStateAndTimestamp(poolId: PoolId): Future[(StoragePoolState, HLCTimestamp)] =
+    given ExecutionContext = this.clientContext
+    getStoragePoolPointer(poolId).flatMap: pointer =>
+      read(pointer).map: kvos =>
+        (StoragePoolState(kvos), kvos.contents(StoragePoolState.ConfigKey).timestamp)
+
+  /** The host's state and the timestamp of the transaction that last wrote it */
+  def getHostStateAndTimestamp(hostId: HostId): Future[(HostState, HLCTimestamp)] =
+    given ExecutionContext = this.clientContext
+    getHostPointer(hostId).flatMap: pointer =>
+      read(pointer).map: kvos =>
+        (HostState(kvos), kvos.contents(HostState.StateKey).timestamp)
   
   def getStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     given ExecutionContext = this.clientContext

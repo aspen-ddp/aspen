@@ -1,14 +1,12 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.common.metadata.HostId
-import org.aspen_ddp.aspen.common.network.{Gossip, HostEndpointChanged, StoreMoved}
-import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.network.{Codec, Gossip, HostEndpointChanged, StoreMoved}
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import scribe.Logging
 
 import java.time.Instant
 import java.time.format.DateTimeParseException
-import java.util.UUID
+import java.util.Base64
 import scala.concurrent.duration.*
 import scala.util.control.NonFatal
 
@@ -17,21 +15,21 @@ import scala.util.control.NonFatal
  *
  *  Scalecube gossip reaches only the hosts that are members when it spreads, so a host that was
  *  down for the original broadcast would otherwise keep its stale mapping until something else
- *  invalidated it. Re-sending is cheap because moves and endpoint changes are rare. Broadcasting
- *  a message that is already pending restarts its lifetime.
+ *  invalidated it. Re-sending is cheap because moves and endpoint changes are rare, and receivers
+ *  ignore a message no newer than what they hold. A message replaces any pending one about the
+ *  same store or host, and starts a fresh lifetime: the older one is obsolete.
  *
  *  Pending messages are kept in `stateFile` so the retransmits resume after a restart. The file
  *  lives in the host's cache directory because it is not needed for correctness: losing it, or
  *  failing to write it, only means the retransmits stop early.
  *
+ *  Each message is stored as its base64-encoded protobuf gossip encoding:
  *  ```
  *  messages:
- *    - store-moved: "11111111-1111-1111-1111-111111111111:3"
+ *    - gossip: "<base64 of Codec.encodeGossip>"
  *      first-sent: "2026-10-22T15:01:57Z"
- *    - host-endpoint-changed: "22222222-2222-2222-2222-222222222222"
- *      first-sent: "2026-10-22T16:30:00Z"
  *  ```
- *  Values are quoted so YAML cannot read a timestamp as a date or a store id as a number.
+ *  Values are quoted so YAML cannot read a timestamp as a date.
  */
 class GossipRetransmitter(val stateFile: os.Path,
                           send: Gossip => Unit,
@@ -41,10 +39,11 @@ class GossipRetransmitter(val stateFile: os.Path,
 
   private var pending: Map[Gossip, Instant] = load(stateFile)
 
-  /** Sends `g` now and schedules it for retransmission */
+  /** Sends `g` now and schedules it for retransmission in place of any pending message about the
+   *  same store or host */
   def broadcast(g: Gossip): Unit =
     synchronized:
-      pending += g -> now()
+      pending = pending.filter((p, _) => subject(p) != subject(g)) + (g -> now())
       save()
     send(g)
 
@@ -95,19 +94,29 @@ object GossipRetransmitter extends Logging:
         catch case e: DateTimeParseException => throw new FormatError(s"Invalid timestamp: $e")
       case _ => throw new FormatError("String Required")
 
+  /** What a message is about. A newer message about the same subject supersedes an older one. */
+  private def subject(g: Gossip): Any = g match
+    case m: StoreMoved => m.storeId
+    case m: HostEndpointChanged => m.hostId
+
+  private object YGossip extends Format[Gossip]:
+    override def format(o: Object): Gossip = o match
+      case v: java.lang.String =>
+        val bytes =
+          try Base64.getDecoder.decode(v)
+          catch case e: IllegalArgumentException => throw new FormatError(s"Invalid base64: $e")
+        Codec.decodeGossip(bytes) match
+          case Right(g) => g
+          case Left(err) => throw new FormatError(err)
+      case _ => throw new FormatError("String Required")
+
   private object YEntry extends YObject[(Gossip, Instant)]:
-    val storeMoved: Optional[StoreId] = Optional("store-moved", StoreId.YStoreId)
-    val hostEndpointChanged: Optional[UUID] = Optional("host-endpoint-changed", YUUID)
+    val gossip: Required[Gossip] = Required("gossip", YGossip)
     val firstSent: Required[Instant] = Required("first-sent", YInstant)
 
-    val attrs: List[Attr] = storeMoved :: hostEndpointChanged :: firstSent :: Nil
+    val attrs: List[Attr] = gossip :: firstSent :: Nil
 
-    def create(o: Object): (Gossip, Instant) =
-      val g = (storeMoved.get(o), hostEndpointChanged.get(o)) match
-        case (Some(storeId), None) => StoreMoved(storeId)
-        case (None, Some(hostId)) => HostEndpointChanged(HostId(hostId))
-        case _ => throw new FormatError("Exactly one of store-moved or host-endpoint-changed is required")
-      g -> firstSent.get(o)
+    def create(o: Object): (Gossip, Instant) = gossip.get(o) -> firstSent.get(o)
 
   private object YState extends YObject[Map[Gossip, Instant]]:
     val messages: Required[List[(Gossip, Instant)]] = Required("messages", YList(YEntry))
@@ -118,10 +127,8 @@ object GossipRetransmitter extends Logging:
 
   private[server] def encode(pending: Map[Gossip, Instant]): String =
     val entries = pending.toList.sortBy(_._2).map: (g, firstSent) =>
-      val id = g match
-        case StoreMoved(storeId) => s"store-moved: ${yamlQuote(storeId.toString)}"
-        case HostEndpointChanged(hostId) => s"host-endpoint-changed: ${yamlQuote(hostId.uuid.toString)}"
-      s"  - $id\n    first-sent: ${yamlQuote(firstSent.toString)}\n"
+      val encoded = Base64.getEncoder.encodeToString(Codec.encodeGossip(g))
+      s"  - gossip: ${yamlQuote(encoded)}\n    first-sent: ${yamlQuote(firstSent.toString)}\n"
     "messages:\n" + entries.mkString
 
   /** The pending messages saved in `file`, or none if there is no file or it cannot be read */

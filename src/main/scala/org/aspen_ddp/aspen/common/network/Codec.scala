@@ -921,17 +921,35 @@ object Codec extends Logging:
 
 
   def encode(o: StoreMoved): codec.StoreMoved =
-    codec.StoreMoved(storeId = Some(encode(o.storeId)))
+    codec.StoreMoved(
+      storeId = Some(encode(o.storeId)),
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      timestamp = o.timestamp.asLong
+    )
 
   def decode(m: codec.StoreMoved): StoreMoved =
-    StoreMoved(decode(m.storeId.get))
+    StoreMoved(decode(m.storeId.get), HostId(decodeUUID(m.hostId.get)), HLCTimestamp(m.timestamp))
 
 
   def encode(o: HostEndpointChanged): codec.HostEndpointChanged =
-    codec.HostEndpointChanged(hostId = Some(encodeUUID(o.hostId.uuid)))
+    codec.HostEndpointChanged(
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      address = o.address,
+      dataPort = o.dataPort,
+      httpPort = o.httpPort,
+      storeTransferPort = o.storeTransferPort,
+      timestamp = o.timestamp.asLong
+    )
 
   def decode(m: codec.HostEndpointChanged): HostEndpointChanged =
-    HostEndpointChanged(HostId(decodeUUID(m.hostId.get)))
+    HostEndpointChanged(
+      HostId(decodeUUID(m.hostId.get)),
+      m.address,
+      m.dataPort,
+      m.httpPort,
+      m.storeTransferPort,
+      HLCTimestamp(m.timestamp)
+    )
 
 
   def encode(o: ClusterTransportMessage): codec.ClusterTransportMessage =

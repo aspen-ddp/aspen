@@ -879,7 +879,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, movingStore)))
       Files.exists(arrived) should be(true)
 
-  atest("a committed transfer broadcasts StoreMoved"):
+  atest("a committed transfer broadcasts StoreMoved with the new host and the pool config's timestamp"):
     given ExecutionContext = executionContext
 
     val hostRoot = newHostDir()
@@ -900,10 +900,14 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       _ = net.takeCapturedGossip()
       _ = transfers.finishTransferIn(movingStore)
       _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
-      _ <- pumpUntil(net.capturedGossip.contains(StoreMoved(movingStore)))
+      _ <- pumpUntil(net.capturedGossip.exists:
+        case m: StoreMoved => m.storeId == movingStore
+        case _ => false)
+      (poolState, poolTimestamp) <- client.getStoragePoolStateAndTimestamp(movingStore.poolId)
     yield
       host.transferOutcomes.get(movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
-      net.takeCapturedGossip() should be(List(StoreMoved(movingStore)))
+      poolState.stores(movingStore.poolIndex).hostId should be(host.hostId)
+      net.takeCapturedGossip() should be(List(StoreMoved(movingStore, host.hostId, poolTimestamp)))
 
   /** A host owning the transfer destination, with the receiving half of a transfer of
    *  `movingStore` already begun through the device check, exactly as the two tests above

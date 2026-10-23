@@ -182,6 +182,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
     val host = newHost(hostRoot, storeRebuildFactory = factory)
+    // A store of a pool that exists, so the StoreMoved gossip can read the pool's config
+    val rebuilt = StoreId(PoolId.BootstrapPoolId, 0)
 
     // Register the device in the tree so the flip transaction can succeed
     for
@@ -193,7 +195,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       state = StorageDeviceState(kvos)
       _ <- client.transactUntilSuccessful: tx =>
         Future.successful:
-          val newState = state.setStoreEntry(storeN(0),
+          val newState = state.setStoreEntry(rebuilt,
             StorageDeviceState.StoreStatus.Rebuilding, None)
           val reqs = List(KeyRevision(StorageDeviceState.StateKey,
             kvos.contents(StorageDeviceState.StateKey).revision))
@@ -205,20 +207,26 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
         realDeviceId, deviceDir, deviceDir.resolve(StorageDeviceConfig.configFilename).toFile))
       armed = host.armLookup(realDeviceId)
       _ = host.testingOnlyCheckAllDevices()
-      readState = deviceState(realDeviceId, Map(rebuilding(storeN(0))))
+      readState = deviceState(realDeviceId, Map(rebuilding(rebuilt)))
       _ = armed.success(readState)
       _ <- yieldUntil(factory.created.nonEmpty)
       _ = factory.created.head.promise.success(())
       _ <- waitForTransactionsToComplete()
-      _ <- yieldUntil(host.loadStoreByIdRequests.contains((realDeviceId, storeN(0))))
+      _ <- yieldUntil(host.loadStoreByIdRequests.contains((realDeviceId, rebuilt)))
       // Verify the entry was flipped to Active
       finalKvos <- client.read(ptr)
       finalState = StorageDeviceState(finalKvos)
+      _ <- yieldUntil(net.capturedGossip.exists:
+        case m: StoreMoved => m.storeId == rebuilt
+        case _ => false)
+      (poolState, poolTimestamp) <- client.getStoragePoolStateAndTimestamp(rebuilt.poolId)
     yield
-      host.loadStoreByIdRequests should contain((realDeviceId, storeN(0)))
-      finalState.stores.get(storeN(0)).map(_.status) should be(
+      host.loadStoreByIdRequests should contain((realDeviceId, rebuilt))
+      finalState.stores.get(rebuilt).map(_.status) should be(
         Some(StorageDeviceState.StoreStatus.Active))
-      net.takeCapturedGossip() should contain(StoreMoved(storeN(0)))
+      // The pool's current host for the store, as of the pool config's timestamp
+      net.takeCapturedGossip() should contain(
+        StoreMoved(rebuilt, poolState.stores(rebuilt.poolIndex).hostId, poolTimestamp))
 
   atest("a rebuild on a tombstoned device is discarded, not loaded"):
     val hostRoot = newHostDir()

@@ -154,9 +154,10 @@ object QuicNetFixture:
   final class DirectoryClient(directory: HostDirectory) extends TestNetwork.TClient(
       ExecutionContext.global, ClientMessenger.None, Radicle.pointer, Replication(1, 1)):
 
-    override def getHostState(hostId: HostId): Future[HostState] =
+    // The directory has no transactions, so every host object reads as written at time zero
+    override def getHostStateAndTimestamp(hostId: HostId): Future[(HostState, HLCTimestamp)] =
       directory.lookup(hostId) match
-        case Some(state) => Future.successful(state)
+        case Some(state) => Future.successful((state, HLCTimestamp.Zero))
         case None => Future.failed(new NoSuchElementException(s"no host object for $hostId"))
 
     override def getBootstrapConfig(): Future[String] =

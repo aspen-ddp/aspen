@@ -679,11 +679,11 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedEmptyState shouldBe empty
 
   test("StoreMoved round trips"):
-    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 3))
+    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 3), HostId(UUID.randomUUID()), HLCTimestamp(12345))
     Codec.decodeGossip(Codec.encodeGossip(m)) shouldBe Right(m)
 
   test("HostEndpointChanged round trips"):
-    val m = HostEndpointChanged(HostId(UUID.randomUUID()))
+    val m = HostEndpointChanged(HostId(UUID.randomUUID()), "10.1.2.3", 4000, 4001, 4002, HLCTimestamp(12345))
     Codec.decodeGossip(Codec.encodeGossip(m)) shouldBe Right(m)
 
   test("decodeGossip rejects garbage"):

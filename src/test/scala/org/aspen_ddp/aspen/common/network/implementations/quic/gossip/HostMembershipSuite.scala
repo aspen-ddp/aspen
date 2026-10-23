@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.common.network.implementations.quic.gossip
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.{ClusterTransportMessage, Codec, Gossip, StoreMoved}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -119,7 +120,7 @@ class HostMembershipSuite extends AnyFunSuite with Matchers:
   test("broadcast gossip reaches every other host"):
     withNet: net =>
       awaitAllOnline(net)
-      val g = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 2.toByte))
+      val g = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 2.toByte), HostId(UUID.randomUUID()), HLCTimestamp(1))
       net.hm(net.a).broadcast(g)
       for h <- List(net.b, net.c) do
         eventually(s"$h received the gossip")(net.rec(h).gossip.contains(g))
@@ -131,7 +132,7 @@ class HostMembershipSuite extends AnyFunSuite with Matchers:
       val raw = Array[Byte](0xff.toByte, 0x01, 0x02)
       Codec.decodeGossip(raw).isLeft shouldBe true
       net.hm(net.a).spreadRawGossip(raw)
-      val g = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 1.toByte))
+      val g = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 1.toByte), HostId(UUID.randomUUID()), HLCTimestamp(1))
       net.hm(net.a).broadcast(g)
       for h <- List(net.b, net.c) do
         eventually(s"$h received the later gossip")(net.rec(h).gossip.contains(g))

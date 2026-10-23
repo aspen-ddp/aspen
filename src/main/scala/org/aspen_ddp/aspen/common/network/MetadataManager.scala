@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.common.network
 
 import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -46,6 +47,10 @@ object MetadataManager:
   private class PendingHostLookup(hostQueueSize: Int):
     val messageQueue = new EvictingQueue[Message](hostQueueSize)
 
+    /** The newest HostEndpointChanged gossip received while the lookup was in flight. The lookup's read may have
+     *  been served before that change committed, so whichever of the two is newer builds the entry. */
+    var gossiped: Option[HostEndpointChanged] = None
+
     def enqueueMessage(msg: Message): Unit = messageQueue.enqueue(msg)
 
     def drainIntoQueue(storeQueue: EvictingQueue[Message]): Unit =
@@ -71,6 +76,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
   private var bootstrapStores: Set[StoreId] = Set()
   private var stores: Map[StoreId, HostId] = Map()
   private var hosts: Map[HostId, Either[PendingHostLookup, T]] = Map()
+  // The timestamp of the StoragePoolState or HostState value each store mapping or host entry was taken from, so
+  // gossip no newer than what is held -- a retransmit, most often -- is ignored. Kept when the mapping or entry is
+  // dropped, so a stale message arriving afterwards still loses. Absent for those taken from the bootstrap config,
+  // which carries no timestamps.
+  private var storeTimestamps: Map[StoreId, HLCTimestamp] = Map()
+  private var hostTimestamps: Map[HostId, HLCTimestamp] = Map()
   private var refreshingBootstrapConfig: Boolean = false
 
   loadInitialBootstrapConfig()
@@ -196,6 +207,54 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         refreshBootstrapConfig()
       else
         stores -= storeId
+
+  /** Applies StoreMoved gossip: maps `storeId` to `hostId` unless the mapping held is at least as new, so no pool
+   *  read is needed. Mapped even if this process has never sent to the store, since it costs nothing.
+   *
+   *  A bootstrap store's mapping comes from the bootstrap config and has no timestamp to compare. For those, a
+   *  message naming the host already mapped is ignored and any other refreshes the config, which is authoritative.
+   */
+  def storeMoved(storeId: StoreId, hostId: HostId, timestamp: HLCTimestamp): Unit =
+    synchronized:
+      if isBootstrapStore(storeId) then
+        if !stores.get(storeId).contains(hostId) then
+          refreshBootstrapConfig()
+      else if storeTimestamps.get(storeId).forall(_ < timestamp) then
+        stores += storeId -> hostId
+        storeTimestamps += storeId -> timestamp
+
+  /** Applies HostEndpointChanged gossip, unless the entry held is at least as new, and returns the entry it
+   *  replaced so the caller can close that entry's connection.
+   *
+   *  A resolved entry is replaced by one built from the message, keeping the old entry's name, so no host read is
+   *  needed. An entry from the bootstrap config has no timestamp and is always replaced: a stale message cannot
+   *  outlive a newer one, since a host's retransmits of the newer change replace its older one. A lookup in
+   *  flight records the message and uses it if it is newer than what the lookup reads. A host with neither is
+   *  left alone; there is nothing stale to correct.
+   */
+  def endpointChanged(m: HostEndpointChanged): Option[T] =
+    synchronized:
+      if !hostTimestamps.get(m.hostId).forall(_ < m.timestamp) then
+        None
+      else
+        hosts.get(m.hostId) match
+          case Some(Right(old)) =>
+            try
+              hosts += m.hostId -> Right(networkImplInterface.createHostEntry(
+                m.hostId, old.name, m.address, m.dataPort, m.httpPort, m.storeTransferPort,
+                new EvictingQueue[Message](1)))
+              hostTimestamps += m.hostId -> m.timestamp
+            catch
+              case NonFatal(t) =>
+                // Back to never-looked-up, so the next send re-reads the host
+                hosts -= m.hostId
+                logger.error(s"Failed to create the host entry for hostId ${m.hostId}. Error: $t", t)
+            Some(old)
+          case Some(Left(phl)) =>
+            if phl.gossiped.forall(_.timestamp < m.timestamp) then
+              phl.gossiped = Some(m)
+            None
+          case None => None
 
   /** Refetches the bootstrap config and reinstalls the store -> host mappings it names, along
    *  with the set of stores that count as bootstrap stores.
@@ -400,23 +459,24 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         given ExecutionContext = client.clientContext
         hosts += hostId -> Left(phl)
         try
-          client.getHostState(hostId).onComplete:
+          client.getHostStateAndTimestamp(hostId).onComplete:
             case Failure(err) =>
               logger.error(s"HostState lookup failed for hostId $hostId. Error: $err")
               synchronized:
                 hosts -= hostId
-            case Success(hostState) =>
+            case Success((hostState, readTimestamp)) =>
               synchronized:
                 try
-                  hosts += hostId -> Right(networkImplInterface.createHostEntry(
-                    hostId,
-                    hostState.name,
-                    hostState.address,
-                    hostState.dataPort,
-                    hostState.httpPort,
-                    hostState.storeTransferPort,
-                    phl.messageQueue
-                  ))
+                  val entry = phl.gossiped match
+                    case Some(g) if g.timestamp > readTimestamp =>
+                      hostTimestamps += hostId -> g.timestamp
+                      networkImplInterface.createHostEntry(hostId, hostState.name, g.address, g.dataPort,
+                        g.httpPort, g.storeTransferPort, phl.messageQueue)
+                    case _ =>
+                      hostTimestamps += hostId -> readTimestamp
+                      networkImplInterface.createHostEntry(hostId, hostState.name, hostState.address,
+                        hostState.dataPort, hostState.httpPort, hostState.storeTransferPort, phl.messageQueue)
+                  hosts += hostId -> Right(entry)
                 catch
                   case NonFatal(t) =>
                     // Retryability rule.
@@ -467,12 +527,12 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         ppl.enqueueMessage(storeId, msg)
         pendingPoolLookups += storeId.poolId -> ppl
         try
-          client.getStoragePoolState(storeId.poolId).onComplete:
+          client.getStoragePoolStateAndTimestamp(storeId.poolId).onComplete:
             case Failure(err) =>
               logger.error(s"StoragePool lookup failed for poolId ${storeId.poolId}. Error: $err")
               synchronized:
                 pendingPoolLookups -= storeId.poolId
-            case Success(poolState) =>
+            case Success((poolState, readTimestamp)) =>
               synchronized:
                 pendingPoolLookups -= storeId.poolId
                 poolState.stores.zipWithIndex.foreach: (se, index) =>
@@ -480,10 +540,17 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
                   // Outside the try on purpose. Nothing here can throw, so this is legibility
                   // rather than mechanism: the mapping is the part that must land for every store
                   // regardless of what the handoff does, and its position says so.
-                  stores += sid -> se.hostId
+                  // StoreMoved gossip newer than this read wins: the read may predate the move.
+                  val hostId =
+                    if storeTimestamps.get(sid).forall(_ <= readTimestamp) then
+                      storeTimestamps += sid -> readTimestamp
+                      se.hostId
+                    else
+                      stores.getOrElse(sid, se.hostId)
+                  stores += sid -> hostId
                   try
                     ppl.storeQueues.get(sid).foreach: storeQueue =>
-                      hosts.get(se.hostId) match
+                      hosts.get(hostId) match
                         case None =>
                           // The pool named a host this process has never looked up. Move the queue
                           // onto a host lookup instead of dropping it: pendingPoolLookups was cleared
@@ -498,7 +565,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
                           // would drain all of them.
                           val phl = new PendingHostLookup(pendingHostLookupQueueSize)
                           phl.drainIntoQueue(storeQueue)
-                          startHostLookup(se.hostId, phl)
+                          startHostLookup(hostId, phl)
                         case Some(e) => e match
                           case Left(phl) => phl.drainIntoQueue(storeQueue)
                           case Right(hostEntry) => networkImplInterface.storeResolved(hostEntry, sid, storeQueue)
@@ -513,7 +580,7 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
                       // and storeResolved is the only live throw site here. The guard spans the
                       // handoff anyway, because the handoff is the unit being contained -- not
                       // because of where the throw happens to come from today.
-                      logger.error(s"Handoff failed for messages parked on store $sid, host ${se.hostId}. " +
+                      logger.error(s"Handoff failed for messages parked on store $sid, host $hostId. " +
                                    s"Those messages may not have been delivered; the rest of the pool " +
                                    s"is unaffected. Error: $t", t)
         catch

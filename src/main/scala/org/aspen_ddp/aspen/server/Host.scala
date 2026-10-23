@@ -567,7 +567,7 @@ class Host(val client: AspenClient,
           // If state update transaction is successful, send a CheckStorageDevice
           // message to the host of the old storage device so they can delete
           // the store content
-          tx.result.foreach: _ =>
+          tx.result.foreach: timestamp =>
             val msg = CheckStorageDevice(
               fromDev.hostId,
               client.clientId,
@@ -582,9 +582,10 @@ class Host(val client: AspenClient,
               RebalancingMessage.encode(
                 TransferComplete(toDev.storageDeviceSet, storeId, fromDeviceId, toDeviceid)))
 
-            // Tell every other host (and client) that the cached address for this store is
-            // stale. Sent only on this branch: the other outcomes did not repoint the pool.
-            gossipRetransmitter.broadcast(StoreMoved(storeId))
+            // Tell every other host (and client) where the store now lives. Sent only on this
+            // branch: the other outcomes did not repoint the pool. This transaction wrote the pool
+            // config, so its timestamp is the config value's.
+            gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp))
 
           TransferOutcome.PoolRepointed
 
@@ -623,9 +624,13 @@ class Host(val client: AspenClient,
                 List(Insert(HostState.StateKey,
                   current.copy(address = address, dataPort = dataPort, httpPort = httpPort,
                                storeTransferPort = storeTransferPort).encode())))
-          .map: _ =>
+              tx
+          // The committed transaction's timestamp is the new HostState value's
+          .flatMap(_.result)
+          .map: timestamp =>
             logger.info(s"Host endpoint updated to $address:$dataPort")
-            gossipRetransmitter.broadcast(HostEndpointChanged(hostId))
+            gossipRetransmitter.broadcast(
+              HostEndpointChanged(hostId, address, dataPort, httpPort, storeTransferPort, timestamp))
             true
 
     // Each call is one attempt; a failed one logs and schedules another. The result is the
@@ -1326,9 +1331,7 @@ class Host(val client: AspenClient,
 
               tx.result.foreach: _ =>
                 logger.info(s"Rebuild of store $storeId complete")
-                // The pool was repointed here when the rebuild was assigned, but peers only
-                // learn it now, exactly as at the end of a transfer.
-                gossipRetransmitter.broadcast(StoreMoved(storeId))
+                gossipRebuiltStoreMoved(storeId)
 
               RebuildOutcome.Adopt
 
@@ -1342,6 +1345,21 @@ class Host(val client: AspenClient,
               // device owns a rebuilt store. Latent rather than live: no current in-tree writer
               // produces "healthy device, entry vanished", but it's the wrong default.
               RebuildOutcome.Discard
+
+  /** Gossips StoreMoved for a store whose rebuild has completed.
+   *
+   *  The pool was repointed when the rebuild was assigned, but peers only learn it now, as at
+   *  the end of a transfer. That was a different transaction, so the pool is read for the host
+   *  and timestamp its config value carries. Best-effort: a failed read only means peers find
+   *  the store the slow way.
+   */
+  private def gossipRebuiltStoreMoved(storeId: StoreId): Unit =
+    client.getStoragePoolStateAndTimestamp(storeId.poolId).onComplete:
+      case Success((poolState, timestamp)) =>
+        val hostId = poolState.stores(storeId.poolIndex).hostId
+        gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp))
+      case Failure(err) =>
+        logger.warn(s"Failed to read pool ${storeId.poolId} to gossip the rebuilt store $storeId: $err")
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
    *

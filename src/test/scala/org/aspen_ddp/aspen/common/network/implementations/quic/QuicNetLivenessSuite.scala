@@ -82,6 +82,9 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
   private def stateOf(hostId: HostId, port: Int): HostState =
     HostState(hostId, s"host_${hostId.uuid}", "127.0.0.1", port, 0, 0, Set())
 
+  private def endpointChanged(hostId: HostId, port: Int, timestamp: HLCTimestamp = HLCTimestamp.now): HostEndpointChanged =
+    HostEndpointChanged(hostId, "127.0.0.1", port, 0, 0, timestamp)
+
   /** A third host C, known to the fixture's directory, once A and B both see it as a member */
   private def startHostC(): (HostId, Node) =
     val hostIdC = HostId(UUID.randomUUID())
@@ -190,23 +193,29 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     recB.restarts shouldBe empty
     entryFor(fx.b.net, fx.hostIdA).connection.get() should be theSameInstanceAs bOut
 
-  test("StoreMoved gossip drops the store mapping on peers"):
+  test("StoreMoved gossip reaches peers"):
     awaitOnline()
     val recB = listen(fx.b.net)
-    val g = StoreMoved(fx.storesB.head)
+    val g = StoreMoved(fx.storesB.head, fx.hostIdB, HLCTimestamp.now)
     fx.a.net.serverMessenger.broadcastGossip(g)
     eventually("B receives the StoreMoved gossip", WaitMillis):
       recB.gossip.contains(g)
 
-  test("HostEndpointChanged gossip drops the host entry on peers"):
+  test("HostEndpointChanged gossip replaces the host entry on peers, and a repeat of it is ignored"):
     awaitOnline()
     val old = entryFor(fx.b.net, fx.hostIdA)
     val bOut = old.connection.get()
     bOut should not be null
-    fx.a.net.serverMessenger.broadcastGossip(HostEndpointChanged(fx.hostIdA))
-    // B re-reads A's host object on its next send, so the entry may already be back as a new instance
-    eventually("B drops its entry for A", WaitMillis)(replaced(fx.b.net, fx.hostIdA, old))
+    val g = endpointChanged(fx.hostIdA, old.dataPort)
+    fx.a.net.serverMessenger.broadcastGossip(g)
+    eventually("B replaces its entry for A", WaitMillis)(replaced(fx.b.net, fx.hostIdA, old))
     eventually("B's outbound connection to A closes", WaitMillis)(bOut.isClosed)
+    // A retransmit carries the same timestamp, so it leaves the new entry alone
+    val current = entryFor(fx.b.net, fx.hostIdA)
+    val recB = listen(fx.b.net)
+    fx.a.net.serverMessenger.broadcastGossip(g)
+    eventually("B receives the repeat", WaitMillis)(recB.gossip.contains(g))
+    entryFor(fx.b.net, fx.hostIdA) should be theSameInstanceAs current
 
   test("a host that moved to a new port rejoins membership before anyone re-reads its host object"):
     awaitOnline()
@@ -225,7 +234,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     eventually("C sees A and B as members", WaitMillis):
       c2.net.membership.exists(m => m.isOnline(fx.hostIdA) && m.isOnline(fx.hostIdB))
 
-  test("a moved host's HostEndpointChanged gossip makes peers re-read it, after which data traffic reaches it"):
+  test("a moved host's HostEndpointChanged gossip gives peers its new endpoint without a re-read"):
     awaitOnline()
     val (hostIdC, c1) = startHostC()
     val recA = listen(fx.a.net)
@@ -238,24 +247,25 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     eventually("A sees the moved C rejoin", WaitMillis)(recA.restarts.contains(hostIdC))
     val stale = entryFor(fx.a.net, hostIdC)
     stale.dataPort should not be newPort
-    c2.net.serverMessenger.broadcastGossip(HostEndpointChanged(hostIdC))
-    eventually("A drops its stale entry for C", WaitMillis)(replaced(fx.a.net, hostIdC, stale))
-    // The next data send re-reads C's host object and dials the new port
-    sendHostMessageTo(hostIdC, c2)
+    val lookupsBefore = fx.directory.lookups.asScala.count(_ == hostIdC)
+    c2.net.serverMessenger.broadcastGossip(endpointChanged(hostIdC, newPort))
+    eventually("A replaces its stale entry for C", WaitMillis)(replaced(fx.a.net, hostIdC, stale))
     entryFor(fx.a.net, hostIdC).dataPort shouldBe newPort
+    sendHostMessageTo(hostIdC, c2)
+    fx.directory.lookups.asScala.count(_ == hostIdC) shouldBe lookupsBefore
 
   test("a top-level HostEndpointChanged is ignored"):
     awaitOnline()
     val old = entryFor(fx.b.net, fx.hostIdA)
     // Endpoint changes travel only as gossip; a direct one is not acted on
-    noException should be thrownBy fx.b.net.dispatchForTests(HostEndpointChanged(fx.hostIdA))
+    noException should be thrownBy fx.b.net.dispatchForTests(endpointChanged(fx.hostIdA, old.dataPort + 1))
     fx.b.net.metadataManager.peekHostEntry(fx.hostIdA).exists(_ eq old) shouldBe true
 
   test("endpoint gossip for an unknown host starts no lookup"):
     awaitOnline()
     val recB = listen(fx.b.net)
     val unknown = HostId(UUID.randomUUID())
-    val g = HostEndpointChanged(unknown)
+    val g = endpointChanged(unknown, 1234)
     fx.a.net.serverMessenger.broadcastGossip(g)
     // QuicNet's own listener was registered first, so it has handled the gossip once the recorder sees it
     eventually("B receives the gossip", WaitMillis):

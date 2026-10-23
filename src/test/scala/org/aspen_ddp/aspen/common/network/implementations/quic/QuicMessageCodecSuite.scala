@@ -183,11 +183,11 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     roundTrip(m) shouldBe m   // 3000 bytes forces the stream path
 
   test("StoreMoved round trips through the QUIC codec"):
-    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 1))
+    val m = StoreMoved(StoreId(PoolId(UUID.randomUUID()), 1), HostId(UUID.randomUUID()), HLCTimestamp(12345))
     roundTrip(m) shouldBe m
 
   test("HostEndpointChanged round trips through the QUIC codec"):
-    val m = HostEndpointChanged(HostId(UUID.randomUUID()))
+    val m = HostEndpointChanged(HostId(UUID.randomUUID()), "10.1.2.3", 4000, 4001, 4002, HLCTimestamp(12345))
     roundTrip(m) shouldBe m
 
   test("empty payloads round-trip"):

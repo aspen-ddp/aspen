@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.common.ida
 
+import java.nio.ByteBuffer
+
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -129,4 +131,23 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
     val enc = d.encode.getByteArray
     for n <- 0 until enc.length do
       an [IllegalArgumentException] should be thrownBy AppendDelta.decode(DataBuffer(enc.take(n)))
+  }
+
+  test("decode rejects inconsistent header fields") {
+    val tail = Some(Array[Byte](1, 2, 3, 4))
+    val bad = List(
+      (16, 8, 0, Array[Byte](1), None),            // shrinking slice
+      (-1, 8, 0, Array[Byte](1), None),            // negative expected length
+      (0, -8, 0, Array[Byte](), None),             // negative new length
+      (0, 8, -1, Array[Byte](1), None),            // negative offset
+      (0, 8, 7, Array[Byte](1, 2), None),          // xor range past new length
+      (2, 8, 0, Array[Byte](1), tail))             // tail longer than expected slice
+    bad.foreach { (e, n, o, x, t) =>
+      val enc = ByteBuffer.allocate(22 + x.length + t.map(_.length).getOrElse(0))
+      enc.put(AppendDelta.FormatVersion).putInt(e).putInt(n).putInt(o).putInt(x.length)
+      enc.put(if t.isDefined then 1.toByte else 0.toByte).putInt(t.map(_.length).getOrElse(0))
+      enc.put(x)
+      t.foreach(a => enc.put(a))
+      an [IllegalArgumentException] should be thrownBy AppendDelta.decode(DataBuffer(enc.array()))
+    }
   }

@@ -17,6 +17,14 @@ final case class AppendDelta(
     xorBytes: Array[Byte],
     expectedTail: Option[Array[Byte]]):
 
+  require(expectedSliceLength >= 0 && expectedSliceLength <= newSliceLength,
+    s"Invalid slice lengths: expected $expectedSliceLength, new $newSliceLength")
+  require(xorOffset >= 0, s"Invalid xorOffset $xorOffset")
+  require(xorOffset.toLong + xorBytes.length <= newSliceLength,
+    s"XOR range ($xorOffset + ${xorBytes.length}) exceeds new slice length $newSliceLength")
+  require(expectedTail.forall(_.length <= expectedSliceLength),
+    "Expected tail is longer than the expected slice")
+
   def matches(slice: DataBuffer): Boolean =
     slice.size == expectedSliceLength && (expectedTail match
       case None => true

@@ -17,12 +17,14 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.{HostMembership, MembershipListener}
+import org.aspen_ddp.aspen.common.network.tls.CertificateVerifier
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{DaemonThreads, EvictingQueue}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import scribe.Logging
 
 import java.net.{InetAddress, InetSocketAddress}
+import java.security.cert.X509Certificate
 import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, ExecutorService, Executors, RejectedExecutionException, TimeUnit,
   TimeoutException}
@@ -131,6 +133,19 @@ object QuicNet:
   * `MetadataManager`. `failingSince` and `lastQueried` are concurrent maps; the scan and every query run on
   * `loops(0)`, which owns `relays`.
   *
+  * Wrong-host detection: a host entry's address can be up but belong to a different host (e.g. after a DHCP
+  * reassignment). Two detectors catch it, both on the sending side's outbound connection for that entry:
+  *  - TLS identity (`config.verifyPeerIdentity`): when the handshake completes, the peer certificate's UUID must be
+  *    the entry's HostId (host certificates are signed for their HostId). It is checked before the connection is
+  *    attached, so nothing queued behind the handshake reaches the wrong host.
+  *  - `WrongHost` reply: every message sent through a host entry carries the intended HostId in its envelope
+  *    (`Received.toHost`). A host receiving one meant for another HostId drops it and, at most once per connection
+  *    per `config.wrongHostReplyInterval`, replies `WrongHost` over the same connection. Messages without a
+  *    `toHost`, and every message a client receives, are never checked.
+  * Either signal marks the entry `knownWrong` (see `markWrong`): its connection is closed, sends through it are
+  * dropped, and its peers are queried at once and then on every scan, whatever the failure clock and online state,
+  * until an answer replaces the entry. `lastWrongHostReply` is a concurrent map, written on each connection's loop.
+  *
   * @param resolveHost resolves a host address that is not an IP literal. It may block: it only runs on the
   *                    plugin's resolver threads, never on a caller or an event loop. Replaceable for tests.
   * @param storeAvailabilityCacheFile host mode: where store availability is saved across restarts
@@ -201,6 +216,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private val lastQueried = new ConcurrentHashMap[HostId, java.lang.Long]()
 
   private val peerQueriesSent = new AtomicLong(0)
+
+  private val wrongHostRepliesSent = new AtomicLong(0)
+
+  /** Host mode: when (System.nanoTime) each connection last carried a `WrongHost` reply. Written on its loop. */
+  private val lastWrongHostReply = new ConcurrentHashMap[QuicConnection, java.lang.Long]()
 
   private val nextDialIndex = new AtomicInteger(0)
 
@@ -634,8 +654,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private[quic] def peerQueryPlanForTests(target: HostId): (Set[HostId], List[HostId]) =
     loops(0).submit(() => (relays, queryPeers(target))).get()
 
-  /** Dispatches `m` as if it had arrived on a connection */
-  private[quic] def dispatchForTests(m: Message): Unit = dispatch(null, QuicMessageCodec.Received(m, None))
+  /** `WrongHost` replies sent so far */
+  private[quic] def wrongHostRepliesSentForTests: Long = wrongHostRepliesSent.get()
+
+  /** Dispatches `m` as if it had arrived on a connection, with `toHost` as its envelope's intended destination */
+  private[quic] def dispatchForTests(m: Message, toHost: Option[HostId] = None): Unit =
+    dispatch(null, QuicMessageCodec.Received(m, toHost))
 
   /** `shutdown` without the shutting-down flag or the linger, waiting for the group to terminate: stops
     * membership, closes every connection on its loop (which cancels its timers), closes the datagram
@@ -695,8 +719,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       droppedAfterShutdown(msg)
     else
       try
-        val conn = connectionFor(entry)
-        conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT))
+        if entry.knownWrong then
+          logger.debug(s"Dropping ${msg.getClass.getSimpleName} for host ${entry.name}: its address belongs to another host")
+        else
+          val conn = connectionFor(entry)
+          conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT, toHost = Some(entry.hostId)))
       catch
         case NonFatal(e) => logger.warn(s"QUIC send of ${msg.getClass.getSimpleName} to host ${entry.name} failed: $e")
 
@@ -779,7 +806,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     ipLiteral(entry.address) match
       case Some(ip) =>
         val address = new InetSocketAddress(ip, entry.dataPort)
-        loop.execute(() => dial(conn, parent, address))
+        loop.execute(() => dial(entry, conn, parent, address))
       case None =>
         val name = entry.address
         val guard = loop.schedule((() =>
@@ -794,7 +821,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
               loop.execute: () =>
                 guard.cancel(false)
                 resolved match
-                  case Right(address) => dial(conn, parent, address)
+                  case Right(address) => dial(entry, conn, parent, address)
                   case Left(e) => conn.handshakeFailed(e)
             catch case _: RejectedExecutionException => () // the loop is gone and with it the connection
         catch
@@ -804,11 +831,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   // ---- Loop side -----------------------------------------------------------------------------------------------
 
-  private def dial(conn: QuicConnection, parent: Channel, address: InetSocketAddress): Unit =
+  private def dial(entry: QuicHostEntry, conn: QuicConnection, parent: Channel, address: InetSocketAddress): Unit =
     if !conn.isClosed then
-      connect(conn, parent, address)
+      connect(entry, conn, parent, address)
 
-  private def connect(conn: QuicConnection, parent: Channel, address: InetSocketAddress): Unit =
+  /** Connects `conn` to `address`. With `config.verifyPeerIdentity`, a peer whose certificate is not for `entry`'s
+    * HostId is never attached, so nothing queued behind the handshake reaches it: see `markWrong`.
+    */
+  private def connect(entry: QuicHostEntry, conn: QuicConnection, parent: Channel, address: InetSocketAddress): Unit =
     val handler = new ConnectionHandler(conn, inbound = false)
     try
       val f = QuicChannel.newBootstrap(parent)
@@ -825,7 +855,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       f.addListener: (r: NFuture[QuicChannel]) =>
         guard.cancel(false)
         if r.isSuccess then
-          conn.attach(r.getNow)
+          val ch = r.getNow
+          val peerId = if config.verifyPeerIdentity then peerCertificateId(ch) else Some(entry.hostId.uuid)
+          if peerId.contains(entry.hostId.uuid) then
+            conn.attach(ch)
+          else
+            ch.close()
+            markWrong(entry, s"its certificate is for ${peerId.getOrElse("no UUID")}")
+            conn.close()
         else
           conn.handshakeFailed(r.cause())
     catch
@@ -848,6 +885,17 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       failingSince.putIfAbsent(entry.hostId, System.nanoTime())
     connectionClosed(conn)
 
+  /** The UUID of `ch`'s peer certificate, if it has one */
+  private def peerCertificateId(ch: QuicChannel): Option[UUID] =
+    try
+      ch.sslEngine().getSession.getPeerCertificates.headOption.flatMap:
+        case c: X509Certificate => CertificateVerifier.extractId(c)
+        case _ => None
+    catch
+      case NonFatal(e) =>
+        logger.debug(s"QUIC peer certificate of ${ch.remoteSocketAddress()} unreadable: $e")
+        None
+
   private def isCurrentEntry(entry: QuicHostEntry): Boolean =
     metadataManager.peekHostEntry(entry.hostId).exists(_ eq entry)
 
@@ -857,6 +905,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private def connectionClosed(conn: QuicConnection): Unit =
     liveConnections.remove(conn)
+    lastWrongHostReply.remove(conn)
     clientRouteMap.forEach: (id, c) =>
       if c eq conn then
         clientRouteMap.remove(id, c)
@@ -910,8 +959,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   // ---- Peer endpoint query ------------------------------------------------------------------------------------
 
   /** On `loops(0)`, every `peerQueryInterval`. Queries about each host reported online whose dials have been failing
-    * for at least `peerQueryDelay` and that was not asked about within the last interval. Scheduling jitter is allowed
-    * for, so a host still failing is asked about on every scan.
+    * for at least `peerQueryDelay`, and about each host whose entry is known-wrong whatever its failure clock and
+    * online state, unless it was asked about within the last interval. Scheduling jitter is allowed for, so a host
+    * still failing (or still known-wrong) is asked about on every scan.
     */
   private def scanForPeerQueries(): Unit =
     if !shuttingDown then
@@ -919,9 +969,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         val now = System.nanoTime()
         val delay = config.peerQueryDelay.toNanos
         val interval = config.peerQueryInterval.toNanos
-        val due = failingSince.asScala.collect:
-          case (h, since) if now - since >= delay && reportedOnline(h) &&
-              Option(lastQueried.get(h)).forall(t => now - t >= interval - interval / 10) => h
+        val failing = failingSince.asScala.collect:
+          case (h, since) if now - since >= delay && reportedOnline(h) => h
+        val knownWrong = metadataManager.resolvedHostEntries.filter(_.knownWrong).map(_.hostId)
+        val due = (failing.toSet ++ knownWrong).filter: h =>
+          Option(lastQueried.get(h)).forall(t => now - t >= interval - interval / 10)
         due.toList.foreach(sendQuery)
       catch
         case NonFatal(e) => logger.warn(s"Peer endpoint query scan failed: $e")
@@ -976,6 +1028,41 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     m.endpoint.foreach: e =>
       if e.hostId == m.hostId && metadataManager.hostTimestamp(e.hostId).forall(_ < e.timestamp) then
         endpointChanged(e)
+
+  // ---- Wrong-host detection ----------------------------------------------------------------------------------
+
+  /** Any thread. `entry`'s address belongs to another host: unless the entry has been replaced (or is already
+    * marked), marks it known-wrong, so sends through it are dropped, closes its connection and queries its peers at
+    * once. The scan keeps querying every interval until an answer replaces the entry.
+    */
+  private def markWrong(entry: QuicHostEntry, why: String): Unit =
+    if !entry.knownWrong && isCurrentEntry(entry) && !ohost.exists(_._1 == entry.hostId) then
+      logger.warn(s"Address ${entry.address}:${entry.dataPort} of host ${entry.name} belongs to another host ($why); " +
+        "dropping messages to it until a peer knows its endpoint")
+      entry.knownWrong = true
+      closeOutbound(entry)
+      requestPeerQuery(entry.hostId)
+
+  /** Host mode, on `conn`'s loop. `msg` was meant for `intended`, not us: dropped, with a `WrongHost` reply unless
+    * this connection carried one within `wrongHostReplyInterval`.
+    */
+  private def misaddressed(conn: QuicConnection, intended: HostId, ourId: HostId, msg: Message): Unit =
+    logger.debug(s"Dropping ${msg.getClass.getSimpleName} meant for host $intended")
+    if conn != null && !conn.isClosed then
+      val now = System.nanoTime()
+      val last = lastWrongHostReply.get(conn)
+      if last == null || now - last >= config.wrongHostReplyInterval.toNanos then
+        lastWrongHostReply.put(conn, now)
+        wrongHostRepliesSent.incrementAndGet()
+        conn.submit(QuicMessageCodec.encode(WrongHost(intended, ourId), PooledByteBufAllocator.DEFAULT))
+
+  /** On `conn`'s loop. Only a reply over the intended host's current connection speaks for its current address; one
+    * arriving after the entry was repaired, or over another connection, is ignored.
+    */
+  private def wrongHostReceived(conn: QuicConnection, m: WrongHost): Unit =
+    metadataManager.peekHostEntry(m.intendedHostId).foreach: entry =>
+      if conn == null || (entry.connection.get() eq conn) then
+        markWrong(entry, s"host ${m.actualHostId} answers there")
 
   // ---- Gossip relaying -----------------------------------------------------------------------------------------
 
@@ -1046,49 +1133,60 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     if conn != null && !conn.isClosed && (clientRouteMap.get(id) ne conn) then
       clientRouteMap.put(id, conn)
 
-  /** Mirrors `ZMQNet.decodeAndDispatch`. Runs on `conn`'s loop; a throwing handler is logged, never propagated. */
+  /** Mirrors `ZMQNet.decodeAndDispatch`. Runs on `conn`'s loop; a throwing handler is logged, never propagated.
+    * Host mode: a message whose envelope names another host is dropped (see `misaddressed`).
+    */
   private def dispatch(conn: QuicConnection, received: QuicMessageCodec.Received): Unit =
     val msg = received.msg
     try
-      msg match
-        case req: ClientRequest =>
-          recordRoute(req.fromClient, conn)
-          messageHandler.onClientRequestReceived(req)
-
-        case resp: ClientResponse =>
-          messageHandler.onClientResponseReceived(resp)
-
-        case tx: TxMessage =>
-          messageHandler.onTransactionMessageReceived(tx)
-
-        case hm: HostMessage =>
-          messageHandler.onHostMessageReceived(hm)
-
-        case m: ClusterTransportMessage =>
-          clusterMessage(conn, m)
-
-        case m: GossipSubscribe =>
-          subscribe(conn, m)
-
-        case g: Gossip =>
-          // Forwarded by a relay. A host takes gossip only from membership, which also carries it between hosts.
-          if membership.isEmpty then
-            applyGossip(g)
-
-        case m: HostOnlineStatus =>
-          if membership.isEmpty then
-            hostOnlineStatus(m)
-
-        case _: HostResponse | _: HostHeartbeat =>
-          // Not handled: liveness comes from host membership
-
-        case m: HostEndpointQuery =>
-          endpointQuery(conn, m)
-
-        case m: HostEndpointAnswer =>
-          endpointAnswer(m)
-
-        case _: WrongHost =>
-          // Not yet handled
+      val wrongFor = for
+        (ourId, _) <- ohost
+        intended <- received.toHost if intended != ourId
+      yield (intended, ourId)
+      wrongFor match
+        case Some((intended, ourId)) => misaddressed(conn, intended, ourId, msg)
+        case None => deliver(conn, msg)
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)
+
+  private def deliver(conn: QuicConnection, msg: Message): Unit =
+    msg match
+      case req: ClientRequest =>
+        recordRoute(req.fromClient, conn)
+        messageHandler.onClientRequestReceived(req)
+
+      case resp: ClientResponse =>
+        messageHandler.onClientResponseReceived(resp)
+
+      case tx: TxMessage =>
+        messageHandler.onTransactionMessageReceived(tx)
+
+      case hm: HostMessage =>
+        messageHandler.onHostMessageReceived(hm)
+
+      case m: ClusterTransportMessage =>
+        clusterMessage(conn, m)
+
+      case m: GossipSubscribe =>
+        subscribe(conn, m)
+
+      case g: Gossip =>
+        // Forwarded by a relay. A host takes gossip only from membership, which also carries it between hosts.
+        if membership.isEmpty then
+          applyGossip(g)
+
+      case m: HostOnlineStatus =>
+        if membership.isEmpty then
+          hostOnlineStatus(m)
+
+      case _: HostResponse | _: HostHeartbeat =>
+        // Not handled: liveness comes from host membership
+
+      case m: HostEndpointQuery =>
+        endpointQuery(conn, m)
+
+      case m: HostEndpointAnswer =>
+        endpointAnswer(m)
+
+      case m: WrongHost =>
+        wrongHostReceived(conn, m)

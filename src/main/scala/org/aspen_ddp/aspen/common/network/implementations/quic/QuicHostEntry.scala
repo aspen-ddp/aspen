@@ -10,7 +10,8 @@ import java.util.concurrent.atomic.AtomicReference
   *
   * `connection` is the current outbound connection to this host, or null. Senders install a new one with a CAS
   * when it is null or closed, so exactly one thread dials; a connection clears itself (CAS from itself to null)
-  * when it closes. `isOnline` is driven by host membership events and read from other threads, hence volatile.
+  * when it closes. `isOnline` is driven by host membership events and read from other threads, hence volatile, as is
+  * `knownWrong`.
   */
 class QuicHostEntry(hostId: HostId,
                     name: String,
@@ -22,6 +23,11 @@ class QuicHostEntry(hostId: HostId,
 
   val connection: AtomicReference[QuicConnection | Null] = new AtomicReference[QuicConnection | Null](null)
   @volatile var isOnline: Boolean = false
+
+  /** Set once this entry's address is known to belong to another host. Sends through it are dropped until a peer
+    * answer replaces the entry (the replacement is a fresh entry, so the mark goes with this one).
+    */
+  @volatile var knownWrong: Boolean = false
 
   def setOnline(): Unit =
     if !isOnline then

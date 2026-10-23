@@ -107,7 +107,10 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     c.net.startIoThread(lookups)
 
     val poolId = PoolId(UUID.randomUUID())
+    // A host the bootstrap config does not know, so its endpoint needs a lookup
     val hostId = HostId(UUID.randomUUID())
+    val port = freeUdpPort()
+    val target = fx.host(hostId, port)
     val req = read(StoreId(poolId, 0.toByte), c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)
     c.net.metadataManager.hasParkedMessages shouldBe true
@@ -120,11 +123,10 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       poolId, "flush_pool", Replication(1, 1), None,
       Array(StoragePoolState.StoreEntry(hostId, StorageDeviceId(UUID.randomUUID()))),
       RocksDBConfig(), StorageDeviceSetId(UUID.randomUUID())))
-    // Host A's address under a host id the bootstrap config does not know
-    lookups.lookupPromise(hostId).success(HostState(hostId, "flush_host", "127.0.0.1", fx.portA, 0, 0, Set()))
+    lookups.lookupPromise(hostId).success(HostState(hostId, "flush_host", "127.0.0.1", port, 0, 0, Set()))
 
     flushed.get(5, TimeUnit.SECONDS) shouldBe true
-    await(fx.a.handler.clientRequests, 1).map(_.message) shouldBe List(req)
+    await(target.handler.clientRequests, 1).map(_.message) shouldBe List(req)
 
   test("flush returns false for unreachable host"):
     val c = fx.client()

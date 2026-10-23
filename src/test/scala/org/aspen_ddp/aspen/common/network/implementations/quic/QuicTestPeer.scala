@@ -9,6 +9,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel
 import io.netty.handler.codec.quic.{QuicChannel, QuicChannelBootstrap, QuicClientCodecBuilder,
   QuicServerCodecBuilder, QuicSslContext, QuicStreamChannel, QuicStreamType}
 import io.netty.handler.ssl.SslHandshakeCompletionEvent
+import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.Message
 import org.aspen_ddp.aspen.common.util.DaemonThreads
 
@@ -213,8 +214,8 @@ object QuicTestPeer:
   def watchLeaks(): LeakWatch = new LeakWatch()
 
   /** Encodes `msg` as one datagram (it must fit `DatagramThreshold`) and writes it to `ch` */
-  def sendDatagram(ch: QuicChannel, msg: Message): ChannelFuture =
-    val enc = QuicMessageCodec.encode(msg, ch.alloc())
+  def sendDatagram(ch: QuicChannel, msg: Message, toHost: Option[HostId] = None): ChannelFuture =
+    val enc = QuicMessageCodec.encode(msg, ch.alloc(), toHost = toHost)
     if !enc.isDatagram then
       enc.release()
       throw new IllegalArgumentException(s"message of ${enc.size} bytes is too large for a datagram")
@@ -233,7 +234,7 @@ object QuicTestPeer:
       throw new AssertionError(s"stream not opened within ${AwaitMillis}ms")
     f.get()
 
-  /** Writes `msg` as one stream frame on `stream` */
-  def writeFrame(stream: QuicStreamChannel, msg: Message): ChannelFuture =
+  /** Writes `msg` as one stream frame on `stream`, with `toHost` as its envelope's intended destination */
+  def writeFrame(stream: QuicStreamChannel, msg: Message, toHost: Option[HostId] = None): ChannelFuture =
     val alloc = stream.alloc()
-    stream.writeAndFlush(QuicMessageCodec.encode(msg, alloc).toStreamFrame(alloc))
+    stream.writeAndFlush(QuicMessageCodec.encode(msg, alloc, toHost = toHost).toStreamFrame(alloc))

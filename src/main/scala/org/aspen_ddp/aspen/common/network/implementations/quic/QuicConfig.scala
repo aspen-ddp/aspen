@@ -17,6 +17,9 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   * @param peerQueryInterval     how often the query repeats while the host stays unreachable; also the period of the
   *                              scan that starts queries
   * @param peerQueryFanout       how many peers each query goes to
+  * @param verifyPeerIdentity    check that the certificate of a host dialed through its host entry is for that HostId;
+  *                              a mismatch marks the entry known-wrong (see `QuicNet`'s wrong-host detection)
+  * @param wrongHostReplyInterval host mode: the least time between two `WrongHost` replies on one connection
   */
 final case class QuicConfig(
   eventLoopThreads: Int = math.min(Runtime.getRuntime.availableProcessors, 4),
@@ -31,7 +34,9 @@ final case class QuicConfig(
   gossip: GossipConfig = GossipConfig(),
   peerQueryDelay: Duration = Duration(2, MINUTES),
   peerQueryInterval: Duration = Duration(2, MINUTES),
-  peerQueryFanout: Int = 3):
+  peerQueryFanout: Int = 3,
+  verifyPeerIdentity: Boolean = true,
+  wrongHostReplyInterval: Duration = Duration(1, SECONDS)):
 
   /** Applies the transport settings shared by the server and client codecs so both are configured identically */
   def applyTo[B <: QuicCodecBuilder[B]](b: B, idle: Duration): B =

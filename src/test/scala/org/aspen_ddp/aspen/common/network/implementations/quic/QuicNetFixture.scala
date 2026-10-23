@@ -22,8 +22,8 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 /** Two host-mode `QuicNet`s on loopback sharing a bootstrap config, plus any number of client-mode nets.
   *
-  * Host A owns bootstrap stores 0 and 1, host B owns 2 and 3. Every net gets fresh credentials from `TestTLS` and a
-  * `RecordingHandler`. `close()` tears down every net it created, including restarted and extra ones.
+  * Host A owns bootstrap stores 0 and 1, host B owns 2 and 3. Every net gets fresh credentials from `TestTLS` (a
+  * host's signed for its HostId, a client's for a random UUID) and a `RecordingHandler`. `close()` tears down every net it created, including restarted and extra ones.
   *
   * Every host-mode net looks hosts up in `directory`, as a real host reads host objects through its `AspenClient`.
   * It holds A and B; a test adding a host, or moving one, puts its state there. Client-mode nets get no lookup client.
@@ -60,7 +60,7 @@ final class QuicNetFixture(val config: QuicConfig = QuicConfig(gossip = GossipCo
 
   def host(hostId: HostId, port: Int, cfg: QuicConfig = config,
            networkCache: NetworkCache = NetworkCache.NoCache): Node =
-    node(None, Some((hostId, port)), cfg, credentials(), networkCache = networkCache)
+    node(None, Some((hostId, port)), cfg, credentials(hostId.uuid), networkCache = networkCache)
 
   def client(cfg: QuicConfig = config, creds: TlsCredentials = credentials(),
              resolve: String => InetAddress = QuicNet.blockingResolve,
@@ -115,8 +115,9 @@ object QuicNetFixture:
 
   val AwaitMillis: Long = 10000
 
-  def credentials(): TlsCredentials =
-    val (cert, key) = TestTLS.credentials(UUID.randomUUID())
+  /** Credentials for `id`. A host's must be for its HostId, which outbound connections to it verify. */
+  def credentials(id: UUID = UUID.randomUUID()): TlsCredentials =
+    val (cert, key) = TestTLS.credentials(id)
     TlsCredentials.fromPem(TestTLS.caCertificatePem, cert, key)
 
   /** Ports for test QuicNets come from 10000-19999: below Linux's ephemeral range (32768-60999), which every QuicNet's

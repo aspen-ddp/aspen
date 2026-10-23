@@ -1374,3 +1374,30 @@ object Codec extends Logging:
       entry.key -> entry.value.toByteArray
     }.toMap
     (step, state)
+
+  def encode(o: CachedStore): Array[Byte] =
+    codec.NetworkCacheStore(
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      timestamp = o.timestamp.asLong
+    ).toByteArray
+
+  /** The store id is carried by the cache key rather than the record */
+  def decodeCachedStore(storeId: StoreId, data: Array[Byte]): CachedStore =
+    val m = codec.NetworkCacheStore.parseFrom(data)
+    CachedStore(storeId, HostId(decodeUUID(m.hostId.get)), HLCTimestamp(m.timestamp))
+
+  def encode(o: CachedHost): Array[Byte] =
+    codec.NetworkCacheHost(
+      hostId = Some(encodeUUID(o.hostId.uuid)),
+      name = o.name,
+      address = o.address,
+      dataPort = o.dataPort,
+      httpPort = o.httpPort,
+      storeTransferPort = o.storeTransferPort,
+      timestamp = o.timestamp.asLong
+    ).toByteArray
+
+  def decodeCachedHost(data: Array[Byte]): CachedHost =
+    val m = codec.NetworkCacheHost.parseFrom(data)
+    CachedHost(HostId(decodeUUID(m.hostId.get)), m.name, m.address, m.dataPort, m.httpPort,
+      m.storeTransferPort, HLCTimestamp(m.timestamp))

@@ -706,3 +706,21 @@ message RepairPolicy {
 message HostRepairLimits {
   uint32 maxConcurrentStoreScans = 1;
 }
+
+//---------------------------------------------------------------------------
+//- Network Cache
+//---------------------------------------------------------------------------
+message NetworkCacheStore {
+  UUID host_id = 1;
+  uint64 timestamp = 2;
+}
+
+message NetworkCacheHost {
+  UUID host_id = 1;
+  string name = 2;
+  string address = 3;
+  uint32 data_port = 4;
+  uint32 http_port = 5;
+  uint32 store_transfer_port = 6;
+  uint64 timestamp = 7;
+}

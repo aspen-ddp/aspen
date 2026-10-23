@@ -99,6 +99,10 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - A pluggable `NetworkCache` persists store->host and host->endpoint mappings, scoped to the system id.
   - `NoCache` for the CLI; RocksDB for hosts (`<host-root>/cache/network`) and `amoebafs --network-cache-dir`
   - MetadataManager seeds from it at startup, trusts entries immediately, and writes every change back
+- `NetworkCachingService` writes a daily snapshot of every host endpoint and store->host mapping. `NetworkSnapshotReader`
+  applies it at startup when the cache was empty (always for `NoCache`) and otherwise at a random slot each day.
+  Newer entries replace held ones; entries absent from it and older than its scan start by more than a 10 minute
+  drop margin are dropped.
 - QUIC repairs stale host endpoints: after `peerQueryDelay` (2 min) of failed dials to a host reported online,
   it asks `peerQueryFanout` (3) peers (clients ask their relays) over a datagram. Newer answers replace the entry.
 - QUIC envelopes carry the intended HostId. A host receiving one meant for another HostId drops it and replies

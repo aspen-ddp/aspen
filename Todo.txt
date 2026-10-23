@@ -1,16 +1,3 @@
 TODO
 ====
 
-- Need a slow-path to avoid reliance on gossip messages that can be missed for Store/Host changes.
-  - NetworkCachingService
-    - Runs every 24 hours
-    - Reads every host and every storage pool
-    - Outputs two zstd compressed DataObjects
-      - List: hostid,address,3ports,HostState object timestamp
-      - List: StoreId, HostId, timestamp of the StoragePoolState's ConfigKey key-value object
-    - Hosts read these objects every 24 hours (randomized throughout the day)
-    - Update any out-of-date connection state
-    - Add method to NetworkCache to do bulk updates given the content of those objects
-      - NoCache simply does nothing
-      - RocksDB can read the entire cache into memory at once rather than looking up each entry individually
-        (should be dramatically faster). Only update behind items

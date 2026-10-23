@@ -17,9 +17,10 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.{HostMembership, MembershipListener}
+import org.aspen_ddp.aspen.common.network.snapshot.{HostSnapshot, NetworkSnapshotReader, StoreSnapshot}
 import org.aspen_ddp.aspen.common.network.tls.CertificateVerifier
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.util.{DaemonThreads, EvictingQueue}
+import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, DaemonThreads, EvictingQueue}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import scribe.Logging
 
@@ -29,6 +30,7 @@ import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, ExecutorService, Executors, RejectedExecutionException, TimeUnit,
   TimeoutException}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
 import scala.util.Random
@@ -205,6 +207,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Rechecks offline stores. Set once, by `startIoThread`. */
   @volatile private var recheckTask: Option[NFuture[?]] = None
+
+  /** Applies the daily network snapshots. Set once, by `startIoThread`. */
+  @volatile private var snapshotReader: Option[NetworkSnapshotReader[QuicHostEntry]] = None
 
   /** Client mode: the hosts our relays last reported online. Written on loops, read by `createHostEntry`. */
   private val relayedOnline = ConcurrentHashMap.newKeySet[HostId]()
@@ -464,6 +469,15 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         lastQueried.remove(m.hostId)
         closeOutbound(old)
 
+  /** Any thread. `old` was replaced or dropped by a network snapshot: as `endpointChanged` does for the entry it
+    * replaces, restarts the failure clock and closes the old outbound connection, so the next send dials anew.
+    */
+  private def snapshotRetired(old: QuicHostEntry): Unit =
+    logger.info(s"Network snapshot retired host ${old.name} at ${old.address}:${old.dataPort}; closing its connection")
+    failingSince.remove(old.hostId)
+    lastQueried.remove(old.hostId)
+    closeOutbound(old)
+
   initOrAbort:
     membership.foreach: m =>
       m.addListener(membershipListener)
@@ -485,7 +499,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   // ---- NetworkPlugin -------------------------------------------------------------------------------------------
 
   /** The loops started with the group; this only supplies the client used for metadata lookups and starts the
-    * offline store recheck, which first runs now
+    * offline store recheck, which first runs now, and the network snapshot reader
     */
   def startIoThread(client: AspenClient): Unit =
     metadataManager.setAspenClient(client)
@@ -496,6 +510,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           try storeAvailability.recheck(client)
           catch case NonFatal(e) => logger.warn(s"Offline store recheck failed: $e")
       recheckTask = Some(loops(0).scheduleAtFixedRate(recheck, 0, ms, TimeUnit.MILLISECONDS))
+      snapshotReader = Some(NetworkSnapshotReader.start(client, metadataManager, snapshotRetired))
 
   override def isStoreOffline(storeId: StoreId): Boolean = storeAvailability.isOffline(storeId)
 
@@ -577,6 +592,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         relayTask.foreach(_.cancel(false))
         recheckTask.foreach(_.cancel(false))
         peerQueryTask.cancel(false)
+      quietly("stop snapshot reader"):
+        snapshotReader.foreach(_.stop())
       quietly("linger"):
         val ms = linger.toMillis
         if ms > 0 then
@@ -663,6 +680,16 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Membership's send path, as scalecube would call it */
   private[quic] def sendClusterMessageForTests(m: ClusterTransportMessage): Unit = sendClusterMessage(m)
 
+  /** Starts a snapshot reader reading from `fetch`, as `startIoThread` starts the real one, with nothing scheduled:
+    * it reads once now if the network cache was empty. Stopped with the net.
+    */
+  private[quic] def startSnapshotReaderForTests(fetch: () => Future[Option[(HostSnapshot, StoreSnapshot)]]): Unit =
+    val reader = new NetworkSnapshotReader[QuicHostEntry](metadataManager, fetch,
+      BackgroundTaskManager.NoBackgroundTaskManager, snapshotRetired)(using ExecutionContext.global)
+    snapshotReader.foreach(_.stop())
+    snapshotReader = Some(reader)
+    reader.start()
+
   /** `WrongHost` replies sent so far */
   private[quic] def wrongHostRepliesSentForTests: Long = wrongHostRepliesSent.get()
 
@@ -679,6 +706,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     relayTask.foreach(_.cancel(false))
     recheckTask.foreach(_.cancel(false))
     peerQueryTask.cancel(false)
+    snapshotReader.foreach(_.stop())
     closeAll(CloseAwaitMillis)
     group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
@@ -691,6 +719,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     relayTask.foreach(_.cancel(false))
     recheckTask.foreach(_.cancel(false))
     peerQueryTask.cancel(false)
+    snapshotReader.foreach(_.stop())
     (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
     resolverPool.shutdownNow()
     group.shutdownGracefully(0, 1, TimeUnit.SECONDS)

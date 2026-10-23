@@ -1,10 +1,12 @@
 package org.aspen_ddp.aspen.common.network
 
 import org.aspen_ddp.aspen.TestNetwork
+import org.aspen_ddp.aspen.client.{DataObjectState, KeyValueObjectState}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.EvictingQueue
@@ -173,6 +175,13 @@ class LookupRecordingClient extends TestNetwork.TClient(
         bootstrapConfigThrownAttempts += bootstrapConfigAttempts
         throw err
       case None => bootstrapConfigPromise(bootstrapConfigAttempts).future
+
+  // A net started with this client starts a snapshot reader; its object reads fail at once rather than hanging
+  override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
+    Future.failed(new UnsupportedOperationException("LookupRecordingClient has no objects to read"))
+
+  override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
+    Future.failed(new UnsupportedOperationException("LookupRecordingClient has no objects to read"))
 
 
 /** A NetworkImplInterface that drains what MetadataManager hands it, the way ZMQNet does, and

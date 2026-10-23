@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.network.snapshot.NetworkSnapshotReader
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.{DaemonThreads, EvictingQueue}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
@@ -224,8 +225,13 @@ class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
   // processes keep themselves alive by blocking the main thread in joinIoThread().
   private val networkThread = DaemonThreads.thread("zmq-io") { ioThread() }
 
+  // Applies the daily network snapshots. Set by startIoThread.
+  @volatile private var snapshotReader: Option[NetworkSnapshotReader[ZMQHostEntry]] = None
+
   def startIoThread(client: AspenClient): Unit =
     metadataManager.setAspenClient(client)
+    // Retired entries need nothing: ZMQNet does not act on HostEndpointChanged either
+    snapshotReader = Some(NetworkSnapshotReader.start(client, metadataManager, _ => ()))
     networkThread.start()
 
   def joinIoThread(): Unit = networkThread.join()
@@ -305,6 +311,9 @@ class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
    */
   def shutdown(linger: Duration): Unit =
     shuttingDown = true
+    try snapshotReader.foreach(_.stop())
+    catch
+      case t: Throwable => logger.debug(s"Failed to stop the snapshot reader during shutdown: $t")
     val lingerMillis = linger.toMillis.toInt
     connectedDealers.forEach: dealer =>
       try

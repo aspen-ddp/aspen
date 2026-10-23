@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.common.network.implementations.quic
 
 import org.aspen_ddp.aspen.{TestNetwork, TestTLS}
+import org.aspen_ddp.aspen.client.{DataObjectState, KeyValueObjectState}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
@@ -8,7 +9,7 @@ import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, 
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -160,7 +161,8 @@ object QuicNetFixture:
       Option(states.get(hostId))
 
   /** An `AspenClient` serving only host lookups, from `directory`. Inherits the rest from `TestNetwork.TClient`; no
-    * read or transaction ever leaves it. A bootstrap refresh fails at once: the fixture has no radicle to read.
+    * read or transaction ever leaves it. A bootstrap refresh and every object read fail at once: there is nothing
+    * to read.
     */
   final class DirectoryClient(directory: HostDirectory) extends TestNetwork.TClient(
       ExecutionContext.global, ClientMessenger.None, Radicle.pointer, Replication(1, 1)):
@@ -177,6 +179,13 @@ object QuicNetFixture:
 
     override def getBootstrapConfig(): Future[String] =
       Future.failed(new UnsupportedOperationException("QuicNetFixture has no bootstrap config to refetch"))
+
+    // No object reads either, so the snapshot reader startIoThread starts fails at once rather than hanging
+    override def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState] =
+      Future.failed(new UnsupportedOperationException("QuicNetFixture has no objects to read"))
+
+    override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
+      Future.failed(new UnsupportedOperationException("QuicNetFixture has no objects to read"))
 
   final case class Delivery[M](message: M, threadName: String)
 

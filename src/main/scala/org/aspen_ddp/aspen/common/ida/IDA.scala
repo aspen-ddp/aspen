@@ -43,6 +43,13 @@ object IDA {
   }
 }
 
+/** IDAs whose slices can be extended in place by XOR-ing a per-store AppendDelta into them */
+sealed trait AppendableIDA:
+  this: IDA =>
+
+  /** One delta per encoding index, for appending `data` (non-empty) to an object of logical length `currentLength` */
+  def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta]
+
 sealed abstract class IDA extends Ordered[IDA] {
 
   /** Algorithm name like "replication" or "reed-solomon" */
@@ -116,7 +123,11 @@ sealed abstract class IDA extends Ordered[IDA] {
   def serializeIDAType(bb: ByteBuffer): Unit
 }
 
-case class Replication(width: Int, writeThreshold: Int) extends IDA {
+case class Replication(width: Int, writeThreshold: Int) extends IDA with AppendableIDA {
+
+  def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta] =
+    require(data.length > 0, "Append data must not be empty")
+    Array.fill(width)(AppendDelta(currentLength, currentLength + data.length, currentLength, data, None))
 
   def name: String = "replication"
   
@@ -410,7 +421,7 @@ case class AppendingReedSolomon(
     width: Int,
     restoreThreshold: Int,
     writeThreshold: Int,
-    cellSize: Int = AppendingReedSolomon.DefaultCellSize) extends IDA:
+    cellSize: Int = AppendingReedSolomon.DefaultCellSize) extends IDA with AppendableIDA:
 
   require(restoreThreshold >= 1,
     s"Appending Reed-Solomon restoreThreshold must be at least 1. Got $restoreThreshold")
@@ -469,7 +480,17 @@ case class AppendingReedSolomon(
   private def encodeToShards(src: Array[Byte], offset: Int, length: Int): Array[Array[Byte]] =
     val rows = rowsFor(length)
     val sliceLength = rows * cellSize
-    val shards = Array.ofDim[Byte](width, sliceLength)
+    val shards = scatter(src, offset, length, rows)
+
+    ByteBuffer.wrap(shards(k - 1)).putLong(sliceLength - AppendingReedSolomon.TrailerSize, length.toLong)
+
+    addParity(shards, sliceLength)
+
+  /** Allocates width shards of the given row count and scatters length stream bytes from src into
+    * the data shards. Stream bytes beyond length are left zero.
+    */
+  private def scatter(src: Array[Byte], offset: Int, length: Int, rows: Int): Array[Array[Byte]] =
+    val shards = Array.ofDim[Byte](width, rows * cellSize)
 
     var row = 0
     while row < rows do
@@ -482,12 +503,48 @@ case class AppendingReedSolomon(
         i += 1
       row += 1
 
-    ByteBuffer.wrap(shards(k - 1)).putLong(sliceLength - AppendingReedSolomon.TrailerSize, length.toLong)
+    shards
 
+  private def addParity(shards: Array[Array[Byte]], sliceLength: Int): Array[Array[Byte]] =
     if nparity > 0 then
       ReedSolomon.codecFor(k, nparity).encodeParity(shards, 0, sliceLength)
-
     shards
+
+  /** Builds the XOR delta stream covering the old final row through the new final row and encodes
+    * it with the same layout and code as the content. Because the code is linear, the encoded delta
+    * XORed into the current slices yields exactly the slices of the extended object.
+    */
+  def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta] =
+    require(data.length > 0, "Append data must not be empty")
+    require(currentLength >= 0, s"Invalid current length $currentLength")
+    require(currentLength.toLong + data.length <= Int.MaxValue - rowBytes, "Object length overflow")
+
+    val newLength = currentLength + data.length
+    val oldRows = rowsFor(currentLength)
+    val newRows = rowsFor(newLength)
+    val startRow = currentLength / rowBytes
+    val base = startRow * rowBytes
+    val deltaRows = newRows - startRow
+    val stream = new Array[Byte](deltaRows * rowBytes)
+
+    System.arraycopy(data, 0, stream, currentLength - base, data.length)
+    xorLong(stream, oldRows * rowBytes - AppendingReedSolomon.TrailerSize - base, currentLength.toLong)
+    xorLong(stream, newRows * rowBytes - AppendingReedSolomon.TrailerSize - base, newLength.toLong)
+
+    val shards = addParity(scatter(stream, 0, stream.length, deltaRows), deltaRows * cellSize)
+
+    val oldTrailer = ByteBuffer.allocate(AppendingReedSolomon.TrailerSize).putLong(currentLength.toLong).array()
+
+    Array.tabulate(width) { i =>
+      AppendDelta(oldRows * cellSize, newRows * cellSize, startRow * cellSize, shards(i),
+        if i == k - 1 then Some(oldTrailer) else None)
+    }
+
+  private def xorLong(arr: Array[Byte], at: Int, value: Long): Unit =
+    var i = 0
+    while i < AppendingReedSolomon.TrailerSize do
+      arr(at + i) = (arr(at + i) ^ (value >>> (8 * (AppendingReedSolomon.TrailerSize - 1 - i))).toByte).toByte
+      i += 1
 
   /** Recovers any missing data shards, validates the trailer, and gathers the content */
   private def restoreToArray(segments: List[(Byte, Array[Byte])]): Array[Byte] =

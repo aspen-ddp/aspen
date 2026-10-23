@@ -28,7 +28,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
-import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
+import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
 import org.aspen_ddp.aspen.server.transfer.StoreTransferManager
 import org.aspen_ddp.aspen.server.*
@@ -1236,7 +1236,7 @@ object Main {
 
     val tls = TlsCredentials.fromPem(bootstrapCfg.caCertificate, hostCfg.tlsCertificate, hostCfg.tlsPrivateKey)
 
-    val objectCacheFactory = () => new SimpleLRUObjectCache(100)
+    val objectCacheFactory = new HostObjectCache(hostCfg.objectCacheBytes).forStore
 
     val (networkBridge, nnet) = createNetwork(bootstrapCfg, onBootstrapConfigRefreshed,
                                               Some((hostCfg.hostId, hostCfg.dataPort)), None, tls,

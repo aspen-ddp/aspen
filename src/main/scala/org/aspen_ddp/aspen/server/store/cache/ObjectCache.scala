@@ -15,10 +15,12 @@ trait ObjectCache {
     */
   def get(objectId: ObjectId): Option[ObjectState]
 
-  /** Inserts an object into the cache and optionally removes one from
-    * the cache
+  /** Inserts an object into the cache, or re-measures one already present after its
+    * content changed, evicting other objects as needed to stay within capacity
+    *
+    * @return The evicted objects
     */
-  def insert(state: ObjectState): Option[ObjectState]
+  def insert(state: ObjectState): List[ObjectState]
 
   /** Removes an object from the cache
     *
@@ -37,7 +39,7 @@ object ObjectCache {
 
     override def get(objectId: ObjectId): Option[ObjectState] = None
 
-    override def insert(state: ObjectState): Option[ObjectState] = None
+    override def insert(state: ObjectState): List[ObjectState] = Nil
 
     override def remove(objectId: ObjectId): Unit = ()
   }

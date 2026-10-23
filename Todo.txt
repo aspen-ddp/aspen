@@ -1,9 +1,6 @@
 TODO
 ====
 
-Consider reimplementing aspen/server/store/cache/SimpleLRUObjectCache.scala
-  - Scaffiene might be better performing, no synchronization
-
 os.Path note:
   - can convert to java Path via os.Path.toNIO
   - then to File via java Path.toFile()

@@ -6,10 +6,10 @@ import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectType, ReadE
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
+import org.aspen_ddp.aspen.common.util.physicalMemory
 import org.rocksdb.{BlockBasedTableConfig, Cache, Env, LRUCache, Options, Priority, RocksDB, WriteBufferManager}
 import scribe.Logging
 
-import java.lang.management.ManagementFactory
 import java.nio.file.Path
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
@@ -71,11 +71,6 @@ object RocksDBBackend extends Logging {
         memory,
         writeBufferBytes.getOrElse((memory * DefaultWriteBufferFraction).toLong),
         maxBackgroundThreads.getOrElse(math.max(2, Runtime.getRuntime.availableProcessors)))
-    }
-
-    private def physicalMemory(): Long = ManagementFactory.getOperatingSystemMXBean match {
-      case os: com.sun.management.OperatingSystemMXBean => os.getTotalMemorySize
-      case _ => Runtime.getRuntime.maxMemory
     }
   }
 

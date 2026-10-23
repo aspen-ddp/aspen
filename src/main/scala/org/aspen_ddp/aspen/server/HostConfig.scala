@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
+import org.aspen_ddp.aspen.common.util.physicalMemory
 import org.aspen_ddp.aspen.server.HostConfig
 import org.aspen_ddp.aspen.server.store.backend.RocksDBBackend
 
@@ -20,6 +21,7 @@ crl:
   storage-engine: simple-crl
   num-streams: 3
   max-file-size-mb: 300
+object-cache-mb: 8192         # optional. Shared by all stores on the host. default: 25% of physical RAM
 rocksdb:                      # optional, as is each entry. Shared by all RocksDB stores on the host
   memory-mb: 4096             # default: 25% of physical RAM
   write-buffer-mb: 1024       # default: 25% of memory-mb
@@ -43,7 +45,14 @@ case class HostConfig(hostId: HostId,
                       crl: HostConfig.CRLBackend,
                       tlsCertificate: String,
                       tlsPrivateKey: String,
-                      rocksdb: HostConfig.RocksDBResources = HostConfig.RocksDBResources()):
+                      rocksdb: HostConfig.RocksDBResources = HostConfig.RocksDBResources(),
+                      objectCacheMb: Option[Int] = None):
+
+  /** Capacity of the object cache shared by all stores on the host */
+  def objectCacheBytes: Long = objectCacheMb match
+    case Some(mb) => mb.toLong * 1024 * 1024
+    case None => (physicalMemory() * HostConfig.DefaultObjectCacheFraction).toLong
+
   def yamlConfig: String =
     val base = s"""host-id: ${hostId.uuid}
        |aspen-system-id: $aspenSystemId
@@ -72,7 +81,9 @@ case class HostConfig(hostId: HostId,
       else
         "rocksdb:\n" + entries.mkString
 
-    base + crlCfg + rocksdbCfg +
+    val objectCacheCfg = objectCacheMb.map(v => s"object-cache-mb: $v\n").getOrElse("")
+
+    base + crlCfg + objectCacheCfg + rocksdbCfg +
       yamlBlockScalar("tls-certificate", tlsCertificate) +
       yamlBlockScalar("tls-private-key", tlsPrivateKey)
 
@@ -80,6 +91,9 @@ case class HostConfig(hostId: HostId,
 object HostConfig extends YObject[HostConfig]:
 
   val configFilename = "aspen-host-config.yaml"
+
+  /** Share of physical RAM given to the object cache when the host config does not specify it */
+  val DefaultObjectCacheFraction = 0.25
 
   sealed abstract class CRLBackend
 
@@ -127,6 +141,7 @@ object HostConfig extends YObject[HostConfig]:
   val tlsCertificate: Required[String] = Required("tls-certificate", YString)
   val tlsPrivateKey: Required[String]  = Required("tls-private-key", YString)
   val rocksdb: Optional[RocksDBResources] = Optional("rocksdb", RocksDBResources)
+  val objectCacheMb: Optional[Int]     = Optional("object-cache-mb", YInt)
 
   val attrs: List[Attr] = List(
     hostId,
@@ -139,7 +154,8 @@ object HostConfig extends YObject[HostConfig]:
     crl,
     tlsCertificate,
     tlsPrivateKey,
-    rocksdb
+    rocksdb,
+    objectCacheMb
   )
 
   def create(o: Object): HostConfig = HostConfig(
@@ -153,7 +169,8 @@ object HostConfig extends YObject[HostConfig]:
     crl.get(o),
     tlsCertificate.get(o),
     tlsPrivateKey.get(o),
-    rocksdb.get(o).getOrElse(RocksDBResources())
+    rocksdb.get(o).getOrElse(RocksDBResources()),
+    objectCacheMb.get(o)
   )
 
   def loadHostConfig(file: File): HostConfig =

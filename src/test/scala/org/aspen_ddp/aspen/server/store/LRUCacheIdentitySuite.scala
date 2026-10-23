@@ -5,7 +5,9 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
-import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -25,7 +27,7 @@ class LRUCacheIdentitySuite extends AnyFunSuite with Matchers {
 
   test("lookup never returns another object's state") {
     val maxEntries = 8
-    val c = new SimpleLRUObjectCache(maxEntries)
+    val c = new HostObjectCache(maxEntries * HostObjectCache.EntryOverhead).forStore(StoreId(PoolId(new UUID(0, 9)), 0))
     val objs = (1 to 40).map(mkobj)
 
     val rng = new scala.util.Random(12345)

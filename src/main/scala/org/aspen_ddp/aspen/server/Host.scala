@@ -121,7 +121,7 @@ class Host(val client: AspenClient,
                    val aspenSystemId: UUID,
                    val rootDir: Path,
                    val ec: ExecutionContext,
-                   val objectCacheFactory: () => ObjectCache,
+                   val objectCacheFactory: StoreId => ObjectCache,
                    val net: Messenger,
                    val backgroundTasks: BackgroundTaskManager,
                    crlFactory: CrashRecoveryLogFactory,
@@ -2046,7 +2046,7 @@ class Host(val client: AspenClient,
         handleRecoveryEvent()
 
       case LoadStore(storageDeviceId, backend, p) =>
-        val store = new Store(storageDeviceId, ec, backend, objectCacheFactory(), net, backgroundTasks, crl,
+        val store = new Store(storageDeviceId, ec, backend, objectCacheFactory(backend.storeId), net, backgroundTasks, crl,
           txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8)
         backend.setCompletionHandler(ioHandler)
         stores += (backend.storeId -> store)
@@ -2086,6 +2086,7 @@ class Host(val client: AspenClient,
           case Some(store) =>
             stores -= storeId
             offlineStores += storeId
+            store.objectCache.clear()
             storageDevices.get(store.storageDeviceId).foreach: sds =>
               sds.offlineStores += storeId
             crl.closeStore(storeId).foreach: trs =>

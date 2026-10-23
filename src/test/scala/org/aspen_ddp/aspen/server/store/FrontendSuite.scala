@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
-import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
+import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.TransactionStatusCache
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -82,9 +82,9 @@ object FrontendSuite {
     override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = txDel = true
   }
 
-  def mkFrontend(): (Frontend, MapBackend, SimpleLRUObjectCache) =
+  def mkFrontend(): (Frontend, MapBackend, ObjectCache) =
     val backend = new MapBackend(storeId)
-    val cache = new SimpleLRUObjectCache(10)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
     val frontend = new Frontend(storeId, backend, cache, new TestNet, new TestCrl,
       new TransactionStatusCache())
     (frontend, backend, cache)

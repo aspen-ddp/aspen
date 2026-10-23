@@ -129,3 +129,17 @@ tls-private-key: |
     rc.memoryBytes should be(4096L * 1024 * 1024)
     rc.writeBufferBytes should be(1024L * 1024 * 1024)
     rc.maxBackgroundThreads should be(8)
+
+  test("object cache size round-trips and converts megabytes to bytes"):
+    val cfg = sample.copy(objectCacheMb = Some(2048))
+    cfg.objectCacheBytes should be(2048L * 1024 * 1024)
+    val f = Files.createTempFile("aspen-host-config-objcache", ".yaml")
+    try
+      Files.write(f, cfg.yamlConfig.getBytes(StandardCharsets.UTF_8))
+      HostConfig.loadHostConfig(f.toFile) should be(cfg)
+    finally
+      Files.deleteIfExists(f)
+
+  test("object cache defaults to a quarter of physical RAM and is omitted from the yaml"):
+    sample.yamlConfig should not include "object-cache-mb"
+    sample.objectCacheBytes should be((org.aspen_ddp.aspen.common.util.physicalMemory() * 0.25).toLong)

@@ -24,7 +24,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
-import org.aspen_ddp.aspen.server.store.cache.SimpleLRUObjectCache
+import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache as StoreObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.common.ida.IDA
 
@@ -94,7 +94,8 @@ class TestNetwork(executionContext: ExecutionContext,
                   val ida: IDA = Replication(3, 2)) extends ServerMessenger {
   import TestNetwork._
 
-  val objectCacheFactory: () => SimpleLRUObjectCache = () => new SimpleLRUObjectCache(1000)
+  /** A new cache on each call. A HostObjectCache must not be shared between Hosts */
+  def objectCacheFactory: StoreId => StoreObjectCache = new HostObjectCache(64 * 1024 * 1024).forStore
 
   /** One store per IDA element. Bootstrap.initialize requires width == stores.length, which
    *  deriving the list from the width satisfies by construction. */
@@ -328,7 +329,7 @@ class TestNetwork(executionContext: ExecutionContext,
    *  than `width` slices, not to model a genuinely dead store.
    *
    *  Dropping responses rather than deleting objects out of the MapBackends is what makes this
-   *  work at all: Frontend.readObjectForNetwork consults the store's SimpleLRUObjectCache before
+   *  work at all: Frontend.readObjectForNetwork consults the host's object cache before
    *  the backend, so a deleted object would keep being served from cache.
    */
   @volatile var readSilencedStores: Set[StoreId] = Set()

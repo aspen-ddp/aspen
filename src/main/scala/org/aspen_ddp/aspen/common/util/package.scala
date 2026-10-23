@@ -328,4 +328,9 @@ package object util {
 
     tracker.call
 
+  /** Total physical RAM of the machine, or the JVM's maximum heap if the platform does not report it */
+  def physicalMemory(): Long = java.lang.management.ManagementFactory.getOperatingSystemMXBean match {
+    case os: com.sun.management.OperatingSystemMXBean => os.getTotalMemorySize
+    case _ => Runtime.getRuntime.maxMemory
+  }
 }

@@ -409,6 +409,15 @@ message ClusterTransportMessage {
   bytes payload = 4;
 }
 
+message GossipSubscribe {
+  UUID fromClient = 1;
+}
+
+message HostOnlineStatus {
+  repeated UUID online = 1;
+  repeated UUID offline = 2;
+}
+
 message CheckStorageDevice {
   UUID toHost = 1;
   UUID fromClient = 2;
@@ -463,6 +472,8 @@ message Message {
     StoreMoved store_moved = 27;
     HostEndpointChanged host_endpoint_changed = 28;
     ClusterTransportMessage cluster_transport = 29;
+    GossipSubscribe gossip_subscribe = 30;
+    HostOnlineStatus host_online_status = 31;
   }
 }
 

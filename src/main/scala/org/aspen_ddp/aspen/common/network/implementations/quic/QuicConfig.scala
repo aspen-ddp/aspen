@@ -11,7 +11,7 @@ import scala.concurrent.duration.{Duration, SECONDS}
   * @param connectionBudgetBytes bound for the handoff queue and the pre-handshake queue. The per-stream high-water
   *                              mark is `connectionBudgetBytes / streamsPerConnection`
   * @param idleTimeout           QUIC max idle timeout. None means `heartbeatPeriod * 3`, resolved by the plugin
-  * @param gossip                scalecube timings for host membership (host mode only)
+  * @param gossip                scalecube timings for host membership, and gossip relaying to clients
   */
 final case class QuicConfig(
   eventLoopThreads: Int = math.min(Runtime.getRuntime.availableProcessors, 4),

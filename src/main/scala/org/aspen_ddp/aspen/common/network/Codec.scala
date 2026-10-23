@@ -969,6 +969,23 @@ object Codec extends Logging:
     )
 
 
+  def encode(o: GossipSubscribe): codec.GossipSubscribe =
+    codec.GossipSubscribe(fromClient = Some(encodeUUID(o.fromClient.uuid)))
+
+  def decode(m: codec.GossipSubscribe): GossipSubscribe =
+    GossipSubscribe(ClientId(decodeUUID(m.fromClient.get)))
+
+
+  def encode(o: HostOnlineStatus): codec.HostOnlineStatus =
+    codec.HostOnlineStatus(
+      online = o.online.map(h => encodeUUID(h.uuid)),
+      offline = o.offline.map(h => encodeUUID(h.uuid))
+    )
+
+  def decode(m: codec.HostOnlineStatus): HostOnlineStatus =
+    HostOnlineStatus(m.online.map(u => HostId(decodeUUID(u))).toList, m.offline.map(u => HostId(decodeUUID(u))).toList)
+
+
   /** Encodes a gossip message as a codec.Message. Used as the scalecube gossip payload. */
   def encodeGossip(g: Gossip): Array[Byte] =
     val msg = g match

@@ -25,8 +25,10 @@ object QuicMessageCodec:
   val DatagramThreshold: Int = 1024
   val FrameLengthSize: Int = 8
 
-  /** Owns `prefix` (pooled) until converted or released. `sections` are the sender's DataBuffers, never copied. */
-  final class Encoded(val prefix: ByteBuf, val sections: Array[DataBuffer]):
+  /** Owns `prefix` (pooled) until converted or released. `sections` are the sender's DataBuffers, never copied.
+    * `streamOnly` sends it on a stream whatever its size, for a small message that must not be silently lost.
+    */
+  final class Encoded(val prefix: ByteBuf, val sections: Array[DataBuffer], val streamOnly: Boolean = false):
     private var consumed = false
 
     /** 4 + prefix.readableBytes + sum of section sizes */
@@ -38,7 +40,7 @@ object QuicMessageCodec:
         i += 1
       total
 
-    def isDatagram: Boolean = size <= DatagramThreshold
+    def isDatagram: Boolean = !streamOnly && size <= DatagramThreshold
 
     /** One pooled buffer holding prefixLen, prefix and the sections (copied). Consumes this. */
     def toDatagram(alloc: ByteBufAllocator): ByteBuf =
@@ -119,6 +121,8 @@ object QuicMessageCodec:
     case m: StoreMoved => codec.Message.Msg.StoreMoved(Codec.encode(m))
     case m: HostEndpointChanged => codec.Message.Msg.HostEndpointChanged(Codec.encode(m))
     case m: ClusterTransportMessage => codec.Message.Msg.ClusterTransport(Codec.encode(m))
+    case m: GossipSubscribe => codec.Message.Msg.GossipSubscribe(Codec.encode(m))
+    case m: HostOnlineStatus => codec.Message.Msg.HostOnlineStatus(Codec.encode(m))
 
   private val NoSections: Array[DataBuffer] = Array.empty[DataBuffer]
 
@@ -148,7 +152,8 @@ object QuicMessageCodec:
 
     case m => (m, ByteBuffer.allocate(0), NoSections)
 
-  def encode(msg: Message, alloc: ByteBufAllocator): Encoded =
+  /** `streamOnly`: see `Encoded` */
+  def encode(msg: Message, alloc: ByteBufAllocator, streamOnly: Boolean = false): Encoded =
     val (headerMsg, aux, sections) = split(msg)
     val header = codec.Message(msg = toMsg(headerMsg))
     val headerLen = header.serializedSize
@@ -163,7 +168,7 @@ object QuicMessageCodec:
       prefix.writeBytes(aux.duplicate())
       prefix.writeInt(sections.length)
       sections.foreach(s => prefix.writeInt(s.size))
-      new Encoded(prefix, sections)
+      new Encoded(prefix, sections, streamOnly)
     catch
       case t: Throwable =>
         prefix.release()
@@ -271,6 +276,8 @@ object QuicMessageCodec:
           case codec.Message.Msg.StoreMoved(r) => Right(Codec.decode(r))
           case codec.Message.Msg.HostEndpointChanged(r) => Right(Codec.decode(r))
           case codec.Message.Msg.ClusterTransport(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.GossipSubscribe(r) => Right(Codec.decode(r))
+          case codec.Message.Msg.HostOnlineStatus(r) => Right(Codec.decode(r))
           case codec.Message.Msg.UnknownStore(r) => Right(Codec.decode(r))
           case codec.Message.Msg.StatusRequest(r) => Right(Codec.decode(r))
           case codec.Message.Msg.StatusResponse(r) => Right(Codec.decode(r))

@@ -29,6 +29,7 @@ import java.util.concurrent.{ConcurrentHashMap, ExecutorService, Executors, Reje
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
+import scala.util.Random
 import scala.util.control.NonFatal
 
 object QuicNet:
@@ -38,6 +39,9 @@ object QuicNet:
   private val CloseAwaitMillis: Long = 5000
 
   private val FlushPollMillis: Long = 25
+
+  /** A client's gossip subscription on a relay host: the connection it arrived on and when its lease runs out */
+  private final case class Subscription(conn: QuicConnection, expiresNanos: Long)
 
   /** The address of an IP literal, built without any lookup; None for a host name */
   private[quic] def ipLiteral(address: String): Option[InetAddress] =
@@ -70,8 +74,12 @@ object QuicNet:
 
     def dropCacheForStore(storeId: StoreId): Unit = net.metadataManager.dropStoreMapping(storeId)
 
-    /** Through membership only. A host whose endpoint changed can gossip too: see `sendClusterMessage`. */
-    override def broadcastGossip(g: Gossip): Unit = net.membership.foreach(_.broadcast(g))
+    /** Through membership to the other hosts, and directly to this host's own subscribers: scalecube does not hand a
+      * member its own gossip. A host whose endpoint changed can gossip too: see `sendClusterMessage`.
+      */
+    override def broadcastGossip(g: Gossip): Unit =
+      net.membership.foreach(_.broadcast(g))
+      net.forwardToSubscribers(g)
 
 
 /** A `NetworkPlugin` over Netty QUIC with mutual TLS.
@@ -88,6 +96,14 @@ object QuicNet:
   *  - Shared state touched from both sides is lock-free: `clientRouteMap` and `liveConnections` are concurrent
   *    maps, `QuicHostEntry.connection` is an `AtomicReference`.
   *  - Host membership (host mode only) runs its listeners on its own "aspen-gossip" thread, never on a loop.
+  *
+  * Gossip reaches clients through relays. Clients are not membership members: each client keeps
+  * `config.gossip.relayCount` relay hosts, picked at random from the hosts it has resolved, and sends each a
+  * `GossipSubscribe` every `relayRenewal` (see `renewRelays`). A relay forwards every gossip message and every host
+  * online/offline change to its subscribers, over streams so nothing is silently lost, until a subscription's
+  * `relayLease` runs out or its connection closes (see `forwardToSubscribers`). Each renewal swaps one relay for
+  * another, so clients do not stay on the bootstrap hosts they start with, and a relay reported offline is replaced
+  * at once. A client therefore gets `relayCount` copies of each message, however many hosts it talks to.
   *
   * Construction order matters: `MetadataManager`'s constructor calls `createHostEntry` for each bootstrap host, so
   * everything the send path uses (loops, channels, maps) is initialized above `metadataManager`. `membership` is
@@ -136,6 +152,15 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     * See `sendClusterMessage`.
     */
   private val clusterRouteMap = new ConcurrentHashMap[HostId, QuicConnection]()
+
+  /** Host mode: the clients subscribed to this host's gossip. Written on loops, read by forwarding threads. */
+  private val subscribers = new ConcurrentHashMap[ClientId, Subscription]()
+
+  /** Client mode: the hosts our relays last reported online. Written on loops, read by `createHostEntry`. */
+  private val relayedOnline = ConcurrentHashMap.newKeySet[HostId]()
+
+  /** Client mode: our current gossip relay hosts. Only touched on `loops(0)`. See `renewRelays`. */
+  private var relays: Set[HostId] = Set()
 
   private val nextDialIndex = new AtomicInteger(0)
 
@@ -315,7 +340,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
                         queuedMessages: EvictingQueue[Message]): QuicHostEntry =
       val entry = new QuicHostEntry(hostId, name, address, dataPort, httpPort, storeTransferPort)
       // A host whose online event arrived before its entry existed (or that was dropped and re-read)
-      if membership.exists(_.isOnline(hostId)) then
+      if reportedOnline(hostId) then
         entry.setOnline()
       sendQueued(entry, queuedMessages)
       entry
@@ -329,17 +354,35 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   val clientMessenger: ClientMessenger = new CliMessenger(this)
   val serverMessenger: ServerMessenger = new SrvMessenger(this)
 
-  /** Applies membership events and gossip. Runs on the membership's "aspen-gossip" thread. */
+  /** Applies membership events and gossip, and forwards them to our subscribers. Runs on the membership's
+    * "aspen-gossip" thread.
+    */
   private val membershipListener = new MembershipListener:
     // Peek, never look up: an entry created later seeds its online state from membership (see createHostEntry)
-    override def online(hostId: HostId): Unit = metadataManager.peekHostEntry(hostId).foreach(_.setOnline())
+    override def online(hostId: HostId): Unit =
+      metadataManager.peekHostEntry(hostId).foreach(_.setOnline())
+      forwardToSubscribers(HostOnlineStatus(List(hostId), Nil))
 
-    override def offline(hostId: HostId): Unit = metadataManager.peekHostEntry(hostId).foreach(_.setOffline())
+    override def offline(hostId: HostId): Unit =
+      metadataManager.peekHostEntry(hostId).foreach(_.setOffline())
+      forwardToSubscribers(HostOnlineStatus(Nil, List(hostId)))
 
     // Gossip that arrived through membership is never re-broadcast
-    override def gossipReceived(g: Gossip): Unit = g match
-      case m: StoreMoved => metadataManager.storeMoved(m.storeId, m.hostId, m.timestamp)
-      case m: HostEndpointChanged => endpointChanged(m)
+    override def gossipReceived(g: Gossip): Unit =
+      applyGossip(g)
+      forwardToSubscribers(g)
+
+  /** Whether membership (host mode) or our relays (client mode) last reported `hostId` online */
+  private def reportedOnline(hostId: HostId): Boolean = membership match
+    case Some(m) => m.isOnline(hostId)
+    case None => relayedOnline.contains(hostId)
+
+  /** Gossip from membership (host mode) or a relay (client mode). Idempotent: every message carries the timestamp
+    * of the state it announces, and a message no newer than what we hold is ignored.
+    */
+  private def applyGossip(g: Gossip): Unit = g match
+    case m: StoreMoved => metadataManager.storeMoved(m.storeId, m.hostId, m.timestamp)
+    case m: HostEndpointChanged => endpointChanged(m)
 
   /** Replaces `m.hostId`'s entry with one for the new endpoint, unless ours is at least as new, and closes our
     * outbound connection to the old one so the next send dials the new endpoint. Our own entry is left alone.
@@ -354,6 +397,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     membership.foreach: m =>
       m.addListener(membershipListener)
       m.start()
+
+  /** Client mode: renews our relay subscriptions every `relayRenewal`, starting now */
+  private val relayTask: Option[NFuture[?]] = initOrAbort:
+    if membership.isDefined then
+      None
+    else
+      val ms = math.max(1L, config.gossip.relayRenewal.toMillis)
+      Some(loops(0).scheduleAtFixedRate((() => renewRelays(rotate = true)): Runnable, 0, ms, TimeUnit.MILLISECONDS))
 
   // ---- NetworkPlugin -------------------------------------------------------------------------------------------
 
@@ -415,7 +466,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Stops the network. Idempotent: calls after the first do nothing.
     *
     *  0. Host membership stops without leaving the cluster (crash-only: peers detect the failure). Never blocks.
-    *  1. Every send from now on is silently dropped.
+    *  1. Every send from now on is silently dropped, and relay renewal (client mode) stops.
     *  2. Sleeps the full `linger` on the caller's thread, so quiche can transmit what flush handed it.
     *     `QuicConnectionStats` exposes no "unsent bytes" signal, so it cannot end early.
     *  3. On each connection's own loop, closes it with a QUIC application close (code 0, empty reason).
@@ -430,6 +481,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       quietly("stop membership"):
         membership.foreach(_.shutdown())
       shuttingDown = true
+      quietly("stop relay renewal"):
+        relayTask.foreach(_.cancel(false))
       quietly("linger"):
         val ms = linger.toMillis
         if ms > 0 then
@@ -491,6 +544,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Datagrams that failed to decode */
   private[quic] def undecodableDatagrams: Long = undecodableCount.get()
 
+  /** Client mode: our current relay hosts. Blocks until `loops(0)` answers. */
+  private[quic] def relaysForTests: Set[HostId] = loops(0).submit(() => relays).get()
+
+  /** Host mode: the clients holding a subscription, lapsed or not */
+  private[quic] def subscribersForTests: Set[ClientId] = subscribers.keySet().asScala.toSet
+
   /** The last boot id recorded for `hostId` */
   private[quic] def lastBootIdOf(hostId: HostId): Option[UUID] = Option(bootIds.get(hostId))
 
@@ -503,6 +562,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     */
   private[quic] def closeForTests(): Unit =
     membership.foreach(_.shutdown())
+    relayTask.foreach(_.cancel(false))
     closeAll(CloseAwaitMillis)
     group.terminationFuture().awaitUninterruptibly(CloseAwaitMillis * 2)
 
@@ -512,6 +572,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     */
   private[quic] def crashForTests(): Unit =
     membership.foreach(_.shutdown())
+    relayTask.foreach(_.cancel(false))
     (serverChannels ++ clientChannels).foreach(_.close().awaitUninterruptibly(CloseAwaitMillis))
     resolverPool.shutdownNow()
     group.shutdownGracefully(0, 1, TimeUnit.SECONDS)
@@ -707,6 +768,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     clusterRouteMap.forEach: (id, c) =>
       if c eq conn then
         clusterRouteMap.remove(id, c)
+    subscribers.forEach: (id, s) =>
+      if s.conn eq conn then
+        subscribers.remove(id, s)
 
   /** Closes `entry`'s outbound connection, if open (and, with `establishedOnly`, past its handshake), on its own
     * loop, so the next send re-dials
@@ -748,6 +812,70 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           closeOutbound(entry, establishedOnly = true)
       hm.receive(m)
 
+  // ---- Gossip relaying -----------------------------------------------------------------------------------------
+
+  /** Host mode, any thread. Sends `msg` to every subscriber whose lease is current, forgetting the lapsed ones. */
+  private def forwardToSubscribers(msg: Message): Unit =
+    if !shuttingDown then
+      val now = System.nanoTime()
+      subscribers.forEach: (id, s) =>
+        if s.conn.isClosed || now - s.expiresNanos >= 0 then
+          subscribers.remove(id, s)
+        else
+          forward(s.conn, msg)
+
+  /** On a stream, whatever its size: a lost datagram would leave the client unaware until the next retransmit */
+  private def forward(conn: QuicConnection, msg: Message): Unit =
+    try conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT, streamOnly = true))
+    catch case NonFatal(e) => logger.warn(s"QUIC forward of ${msg.getClass.getSimpleName} to a client failed: $e")
+
+  /** Host mode, on `conn`'s loop. Starts or renews `m.fromClient`'s lease. A subscription that is new, or renewed
+    * over a different connection or after lapsing, starts with a snapshot of the hosts we see online, ourselves
+    * included.
+    */
+  private def subscribe(conn: QuicConnection, m: GossipSubscribe): Unit =
+    for hm <- membership; (hostId, _) <- ohost do
+      if conn != null && !conn.isClosed then
+        val now = System.nanoTime()
+        val previous = subscribers.put(m.fromClient, Subscription(conn, now + config.gossip.relayLease.toNanos))
+        if previous == null || (previous.conn ne conn) || now - previous.expiresNanos >= 0 then
+          forward(conn, HostOnlineStatus(hostId :: hm.onlineHosts.toList, Nil))
+
+  /** Client mode, on `loops(0)`. Keeps `relayCount` relays among the hosts we have resolved and renews each one's
+    * subscription. With `rotate`, one relay is first swapped for a host not currently a relay, when there is one.
+    * New relays are subscribed before a dropped one's lease lapses, so coverage never gaps. Relays are picked at
+    * random, hosts reported online first.
+    */
+  private def renewRelays(rotate: Boolean): Unit =
+    if !shuttingDown then
+      try
+        val known = metadataManager.resolvedHostEntries
+        val count = config.gossip.relayCount
+        var kept = relays.intersect(known.map(_.hostId).toSet)
+        val candidates = Random.shuffle(known.filterNot(e => relays.contains(e.hostId))).sortBy(e => !e.isOnline)
+        if rotate && kept.nonEmpty && kept.size >= count && candidates.nonEmpty then
+          kept -= Random.shuffle(kept.toList).head
+        relays = kept ++ candidates.take(count - kept.size).map(_.hostId)
+        relays.foreach(sendToHostId(_, GossipSubscribe(clientId)))
+      catch
+        case NonFatal(e) => logger.warn(s"Gossip relay renewal failed: $e")
+
+  /** Client mode, on a loop. Applies a relay's liveness report; a relay reported offline is replaced at once. */
+  private def hostOnlineStatus(m: HostOnlineStatus): Unit =
+    m.online.foreach: h =>
+      relayedOnline.add(h)
+      metadataManager.peekHostEntry(h).foreach(_.setOnline())
+    m.offline.foreach: h =>
+      relayedOnline.remove(h)
+      metadataManager.peekHostEntry(h).foreach(_.setOffline())
+    if m.offline.nonEmpty then
+      try
+        loops(0).execute: () =>
+          if m.offline.exists(relays.contains) then
+            relays --= m.offline
+            renewRelays(rotate = false)
+      catch case _: RejectedExecutionException => () // shutting down
+
   private def recordRoute(id: ClientId, conn: QuicConnection): Unit =
     if conn != null && !conn.isClosed && (clientRouteMap.get(id) ne conn) then
       clientRouteMap.put(id, conn)
@@ -772,7 +900,19 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         case m: ClusterTransportMessage =>
           clusterMessage(conn, m)
 
-        case _: HostResponse | _: HostHeartbeat | _: Gossip =>
-          // Not handled: liveness comes from host membership, and gossip only travels inside scalecube payloads
+        case m: GossipSubscribe =>
+          subscribe(conn, m)
+
+        case g: Gossip =>
+          // Forwarded by a relay. A host takes gossip only from membership, which also carries it between hosts.
+          if membership.isEmpty then
+            applyGossip(g)
+
+        case m: HostOnlineStatus =>
+          if membership.isEmpty then
+            hostOnlineStatus(m)
+
+        case _: HostResponse | _: HostHeartbeat =>
+          // Not handled: liveness comes from host membership
     catch
       case NonFatal(e) => logger.error(s"Error dispatching ${msg.getClass.getSimpleName}: $e", e)

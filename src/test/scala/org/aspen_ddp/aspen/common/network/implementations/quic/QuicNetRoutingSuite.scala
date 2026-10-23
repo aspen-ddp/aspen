@@ -81,7 +81,8 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.b.handler.clientRequests.isEmpty shouldBe true
 
   test("host response reaches the requesting client over the client's connection"):
-    val c = fx.client()
+    // No gossip relays, which would dial A as well
+    val c = fx.client(fx.config.copy(gossip = fx.config.gossip.copy(relayCount = 0)))
     c.net.ohost shouldBe None
     val req = read(fx.storesB.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)

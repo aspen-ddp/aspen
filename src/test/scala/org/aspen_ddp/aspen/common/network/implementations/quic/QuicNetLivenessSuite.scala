@@ -101,6 +101,10 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     fx.a.net.clientMessenger.sendHostMessage(m)
     await(node.handler.hostMessages, 1, WaitMillis).map(_.message) shouldBe List(m)
 
+  /** A client without gossip relays, so its only connection and traffic are the test's own */
+  private def quietClient(): Node =
+    fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 0)))
+
   private def awaitOnline(): Unit =
     eventually("each host sees the other online", WaitMillis):
       entryFor(fx.a.net, fx.hostIdB).isOnline && entryFor(fx.b.net, fx.hostIdA).isOnline
@@ -119,7 +123,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
       !entryFor(fx.a.net, fx.hostIdB).isOnline
 
   test("quiet client connection survives beyond the idle timeout"):
-    val c = fx.client()
+    val c = quietClient()
     val req = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)
     await(fx.a.handler.clientRequests, 1)
@@ -281,8 +285,55 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     noException should be thrownBy c.net.dispatchForTests(m)
     c.net.lastBootIdOf(fx.hostIdA) shouldBe None
 
-  test("keepalive datagrams are not dispatched"):
+  test("a client subscribes to relays and receives forwarded gossip"):
+    awaitOnline()
     val c = fx.client()
+    // Only two hosts are known, fewer than relayCount
+    eventually("the client relays through A and B", WaitMillis)(c.net.relaysForTests == Set(fx.hostIdA, fx.hostIdB))
+    eventually("A and B hold the client's subscription", WaitMillis):
+      fx.a.net.subscribersForTests.contains(c.net.clientId) && fx.b.net.subscribersForTests.contains(c.net.clientId)
+    val old = entryFor(c.net, fx.hostIdB)
+    // Originated by A: reaches A's subscribers directly, B's through membership
+    fx.a.net.serverMessenger.broadcastGossip(endpointChanged(fx.hostIdB, old.dataPort))
+    eventually("the client replaces its entry for B", WaitMillis)(replaced(c.net, fx.hostIdB, old))
+    fx.directory.lookups.asScala.toList should not contain fx.hostIdB
+
+  test("a client learns host liveness from its relays and replaces a relay that goes offline"):
+    awaitOnline()
+    val c = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 1)))
+    eventually("the client sees A and B online", WaitMillis):
+      entryFor(c.net, fx.hostIdA).isOnline && entryFor(c.net, fx.hostIdB).isOnline
+    // Wait until B is the sole relay, then crash it: A reports it offline and becomes the relay
+    eventually("B is the client's relay", WaitMillis)(c.net.relaysForTests == Set(fx.hostIdB))
+    fx.crashB()
+    eventually("the client sees B offline", WaitMillis)(!entryFor(c.net, fx.hostIdB).isOnline)
+    eventually("A replaces B as the relay", WaitMillis)(c.net.relaysForTests == Set(fx.hostIdA))
+
+  test("relays rotate between renewals"):
+    val c = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 1)))
+    val seen = scala.collection.mutable.Set[Set[HostId]]()
+    eventually("the client relays through each host in turn", WaitMillis):
+      seen += c.net.relaysForTests
+      seen.contains(Set(fx.hostIdA)) && seen.contains(Set(fx.hostIdB))
+    seen.foreach(_.size shouldBe 1)
+
+  test("a host forgets a crashed client's subscription"):
+    awaitOnline()
+    val c = fx.client()
+    eventually("A holds the client's subscription", WaitMillis)(fx.a.net.subscribersForTests.contains(c.net.clientId))
+    c.net.crashForTests()
+    eventually("A forgets the subscription", WaitMillis)(!fx.a.net.subscribersForTests.contains(c.net.clientId))
+
+  test("hosts ignore forwarded gossip and liveness reports"):
+    awaitOnline()
+    val old = entryFor(fx.b.net, fx.hostIdA)
+    fx.b.net.dispatchForTests(HostOnlineStatus(Nil, List(fx.hostIdA)))
+    entryFor(fx.b.net, fx.hostIdA).isOnline shouldBe true
+    fx.b.net.dispatchForTests(StoreMoved(fx.storesA.head, fx.hostIdB, HLCTimestamp.now))
+    fx.b.net.metadataManager.peekHostEntry(fx.hostIdA).exists(_ eq old) shouldBe true
+
+  test("keepalive datagrams are not dispatched"):
+    val c = quietClient()
     val req = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)
     await(fx.a.handler.clientRequests, 1)

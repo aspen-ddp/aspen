@@ -190,6 +190,24 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val m = HostEndpointChanged(HostId(UUID.randomUUID()), "10.1.2.3", 4000, 4001, 4002, HLCTimestamp(12345))
     roundTrip(m) shouldBe m
 
+  test("GossipSubscribe round trips through the QUIC codec"):
+    val m = GossipSubscribe(ClientId(UUID.randomUUID()))
+    roundTrip(m) shouldBe m
+
+  test("HostOnlineStatus round trips through the QUIC codec"):
+    val m = HostOnlineStatus(List(HostId(UUID.randomUUID()), HostId(UUID.randomUUID())), List(HostId(UUID.randomUUID())))
+    roundTrip(m) shouldBe m
+    roundTrip(HostOnlineStatus(Nil, Nil)) shouldBe HostOnlineStatus(Nil, Nil)
+
+  test("a stream-only message is never a datagram"):
+    val m = GossipSubscribe(ClientId(UUID.randomUUID()))
+    val dg = QuicMessageCodec.encode(m, alloc)
+    dg.isDatagram shouldBe true
+    dg.release()
+    val stream = QuicMessageCodec.encode(m, alloc, streamOnly = true)
+    stream.isDatagram shouldBe false
+    stream.release()
+
   test("empty payloads round-trip"):
     val msgs: List[Message] = List(
       prepare(List(ObjectUpdate(ObjectId(uuid(1)), DataBuffer.Empty)), Nil),

@@ -346,7 +346,7 @@ class ZMQNet(initialBootstrapConfig: BootstrapConfig.Config,
           case _: HostResponse =>
             // Not currently handled
 
-          case _: Gossip | _: ClusterTransportMessage =>
+          case _: Gossip | _: ClusterTransportMessage | _: GossipSubscribe | _: HostOnlineStatus =>
             // Membership gossip only travels over QUIC; ignored here
 
   private def heartbeat(hostsArray: Array[ZMQHostEntry]): Unit =

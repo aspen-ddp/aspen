@@ -137,6 +137,8 @@ object ProtobufMessageCodec extends Logging:
     case m: HostMessage => encodeHostMessage(m)
     case m: Gossip => Codec.encodeGossip(m)
     case m: ClusterTransportMessage => codec.Message(msg = codec.Message.Msg.ClusterTransport(Codec.encode(m))).toByteArray
+    case m: GossipSubscribe => codec.Message(msg = codec.Message.Msg.GossipSubscribe(Codec.encode(m))).toByteArray
+    case m: HostOnlineStatus => codec.Message(msg = codec.Message.Msg.HostOnlineStatus(Codec.encode(m))).toByteArray
 
   // ============================================================================
   // Decoding Methods
@@ -288,6 +290,12 @@ object ProtobufMessageCodec extends Logging:
           Some(Codec.decode(r))
 
         case codec.Message.Msg.ClusterTransport(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.GossipSubscribe(r) =>
+          Some(Codec.decode(r))
+
+        case codec.Message.Msg.HostOnlineStatus(r) =>
           Some(Codec.decode(r))
 
         case codec.Message.Msg.Empty =>

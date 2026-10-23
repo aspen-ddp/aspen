@@ -13,7 +13,10 @@ sealed abstract class Message
 
 case class HostHeartbeat(hostId: HostId) extends Message
 
-/** Membership gossip. Carried as the scalecube gossip payload, never sent as a direct message */
+/** Membership gossip. Carried as the scalecube gossip payload between hosts. Hosts forward it to the clients
+  * subscribed to them (see `GossipSubscribe`) as a direct message. A client may receive the same message from each
+  * of its relay hosts, so applying one must be idempotent.
+  */
 sealed abstract class Gossip extends Message
 
 /** `storeId` is now hosted by `hostId`. `timestamp` is that of the StoragePoolState config value naming the new host,
@@ -30,6 +33,17 @@ final case class HostEndpointChanged(hostId: HostId,
                                      httpPort: Int,
                                      storeTransferPort: Int,
                                      timestamp: HLCTimestamp) extends Gossip
+
+/** Sent by a client to each of its gossip relay hosts, starting or renewing a lease under which that host forwards
+  * it every gossip message and host online/offline change it sees. Handled by QuicNet itself.
+  */
+final case class GossipSubscribe(fromClient: ClientId) extends Message
+
+/** Host liveness forwarded by a relay host to its gossip subscribers: hosts that came online and hosts that went
+  * offline. The snapshot sent when a subscription starts lists every host the relay sees online, and none offline.
+  * Handled by QuicNet itself.
+  */
+final case class HostOnlineStatus(online: List[HostId], offline: List[HostId]) extends Message
 
 /** Carries an opaque scalecube transport payload between hosts. Handled by QuicNet itself; it is not a
   * HostMessage and never reaches the MessageHandler.

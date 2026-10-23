@@ -1,20 +1,6 @@
 TODO
 ====
 
-Implement DataUpdateOperation.Append correctly for slicing IDAs
-  - Currently rejected at every layer: TransactionBuilder.append throws AppendNotYetSupported,
-    RequirementsChecker fails the requirement with UnsupportedOperation, RequirementsApplyer throws
-  - The old store-local append was silently incorrect under ReedSolomon: each store appended raw
-    update bytes to its own encoded fragment, producing data that does not reconstruct
-  - A correct implementation must encode the appended data through the pool's IDA and hand each
-    store its own fragment
-    - Note that the encoding strategy will usually (maybe always) require that the backends overwrite
-      part of the tail of the data they currently hold. It will not be a simple operation of appending
-      the new data to the old data when an erasure-coded IDA is used.
-  - Consider implementing this abstractly in its own class/object to get the logic right without the
-    added complexity of the full Aspen stack. Once that is functional and all corner-cases are tested,
-    then work it into the Transaction implementation and Host/Store implementation.
-
 QUIC tests seem to fail randomly. Likely due to load. The test suite needs to pass correctly under load.
 Investigate the causes of these failures and see what can be done to improve reliability. Note simply
 increasing timeouts/linger and the like is generally not acceptable as it can dramatically increase the

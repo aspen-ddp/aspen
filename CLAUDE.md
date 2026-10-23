@@ -24,7 +24,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Objects allocated within the pool have their data dispersed amongst the enclosing stores
 - **Information Dispersal Algorithm (IDA)**:
   - Defines the replication/erasure-coding strategy used to provide robustness against data loss
-  - Currently only Replication and ReedSolomon are supported
+  - Currently Replication, ReedSolomon and AppendingReedSolomon are supported
+  - AppendingReedSolomon lays data out in rows of `k * cellSize` bytes with an 8-byte length trailer, so
+    DataObjects in such pools support efficient appends (`Transaction.append` with an `AppendPosition`) and
+    byte-range/tail reads (`readRange`, `readAppendPosition`). Replication supports them too. Classic
+    ReedSolomon does not: those operations fail with `RangeReadNotSupported` / `AppendNotSupported`
 - **ObjectPointer**:
   - Allocations result in a binary-encoded ObjectPointer.
   - Intended to be embedded within other objects to form distributed data structures

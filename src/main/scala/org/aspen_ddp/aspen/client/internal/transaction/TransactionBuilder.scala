@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
-import org.aspen_ddp.aspen.client.{AppendNotYetSupported, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject}
+import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction.*
 import org.aspen_ddp.aspen.common.util.printStack
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.ida.{AppendableIDA, IDA}
 import org.aspen_ddp.aspen.common.pool.PoolId
 
 object TransactionBuilder {
@@ -38,6 +38,7 @@ class TransactionBuilder(
   private  var updatingObjects = Set[ObjectPointer]() // Tracks UUIDs of all objects being modified
   private  var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects
   private  var dataObjectUpdates = Map[ObjectPointer, DataBuffer]()
+  private  var appendUpdates = Map[ObjectPointer, (AppendPosition, DataBuffer)]()
   private  var keyValueUpdates = Map[KeyValueObjectPointer, KVUpdate]()
 
   private  var finalizationActions = List[SerializedFinalizationAction]()
@@ -53,6 +54,7 @@ class TransactionBuilder(
       refcountUpdates.isEmpty &&
       updatingObjects.isEmpty &&
       dataObjectUpdates.isEmpty &&
+      appendUpdates.isEmpty &&
       keyValueUpdates.isEmpty &&
       finalizationActions.isEmpty &&
       allocatingObjects.isEmpty
@@ -135,6 +137,16 @@ class TransactionBuilder(
       addUpdate(objectPointer, poolIDAMap(objectPointer.poolId).encode(buf))
     }
 
+    appendUpdates foreach { t =>
+      val (objectPointer, (position, buf)) = t
+
+      poolIDAMap(objectPointer.poolId) match
+        case ida: (IDA & AppendableIDA) =>
+          addUpdate(objectPointer, ida.appendDeltas(position.length, buf.getByteArray).map(_.encode))
+        case ida =>
+          throw AppendNotSupported(objectPointer, ida)
+    }
+
     keyValueUpdates.valuesIterator.foreach { kvu =>
       addUpdate(kvu.pointer, KeyValueOperation.encode(kvu.operations, poolIDAMap(kvu.pointer.poolId)))
     }
@@ -162,14 +174,20 @@ class TransactionBuilder(
     missedCommitDelayInMs = msec
   }
 
-  /** Not yet implemented -- always throws. See the note on DataUpdateOperation.Append.
-    *
-    * Retained as the placeholder for an eventual IDA-correct implementation. Building the
-    * transaction was never the hard part; what is missing is a store-side apply that is correct
-    * when object data is sliced across stores rather than replicated.
+  /** Appends data at the given position. Whether the pool's IDA supports appends is checked when the
+    * transaction is built, since the IDA is not known here.
     */
-  def append(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit =
-    throw AppendNotYetSupported(objectPointer)
+  def append(position: AppendPosition, data: DataBuffer): Unit = synchronized {
+    val objectPointer = position.pointer
+    if (updatingObjects.contains(objectPointer))
+      throw MultipleDataUpdatesToObject(objectPointer)
+    if (revisionLocks.contains(objectPointer))
+      throw ConflictingRequirements(objectPointer)
+
+    updatingObjects += objectPointer
+    appendUpdates += (objectPointer -> (position, data))
+    requirements  = DataUpdate(objectPointer, position.revision, DataUpdateOperation.Append) :: requirements
+  }
 
   def overwrite(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized {
     //println(s"   TXB Overwrite txid $transactionUUID object ${objectPointer.uuid}")

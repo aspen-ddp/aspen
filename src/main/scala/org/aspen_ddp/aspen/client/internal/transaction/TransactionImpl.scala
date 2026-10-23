@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AbortAfterCommit, AspenClient, PostCommitTransactionModification, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{AbortAfterCommit, AppendPosition, AspenClient, PostCommitTransactionModification, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
@@ -58,10 +58,14 @@ class TransactionImpl(val client: AspenClient,
     bldr.setMissedCommitDelayInMs(msec)
   }
 
-  def append(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = modify { bldr =>
-    havePendingUpdates = true
-    bldr.append(objectPointer, requiredRevision, data)
-  }
+  def append(position: AppendPosition, data: DataBuffer): AppendPosition =
+    require(data.size > 0, "Cannot append empty data")
+    modify { bldr =>
+      havePendingUpdates = true
+      bldr.append(position, data)
+    }
+    AppendPosition(position.pointer, revision, position.length + data.size)
+
   def overwrite(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = modify { bldr =>
     havePendingUpdates = true
     bldr.overwrite(objectPointer, requiredRevision, data)

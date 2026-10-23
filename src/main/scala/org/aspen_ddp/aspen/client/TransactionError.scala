@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.AspenError
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 
@@ -14,11 +15,8 @@ final case class MultipleDataUpdatesToObject(objectPointer:ObjectPointer) extend
 /** Used if revision modifications and revision-locks are applied to the same object */
 final case class ConflictingRequirements(objectPointer:ObjectPointer) extends TransactionCreationError
 
-/** Used if a transaction attempts a DataUpdateOperation.Append, which is not yet implemented.
-  *
-  * See the note on DataUpdateOperation.Append for why appends are currently rejected.
-  */
-final case class AppendNotYetSupported(objectPointer:ObjectPointer) extends TransactionCreationError
+/** Used if an append is attempted on an object whose pool IDA does not support appends (e.g. classic ReedSolomon) */
+final case class AppendNotSupported(objectPointer:ObjectPointer, ida: IDA) extends TransactionCreationError
 
 /** Used if multiple refcount modifications are attempted on the same object within a single transaction */
 final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) extends TransactionCreationError

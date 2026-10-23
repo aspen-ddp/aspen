@@ -18,13 +18,11 @@ trait Transaction {
 
   // All returns are what the new object revision/refcount will be if the transaction completes successfully
 
-  /** NOT YET SUPPORTED -- always throws AppendNotYetSupported.
-    *
-    * Reserved for a future implementation. See the note on DataUpdateOperation.Append.
+  /** Appends data to the object at the given position. Returns the position that holds once this transaction
+    * commits. Throws IllegalArgumentException if data is empty. If the object's pool IDA does not support
+    * appends, building the transaction fails with AppendNotSupported.
     */
-  def append(objectPointer: DataObjectPointer,
-             requiredRevision: ObjectRevision,
-             data: DataBuffer): Unit
+  def append(position: AppendPosition, data: DataBuffer): AppendPosition
 
   def overwrite(objectPointer: DataObjectPointer,
                 requiredRevision: ObjectRevision,

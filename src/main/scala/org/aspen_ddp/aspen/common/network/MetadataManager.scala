@@ -130,7 +130,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         case _ => None
 
   /** Cache writes. Best-effort: skip bootstrap and self entries, and log and swallow any NonFatal throw so it can
-   *  never escape into the retryability and containment paths of the callers, all of which hold the monitor.
+   *  never escape into the retryability and containment paths of the callers, all of which hold the monitor
+   *  (applySnapshot's bulkUpdate alone runs after releasing it, under the same containment).
    *  Truly non-throwing for NonFatal: the log call is guarded too ("repair first, log second"), so these are safe
    *  to call from inside those paths without a cache failure undoing an installed entry or abandoning the rest
    *  of a pool. */
@@ -354,8 +355,25 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
    *  unchanged, so the next send re-reads it) and the rest of the snapshot is still applied; the old entry, if any,
    *  is still returned since it is no longer held. The cache is written once, by a single bulkUpdate after
    *  everything has been applied, and a failure there is logged and swallowed like every other cache write.
+   *
+   *  That bulkUpdate runs after the monitor is released: a RocksDB cache reads every touched key before writing,
+   *  and at tens of thousands of hosts that would stall every send on the node for as long. Racing a cache write
+   *  made under the monitor in the meantime affects only what is persisted, never what is held. bulkUpdate's puts
+   *  are newer-only, so the race is confined to a write landing between its read and its write: an older value
+   *  persisted over it, or a removal deleting a mapping re-added since. Either costs at most a stale or missing
+   *  entry after a restart, which the usual lookup and endpoint repair correct.
    */
   def applySnapshot(hostSnapshot: HostSnapshot, storeSnapshot: StoreSnapshot, dropMargin: Duration): List[T] =
+    val (closeable, content, droppedStores, droppedHostIds) = applySnapshotLocked(hostSnapshot, storeSnapshot,
+      dropMargin)
+    try networkCache.bulkUpdate(content, droppedStores, droppedHostIds)
+    catch
+      case NonFatal(t) => warnCache(s"Network cache bulkUpdate failed while applying a snapshot. Error: $t")
+    closeable
+
+  /** applySnapshot's in-memory half: the entries to close, plus the cache content and removals to persist */
+  private def applySnapshotLocked(hostSnapshot: HostSnapshot, storeSnapshot: StoreSnapshot,
+                                  dropMargin: Duration): (List[T], NetworkCacheContent, List[StoreId], List[HostId]) =
     synchronized:
       def skipHost(hostId: HostId): Boolean = bootstrapHostIds.contains(hostId) || selfHostId.contains(hostId)
 
@@ -422,12 +440,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
       .toList
       stores --= droppedStores
 
-      try networkCache.bulkUpdate(NetworkCacheContent(cachedStores.reverse, cachedHosts.reverse), droppedStores,
+      (closeable, NetworkCacheContent(cachedStores.reverse, cachedHosts.reverse), droppedStores,
         droppedHosts.map(_.hostId))
-      catch
-        case NonFatal(t) => warnCache(s"Network cache bulkUpdate failed while applying a snapshot. Error: $t")
-
-      closeable
 
   /** Refetches the bootstrap config and reinstalls the store -> host mappings it names, along
    *  with the set of stores that count as bootstrap stores.

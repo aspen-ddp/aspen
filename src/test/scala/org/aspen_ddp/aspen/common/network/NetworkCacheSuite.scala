@@ -70,6 +70,35 @@ class NetworkCacheSuite extends AnyFunSuite with Matchers:
     content.hosts should be (List(host(host1, "fresh", 20)))
     c.close()
 
+  test("bulkUpdate compares each store and host against its own held record"):
+    val c = NetworkCache.open(os.temp.dir(), sysA)
+    c.putStore(store(0, host1, 10))
+    c.putStore(store(1, host1, 10))
+    c.putHost(host(host1, "held1", 10))
+    c.putHost(host(host2, "held2", 10))
+    c.bulkUpdate(NetworkCacheContent(
+      List(store(0, host2, 20), store(1, host2, 5), store(2, host2, 1)),
+      List(host(host1, "old1", 5), host(host2, "fresh2", 20))))
+    val content = c.load()
+    content.stores.toSet should be (Set(store(0, host2, 20), store(1, host1, 10), store(2, host2, 1)))
+    content.hosts.toSet should be (Set(host(host1, "held1", 10), host(host2, "fresh2", 20)))
+    c.close()
+
+  test("bulkUpdate replaces a corrupt held record"):
+    val dir = os.temp.dir()
+    NetworkCache.open(dir, sysA).close()
+    val opts = new Options()
+    val raw = RocksDB.open(opts, dir.toString)
+    try
+      raw.put('h'.toByte +: Array.fill[Byte](16)(0x22.toByte), Array[Byte](-1, -2, -3, -4))
+    finally
+      raw.close()
+      opts.close()
+    val c = NetworkCache.open(dir, sysA)
+    c.bulkUpdate(NetworkCacheContent(Nil, List(host(host1, "fresh", 1))))
+    c.load().hosts should be (List(host(host1, "fresh", 1)))
+    c.close()
+
   test("a different system id wipes the cache"):
     val dir = os.temp.dir()
     val c = NetworkCache.open(dir, sysA)

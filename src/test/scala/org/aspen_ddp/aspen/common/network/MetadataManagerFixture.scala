@@ -275,6 +275,8 @@ class RecordingNetworkCache(preset: NetworkCacheContent = NetworkCacheContent(Ni
   val bulkUpdates: mutable.ListBuffer[(NetworkCacheContent, List[StoreId], List[HostId])] = mutable.ListBuffer()
 
   @volatile var throwOnWrite: Boolean = false
+  // Runs at the start of bulkUpdate, before the cache's own lock is taken
+  @volatile var onBulkUpdate: () => Unit = () => ()
 
   private def check(): Unit =
     if throwOnWrite then throw new RuntimeException("cache write failed")
@@ -293,7 +295,12 @@ class RecordingNetworkCache(preset: NetworkCacheContent = NetworkCacheContent(Ni
     removedHosts += hostId
     check()
   def bulkUpdate(content: NetworkCacheContent, storeRemovals: Iterable[StoreId] = Nil,
-                 hostRemovals: Iterable[HostId] = Nil): Unit = synchronized:
+                 hostRemovals: Iterable[HostId] = Nil): Unit =
+    onBulkUpdate()
+    synchronized:
+      recordBulkUpdate(content, storeRemovals, hostRemovals)
+  private def recordBulkUpdate(content: NetworkCacheContent, storeRemovals: Iterable[StoreId],
+                               hostRemovals: Iterable[HostId]): Unit =
     bulkUpdates += ((content, storeRemovals.toList, hostRemovals.toList))
     removedStores ++= storeRemovals
     removedHosts ++= hostRemovals

@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.common.network
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -9,7 +10,7 @@ import scribe.Logging
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.util.UUID
-import scala.collection.mutable
+import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
 object RocksDBNetworkCache:
@@ -108,21 +109,36 @@ class RocksDBNetworkCache(dir: os.Path, systemId: UUID) extends NetworkCache wit
     try db.delete(hostKey(hostId))
     catch case NonFatal(t) => logger.warn(s"Network cache removeHost failed: $t")
 
+  /** Reads only the keys it touches (one multiGet) rather than the whole cache, then writes one batch. */
   def bulkUpdate(content: NetworkCacheContent, removedStores: Iterable[StoreId] = Nil,
                  removedHosts: Iterable[HostId] = Nil): Unit =
     try
-      val held = load()
-      val heldStores = mutable.HashMap.from(held.stores.map(s => s.storeId -> s))
-      val heldHosts = mutable.HashMap.from(held.hosts.map(h => h.hostId -> h))
+      val newestStores = content.stores.groupBy(_.storeId).values.map(_.maxBy(_.timestamp)).toList
+      val newestHosts = content.hosts.groupBy(_.hostId).values.map(_.maxBy(_.timestamp)).toList
+      val keys = newestStores.map(s => storeKey(s.storeId)) ++ newestHosts.map(h => hostKey(h.hostId))
+      val held = if keys.isEmpty then Nil else db.multiGetAsList(keys.asJava).asScala.toList
+      val (heldStores, heldHosts) = held.splitAt(newestStores.size)
+
+      // A held record that is missing or unreadable never blocks the write
+      def heldTimestamp(bytes: Array[Byte], decode: Array[Byte] => HLCTimestamp): Option[HLCTimestamp] =
+        if bytes == null then
+          None
+        else
+          try Some(decode(bytes))
+          catch
+            case NonFatal(t) =>
+              logger.warn(s"Replacing corrupt network cache record: $t")
+              None
+
       val batch = new WriteBatch()
       val wo = new WriteOptions()
       try
-        val newestStores = content.stores.groupBy(_.storeId).values.map(_.maxBy(_.timestamp))
-        val newestHosts = content.hosts.groupBy(_.hostId).values.map(_.maxBy(_.timestamp))
-        for s <- newestStores if heldStores.get(s.storeId).forall(_.timestamp < s.timestamp) do
-          batch.put(storeKey(s.storeId), Codec.encode(s))
-        for h <- newestHosts if heldHosts.get(h.hostId).forall(_.timestamp < h.timestamp) do
-          batch.put(hostKey(h.hostId), Codec.encode(h))
+        newestStores.zip(heldStores).foreach: (s, bytes) =>
+          if heldTimestamp(bytes, b => Codec.decodeCachedStore(s.storeId, b).timestamp).forall(_ < s.timestamp) then
+            batch.put(storeKey(s.storeId), Codec.encode(s))
+        newestHosts.zip(heldHosts).foreach: (h, bytes) =>
+          if heldTimestamp(bytes, b => Codec.decodeCachedHost(b).timestamp).forall(_ < h.timestamp) then
+            batch.put(hostKey(h.hostId), Codec.encode(h))
         for s <- removedStores do batch.delete(storeKey(s))
         for h <- removedHosts do batch.delete(hostKey(h))
         if batch.count() > 0 then

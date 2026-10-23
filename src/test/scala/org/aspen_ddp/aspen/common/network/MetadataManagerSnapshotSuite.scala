@@ -259,6 +259,17 @@ class MetadataManagerSnapshotSuite extends AnyFunSuite
     mgr.peekStoreHost(store0) should be(Some(remoteHostId))
     cache.bulkUpdates.size should be(1)
 
+  test("the cache is written after the manager's monitor is released"):
+    val cache = new RecordingNetworkCache()
+    val (mgr, _, _) = newManager(cache)
+    @volatile var heldMonitor: Option[Boolean] = None
+    cache.onBulkUpdate = () => heldMonitor = Some(Thread.holdsLock(mgr))
+
+    mgr.applySnapshot(hostSnap(T, remote(T)), storeSnap(T, CachedStore(store0, remoteHostId, at(T))), dropMargin)
+
+    heldMonitor should be(Some(false))
+    cache.bulkUpdates.size should be(1)
+
   test("cacheWasEmpty"):
     newManager(NetworkCache.NoCache)._1.cacheWasEmpty should be(true)
     newManager(new RecordingNetworkCache())._1.cacheWasEmpty should be(true)

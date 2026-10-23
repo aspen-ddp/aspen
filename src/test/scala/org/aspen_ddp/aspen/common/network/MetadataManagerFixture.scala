@@ -260,7 +260,6 @@ class RecordingNetworkImpl extends MetadataManager.NetworkImplInterface[Metadata
 /** An in-memory NetworkCache serving a preset load() and recording every write. */
 class RecordingNetworkCache(preset: NetworkCacheContent = NetworkCacheContent(Nil, Nil)) extends NetworkCache:
   val storePuts: mutable.ListBuffer[CachedStore] = mutable.ListBuffer()
-  val storeRemoves: mutable.ListBuffer[StoreId] = mutable.ListBuffer()
   val hostPuts: mutable.ListBuffer[CachedHost] = mutable.ListBuffer()
   val removedHosts: mutable.ListBuffer[HostId] = mutable.ListBuffer()
   val removedStores: mutable.ListBuffer[StoreId] = mutable.ListBuffer()
@@ -276,7 +275,7 @@ class RecordingNetworkCache(preset: NetworkCacheContent = NetworkCacheContent(Ni
     storePuts += e
     check()
   def removeStore(storeId: StoreId): Unit = synchronized:
-    storeRemoves += storeId
+    removedStores += storeId
     check()
   def putHost(e: CachedHost): Unit = synchronized:
     hostPuts += e
@@ -284,12 +283,15 @@ class RecordingNetworkCache(preset: NetworkCacheContent = NetworkCacheContent(Ni
   def removeHost(hostId: HostId): Unit = synchronized:
     removedHosts += hostId
     check()
-  def bulkUpdate(content: NetworkCacheContent, removedStores: Iterable[StoreId] = Nil,
-                 removedHosts: Iterable[HostId] = Nil): Unit = synchronized:
-    bulkUpdates += ((content, removedStores.toList, removedHosts.toList))
+  def bulkUpdate(content: NetworkCacheContent, storeRemovals: Iterable[StoreId] = Nil,
+                 hostRemovals: Iterable[HostId] = Nil): Unit = synchronized:
+    bulkUpdates += ((content, storeRemovals.toList, hostRemovals.toList))
+    removedStores ++= storeRemovals
+    removedHosts ++= hostRemovals
+    check()
   def close(): Unit = ()
 
-  def writeCount: Int = synchronized(storePuts.size + storeRemoves.size + hostPuts.size)
+  def writeCount: Int = synchronized(storePuts.size + removedStores.size + removedHosts.size + hostPuts.size)
 
 
 /** A MetadataManager over a temp bootstrap config naming exactly one host, plus the ids of a

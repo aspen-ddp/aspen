@@ -122,14 +122,14 @@ class MetadataManagerNetworkCacheSuite extends AnyFunSuite
     val (mgr, _, _) = newManager(cache)
     mgr.storeMoved(store0, remoteHostId, ts(7))
     mgr.dropStoreMapping(store0)
-    cache.storeRemoves.toList should be(List(store0))
+    cache.removedStores.toList should be(List(store0))
 
     val store1 = StoreId(unknownPoolId, 1.toByte)
     mgr.storeMoved(store1, remoteHostId, ts(7))
     mgr.receivedUnknownStoreFromHost(otherHostId, store1) // different host: no removal
-    cache.storeRemoves.size should be(1)
+    cache.removedStores.size should be(1)
     mgr.receivedUnknownStoreFromHost(remoteHostId, store1)
-    cache.storeRemoves.toList should be(List(store0, store1))
+    cache.removedStores.toList should be(List(store0, store1))
 
     val before = cache.writeCount
     mgr.dropStoreMapping(StoreId(poolId, 0.toByte)) // bootstrap refresh
@@ -189,3 +189,14 @@ class MetadataManagerNetworkCacheSuite extends AnyFunSuite
     impl3.resolutions.map(_._2).toSet should be(Set(store0, s1))
     impl3.deliveredTo(bootstrapHostId).size should be(2)
     c3.storePuts.size should be(2)
+
+  test("RecordingNetworkCache records single and bulk removals"):
+    val c = new RecordingNetworkCache()
+    val s1 = StoreId(unknownPoolId, 1.toByte)
+    c.removeStore(store0)
+    c.removeHost(remoteHostId)
+    c.bulkUpdate(NetworkCacheContent(Nil, Nil), List(s1), List(bootstrapHostId))
+    c.removedStores.toList should be(List(store0, s1))
+    c.removedHosts.toList should be(List(remoteHostId, bootstrapHostId))
+    c.bulkUpdates.toList should be(List((NetworkCacheContent(Nil, Nil), List(s1), List(bootstrapHostId))))
+    c.writeCount should be(4)

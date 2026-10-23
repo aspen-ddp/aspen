@@ -27,7 +27,7 @@ object TransactionBuilder {
 
 class TransactionBuilder(
                           val transactionId: TransactionId,
-                          val chooseDesignatedLeader: ObjectPointer => Byte, // Uses peer online/offline knowledge to select designated leaders for transactions)
+                          val chooseDesignatedLeader: (ObjectPointer, IDA) => Byte, // Uses peer online/offline knowledge to select designated leaders for transactions
                           val clientId: ClientId) {
 
   import TransactionBuilder._
@@ -87,13 +87,12 @@ class TransactionBuilder(
       case _ => None
     }.map(_.objectPointer).maxBy(ptr => poolIDAMap(ptr.poolId))
 
-    val designatedLeaderUID = chooseDesignatedLeader(primaryObject)
+    val primaryObjectIDA = poolIDAMap(primaryObject.poolId)
+    val designatedLeaderUID = chooseDesignatedLeader(primaryObject, primaryObjectIDA)
     val originatingClient = Some(clientId)
 
     if (addMissedUpdateTrackingFA)
       finalizationActions = MissedUpdateFinalizationAction.createSerializedFA(missedCommitDelayInMs) :: finalizationActions
-
-    val primaryObjectIDA = poolIDAMap(primaryObject.poolId)
 
     val txd = TransactionDescription(transactionId, startTimestamp, primaryObject, designatedLeaderUID,
       requirements, finalizationActions, originatingClient, notifyOnResolution.toList,

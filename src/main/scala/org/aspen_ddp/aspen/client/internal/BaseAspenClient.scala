@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.internal
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.{ReadDriver, ReadManager}
-import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, TransactionImpl, TransactionManager}
+import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, DesignatedLeader, TransactionImpl, TransactionManager}
 import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
 // Explicit: common.objects also defines a ReadError (an Enumeration object). Only the client
@@ -115,7 +115,7 @@ abstract class BaseAspenClient(
   // ---- Transactions ----
 
   override def newTransaction(): Transaction =
-    TransactionImpl(this, txManager, _ => 0, None)
+    TransactionImpl(this, txManager, DesignatedLeader.choose(messenger, _, _), None)
 
   override def getAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] =
     allocatorManager.getAllocator(allocatorId)

@@ -19,7 +19,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private val p1 = DataObjectPointer(oid1, PoolId(new UUID(0, 0)), Array[Byte]())
 
   private def mkBuilder(): TransactionBuilder =
-    new TransactionBuilder(tx1, _ => 0.toByte, ClientId(new UUID(0, 4)))
+    new TransactionBuilder(tx1, (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
 
   test("append throws AppendNotYetSupported") {
     val bldr = mkBuilder()

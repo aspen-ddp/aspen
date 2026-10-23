@@ -20,6 +20,17 @@ trait Messenger:
   // layer to drop its cached value and lookup the new store location
   def dropCacheForStore(storeId: StoreId): Unit
 
+  /** True if `storeId` is believed offline for a transfer or rebuild. Advisory, used to choose designated leaders.
+   *  Networks without gossip know of no offline stores.
+   */
+  def isStoreOffline(storeId: StoreId): Boolean = false
+
+  /** True if the host `storeId` is mapped to is known to be online. Advisory, used to choose designated leaders.
+   *  Never starts a lookup, so a store not yet mapped is not known online. Networks without liveness tracking
+   *  report every host online.
+   */
+  def isStoreHostOnline(storeId: StoreId): Boolean = true
+
 
 object Messenger:
   object None extends Messenger:

@@ -119,6 +119,11 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         case Some(Right(hostEntry)) => Some(hostEntry)
         case _ => None
 
+  /** The host `storeId` is currently mapped to, if any. Like peekHostEntry, this never starts a lookup. */
+  def peekStoreHost(storeId: StoreId): Option[HostId] =
+    synchronized:
+      stores.get(storeId)
+
   /** Every host entry that has resolved, in no particular order. Excludes hosts whose lookup
    *  is still pending and hosts never looked up at all.
    *

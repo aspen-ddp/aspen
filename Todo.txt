@@ -1,10 +1,6 @@
 TODO
 ====
 
-- Now that we have tracking of offline stores and accurate tracking of online/offline status for Hosts, we can remove
-  the hard-coded choice of always store 0 for the designatedLeader on transactions. Instead, we should randomly select
-  a store that isn't offline and who's host is currently online.
-
 - Add a NetworkCache class
   - Abstract, pluggable interface
   - Implementations:

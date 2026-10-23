@@ -65,6 +65,10 @@ object QuicNet:
 
     def dropCacheForStore(storeId: StoreId): Unit = net.metadataManager.dropStoreMapping(storeId)
 
+    override def isStoreOffline(storeId: StoreId): Boolean = net.isStoreOffline(storeId)
+
+    override def isStoreHostOnline(storeId: StoreId): Boolean = net.isStoreHostOnline(storeId)
+
   private class SrvMessenger(net: QuicNet) extends ServerMessenger:
     def sendClientResponse(msg: ClientResponse): Unit = net.sendToClient(msg)
 
@@ -439,6 +443,10 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       recheckTask = Some(loops(0).scheduleAtFixedRate(recheck, 0, ms, TimeUnit.MILLISECONDS))
 
   override def isStoreOffline(storeId: StoreId): Boolean = storeAvailability.isOffline(storeId)
+
+  /** True if `storeId` is mapped to this host, or to one membership or our relays last reported online */
+  def isStoreHostOnline(storeId: StoreId): Boolean =
+    metadataManager.peekStoreHost(storeId).exists(h => ohost.exists(_._1 == h) || reportedOnline(h))
 
   def joinIoThread(): Unit = group.terminationFuture().awaitUninterruptibly()
 

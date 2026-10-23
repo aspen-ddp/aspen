@@ -18,13 +18,13 @@ import scala.util.{Failure, Success}
 object TransactionImpl {
   def Factory(client: AspenClient,
               txManager: TransactionManager,
-              chooseDesignatedLeader: ObjectPointer => Byte, // Uses peer online/offline knowledge to select designated leaders for transactions)
+              chooseDesignatedLeader: (ObjectPointer, IDA) => Byte, // Uses peer online/offline knowledge to select designated leaders for transactions
               transactionDriverStrategy: Option[ClientTransactionDriver.Factory]) = new TransactionImpl(client, txManager, chooseDesignatedLeader, transactionDriverStrategy)
 }
 
 class TransactionImpl(val client: AspenClient,
                       txManager: TransactionManager,
-                      chooseDesignatedLeader: ObjectPointer => Byte, // Uses peer online/offline knowledge to select designated leaders for transactions)
+                      chooseDesignatedLeader: (ObjectPointer, IDA) => Byte, // Uses peer online/offline knowledge to select designated leaders for transactions
                       transactionDriverStrategy: Option[ClientTransactionDriver.Factory]) extends Transaction with Logging {
 
   val id: TransactionId = TransactionId(UUID.randomUUID())

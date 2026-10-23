@@ -1,15 +1,15 @@
 TODO
 ====
 
-- To further improve reliability of Gossip for StoreMove/HostChange messages:
-  - Hosts retransmit their host/store state change gossip messages every 30 minutes for 24 hours
-    - Thus if a host was offline for the initial gossip, it can get one later
-    - minimal cost as these moves are relatively rare
-    - May want a <host-dir>/cache/retransmitting-gossip-messages.yaml file
-      - Read on startup so retransmits can be resumed after a process restart
-      - Not needed for correctness so loosing it is okay (hence cache directory)
-  - Add send of StoreMoved message to end of the Rebuild process (functionally identical to a transfer)
-
+- For StoreMoved and HostEndpointChanged, the lack of the updated information in the message means that network
+  state reads will need to be made by every Host. That would man 10,000 reads for large networks containing
+  10,000 hosts. To avoid this, we can track the HLCTimestamp of the StoragePoolState ConfigKey value that
+  provides the StoreId -> HostId mapping and the timestamp of the HostState that gives the connection information.
+  The gossip messages can include the HLCTimestamp of the transaction they used to successfully update those
+  objects. Thus, when receiving the message, the Hosts can look to see whether the new state provided in
+  the gossip message is newer than what it had previously. If so, apply the changes. If not, ignore the
+  message.
+  
 - Add Gossip messages for notifying peers of stores going offline for Transfer/Rebuild
   - Hosts cache this <host-dir>/cache/offline-stores.yaml so they can restore it on a restart
   - Used to skip selecting them as designated leaders
@@ -32,15 +32,6 @@ TODO
   the hard-coded choice of always store 0 for the designatedLeader on transactions. Instead, we should randomly select
   a store who's host is online. The store itself may be temporarily offline due to a transfer but we don't currently
   track that.
-
-- For StoreMoved and HostEndpointChanged, the lack of the updated information in the message means that network
-  state reads will need to be made by every Host. That would man 10,000 reads for large networks containing
-  10,000 hosts. To avoid this, we can track the HLCTimestamp of the StoragePoolState ConfigKey value that
-  provides the StoreId -> HostId mapping and the timestamp of the HostState that gives the connection information.
-  The gossip messages can include the HLCTimestamp of the transaction they used to successfully update those
-  objects. Thus, when receiving the message, the Hosts can look to see whether the new state provided in
-  the gossip message is newer than what it had previously. If so, apply the changes. If not, ignore the
-  message.
 
 - Add a NetworkCache class
   - Abstract, pluggable interface

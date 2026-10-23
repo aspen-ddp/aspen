@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, fixed_ids}
+import org.aspen_ddp.aspen.common.network.StoreMoved
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -176,7 +177,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       factory.created.map(_.storeId).toList should be(List(storeN(0), storeN(1)))
       factory.created.map(_.storageDeviceId).toList should be(List(deviceA, deviceB))
 
-  atest("a successfully flipped rebuild is loaded and marked Active"):
+  atest("a successfully flipped rebuild is loaded, marked Active, and gossips StoreMoved"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val factory = new RecordingRebuildFactory
@@ -217,6 +218,7 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       host.loadStoreByIdRequests should contain((realDeviceId, storeN(0)))
       finalState.stores.get(storeN(0)).map(_.status) should be(
         Some(StorageDeviceState.StoreStatus.Active))
+      net.takeCapturedGossip() should contain(StoreMoved(storeN(0)))
 
   atest("a rebuild on a tombstoned device is discarded, not loaded"):
     val hostRoot = newHostDir()

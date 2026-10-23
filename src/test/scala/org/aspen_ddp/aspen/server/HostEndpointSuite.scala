@@ -37,6 +37,9 @@ class HostEndpointSuite extends IntegrationTestSuite with HostTestHarness:
       after.dataPort should be(hs.dataPort + 1)
       after.httpPort should be(hs.httpPort)
       net.takeCapturedGossip() should be(List(HostEndpointChanged(host.hostId)))
+      // Saved so the retransmits survive a restart
+      host.gossipRetransmitter.pendingMessages.keySet should be(Set(HostEndpointChanged(host.hostId)))
+      os.exists(GossipRetransmitter.stateFile(host.rootDir)) should be(true)
 
   atest("a failed first attempt is retried until the endpoint is updated and gossiped"):
     given ExecutionContext = executionContext
@@ -59,6 +62,9 @@ class HostEndpointSuite extends IntegrationTestSuite with HostTestHarness:
       host.endpointRetriesScheduled.get should be(2)
       after.address should be("10.9.8.7")
       net.takeCapturedGossip() should be(List(HostEndpointChanged(host.hostId)))
+      // Saved so the retransmits survive a restart
+      host.gossipRetransmitter.pendingMessages.keySet should be(Set(HostEndpointChanged(host.hostId)))
+      os.exists(GossipRetransmitter.stateFile(host.rootDir)) should be(true)
 
   atest("a retry that finds the endpoint already matching stops without gossiping"):
     given ExecutionContext = executionContext

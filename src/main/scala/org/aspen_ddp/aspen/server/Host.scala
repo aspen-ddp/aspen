@@ -183,6 +183,14 @@ class Host(val client: AspenClient,
   private val deviceUsageManager = new StorageDeviceUsageManager(client)
   private var usageUpdateTask: Option[ScheduledTask] = None
 
+  /** All StoreMoved and HostEndpointChanged gossip goes through here, so hosts that miss the
+   *  first broadcast still hear it from a retransmit. */
+  private[aspen] val gossipRetransmitter =
+    new GossipRetransmitter(GossipRetransmitter.stateFile(rootDir), net.broadcastGossip)
+
+  private val gossipRetransmitTask = backgroundTasks.schedulePeriodic(GossipRetransmitter.Period):
+    gossipRetransmitter.retransmit()
+
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
     retransmitPendingStartTransfers()
 
@@ -576,7 +584,7 @@ class Host(val client: AspenClient,
 
             // Tell every other host (and client) that the cached address for this store is
             // stale. Sent only on this branch: the other outcomes did not repoint the pool.
-            net.broadcastGossip(StoreMoved(storeId))
+            gossipRetransmitter.broadcast(StoreMoved(storeId))
 
           TransferOutcome.PoolRepointed
 
@@ -617,7 +625,7 @@ class Host(val client: AspenClient,
                                storeTransferPort = storeTransferPort).encode())))
           .map: _ =>
             logger.info(s"Host endpoint updated to $address:$dataPort")
-            net.broadcastGossip(HostEndpointChanged(hostId))
+            gossipRetransmitter.broadcast(HostEndpointChanged(hostId))
             true
 
     // Each call is one attempt; a failed one logs and schedules another. The result is the
@@ -1318,6 +1326,9 @@ class Host(val client: AspenClient,
 
               tx.result.foreach: _ =>
                 logger.info(s"Rebuild of store $storeId complete")
+                // The pool was repointed here when the rebuild was assigned, but peers only
+                // learn it now, exactly as at the end of a transfer.
+                gossipRetransmitter.broadcast(StoreMoved(storeId))
 
               RebuildOutcome.Adopt
 
@@ -1834,6 +1845,7 @@ class Host(val client: AspenClient,
     serviceExecutorPromise.future.foreach(_.shutdown())
     systemTaskRunnerPromise.future.foreach(_.shutdown())
     pendingStartTask.cancel()
+    gossipRetransmitTask.cancel()
     heartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
     usageUpdateTask.foreach(_.cancel())

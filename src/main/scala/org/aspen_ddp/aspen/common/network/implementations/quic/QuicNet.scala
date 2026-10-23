@@ -670,6 +670,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** When (System.nanoTime) dials to `hostId`'s current entry started failing, if they are */
   private[quic] def failingSinceForTests(hostId: HostId): Option[Long] = Option(failingSince.get(hostId)).map(_.longValue)
 
+  /** When (System.nanoTime) peers were last asked for `hostId`'s endpoint, if they have been */
+  private[quic] def lastQueriedForTests(hostId: HostId): Option[Long] = Option(lastQueried.get(hostId)).map(_.longValue)
+
   /** Our relays (client mode) and the peers a query about `target` would go to now. Blocks until `loops(0)` answers. */
   private[quic] def peerQueryPlanForTests(target: HostId): (Set[HostId], List[HostId]) =
     loops(0).submit(() => (relays, queryPeers(target))).get()

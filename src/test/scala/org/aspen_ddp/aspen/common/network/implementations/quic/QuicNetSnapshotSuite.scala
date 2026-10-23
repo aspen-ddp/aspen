@@ -62,3 +62,38 @@ class QuicNetSnapshotSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     c1.net.crashForTests()
     val c2 = fx.host(hostIdC, portC2)
     sendUntilDelivered(fx.a, hostIdC, c2)
+
+  test("a snapshot that drops a host closes its connection"):
+    val hostIdC = HostId(UUID.randomUUID())
+    val portC = freeUdpPort()
+    fx.directory.put(HostState(hostIdC, "host_c", "127.0.0.1", portC, 0, 0, Set()))
+    val c = fx.host(hostIdC, portC)
+
+    sendUntilDelivered(fx.a, hostIdC, c)
+    val oldConn = fx.a.net.metadataManager.peekHostEntry(hostIdC).get.connection.get()
+    oldConn should not be null
+    oldConn.isClosed shouldBe false
+
+    // The directory reads every host as written at time zero, so a snapshot scanned now that omits C drops it
+    val snapshot = (HostSnapshot(HLCTimestamp.now, Nil), StoreSnapshot(HLCTimestamp.now, Nil))
+    fx.a.net.startSnapshotReaderForTests(() => Future.successful(Some(snapshot)))
+
+    eventually("A's connection to the dropped C is closed", WaitMillis)(oldConn.isClosed)
+    fx.a.net.metadataManager.peekHostEntry(hostIdC) shouldBe None
+
+  test("a retired entry's failure clock and query time are reset"):
+    // C is never started, so A's dials to it fail
+    val hostIdC = HostId(UUID.randomUUID())
+    fx.directory.put(HostState(hostIdC, "host_c", "127.0.0.1", freeUdpPort(), 0, 0, Set()))
+
+    send(fx.a, hostIdC)
+    eventually("A's dial to C fails", WaitMillis)(fx.a.net.failingSinceForTests(hostIdC).isDefined)
+    fx.a.net.requestPeerQuery(hostIdC)
+    eventually("A asks its peers about C", WaitMillis)(fx.a.net.lastQueriedForTests(hostIdC).isDefined)
+
+    val snapshot = (HostSnapshot(HLCTimestamp.now, Nil), StoreSnapshot(HLCTimestamp.now, Nil))
+    fx.a.net.startSnapshotReaderForTests(() => Future.successful(Some(snapshot)))
+
+    eventually("A drops C", WaitMillis)(fx.a.net.metadataManager.peekHostEntry(hostIdC).isEmpty)
+    eventually("the retired entry's clocks are reset", WaitMillis):
+      fx.a.net.failingSinceForTests(hostIdC).isEmpty && fx.a.net.lastQueriedForTests(hostIdC).isEmpty

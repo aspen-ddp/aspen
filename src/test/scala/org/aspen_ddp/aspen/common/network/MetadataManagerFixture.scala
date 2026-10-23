@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.EvictingQueue
@@ -181,6 +181,13 @@ class LookupRecordingClient extends TestNetwork.TClient(
     Future.failed(new UnsupportedOperationException("LookupRecordingClient has no objects to read"))
 
   override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
+    Future.failed(new UnsupportedOperationException("LookupRecordingClient has no objects to read"))
+
+  override def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String): Future[KeyValueObjectState] =
+    Future.failed(new UnsupportedOperationException("LookupRecordingClient has no objects to read"))
+
+  override def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
+                            comment: String): Future[KeyValueObjectState] =
     Future.failed(new UnsupportedOperationException("LookupRecordingClient has no objects to read"))
 
 

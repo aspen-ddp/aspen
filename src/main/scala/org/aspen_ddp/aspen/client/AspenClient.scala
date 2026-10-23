@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientResponse, HostMessage, ServiceMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -57,6 +57,11 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def read(pointer: DataObjectPointer, comment: String): Future[DataObjectState]
 
   def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState]
+
+  def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String): Future[KeyValueObjectState]
+
+  def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
+                   comment: String): Future[KeyValueObjectState]
 
   def newTransaction(): Transaction
 

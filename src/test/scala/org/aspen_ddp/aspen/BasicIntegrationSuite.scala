@@ -3,13 +3,56 @@ package org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.{KeyValueObjectState, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, Key, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.Future
 import scala.language.implicitConversions
 
 class BasicIntegrationSuite extends IntegrationTestSuite {
+
+  def k(n: Int): Key = Key(Array[Byte](n.toByte))
+
+  /** Allocates a KeyValue object holding keys 1 through 5 (value of key n is Array(n * 10)) and links it
+    * into the radicle under `radicleKey` */
+  def allocateFiveKeyObject(radicleKey: Key): Future[KeyValueObjectPointer] =
+    given tx: Transaction = client.newTransaction()
+
+    tx.update(radicle, None, None, List(KeyValueUpdate.DoesNotExist(radicleKey)), List(Insert(radicleKey, Array[Byte](1))))
+
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      kp <- pool.allocator.allocateKeyValueObject((1 to 5).map(n => k(n) -> Value(Array[Byte]((n * 10).toByte))).toMap)
+      _ <- tx.commit()
+    yield kp
+
+  atest("Read subset of keys") {
+    for
+      kp <- allocateFiveKeyObject(k(101))
+      subset <- client.readKeys(kp, k(2), k(4), k(9))
+      noKeys <- client.readKeys(kp, Nil)
+      full <- client.read(kp)
+    yield
+      subset.contents.keySet should be (Set(k(2), k(4)))
+      subset.contents(k(2)).value.bytes.toList should be (List[Byte](20))
+      subset.contents(k(4)).value.bytes.toList should be (List[Byte](40))
+      subset.partial should be (true)
+
+      noKeys.contents should be (empty)
+      noKeys.partial should be (true)
+
+      full.contents.keySet should be ((1 to 5).map(k).toSet)
+      full.partial should be (false)
+  }
+
+  atest("Read key range") {
+    for
+      kp <- allocateFiveKeyObject(k(102))
+      range <- client.readKeyRange(kp, k(2), k(4), ByteArrayKeyOrdering)
+    yield
+      range.contents.keySet should be (Set(k(2), k(3), k(4)))
+      range.partial should be (true)
+  }
 
   atest("Read radicle") {
     client.read(radicle).map( kvos => kvos.contents.isEmpty should be (false) )

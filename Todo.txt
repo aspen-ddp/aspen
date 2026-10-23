@@ -1,15 +1,6 @@
 TODO
 ====
 
-Add ability to read subsets of keys
-  - readKeys(KeyValueObjectPointer, List[Key]): Future[KeyValueObjectState]
-    - Reads just the specified keys
-    - Partially implemented but never completed or tested
-    - Add convenience method that takes variable argument number of keys
-      - so the user can write readKeys(ptr, key1, key2, key3)
-  - readKeyRange(KeyValueObjectPointer, startKey: Key, endKey: Key): Future[KeyValueObjectState]
-    - ranges are inclusive. If startKey or endKey exists, they will be included in the returned object
-
 Implement DataUpdateOperation.Append correctly for slicing IDAs
   - Currently rejected at every layer: TransactionBuilder.append throws AppendNotYetSupported,
     RequirementsChecker fails the requirement with UnsupportedOperation, RequirementsApplyer throws

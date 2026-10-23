@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, 
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -185,6 +185,13 @@ object QuicNetFixture:
       Future.failed(new UnsupportedOperationException("QuicNetFixture has no objects to read"))
 
     override def read(pointer: KeyValueObjectPointer, comment: String): Future[KeyValueObjectState] =
+      Future.failed(new UnsupportedOperationException("QuicNetFixture has no objects to read"))
+
+    override def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String): Future[KeyValueObjectState] =
+      Future.failed(new UnsupportedOperationException("QuicNetFixture has no objects to read"))
+
+    override def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
+                              comment: String): Future[KeyValueObjectState] =
       Future.failed(new UnsupportedOperationException("QuicNetFixture has no objects to read"))
 
   final case class Delivery[M](message: M, threadName: String)

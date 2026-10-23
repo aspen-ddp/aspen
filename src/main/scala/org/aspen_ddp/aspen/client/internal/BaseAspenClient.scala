@@ -112,6 +112,17 @@ abstract class BaseAspenClient(
       rmgr.read(pointer, ida, comment).map(_.asInstanceOf[KeyValueObjectState])
     }
 
+  override def readKeys(pointer: KeyValueObjectPointer, keys: List[Key], comment: String): Future[KeyValueObjectState] =
+    resolveIda(pointer).flatMap { ida =>
+      rmgr.read(pointer, ida, comment, readType = KeySet(keys)).map(_.asInstanceOf[KeyValueObjectState])
+    }
+
+  override def readKeyRange(pointer: KeyValueObjectPointer, startKey: Key, endKey: Key, ordering: KeyOrdering,
+                            comment: String): Future[KeyValueObjectState] =
+    resolveIda(pointer).flatMap { ida =>
+      rmgr.read(pointer, ida, comment, readType = KeyRange(startKey, endKey, ordering)).map(_.asInstanceOf[KeyValueObjectState])
+    }
+
   // ---- Transactions ----
 
   override def newTransaction(): Transaction =

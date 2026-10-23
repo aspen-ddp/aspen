@@ -55,7 +55,7 @@ two object reads.
      overwrites the corresponding DataObject. `scanStart` is carried in each snapshot's payload.
      The two objects need not be overwritten in one transaction: readers apply each snapshot independently
      using its own `scanStart`.
-- The state object also records when the last run completed, so a service that moves to another host (lease
+- The state object also records the last run's `scanStart`, so a service that moves to another host (lease
   loss, crash) runs when the next run is due rather than restarting the 24h clock or running immediately.
 
 ### Readers: every `MetadataManager`

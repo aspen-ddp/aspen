@@ -15,6 +15,7 @@ import java.nio.ByteBuffer
 import java.util.UUID
 import scala.concurrent.duration.{Duration, FiniteDuration, HOURS, MINUTES}
 import scala.concurrent.{ExecutionContext, Future}
+import scala.util.control.NonFatal
 
 /** Periodically writes two zstd compressed DataObjects listing every host endpoint and every
   * store->host mapping. Nodes read them to catch up on network changes they never heard about.
@@ -140,6 +141,11 @@ class NetworkCachingService(val client: AspenClient,
       _ <- if stopped then Future.unit else write(scanStart, hosts, stores)
     yield ()
 
+  /** Names the failing item in the error, which poll's warning prints, so an operator can find it */
+  private def naming[A](what: String)(f: Future[A]): Future[A] =
+    f.recoverWith:
+      case NonFatal(t) => Future.failed(new RuntimeException(s"Failed to read $what: $t", t))
+
   private def sequentially[A, B](items: List[A])(fn: A => Future[B]): Future[List[B]] =
     items.foldLeft(Future.successful(List.empty[B])): (acc, item) =>
       acc.flatMap(done => fn(item).map(b => b :: done))
@@ -149,7 +155,7 @@ class NetworkCachingService(val client: AspenClient,
     for
       entries <- client.listHosts()
       hosts <- sequentially(entries): (_, hostId) =>
-                 client.getHostStateAndTimestamp(hostId).map: (hs, ts) =>
+                 naming(s"host $hostId")(client.getHostStateAndTimestamp(hostId)).map: (hs, ts) =>
                    CachedHost(hs.hostId, hs.name, hs.address, hs.dataPort, hs.httpPort,
                               hs.storeTransferPort, ts)
     yield hosts
@@ -158,7 +164,7 @@ class NetworkCachingService(val client: AspenClient,
     for
       entries <- client.listStoragePools()
       perPool <- sequentially(entries): (_, poolId) =>
-                   client.getStoragePoolStateAndTimestamp(poolId).map: (ps, ts) =>
+                   naming(s"storage pool $poolId")(client.getStoragePoolStateAndTimestamp(poolId)).map: (ps, ts) =>
                      ps.stores.toList.zipWithIndex.map: (entry, index) =>
                        CachedStore(StoreId(poolId, index.toByte), entry.hostId, ts)
     yield perPool.flatten
@@ -170,7 +176,7 @@ class NetworkCachingService(val client: AspenClient,
                     stores: List[CachedStore]): Future[Unit] =
     val hostBytes = NetworkSnapshot.encodeHosts(HostSnapshot(scanStart, hosts))
     val storeBytes = NetworkSnapshot.encodeStores(StoreSnapshot(scanStart, stores))
-    client.transactUntilSuccessful: tx =>
+    val written = client.transactUntilSuccessful: tx =>
       given Transaction = tx
       for
         kvos <- client.read(statePointer)
@@ -182,5 +188,9 @@ class NetworkCachingService(val client: AspenClient,
         tx.overwrite(hostPtr, hostDos.revision, DataBuffer(hostBytes))
         tx.overwrite(storePtr, storeDos.revision, DataBuffer(storeBytes))
         val reqs = KeyValueUpdate.KeyRevision(LastRunKey, kvos.contents(LastRunKey).revision) :: Nil
+        // The scan's start, not the write's completion: the next run is due a full period after this one began
         val ops = Insert(LastRunKey, encodeLastRun(scanStart)) :: Nil
         tx.update(statePointer, None, None, reqs, ops)
+    written.map: _ =>
+      logger.info(s"Wrote network snapshots: ${hosts.size} hosts in ${hostBytes.length} bytes, " +
+        s"${stores.size} stores in ${storeBytes.length} bytes")

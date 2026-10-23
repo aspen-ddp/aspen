@@ -30,8 +30,17 @@ object NetworkSnapshot:
 
   private def compress(raw: Array[Byte]): Array[Byte] = Zstd.compress(raw, CompressionLevel)
 
+  /** Far above any real snapshot (some 100 bytes per host, under 50 per store), yet small enough that a corrupt
+   *  or hostile frame cannot make a reader allocate without bound */
+  val MaxDecompressedSize: Long = 256L * 1024 * 1024
+
+  /** The frame's declared size is checked before it is allocated */
   private def decompress(b: Array[Byte]): Array[Byte] =
-    val size = Zstd.decompressedSize(b)
+    // Negative for a frame that declares no size or is not a zstd frame at all
+    val size = Zstd.getFrameContentSize(b)
     if size < 0 then
-      throw new IllegalArgumentException("Invalid network snapshot: unknown decompressed size")
+      throw new IllegalArgumentException(s"Invalid network snapshot: unknown or invalid decompressed size ($size)")
+    if size > MaxDecompressedSize then
+      throw new IllegalArgumentException(
+        s"Invalid network snapshot: declared size $size exceeds the $MaxDecompressedSize byte limit")
     Zstd.decompress(b, size.toInt)

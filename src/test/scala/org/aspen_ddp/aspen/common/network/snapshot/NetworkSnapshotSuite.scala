@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 
 class NetworkSnapshotSuite extends AnyFunSuite with Matchers:
@@ -38,3 +39,24 @@ class NetworkSnapshotSuite extends AnyFunSuite with Matchers:
   test("corrupt bytes fail to decode"):
     an[Exception] should be thrownBy NetworkSnapshot.decodeHosts(Array[Byte](1, 2, 3))
     an[Exception] should be thrownBy NetworkSnapshot.decodeStores(Array[Byte](1, 2, 3))
+
+  /** A zstd frame header alone (single segment, 8-byte content size) declaring `size` decompressed bytes */
+  private def frameDeclaring(size: Long): Array[Byte] =
+    ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN)
+      .putInt(0xFD2FB528).put(0xE0.toByte).putLong(size).array()
+
+  private def rejection(b: Array[Byte]): String =
+    val hosts = the[IllegalArgumentException] thrownBy NetworkSnapshot.decodeHosts(b)
+    val stores = the[IllegalArgumentException] thrownBy NetworkSnapshot.decodeStores(b)
+    hosts.getMessage should be(stores.getMessage)
+    hosts.getMessage
+
+  test("a declared size above the cap is rejected before allocating"):
+    rejection(frameDeclaring(NetworkSnapshot.MaxDecompressedSize + 1)) should include("exceeds")
+    rejection(frameDeclaring(1L << 40)) should include("exceeds")
+    // Would overflow an Int
+    rejection(frameDeclaring(Int.MaxValue.toLong + 1)) should include("exceeds")
+
+  test("a size the frame does not declare is rejected"):
+    rejection(frameDeclaring(-1L)) should include("unknown")
+    rejection(Array[Byte](1, 2, 3, 4, 5, 6, 7, 8)) should include("unknown")

@@ -158,3 +158,34 @@ class MetadataManagerNetworkCacheSuite extends AnyFunSuite
     mgr.getHostEntry(otherHostId) // pending
     mgr.endpointAnswer(otherHostId) should be(None)
     client.lookups.toList should be(List(otherHostId))
+
+  test("a throwing cache does not undo a host lookup, an endpoint change or a pool handoff"):
+    // (a) host lookup installs the entry and delivers parked messages
+    val c1 = new RecordingNetworkCache()
+    c1.throwOnWrite = true
+    val (m1, cl1, impl1) = newManager(c1)
+    m1.getHostEntryOrQueueMessage(remoteHostId, nudge())
+    cl1.lookupPromise(remoteHostId).success(remoteHostState)
+    m1.peekHostEntry(remoteHostId) should not be None
+    impl1.deliveredTo(remoteHostId).size should be(1)
+    c1.hostPuts should not be empty
+
+    // (b) endpointChanged installs the new entry
+    val c2 = new RecordingNetworkCache(NetworkCacheContent(Nil, List(cachedRemote(5))))
+    c2.throwOnWrite = true
+    val (m2, _, _) = newManager(c2)
+    m2.endpointChanged(changed(6))
+    m2.peekHostEntry(remoteHostId).map(_.address) should be(Some("10.9.9.9"))
+    c2.hostPuts should not be empty
+
+    // (c) pool lookup hands off every store's queue
+    val c3 = new RecordingNetworkCache()
+    c3.throwOnWrite = true
+    val (m3, cl3, impl3) = newManager(c3)
+    val s1 = StoreId(unknownPoolId, 1.toByte)
+    m3.getHostEntryOrQueueMessage(store0, nudge())
+    m3.getHostEntryOrQueueMessage(s1, nudge())
+    cl3.poolLookupPromise(unknownPoolId).success(poolStateWith(unknownPoolId, bootstrapHostId, bootstrapHostId))
+    impl3.resolutions.map(_._2).toSet should be(Set(store0, s1))
+    impl3.deliveredTo(bootstrapHostId).size should be(2)
+    c3.storePuts.size should be(2)

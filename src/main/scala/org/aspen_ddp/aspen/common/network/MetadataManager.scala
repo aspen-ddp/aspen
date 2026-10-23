@@ -120,25 +120,34 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
         case _ => None
 
   /** Cache writes. Best-effort: skip bootstrap and self entries, and log and swallow any NonFatal throw so it can
-   *  never escape into the retryability and containment paths of the callers, all of which hold the monitor. */
+   *  never escape into the retryability and containment paths of the callers, all of which hold the monitor.
+   *  Truly non-throwing for NonFatal: the log call is guarded too ("repair first, log second"), so these are safe
+   *  to call from inside those paths without a cache failure undoing an installed entry or abandoning the rest
+   *  of a pool. */
+  private def warnCache(msg: String): Unit =
+    // A throwing logger must not turn a swallowed cache failure into an escaping one
+    try logger.warn(msg)
+    catch
+      case NonFatal(_) =>
+
   private def cacheStore(storeId: StoreId, hostId: HostId, timestamp: HLCTimestamp): Unit =
     if !bootstrapStores.contains(storeId) then
       try networkCache.putStore(CachedStore(storeId, hostId, timestamp))
       catch
-        case NonFatal(t) => logger.warn(s"Network cache putStore failed for $storeId. Error: $t")
+        case NonFatal(t) => warnCache(s"Network cache putStore failed for $storeId. Error: $t")
 
   private def uncacheStore(storeId: StoreId): Unit =
     if !bootstrapStores.contains(storeId) then
       try networkCache.removeStore(storeId)
       catch
-        case NonFatal(t) => logger.warn(s"Network cache removeStore failed for $storeId. Error: $t")
+        case NonFatal(t) => warnCache(s"Network cache removeStore failed for $storeId. Error: $t")
 
   private def cacheHost(e: HostEntry, timestamp: HLCTimestamp): Unit =
     if !bootstrapHostIds.contains(e.hostId) && !selfHostId.contains(e.hostId) then
       try networkCache.putHost(CachedHost(e.hostId, e.name, e.address, e.dataPort, e.httpPort,
         e.storeTransferPort, timestamp))
       catch
-        case NonFatal(t) => logger.warn(s"Network cache putHost failed for ${e.hostId}. Error: $t")
+        case NonFatal(t) => warnCache(s"Network cache putHost failed for ${e.hostId}. Error: $t")
 
   def receivedUnknownStoreFromHost(hostId: HostId, storeId: StoreId): Unit =
     synchronized:
@@ -622,7 +631,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
                 pendingPoolLookups -= storeId.poolId
                 poolState.stores.zipWithIndex.foreach: (se, index) =>
                   val sid = StoreId(storeId.poolId, index.toByte)
-                  // Outside the try on purpose. Nothing here can throw, so this is legibility
+                  // Outside the try on purpose. Nothing here can throw (cacheStore below swallows
+                  // its own failures, including a throwing logger), so this is legibility
                   // rather than mechanism: the mapping is the part that must land for every store
                   // regardless of what the handoff does, and its position says so.
                   // StoreMoved gossip newer than this read wins: the read may predate the move.

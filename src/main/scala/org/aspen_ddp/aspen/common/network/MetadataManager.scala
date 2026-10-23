@@ -3,12 +3,14 @@ package org.aspen_ddp.aspen.common.network
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
+import org.aspen_ddp.aspen.common.network.snapshot.{HostSnapshot, StoreSnapshot}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.EvictingQueue
 import scribe.Logging
 
 import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
 import scala.util.{Failure, Success}
 
@@ -91,8 +93,16 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
   private var hostTimestamps: Map[HostId, HLCTimestamp] = Map()
   private var refreshingBootstrapConfig: Boolean = false
   private val bootstrapHostIds: Set[HostId] = initialBootstrapConfig.hosts.map(_.hostId).toSet
+  // Set by loadInitialBootstrapConfig, so it must be declared (and initialized) before that call below
+  private var initialCacheEmpty: Boolean = true
 
   loadInitialBootstrapConfig()
+
+  /** True when the networkCache's load at construction returned no stores and no hosts -- always for NoCache, and
+   *  when the load threw. Read by the snapshot reader to decide whether this process starts with nothing cached. */
+  def cacheWasEmpty: Boolean =
+    synchronized:
+      initialCacheEmpty
 
   def setAspenClient(client: AspenClient): Unit =
     synchronized:
@@ -319,6 +329,106 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
             None
           case None => None
 
+  /** Applies a network snapshot -- complete lists of every host endpoint and store -> host mapping, each read at
+   *  or after its `scanStart` -- and returns the host entries it replaced or dropped, for the caller to close.
+   *
+   *  Bootstrap stores and hosts (the config is authoritative for them) and `selfHostId` are skipped throughout.
+   *
+   *  An entry is applied only if it is newer than the timestamp held, the same rule gossip follows, so a snapshot
+   *  can never roll back a newer change. A resolved host whose endpoint is unchanged only has its timestamp
+   *  advanced: its entry, and whatever connection hangs off it, is kept. One whose endpoint changed is replaced,
+   *  and the old entry returned. A lookup in flight records the snapshot entry as gossip, exactly as
+   *  endpointChanged does, so whichever of it and the lookup's read is newer builds the entry. An unknown host is
+   *  created outright, so sends to it need no lookup.
+   *
+   *  Drops. A resolved host or a store mapping absent from its snapshot is dropped once its held timestamp is more
+   *  than `dropMargin` older than that snapshot's own `scanStart`: the scan began after the entry was written
+   *  and, margin aside, would have seen it had it still existed. The margin absorbs clock skew between the
+   *  writer of the entry and the scanner. The timestamp is kept, as everywhere else in this class, so gossip or a
+   *  later snapshot carrying the dropped value cannot resurrect it. Entries without a timestamp are bootstrap
+   *  entries and are never dropped; nor is a pending lookup, which holds nothing stale.
+   *  HostSnapshot(Zero, Nil) -- what a system that has never written a snapshot yields -- therefore drops
+   *  nothing, since no held timestamp is more than the margin older than Zero.
+   *
+   *  Never throws a NonFatal. A failing createHostEntry puts that host back to never-looked-up (its timestamp
+   *  unchanged, so the next send re-reads it) and the rest of the snapshot is still applied; the old entry, if any,
+   *  is still returned since it is no longer held. The cache is written once, by a single bulkUpdate after
+   *  everything has been applied, and a failure there is logged and swallowed like every other cache write.
+   */
+  def applySnapshot(hostSnapshot: HostSnapshot, storeSnapshot: StoreSnapshot, dropMargin: Duration): List[T] =
+    synchronized:
+      def skipHost(hostId: HostId): Boolean = bootstrapHostIds.contains(hostId) || selfHostId.contains(hostId)
+
+      // Repair first, log second: a throwing logger must not escape this method
+      def logError(msg: String, t: Throwable): Unit =
+        try logger.error(msg, t)
+        catch
+          case NonFatal(_) =>
+
+      var closeable: List[T] = Nil
+      var cachedHosts: List[CachedHost] = Nil
+      var cachedStores: List[CachedStore] = Nil
+
+      def install(ch: CachedHost): Unit =
+        try
+          val created = networkImplInterface.createHostEntry(ch.hostId, ch.name, ch.address, ch.dataPort,
+            ch.httpPort, ch.storeTransferPort, new EvictingQueue[Message](1))
+          hosts += ch.hostId -> Right(created)
+          hostTimestamps += ch.hostId -> ch.timestamp
+          cachedHosts = ch :: cachedHosts
+        catch
+          case NonFatal(t) =>
+            // Back to never-looked-up, so the next send re-reads the host
+            hosts -= ch.hostId
+            logError(s"Failed to create the host entry for hostId ${ch.hostId} from a snapshot. Error: $t", t)
+
+      hostSnapshot.hosts.foreach: ch =>
+        if !skipHost(ch.hostId) && hostTimestamps.get(ch.hostId).forall(_ < ch.timestamp) then
+          hosts.get(ch.hostId) match
+            case Some(Right(old)) =>
+              if old.address == ch.address && old.dataPort == ch.dataPort && old.httpPort == ch.httpPort &&
+                 old.storeTransferPort == ch.storeTransferPort then
+                hostTimestamps += ch.hostId -> ch.timestamp
+                cachedHosts = CachedHost(old.hostId, old.name, old.address, old.dataPort, old.httpPort,
+                  old.storeTransferPort, ch.timestamp) :: cachedHosts
+              else
+                install(ch)
+                closeable = old :: closeable
+            case Some(Left(phl)) =>
+              if phl.gossiped.forall(_.timestamp < ch.timestamp) then
+                phl.gossiped = Some(HostEndpointChanged(ch.hostId, ch.address, ch.dataPort, ch.httpPort,
+                  ch.storeTransferPort, ch.timestamp))
+            case None => install(ch)
+
+      storeSnapshot.stores.foreach: cs =>
+        if !bootstrapStores.contains(cs.storeId) && storeTimestamps.get(cs.storeId).forall(_ < cs.timestamp) then
+          stores += cs.storeId -> cs.hostId
+          storeTimestamps += cs.storeId -> cs.timestamp
+          cachedStores = cs :: cachedStores
+
+      def stale(held: HLCTimestamp, scanStart: HLCTimestamp): Boolean = scanStart - held > dropMargin
+
+      val hostsSeen = hostSnapshot.hosts.iterator.map(_.hostId).toSet
+      val droppedHosts = hosts.toList.collect:
+        case (hostId, Right(e)) if !skipHost(hostId) && !hostsSeen.contains(hostId) &&
+            hostTimestamps.get(hostId).exists(stale(_, hostSnapshot.scanStart)) => e
+      droppedHosts.foreach(e => hosts -= e.hostId)
+      closeable = droppedHosts ++ closeable
+
+      val storesSeen = storeSnapshot.stores.iterator.map(_.storeId).toSet
+      val droppedStores = stores.keys.filter: storeId =>
+        !bootstrapStores.contains(storeId) && !storesSeen.contains(storeId) &&
+          storeTimestamps.get(storeId).exists(stale(_, storeSnapshot.scanStart))
+      .toList
+      stores --= droppedStores
+
+      try networkCache.bulkUpdate(NetworkCacheContent(cachedStores.reverse, cachedHosts.reverse), droppedStores,
+        droppedHosts.map(_.hostId))
+      catch
+        case NonFatal(t) => warnCache(s"Network cache bulkUpdate failed while applying a snapshot. Error: $t")
+
+      closeable
+
   /** Refetches the bootstrap config and reinstalls the store -> host mappings it names, along
    *  with the set of stores that count as bootstrap stores.
    *
@@ -501,6 +611,8 @@ class MetadataManager[T <: MetadataManager.HostEntry](initialBootstrapConfig: Bo
           case NonFatal(t) =>
             logger.warn(s"Network cache load failed; continuing without it. Error: $t")
             NetworkCacheContent(Nil, Nil)
+
+      initialCacheEmpty = cached.stores.isEmpty && cached.hosts.isEmpty
 
       cached.stores.foreach: cs =>
         if !bootstrapStores.contains(cs.storeId) then

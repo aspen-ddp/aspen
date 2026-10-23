@@ -89,6 +89,44 @@ class DataObjectState(
       None
 }
 
+/** The result of a byte-range read of a data object. `data` holds the logical bytes beginning at `offset`.
+  * `objectLength` is the object's logical length, known only when the read reached the end of the object.
+  */
+class DataObjectRangeState(
+                            override val pointer: DataObjectPointer,
+                            revision: ObjectRevision,
+                            refcount: ObjectRefcount,
+                            timestamp: HLCTimestamp,
+                            readTimestamp: HLCTimestamp,
+                            val ida: IDA,
+                            val offset: Int,
+                            val data: DataBuffer,
+                            val objectLength: Option[Int]) extends ObjectState(pointer, revision, refcount, timestamp, readTimestamp) {
+
+  def lastUpdateTimestamp: HLCTimestamp = timestamp
+
+  def size: Int = data.size
+
+  /** Defined only when the object's length is known */
+  def appendPosition: Option[AppendPosition] = objectLength.map(AppendPosition(pointer, revision, _))
+
+  def canEqual(other: Any): Boolean = other.isInstanceOf[DataObjectRangeState]
+
+  override def equals(other: Any): Boolean =
+    other match
+      case that: DataObjectRangeState =>
+        (that `canEqual` this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount &&
+          offset == that.offset && data == that.data && objectLength == that.objectLength
+      case _ => false
+
+  override def hashCode: Int =
+    List(pointer.hashCode, revision.hashCode, refcount.hashCode, offset.hashCode, data.hashCode, objectLength.hashCode)
+      .reduce( (a,b) => a ^ b )
+
+  /** A partial state can never be used to rebuild a store */
+  def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] = None
+}
+
 object DataObjectState {
   def apply(
              pointer: DataObjectPointer,

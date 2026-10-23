@@ -37,6 +37,20 @@ trait ObjectReader {
 
   def readMetadata(pointer: ObjectPointer): Future[MetadataObjectState] = readMetadata(pointer, "")
 
+  /** Reads the logical bytes [offset, offset + length) of a data object, or [offset, end) when length is None.
+    * The result's `offset` is the requested offset and its data is clipped to the object's length when that is
+    * known. Fails with RangeReadNotSupported unless the object's IDA supports append and range reads.
+    */
+  def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int], comment: String): Future[DataObjectRangeState]
+
+  def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int]): Future[DataObjectRangeState] =
+    readRange(pointer, offset, length, "")
+
+  /** Reads the position at which the object can currently be appended to */
+  def readAppendPosition(pointer: DataObjectPointer, comment: String): Future[AppendPosition]
+
+  def readAppendPosition(pointer: DataObjectPointer): Future[AppendPosition] = readAppendPosition(pointer, "")
+
   def readOptional(pointer: DataObjectPointer)(implicit ec: ExecutionContext): Future[Option[DataObjectState]] =
     read(pointer, "").map(Some(_)).recover:
       case e: InvalidObject => None

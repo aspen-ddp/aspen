@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNod
 import org.aspen_ddp.aspen.client.ReadError
 import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.ida.{AppendableIDA, IDA}
 import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.metadata.management.{FailedStorageDeviceDurableTask, MigratePoolToSetDurableTask}
 import org.aspen_ddp.aspen.common.network.*
@@ -126,6 +126,48 @@ abstract class BaseAspenClient(
   override def readMetadata(pointer: ObjectPointer, comment: String): Future[MetadataObjectState] =
     resolveIda(pointer).flatMap { ida =>
       rmgr.read(pointer, ida, comment, readType = MetadataOnly()).map(_.asInstanceOf[MetadataObjectState])
+    }
+
+  /** Resolves the IDA and requires range read support */
+  private def resolveAppendableIda(pointer: DataObjectPointer): Future[IDA & AppendableIDA] =
+    resolveIda(pointer).flatMap:
+      case ida: (IDA & AppendableIDA) => Future.successful(ida)
+      case ida => Future.failed(new RangeReadNotSupported(pointer, ida))
+
+  override def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int],
+                         comment: String): Future[DataObjectRangeState] =
+    if offset < 0 || length.exists(_ < 0) then
+      Future.failed(new IllegalArgumentException(s"Invalid range: offset $offset length $length"))
+    else
+      resolveAppendableIda(pointer).flatMap { ida =>
+        val readType = length match
+          case Some(n) =>
+            val (start, end) = ida.sliceRangeFor(offset, n)
+            ByteRange(start, end - start)
+          case None => ByteRangeToEnd(ida.sliceOffsetFor(offset))
+        rmgr.read(pointer, ida, comment, readType = readType).map { os =>
+          trimRange(os.asInstanceOf[DataObjectRangeState], offset, length)
+        }
+      }
+
+  /** Restored windows are row-aligned and may run past the request, so they are trimmed to the request */
+  private def trimRange(state: DataObjectRangeState, offset: Int, length: Option[Int]): DataObjectRangeState =
+    val bytes = state.data.getByteArray
+    val from = math.min(offset - state.offset, bytes.length)
+    val requestedEnd = length.fold(Long.MaxValue)(offset.toLong + _)
+    val limit = math.min(requestedEnd, state.objectLength.fold(Long.MaxValue)(_.toLong))
+    val end = math.min(limit - state.offset, bytes.length.toLong).toInt
+    val trimmed = if end <= from then Array.emptyByteArray else bytes.slice(from, end)
+    new DataObjectRangeState(state.pointer, state.revision, state.refcount, state.timestamp, state.readTimestamp,
+      state.ida, offset, DataBuffer(trimmed), state.objectLength)
+
+  override def readAppendPosition(pointer: DataObjectPointer, comment: String): Future[AppendPosition] =
+    resolveAppendableIda(pointer).flatMap { ida =>
+      rmgr.read(pointer, ida, comment, readType = SliceTail(ida.lengthProbeBytes)).flatMap { os =>
+        os.asInstanceOf[DataObjectRangeState].appendPosition match
+          case Some(position) => Future.successful(position)
+          case None => Future.failed(new CorruptedObject(pointer))
+      }
     }
 
   // ---- Transactions ----

@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.AspenError
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.ObjectPointer
 
 sealed abstract class ReadError(msg: String) extends AspenError(msg) {
@@ -20,6 +21,9 @@ class CorruptedObject(val pointer: ObjectPointer) extends FatalReadError("Corrup
 
 /** Thrown when IDA decoding fails */
 class CorruptedIDA(pointer: ObjectPointer) extends CorruptedObject(pointer)
+
+/** Thrown when a byte-range read is attempted on an object whose IDA does not support them */
+class RangeReadNotSupported(val pointer: ObjectPointer, val ida: IDA) extends FatalReadError("RangeReadNotSupported")
 
 /** Thrown when the content of a complex object such as a KeyValue object becomes corrupted
   *  and cannot be decoded.

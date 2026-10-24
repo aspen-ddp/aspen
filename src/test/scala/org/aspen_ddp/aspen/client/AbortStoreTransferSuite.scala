@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -13,6 +14,38 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
 
   private val sourceId = StorageDeviceId.BootstrapStorageDeviceId
   private val storeId = StoreId(PoolId.BootstrapPoolId, 1)
+
+  private def takeNudges(): List[CheckStorageDevice] =
+    net.takeCapturedHostMessages().collect:
+      case m: CheckStorageDevice => m
+
+  atest("abortStoreTransfer nudges the source and destination hosts"):
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(storeId, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = takeNudges()
+      _ <- client.abortStoreTransfer(storeId)
+      nudges = takeNudges()
+      src <- client.getStorageDeviceState(sourceId)
+      dst <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      nudges.map(n => (n.deviceId, n.toHost)).toSet should be(
+        Set((sourceId, src.hostId), (net.secondDeviceId, dst.hostId)))
+      nudges.size should be(2)
+      nudges.map(_.fromClient).distinct should be(List(client.clientId))
+
+  atest("abortStoreTransfer sends no nudge when nothing was outstanding"):
+    given ExecutionContext = executionContext
+    for
+      _ <- waitForTransactionsToComplete()
+      _ = takeNudges()
+      _ <- client.abortStoreTransfer(storeId)
+      nudges = takeNudges()
+    yield
+      nudges should be(Nil)
 
   atest("abortStoreTransfer rolls back an outstanding transfer on both devices"):
     given ExecutionContext = executionContext

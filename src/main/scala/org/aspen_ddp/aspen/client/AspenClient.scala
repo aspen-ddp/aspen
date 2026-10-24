@@ -453,8 +453,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *  transfer device and the destination's TransferringIn entry is removed, in one transaction.
    *
    *  Succeeds and changes nothing when no transfer is outstanding -- the store is Active, or the
-   *  transfer already completed and the pool names the destination. Sends no host message: a host
-   *  that has begun moving bytes notices the withdrawn entries on its next device poll.
+   *  transfer already completed and the pool names the destination. When it does change something,
+   *  best-effort CheckStorageDevice nudges go to the source and destination hosts once the
+   *  transaction has committed, so a host that has begun moving bytes sees the withdrawn entries
+   *  promptly rather than on its next device poll. Nothing is sent when nothing changed.
    */
   def abortStoreTransfer(storeId: StoreId): Future[Unit] =
     given ExecutionContext = this.clientContext
@@ -465,7 +467,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       // As in transferStore: an unlisted error must not MatchError out of onFail.
       case _ => Future.unit
 
-    transactUntilSuccessfulWithRecovery(onFail): tx =>
+    val fStaged: Future[List[CheckStorageDevice]] = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
 
       for
@@ -486,9 +488,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
               dstKvos <- read(dstPtr)
             yield Some((dstPtr, dstKvos))
       yield
-        for
-          (dstPtr, dstKvos) <- dstRead
-        do
+        // Built here and sent after commit, as in transferStore, so a retried attempt cannot
+        // double-send. Empty when nothing was changed.
+        dstRead.toList.flatMap: (dstPtr, dstKvos) =>
           val newSrcState = srcState.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Active, None)
           tx.update(srcPtr, None, None,
             List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision)),
@@ -505,6 +507,12 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
             tx.update(dstPtr, None, None,
               List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision)),
               List(Insert(StorageDeviceState.StateKey, dstState.removeStore(storeId).encode())))
+
+          List(
+            CheckStorageDevice(srcState.hostId, clientId, sourceId),
+            CheckStorageDevice(dstState.hostId, clientId, outstanding.get))
+
+    fStaged.map(_.foreach(sendBestEffortHostMessage))
 
   def getBootstrapConfig(): Future[String] =
     given ExecutionContext = this.clientContext

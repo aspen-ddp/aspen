@@ -127,6 +127,41 @@ class DataObjectRangeState(
   def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] = None
 }
 
+/** The result of a multi-range read of a data object. `ranges` holds one restored (row-aligned, untrimmed) state per
+  * requested range, in request order. `objectLength` is the object's logical length, taken from the tail piece.
+  */
+class DataObjectRangesState(
+                             override val pointer: DataObjectPointer,
+                             revision: ObjectRevision,
+                             refcount: ObjectRefcount,
+                             timestamp: HLCTimestamp,
+                             readTimestamp: HLCTimestamp,
+                             val ida: IDA,
+                             val ranges: List[DataObjectRangeState],
+                             val objectLength: Option[Int]) extends ObjectState(pointer, revision, refcount, timestamp, readTimestamp) {
+
+  def lastUpdateTimestamp: HLCTimestamp = timestamp
+
+  /** Defined only when the object's length is known */
+  def appendPosition: Option[AppendPosition] = objectLength.map(AppendPosition(pointer, revision, _))
+
+  def canEqual(other: Any): Boolean = other.isInstanceOf[DataObjectRangesState]
+
+  override def equals(other: Any): Boolean =
+    other match
+      case that: DataObjectRangesState =>
+        (that `canEqual` this) && pointer == that.pointer && revision == that.revision && refcount == that.refcount &&
+          ranges == that.ranges && objectLength == that.objectLength
+      case _ => false
+
+  override def hashCode: Int =
+    List(pointer.hashCode, revision.hashCode, refcount.hashCode, ranges.hashCode, objectLength.hashCode)
+      .reduce( (a,b) => a ^ b )
+
+  /** A partial state can never be used to rebuild a store */
+  def getRebuildDataForStore(storeId: StoreId): Option[DataBuffer] = None
+}
+
 object DataObjectState {
   def apply(
              pointer: DataObjectPointer,

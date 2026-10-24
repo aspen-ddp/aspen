@@ -1,11 +1,11 @@
 package org.aspen_ddp.aspen.client.internal.read
 
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{DataObjectRangeState, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadDriverClient, ReadError}
+import org.aspen_ddp.aspen.client.{DataObjectRangeState, DataObjectRangesState, DataObjectState, KeyValueObjectState, MetadataObjectState, ObjectState, ReadDriverClient, ReadError}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
-import org.aspen_ddp.aspen.common.objects.{ByteRange, ByteRangeToEnd, SliceTail, DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{ByteRange, ByteRanges, ByteRangeToEnd, SliceTail, DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import scribe.Logging
 
@@ -26,7 +26,7 @@ abstract class BaseReadDriver(
   /** Partial results must never be cached or used for opportunistic rebuilds: the entries they omit would
     * be mistaken for deletions. Metadata-only results carry no content at all */
   private val isPartial: Boolean = readType match
-    case _: KeySet | _: KeyRange | _: MetadataOnly | _: ByteRange | _: ByteRangeToEnd | _: SliceTail => true
+    case _: KeySet | _: KeyRange | _: MetadataOnly | _: ByteRange | _: ByteRanges | _: ByteRangeToEnd | _: SliceTail => true
     case _ => false
 
   // Detect invalid combinations
@@ -36,7 +36,7 @@ abstract class BaseReadDriver(
 
     case (p: DataObjectPointer,     _:MetadataOnly) => new DataObjectReader(true, p, ida, readUUID)
     case (p: DataObjectPointer,     _:FullObject) => new DataObjectReader(false, p, ida, readUUID)
-    case (p: DataObjectPointer,     _: (ByteRange | ByteRangeToEnd | SliceTail)) => new DataObjectRangeReader(p, ida, readUUID, readType)
+    case (p: DataObjectPointer,     _: (ByteRange | ByteRanges | ByteRangeToEnd | SliceTail)) => new DataObjectRangeReader(p, ida, readUUID, readType)
     case (_: DataObjectPointer,     rt) => throw new IllegalArgumentException(s"Read type $rt is not supported for DataObjects")
 
     case _ => throw new AssertionError("Invalid read combination")
@@ -128,6 +128,7 @@ abstract class BaseReadDriver(
               os match {
                 case dos: DataObjectState => HLCTimestamp.update(dos.timestamp)
                 case rs: DataObjectRangeState => HLCTimestamp.update(rs.timestamp)
+                case rs: DataObjectRangesState => HLCTimestamp.update(rs.timestamp)
                 case kvos: KeyValueObjectState => HLCTimestamp.update(kvos.lastUpdateTimestamp)
                 case mos: MetadataObjectState => HLCTimestamp.update(mos.timestamp)
               }
@@ -147,6 +148,7 @@ abstract class BaseReadDriver(
             case Right(obj) =>
               obj match {
                 case rs: DataObjectRangeState => logger.info(s"Read UUID $readUUID: Successfully read DataObject range of ${objectPointer.id} Rev ${rs.revision} Ref ${rs.refcount} Offset ${rs.offset} Size ${rs.data.size}")
+                case rs: DataObjectRangesState => logger.info(s"Read UUID $readUUID: Successfully read DataObject ranges of ${objectPointer.id} Rev ${rs.revision} Ref ${rs.refcount} Ranges ${rs.ranges.size}")
                 case dos: DataObjectState => logger.info(s"Read UUID $readUUID: Successfully read DataObject ${objectPointer.id} Rev ${dos.revision} Ref ${dos.refcount} Size ${dos.data.size} Hash ${dos.data.hashString}")
                 case kvos: KeyValueObjectState => logger.info(s"Read UUID $readUUID: Successfully read KeyValueObject ${objectPointer.id} Rev ${kvos.revision} Ref ${kvos.refcount} Num Entries ${kvos.contents.size}")
                 case mos: MetadataObjectState => logger.info(s"Read UUID $readUUID: Successfully read MetadataObject ${objectPointer.id} Rev ${mos.revision} Ref ${mos.refcount}")

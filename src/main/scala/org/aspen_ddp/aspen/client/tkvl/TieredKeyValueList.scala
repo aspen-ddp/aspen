@@ -124,9 +124,11 @@ class TieredKeyValueList(val client: AspenClient,
         yield
           kvp
 
+    // Returns the new tree's tier along with its root. The path has one node per tier, and it
+    // can be a tier shorter than `tier` if a tier reduction raced the descent.
     def nonEmpty(tier: Int,
                  ordering: KeyOrdering,
-                 root: KeyValueListNode): Future[KeyValueObjectPointer] =
+                 root: KeyValueListNode): Future[(Int, KeyValueObjectPointer)] =
       for
         e <- fetchContainingNodePath(client, tier, 0, ordering, splitAtKey, root, Set())
 
@@ -142,12 +144,12 @@ class TieredKeyValueList(val client: AspenClient,
 
         kvp <- rinsert(1, ordering, rpath.tail, down.pointer)
       yield
-        kvp
+        (rpath.length - 1, kvp)
 
     for
       oldRoot <- rootManager.getRoot()
       (tier, ordering, oroot) <- rootManager.getRootNode()
-      ptr <- oroot match
+      (newTier, ptr) <- oroot match
         case Some(root) => nonEmpty(tier, ordering, root)
         case None =>
           for
@@ -155,9 +157,9 @@ class TieredKeyValueList(val client: AspenClient,
             alloc <- rootManager.getAllocatorForTier(0)
             ptr <- alloc.allocateKeyValueObject(Map[Key, Value]())
           yield
-            ptr
+            (tier, ptr)
     yield
-      Root(tier, ordering, Some(ptr), oldRoot.nodeAllocator)
+      Root(newTier, ordering, Some(ptr), oldRoot.nodeAllocator)
   }
 
   def set(key: Key,
@@ -362,6 +364,10 @@ object TieredKeyValueList {
    blacklists them), so any InvalidObject here comes from the target-tier scan. currentNode is
    the leftmost node of its tier, which a join never deletes, so refreshing it and descending
    again sees the list as the join left it.
+
+   Tier reduction does delete the root, though, so the refresh fails if one ran after the caller
+   read it. The deleted root held only its AbsoluteMinimum child, which became the new root, so
+   the restart descends from that child one tier down instead.
    */
   private[tkvl] def fetchContainingNodePath(client: AspenClient,
                                             currentTier: Int,
@@ -374,12 +380,24 @@ object TieredKeyValueList {
 
     given ExecutionContext = client.clientContext
 
-    def attempt(start: KeyValueListNode, restarts: Int): Future[Either[Set[ObjectId], List[KeyValueListNode]]] =
-      descend(client, currentTier, targetTier, ordering, target, start, initialBlacklist, reversePath).recoverWith:
-        case _: InvalidObject if restarts < MaxJoinRaceRestarts =>
-          start.refresh().flatMap(attempt(_, restarts + 1))
+    def leftmostChild(stale: KeyValueListNode): Future[KeyValueListNode] =
+      stale.contents.get(Key.AbsoluteMinimum) match
+        case None => Future.failed(new BrokenTree())
+        case Some(vs) =>
+          val lp = KeyValueListPointer(Key.AbsoluteMinimum, KeyValueObjectPointer(vs.value.bytes))
+          client.read(lp.pointer, s"TKVL restart below deleted root ${stale.pointer.id}").map: kvos =>
+            KeyValueListNode(client, lp, ordering, kvos)
 
-    attempt(currentNode, 0)
+    def attempt(tier: Int,
+                start: KeyValueListNode,
+                restarts: Int): Future[Either[Set[ObjectId], List[KeyValueListNode]]] =
+      descend(client, tier, targetTier, ordering, target, start, initialBlacklist, reversePath).recoverWith:
+        case _: InvalidObject if restarts < MaxJoinRaceRestarts =>
+          start.refresh().map(n => (tier, n)).recoverWith:
+            case _: InvalidObject if tier > targetTier => leftmostChild(start).map(n => (tier - 1, n))
+          .flatMap((t, n) => attempt(t, n, restarts + 1))
+
+    attempt(currentTier, currentNode, 0)
   }
 
   private def descend(client: AspenClient,
@@ -408,7 +426,7 @@ object TieredKeyValueList {
           fetchNode(client, ordering, targetTier, candidates.head._1, candidates.head._2, blacklist) foreach {
             case Left(blklst) => rtry(candidates.tail, blklst)
             case Right(next) => descend(client, currentTier-1, targetTier, ordering, target,
-              next, blacklist, reversePath).onComplete {
+              next, blacklist, currentNode :: reversePath).onComplete {
               case Failure(err) => p.failure(err)
               case Success(Left(blklst)) => p.success(Left(blklst + next.pointer.id))
               case Success(Right(rpath)) => p.success(Right(rpath))

@@ -1,10 +1,3 @@
-A tiered-list scan restart fails if tier reduction deleted the root it restarts from
-  - TieredKeyValueList.fetchContainingNodePath restarts a scan that read a node deleted by a
-    racing join by refreshing the node the descent started from (the tree root). If a
-    JoinFinalizationAction's tier reduction deleted that root after the caller read it, the
-    refresh itself fails with InvalidObject. Rare (needs both races at once). Fix by falling
-    back to the stale root's AbsoluteMinimum child, one tier down, which a join never deletes
-
 Follow-ups from parallel store transfers
   1. SetRebalanceDurableTask passes can overlap (wake() plus the poll, no single-flight
      guard). Add boundedSingleFlight (maxInFlight 2, arm the poll at pass start).

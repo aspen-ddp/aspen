@@ -3,7 +3,8 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 import scala.concurrent.Future
@@ -476,12 +477,15 @@ class TKVLSuite extends IntegrationTestSuite {
     yield
       nodes
 
-  /** Hands out `stale` as a tier-0 root on the first getRootNode call, then defers to `real`.
+  /** Hands out `stale` as a root of `staleTier` on the first getRootNode call, then defers to
+   *  `real`.
    *
-   *  Reproduces a client that read the leftmost tier-0 node just before a join committed, so
-   *  the races below are deterministic.
+   *  Reproduces a client that read the root just before a join committed, so the races below
+   *  are deterministic.
    */
-  private class StaleOnceRootManager(real: RootManager, stale: KeyValueListNode) extends RootManager:
+  private class StaleOnceRootManager(real: RootManager,
+                                     stale: KeyValueListNode,
+                                     staleTier: Int = 0) extends RootManager:
     private var served = false
     def getRoot(): Future[Root] = real.getRoot()
     def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] =
@@ -489,7 +493,7 @@ class TKVLSuite extends IntegrationTestSuite {
         real.getRootNode()
       else
         served = true
-        Future.successful((0, stale.ordering, Some(stale)))
+        Future.successful((staleTier, stale.ordering, Some(stale)))
     def createInitialNode(contents: Map[Key, Value])(using tx: Transaction): Future[Unit] =
       real.createInitialNode(contents)
     def getAllocatorForTier(tier: Int): Future[ObjectAllocator] =
@@ -539,6 +543,47 @@ class TKVLSuite extends IntegrationTestSuite {
       v2.isEmpty should be (false)
   }
 
+  atest("A scan restart falls back a tier when tier reduction deleted the root") {
+    for
+      (tree, root, keys) <- buildSplitTree(3)
+      (numTiers, ordering, oroot) <- root.getRootNode()
+      realRoot = oroot.getOrElse(throw new BrokenTree())
+      ikvos <- client.read(radicle)
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+
+      // deadRoot stands in for a root that tier reduction deleted. x stands in for a node read
+      // just before a join deleted its right neighbour, deadRight.
+      tx0 = client.newTransaction()
+      _ = tx0.lockRevision(radicle, ikvos.revision)
+      deadRoot <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)
+      deadRight <- alloc.allocateKeyValueObject(Map[Key, Value]())(using tx0)
+      x <- alloc.allocateKeyValueObject(Map(Key(2) -> Value(Array[Byte](2))),
+             right = Some(Value(KeyValueListPointer(Key(3), deadRight).toArray)))(using tx0)
+      _ <- tx0.commit()
+      _ <- waitForTransactionsToComplete()
+
+      rootState <- client.read(deadRoot)
+      rightState <- client.read(deadRight)
+      tx1 = client.newTransaction()
+      _ = tx1.setRefcount(deadRoot, rootState.refcount, rootState.refcount.decrement())
+      _ = tx1.setRefcount(deadRight, rightState.refcount, rightState.refcount.decrement())
+      _ <- tx1.commit()
+      _ <- waitForTransactionsToComplete()
+
+      // The descent for key 3 picks x, scans right into deadRight, and must then restart
+      // without refreshing deadRoot. Its leftmost child is the real tier-0 list.
+      leftmost = realRoot.contents(Key.AbsoluteMinimum)
+      stale = new KeyValueListNode(client, realRoot.ida, deadRoot, ordering, Key.AbsoluteMinimum,
+        realRoot.revision, realRoot.refcount,
+        Map(Key.AbsoluteMinimum -> leftmost, Key(2) -> leftmost.copy(value = Value(x.toArray))), None)
+      staleTree = new TieredKeyValueList(client, new StaleOnceRootManager(root, stale, numTiers))
+      v <- staleTree.get(Key(3))
+    yield
+      numTiers should be (1)
+      v.isEmpty should be (false)
+  }
+
   atest("A scan into a permanently deleted node fails rather than hanging") {
     for
       (tree, root, keys) <- buildSplitTree(3)
@@ -555,6 +600,33 @@ class TKVLSuite extends IntegrationTestSuite {
     yield
       numTiers should be >= 1
       result.failed.get shouldBe a [InvalidObject]
+  }
+
+  atest("splitTree splits every tier of a multi-tier tree") {
+    val newTreeKey = Key(Array[Byte](1))
+    val splitAtKey = Key(3)
+    for
+      (tree, root, keys) <- buildSplitTree(4)
+      (numTiers, ordering, _) <- root.getRootNode()
+
+      splitTx = client.newTransaction()
+      newRoot <- tree.splitTree(splitAtKey)(using splitTx)
+      _ = splitTx.update(root.pointer, None, None, KeyValueUpdate.DoesNotExist(newTreeKey) :: Nil,
+            Insert(newTreeKey, newRoot.encode()) :: Nil)
+      _ <- splitTx.commit()
+      _ <- waitForTransactionsToComplete()
+
+      newTree = new TieredKeyValueList(client, new KVObjectRootManager(client, newTreeKey, root.pointer))
+      (_, _, ooldRoot) <- root.getRootNode()
+      oldValues <- Future.sequence(keys.map(tree.get))
+      newValues <- Future.sequence(keys.map(newTree.get))
+    yield
+      numTiers should be >= 1
+      newRoot.tier should be (numTiers)
+      oldValues.map(_.isDefined) should be (List(true, true, false, false))
+      newValues.map(_.isDefined) should be (List(false, false, true, true))
+      // The original tree's upper tier must not keep entries for nodes that moved to the new tree
+      ooldRoot.get.contents.keys.filter(k => ordering.compare(k, splitAtKey) >= 0) should be (empty)
   }
 
   atest("foreach visits every key exactly once on a split tree") {

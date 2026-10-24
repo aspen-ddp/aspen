@@ -137,9 +137,7 @@ object KVObjectRootManager extends RootManagerFactory {
                  hostingObject: KeyValueObjectPointer,
                  rootKey: Key,
                  requireKeyNotExist: Boolean,
-                 rootPointer: KeyValueObjectPointer,
-                 ordering: KeyOrdering,
-                 nodeAllocator: NodeAllocator)(using tx:Transaction): Future[KVObjectRootManager] =
+                 root: Root)(using tx:Transaction): Future[KVObjectRootManager] =
 
     given ExecutionContext = client.clientContext
 
@@ -147,7 +145,6 @@ object KVObjectRootManager extends RootManagerFactory {
       KeyValueUpdate.DoesNotExist(rootKey) :: Nil
     else
       Nil
-    val root = Root(0, ordering, Some(rootPointer), nodeAllocator)
     tx.update(hostingObject, None, None, kreqs, Insert(rootKey, root.encode()) :: Nil)
     tx.result.map:  _ =>
       new KVObjectRootManager(client, rootKey, hostingObject)
@@ -186,7 +183,7 @@ object KVObjectRootManager extends RootManagerFactory {
       kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
       rptr <- alloc.allocateKeyValueObject(initialContent)
     yield
-      setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
+      setNewRoot(client, pointer, key, true, Root(0, ordering, Some(rptr), nodeAllocator))
     /*
     if initialContent.isEmpty then
       Future.successful(Future.successful(new KVObjectRootManager(client, key, pointer)))
@@ -196,6 +193,6 @@ object KVObjectRootManager extends RootManagerFactory {
         kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
         rptr <- alloc.allocateKeyValueObject(initialContent)
       yield
-        setNewRoot(client, pointer, key, true, rptr, ordering, nodeAllocator)
+        setNewRoot(client, pointer, key, true, Root(0, ordering, Some(rptr), nodeAllocator))
      */
 }

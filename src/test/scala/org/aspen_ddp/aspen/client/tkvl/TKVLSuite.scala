@@ -3,8 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Insert, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, Value}
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 import scala.concurrent.Future
@@ -611,12 +610,12 @@ class TKVLSuite extends IntegrationTestSuite {
 
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
-      _ = splitTx.update(root.pointer, None, None, KeyValueUpdate.DoesNotExist(newTreeKey) :: Nil,
-            Insert(newTreeKey, newRoot.encode()) :: Nil)
+      fnewTreeRoot = KVObjectRootManager.setNewRoot(client, root.pointer, newTreeKey, true, newRoot)(using splitTx)
       _ <- splitTx.commit()
       _ <- waitForTransactionsToComplete()
 
-      newTree = new TieredKeyValueList(client, new KVObjectRootManager(client, newTreeKey, root.pointer))
+      newTreeRoot <- fnewTreeRoot
+      newTree <- newTreeRoot.getTree()
       (_, _, ooldRoot) <- root.getRootNode()
       oldValues <- Future.sequence(keys.map(tree.get))
       newValues <- Future.sequence(keys.map(newTree.get))

@@ -193,7 +193,8 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
       _ = tx0.bumpVersion(radicle, kvos0.revision)
       _ <- tx0.commit()
       tx1 = client.newTransaction()
-      frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true, rootNode, ByteArrayKeyOrdering, na)(using tx1)
+      frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true,
+        Root(0, ByteArrayKeyOrdering, Some(rootNode), na))(using tx1)
       _ <- tx1.commit()
       rootManager <- frm
       action = new SplitFinalizationAction(client, null, rootManager, 1, Key(Array[Byte](5)), newNode)

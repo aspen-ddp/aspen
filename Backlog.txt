@@ -1,41 +1,8 @@
-
-A single stuck transfer start can freeze a pool migration or a set rebalance
-  - Both MigratePoolToSetDurableTask (tryStores) and SetRebalanceDurableTask (advance,
-    folded sequentially over a pass's not-started transfers) *wait for*
-    TransferStarter.start before the pass is allowed to finish. A migration pass may
-    start several transfers; each start is awaited in turn
-  - TransferStarter.start awaits client.transferStore, the post-start verification
-    reads of pool and device state, and on rollback client.abortStoreTransfer.
-    transferStore and abortStoreTransfer run under transactUntilSuccessfulWithRecovery,
-    which retries forever on any error not classified as StopRetrying (only
-    NoSuchElementException, InvalidDestination, StoreNotActive and DeviceFailed give
-    up). Anything else (a persistently colliding or unreachable device object, a host
-    that never answers) is retried with no attempt limit and no deadline, so the
-    Future never completes
-  - While that Future is pending the pass never ends, and in both tasks the next poll
-    is armed by scheduleRecheck only at the end of a pass, so no tick is scheduled at
-    all. Further:
-      1. migration: the single-flight guard (boundedSingleFlight) stays set, so any
-         other trigger is dropped; SystemTaskRunner.heartbeat() bumps every *running*
-         task whether or not it is making progress, so the service never decides the
-         task is dead and re-dispatches it; and a retarget is only noticed at the
-         start of a pass, so it cannot rescue it either
-      2. rebalance: only wake() (a TransferComplete message) can start another pass,
-         and that pass may itself block on the same call
-  - The result is a task that shows as running forever and moves nothing
-  - The retry loop is the right recovery for genuinely transient faults, which is
-    why it was left alone. The fix is to stop the pass from depending on the
-    calls' completion (fire and let the next poll observe the device entries) or to
-    give them a bounded number of attempts
-  - Deliberately split out of the parallel-store-transfers work
-    (docs/superpowers/specs/2026-10-24-parallel-store-transfers-design.md)
-
 Follow-ups from parallel store transfers
   1. SetRebalanceDurableTask passes can overlap (wake() plus the poll, no single-flight
-     guard). Add boundedSingleFlight (maxInFlight 2, arm the poll at pass start)
-     together with the stall decision in the entry above. MigratePoolToSetDurableTask lost its
-     end-of-pass wakeup because its guard dropped a tick that fired before the pass released
-     (fixed: run() now arms the poll on every call). SetRebalanceDurableTask does NOT have
+     guard). Add boundedSingleFlight (maxInFlight 2, arm the poll at pass start).
+     MigratePoolToSetDurableTask lost its end-of-pass wakeup because its guard dropped a
+     tick that fired before the pass released (fixed: run() now arms the poll on every call). SetRebalanceDurableTask does NOT have
      that race today, since with no guard no tick is ever dropped and every pass ends in
      scheduleRecheck, a re-entry, or finish. Adding the guard here WOULD introduce it, so
      arm the poll at the start of every call (as the migration task's run() does) in the

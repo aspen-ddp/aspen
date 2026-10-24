@@ -363,16 +363,14 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def transferStore(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = this.clientContext
 
+    // Only a collision is retried. Every other error -- InvalidObject from a deleted pool or
+    // device, CorruptedObject, a TransactionCreationError, InvalidDestination, ... -- fails the
+    // same way on every attempt, so retrying it would never complete the future, and the
+    // rebalance and migration tasks await it inside a pass. They treat a failure as "back off and
+    // retry on the next poll", so misclassifying a transient error costs only one poll interval.
     def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: InvalidDestination => throw StopRetrying(e)
-      case e: StoreNotActive => throw StopRetrying(e)
-      case e: DeviceFailed => throw StopRetrying(e)
-      // Without this, an unlisted error -- a CorruptedObject on either device read, say --
-      // MatchErrors out of onFail, ExponentialBackoffRetryStrategy catches it and reschedules,
-      // and the promise never completes. MigratePoolToSetDurableTask.tryStores awaits this
-      // future inside a pass, so that permanently wedges the migration task's single-flight flag.
-      case _ => Future.unit
+      case _: TransactionAborted => Future.unit
+      case e => throw StopRetrying(e)
 
     val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx
@@ -461,11 +459,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def abortStoreTransfer(storeId: StoreId): Future[Unit] =
     given ExecutionContext = this.clientContext
 
+    // As in transferStore: only a collision is retried.
     def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: DeviceFailed => throw StopRetrying(e)
-      // As in transferStore: an unlisted error must not MatchError out of onFail.
-      case _ => Future.unit
+      case _: TransactionAborted => Future.unit
+      case e => throw StopRetrying(e)
 
     val fStaged: Future[List[CheckStorageDevice]] = transactUntilSuccessfulWithRecovery(onFail): tx =>
       given Transaction = tx

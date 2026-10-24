@@ -1,13 +1,6 @@
 TODO
 ====
 
-QUIC tests seem to fail randomly. Likely due to load. The test suite needs to pass correctly under load.
-Investigate the causes of these failures and see what can be done to improve reliability. Note simply
-increasing timeouts/linger and the like is generally not acceptable as it can dramatically increase the
-duration of the regression. Some increases for reliability are probably allowable but they must be
-relatively small in the common case. If the test can somehow detect that it is running under load and
-increase its timeouts/linger only under those circumstances, that might be reasonable.
-
 RangedWrites - AppendingReedSolomon should be able to efficiently update sections of a large DataObject
 
 Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to

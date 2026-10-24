@@ -164,7 +164,7 @@ final class QuicTestPeer private (val isServer: Boolean,
     group.shutdownGracefully(0, AwaitMillis, TimeUnit.MILLISECONDS).awaitUninterruptibly(AwaitMillis)
 
 object QuicTestPeer:
-  val AwaitMillis: Long = 5000
+  def AwaitMillis: Long = LoadProbe.scaleMillis(5000)
   val DefaultIdle: Duration = Duration(10, SECONDS)
 
   enum Transport:

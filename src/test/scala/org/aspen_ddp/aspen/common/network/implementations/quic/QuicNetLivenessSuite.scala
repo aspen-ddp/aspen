@@ -21,9 +21,10 @@ import scala.jdk.CollectionConverters.*
 class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with BeforeAndAfterEach:
   import QuicNetFixture.*
 
-  private val HeartbeatPeriod = Duration(200, MILLISECONDS)
-  private val IdleTimeout = Duration(600, MILLISECONDS)
-  private val WaitMillis = 5000L
+  // Stretched on a loaded machine, where an event loop can miss a 600ms idle timeout through CPU starvation alone
+  private def HeartbeatPeriod = LoadProbe.scale(Duration(200, MILLISECONDS))
+  private def IdleTimeout = LoadProbe.scale(Duration(600, MILLISECONDS))
+  private def WaitMillis = LoadProbe.scaleMillis(5000L)
 
   private var previousLevel: ResourceLeakDetector.Level = scala.compiletime.uninitialized
   private var leakWatch: QuicTestPeer.LeakWatch = scala.compiletime.uninitialized
@@ -130,7 +131,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val connsBefore = c.net.connectionCount
     connsBefore shouldBe 1
     // The client sends nothing for more than three idle timeouts
-    Thread.sleep(2000)
+    Thread.sleep(LoadProbe.scaleMillis(2000))
     val resp = response(c.net.clientId, req.toStore, req.readUUID)
     fx.a.net.serverMessenger.sendClientResponse(resp)
     await(c.handler.clientResponses, 1).map(_.message) shouldBe List(resp)
@@ -141,7 +142,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val stale = entryFor(fx.a.net, fx.hostIdB).connection.get()
     stale should not be null
     fx.stopB()
-    eventually("A's connection to the stopped B closes", 3000):
+    eventually("A's connection to the stopped B closes", LoadProbe.scaleMillis(3000)):
       stale.isClosed
     fx.startB()
     val m = rebuildData(fx.storesB.head)
@@ -162,7 +163,8 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     await(fx.b.handler.txMessages, 1, WaitMillis)
     val stale = entryFor(fx.a.net, fx.hostIdB).connection.get()
     stale should not be null
-    stale.isActive shouldBe true
+    // The queued message is flushed before the connection is marked active, so B can receive it first
+    eventually("A's connection to B is active", WaitMillis)(stale.isActive)
     fx.crashB()
     fx.startB()
     val restarted = System.nanoTime()
@@ -192,7 +194,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val m = txHeartbeat(fx.storesB.head, fx.storesA.head)
     fx.a.net.serverMessenger.sendTransactionMessage(m)
     await(fx.b.handler.txMessages, 1, WaitMillis).map(_.message) shouldBe List(m)
-    Thread.sleep(500)
+    Thread.sleep(LoadProbe.scaleMillis(500))
     recA.restarts shouldBe empty
     recB.restarts shouldBe empty
     entryFor(fx.b.net, fx.hostIdA).connection.get() should be theSameInstanceAs bOut
@@ -313,7 +315,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
       !fx.a.net.isStoreOffline(store) && !fx.b.net.isStoreOffline(store) && !c.net.isStoreOffline(store)
     // A retransmit of the StoreOffline is older than the StoreMoved, so it changes nothing
     fx.a.net.serverMessenger.broadcastGossip(StoreOffline(store, wentOffline))
-    Thread.sleep(300)
+    Thread.sleep(LoadProbe.scaleMillis(300))
     fx.b.net.isStoreOffline(store) shouldBe false
     c.net.isStoreOffline(store) shouldBe false
 
@@ -368,7 +370,7 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val totalBefore = fx.a.handler.total
     val undecodableBefore = fx.a.net.undecodableDatagrams
     // Quiet for several keepalive intervals (idleTimeout / 2 = 300ms)
-    eventually("A receives keepalives from the quiet client", 3000):
+    eventually("A receives keepalives from the quiet client", LoadProbe.scaleMillis(3000)):
       fx.a.net.keepalivesReceived >= 3
     fx.a.handler.total shouldBe totalBefore
     fx.a.net.undecodableDatagrams shouldBe undecodableBefore

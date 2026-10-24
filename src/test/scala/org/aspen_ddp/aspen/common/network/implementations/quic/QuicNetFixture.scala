@@ -115,7 +115,8 @@ object QuicNetFixture:
     OpportunisticRebuild(to, ClientId(UUID.randomUUID()), ptr, ObjectRevision(TransactionId(UUID.randomUUID())),
       ObjectRefcount(1, 1), HLCTimestamp(1000L), DataBuffer(payload))
 
-  val AwaitMillis: Long = 10000
+  /** Upper bound for waits; stretched on a loaded machine (see `LoadProbe`), and free when the wait succeeds */
+  def AwaitMillis: Long = LoadProbe.scaleMillis(10000)
 
   /** Credentials for `id`. A host's must be for its HostId, which outbound connections to it verify. */
   def credentials(id: UUID = UUID.randomUUID()): TlsCredentials =

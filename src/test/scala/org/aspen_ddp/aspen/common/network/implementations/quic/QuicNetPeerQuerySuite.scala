@@ -20,10 +20,11 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
   import QuicNetFixture.*
 
   /** Short peer-query timings. A 1s handshake timeout makes dials to a dead port fail quickly. */
-  private val Config = QuicConfig(gossip = GossipConfig.ForTests, handshakeTimeout = 1.second,
-    peerQueryDelay = 300.millis, peerQueryInterval = 300.millis, knownWrongRetryAfter = 1.second)
+  private def Config = QuicConfig(gossip = GossipConfig.ForTests, handshakeTimeout = LoadProbe.scale(1.second),
+    peerQueryDelay = LoadProbe.scale(300.millis), peerQueryInterval = LoadProbe.scale(300.millis),
+    knownWrongRetryAfter = LoadProbe.scale(1.second))
 
-  private val WaitMillis = 15000L
+  private def WaitMillis = LoadProbe.scaleMillis(15000L)
 
   private var fx: QuicNetFixture = scala.compiletime.uninitialized
 
@@ -99,7 +100,9 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
 
     sendUntilDelivered(d, hostIdC, c)
 
-    d.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(ts(2))
+    // The message can reach C by another route (C's own connection to D) before the peer's answer is applied
+    eventually("D's entry for C is repaired", WaitMillis):
+      d.net.metadataManager.hostTimestamp(hostIdC).contains(ts(2))
     d.net.peerQueriesSentForTests should be > 0L
     d.net.failingSinceForTests(hostIdC) shouldBe None
     cache.synchronized(cache.hostPuts.toList).map(h => (h.hostId, h.dataPort, h.timestamp)) should contain(
@@ -144,12 +147,12 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
     eventually("D sees C offline", WaitMillis)(!d.net.membership.exists(_.isOnline(hostIdC)))
     // While C was online, D's membership traffic to C may have gone through the stale entry and been queried
     // about. Let a scan already running finish, then count from here.
-    Thread.sleep(400)
+    Thread.sleep(LoadProbe.scaleMillis(400))
     val baseline = d.net.peerQueriesSentForTests
 
     send(d, hostIdC)
     eventually("D's dial to C fails", WaitMillis)(d.net.failingSinceForTests(hostIdC).isDefined)
-    Thread.sleep(1500) // the delay plus several intervals: there is no event to wait for
+    Thread.sleep(LoadProbe.scaleMillis(1500)) // the delay plus several intervals: there is no event to wait for
     d.net.peerQueriesSentForTests shouldBe baseline
 
   test("the failure clock restarts when the entry is replaced"):

@@ -15,7 +15,7 @@ import scala.concurrent.Future
 class QuicNetSnapshotSuite extends AnyFunSuite with Matchers with BeforeAndAfterEach:
   import QuicNetFixture.*
 
-  private val WaitMillis = 15000L
+  private def WaitMillis = LoadProbe.scaleMillis(15000L)
 
   private var fx: QuicNetFixture = scala.compiletime.uninitialized
 
@@ -70,7 +70,8 @@ class QuicNetSnapshotSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val c = fx.host(hostIdC, portC)
 
     sendUntilDelivered(fx.a, hostIdC, c)
-    val oldConn = fx.a.net.metadataManager.peekHostEntry(hostIdC).get.connection.get()
+    val oldEntry = fx.a.net.metadataManager.peekHostEntry(hostIdC).get
+    val oldConn = oldEntry.connection.get()
     oldConn should not be null
     oldConn.isClosed shouldBe false
 
@@ -79,7 +80,8 @@ class QuicNetSnapshotSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     fx.a.net.startSnapshotReaderForTests(() => Future.successful(Some(snapshot)))
 
     eventually("A's connection to the dropped C is closed", WaitMillis)(oldConn.isClosed)
-    fx.a.net.metadataManager.peekHostEntry(hostIdC) shouldBe None
+    // C is still up and in the directory, so traffic from A (membership, say) may already have resolved a fresh entry
+    fx.a.net.metadataManager.peekHostEntry(hostIdC).exists(_ eq oldEntry) shouldBe false
 
   test("a retired entry's failure clock and query time are reset"):
     // C is never started, so A's dials to it fail

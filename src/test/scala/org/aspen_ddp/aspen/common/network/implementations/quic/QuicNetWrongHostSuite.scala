@@ -20,10 +20,11 @@ class QuicNetWrongHostSuite extends AnyFunSuite with Matchers with BeforeAndAfte
   import QuicNetFixture.*
 
   /** Short peer-query timings, as in `QuicNetPeerQuerySuite`, and a short known-wrong retry */
-  private val Config = QuicConfig(gossip = GossipConfig.ForTests, handshakeTimeout = 1.second,
-    peerQueryDelay = 300.millis, peerQueryInterval = 300.millis, knownWrongRetryAfter = 1.second)
+  private def Config = QuicConfig(gossip = GossipConfig.ForTests, handshakeTimeout = LoadProbe.scale(1.second),
+    peerQueryDelay = LoadProbe.scale(300.millis), peerQueryInterval = LoadProbe.scale(300.millis),
+    knownWrongRetryAfter = LoadProbe.scale(1.second))
 
-  private val WaitMillis = 15000L
+  private def WaitMillis = LoadProbe.scaleMillis(15000L)
 
   private var fx: QuicNetFixture = scala.compiletime.uninitialized
 

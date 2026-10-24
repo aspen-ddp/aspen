@@ -24,8 +24,9 @@ final case class RangeWriteNotSupported(objectPointer:ObjectPointer, ida: IDA) e
 /** Used if a ranged write starts beyond the current end of the object and zero fill was not requested */
 final case class RangeWriteBeyondEnd(objectPointer:ObjectPointer, currentLength: Int, offset: Int) extends TransactionCreationError
 
-/** Used if a ranged write would grow the object beyond the pool's maxObjectSize, or beyond the largest
-  * length the pool's IDA can represent
+/** Used if an overwrite, append, ranged write or allocation's initial content would make an object larger than
+  * the pool's derived `maxObjectSize` (its `maxSliceSize` converted through the pool's IDA), or larger than the
+  * largest length the pool's IDA can represent when the pool has no limit. `maxObjectSize` is the limit that applied.
   */
 final case class ObjectSizeLimitExceeded(objectPointer:ObjectPointer, newLength: Long, maxObjectSize: Long) extends TransactionCreationError
 

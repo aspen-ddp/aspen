@@ -161,7 +161,7 @@ class TransactionRangedWriteSuite extends AnyFunSuite with Matchers {
     bldr.rangedWrites(fullState(), List(RangedWrite(Int.MaxValue - ars.rowBytes, bytes("a"))), true)
     val err = intercept[ObjectSizeLimitExceeded]:
       build(bldr, ars)
-    err.maxObjectSize should be (Int.MaxValue - ars.rowBytes)
+    err.maxObjectSize should be (ars.maxObjectSize(Long.MaxValue))
   }
 
   test("the requirement is DataUpdate(ptr, state.revision, WriteRange)") {

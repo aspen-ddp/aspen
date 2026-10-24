@@ -19,7 +19,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
  *  `TransferStarter` re-reads state immediately before each start, verifies after the start
  *  commits with `isBelowFloor` (the same floor computation as admission, never the raw write
  *  threshold), and if the pool is below the floor rolls back the transfer it just started and
- *  retries with backoff. The pool is therefore only ever below the floor very briefly. Do not
+ *  returns `RolledBack`; its callers then retry with backoff (`TransferBackoff`). The pool is
+ *  therefore only ever below the floor very briefly. Do not
  *  treat `isSafe` as a guarantee at the instant of the start. */
 object TransferSafety:
 

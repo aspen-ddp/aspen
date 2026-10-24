@@ -34,6 +34,9 @@ trait Transaction {
     * with RangeWriteNotSupported if the pool's IDA does not support ranged writes (classic ReedSolomon),
     * RangeWriteBeyondEnd for a gap without `zeroFill`, and ObjectSizeLimitExceeded if the result would exceed the
     * pool's maxObjectSize or the IDA's length limit.
+    *
+    * The caller's arrays (`RangedWrite.data` and any state pieces) are held by reference until the transaction
+    * commits and must not be modified.
     */
   def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean = false): Unit
 

@@ -118,7 +118,7 @@ trait RangedWriteIntegrationTests:
           bytesShouldMatch(s.data.getByteArray, expected)
     reads.map(_ => ())
 
-  /** Host.repair queues its work for the harness's event pump, which must run on the test thread */
+  /** Host.repair queues its work for the harness's event pump, which is drained by repeatedly running net.handleEvents() on the global execution context until `f` completes */
   private def pumpUntilComplete[T](f: Future[T]): Future[T] =
     if f.isCompleted then
       f
@@ -183,8 +183,9 @@ trait RangedWriteIntegrationTests:
     val w1 = RangedWrite(L - 5, chunkOf(rnd, R + 30))
     // Starts exactly at the end
     val w2 = RangedWrite(L + R + 25, chunkOf(rnd, 11))
-    // Leaves fewer than 8 bytes free in the final row, so a slicing IDA's trailer spills into a new row
-    val spill = chunkOf(rnd, 4 * R - 12)
+    // Old length 4R-10 (4 rows), new length 4R-6 leaves under 8 bytes free in the 4th row, so a slicing IDA's
+    // trailer moves into a 5th row
+    val spill = chunkOf(rnd, 4 * R - 10)
     val w3 = RangedWrite(spill.length - 2, chunkOf(rnd, 6))
     val afterFirst = applyWrites(content, List(w1))
     val expected = applyWrites(afterFirst, List(w2))

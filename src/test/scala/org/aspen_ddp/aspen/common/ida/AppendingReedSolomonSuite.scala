@@ -169,7 +169,7 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
             at(2 * rb - 1, rb + 2),              // spanning several rows
             at(len - 2, 10),                     // extending past the end
             at(len, 1),                          // starting at the old length
-            at(len, rb - 8 - len % rb),          // filling the final row so the trailer moves
+            at(len, rb - 7 - len % rb),          // one byte past 8-byte room in the final row, so the trailer moves
             at(len + 2 * rb + 3, 4),             // beyond the length with a gap
             at(0, len + 1),                      // rewrite everything and extend
             at(len - 1, 1)                       // last byte, no extension

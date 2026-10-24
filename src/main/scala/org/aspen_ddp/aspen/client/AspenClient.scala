@@ -182,7 +182,13 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   protected def createStoragePool(config: StoragePoolState): Future[PoolId]
 
-  def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId]
+  /** Creates a new allocation group.
+    *
+    * @param maxSliceSize the group's slice limit, fixed for the group's lifetime, or `None` for no limit. Only pools
+    *                     and groups whose own `maxSliceSize` is no larger may join it. The object size limit users
+    *                     see is the group's derived `maximumObjectSize`.
+    */
+  def createAllocationGroup(groupName: String, level: Int, maxSliceSize: Option[Int] = None): Future[AllocationGroupId]
 
   def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId]
 
@@ -302,12 +308,24 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     retryStrategy.retryUntilSuccessful(onCommitFailure):
       transact(prepare)
       
+  /** Creates a new storage pool.
+    *
+    * @param maxSliceSize the largest slice, in bytes, any store of the pool holds for one object, or `None` for no
+    *                     limit. Fixed for the pool's lifetime. The pool's `maxObjectSize` is derived from it.
+    * @throws IllegalArgumentException (immediately, before any state changes) if `maxSliceSize` is smaller than
+    *                                  `ida.minSliceSize`, since such a limit admits no objects at all
+    */
   def createNewStoragePool(name: String,
                            ida: IDA,
-                           maxObjectSize: Option[Int],
+                           maxSliceSize: Option[Int],
                            backendConfig: BackendConfig,
                            storageDeviceSet: StorageDeviceSetId,
                            maximumStoreSize: Long): Future[PoolId] =
+    maxSliceSize.foreach: limit =>
+      if limit < ida.minSliceSize then
+        throw new IllegalArgumentException(
+          s"maxSliceSize ($limit) must be at least ${ida.minSliceSize} for $ida")
+
     given ExecutionContext = this.clientContext
     val poolId = PoolId(UUID.randomUUID())
     for
@@ -323,7 +341,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         poolId,
         name,
         ida,
-        maxObjectSize,
+        maxSliceSize,
         stores,
         backendConfig,
         storageDeviceSet,

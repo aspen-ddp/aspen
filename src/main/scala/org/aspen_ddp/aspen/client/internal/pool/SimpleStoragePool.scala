@@ -28,7 +28,7 @@ class SimpleStoragePool(val client: AspenClient,
   
   val poolId: PoolId = initialState.poolId
   val ida: IDA = initialState.ida
-  val maxObjectSize: Option[Int] = initialState.maxObjectSize
+  val maxSliceSize: Option[Int] = initialState.maxSliceSize
   
   val allocationTree: TieredKeyValueList = new TieredKeyValueList(client,
     new KVObjectRootManager(client, StoragePoolState.AllocationTreeKey, kvos.pointer))

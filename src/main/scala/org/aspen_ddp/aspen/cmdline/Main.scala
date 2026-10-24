@@ -107,6 +107,7 @@ object Main {
                   cellSize:Int=AppendingReedSolomon.DefaultCellSize,
                   deviceSetName:String="",
                   maximumStoreSize:Long=0L,
+                  maxSliceSize:Option[Int]=None,
                   setId:String="",
                   newSetName:String="",
                   newSetLevel:Int=0,
@@ -313,6 +314,16 @@ object Main {
         else failure(s"--cell-size must be between ${AppendingReedSolomon.TrailerSize} and ${AppendingReedSolomon.MaxCellSize} bytes, got $x")).
       action((x, c) => c.copy(cellSize = x))
 
+  /** Slice size limit for a new pool or allocation group. Omitted means no limit. */
+  private def maxSliceSizeOption(p: ArgParser): OptionDef[?, Args] =
+    import p.*
+    opt[Int]("max-slice-size").valueName("<bytes>").
+      text("Largest slice, in bytes, any store holds for one object; fixed at creation (default: unlimited)").
+      validate(x =>
+        if x > 0 then success
+        else failure(s"--max-slice-size must be positive, got $x")).
+      action((x, c) => c.copy(maxSliceSize = Some(x)))
+
   /** Shared by every argument that names an entity by UUID. The message varies because the
    *  entity does; what it rejects does not.
    */
@@ -416,6 +427,8 @@ object Main {
 
       cellSizeOption(p),
 
+      maxSliceSizeOption(p),
+
       arg[Long]("<maximum-store-size>").optional().text("Maximum per-store size in bytes (0 = default/unbounded)").
         action((x, c) => c.copy(maximumStoreSize = x)),
     )
@@ -449,6 +462,8 @@ object Main {
       arg[Int]("<level>").text("Hierarchy level (0 = group of pools, 1+ = group of groups)").
         action((x, c) => c.copy(newGroupLevel = x)).
         validate(x => if (x >= 0) success else failure("Level must be >= 0")),
+
+      maxSliceSizeOption(p),
     )
 
   private def createFilesystemArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -822,9 +837,10 @@ object Main {
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
-            case "create-pool" => create_pool(session, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize)
+            case "create-pool" => create_pool(session, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize,
+              cfg.maxSliceSize)
             case "create-device-set" => create_device_set(session, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
-            case "create-allocation-group" => create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel)
+            case "create-allocation-group" => create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel, cfg.maxSliceSize)
             case "create-filesystem" => create_filesystem(session, cfg.fsName, cfg.poolName)
             case "add-pool-to-group" => add_pool_to_group(session, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(session, cfg.srcGroupName, cfg.newGroupName)
@@ -1461,7 +1477,8 @@ object Main {
                   poolName: String,
                   ida: IDA,
                   deviceSetName: String,
-                  maximumStoreSize: Long): Int = {
+                  maximumStoreSize: Long,
+                  maxSliceSize: Option[Int] = None): Int = {
 
     configureLogging()
 
@@ -1473,7 +1490,7 @@ object Main {
 
     val f = for
       setId <- client.getStorageDeviceSetId(deviceSetName)
-      poolId <- client.createNewStoragePool(poolName, ida, None, RocksDBConfig(), setId, maximumStoreSize)
+      poolId <- client.createNewStoragePool(poolName, ida, maxSliceSize, RocksDBConfig(), setId, maximumStoreSize)
     yield poolId
 
     // Translate the known failure modes into human-readable messages. The client's retry
@@ -1547,7 +1564,8 @@ object Main {
 
   def create_allocation_group(session: ClientSession,
                               name: String,
-                              level: Int): Int = {
+                              level: Int,
+                              maxSliceSize: Option[Int] = None): Int = {
 
     configureLogging()
 
@@ -1557,7 +1575,7 @@ object Main {
 
     given ExecutionContext = client.clientContext
 
-    val f = client.createAllocationGroup(name, level)
+    val f = client.createAllocationGroup(name, level, maxSliceSize)
 
     // Translate the known failure mode into human-readable messages. The client's retry
     // strategy unwraps StopRetrying, so the future fails with the underlying cause.
@@ -2207,6 +2225,7 @@ object Main {
     lines += s"Pool: ${s.name}"
     lines += s"  UUID:         ${s.poolId.uuid}"
     lines += s"  IDA:          ${s.ida}"
+    lines += s"  Max Slice Sz: ${s.maxSliceSize.map(_.toString).getOrElse("unbounded")}"
     lines += s"  Max Obj Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"
     lines += s"  Device Set:   $set (${s.storageDeviceSet.uuid})"
     s.migration.foreach: m =>
@@ -2261,6 +2280,8 @@ object Main {
     lines += s"  UUID:  ${s.groupId.uuid}"
     lines += s"  Level: ${s.level}"
     lines += s"  Usage: ${formatBytes(s.currentUsage)} / ${formatBytes(s.maximumSize)}"
+    lines += s"  Max Slice Size:  ${s.maxSliceSize.map(_.toString).getOrElse("unbounded")}"
+    lines += s"  Max Object Size: ${s.maximumObjectSize.map(_.toString).getOrElse("unbounded")}"
     if s.members.isEmpty then
       lines += "  Members: none"
     else

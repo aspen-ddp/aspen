@@ -36,11 +36,15 @@ object StoragePoolState:
   def apply(kvos: KeyValueObjectState): StoragePoolState = StoragePoolState(kvos.contents(ConfigKey).value.bytes)
 
 
+/** @param maxSliceSize the largest slice, in bytes, that any store of this pool will hold for one object, or
+  *                     `None` for no limit. Fixed when the pool is created. Most code should use
+  *                     `maxObjectSize` instead, which converts this into the largest object the pool accepts.
+  */
 final case class StoragePoolState(
                                    poolId: PoolId,
                                    name: String,
                                    ida: IDA,
-                                   maxObjectSize: Option[Int],
+                                   maxSliceSize: Option[Int],
                                    stores: Array[StoragePoolState.StoreEntry],
                                    backendConfig: BackendConfig,
                                    storageDeviceSet: StorageDeviceSetId,
@@ -52,8 +56,13 @@ final case class StoragePoolState(
 
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
 
+  /** Largest object, in bytes, this pool accepts: `maxSliceSize` converted through `ida.maxObjectSize`, so an object
+    * of exactly this size encodes to slices no larger than `maxSliceSize`. `None` when the pool has no slice limit.
+    */
+  def maxObjectSize: Option[Int] = maxSliceSize.map(ida.maxObjectSize(_))
+
   /** Every field, with `stores` as a Seq so it compares by content */
-  private def contentFields = (poolId, name, ida, maxObjectSize, stores.toSeq, backendConfig, storageDeviceSet,
+  private def contentFields = (poolId, name, ida, maxSliceSize, stores.toSeq, backendConfig, storageDeviceSet,
     currentUsage, maximumStoreSize, allocationGroups, migration)
 
   override def equals(other: Any): Boolean = other match

@@ -14,7 +14,17 @@ trait StoragePool:
 
   val ida: IDA
 
-  val maxObjectSize: Option[Int]
+  /** Largest slice, in bytes, that any store of this pool holds for a single object, or `None` for no limit.
+    * Fixed when the pool is created. Most code should use `maxObjectSize` instead, which expresses the same
+    * limit in terms of object size.
+    */
+  val maxSliceSize: Option[Int]
+
+  /** Largest object, in bytes, that this pool accepts, or `None` for no limit. Derived from `maxSliceSize` and the
+    * pool's IDA via `ida.maxObjectSize`: an object of exactly this size encodes to slices no larger than
+    * `maxSliceSize`, and one byte more would not.
+    */
+  def maxObjectSize: Option[Int] = maxSliceSize.map(ida.maxObjectSize(_))
 
   def allocator: ObjectAllocator
 

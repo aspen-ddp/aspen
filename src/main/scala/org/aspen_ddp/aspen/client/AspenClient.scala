@@ -312,8 +312,12 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     *
     * @param maxSliceSize the largest slice, in bytes, any store of the pool holds for one object, or `None` for no
     *                     limit. Fixed for the pool's lifetime. The pool's `maxObjectSize` is derived from it.
-    * @throws IllegalArgumentException (immediately, before any state changes) if `maxSliceSize` is smaller than
-    *                                  `ida.minSliceSize`, since such a limit admits no objects at all
+    * @param backendConfig the stores' backend. Its own optional `maxSliceSize` combines with the pool's as
+    *                      `min(pool, backend)`; that effective limit is what stores enforce and what the pool's
+    *                      `maxObjectSize` is derived from.
+    * @throws IllegalArgumentException (immediately, before any state changes) if `maxSliceSize` or the backend's
+    *                                  `maxSliceSize` is smaller than `ida.minSliceSize`, since such a limit admits
+    *                                  no objects at all
     */
   def createNewStoragePool(name: String,
                            ida: IDA,
@@ -325,6 +329,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       if limit < ida.minSliceSize then
         throw new IllegalArgumentException(
           s"maxSliceSize ($limit) must be at least ${ida.minSliceSize} for $ida")
+    backendConfig.maxSliceSize.foreach: limit =>
+      if limit < ida.minSliceSize then
+        throw new IllegalArgumentException(
+          s"backend maxSliceSize ($limit) must be at least ${ida.minSliceSize} for $ida")
 
     given ExecutionContext = this.clientContext
     val poolId = PoolId(UUID.randomUUID())

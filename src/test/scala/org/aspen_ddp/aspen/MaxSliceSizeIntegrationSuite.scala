@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen
 
-import org.aspen_ddp.aspen.client.{ObjectSizeLimitExceeded, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{ObjectSizeLimitExceeded, Transaction}
+import org.aspen_ddp.aspen.client.internal.transaction.UncheckedTransaction
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.objects.DataObjectPointer
@@ -63,32 +64,52 @@ class MaxSliceSizePoolIntegrationSuite extends IntegrationTestSuite with MaxSlic
       after.revision should be (stored.revision)
 
 
-/** The stores' effective limit (min of pool and backend limits) is below the pool's, so the client's check, which
-  * only knows the pool limit, lets through updates that the stores must reject by voting to abort.
+/** The pool's backend limit is below the pool's own limit. The stores enforce the smaller one, and so does the
+  * client, because the pool's maxObjectSize is derived from that same effective limit.
   */
 class MaxSliceSizeStoreIntegrationSuite extends IntegrationTestSuite with MaxSliceSizeHelpers:
   val poolSliceLimit: Int = 32768
-  val storeSliceLimit: Long = 16384
+  val backendSliceLimit: Int = 16384
 
   override def testIda: IDA = ReedSolomon(5, 3, 4)
   override def testPoolMaxSliceSize: Option[Int] = Some(poolSliceLimit)
-  override def testStoreMaxSliceSize: Option[Long] = Some(storeSliceLimit)
+  override def testBackendMaxSliceSize: Option[Int] = Some(backendSliceLimit)
 
-  atest("stores vote abort when a slice would exceed their limit even though the client check passes"):
-    val storeMaxObjectSize = testIda.maxObjectSize(storeSliceLimit)
+  private def effectiveMaxObjectSize: Int = testIda.maxObjectSize(backendSliceLimit.toLong)
+
+  atest("the client derives maxObjectSize from the backend limit when it is below the pool's"):
     for
       pool <- client.getStoragePool(Radicle.poolId)
-      _ = pool.maxObjectSize.get should be > (storeMaxObjectSize + 1)
+      _ = pool.maxSliceSize should be (Some(backendSliceLimit))
+      _ = pool.maxObjectSize should be (Some(effectiveMaxObjectSize))
       dp <- allocate(16)
-      ok <- overwrite(dp, storeMaxObjectSize)
+      ok <- overwrite(dp, effectiveMaxObjectSize)
       stored <- client.read(dp)
-      tooBig <- overwrite(dp, storeMaxObjectSize + 1)
+      tooBig <- overwrite(dp, effectiveMaxObjectSize + 1)
       after <- client.read(dp)
     yield
       ok should be (None)
-      stored.data.size should be (storeMaxObjectSize)
+      stored.data.size should be (effectiveMaxObjectSize)
       tooBig match
-        case Some(_: TransactionAborted) =>
-        case other => fail(s"Expected TransactionAborted, got $other")
+        case Some(ObjectSizeLimitExceeded(_, newLength, limit)) =>
+          newLength should be (effectiveMaxObjectSize + 1L)
+          limit should be (effectiveMaxObjectSize.toLong)
+        case other => fail(s"Expected ObjectSizeLimitExceeded, got $other")
       after.revision should be (stored.revision)
-      after.data.size should be (storeMaxObjectSize)
+
+  atest("stores vote abort for an oversized slice from a client that skips the size check"):
+    for
+      dp <- allocate(16)
+      initial <- client.read(dp)
+      atLimit <- UncheckedTransaction.run(client): bldr =>
+        bldr.overwrite(dp, initial.revision, DataBuffer(content(effectiveMaxObjectSize)))
+      before <- client.read(dp)
+      overLimit <- UncheckedTransaction.run(client): bldr =>
+        bldr.overwrite(dp, before.revision, DataBuffer(content(effectiveMaxObjectSize + 1)))
+      after <- client.read(dp)
+    yield
+      atLimit should be (true)
+      before.data.size should be (effectiveMaxObjectSize)
+      overLimit should be (false)
+      after.revision should be (before.revision)
+      after.data.size should be (effectiveMaxObjectSize)

@@ -92,7 +92,8 @@ class TestNetwork(executionContext: ExecutionContext,
                   userTypeFactories: List[RegisteredTypeFactory] = Nil,
                   val ida: IDA = Replication(3, 2),
                   poolMaxSliceSize: Option[Int] = None,
-                  storeMaxSliceSize: Option[Long] = None) extends ServerMessenger {
+                  storeMaxSliceSize: Option[Long] = None,
+                  backendMaxSliceSize: Option[Int] = None) extends ServerMessenger {
   import TestNetwork._
 
   /** A new cache on each call. A HostObjectCache must not be shared between Hosts */
@@ -135,7 +136,8 @@ class TestNetwork(executionContext: ExecutionContext,
     bootstrapSD,
     stores,
     TestTLS.ca,
-    poolMaxSliceSize)
+    poolMaxSliceSize,
+    backendMaxSliceSize)
 
   // All transactions will miss the third store. Don't wait long before updating the
   // error tree

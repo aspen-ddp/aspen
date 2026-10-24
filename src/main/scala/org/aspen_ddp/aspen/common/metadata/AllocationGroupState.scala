@@ -22,11 +22,15 @@ object AllocationGroupState:
 
   /** A pool or child group within an allocation group.
     *
-    * @param maxSliceSize  the member's declared slice limit (the pool's or child group's `maxSliceSize`), or `None`
-    *                      for no limit. Used to enforce the membership rule; most code should use `maxObjectSize`.
-    * @param maxObjectSize largest object, in bytes, that can be allocated through this member. For a pool it is
-    *                      `pool.ida.maxObjectSize(maxSliceSize)`; for a group it is that group's `maximumObjectSize`.
-    *                      `None` when unlimited.
+    * @param maxSliceSize  the member's slice limit, or `None` for no limit: for a pool its effective limit
+    *                      (`StoragePoolState.effectiveMaxSliceSize`, which includes the backend's), for a child group
+    *                      its declared `maxSliceSize`. Used to enforce the membership rule; most code should use
+    *                      `maxObjectSize`.
+    * @param maxObjectSize largest object, in bytes, that can be allocated through this member. For a pool it is the
+    *                      pool's `maxObjectSize`, which is fixed for the pool's lifetime. For a child group it is a
+    *                      snapshot of the child's `maximumObjectSize` taken when it joined, which can go stale as the
+    *                      child's membership changes; group allocators compute the live value from the child's own
+    *                      state instead (see `ObjectAllocator.maxObjectSize`). `None` when unlimited.
     */
   case class Member(memberType: MemberType,
                     uuid: UUID,
@@ -36,9 +40,10 @@ object AllocationGroupState:
                     maximumSize: Long)
 
   object Member:
-    /** The Member entry for pool `ps`, with its object limit derived from the pool's slice limit and IDA */
+    /** The Member entry for pool `ps`, with its limits taken from the pool's effective slice limit and IDA */
     def forPool(ps: StoragePoolState): Member =
-      Member(MemberType.Pool, ps.poolId.uuid, ps.maxSliceSize, ps.maxObjectSize, ps.currentUsage, ps.maximumStoreSize)
+      Member(MemberType.Pool, ps.poolId.uuid, ps.effectiveMaxSliceSize, ps.maxObjectSize, ps.currentUsage,
+        ps.maximumStoreSize)
 
     /** The Member entry for child group `ags` */
     def forGroup(ags: AllocationGroupState): Member =
@@ -77,7 +82,7 @@ object AllocationGroupState:
       if ps.allocationGroups.contains(parentId.uuid) && ags.members.exists(_.uuid == poolId.uuid) then
         None
       else
-        checkMemberLimit(ps.poolId.uuid, ps.maxSliceSize, ags)
+        checkMemberLimit(ps.poolId.uuid, ps.effectiveMaxSliceSize, ags)
 
         val nps = ps.copy(allocationGroups = parentId.uuid :: ps.allocationGroups)
         val reqs = List(KeyRevision(StoragePoolState.ConfigKey, psKvos.contents(StoragePoolState.ConfigKey).revision))

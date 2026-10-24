@@ -586,6 +586,42 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     m.maxSliceSize should be(Some(1000))
     m.maxObjectSize should be(Some(9999))
 
+  test("StoragePoolState.effectiveMaxSliceSize is the smaller of the pool and backend limits"):
+    def ps(pool: Option[Int], backend: Option[Int]) =
+      StoragePoolState(PoolId(java.util.UUID.randomUUID()), "p", ReedSolomon(5, 3, 4), pool, Array.empty,
+        RocksDBConfig(backend), StorageDeviceSetId.BootstrapStorageDeviceSetId)
+    ps(Some(2000), Some(1000)).effectiveMaxSliceSize should be(Some(1000))
+    ps(Some(1000), Some(2000)).effectiveMaxSliceSize should be(Some(1000))
+    ps(None, Some(1000)).effectiveMaxSliceSize should be(Some(1000))
+    ps(Some(1000), None).effectiveMaxSliceSize should be(Some(1000))
+    ps(None, None).effectiveMaxSliceSize should be(None)
+    ps(Some(2000), Some(1000)).maxObjectSize should be(Some(ReedSolomon(5, 3, 4).maxObjectSize(1000)))
+    ps(None, None).maxObjectSize should be(None)
+
+  test("Member.forPool uses the pool's effective limit, including the backend's"):
+    val ps = StoragePoolState(PoolId(java.util.UUID.randomUUID()), "rs-pool", ReedSolomon(14, 10, 12),
+      Some(2000), Array.empty, RocksDBConfig(Some(1000)), StorageDeviceSetId.BootstrapStorageDeviceSetId)
+    val m = AllocationGroupState.Member.forPool(ps)
+    m.maxSliceSize should be(Some(1000))
+    m.maxObjectSize should be(Some(9999))
+
+  atest("addPool applies the membership rule to the pool's effective limit"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      poolId <- client.createNewStoragePool("backend-limited-member", Replication(1, 1), Some(2000),
+        RocksDBConfig(Some(1000)), StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      _ <- waitForTransactionsToComplete()
+      groupId <- client.createAllocationGroup("effective-limit-group", level = 0, maxSliceSize = Some(1000))
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addPool(client, poolId, groupId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      ags <- readGroupState(groupId)
+    yield
+      val m = ags.members.find(_.uuid == poolId.uuid).get
+      m.maxSliceSize should be(Some(1000))
+      m.maxObjectSize should be(Some(1000))
+
   test("maximumObjectSize is the smallest of the members' maxObjectSize"):
     import AllocationGroupState.{Member, MemberType}
     val ags = AllocationGroupState(AllocationGroupId(java.util.UUID.randomUUID()), 0, "mixed",

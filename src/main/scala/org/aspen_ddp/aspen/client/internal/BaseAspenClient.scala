@@ -83,7 +83,8 @@ abstract class BaseAspenClient(
   // protected so subclass allocator-cache overrides can delegate to it
   protected val allocatorManager = new ObjectAllocatorManager(this)
 
-  private val txManager = new TransactionManager(this, txDriverFactory)
+  // private[client] so tests can run a raw TransactionBuilder, bypassing TransactionImpl's client-side checks
+  private[client] val txManager = new TransactionManager(this, txDriverFactory)
 
   def clientContext: ExecutionContext = executionContext
 

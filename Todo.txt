@@ -1,6 +1,23 @@
 TODO
 ====
 
+readRangedWriteState is implemented in terms of calls to readRange. This is a terrible design that
+can fail. Instead, we need to add a new type of read that can read multiple ranges of an object in
+a single read request. This is similar in concept to a key-value object read that read specific keys
+one read request reading sub-components of the overall object.
+
+Ensure that maxObjectSize is universally enforced by the client either in the transaction build phase
+or as part of the commit() flow. No transaction should be started that would cause an object to
+exceed that size.
+  - Also, the actual restriction is on the slice size allowed by the backing store. So where a Replicated
+    object's maximum size equals the slice size, a 10 read-threshold ReedSolomon's maximum object size
+    is actually 10 times the maximum slice size. I don't think the code currently accounts for this. A
+    full audit to understand the current handling along with a comprehensive plan for managing this
+    correctly is needed.
+  - Backends may also be configured with a maximum size for the objects they can store. This should be
+    taken into account when checking transaction requirements. If the transaction were to try to commit
+    an object larger than the backend's maximum size, it must vote to abort the transaction.
+
 Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
 that talks about things like IDA + Backend combinations. AppendingReedSolmon + RocksDB is a poor

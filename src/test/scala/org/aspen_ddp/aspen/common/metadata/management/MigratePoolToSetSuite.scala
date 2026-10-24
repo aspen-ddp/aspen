@@ -6,9 +6,12 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.TypeFactories
-import org.aspen_ddp.aspen.common.metadata.{StorageDeviceSetId, StorageDeviceSetState, StoragePoolState}
+import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState,
+                                            StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.compute.DurableTaskFactory
 import org.aspen_ddp.aspen.compute.DurableTaskPointer
 import org.aspen_ddp.aspen.compute.ServiceEntry
@@ -17,7 +20,180 @@ import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, System
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
-class MigratePoolToSetSuite extends IntegrationTestSuite:
+/** Shared harness for the migration suites; subclasses pick the bootstrap pool's IDA. */
+abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
+
+  private var tasks: List[MigratePoolToSetDurableTask] = Nil
+
+  // Runs on failure and timeout too, so a failed test cannot leave a task polling.
+  override def subFixtureSetup(): Unit = tasks = Nil
+
+  override def subFixtureTeardown(): Unit = synchronized:
+    tasks.foreach(_.stop())
+    tasks = Nil
+
+  /** The task state objects currently enrolled with the system task executor. */
+  protected def enrolledTasks(): Future[List[(java.util.UUID, KeyValueObjectPointer)]] =
+    given ExecutionContext = executionContext
+    val tkvl = TieredKeyValueList(client,
+      KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
+    for
+      vs <- tkvl.get(Key(SystemTaskExecutorService.ServiceUUID))
+      statePtr = ServiceEntry.decode(vs.get.value.bytes).statePointer
+      enrolled <- SystemTaskServiceState.scan(client, statePtr)
+    yield enrolled
+
+  protected val fastPoll = Duration(50, MILLISECONDS)
+
+  /** Build a task instance over the state object migratePoolToSet enrolled. */
+  protected def taskForEnrolled(poolId: PoolId): Future[MigratePoolToSetDurableTask] =
+    given ExecutionContext = executionContext
+    enrolledTasks().map: enrolled =>
+      enrolled.size should be(1)
+      val task = new MigratePoolToSetDurableTask(
+        DurableTaskPointer(enrolled.head._2), client, poolId, fastPoll)
+      synchronized { tasks ::= task }
+      task
+
+  /** Await the task's completion under a deadline. A bare `task.completed` would hang the whole
+   *  suite rather than fail if the loop ever stopped making progress. */
+  protected def awaitCompletion(task: MigratePoolToSetDurableTask, timeout: Duration): Future[Unit] =
+    given ExecutionContext = executionContext
+    val expired = Promise[Unit]()
+    client.backgroundTaskManager.schedule(timeout):
+      expired.tryFailure(new AssertionError(s"task did not complete within $timeout"))
+    Future.firstCompletedOf(List(task.completed.map(_ => ()), expired.future))
+
+  /** Repeatedly complete in-flight transfers landing on `destinationSetId`'s member devices
+   *  until the task completes. Fails on timeout. */
+  protected def driveUntilComplete(task: MigratePoolToSetDurableTask,
+                                   destinationSetId: StorageDeviceSetId,
+                                   timeout: Duration): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+    def loop(): Future[Unit] =
+      if task.completed.isCompleted then
+        task.completed.map(_ => ())
+      else if System.nanoTime() > deadline then
+        client.getStoragePoolState(PoolId.BootstrapPoolId).flatMap: ps =>
+          Future.failed(new AssertionError(
+            s"migration did not complete; migration=${ps.migration} " +
+              s"stores=${ps.stores.map(_.storageDeviceId.uuid).mkString(",")}"))
+      else
+        net.completeInFlightTransfers(destinationSetId).flatMap: _ =>
+          val p = Promise[Unit]()
+          client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
+          p.future.flatMap(_ => loop())
+    loop()
+
+  /** Like `driveUntilComplete`, but pumps several sets on every pass.
+   *
+   *  A retarget can leave a transfer in flight toward the set just abandoned, and in a pool whose
+   *  floor admits one transfer at a time the task can start nothing new until it clears -- so
+   *  pumping only the new target would deadlock. Sequential rather than parallel: each pump transacts against the same
+   *  pool object, and concurrent passes would collide. Fails on timeout. */
+  protected def driveUntilCompleteAcross(task: MigratePoolToSetDurableTask,
+                                         destinationSetIds: List[StorageDeviceSetId],
+                                         timeout: Duration): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+
+    def pumpAll(remaining: List[StorageDeviceSetId]): Future[Unit] = remaining match
+      case Nil => Future.unit
+      case head :: tail => net.completeInFlightTransfers(head).flatMap(_ => pumpAll(tail))
+
+    def loop(): Future[Unit] =
+      if task.completed.isCompleted then
+        task.completed.map(_ => ())
+      else if System.nanoTime() > deadline then
+        client.getStoragePoolState(PoolId.BootstrapPoolId).flatMap: ps =>
+          Future.failed(new AssertionError(
+            s"migration did not complete; migration=${ps.migration} " +
+              s"stores=${ps.stores.map(_.storageDeviceId.uuid).mkString(",")}"))
+      else
+        pumpAll(destinationSetIds).flatMap: _ =>
+          val p = Promise[Unit]()
+          client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
+          p.future.flatMap(_ => loop())
+    loop()
+
+  /** Complete in-flight transfers until `poolId` has at least `moved` stores sitting on a
+   *  device of `destinationSetId`, then stop pumping. Used to leave a migration partially
+   *  done: the floor admits one transfer of the default pool at a time and a transfer completes
+   *  only when this helper completes it, so ceasing to pump freezes progress deterministically.
+   *  A wall-clock window would not -- it races the whole migration. Fails on timeout. */
+  protected def pumpUntilStoresMoved(poolId: PoolId,
+                                     destinationSetId: StorageDeviceSetId,
+                                     moved: Int,
+                                     timeout: Duration): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+    def loop(): Future[Unit] =
+      for
+        targetSet <- client.getStorageDeviceSetState(destinationSetId)
+        members <- targetSet.collectMemberDevices(client)
+        poolState <- client.getStoragePoolState(poolId)
+        onTarget = poolState.stores.count(e => members.contains(e.storageDeviceId))
+        result <-
+          if onTarget >= moved then
+            Future.unit
+          else if System.nanoTime() > deadline then
+            Future.failed(new AssertionError(
+              s"only $onTarget of $moved stores reached the target set; " +
+                s"migration=${poolState.migration}"))
+          else
+            net.completeInFlightTransfers(destinationSetId).flatMap: _ =>
+              val p = Promise[Unit]()
+              client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
+              p.future.flatMap(_ => loop())
+      yield result
+    loop()
+
+  protected def sleep(d: Duration): Future[Unit] =
+    val p = Promise[Unit]()
+    client.backgroundTaskManager.schedule(d)(p.success(()))
+    p.future
+
+  /** Poll `cond` until it holds or `timeout` elapses. Fails the test on timeout. */
+  protected def awaitUntil(what: String, timeout: Duration = Duration(60000, MILLISECONDS))
+                          (cond: => Future[Boolean]): Future[Unit] =
+    given ExecutionContext = executionContext
+    val deadline = System.nanoTime() + timeout.toNanos
+    def loop(): Future[Unit] =
+      cond.flatMap: ok =>
+        if ok then Future.unit
+        else if System.nanoTime() > deadline then
+          Future.failed(new AssertionError(s"timed out waiting for: $what"))
+        else
+          sleep(fastPoll).flatMap(_ => loop())
+    loop()
+
+  protected def statusOf(deviceId: StorageDeviceId,
+                         sid: StoreId): Future[Option[StorageDeviceState.StoreStatus]] =
+    given ExecutionContext = executionContext
+    client.getStorageDeviceState(deviceId).map(_.stores.get(sid).map(_.status))
+
+  protected def countTransferringOut(deviceId: StorageDeviceId): Future[Int] =
+    given ExecutionContext = executionContext
+    client.getStorageDeviceState(deviceId).map: ds =>
+      ds.stores.values.count(_.status == StorageDeviceState.StoreStatus.TransferringOut)
+
+  /** A new level-0 set holding only the second device, ready to be a migration target. */
+  protected def targetWithSecondDevice(name: String): Future[StorageDeviceSetId] =
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      targetSetId <- client.createStorageDeviceSet(name, level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.secondDeviceId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+    yield targetSetId
+
+/** Default Replication(3, 2): floor min(2 + 2, 3 - 1) = 2, so one store of the pool may be in
+ *  flight at a time. */
+class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
+
 
   atest("MigratePoolToSetDurableTask is registered in the client type registry"):
     given ExecutionContext = executionContext
@@ -28,16 +204,6 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
     factory should be(Some(MigratePoolToSetDurableTask))
     TypeFactories.factories should contain(MigratePoolToSetDurableTask)
 
-  /** The task state objects currently enrolled with the system task executor. */
-  private def enrolledTasks(): Future[List[(java.util.UUID, KeyValueObjectPointer)]] =
-    given ExecutionContext = executionContext
-    val tkvl = TieredKeyValueList(client,
-      KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
-    for
-      vs <- tkvl.get(Key(SystemTaskExecutorService.ServiceUUID))
-      statePtr = ServiceEntry.decode(vs.get.value.bytes).statePointer
-      enrolled <- SystemTaskServiceState.scan(client, statePtr)
-    yield enrolled
 
   atest("migratePoolToSet flips the pointer, swaps assignedPools, and enrolls one task"):
     given ExecutionContext = executionContext
@@ -113,110 +279,6 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
       enrolled.size should be(1)
 
   // ---- End-to-end migration -------------------------------------------------------
-
-  private val fastPoll = Duration(50, MILLISECONDS)
-
-  /** Build a task instance over the state object migratePoolToSet enrolled. */
-  private def taskForEnrolled(poolId: PoolId): Future[MigratePoolToSetDurableTask] =
-    given ExecutionContext = executionContext
-    enrolledTasks().map: enrolled =>
-      enrolled.size should be(1)
-      new MigratePoolToSetDurableTask(
-        DurableTaskPointer(enrolled.head._2), client, poolId, fastPoll)
-
-  /** Await the task's completion under a deadline. A bare `task.completed` would hang the whole
-   *  suite rather than fail if the loop ever stopped making progress. */
-  private def awaitCompletion(task: MigratePoolToSetDurableTask, timeout: Duration): Future[Unit] =
-    given ExecutionContext = executionContext
-    val expired = Promise[Unit]()
-    client.backgroundTaskManager.schedule(timeout):
-      expired.tryFailure(new AssertionError(s"task did not complete within $timeout"))
-    Future.firstCompletedOf(List(task.completed.map(_ => ()), expired.future))
-
-  /** Repeatedly complete in-flight transfers landing on `destinationSetId`'s member devices
-   *  until the task completes. Fails on timeout. */
-  private def driveUntilComplete(task: MigratePoolToSetDurableTask,
-                                 destinationSetId: StorageDeviceSetId,
-                                 timeout: Duration): Future[Unit] =
-    given ExecutionContext = executionContext
-    val deadline = System.nanoTime() + timeout.toNanos
-    def loop(): Future[Unit] =
-      if task.completed.isCompleted then
-        task.completed.map(_ => ())
-      else if System.nanoTime() > deadline then
-        client.getStoragePoolState(PoolId.BootstrapPoolId).flatMap: ps =>
-          Future.failed(new AssertionError(
-            s"migration did not complete; migration=${ps.migration} " +
-              s"stores=${ps.stores.map(_.storageDeviceId.uuid).mkString(",")}"))
-      else
-        net.completeInFlightTransfers(destinationSetId).flatMap: _ =>
-          val p = Promise[Unit]()
-          client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
-          p.future.flatMap(_ => loop())
-    loop()
-
-  /** Like `driveUntilComplete`, but pumps several sets on every pass.
-   *
-   *  A retarget can leave a transfer in flight toward the set just abandoned, and the task
-   *  starts nothing new until its in-flight check clears -- so pumping only the new target
-   *  would deadlock. Sequential rather than parallel: each pump transacts against the same
-   *  pool object, and concurrent passes would collide. Fails on timeout. */
-  private def driveUntilCompleteAcross(task: MigratePoolToSetDurableTask,
-                                       destinationSetIds: List[StorageDeviceSetId],
-                                       timeout: Duration): Future[Unit] =
-    given ExecutionContext = executionContext
-    val deadline = System.nanoTime() + timeout.toNanos
-
-    def pumpAll(remaining: List[StorageDeviceSetId]): Future[Unit] = remaining match
-      case Nil => Future.unit
-      case head :: tail => net.completeInFlightTransfers(head).flatMap(_ => pumpAll(tail))
-
-    def loop(): Future[Unit] =
-      if task.completed.isCompleted then
-        task.completed.map(_ => ())
-      else if System.nanoTime() > deadline then
-        client.getStoragePoolState(PoolId.BootstrapPoolId).flatMap: ps =>
-          Future.failed(new AssertionError(
-            s"migration did not complete; migration=${ps.migration} " +
-              s"stores=${ps.stores.map(_.storageDeviceId.uuid).mkString(",")}"))
-      else
-        pumpAll(destinationSetIds).flatMap: _ =>
-          val p = Promise[Unit]()
-          client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
-          p.future.flatMap(_ => loop())
-    loop()
-
-  /** Complete in-flight transfers until `poolId` has at least `moved` stores sitting on a
-   *  device of `destinationSetId`, then stop pumping. Used to leave a migration partially
-   *  done: the task only ever has one transfer in flight and a transfer completes only when
-   *  this helper completes it, so ceasing to pump freezes progress deterministically. A
-   *  wall-clock window would not -- it races the whole migration. Fails on timeout. */
-  private def pumpUntilStoresMoved(poolId: PoolId,
-                                   destinationSetId: StorageDeviceSetId,
-                                   moved: Int,
-                                   timeout: Duration): Future[Unit] =
-    given ExecutionContext = executionContext
-    val deadline = System.nanoTime() + timeout.toNanos
-    def loop(): Future[Unit] =
-      for
-        targetSet <- client.getStorageDeviceSetState(destinationSetId)
-        members <- targetSet.collectMemberDevices(client)
-        poolState <- client.getStoragePoolState(poolId)
-        onTarget = poolState.stores.count(e => members.contains(e.storageDeviceId))
-        result <-
-          if onTarget >= moved then
-            Future.unit
-          else if System.nanoTime() > deadline then
-            Future.failed(new AssertionError(
-              s"only $onTarget of $moved stores reached the target set; " +
-                s"migration=${poolState.migration}"))
-          else
-            net.completeInFlightTransfers(destinationSetId).flatMap: _ =>
-              val p = Promise[Unit]()
-              client.backgroundTaskManager.schedule(fastPoll)(p.success(()))
-              p.future.flatMap(_ => loop())
-      yield result
-    loop()
 
   atest("level-0 migration moves every store and marks the migration Complete"):
     given ExecutionContext = executionContext
@@ -418,3 +480,109 @@ class MigratePoolToSetSuite extends IntegrationTestSuite:
         entry.storageDeviceId should be(net.storageDeviceId)
       poolState.migration should be(Some(StoragePoolState.Migration(
         bootstrapSetId, StoragePoolState.MigrationStatus.Complete)))
+
+  atest("an aborted migration transfer is restarted toward a freshly selected destination"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val s0 = StoreId(poolId, 0)
+    for
+      targetSetId <- targetWithSecondDevice("abort-target")
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.migratePoolToSet(poolId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(poolId)
+      _ <- awaitUntil("the first transfer to start")(
+             statusOf(net.secondDeviceId, s0).map(_.contains(StorageDeviceState.StoreStatus.TransferringIn)))
+
+      // Swap the target set's only member while the transfer is in flight, so the only
+      // destination selection can offer after the abort is the third device.
+      _ <- client.moveDeviceToSet(net.thirdDeviceId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.secondDeviceId, StorageDeviceSetId.BootstrapStorageDeviceSetId)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.abortStoreTransfer(s0)
+      _ <- awaitUntil("the store to be restarted toward the third device")(
+             statusOf(net.thirdDeviceId, s0).map(_.contains(StorageDeviceState.StoreStatus.TransferringIn)))
+      onSecond <- statusOf(net.secondDeviceId, s0)
+
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
+      poolState <- client.getStoragePoolState(poolId)
+    yield
+      onSecond should be(None)
+      poolState.stores.size should be(3)
+      poolState.stores.foreach: entry =>
+        entry.storageDeviceId should be(net.thirdDeviceId)
+      poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)
+
+/** Replication(10, 6): floor min(6 + 2, 10 - 1) = 8, so two of the ten stores may be in flight at
+ *  once. (The harness needs writeThreshold > width / 2, which rules out narrower pools that admit
+ *  two transfers.) */
+class ParallelMigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
+  override def testIda: IDA = Replication(10, 6)
+
+  atest("one pass starts as many transfers as the floor admits"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val boot = net.storageDeviceId
+    for
+      targetSetId <- targetWithSecondDevice("parallel-target")
+      _ <- client.migratePoolToSet(poolId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(poolId)
+      _ <- awaitUntil("two transfers to be in flight together", Duration(20000, MILLISECONDS))(
+             countTransferringOut(boot).map(_ >= 2))
+      // Several more passes: a third must still be held back by the floor.
+      _ <- sleep(Duration(500, MILLISECONDS))
+      inFlight <- countTransferringOut(boot)
+
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
+      poolState <- client.getStoragePoolState(poolId)
+    yield
+      inFlight should be(2)
+      poolState.stores.size should be(10)
+      poolState.stores.foreach: entry =>
+        entry.storageDeviceId should be(net.secondDeviceId)
+      poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)
+
+/** Replication(3, 3): writeThreshold == width, so the floor clamps to width - 1 = 2 and exactly
+ *  one store may be in flight at a time. */
+class FullWidthMigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
+  override def testIda: IDA = Replication(3, 3)
+
+  atest("a writeThreshold == width pool still migrates, one store at a time"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val boot = net.storageDeviceId
+    @volatile var maxInFlight = 0
+
+    // Sample the source device until the task completes, recording the most stores ever
+    // TransferringOut together.
+    def sample(task: MigratePoolToSetDurableTask): Future[Unit] =
+      if task.completed.isCompleted then
+        Future.unit
+      else
+        countTransferringOut(boot).flatMap: n =>
+          maxInFlight = math.max(maxInFlight, n)
+          sleep(Duration(10, MILLISECONDS)).flatMap(_ => sample(task))
+
+    for
+      targetSetId <- targetWithSecondDevice("full-width-target")
+      _ <- client.migratePoolToSet(poolId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(poolId)
+      sampling = sample(task)
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
+      _ <- sampling
+      poolState <- client.getStoragePoolState(poolId)
+    yield
+      maxInFlight should be(1)
+      poolState.stores.size should be(3)
+      poolState.stores.foreach: entry =>
+        entry.storageDeviceId should be(net.secondDeviceId)
+      poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)

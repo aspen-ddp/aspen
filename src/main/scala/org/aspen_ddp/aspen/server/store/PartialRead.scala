@@ -25,10 +25,7 @@ object PartialRead:
         }))
 
       case (ObjectType.Data, rt: ByteRanges) =>
-        val size = data.size.toLong
-        val parts = rt.ranges.map((offset, length) => clip(data, offset.toLong, offset.toLong + length.toLong)) :+
-          clip(data, size - rt.tail.toLong, size)
-        Some(concat(parts))
+        Some(concat(rt.pieces(data.size).map((start, end) => data.slice(start, end - start))))
 
       case _ => Some(data)
 
@@ -47,13 +44,6 @@ object PartialRead:
         nonEmpty.foreach(part => bb.put(part.asReadOnlyBuffer()))
         bb.flip()
         DataBuffer(bb)
-
-  /** Returns [start, end) of the data with both ends clamped to [0, size] */
-  private def clip(data: DataBuffer, start: Long, end: Long): DataBuffer =
-    val size = data.size.toLong
-    val s = math.min(math.max(start, 0L), size)
-    val e = math.max(s, math.min(end, size))
-    data.slice(s.toInt, (e - s).toInt)
 
   private def reduce(data: DataBuffer, select: KVObjectState => Map[Key, ValueState]): DataBuffer =
     val kvos = KVObjectState.decode(data)

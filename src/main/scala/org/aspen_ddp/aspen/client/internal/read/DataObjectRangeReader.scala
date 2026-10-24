@@ -29,21 +29,14 @@ class DataObjectRangeReader(pointer: DataObjectPointer, ida: IDA, readUUID: UUID
     val sliceSize = matchingStoreStates.head.sizeOnStore
 
     readType match
-      case ByteRanges(ranges, tail) => restoreRanges(revision, refcount, timestamp, readTime, matchingStoreStates, sliceSize, ranges, tail)
+      case bytes: ByteRanges => restoreRanges(revision, refcount, timestamp, readTime, matchingStoreStates, sliceSize, bytes)
       case rt => throw new IllegalArgumentException(s"Read type $rt is not a byte range read")
-
-  /** Mirrors the store-side clipping of a ByteRanges read: [start, end) clamped to [0, sliceSize] */
-  private def clipped(start: Long, end: Long, sliceSize: Int): (Int, Int) =
-    val s = math.min(math.max(start, 0L), sliceSize.toLong)
-    val e = math.max(s, math.min(end, sliceSize.toLong))
-    (s.toInt, e.toInt)
 
   private def restoreRanges(revision: ObjectRevision, refcount: ObjectRefcount, timestamp: HLCTimestamp,
                             readTime: HLCTimestamp, matchingStoreStates: List[DataObjectStoreState],
-                            sliceSize: Int, ranges: List[(Int, Int)], tail: Int): ObjectState =
+                            sliceSize: Int, bytes: ByteRanges): ObjectState =
     // The tail piece is always present, even when empty, so Replication still reports the object length
-    val pieces = ranges.map((offset, length) => clipped(offset.toLong, offset.toLong + length.toLong, sliceSize)) :+
-      clipped(sliceSize.toLong - tail.toLong, sliceSize.toLong, sliceSize)
+    val pieces = bytes.pieces(sliceSize).toVector
 
     // Split each store's concatenated buffer into per-piece segments
     val splits = pieces.scanLeft(0)((pos, p) => pos + (p._2 - p._1))
@@ -52,7 +45,7 @@ class DataObjectRangeReader(pointer: DataObjectPointer, ida: IDA, readUUID: UUID
         val arr = db.getByteArray
         if splits.last != arr.length then
           throw BaseObjectReader.NotRestorable(s"Range restore failed: unexpected response length ${arr.length}")
-        ss.storeId.poolIndex -> pieces.indices.map(i => arr.slice(splits(i), splits(i + 1))).toList
+        ss.storeId.poolIndex -> pieces.indices.map(i => arr.slice(splits(i), splits(i + 1))).toVector
 
     if perStore.size < threshold then
       throw BaseObjectReader.NotRestorable("Below Threshold")
@@ -65,6 +58,6 @@ class DataObjectRangeReader(pointer: DataObjectPointer, ida: IDA, readUUID: UUID
         new DataObjectRangeState(pointer, revision, refcount, timestamp, readTime, ida,
           range.logicalOffset, DataBuffer(range.data), range.objectLength)
       new DataObjectRangesState(pointer, revision, refcount, timestamp, readTime, ida,
-        states.init, restored.last.objectLength)
+        states.init.toList, restored.last.objectLength)
     catch
       case e: IDARestoreError => throw BaseObjectReader.NotRestorable(s"Range restore failed: ${e.getMessage}")

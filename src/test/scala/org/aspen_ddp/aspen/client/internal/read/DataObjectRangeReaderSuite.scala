@@ -34,12 +34,7 @@ class DataObjectRangeReaderSuite extends AnyFunSuite with Matchers:
   // Builds a store response for a ByteRanges read: each range clipped to the slice, then the tail, concatenated
   private def rangesResponse(store: Int, rev: ObjectRevision, ts: HLCTimestamp, slice: Array[Byte],
                              rt: ByteRanges): ReadResponse =
-    def clip(start: Long, end: Long): Array[Byte] =
-      val s = math.min(math.max(start, 0L), slice.length.toLong)
-      val e = math.max(s, math.min(end, slice.length.toLong))
-      slice.slice(s.toInt, e.toInt)
-    val size = slice.length.toLong
-    val parts = rt.ranges.map((o, l) => clip(o.toLong, o.toLong + l)) :+ clip(size - rt.tail, size)
+    val parts = rt.pieces(slice.length).map((s, e) => slice.slice(s, e))
     val cs = ReadResponse.CurrentState(rev, ObjectRefcount(0, 1), ts, slice.length,
       Some(DataBuffer(parts.flatten.toArray)), Set())
     ReadResponse(client, StoreId(pool, store.toByte), readUUID, HLCTimestamp.Zero, Right(cs))

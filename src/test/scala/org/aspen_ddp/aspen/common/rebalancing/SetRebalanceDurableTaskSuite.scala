@@ -198,6 +198,103 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase
     yield
       phase should be(SetRebalanceDurableTask.Phase.InFlight)
 
+  // ---- Device death mid-transfer, through the real FailedStorageDeviceDurableTask ------
+
+  /** Declare `deviceId` failed and run the real drain until its store map is empty. */
+  private def failAndDrain(deviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    for
+      _ <- client.failStorageDevice(deviceId)
+      _ <- waitForTransactionsToComplete()
+      drain <- taskForEnrolled(deviceId)
+      _ <- withTimeout(drain.completed.map(_ => ()), Duration(60000, MILLISECONDS), "the drain")
+    yield ()
+
+  /** The TransferringIn and TransferringOut entries on `deviceId`: the halves of transfers. */
+  private def transferEntries(deviceId: StorageDeviceId): Future[Map[StoreId, StorageDeviceState.StoreEntry]] =
+    given ExecutionContext = executionContext
+    client.getStorageDeviceState(deviceId).map: ds =>
+      ds.stores.filter: (_, e) =>
+        e.status == StorageDeviceState.StoreStatus.TransferringIn ||
+        e.status == StorageDeviceState.StoreStatus.TransferringOut
+
+  atest("a destination dying mid-transfer restores the source and the transfer is retried elsewhere"):
+    given ExecutionContext = executionContext
+    val s0 = storeId(0)
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- writePending(List((s0, boot, net.secondDeviceId)))
+      task = startTask()
+      _ <- awaitUntil("the transfer to start")(
+             statusOf(net.secondDeviceId, s0).map(_.contains(StorageDeviceState.StoreStatus.TransferringIn)))
+
+      // The drain disowns the destination's TransferringIn entry and puts the source back.
+      _ <- failAndDrain(net.secondDeviceId)
+      srcAfterDrain <- client.getStorageDeviceState(boot)
+
+      // The only usable non-pool device left in the set is the third one.
+      _ <- awaitUntil("the destination to be replaced")(
+             pendingTransfers().map(_ == List((s0, boot, net.thirdDeviceId))))
+      _ <- driveToCompletion(task)
+      remaining <- pendingTransfers()
+      dst <- statusOf(net.thirdDeviceId, s0)
+      src <- statusOf(boot, s0)
+      dead <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      // The task polls every 50 ms, so by the time this is read it may already have restarted
+      // the transfer toward the third device. What must not survive is the half naming the
+      // dead device.
+      srcAfterDrain.stores(s0) should not be
+        StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(net.secondDeviceId))
+      remaining shouldBe empty
+      dst should be(Some(StorageDeviceState.StoreStatus.Active))
+      src should be(None)
+      dead.stores.get(s0) should be(None)
+
+  atest("a source dying mid-transfer is waited out while it rebuilds, then the task finishes"):
+    given ExecutionContext = executionContext
+    val s0 = storeId(0)
+    val planned = (s0, net.secondDeviceId, net.thirdDeviceId)
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      // Put store 0 on the second device so that failing it costs one replica, not three.
+      _ <- net.simulateTransferComplete(s0, boot, net.secondDeviceId)
+      _ <- writePending(List(planned))
+      task = startTask()
+      _ <- awaitUntil("the transfer to start")(
+             statusOf(net.thirdDeviceId, s0).map(_.contains(StorageDeviceState.StoreStatus.TransferringIn)))
+
+      // The drain owns store 0 (TransferringOut, pool names the second device) and rebuilds it.
+      // The set now holds the bootstrap device, soft-excluded as a pool device, and the third
+      // device, so the rebuild lands on the planned destination.
+      _ <- failAndDrain(net.secondDeviceId)
+      rebuilding <- statusOf(net.thirdDeviceId, s0)
+
+      // Many passes while the store rebuilds. Nothing may start, replace, or drop anything.
+      _ <- sleep(Duration(1000, MILLISECONDS))
+      duringRebuild <- pendingTransfers()
+      bootTransfers <- transferEntries(boot)
+      thirdTransfers <- transferEntries(net.thirdDeviceId)
+      stillRebuilding <- statusOf(net.thirdDeviceId, s0)
+      doneEarly = task.completed.isCompleted
+
+      // The destination host finishes the rebuild, as Host.markRebuiltStoreActive does.
+      _ <- updateDevice(net.thirdDeviceId)(_.setStoreEntry(s0, StorageDeviceState.StoreStatus.Active, None))
+      _ <- driveToCompletion(task)
+      remaining <- pendingTransfers()
+      dst <- statusOf(net.thirdDeviceId, s0)
+    yield
+      rebuilding should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      duringRebuild should be(List(planned))
+      bootTransfers shouldBe empty
+      thirdTransfers shouldBe empty
+      stillRebuilding should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      doneEarly should be(false)
+      remaining shouldBe empty
+      dst should be(Some(StorageDeviceState.StoreStatus.Active))
+
 /** Replication(10, 6): floor min(6 + 2, 10 - 1) = 8, so two of the ten stores may be in flight at
  *  once. (The harness needs writeThreshold > width / 2, which rules out narrower pools that admit
  *  two transfers.) */

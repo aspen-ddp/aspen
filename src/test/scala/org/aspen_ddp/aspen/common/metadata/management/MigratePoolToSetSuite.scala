@@ -9,9 +9,11 @@ import org.aspen_ddp.aspen.common.TypeFactories
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState,
                                             StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.compute.DurableTask
 import org.aspen_ddp.aspen.compute.DurableTaskFactory
 import org.aspen_ddp.aspen.compute.DurableTaskPointer
 import org.aspen_ddp.aspen.compute.ServiceEntry
@@ -24,7 +26,7 @@ import scala.util.Random
 /** Shared harness for the migration suites; subclasses pick the bootstrap pool's IDA. */
 abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
 
-  private var tasks: List[MigratePoolToSetDurableTask] = Nil
+  private var tasks: List[DurableTask] = Nil
 
   // Runs on failure and timeout too, so a failed test cannot leave a task polling.
   override def subFixtureSetup(): Unit = tasks = Nil
@@ -180,6 +182,43 @@ abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     client.getStorageDeviceState(deviceId).map: ds =>
       ds.stores.values.count(_.status == StorageDeviceState.StoreStatus.TransferringOut)
+
+  /** Declare `deviceId` failed and run the real FailedStorageDeviceDurableTask until its store
+   *  map is empty. The migration task is enrolled too, so the drain's state object is the one
+   *  failStorageDevice added. */
+  protected def failAndDrain(deviceId: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    for
+      before <- enrolledTasks()
+      _ <- client.failStorageDevice(deviceId)
+      _ <- waitForTransactionsToComplete()
+      after <- enrolledTasks()
+      added = after.filterNot(e => before.exists(_._1 == e._1))
+      _ = added.size should be(1)
+      drain = new FailedStorageDeviceDurableTask(
+                DurableTaskPointer(added.head._2), client, deviceId, fastPoll)
+      _ = synchronized { tasks ::= drain }
+      _ <- Future.firstCompletedOf(List(
+             drain.completed.map(_ => ()),
+             sleep(Duration(60000, MILLISECONDS)).flatMap(_ =>
+               Future.failed(new AssertionError(s"the drain of ${deviceId.uuid} did not complete")))))
+    yield ()
+
+  /** Flip `sid`'s Rebuilding entry on `deviceId` to Active, as Host.markRebuiltStoreActive does
+   *  once the destination host has reconstructed the store. */
+  protected def completeRebuild(deviceId: StorageDeviceId, sid: StoreId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStorageDevicePointer(deviceId)
+        kvos <- client.read(ptr)
+      yield
+        val state = StorageDeviceState(kvos)
+        state.stores.get(sid).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+        tx.update(ptr, None, None,
+          List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+          List(Insert(StorageDeviceState.StateKey,
+            state.setStoreEntry(sid, StorageDeviceState.StoreStatus.Active, None).encode())))
 
   /** A new level-0 set holding only the second device, ready to be a migration target. */
   protected def targetWithSecondDevice(name: String): Future[StorageDeviceSetId] =
@@ -518,6 +557,103 @@ class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       poolState.stores.foreach: entry =>
         entry.storageDeviceId should be(net.thirdDeviceId)
       poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)
+
+  // ---- Device death mid-transfer, through the real FailedStorageDeviceDurableTask ------
+
+  atest("a destination dying mid-transfer restores the source and the migration carries on elsewhere"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val boot = net.storageDeviceId
+    val s0 = StoreId(poolId, 0)
+    for
+      targetSetId <- targetWithSecondDevice("dst-death-target")
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.migratePoolToSet(poolId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(poolId)
+      _ <- awaitUntil("the first transfer to start")(
+             statusOf(net.secondDeviceId, s0).map(_.contains(StorageDeviceState.StoreStatus.TransferringIn)))
+
+      // Give the target set a live member besides the one about to die.
+      _ <- client.moveDeviceToSet(net.thirdDeviceId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- failAndDrain(net.secondDeviceId)
+      srcAfterDrain <- client.getStorageDeviceState(boot)
+
+      // The pass after the restore may pick store 0 or the next store in poolIndex order (the
+      // floor admits one at a time); either way the only destination left is the third device.
+      _ <- awaitUntil("a transfer to be started toward the third device")(
+             client.getStorageDeviceState(net.thirdDeviceId).map(_.stores.values.exists(
+               _.status == StorageDeviceState.StoreStatus.TransferringIn)))
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
+      poolState <- client.getStoragePoolState(poolId)
+      dead <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      // The task polls every 50 ms and may already have restarted the transfer; what must not
+      // survive is the half naming the dead device.
+      srcAfterDrain.stores(s0) should not be
+        StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(net.secondDeviceId))
+      dead.stores shouldBe empty
+      poolState.stores.size should be(3)
+      poolState.stores.foreach: entry =>
+        entry.storageDeviceId should be(net.thirdDeviceId)
+      poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)
+
+  atest("a source dying mid-transfer is waited out while it rebuilds, then the migration finishes"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val boot = net.storageDeviceId
+    val s0 = StoreId(poolId, 0)
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      // Put store 0 on the second device so that failing it costs one replica, not three.
+      _ <- net.simulateTransferComplete(s0, boot, net.secondDeviceId)
+      targetSetId <- client.createStorageDeviceSet("src-death-target", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.thirdDeviceId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      _ <- client.migratePoolToSet(poolId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      // Stores are tried in poolIndex order and the floor of 2 admits one at a time, so store 0
+      // is the one in flight.
+      task <- taskForEnrolled(poolId)
+      _ <- awaitUntil("store 0's transfer to start")(
+             statusOf(net.secondDeviceId, s0).map(_.contains(StorageDeviceState.StoreStatus.TransferringOut)))
+
+      // The drain owns store 0 and rebuilds it into the pool's set, which is now the target, so
+      // onto the third device. The pool names the third device from here on.
+      _ <- failAndDrain(net.secondDeviceId)
+      rebuilding <- statusOf(net.thirdDeviceId, s0)
+
+      // Many passes while the store rebuilds. A Rebuilding store does not count toward the
+      // floor, so neither remaining store may be started, and nothing may touch store 0.
+      _ <- sleep(Duration(1000, MILLISECONDS))
+      bootOut <- countTransferringOut(boot)
+      stillRebuilding <- statusOf(net.thirdDeviceId, s0)
+      midPool <- client.getStoragePoolState(poolId)
+
+      _ <- completeRebuild(net.thirdDeviceId, s0)
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
+      poolState <- client.getStoragePoolState(poolId)
+      third <- client.getStorageDeviceState(net.thirdDeviceId)
+    yield
+      rebuilding should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      bootOut should be(0)
+      stillRebuilding should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      midPool.migration.get.status should be(StoragePoolState.MigrationStatus.InProgress)
+      poolState.stores.size should be(3)
+      poolState.stores.foreach: entry =>
+        entry.storageDeviceId should be(net.thirdDeviceId)
+      poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)
+      third.stores.values.map(_.status).toSet should be(Set(StorageDeviceState.StoreStatus.Active))
 
 /** Replication(10, 6): floor min(6 + 2, 10 - 1) = 8, so two of the ten stores may be in flight at
  *  once. (The harness needs writeThreshold > width / 2, which rules out narrower pools that admit

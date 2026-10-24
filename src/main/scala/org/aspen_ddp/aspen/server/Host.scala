@@ -131,6 +131,10 @@ object Host:
   /** How long a failed transfer in waits before it is restarted */
   val TransferInRetryDelay: Duration = Duration(30, SECONDS)
 
+  /** How long after a transfer out begins, or is found still sending, its source device is
+   *  checked again. See scheduleDeviceRecheck. */
+  val TransferOutRecheckDelay: Duration = Duration(10, SECONDS)
+
 
 class Host(val client: AspenClient,
                    val hostId: HostId,
@@ -190,6 +194,8 @@ class Host(val client: AspenClient,
   // stays in transferringIn meanwhile, so device checks do not start a parallel attempt.
   private var transferInRetries: Map[StoreId, TransferInRetry] = Map()
   private var activeDeviceChecks: Set[StorageDeviceId] = Set()
+  // Devices with a re-check waiting out TransferOutRecheckDelay. At most one each.
+  private var scheduledDeviceRechecks: Set[StorageDeviceId] = Set()
   private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
@@ -1066,6 +1072,11 @@ class Host(val client: AspenClient,
                 os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
                 storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
                   toHostState.address, toHostState.storeTransferPort, m.timestamp)
+                // The transfer may have been aborted after the reads above, and the abort's
+                // nudge handled before the marker above existed. No check would then ever see
+                // the marker beside the Active entry, leaving the store dark for a full
+                // checkStorageDevicePeriod while the tree counts it online.
+                scheduleDeviceRecheck(sourceDs.storageDeviceId)
                 if wasLoaded then
                   gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
               catch
@@ -1490,14 +1501,20 @@ class Host(val client: AspenClient,
       // destination still named, means the marker is doing its job. isTransferringOut is the
       // same question asked of this process rather than the tree, and covers the window where
       // the drain restores the entry while this host is still shipping bytes.
-      local.offlineStores.filter(storeId =>
-        !storeTransferService.isTransferringOut(storeId) &&
+      //
+      // A store still sending is left alone but re-checked shortly. An abort's nudge usually
+      // arrives while the send is still running, and the send ends (the destination cancels its
+      // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
+      val (stillSending, abandonedOut) = local.offlineStores.filter(storeId =>
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
         os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile)
-      ).foreach: storeId =>
+      ).partition(storeTransferService.isTransferringOut)
+      abandonedOut.foreach: storeId =>
         reinstateAbandonedTransferOut(local, storeId)
+      if stillSending.nonEmpty then
+        scheduleDeviceRecheck(local.storageDeviceId)
 
       //----------------------
       // Completed Transfers In
@@ -1688,6 +1705,23 @@ class Host(val client: AspenClient,
         // has no timeout of its own and its retransmits go to a host that does not exist.
         if result.isSuccess then
           dropAbandonedTransferIn(storeId, fromDeviceId, toDeviceId)
+  }
+
+  /** Checks `storageDeviceId` again after TransferOutRecheckDelay, so a store left offline behind
+   *  a transfer-out marker is reinstated soon after an aborted transfer's send ends rather than at
+   *  the next periodic check. At most one is scheduled per device; requests made meanwhile are
+   *  covered by it.
+   */
+  private def scheduleDeviceRecheck(storageDeviceId: StorageDeviceId): Unit = synchronized {
+    if ! scheduledDeviceRechecks.contains(storageDeviceId) then
+      scheduledDeviceRechecks += storageDeviceId
+      backgroundTasks.schedule(TransferOutRecheckDelay)(runDeviceRecheck(storageDeviceId))
+  }
+
+  private def runDeviceRecheck(storageDeviceId: StorageDeviceId): Unit = synchronized {
+    if scheduledDeviceRechecks.contains(storageDeviceId) then
+      scheduledDeviceRechecks -= storageDeviceId
+      checkStorageDevice(storageDeviceId)
   }
 
   /** Requests a check of one storage device.
@@ -2001,6 +2035,14 @@ class Host(val client: AspenClient,
   /** Testing hook: runs every scheduled transfer-in retry now rather than after its delay. */
   private[aspen] def testingOnlyRetryTransferIns(): Unit =
     synchronized(transferInRetries.values.toList).foreach(_.run())
+
+  /** Testing hook: the devices with a re-check waiting out TransferOutRecheckDelay. */
+  private[aspen] def testingOnlyScheduledDeviceRechecks: Set[StorageDeviceId] =
+    synchronized(scheduledDeviceRechecks)
+
+  /** Testing hook: runs every scheduled device re-check now rather than after its delay. */
+  private[aspen] def testingOnlyRunDeviceRechecks(): Unit =
+    synchronized(scheduledDeviceRechecks).foreach(runDeviceRecheck)
 
   /** Testing hook: the storage devices with a state lookup currently in flight. */
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =

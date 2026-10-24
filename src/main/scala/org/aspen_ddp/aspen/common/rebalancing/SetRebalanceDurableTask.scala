@@ -10,7 +10,7 @@ import scribe.Logging
 
 import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Random, Success}
 
 object SetRebalanceDurableTask:
 
@@ -55,7 +55,8 @@ class SetRebalanceDurableTask(
     val taskPointer: DurableTaskPointer,
     val client: AspenClient,
     val setId: StorageDeviceSetId,
-    pollPeriod: Duration
+    pollPeriod: Duration,
+    rng: Random = new Random()  // Destination-selection randomness; a test seam.
 ) extends DurableTask with Logging:
   import SetRebalanceDurableTask.{Phase, Transfer}
 
@@ -183,8 +184,8 @@ class SetRebalanceDurableTask(
 
   /** Pick a new destination for a not-started transfer whose planned one is unusable and write
    *  it back into pendingTransfers. The entry is never dropped: when nothing usable can be
-   *  selected it is left as is for the next poll. Selection soft-excludes the pool's devices,
-   *  as the migration task does. */
+   *  selected it is left as is for the next poll. Selection soft-excludes the pool's devices and
+   *  the destinations of its other pending transfers, as the migration task does. */
   private def replaceDestination(t: Transfer,
                                  setState: StorageDeviceSetState,
                                  planningState: State.PlanningState): Future[Unit] =
@@ -192,6 +193,12 @@ class SetRebalanceDurableTask(
     val poolDevices = planningState.devices.values
       .filter(_.stores.keys.exists(_.poolId == storeId.poolId))
       .map(_.deviceId).toSet
+    // Planning state drops TransferringIn entries and knows nothing of planned destinations, so
+    // the destinations of the pool's other pending transfers are excluded too. Without them a
+    // replacement can land on a device already receiving, or planned to receive, another store
+    // of the same pool. Still a SOFT exclude, as the migration task's.
+    val pendingDestinations = setState.pendingTransfers.collect:
+      case (sid, _, to) if sid.poolId == storeId.poolId && sid != storeId => to
     val requiredSize = planningState.pools.get(storeId.poolId)
       .flatMap(_.stores.get(storeId))
       .map(_.currentSize)
@@ -203,7 +210,7 @@ class SetRebalanceDurableTask(
         s"unusable): $why; will retry")
       Future.unit
 
-    setState.selectDeviceForStore(requiredSize, poolDevices, client)
+    setState.selectDeviceForStore(requiredSize, poolDevices ++ pendingDestinations, client, rng)
       .map(Some(_))
       .recover { case _ => None }
       .flatMap:

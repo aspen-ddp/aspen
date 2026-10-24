@@ -79,6 +79,36 @@ private class StagedTransferService extends StoreTransferService:
   def transferringOutStores: Set[StoreId] = Set.empty
 
 
+/** A StoreTransferService whose sends move no bytes and end only when the test says so, for
+ *  tests where this host is the transfer's source. beginTransferIn is unimplemented on purpose,
+ *  as beginTransferOut is in StagedTransferService.
+ */
+private class StagedSendService extends StoreTransferService:
+  private var sending = Set[StoreId]()
+  private var begun = Vector[(StoreId, UUID)]()
+
+  /** Every beginTransferOut call, in order. */
+  def transfersOut: Vector[(StoreId, UUID)] = synchronized(begun)
+
+  /** Ends `storeId`'s send, as a failure or a completion would: it is no longer transferring out. */
+  def endTransferOut(storeId: StoreId): Unit = synchronized:
+    sending -= storeId
+
+  def beginTransferIn(storeId: StoreId, transferUUID: UUID, destinationDirectory: os.Path): Future[Unit] =
+    throw new UnsupportedOperationException("StagedSendService does not receive stores")
+
+  def cancelTransferIn(storeId: StoreId, transferUUID: UUID): Unit = ()
+
+  def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
+                       destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit = synchronized:
+    begun :+= (storeId, transferUUID)
+    sending += storeId
+
+  def isTransferringOut(storeId: StoreId): Boolean = synchronized(sending.contains(storeId))
+
+  def transferringOutStores: Set[StoreId] = synchronized(sending)
+
+
 /** Delegates execution to `underlying`, and records every reportFailure call instead of
  *  passing it on.
  *
@@ -1334,6 +1364,126 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       markedBeforeAbort should be(true)
       os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
       host.storeLoadAttempts.toList.drop(before) should be(List((sourceId, storeDir)))
+
+  /** A host owning the source of a transfer of `movingStore` whose send has begun through a real
+   *  StartStoreTransfer: the store directory is marked and the StagedSendService is sending. */
+  private case class TransferOutStarted(host: RecordingHost,
+                                        sends: StagedSendService,
+                                        storeDir: os.Path,
+                                        movingStore: StoreId,
+                                        sourceId: StorageDeviceId)
+
+  private def startTransferOut(): Future[TransferOutStarted] =
+    given ExecutionContext = executionContext
+
+    val hostRoot = newHostDir()
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+    val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends)
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+
+    // The recording host never loads the store, so closeStore has nothing to close and does not
+    // mark it offline; that is done by hand, as ShutdownStore would.
+    val storeDir = deviceDir / movingStore.directoryName
+    os.makeDir.all(storeDir)
+    val local = host.loadedDevices(sourceId)
+    local.offlineStores = local.offlineStores + movingStore
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyHandleHostMessage(StartStoreTransfer(host.hostId, client.clientId,
+            sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
+      _ <- pumpUntil(sends.isTransferringOut(movingStore))
+    yield
+      sends.isTransferringOut(movingStore) should be(true)
+      os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(true)
+      TransferOutStarted(host, sends, storeDir, movingStore, sourceId)
+
+  atest("an abort during an active send reinstates the source once the send ends"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferOut()
+      _ <- client.abortStoreTransfer(t.movingStore)
+      _ <- waitForTransactionsToComplete()
+
+      // The abort's nudge: the send is still running, so the marker must stay for now.
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!t.host.testingOnlyActiveDeviceChecks.contains(t.sourceId))
+      markedWhileSending = os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile)
+      before = t.host.storeLoadAttempts.size
+
+      // The destination cancels its receive and the send fails. Nothing else is sent to this
+      // host, and the next periodic check is an hour away in production.
+      _ = t.sends.endTransferOut(t.movingStore)
+      _ = t.host.testingOnlyRunDeviceRechecks()
+      _ <- pumpUntil(!os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile) &&
+                     !t.host.testingOnlyActiveDeviceChecks.contains(t.sourceId))
+    yield
+      markedWhileSending should be(true)
+      os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+      t.host.storeLoadAttempts.toList.drop(before) should be(List((t.sourceId, t.storeDir)))
+      t.host.testingOnlyScheduledDeviceRechecks should be(Set())
+
+  atest("a send begun after the abort's check still reinstates the source"):
+    given ExecutionContext = executionContext
+
+    // startStoreTransferOut read TransferringOut before the abort committed and the abort's
+    // nudge was handled before the marker existed, so no device check ever sees the marker
+    // alongside the Active entry. Only the re-check the send's start arranges does.
+    for
+      t <- startTransferOut()
+      _ <- client.abortStoreTransfer(t.movingStore)
+      _ <- waitForTransactionsToComplete()
+      before = t.host.storeLoadAttempts.size
+      scheduled = t.host.testingOnlyScheduledDeviceRechecks
+
+      _ = t.sends.endTransferOut(t.movingStore)
+      _ = t.host.testingOnlyRunDeviceRechecks()
+      _ <- pumpUntil(!os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile) &&
+                     !t.host.testingOnlyActiveDeviceChecks.contains(t.sourceId))
+    yield
+      scheduled should be(Set(t.sourceId))
+      os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+      t.host.storeLoadAttempts.toList.drop(before) should be(List((t.sourceId, t.storeDir)))
+
+  atest("a send that is still running when its re-check fires is re-checked again"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferOut()
+      _ <- client.abortStoreTransfer(t.movingStore)
+      _ <- waitForTransactionsToComplete()
+
+      _ = t.host.testingOnlyRunDeviceRechecks()
+      _ <- pumpUntil(!t.host.testingOnlyActiveDeviceChecks.contains(t.sourceId) &&
+                     t.host.testingOnlyScheduledDeviceRechecks.nonEmpty)
+      markedWhileSending = os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile)
+      rescheduled = t.host.testingOnlyScheduledDeviceRechecks
+
+      _ = t.sends.endTransferOut(t.movingStore)
+      _ = t.host.testingOnlyRunDeviceRechecks()
+      _ <- pumpUntil(!os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile))
+    yield
+      markedWhileSending should be(true)
+      rescheduled should be(Set(t.sourceId))
+      os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+
+  atest("a normal transfer out is not re-checked once its first re-check finds it outstanding"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferOut()
+      _ = t.host.testingOnlyRunDeviceRechecks()
+      _ <- pumpUntil(!t.host.testingOnlyActiveDeviceChecks.contains(t.sourceId))
+    yield
+      t.host.testingOnlyActiveDeviceChecks should not contain t.sourceId
+      t.host.testingOnlyScheduledDeviceRechecks should be(Set())
+      os.exists(t.storeDir / StoreTransfer.TransferOutMarkerFile) should be(true)
 
   atest("a stale transfer staging directory is removed when its device loads"):
     val hostRoot = newHostDir()

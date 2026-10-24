@@ -14,6 +14,7 @@ import org.aspen_ddp.aspen.compute.DurableTaskPointer
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.util.Random
 
 /** Drives SetRebalanceDurableTask directly over a hand-written `pendingTransfers` list, so each
  *  test controls exactly which transfers are planned and to where. */
@@ -38,8 +39,9 @@ abstract class SetRebalanceDurableTaskSuiteBase extends IntegrationTestSuite:
 
   /** The task is constructed and driven directly, as RebalancingDurableService does. Its task
    *  pointer is only an identity, so any KV pointer serves. */
-  protected def startTask(): SetRebalanceDurableTask =
-    val task = new SetRebalanceDurableTask(DurableTaskPointer(Radicle.pointer), client, setId, pollPeriod)
+  protected def startTask(rng: Random = new Random()): SetRebalanceDurableTask =
+    val task = new SetRebalanceDurableTask(DurableTaskPointer(Radicle.pointer), client, setId,
+                                           pollPeriod, rng)
     tasks ::= task
     task
 
@@ -162,6 +164,30 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase
     yield
       remaining shouldBe empty
       dst should be(Some(StorageDeviceState.StoreStatus.Active))
+
+  atest("a replacement destination avoids another pending destination of the same pool"):
+    given ExecutionContext = executionContext
+    val s0 = storeId(0)
+    val s1 = storeId(1)
+    val fourthDeviceId = StorageDeviceId(new java.util.UUID(0, 102))
+    // shuffle never reorders when nextInt(n) always returns n - 1, so selection tries the set's
+    // members in list order: boot, second, third, fourth. Without s1's planned destination in
+    // the exclude set the replacement for s0 would therefore land on third.
+    val noShuffle = new Random(new java.util.Random:
+      override def nextInt(bound: Int): Int = bound - 1)
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- net.createDevice(fourthDeviceId)
+      _ <- tombstone(net.secondDeviceId)
+      _ <- writePending(List((s0, boot, net.secondDeviceId), (s1, boot, net.thirdDeviceId)))
+      task = startTask(noShuffle)
+      _ <- awaitUntil("the destination to be replaced")(
+             pendingTransfers().map(!_.contains((s0, boot, net.secondDeviceId))))
+      remaining <- pendingTransfers()
+    yield
+      remaining should contain((s0, boot, fourthDeviceId))
+      remaining should not contain((s0, boot, net.thirdDeviceId))
 
   atest("a pending transfer is kept, not dropped, when no new destination is selectable"):
     given ExecutionContext = executionContext

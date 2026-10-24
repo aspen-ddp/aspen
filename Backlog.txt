@@ -1,32 +1,66 @@
-A single stuck transferStore call can freeze a pool migration permanently
-  - Each migration pass (MigratePoolToSetDurableTask.processNext) starts at most one
-    transfer by calling client.transferStore in tryStores and *waiting for its Future*
-    before the pass is allowed to finish
-  - transferStore is a transaction that updates the source and destination device
-    objects. It runs under transactUntilSuccessfulWithRecovery, which retries forever
-    on any error not classified as StopRetrying. Only NoSuchElementException,
-    InvalidDestination, StoreNotActive and DeviceFailed give up. Anything else
-    (a persistently colliding or unreachable device object, a host that never answers)
-    is retried with no attempt limit and no deadline, so the Future never completes
-  - While that Future is pending the pass never ends, and three things then keep
-    anything else from happening:
-      1. the single-flight guard (boundedSingleFlight) stays set, so every poll tick
-         is dropped
-      2. the next poll is only armed by scheduleRecheck at the end of a pass, so no
-         tick is scheduled at all
-      3. SystemTaskRunner.heartbeat() bumps every *running* task whether or not it is
-         making progress, so the service never decides the task is dead and
-         re-dispatches it. A retarget of the migration cannot rescue it either,
-         because it is only noticed at the start of a pass
-  - The result is a migration that shows as running forever and moves nothing
-  - Contrast SetRebalanceDurableTask, which fires transferStore without waiting
-    and reschedules immediately, so the same stuck call cannot stall it
+A single stuck transfer start can freeze a pool migration or a set rebalance
+  - Both MigratePoolToSetDurableTask (tryStores) and SetRebalanceDurableTask (advance,
+    folded sequentially over a pass's not-started transfers) *wait for*
+    TransferStarter.start before the pass is allowed to finish. A migration pass may
+    start several transfers; each start is awaited in turn
+  - TransferStarter.start awaits client.transferStore, the post-start verification
+    reads of pool and device state, and on rollback client.abortStoreTransfer.
+    transferStore and abortStoreTransfer run under transactUntilSuccessfulWithRecovery,
+    which retries forever on any error not classified as StopRetrying (only
+    NoSuchElementException, InvalidDestination, StoreNotActive and DeviceFailed give
+    up). Anything else (a persistently colliding or unreachable device object, a host
+    that never answers) is retried with no attempt limit and no deadline, so the
+    Future never completes
+  - While that Future is pending the pass never ends, and in both tasks the next poll
+    is armed by scheduleRecheck only at the end of a pass, so no tick is scheduled at
+    all. Further:
+      1. migration: the single-flight guard (boundedSingleFlight) stays set, so any
+         other trigger is dropped; SystemTaskRunner.heartbeat() bumps every *running*
+         task whether or not it is making progress, so the service never decides the
+         task is dead and re-dispatches it; and a retarget is only noticed at the
+         start of a pass, so it cannot rescue it either
+      2. rebalance: only wake() (a TransferComplete message) can start another pass,
+         and that pass may itself block on the same call
+  - The result is a task that shows as running forever and moves nothing
   - The retry loop is the right recovery for genuinely transient faults, which is
     why it was left alone. The fix is to stop the pass from depending on the
-    call's completion (fire and let the next poll observe the device entries, as
-    the rebalance task does) or to give the call a bounded number of attempts
+    calls' completion (fire and let the next poll observe the device entries) or to
+    give them a bounded number of attempts
   - Deliberately split out of the parallel-store-transfers work
     (docs/superpowers/specs/2026-10-24-parallel-store-transfers-design.md)
+
+Follow-ups from parallel store transfers
+  1. SetRebalanceDurableTask passes can overlap (wake() plus the poll, no single-flight
+     guard). Add boundedSingleFlight (maxInFlight 2, arm the poll at pass start)
+     together with the stall decision in the entry above
+  2. Stale resume of a promoted aborted copy: after a crash or StopRetrying, a re-transfer
+     to the same destination resumes the old marked copy (Host.startStoreTransferIn's
+     resume path). Carry the transfer UUID in the device entry, or discard a marked
+     finalPath whose entry is absent
+  3. A retry to a different device on the same host waits up to one device poll. Drop
+     tracked attempts for a store this device's remote records TransferringIn from a
+     different toDeviceId
+  4. AspenClient.abortStoreTransfer nudges the destination host even when the entry was not
+     ours or the destination is tombstoned; no test for the 'already completed' no-op nudge
+  5. TransferStarter: a failed Future from start is ambiguous (document it); RolledBack is
+     returned even when the abort was a no-op; TransferBackoff has no jitter and does not
+     use FiniteDuration
+  6. Rebalance minors: requiredSize falls back to 0; one random candidate per poll; the
+     classify traverse is unbounded and each ready transfer reads the whole pool per poll
+     (use runBoundedParallel); a stuck Rebuilding entry keeps the task InFlight forever
+  7. Migration: a selection failure (AllocationError) does not back off
+  8. Tests: a rebuild landing on a device other than the planned destination is untested;
+     the 'no competing transfer' check is a single snapshot after a fixed sleep;
+     failAndDrain/completeRebuild are duplicated across suites; no isSafe test for a
+     width-1 pool
+  9. The CLI transfer-store (cmdline/Main.scala ~1976) bypasses TransferSafety. Add a comment
+     that it is an operator override that can push a pool below the floor
+  10. The createSecondDevice test harness hangs for Replication pools with
+      writeThreshold <= width/2 (tried (5,1), (5,2), (6,2), (6,3)). May be a real bug;
+      uninvestigated
+  11. Pre-existing: when the destination finishes after a tombstoned source's entry was
+      already drained, Host.updateStateForTransferredStore falls through to PoolRepointed
+      and loads a copy the pool does not name
 
 StoragePool.getState() and dropCachedState() are now dead API
   - SimpleStoragePool caches its StoragePoolState at construction and

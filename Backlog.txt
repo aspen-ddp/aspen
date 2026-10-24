@@ -1,7 +1,3 @@
-QUIC tests are flaky under the full test run
-  - Seen while looping the full run (1 failure each in 12 runs): "a second host on a port in use
-    fails clearly and leaves nothing behind" and "end-to-end transaction over QUIC". Both pass
-    alone; not investigated
 
 A single stuck transfer start can freeze a pool migration or a set rebalance
   - Both MigratePoolToSetDurableTask (tryStores) and SetRebalanceDurableTask (advance,

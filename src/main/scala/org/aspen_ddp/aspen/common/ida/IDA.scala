@@ -48,6 +48,14 @@ sealed trait AppendableIDA:
   /** One delta per encoding index, for appending `data` (non-empty) to an object of logical length `currentLength` */
   def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta]
 
+  /** One delta per encoding index, for overwriting byte ranges of an object of logical length
+    * `currentLength`. Edits must be non-empty and non-overlapping. An edit may begin beyond the current
+    * end, in which case the gap is zero filled. The new length is the larger of the current length
+    * and the furthest edit end. Only the old bytes under each edit are needed: by linearity the slice
+    * deltas depend only on the data deltas (old XOR new at the edited bytes, zero elsewhere).
+    */
+  def rangedWriteDeltas(currentLength: Int, edits: List[RangeEdit]): Array[AppendDelta]
+
   /** Row-aligned slice offset at which logical byte `offset` begins */
   def sliceOffsetFor(offset: Int): Int
 
@@ -153,6 +161,23 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA with Appenda
   def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta] =
     require(data.length > 0, "Append data must not be empty")
     Array.fill(width)(AppendDelta(currentLength, currentLength + data.length, currentLength, data, None))
+
+  /** Each region is exactly an edit's XOR delta: old ^ new over the existing content and the new bytes
+    * beyond it. Edits that touch are merged. A gap beyond the old end needs no bytes since the store
+    * zero-extends the slice.
+    */
+  def rangedWriteDeltas(currentLength: Int, edits: List[RangeEdit]): Array[AppendDelta] =
+    val (sorted, newLength) = RangeEdit.validate(currentLength, edits)
+    require(newLength <= Int.MaxValue, "Object length overflow")
+
+    val regions = sorted.foldRight(List.empty[XorRegion]) { (e, acc) =>
+      val bytes = Array.tabulate(e.newBytes.length)(j => e.deltaAt(e.offset + j))
+      acc match
+        case next :: rest if next.offset == e.end => XorRegion(e.offset, bytes ++ next.bytes) :: rest
+        case _ => XorRegion(e.offset, bytes) :: acc
+    }
+
+    Array.fill(width)(AppendDelta(currentLength, newLength.toInt, regions, None))
 
   def sliceOffsetFor(offset: Int): Int = offset
 
@@ -579,6 +604,75 @@ case class AppendingReedSolomon(
 
     Array.tabulate(width) { i =>
       AppendDelta(oldRows * cellSize, newRows * cellSize, startRow * cellSize, shards(i),
+        if i == k - 1 then Some(oldTrailer) else None)
+    }
+
+  /** Sparse, row by row: only rows holding an edited byte, plus the old and new trailer rows when the
+    * length changes, contribute. Runs of adjacent affected rows are encoded together as an XOR delta
+    * stream and each store receives that run's cells, trimmed to their nonzero span. The store
+    * holding the trailer always receives the old trailer as the expected tail.
+    */
+  def rangedWriteDeltas(currentLength: Int, edits: List[RangeEdit]): Array[AppendDelta] =
+    val (sorted, newLengthL) = RangeEdit.validate(currentLength, edits)
+    require(newLengthL <= Int.MaxValue - rowBytes, "Object length overflow")
+
+    val newLength = newLengthL.toInt
+    val oldRows = rowsFor(currentLength)
+    val newRows = rowsFor(newLength)
+    val lengthChanges = newLength != currentLength
+
+    // Inclusive row intervals, merged where they overlap or are adjacent
+    val editRows = sorted.map(e => (e.offset / rowBytes, ((e.end - 1) / rowBytes).toInt))
+    val trailerRows = if lengthChanges then List((oldRows - 1, oldRows - 1), (newRows - 1, newRows - 1)) else Nil
+    val runs = (editRows ++ trailerRows).sortBy(_._1).foldLeft(List.empty[(Int, Int)]) { (acc, r) =>
+      acc match
+        case (a, b) :: rest if r._1 <= b + 1 => (a, math.max(b, r._2)) :: rest
+        case _ => r :: acc
+    }.reverse
+
+    val regions = Array.fill(width)(List.newBuilder[XorRegion])
+
+    runs.foreach { (firstRow, lastRow) =>
+      val nrows = lastRow - firstRow + 1
+      val base = firstRow.toLong * rowBytes
+      val stream = new Array[Byte](nrows * rowBytes)
+
+      sorted.foreach { e =>
+        val from = math.max(e.offset.toLong, base)
+        val to = math.min(e.end, base + stream.length)
+        var p = from
+        while p < to do
+          stream((p - base).toInt) = e.deltaAt(p.toInt)
+          p += 1
+      }
+
+      // Each trailer lies entirely within its final row
+      if lengthChanges then
+        if oldRows - 1 >= firstRow && oldRows - 1 <= lastRow then
+          xorLong(stream, (oldRows.toLong * rowBytes - AppendingReedSolomon.TrailerSize - base).toInt, currentLength.toLong)
+        if newRows - 1 >= firstRow && newRows - 1 <= lastRow then
+          xorLong(stream, (newRows.toLong * rowBytes - AppendingReedSolomon.TrailerSize - base).toInt, newLength.toLong)
+
+      val shards = addParity(scatter(stream, 0, stream.length, nrows), nrows * cellSize)
+
+      var i = 0
+      while i < width do
+        val cells = shards(i)
+        var lo = 0
+        while lo < cells.length && cells(lo) == 0 do
+          lo += 1
+        if lo < cells.length then
+          var hi = cells.length
+          while cells(hi - 1) == 0 do
+            hi -= 1
+          regions(i) += XorRegion(firstRow * cellSize + lo, java.util.Arrays.copyOfRange(cells, lo, hi))
+        i += 1
+    }
+
+    val oldTrailer = ByteBuffer.allocate(AppendingReedSolomon.TrailerSize).putLong(currentLength.toLong).array()
+
+    Array.tabulate(width) { i =>
+      AppendDelta(oldRows * cellSize, newRows * cellSize, regions(i).result(),
         if i == k - 1 then Some(oldTrailer) else None)
     }
 

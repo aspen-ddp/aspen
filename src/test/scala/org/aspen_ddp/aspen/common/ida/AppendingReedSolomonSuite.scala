@@ -138,3 +138,81 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
       bb.flip()
       IDA.deserializeIDAType(bb) should be (ida)
   }
+
+  private val RangedConfigs: List[AppendingReedSolomon] = Configs ++ List(
+    AppendingReedSolomon(4, 2, 3, 8),
+    AppendingReedSolomon(7, 4, 5, 9),
+    AppendingReedSolomon(3, 3, 3, 13))
+
+  private def checkRanged(ida: AppendingReedSolomon, old: Array[Byte], writes: List[(Int, Array[Byte])]): Unit =
+    import RangedWriteDeltaSuite.{applyDeltas, applyWrites}
+    val expected = ida.encode(applyWrites(old, writes))
+    val actual = applyDeltas(ida, old, writes)
+    withClue(s"$ida len=${old.length} writes=${writes.map((o, b) => (o, b.length))}") {
+      actual.indices.foreach(i => actual(i).toSeq should be (expected(i).toSeq))
+    }
+
+  test("rangedWriteDeltas: delta-applied slices equal a fresh encode for edit shapes") {
+    import RangedWriteDeltaSuite.{bytes, randomWrites}
+    val rnd = new scala.util.Random(11)
+    for ida <- RangedConfigs do
+      val rb = ida.rowBytes
+      for len <- List(0, 1, rb - 9, rb - 8, rb - 7, rb, rb + 1, 3 * rb - 8, 4 * rb + 5, 10 * rb + 3) do
+        if len >= 0 then
+          val old = bytes(len, rnd)
+          def at(off: Int, n: Int): Option[(Int, Array[Byte])] =
+            if off >= 0 && n > 0 then Some((off, bytes(n, rnd))) else None
+          val shapes: List[List[(Int, Array[Byte])]] = List(
+            at(1, 3),                            // within a row
+            at(rb - 2, 5),                       // spanning rows
+            at(rb - 3, 3),                       // ending exactly on a row boundary
+            at(2 * rb - 1, rb + 2),              // spanning several rows
+            at(len - 2, 10),                     // extending past the end
+            at(len, 1),                          // starting at the old length
+            at(len, rb - 8 - len % rb),          // filling the final row so the trailer moves
+            at(len + 2 * rb + 3, 4),             // beyond the length with a gap
+            at(0, len + 1),                      // rewrite everything and extend
+            at(len - 1, 1)                       // last byte, no extension
+          ).flatten.map(List(_)) ++ List(
+            List(at(0, 2), at(rb + 1, 1), at(len + 1, 3)).flatten,
+            List(at(len, 2), at(len + 5 * rb, 2)).flatten)
+          def disjoint(w: List[(Int, Array[Byte])]): Boolean =
+            w.sortBy(_._1).sliding(2).forall {
+              case List(a, b) => a._1 + a._2.length <= b._1
+              case _ => true
+            }
+          shapes.filter(w => w.nonEmpty && disjoint(w)).foreach(w => checkRanged(ida, old, w))
+          (0 until 15).foreach(_ => checkRanged(ida, old, randomWrites(rnd, len + 3 * rb, 4)))
+  }
+
+  test("rangedWriteDeltas: a non-extending write keeps the slice length") {
+    import RangedWriteDeltaSuite.{bytes, edit}
+    val rnd = new scala.util.Random(12)
+    for ida <- RangedConfigs do
+      val old = bytes(5 * ida.rowBytes + 3, rnd)
+      val deltas = ida.rangedWriteDeltas(old.length, List(edit(old, ida.rowBytes + 1, bytes(4, rnd))))
+      deltas.foreach(d => d.newSliceLength should be (d.expectedSliceLength))
+      deltas(ida.restoreThreshold - 1).expectedTail.map(_.toSeq) should be (
+        Some(ByteBuffer.allocate(8).putLong(old.length.toLong).array().toSeq))
+  }
+
+  test("rangedWriteDeltas: distant edits send no bytes from the rows between") {
+    import RangedWriteDeltaSuite.{bytes, edit}
+    val rnd = new scala.util.Random(13)
+    for ida <- RangedConfigs do
+      val rb = ida.rowBytes
+      val old = bytes(200 * rb, rnd)
+      // Two edits, each within one row, 150 rows apart, length unchanged: two affected rows
+      val writes = List((2 * rb + 1, 3), (152 * rb + 1, 3)).map((o, n) => edit(old, o, bytes(n, rnd)))
+      val deltas = ida.rangedWriteDeltas(old.length, writes)
+      deltas.foreach { d =>
+        val dataBytes = d.regions.map(_.bytes.length).sum
+        dataBytes should be <= (2 * ida.cellSize)
+        d.encode.size should be <= (18 + 2 * 8 + 2 * ida.cellSize + 8)
+      }
+      // The same edits extending the object also touch the old and new trailer rows only
+      val grow = writes :+ RangeEdit(old.length + 3 * rb, bytes(2, rnd), Array.emptyByteArray)
+      ida.rangedWriteDeltas(old.length, grow).foreach { d =>
+        d.regions.map(_.bytes.length).sum should be <= (5 * ida.cellSize)
+      }
+  }

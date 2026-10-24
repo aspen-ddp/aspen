@@ -232,6 +232,38 @@ trait AppendIntegrationTests:
       bytesShouldMatch(state.data.getByteArray, base ++ winner)
       succeed
 
+  atest("readRange, readAppendPosition and readRanges agree with the written content"):
+    val rnd = new Random(11)
+    val R = rowBytes
+    val content = chunkOf(rnd, 3 * R + 21)
+    val L = content.length
+    def slice(offset: Int, length: Int): Array[Byte] =
+      if offset >= L then Array[Byte]() else content.slice(offset, math.min(offset.toLong + length, L.toLong).toInt)
+    val ranges = List((R + 1, 9), (R + 1, 9), (5, 2 * R), (R, R), (0, 0), (L, 4), (L + 3 * R, 4), (L - 3, 100), (0, L))
+    for
+      dp <- allocateWith(1, content)
+      some <- client.readRange(dp, R + 2, Some(11))
+      none <- client.readRange(dp, R + 2, None)
+      empty <- client.readRange(dp, 4, Some(0))
+      pos <- client.readAppendPosition(dp)
+      noRanges <- client.readRanges(dp, Nil)
+      results <- client.readRanges(dp, ranges)
+    yield
+      some.offset should be (R + 2)
+      bytesShouldMatch(some.data.getByteArray, slice(R + 2, 11))
+      none.offset should be (R + 2)
+      bytesShouldMatch(none.data.getByteArray, slice(R + 2, Int.MaxValue))
+      none.objectLength should be (Some(L))
+      bytesShouldMatch(empty.data.getByteArray, Array[Byte]())
+      pos.length should be (L)
+      noRanges should be (Nil)
+      results.length should be (ranges.length)
+      ranges.zip(results).foreach: (range, rs) =>
+        withClue(s"range $range: "):
+          rs.offset should be (range._1)
+          bytesShouldMatch(rs.data.getByteArray, slice(range._1, range._2))
+      succeed
+
   atest("readRanges returns each range's bytes in request order"):
     val rnd = new Random(7)
     val R = rowBytes

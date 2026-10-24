@@ -134,20 +134,36 @@ abstract class BaseAspenClient(
       case ida: (IDA & AppendableIDA) => Future.successful(ida)
       case ida => Future.failed(new RangeReadNotSupported(pointer, ida))
 
+  /** The single read path for range reads: one ByteRanges request, so every piece comes from the same revision.
+    * `ranges` are (offset, length) pairs in logical coordinates and `tail` is a number of slice tail bytes
+    */
+  private def readByteRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], tail: Int,
+                             comment: String): Future[DataObjectRangesState] =
+    // Resolved first so that an empty list still fails for an IDA without range reads
+    resolveAppendableIda(pointer).flatMap { ida =>
+      if ranges.exists((offset, length) => offset < 0 || length < 0) then
+        Future.failed(new IllegalArgumentException(s"Invalid ranges: $ranges"))
+      else
+        val sliceRanges = ranges.map: (offset, length) =>
+          val (start, end) = ida.sliceRangeFor(offset, length)
+          (start, end - start)
+        rmgr.read(pointer, ida, comment, readType = ByteRanges(sliceRanges, tail)).map(_.asInstanceOf[DataObjectRangesState])
+    }
+
   override def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int],
                          comment: String): Future[DataObjectRangeState] =
     if offset < 0 || length.exists(_ < 0) then
       Future.failed(new IllegalArgumentException(s"Invalid range: offset $offset length $length"))
     else
       resolveAppendableIda(pointer).flatMap { ida =>
+        // An open ended range is requested directly in slice coordinates so that no end can overflow
         val readType = length match
           case Some(n) =>
             val (start, end) = ida.sliceRangeFor(offset, n)
-            ByteRange(start, end - start)
-          case None => ByteRangeToEnd(ida.sliceOffsetFor(offset))
-        rmgr.read(pointer, ida, comment, readType = readType).map { os =>
-          trimRange(os.asInstanceOf[DataObjectRangeState], offset, length)
-        }
+            ByteRanges(List((start, end - start)), 0)
+          case None => ByteRanges(List((ida.sliceOffsetFor(offset), Int.MaxValue)), 0)
+        rmgr.read(pointer, ida, comment, readType = readType).map: os =>
+          trimRange(os.asInstanceOf[DataObjectRangesState].ranges.head, offset, length)
       }
 
   /** Restored windows are row-aligned and may run past the request, so they are trimmed to the request */
@@ -163,27 +179,27 @@ abstract class BaseAspenClient(
 
   override def readRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)],
                           comment: String): Future[List[DataObjectRangeState]] =
-    // Resolved up front so that an empty list still fails for an IDA without range reads
-    resolveAppendableIda(pointer).flatMap { _ =>
-      Future.sequence(ranges.map((offset, length) => readRange(pointer, offset, Some(length), comment)))
-    }
+    readByteRanges(pointer, ranges, 0, comment).map: state =>
+      ranges.zip(state.ranges).map((range, piece) => trimRange(piece, range._1, Some(range._2)))
 
   override def readRangedWriteState(pointer: DataObjectPointer, writes: List[RangedWrite],
                                     comment: String): Future[RangedWriteState] =
-    RangedWriteFetch.fetch(pointer, writes) { () =>
-      // Started together: the length read and one range read per write form a single concurrent round
-      val position = readAppendPosition(pointer, comment)
-      val reads = readRanges(pointer, writes.map(w => (w.offset, w.data.length)), comment)
-      position.zip(reads)
+    // The length probe and one range per write are a single request, so they share a revision
+    resolveAppendableIda(pointer).flatMap { ida =>
+      readByteRanges(pointer, writes.map(w => (w.offset, w.data.length)), ida.lengthProbeBytes, comment).flatMap: state =>
+        state.appendPosition match
+          case Some(position) =>
+            val reads = writes.zip(state.ranges).map((w, piece) => trimRange(piece, w.offset, Some(w.data.length)))
+            Future.successful(RangedWriteFetch.combine(pointer, writes, position, reads))
+          case None => Future.failed(new CorruptedObject(pointer))
     }
 
   override def readAppendPosition(pointer: DataObjectPointer, comment: String): Future[AppendPosition] =
     resolveAppendableIda(pointer).flatMap { ida =>
-      rmgr.read(pointer, ida, comment, readType = SliceTail(ida.lengthProbeBytes)).flatMap { os =>
-        os.asInstanceOf[DataObjectRangeState].appendPosition match
+      readByteRanges(pointer, Nil, ida.lengthProbeBytes, comment).flatMap: state =>
+        state.appendPosition match
           case Some(position) => Future.successful(position)
           case None => Future.failed(new CorruptedObject(pointer))
-      }
     }
 
   // ---- Transactions ----

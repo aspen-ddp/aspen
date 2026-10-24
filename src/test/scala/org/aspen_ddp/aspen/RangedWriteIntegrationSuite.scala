@@ -368,6 +368,55 @@ trait RangedWriteIntegrationTests:
       _ <- readsWithStoresDown(dp, expected)
     yield succeed
 
+  /** Content whose byte at index i is a function of i alone, so any revision's prefix is predictable */
+  private def patternAt(i: Int): Byte = (i * 31 + 7).toByte
+
+  /** Appends 37 byte pattern chunks in the background, starting at `start`, `count` times */
+  private def appendPattern(dp: DataObjectPointer, start: Int, count: Int): Future[Unit] =
+    client.readAppendPosition(dp).flatMap: pos0 =>
+      (0 until count).foldLeft(Future.successful(pos0)): (fpos, n) =>
+        fpos.flatMap: pos =>
+          val tx = client.newTransaction()
+          val chunk = Array.tabulate[Byte](37)(i => patternAt(start + n * 37 + i))
+          val next = tx.append(pos, DataBuffer(chunk))
+          tx.commit().map(_ => next)
+      .map(_ => ())
+
+  private def repeat(times: Int)(f: Int => Future[Unit]): Future[Unit] =
+    (0 until times).foldLeft(Future.successful(())): (acc, n) =>
+      acc.flatMap(_ => f(n))
+
+  atest("readRangedWriteState never fails with a mixed revision while a writer appends"):
+    val R = rowBytes
+    val initial = Array.tabulate[Byte](3 * R + 5)(patternAt)
+    val writes = List(RangedWrite(3, Array[Byte](1, 2, 3)), RangedWrite(R + 2, Array.fill[Byte](R)(5)),
+                      RangedWrite(initial.length - 4, Array.fill[Byte](20)(6)))
+    for
+      dp <- allocateWith(1, initial)
+      appender = appendPattern(dp, initial.length, 25)
+      _ <- repeat(25): _ =>
+             client.readRangedWriteState(dp, writes).map: state =>
+               state.length should be >= initial.length
+               writes.foreach: w =>
+                 val end = math.min(w.end, state.length.toLong).toInt
+                 val expected = (w.offset until end).map(i => patternAt(i)).toList
+                 state.oldBytes(w.offset, w.data.length).toList should be (expected)
+      _ <- appender
+    yield succeed
+
+  atest("readRanges returns every range at one revision"):
+    val R = rowBytes
+    val initial = Array.tabulate[Byte](3 * R + 5)(patternAt)
+    val ranges = List((0, 10), (R, R), (initial.length - 4, 30))
+    for
+      dp <- allocateWith(1, initial)
+      appender = appendPattern(dp, initial.length, 25)
+      _ <- repeat(25): _ =>
+             client.readRanges(dp, ranges).map: states =>
+               states.map(_.revision).distinct.length should be (1)
+      _ <- appender
+    yield succeed
+
   atest("two far apart edits in a large object"):
     val rnd = new Random(112)
     val content = chunkOf(rnd, 64 * 1024)

@@ -80,6 +80,11 @@ object Host:
      *  the pool left naming it. The arrived copy belongs to nobody. */
     case SourceRestored
 
+    /** The transfer was aborted (AspenClient.abortStoreTransfer) before its bytes were recorded:
+     *  the source's entry is no longer TransferringOut to the destination. The pool still names
+     *  the source, which kept its copy, so the arrived copy belongs to nobody. */
+    case Aborted
+
   /** What markRebuiltStoreActive decided about a rebuilt store, so its caller knows whether the
    *  device is allowed to adopt the copy the rebuild placed.
    *
@@ -111,11 +116,17 @@ object Host:
     def totalSize: Long = configFile.toIO.getTotalSpace
     def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace
 
-  class PendingTransfer(val msg: StartStoreTransfer, var lastSend: HLCTimestamp)
+  /** `toDeviceId` is the local device receiving the store, so a check of that device can tell
+   *  which of its transfers in the tree no longer records. */
+  class PendingTransfer(val msg: StartStoreTransfer,
+                        val toDeviceId: StorageDeviceId,
+                        var lastSend: HLCTimestamp)
 
   /** A failed transfer in waiting out TransferInRetryDelay. `fromDeviceId` is the source the retry
-   *  would ask for the store again. */
-  class TransferInRetry(val fromDeviceId: StorageDeviceId, val run: () => Unit)
+   *  would ask for the store again, `toDeviceId` the local device receiving it. */
+  class TransferInRetry(val fromDeviceId: StorageDeviceId,
+                        val toDeviceId: StorageDeviceId,
+                        val run: () => Unit)
 
   /** How long a failed transfer in waits before it is restarted */
   val TransferInRetryDelay: Duration = Duration(30, SECONDS)
@@ -552,6 +563,16 @@ class Host(val client: AspenClient,
 
           TransferOutcome.SourceRestored
 
+        // Aborted (AspenClient.abortStoreTransfer) while the bytes were in flight, which puts the
+        // source back to Active and leaves the pool naming it. Repointing the pool now would
+        // complete a transfer its initiator has been told never happened.
+        else if fromDev.stores.get(storeId).exists(entry =>
+                  entry.status != StorageDeviceState.StoreStatus.TransferringOut ||
+                  !entry.transferDevice.contains(toDeviceid)) then
+          logger.info(s"Transfer of store $storeId from device $fromDeviceId onto device " +
+                      s"$toDeviceid finished after it was aborted. Discarding the arrived copy")
+          TransferOutcome.Aborted
+
         // If the from device doesn't contain the storeId, we're already done.
         // A concurrent call to this method must have succeeded
         else if fromDev.stores.contains(storeId) then
@@ -684,7 +705,7 @@ class Host(val client: AspenClient,
       case Some(sds) =>
         val storePath = sds.devicePath / storeId.directoryName
         if os.exists(storePath) then
-          logger.warn(s"Discarding the copy of store $storeId on failed device $deviceId. " +
+          logger.warn(s"Discarding the copy of store $storeId on device $deviceId. " +
                       s"$reason: $storePath")
           try
             os.remove.all(storePath)
@@ -751,7 +772,7 @@ class Host(val client: AspenClient,
     }
 
     logger.info(s"Retrying the transfer in of store $storeId in $TransferInRetryDelay")
-    transferInRetries += storeId -> new TransferInRetry(fromDeviceId, () => retry())
+    transferInRetries += storeId -> new TransferInRetry(fromDeviceId, toDeviceid, () => retry())
     backgroundTasks.schedule(TransferInRetryDelay)(retry())
   }
 
@@ -843,7 +864,7 @@ class Host(val client: AspenClient,
                   sds.offlineStores += storeId
             }
 
-          case Success(TransferOutcome.SourceRestored) =>
+          case Success(TransferOutcome.SourceRestored) | Success(TransferOutcome.Aborted) =>
             discardArrivedTransferIn(storeId, toDeviceid)
 
           case Failure(t) =>
@@ -970,7 +991,7 @@ class Host(val client: AspenClient,
             transferUUID
           )
 
-          pendingStartTransfers += storeId -> new PendingTransfer(msg, HLCTimestamp.now)
+          pendingStartTransfers += storeId -> new PendingTransfer(msg, toDeviceid, HLCTimestamp.now)
 
           client.sendHostMessage(msg)
   }
@@ -1507,6 +1528,29 @@ class Host(val client: AspenClient,
         storeId
       ).foreach: storeId =>
         createNewStore(local, storeId)
+
+      //----------------------
+      // Aborted Transfers In
+      //
+      // An abort removes this device's TransferringIn entry and tells nobody, so this check is the
+      // only thing that learns of it. Left alone, an attempt still waiting on bytes keeps
+      // retransmitting its request and holds the store in transferringIn, which would make the
+      // pass below skip a later transfer of the same store. Before that pass for that reason.
+      // An attempt past promotion is not covered here; updateStateForTransferredStore sees the
+      // abort in the source's entry instead.
+      val trackedTransfersIn =
+        pendingStartTransfers.valuesIterator
+          .filter(_.toDeviceId == local.storageDeviceId)
+          .map(p => (p.msg.storeId, p.msg.fromDevice)).toList ++
+        transferInRetries.iterator
+          .filter((_, r) => r.toDeviceId == local.storageDeviceId)
+          .map((storeId, r) => (storeId, r.fromDeviceId)).toList
+      trackedTransfersIn.filterNot((storeId, fromDeviceId) =>
+        remote.stores.get(storeId).exists(entry =>
+          entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+          entry.transferDevice.contains(fromDeviceId))
+      ).foreach: (storeId, fromDeviceId) =>
+        dropAbandonedTransferIn(storeId, fromDeviceId, local.storageDeviceId)
 
       //----------------------
       // Transferring In Stores

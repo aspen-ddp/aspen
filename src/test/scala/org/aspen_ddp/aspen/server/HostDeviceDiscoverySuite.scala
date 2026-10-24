@@ -1176,6 +1176,165 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       t.transfers.transfersIn.size should be(1)
       takeStartTransfers(t.movingStore) should be(Nil)
 
+  // An abort (AspenClient.abortStoreTransfer) sends no host message: it flips the source back to
+  // Active and removes the destination's TransferringIn entry, and each host learns of it only
+  // from its own device check.
+
+  atest("an aborted transfer in is cancelled on the next device check"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      List((_, registered, _)) = t.transfers.transfersIn.toList: @unchecked
+
+      _ <- client.abortStoreTransfer(t.movingStore)
+      _ <- waitForTransactionsToComplete()
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!t.host.testingOnlyTransferringIn.contains(t.movingStore))
+      // The cancellation fails the attempt's future, which must not schedule a restart.
+      _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.nonEmpty, rounds = 3)
+
+      _ = takeStartTransfers(t.movingStore)
+      _ = t.host.retransmitPendingStartTransfers(force = true)
+    yield
+      t.host.testingOnlyTransferringIn should not contain t.movingStore
+      t.transfers.cancelledTransfersIn should be(Vector((t.movingStore, registered)))
+      t.host.testingOnlyScheduledTransferInRetries should be(Set())
+      takeStartTransfers(t.movingStore) should be(Nil)
+
+  atest("an abort during the retry delay cancels the retry and the staged copy"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = t.transfers.failTransferIn(t.movingStore)
+      _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.contains(t.movingStore))
+      // What a failed promotion leaves behind for the retry to replace.
+      staged = t.deviceDir / StoreTransfer.StagingDirectory / t.movingStore.directoryName
+      _ = os.makeDir.all(staged)
+
+      _ <- client.abortStoreTransfer(t.movingStore)
+      _ <- waitForTransactionsToComplete()
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!t.host.testingOnlyTransferringIn.contains(t.movingStore))
+
+      _ = t.host.testingOnlyRetryTransferIns()
+      _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
+      _ = takeStartTransfers(t.movingStore)
+      _ = t.host.retransmitPendingStartTransfers(force = true)
+    yield
+      t.host.testingOnlyTransferringIn should not contain t.movingStore
+      t.host.testingOnlyScheduledTransferInRetries should be(Set())
+      t.transfers.transfersIn.size should be(1)
+      os.exists(staged) should be(false)
+      takeStartTransfers(t.movingStore) should be(Nil)
+
+  atest("a transfer whose bytes land after its abort is discarded, not recorded"):
+    given ExecutionContext = executionContext
+
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+
+    for
+      t <- startTransferIn()
+      arrived = t.deviceDir / t.movingStore.directoryName
+
+      // The abort commits while the bytes are still moving, and the last of them arrive before
+      // this host's next device check could cancel the attempt.
+      _ <- client.abortStoreTransfer(t.movingStore)
+      _ <- waitForTransactionsToComplete()
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(t.host.transferOutcomes.contains(t.movingStore) &&
+                     !t.host.testingOnlyTransferringIn.contains(t.movingStore))
+      _ <- pumpUntil(!os.exists(arrived))
+
+      source <- client.getStorageDeviceState(sourceId)
+      dest <- client.getStorageDeviceState(net.secondDeviceId)
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield
+      t.host.transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.Aborted))
+
+      // Recording it anyway would undo the abort: the pool repointed here, the source's entry
+      // dropped, while the initiator believes the transfer never happened.
+      poolState.stores(t.movingStore.poolIndex).storageDeviceId should be(sourceId)
+      source.stores(t.movingStore) should be(
+        StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
+      dest.stores.contains(t.movingStore) should be(false)
+
+      t.host.loadStoreByIdRequests.toList should be(Nil)
+      os.exists(arrived) should be(false)
+      t.host.testingOnlyTransferringIn should not contain t.movingStore
+
+  atest("a store can be transferred again after its transfer was aborted"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ <- client.abortStoreTransfer(t.movingStore)
+      _ <- waitForTransactionsToComplete()
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!t.host.testingOnlyTransferringIn.contains(t.movingStore))
+
+      _ <- client.transferStore(t.movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = t.host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2))
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(t.host.transferOutcomes.contains(t.movingStore))
+
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      dest <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      val attempts = t.transfers.transfersIn
+      attempts.size should be(2)
+      attempts(1)._2 should not be attempts(0)._2
+
+      t.host.transferOutcomes.get(t.movingStore) should be(Some(Host.TransferOutcome.PoolRepointed))
+      poolState.stores(t.movingStore.poolIndex).storageDeviceId should be(net.secondDeviceId)
+      dest.stores.get(t.movingStore).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Active))
+      t.host.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
+
+  atest("the source of an aborted transfer clears its marker and loads the store"):
+    given ExecutionContext = executionContext
+
+    // This host owns the transfer's source rather than its destination. The recording
+    // tryLoadStore opens nothing, so it can sit on the bootstrap device alongside TestNetwork's
+    // own stores.
+    val hostRoot = newHostDir()
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+    val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
+    val host = newHost(hostRoot)
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+
+    // What startStoreTransferOut leaves behind once the destination asks for the store: the
+    // directory marked and the store offline.
+    val storeDir = deviceDir / movingStore.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
+    val local = host.loadedDevices(sourceId)
+    local.offlineStores = local.offlineStores + movingStore
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      // While the transfer is outstanding the marker is doing its job.
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!host.testingOnlyActiveDeviceChecks.contains(sourceId))
+      markedBeforeAbort = os.exists(storeDir / StoreTransfer.TransferOutMarkerFile)
+      before = host.storeLoadAttempts.size
+
+      _ <- client.abortStoreTransfer(movingStore)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) &&
+                     !host.testingOnlyActiveDeviceChecks.contains(sourceId))
+    yield
+      markedBeforeAbort should be(true)
+      os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+      host.storeLoadAttempts.toList.drop(before) should be(List((sourceId, storeDir)))
+
   atest("a stale transfer staging directory is removed when its device loads"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)

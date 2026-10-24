@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.util.printStack
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{AppendableIDA, IDA, RangeEdit}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.server.store.KVObjectState
 
 object TransactionBuilder {
   case class KVUpdate(
@@ -65,13 +66,20 @@ class TransactionBuilder(
       allocatingObjects.isEmpty
 
   /** `poolMaxObjectSizeMap` holds each referenced pool's derived maxObjectSize (`StoragePool.maxObjectSize`). It is
-    * enforced for every data-setting operation: overwrites, appends, ranged writes and the initial content of
-    * allocated key-value objects. Other key-value updates are checked by the stores, since the client does not
-    * know the object's current size.
+    * enforced for data object overwrites, appends, ranged writes and allocations with initial content.
+    *
+    * `poolMaxSliceSizeMap` holds each referenced pool's effective slice limit (`StoragePool.maxSliceSize`). It is
+    * enforced for the initial content of allocated key-value objects, measured exactly as the stores measure it
+    * (`KVObjectState.allocationSliceSize`), since a key-value object's slice is not a simple function of its
+    * logical size. Other key-value updates are checked by the stores, since the client does not know the object's
+    * current content.
+    *
+    * A pool missing from either map is treated as unlimited by that map.
     */
   def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager,
                       poolIDAMap: Map[PoolId, IDA],
-                      poolMaxObjectSizeMap: Map[PoolId, Option[Int]]): (TransactionDescription,
+                      poolMaxObjectSizeMap: Map[PoolId, Option[Int]],
+                      poolMaxSliceSizeMap: Map[PoolId, Option[Int]]): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {
 
     HLCTimestamp.update(minimumTimestamp)
@@ -168,9 +176,9 @@ class TransactionBuilder(
     appendUpdates foreach { t =>
       val (objectPointer, (position, buf)) = t
 
-      checkObjectSize(objectPointer, position.length.toLong + buf.size)
       poolIDAMap(objectPointer.poolId) match
         case ida: (IDA & AppendableIDA) =>
+          checkObjectSize(objectPointer, position.length.toLong + buf.size)
           addUpdate(objectPointer, ida.appendDeltas(position.length, buf.getByteArray).map(_.encode))
         case ida =>
           throw AppendNotSupported(objectPointer, ida)
@@ -196,10 +204,11 @@ class TransactionBuilder(
     keyValueUpdates.valuesIterator.foreach { kvu =>
       if allocatingObjects.contains(kvu.pointer) then
         // Only the initial content of a new object is known here. Later updates are checked by the stores
-        val contentSize = kvu.operations.foldLeft(0L):
-          case (total, i: Insert) => total + i.key.bytes.length + i.value.length
-          case (total, _) => total
-        checkObjectSize(kvu.pointer, contentSize)
+        poolMaxSliceSizeMap.get(kvu.pointer.poolId).flatten.foreach: limit =>
+          val sliceSize = KVObjectState.allocationSliceSize(poolIDAMap(kvu.pointer.poolId), kvu.operations)
+          // Same rule as the stores' RequirementsChecker.checkSliceSize, against the empty state of a new object
+          if sliceSize > limit && sliceSize > KVObjectState.EmptyEncodedSize then
+            throw ObjectSizeLimitExceeded(kvu.pointer, sliceSize, limit)
       addUpdate(kvu.pointer, KeyValueOperation.encode(kvu.operations, poolIDAMap(kvu.pointer.poolId)))
     }
 

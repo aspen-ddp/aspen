@@ -1,13 +1,15 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
-import org.aspen_ddp.aspen.client.{AppendPosition, DataObjectState, ObjectSizeLimitExceeded, RangedWrite, RangedWriteState}
+import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, DataObjectState, ObjectSizeLimitExceeded, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.ClientId
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, SetLeft, SetMin}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RequirementError, SliceSizeExceeded, TransactionId}
+import org.aspen_ddp.aspen.server.store.{KVObjectState, ObjectState, RequirementsChecker}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -29,7 +31,11 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
     new TransactionBuilder(tx1, (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
 
   private def build(bldr: TransactionBuilder, ida: IDA, max: Option[Int]) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pool -> ida), Map(pool -> max))
+    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pool -> ida), Map(pool -> max), Map())
+
+  private def buildKV(bldr: TransactionBuilder, ida: IDA, sliceLimit: Option[Int]) =
+    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pool -> ida),
+      Map(pool -> sliceLimit.map(ida.maxObjectSize(_))), Map(pool -> sliceLimit))
 
   private def state(ida: IDA, length: Int): RangedWriteState =
     RangedWriteState.fromObject(DataObjectState(dp, rev1, ObjectRefcount(0, 1), HLCTimestamp.now, HLCTimestamp.now,
@@ -91,17 +97,49 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
       expectExceeded(dp, max, max + 1L)(build(allocate(max + 1), ida, Some(max)))
   }
 
-  test("key-value allocation with initial content is limited by key and value bytes") {
+  test("key-value allocation is limited by the stores' exact slice measure") {
     idas.foreach: ida =>
-      val max = ida.maxObjectSize(maxSliceSize)
-      def allocate(len: Int): TransactionBuilder =
+      def ops(keyLen: Int): List[KeyValueOperation] =
+        List(Insert(Key(Array.fill[Byte](keyLen)(1)), new Array[Byte](37)), SetMin(Key(new Array[Byte](3))),
+          SetLeft(new Array[Byte](11)))
+
+      // Keys are replicated, so each extra key byte adds exactly one byte to every slice (while its length
+      // varint stays one byte). A 60-byte key makes the store measure land exactly on the limit.
+      val atLimit = 60
+      val sliceLimit = KVObjectState.allocationSliceSize(ida, ops(0)) + atLimit
+      KVObjectState.allocationSliceSize(ida, ops(atLimit)) should be (sliceLimit)
+
+      def allocate(keyLen: Int): TransactionBuilder =
         val b = mkBuilder()
         b.addAllocatingObject(kp)
-        b.update(kp, None, None, Nil, List(Insert(Key(new Array[Byte](4)), new Array[Byte](len - 4))))
+        b.update(kp, None, None, Nil, ops(keyLen))
         b
 
-      build(allocate(max), ida, Some(max))
-      expectExceeded(kp, max, max + 1L)(build(allocate(max + 1), ida, Some(max)))
+      /** The stores' votes on the per-store payloads the builder produced for the allocation */
+      def storeErrors(keyLen: Int): List[Option[RequirementError]] =
+        val (txd, updates, _) = buildKV(allocate(keyLen), ida, None)
+        val reqs = txd.requirements.collect { case r: KeyValueUpdate => r }
+        (0 until ida.width).toList.map: i =>
+          val payload = updates(StoreId(pool, i.toByte)).localUpdates.find(_.objectId == kp.id).get.data
+          val os = new ObjectState(kp.id, Metadata(ObjectRevision.Allocating, ObjectRefcount.Allocating,
+            txd.startTimestamp), ObjectType.KeyValue, DataBuffer.Empty)
+          val (oerrs, _) = RequirementsChecker.check(txd.transactionId, txd.startTimestamp, reqs,
+            Map(kp.id -> os), Map(kp.id -> payload), Some(sliceLimit.toLong))
+          oerrs.get(kp.id)
+
+      buildKV(allocate(atLimit), ida, Some(sliceLimit))
+      storeErrors(atLimit).foreach(_ should be (None))
+
+      expectExceeded(kp, sliceLimit, sliceLimit + 1L)(buildKV(allocate(atLimit + 1), ida, Some(sliceLimit)))
+      storeErrors(atLimit + 1).foreach(_ should be (Some(SliceSizeExceeded(sliceLimit + 1L, sliceLimit.toLong))))
+  }
+
+  test("an oversized append on an IDA without append support reports AppendNotSupported") {
+    val rs = ReedSolomon(5, 3, 4)
+    val max = rs.maxObjectSize(maxSliceSize)
+    val b = mkBuilder()
+    b.append(AppendPosition(dp, rev1, 10), DataBuffer(new Array[Byte](max)))
+    intercept[AppendNotSupported](build(b, rs, Some(max)))
   }
 
   test("a pool without a limit still enforces the IDA's own bound") {

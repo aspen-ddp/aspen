@@ -504,7 +504,7 @@ class RangedWritePayloadSuite extends AnyFunSuite with Matchers:
     val bldr = new TransactionBuilder(TransactionId(new UUID(0, 2)), (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
     bldr.rangedWrites(state, writes, false)
     val (_, updates, _) = bldr.buildTranaction(OpportunisticRebuildManager.None, Map(pointer.poolId -> ida),
-                                               Map(pointer.poolId -> None))
+                                               Map(pointer.poolId -> None), Map())
     updates.size should be (ida.width)
     (0 until ida.width).toList.map: i =>
       val td = updates(StoreId(pointer.poolId, i.toByte))

@@ -33,6 +33,24 @@ class KVObjectState(
     * revision and timestamp do not affect the result.
     */
   def encodedSizeAfter(ops: List[KeyValueOperation]): Int =
+    val (nmin, nmax, nleft, nright, ncontent) = KVObjectState.applyOps(min, max, left, right, content, ops)
+    KVObjectState.encodedSize(nmin, nmax, nleft, nright, ncontent)
+}
+
+object KVObjectState {
+
+  def apply(dataBuffer: DataBuffer): KVObjectState = decode(dataBuffer)
+
+  /** The min, max, left, right and content that applying `ops` in order (as RequirementsApplyer does) to the given
+    * ones produces. Inserted entries get a null revision and zero timestamp: only their sizes matter here.
+    */
+  def applyOps(min: Option[Key],
+               max: Option[Key],
+               left: Option[Value],
+               right: Option[Value],
+               content: Map[Key, ValueState],
+               ops: List[KeyValueOperation])
+      : (Option[Key], Option[Key], Option[Value], Option[Value], Map[Key, ValueState]) =
     var nmin = min
     var nmax = max
     var nleft = left
@@ -51,12 +69,21 @@ class KVObjectState(
         ncontent += (o.key -> new ValueState(Value(o.value), ObjectRevision.Null, HLCTimestamp.Zero, None))
       case o: Delete => ncontent -= o.key
     }
-    KVObjectState.encodedSize(nmin, nmax, nleft, nright, ncontent)
-}
+    (nmin, nmax, nleft, nright, ncontent)
 
-object KVObjectState {
+  /** Size in bytes of the slice each store of a pool using `ida` holds for a new key-value object whose initial
+    * content is `ops` (given with full, unencoded values). This is exactly the `encodedSizeAfter` measure stores
+    * apply to an allocation: SetMin/SetMax keys and entry keys are replicated, while Insert, SetLeft and SetRight
+    * values are IDA-encoded to `ida.calculateEncodedSegmentLength` bytes per store.
+    */
+  /** encodedSize of an empty state: the slice a store holds for a newly allocated key-value object before its
+    * initial content is applied (mask byte plus a zero entry count)
+    */
+  val EmptyEncodedSize: Int = encodedSize(None, None, None, None, Map())
 
-  def apply(dataBuffer: DataBuffer): KVObjectState = decode(dataBuffer)
+  def allocationSliceSize(ida: IDA, ops: List[KeyValueOperation]): Int =
+    val (min, max, left, right, content) = applyOps(None, None, None, None, Map(), ops)
+    encodedSizeIDA(ida, min, max, left, right, content)
 
   // <mask byte> min 0 max << 1 left << 2 right << 3
   // <vartint len><nbytes>

@@ -1,8 +1,6 @@
 TODO
 ====
 
-RangedWrites - AppendingReedSolomon should be able to efficiently update sections of a large DataObject
-
 Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
 that talks about things like IDA + Backend combinations. AppendingReedSolmon + RocksDB is a poor

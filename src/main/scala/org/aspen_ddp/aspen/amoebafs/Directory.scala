@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.amoebafs
 
 import org.aspen_ddp.aspen.client.tkvl.{Root, SinglePoolNodeAllocator}
-import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction, TransactionCreationError}
 import org.aspen_ddp.aspen.common.objects.{IntegerKeyOrdering, LexicalKeyOrdering, ObjectRevision}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty, InvalidInode}
 import org.aspen_ddp.aspen.amoebafs.impl.simple.CreateFileTask
@@ -44,6 +44,7 @@ trait Directory extends BaseFile with Logging {
       err match
         case e: InvalidInode => throw StopRetrying(e)
         case e: FatalReadError => throw StopRetrying(e)
+        case e: TransactionCreationError => throw StopRetrying(e)
         case e: DirectoryNotEmpty => throw StopRetrying(e)
         case _ =>
           logger.info(s"retryUntilSuccessOr error $err")
@@ -63,6 +64,7 @@ trait Directory extends BaseFile with Logging {
       err match
         case e: InvalidInode => throw StopRetrying(e)
         case e: FatalReadError => throw StopRetrying(e)
+        case e: TransactionCreationError => throw StopRetrying(e)
         case e: DirectoryEntryExists => throw StopRetrying(e)
         case _ => refresh().recover:
           case e: InvalidInode => throw StopRetrying(e)
@@ -84,6 +86,7 @@ trait Directory extends BaseFile with Logging {
       err match
         case e: InvalidInode => throw StopRetrying(e)
         case e: FatalReadError => throw StopRetrying(e)
+        case e: TransactionCreationError => throw StopRetrying(e)
         case e: DirectoryNotEmpty => throw StopRetrying(e)
         case e: DirectoryEntryExists => throw StopRetrying(e)
         case _ =>
@@ -115,6 +118,7 @@ trait Directory extends BaseFile with Logging {
       err match
         case e: InvalidInode => throw StopRetrying(e)
         case e: FatalReadError => throw StopRetrying(e)
+        case e: TransactionCreationError => throw StopRetrying(e)
         case e: DirectoryNotEmpty => throw StopRetrying(e)
         case e: DirectoryEntryExists => throw StopRetrying(e)
         case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)

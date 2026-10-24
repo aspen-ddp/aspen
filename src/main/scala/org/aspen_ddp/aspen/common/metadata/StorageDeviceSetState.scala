@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.metadata
 
-import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, DataObjectState, ReadError, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, DataObjectState, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.network.Codec
@@ -91,18 +91,7 @@ object StorageDeviceSetState:
               tx.overwrite(oldPtr, oldDos.revision, DataBuffer(newOld.toBytes))
       yield ()
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: ReadError => throw StopRetrying(e)
-      case e: NotLevelZero => throw StopRetrying(e)
-      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
-      // Without this, an unlisted error -- a CorruptedObject on any of the three reads, say --
-      // MatchErrors out of onFail, ExponentialBackoffRetryStrategy catches it and reschedules,
-      // and the promise never completes. The only caller is the move-device-to-set CLI command,
-      // which is Await-bounded, so the operator sees a timeout while the loop runs on unseen.
-      case _ => Future.unit
-
-    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       prep(tx)
 
 /** Hierarchical grouping of physical storage, parallel to AllocationGroupState.

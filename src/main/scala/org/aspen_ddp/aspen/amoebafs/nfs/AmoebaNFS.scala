@@ -4,7 +4,7 @@ import scala.language.implicitConversions
 import java.io.IOException
 import java.nio.ByteBuffer
 import com.github.blemale.scaffeine.{LoadingCache, Scaffeine}
-import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{FatalReadError, StopRetrying, Transaction, TransactionCreationError}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, InvalidInode}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, BlockDevice, CharacterDevice, Directory, DirectoryInode, File, FileHandle, FileMode, FileSystem, FileType, InodePointer, Symlink, Timespec}
 
@@ -348,6 +348,7 @@ class AmoebaNFS(val fs: FileSystem,
             case e: DirectoryEntryExists => throw StopRetrying(e)
             case e: DirectoryEntryDoesNotExist => throw StopRetrying(e)
             case e: FatalReadError => throw StopRetrying(e)
+            case e: TransactionCreationError => throw StopRetrying(e)
             case _ =>
               val refreshOld = s.getEntry(oldName)
               val refreshNew = d.getEntry(newName)

@@ -363,16 +363,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   def transferStore(storeId: StoreId, destinationId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = this.clientContext
 
-    // Only a collision is retried. Every other error -- InvalidObject from a deleted pool or
-    // device, CorruptedObject, a TransactionCreationError, InvalidDestination, ... -- fails the
-    // same way on every attempt, so retrying it would never complete the future, and the
-    // rebalance and migration tasks await it inside a pass. They treat a failure as "back off and
-    // retry on the next poll", so misclassifying a transient error costs only one poll interval.
-    def onFail(err: Throwable): Future[Unit] = err match
-      case _: TransactionAborted => Future.unit
-      case e => throw StopRetrying(e)
-
-    val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(onFail): tx =>
+    // Only a collision is retried. The rebalance and migration tasks await this future inside a
+    // pass and treat a failure as "back off and retry on the next poll".
+    val fStaged: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
 
       for
@@ -460,11 +453,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     given ExecutionContext = this.clientContext
 
     // As in transferStore: only a collision is retried.
-    def onFail(err: Throwable): Future[Unit] = err match
-      case _: TransactionAborted => Future.unit
-      case e => throw StopRetrying(e)
-
-    val fStaged: Future[List[CheckStorageDevice]] = transactUntilSuccessfulWithRecovery(onFail): tx =>
+    val fStaged: Future[List[CheckStorageDevice]] = transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
 
       for

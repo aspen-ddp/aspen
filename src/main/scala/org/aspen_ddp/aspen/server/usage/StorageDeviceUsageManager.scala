@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.usage
 
-import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, StopRetrying}
+import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying}
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -35,11 +35,7 @@ class StorageDeviceUsageManager(client: AspenClient) extends Logging:
     if !exceedsThreshold(currentUsage, lastUsage) && !exceedsThreshold(totalSize, lastTotalSize) then
       Future.unit
     else
-      def onFail(err: Throwable): Future[Unit] = err match
-        case _: FatalReadError => throw StopRetrying(err)
-        case _ => Future.unit
-
-      client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
         for
           devPtr <- getDevicePointer(storageDeviceId)
           devKvos <- client.read(devPtr)

@@ -306,14 +306,7 @@ abstract class BaseAspenClient(
       maxSliceSize
     )
 
-    // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
-    // name registration through Registry.prepareRegister, which reports a taken name that way.
-    // DuplicateRegistration comes only from Registry.register, the non-transactional path.
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: KeyAlreadyExists => throw StopRetrying(e)
-      case _ => Future.unit
-
-    runCreate(onFail): tx =>
+    runCreate(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
@@ -347,16 +340,7 @@ abstract class BaseAspenClient(
         val updated = parentState.copy(memberSets = sds.setId :: parentState.memberSets)
         tx.overwrite(parentPtr, parentDos.revision, DataBuffer(updated.toBytes))
 
-    // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
-    // name registration through Registry.prepareRegister, which reports a taken name that way.
-    // DuplicateRegistration comes only from Registry.register, the non-transactional path.
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: KeyAlreadyExists => throw StopRetrying(e)
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: AspenClient.InvalidDeviceSetLevel => throw StopRetrying(e)
-      case _ => Future.unit
-
-    runCreate(onFail): tx =>
+    runCreate(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
@@ -379,16 +363,9 @@ abstract class BaseAspenClient(
     // retried attempt reuses it rather than leaking a fresh UUID per attempt.
     val state = HostState(hostId, name, address, dataPort, httpPort, storeTransferPort, Set())
 
-    // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
-    // name registration through Registry.prepareRegister, which reports a taken name that way.
-    // DuplicateRegistration comes only from Registry.register, the non-transactional path.
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: KeyAlreadyExists => throw StopRetrying(e)
-      case _ => Future.unit
-
     // No TaskExecutorRootKey is written. Host inserts it on first start under a
     // DoesNotExist requirement, so seeding it here would only duplicate that.
-    runCreate(onFail): tx =>
+    runCreate(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
       for
         bsPool <- getStoragePool(PoolId.BootstrapPoolId)
@@ -408,13 +385,7 @@ abstract class BaseAspenClient(
     val deviceId = StorageDeviceId(UUID.randomUUID())
     val state = StorageDeviceState(deviceId, hostId, 0L, 0L, Map(), deviceSetId)
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: ReadError => throw StopRetrying(e)
-      case e: StorageDeviceSetState.NotLevelZero => throw StopRetrying(e)
-      case _ => Future.unit
-
-    runCreate(onFail): tx =>
+    runCreate(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
       for
         bsPool   <- getStoragePool(PoolId.BootstrapPoolId)
@@ -453,19 +424,10 @@ abstract class BaseAspenClient(
         deviceId
 
   override protected def createStoragePool(config: StoragePoolState): Future[PoolId] =
-    // A taken pool name is permanent, so it must stop the retry loop rather than be treated as
-    // a transient commit failure. KeyAlreadyExists, not Registry.DuplicateRegistration:
-    // prepareRegisterObject reaches the name registration through Registry.prepareRegister,
-    // which reports a taken name that way. DuplicateRegistration comes only from
-    // Registry.register, the non-transactional path. Everything else retries, which for the
-    // production client matches the previous transactUntilSuccessful (retry, no recovery); for
-    // the test client runCreate performs a single attempt regardless.
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: KeyAlreadyExists => throw StopRetrying(e)
-      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
-      case _ => Future.unit
-
-    val fStaged = runCreate(onFail): tx =>
+    // Only a collision is retried: a taken pool name (KeyAlreadyExists), a failed device and an
+    // allocation failure are all permanent. The test client's runCreate performs a single
+    // attempt regardless.
+    val fStaged = runCreate(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
 
       def createPoolObj(alloc: ObjectAllocator): Future[KeyValueObjectPointer] =
@@ -609,16 +571,8 @@ abstract class BaseAspenClient(
                                 targetSetId: StorageDeviceSetId): Future[Unit] =
     given ExecutionContext = clientContext
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: ReadError => throw StopRetrying(e)
-      case e: SameSetNoOp => throw StopRetrying(e)
-      // Without this, anything else -- a CorruptedObject on a read, say -- throws MatchError out
-      // of the handler, ExponentialBackoffRetryStrategy catches it, reschedules, and the promise
-      // never completes.
-      case _ => Future.unit
-
-    val migrated = transactUntilSuccessfulWithRecovery(onFail): tx =>
+    // SameSetNoOp stops the loop like any other non-collision error and is recovered below.
+    val migrated = transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
 
       for
@@ -689,16 +643,7 @@ abstract class BaseAspenClient(
   override def failStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
     given ExecutionContext = clientContext
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: ReadError => throw StopRetrying(e)
-      case e: AspenClient.DeviceAlreadyFailed => throw StopRetrying(e)
-      // Anything else would throw MatchError out of the handler and leave the promise forever
-      // incomplete. The CLI's 30 s Await.ready bounds what the operator sees to a timeout
-      // message, but the retry loop would go on running in the background regardless.
-      case _ => Future.unit
-
-    transactUntilSuccessfulWithRecovery(onFail): tx =>
+    transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
 
       for

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.metadata
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, ReadError, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
@@ -168,12 +168,7 @@ object AllocationGroupState:
           case None            => Future.unit
       yield ()
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: ReadError => throw StopRetrying(e)
-      case e: MemberLimitExceedsGroup => throw StopRetrying(e)
-
-    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       prep(tx)
 
 
@@ -255,13 +250,7 @@ object AllocationGroupState:
           case None               => Future.unit
       yield ()
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: ReadError => throw StopRetrying(e)
-      case e: InvalidLevel => throw StopRetrying(e)
-      case e: MemberLimitExceedsGroup => throw StopRetrying(e)
-
-    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       prep(tx)
 
 

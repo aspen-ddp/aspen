@@ -308,10 +308,7 @@ class MigratePoolToSetDurableTask(
   private def markComplete(poolPtr: KeyValueObjectPointer,
                            migration: StoragePoolState.Migration): Future[Unit] =
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: MigrationSuperseded => throw StopRetrying(e)
-
-    val done = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    val done = client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       client.read(poolPtr, "pool migration completion").map: kvos =>
         val current = StoragePoolState(kvos)
         if !current.migration.contains(migration) then

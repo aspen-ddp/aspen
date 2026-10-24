@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.common.metadata.management
 
-import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectState, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostState, StorageDeviceId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
@@ -167,11 +167,7 @@ class FailedStorageDeviceDurableTask(
    *  Widened to private[management] for the idempotency test.
    */
   private[management] def tombstone(): Future[Unit] =
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: FatalReadError => throw StopRetrying(e)
-      case _ => Future.unit
-
-    val done = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    val done = client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       for
         devPtr <- client.getStorageDevicePointer(deviceId)
         devKvos <- client.read(devPtr, "fail storage device")
@@ -372,19 +368,9 @@ class FailedStorageDeviceDurableTask(
   private def moveStore(storeId: StoreId,
                         odestinationId: Option[StorageDeviceId]): Future[Option[CheckStorageDevice]] =
 
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: IndexOutOfBoundsException => throw StopRetrying(e)
-      // generateBootstrapConfig's two `require`s raise this. Both are believed unfalsifiable
-      // from here, but a permanent error with no route to StopRetrying is an infinite 60s retry
-      // loop and a never-completing future. One line to fail loudly instead.
-      case e: IllegalArgumentException => throw StopRetrying(e)
-      case e: AspenClient.DeviceFailed => throw StopRetrying(e)
-      case e: StoreAlreadyMoved => throw StopRetrying(e)
-      case e: FatalReadError => throw StopRetrying(e)
-      case _ => Future.unit
-
-    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    // Only a collision is retried. Everything else fails the pass, and the caller's
+    // scheduleRecheck retries on the next poll.
+    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
 
       for

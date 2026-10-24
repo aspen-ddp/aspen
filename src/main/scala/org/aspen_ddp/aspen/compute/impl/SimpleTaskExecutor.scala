@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.compute.impl
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, StopRetrying, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, KeyValueObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, DurableTaskFactory, TaskExecutor}
@@ -72,10 +72,14 @@ class SimpleTaskExecutor(val client: AspenClient,
                 active += taskPointer -> task
 
   private def allocateTask(): Future[DurableTaskPointer] =
-    def onFail(err: Throwable): Future[Unit] =
-      client.read(executorObject).map: kvos =>
-        synchronized:
-          executorRevision = kvos.revision
+    // Only a collision is retried, after refreshing the executor's revision. Anything else -- an
+    // unreadable executor object, an executor object grown past its size limit -- is permanent.
+    def onFail(err: Throwable): Future[Unit] = err match
+      case _: TransactionAborted =>
+        client.read(executorObject).map: kvos =>
+          synchronized:
+            executorRevision = kvos.revision
+      case e => throw StopRetrying(e)
 
     client.transactUntilSuccessfulWithRecovery[DurableTaskPointer](onFail): tx =>
       given Transaction = tx

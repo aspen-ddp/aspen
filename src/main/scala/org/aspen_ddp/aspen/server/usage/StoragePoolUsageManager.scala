@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.usage
 
-import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, StopRetrying}
+import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.StoragePoolState
 import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
@@ -43,11 +43,7 @@ class StoragePoolUsageManager(client: AspenClient) extends Logging:
     if !exceedsThreshold(currentEstimatedUsage, lastSize) then
       Future.unit
     else
-      def onFail(err: Throwable): Future[Unit] = err match
-        case _: FatalReadError => throw StopRetrying(err)
-        case _ => Future.unit
-
-      client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
         for
           poolPtr <- getPoolPointer(storeId.poolId)
           poolKvos <- client.read(poolPtr)

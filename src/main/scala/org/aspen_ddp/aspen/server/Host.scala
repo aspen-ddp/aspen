@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{AspenClient, FatalReadError, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget, StoreNotHosted}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
@@ -504,20 +504,11 @@ class Host(val client: AspenClient,
   protected def updateStateForTransferredStore(storeId: StoreId,
                                                fromDeviceId: StorageDeviceId,
                                                toDeviceid: StorageDeviceId): Future[TransferOutcome] =
-    // Nothing consumes the Future this returns, so under a bare transactUntilSuccessful a
-    // permanent error is a 60 s retry loop that runs for the life of the process and reports
-    // nothing at all. These are the permanent classes: an id with no entry in its tree, a pool
-    // index the config does not have, generateBootstrapConfig's two requires, and an object that
-    // cannot be read. The catch-all keeps every other error on the retry path, where a lost
-    // transaction race and a transient read failure belong.
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: IndexOutOfBoundsException => throw StopRetrying(e)
-      case e: IllegalArgumentException => throw StopRetrying(e)
-      case e: FatalReadError => throw StopRetrying(e)
-      case _ => Future.unit
-
-    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    // Only a collision is retried. Any other error -- an id with no entry in its tree, a pool
+    // index the config does not have, generateBootstrapConfig's two requires, an object that
+    // cannot be read -- is permanent, and retrying it would be a 60 s loop for the life of the
+    // process that reports nothing at all.
+    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       for
         poolPtr <- client.getStoragePoolPointer(storeId.poolId)
         fromDevPtr <- client.getStorageDevicePointer(fromDeviceId)
@@ -1348,18 +1339,13 @@ class Host(val client: AspenClient,
    *  finishing. Reading the state inside the transaction and checking isFailed before the status
    *  check ensures the decision is made from current metadata, not stale assumptions.
    *
-   *  Without exhaustive onFail, getStorageDevicePointer's NoSuchElementException is neither
-   *  StopRetrying nor a match, so ExponentialBackoffRetryStrategy reschedules forever, the future
-   *  never completes, and this device's rebuild queue never advances.
+   *  Only a collision is retried. Retrying a permanent error -- getStorageDevicePointer's
+   *  NoSuchElementException, an unreadable device object -- would never complete the future, and
+   *  this device's rebuild queue would never advance.
    */
   protected def markRebuiltStoreActive(storageDeviceId: StorageDeviceId,
                                        storeId: StoreId): Future[RebuildOutcome] =
-    def onFail(err: Throwable): Future[Unit] = err match
-      case e: NoSuchElementException => throw StopRetrying(e)
-      case e: FatalReadError => throw StopRetrying(e)
-      case _ => Future.unit
-
-    client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
       for
         ptr <- client.getStorageDevicePointer(storageDeviceId)
         kvos <- client.read(ptr)
@@ -1666,17 +1652,10 @@ class Host(val client: AspenClient,
       logger.warn(s"Abandoning transfer of store $storeId onto device $toDeviceId: source " +
                   s"device $fromDeviceId has been declared failed")
 
-      // Nothing consumes this Future, so a bare transactUntilSuccessful would turn a permanent
-      // error into a silent 60 s loop for the life of the process -- and now that the guard above
-      // is set, one that no later check could ever displace. Only two permanent classes are
-      // reachable from these two reads: a device id with no entry in the storage-devices tree,
-      // and an object that cannot be read. Everything else stays on the retry path.
-      def onFail(err: Throwable): Future[Unit] = err match
-        case e: NoSuchElementException => throw StopRetrying(e)
-        case e: FatalReadError => throw StopRetrying(e)
-        case _ => Future.unit
-
-      val fabandon = client.transactUntilSuccessfulWithRecovery(onFail): tx =>
+      // Nothing consumes this Future, so retrying a permanent error would be a silent 60 s loop
+      // for the life of the process -- and now that the guard above is set, one that no later
+      // check could ever displace. Only a collision is retried.
+      val fabandon = client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
         for
           ptr <- client.getStorageDevicePointer(toDeviceId)
           kvos <- client.read(ptr)

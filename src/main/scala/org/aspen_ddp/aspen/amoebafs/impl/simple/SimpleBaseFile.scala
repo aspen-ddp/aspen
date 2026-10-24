@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.amoebafs.impl.simple
 
-import org.aspen_ddp.aspen.client.{InvalidObject, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{InvalidObject, StopRetrying, Transaction, TransactionCreationError}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.amoebafs.{BaseFile, FileMode, FileSystem, Inode, InodePointer, Timespec}
 import scribe.Logging
@@ -201,6 +201,12 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
     def onCommitFailure(foo: Throwable): Future[Unit] = {
       //println(s"OnCommitFailure: $foo")
       //foo.printStackTrace()
+
+      // Fails identically on every attempt: an oversized write, a ranged write past the end, ...
+      foo match
+        case err: TransactionCreationError => throw StopRetrying(err)
+        case _ =>
+
       refresh().recover {
         case err: InvalidObject => throw StopRetrying(err) // Only InvalidObject should cause a read failure, which means the object has been deleted
         case err =>

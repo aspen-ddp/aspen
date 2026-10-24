@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction, UnknownStoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction, TransactionCreationError, UnknownStoragePool}
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription}
@@ -83,6 +83,10 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
       case err: UnknownStoragePool =>
         // StoragePool must have been deleted
         throw StopRetrying(err)
+
+      // Always permanent. Other errors stay on the retry path: the error tree deletes entries, so a
+      // join racing the insert's scan can raise a transient InvalidObject.
+      case err: TransactionCreationError => throw StopRetrying(err)
 
       case _ => Future.unit
     }}

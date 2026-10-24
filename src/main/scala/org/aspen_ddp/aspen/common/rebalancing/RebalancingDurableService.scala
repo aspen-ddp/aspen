@@ -134,13 +134,20 @@ object RebalancingDurableService extends DurableServiceFactory with Logging:
       ()
 
   /** Build a plan for `setId` and enroll a SetRebalanceDurableTask, unless one is already in
-   *  progress. Idempotent and safe against concurrent callers (revision-checked writes). */
+   *  progress. Idempotent and safe against concurrent callers (revision-checked writes). A set
+   *  with transfers already pending returns without looking up the service. */
   def rebalanceStorageDeviceSet(client: AspenClient, setId: StorageDeviceSetId): Future[Unit] =
     given ExecutionContext = client.clientContext
     for
       setState <- client.getStorageDeviceSetState(setId)
-      statePtr <- readServiceStatePointer(client)
-      r <- rebalanceReadSet(client, setId, setState, statePtr)
+      r <-
+        if setState.pendingTransfers.nonEmpty then
+          Future.unit
+        else
+          for
+            statePtr <- readServiceStatePointer(client)
+            r <- rebalanceReadSet(client, setId, setState, statePtr)
+          yield r
     yield r
 
   /** As above, for a caller that has already read the set's state and the service state

@@ -1,13 +1,3 @@
-rebalanceStorageDeviceSet now walks the services TKVL on its no-op path
-  - Splitting the entry point so the sweep can pass its own statePointer moved
-    the pointer lookup above the pendingTransfers.nonEmpty short-circuit, so a
-    set with a transfer in flight pays a multi-tier traversal to decide to do
-    nothing, and returns a failed future rather than Future.unit if the service
-    is unregistered
-  - Bootstrap always registers the service, so the failure mode is theoretical;
-    the wasted read is not. Reordering the short-circuit above the lookup fixes
-    both
-
 A pool stuck at migration InProgress cannot be re-driven through the public
 API
   - migratePoolToSet only enrolls a MigratePoolToSetDurableTask when the pool

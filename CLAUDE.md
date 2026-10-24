@@ -27,7 +27,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Currently Replication, ReedSolomon and AppendingReedSolomon are supported
   - AppendingReedSolomon lays data out in rows of `k * cellSize` bytes with an 8-byte length trailer, so
     DataObjects in such pools support efficient appends (`Transaction.append` with an `AppendPosition`) and
-    byte-range/tail reads (`readRange`, `readAppendPosition`, `readRanges`). They also support ranged writes
+    byte-range/tail reads (`readRange`, `readAppendPosition`, `readRanges`), all served by a single `ByteRanges`
+    read request (ranges plus an optional tail). `readRanges` and `readRangedWriteState` therefore read one
+    consistent revision. They also support ranged writes
     (`Transaction.rangedWrites`): the caller supplies a `RangedWriteState` (from `RangedWriteState.fromObject` or
     `ObjectReader.readRangedWriteState`) and stores receive only sparse XOR deltas of the changed bytes.
     Replication supports all of them too. Classic ReedSolomon does not: those operations fail with

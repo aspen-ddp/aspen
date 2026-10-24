@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.{DataObjectRangeState, DataObjectRangesState, 
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
-import org.aspen_ddp.aspen.common.objects.{ByteRange, ByteRanges, ByteRangeToEnd, SliceTail, DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
+import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import scribe.Logging
 
@@ -26,7 +26,7 @@ abstract class BaseReadDriver(
   /** Partial results must never be cached or used for opportunistic rebuilds: the entries they omit would
     * be mistaken for deletions. Metadata-only results carry no content at all */
   private val isPartial: Boolean = readType match
-    case _: KeySet | _: KeyRange | _: MetadataOnly | _: ByteRange | _: ByteRanges | _: ByteRangeToEnd | _: SliceTail => true
+    case _: KeySet | _: KeyRange | _: MetadataOnly | _: ByteRanges => true
     case _ => false
 
   // Detect invalid combinations
@@ -36,7 +36,7 @@ abstract class BaseReadDriver(
 
     case (p: DataObjectPointer,     _:MetadataOnly) => new DataObjectReader(true, p, ida, readUUID)
     case (p: DataObjectPointer,     _:FullObject) => new DataObjectReader(false, p, ida, readUUID)
-    case (p: DataObjectPointer,     _: (ByteRange | ByteRanges | ByteRangeToEnd | SliceTail)) => new DataObjectRangeReader(p, ida, readUUID, readType)
+    case (p: DataObjectPointer,     _: ByteRanges) => new DataObjectRangeReader(p, ida, readUUID, readType)
     case (_: DataObjectPointer,     rt) => throw new IllegalArgumentException(s"Read type $rt is not supported for DataObjects")
 
     case _ => throw new AssertionError("Invalid read combination")

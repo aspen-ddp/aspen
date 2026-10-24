@@ -1,13 +1,12 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{ByteRange, ByteRanges, ByteRangeToEnd, Key, KeyRange, KeySet, MetadataOnly, ObjectType, ReadType, SliceTail}
+import org.aspen_ddp.aspen.common.objects.{ByteRanges, Key, KeyRange, KeySet, MetadataOnly, ObjectType, ReadType}
 
 /** Reduces a store's object data to just what a partial read asked for.
   *
   * MetadataOnly reads return no data. KeyValue objects read with KeySet or KeyRange are reduced; the
-  * object's min, max, left, and right are always kept. Data objects read with ByteRange, ByteRangeToEnd,
-  * SliceTail or ByteRanges are clipped to the requested part of the slice. Everything else is returned unchanged.
+  * object's min, max, left, and right are always kept. Data objects read with ByteRanges are clipped to the requested part of the slice. Everything else is returned unchanged.
   */
 object PartialRead:
 
@@ -23,15 +22,6 @@ object PartialRead:
         Some(reduce(data, kvos => kvos.content.filter { (key, _) =>
           rt.ordering.compare(key, rt.minimum) >= 0 && rt.ordering.compare(key, rt.maximum) <= 0
         }))
-
-      case (ObjectType.Data, rt: ByteRange) =>
-        Some(clip(data, rt.offset.toLong, rt.offset.toLong + rt.length.toLong))
-
-      case (ObjectType.Data, rt: ByteRangeToEnd) =>
-        Some(clip(data, rt.offset.toLong, data.size.toLong))
-
-      case (ObjectType.Data, rt: SliceTail) =>
-        Some(clip(data, data.size.toLong - rt.length.toLong, data.size.toLong))
 
       case (ObjectType.Data, rt: ByteRanges) =>
         val size = data.size.toLong

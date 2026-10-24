@@ -389,23 +389,14 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val fullObj = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, FullObject())
     Codec.decode(Codec.encode(fullObj)).readType shouldBe a[FullObject]
 
-    val byteRange = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, ByteRange(100, 200))
-    val decodedBR = Codec.decode(Codec.encode(byteRange)).readType.asInstanceOf[ByteRange]
-    decodedBR.offset shouldBe 100
-    decodedBR.length shouldBe 200
-
-    val range = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, ByteRange(5, 10))
-    Codec.decode(Codec.encode(range)).readType shouldBe ByteRange(5, 10)
-
-    val toEnd = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, ByteRangeToEnd(64))
-    Codec.decode(Codec.encode(toEnd)).readType shouldBe ByteRangeToEnd(64)
-
-    val tail = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, SliceTail(64))
-    Codec.decode(Codec.encode(tail)).readType shouldBe SliceTail(64)
-
-    for br <- List(ByteRanges(List((0, 8), (40, 16)), 8), ByteRanges(Nil, 0), ByteRanges(Nil, 64)) do
+    for br <- List(ByteRanges(List((0, 8), (40, 16)), 8), ByteRanges(Nil, 0), ByteRanges(Nil, 64),
+        ByteRanges(List((100, 200)), 0), ByteRanges(List((64, Int.MaxValue)), 0)) do
       val r = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, br)
       Codec.decode(Codec.encode(r)).readType shouldBe br
+
+    val mismatched = Codec.encode(Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, ByteRanges(List((1, 2), (3, 4)), 0)))
+      .copy(rangeLengths = Seq(2))
+    an [EncodingError] should be thrownBy Codec.decode(mismatched)
 
     val singleKey = Read(storeId(10), ClientId(uuid(20)), uuid(30), kvPtr(1), SingleKey(Key(Array[Byte](1, 2)), LexicalKeyOrdering))
     val decodedSK = Codec.decode(Codec.encode(singleKey)).readType.asInstanceOf[SingleKey]

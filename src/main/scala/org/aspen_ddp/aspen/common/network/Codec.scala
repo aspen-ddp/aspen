@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, ByteRanges, ByteRangeToEnd, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey, SliceTail}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRanges, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -709,15 +709,6 @@ object Codec extends Logging:
       case _: FullObject =>
         (codec.ReadType.READ_TYPE_FULL_OBJECT, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
           codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, 0, 0)
-      case rt: ByteRange =>
-        (codec.ReadType.READ_TYPE_BYTE_RANGE, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
-          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, rt.offset, rt.length)
-      case rt: ByteRangeToEnd =>
-        (codec.ReadType.READ_TYPE_BYTE_RANGE_TO_END, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
-          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, rt.offset, 0)
-      case rt: SliceTail =>
-        (codec.ReadType.READ_TYPE_SLICE_TAIL, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
-          codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, 0, rt.length)
       case rt: ByteRanges =>
         (codec.ReadType.READ_TYPE_BYTE_RANGES, ByteString.EMPTY, ByteString.EMPTY, ByteString.EMPTY,
           codec.KeyComparison.KEY_COMPARISON_BYTE_ARRAY, 0, rt.tail)
@@ -770,10 +761,9 @@ object Codec extends Logging:
     val readType = m.readType match
       case codec.ReadType.READ_TYPE_METADATA_ONLY => MetadataOnly()
       case codec.ReadType.READ_TYPE_FULL_OBJECT => FullObject()
-      case codec.ReadType.READ_TYPE_BYTE_RANGE => ByteRange(m.offset, m.length)
-      case codec.ReadType.READ_TYPE_BYTE_RANGE_TO_END => ByteRangeToEnd(m.offset)
-      case codec.ReadType.READ_TYPE_SLICE_TAIL => SliceTail(m.length)
       case codec.ReadType.READ_TYPE_BYTE_RANGES =>
+        if m.rangeOffsets.size != m.rangeLengths.size then
+          throw new EncodingError(f"ByteRanges offsets (${m.rangeOffsets.size}) and lengths (${m.rangeLengths.size}) differ in size")
         ByteRanges(m.rangeOffsets.zip(m.rangeLengths).toList, m.length)
       case codec.ReadType.READ_TYPE_SINGLE_KEY => SingleKey(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))
       case codec.ReadType.READ_TYPE_LARGEST_KEY_LESS_THAN => LargestKeyLessThan(Key(m.key.toByteArray), decodeKeyComparison(m.comparison))

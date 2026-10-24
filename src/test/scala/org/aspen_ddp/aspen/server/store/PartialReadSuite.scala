@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, ByteRanges, ByteRangeToEnd, FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, MetadataOnly, ObjectRevision, ObjectType, ReadType, SliceTail, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRanges, FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, MetadataOnly, ObjectRevision, ObjectType, ReadType, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -45,23 +45,23 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
   private def bytesOf(rt: ReadType): List[Int] =
     filtered(ObjectType.Data, bytes100, rt).getByteArray.map(_.toInt).toList
 
-  test("ByteRange clips to the slice") {
-    bytesOf(ByteRange(10, 5)) shouldBe (10 until 15).toList
-    bytesOf(ByteRange(90, 20)) shouldBe (90 until 100).toList
-    bytesOf(ByteRange(200, 5)) shouldBe Nil
+  test("a single range clips to the slice") {
+    bytesOf(ByteRanges(List((10, 5)), 0)) shouldBe (10 until 15).toList
+    bytesOf(ByteRanges(List((90, 20)), 0)) shouldBe (90 until 100).toList
+    bytesOf(ByteRanges(List((200, 5)), 0)) shouldBe Nil
   }
 
-  test("ByteRangeToEnd returns the suffix") {
-    bytesOf(ByteRangeToEnd(95)) shouldBe (95 until 100).toList
-    bytesOf(ByteRangeToEnd(0)) shouldBe (0 until 100).toList
-    bytesOf(ByteRangeToEnd(150)) shouldBe Nil
+  test("a to-end range returns the suffix") {
+    bytesOf(ByteRanges(List((95, Int.MaxValue)), 0)) shouldBe (95 until 100).toList
+    bytesOf(ByteRanges(List((0, Int.MaxValue)), 0)) shouldBe (0 until 100).toList
+    bytesOf(ByteRanges(List((150, Int.MaxValue)), 0)) shouldBe Nil
   }
 
-  test("SliceTail returns the last n bytes, or the whole slice when shorter") {
-    bytesOf(SliceTail(8)) shouldBe (92 until 100).toList
-    bytesOf(SliceTail(100)) shouldBe (0 until 100).toList
-    bytesOf(SliceTail(500)) shouldBe (0 until 100).toList
-    bytesOf(SliceTail(0)) shouldBe Nil
+  test("a tail returns the last n bytes, or the whole slice when shorter") {
+    bytesOf(ByteRanges(Nil, 8)) shouldBe (92 until 100).toList
+    bytesOf(ByteRanges(Nil, 100)) shouldBe (0 until 100).toList
+    bytesOf(ByteRanges(Nil, 500)) shouldBe (0 until 100).toList
+    bytesOf(ByteRanges(Nil, 0)) shouldBe Nil
   }
 
   test("ByteRanges returns clipped ranges in request order followed by the tail") {
@@ -79,7 +79,7 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
   }
 
   test("byte-range read types leave KeyValue objects unchanged") {
-    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, ByteRange(0, 1)))
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, ByteRanges(List((0, 1)), 0)))
     keysOf(r) shouldBe (1 to 5).toSet
   }
 

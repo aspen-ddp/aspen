@@ -1,11 +1,6 @@
 TODO
 ====
 
-readRangedWriteState is implemented in terms of calls to readRange. This is a terrible design that
-can fail. Instead, we need to add a new type of read that can read multiple ranges of an object in
-a single read request. This is similar in concept to a key-value object read that read specific keys
-one read request reading sub-components of the overall object.
-
 Ensure that maxObjectSize is universally enforced by the client either in the transaction build phase
 or as part of the commit() flow. No transaction should be started that would cause an object to
 exceed that size.

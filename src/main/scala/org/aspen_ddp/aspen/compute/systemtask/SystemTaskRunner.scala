@@ -29,6 +29,9 @@ class SystemTaskRunner(val client: AspenClient,
   private var running: Map[UUID, (DurableTask, KeyValueObjectPointer)] = Map.empty
   @volatile private var stopped = false
 
+  /** Test-only teardown; a Host never shuts down its runner in production. Stopped tasks fail
+   *  with TaskStopped and are deregistered by onTaskComplete without having finished, so any
+   *  production caller would need to account for tasks left enrolled-but-unregistered. */
   def shutdown(): Unit = synchronized:
     stopped = true
     running.values.foreach((task, _) => task.stop())

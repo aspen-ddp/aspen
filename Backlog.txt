@@ -1,25 +1,3 @@
-A pool stuck at migration InProgress cannot be re-driven through the public
-API
-  - migratePoolToSet only enrolls a MigratePoolToSetDurableTask when the pool
-    is not already InProgress. Once it is, a same-set call is a no-op and a
-    different-set call retargets without enrolling, so no call can arm a
-    driver
-  - If the task instance is ever lost while the pool is InProgress, the pool
-    is wedged with no public recourse -- there is no way to clear the
-    migration field or re-enroll
-  - Not currently reachable. Enrollment is durable, so a crash is fine: the
-    runner re-creates enrolled tasks on restart. The one path that
-    deregisters without finishing is SystemTaskRunner.shutdown(), which
-    fails the task's promise with TaskStopped, and onTaskComplete
-    deregisters on failure too. That method has no production caller -- only
-    SystemTaskRunnerSuite and SystemTaskExecutorServiceSuite
-  - Candidate fix is to make enrollment idempotent and unconditional, or to
-    enroll when the pool is InProgress but nothing is registered for it.
-    Either removes the trap without needing shutdown() to change
-  - Note that AspenClient.migratePoolToSet's docstring currently claims there
-    is "no window in which a pool is InProgress with no task driving it".
-    That is true of the start transaction but not of the shutdown path
-
 MigratePoolToSetDurableTask awaits transferStore, so a stalled transfer
 stalls the task permanently
   - SetRebalanceDurableTask fires transferStore and immediately reschedules;

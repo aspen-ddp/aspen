@@ -147,6 +147,30 @@ sealed abstract class IDA extends Ordered[IDA] {
   /** Returns length of the DataBuffers that would be returned by calling encode() on the provided number of bytes */
   def calculateEncodedSegmentLength(nbytes: Int): Int
 
+  /** Largest object size, in bytes, whose slices each fit within `maxSliceSize` bytes. This is the
+    * limit applications should code against.
+    *
+    * It is the exact inverse of `calculateEncodedSegmentLength`: the result is the largest n for which
+    * `calculateEncodedSegmentLength(n) <= maxSliceSize`, capped at `Int.MaxValue` (object lengths are
+    * Ints). Each IDA derives it from its own slice layout:
+    *
+    *   - Replication: every slice is a full copy, so n = maxSliceSize
+    *   - ReedSolomon: slice = n / k + 1 bytes (k = restoreThreshold, with at least one pad byte),
+    *     so n = k * maxSliceSize - 1
+    *   - AppendingReedSolomon: slices are whole rows of cellSize bytes and the stream holds the content
+    *     plus an 8 byte trailer, so n = (maxSliceSize / cellSize) * rowBytes - 8, where
+    *     rowBytes = k * cellSize. Capped at Int.MaxValue - rowBytes, the largest length supported by
+    *     appends and ranged writes.
+    *
+    * @throws IllegalArgumentException if `maxSliceSize < minSliceSize`
+    */
+  def maxObjectSize(maxSliceSize: Long): Int
+
+  /** Smallest `maxSliceSize` that can hold the slices of an empty object. Smaller values admit no
+    * objects at all and are rejected by `maxObjectSize`.
+    */
+  def minSliceSize: Int
+
   /** Returns the number of bytes needed to serialize the IDA type. */
   def getSerializedIDATypeLength: Int
 
@@ -222,6 +246,15 @@ case class Replication(width: Int, writeThreshold: Int) extends IDA with Appenda
   }
 
   def calculateEncodedSegmentLength(nbytes: Int): Int = nbytes
+
+  /** Every slice is a full copy of the object, so the object size equals the slice size */
+  def maxObjectSize(maxSliceSize: Long): Int =
+    require(maxSliceSize >= minSliceSize,
+      s"maxSliceSize ($maxSliceSize) must be at least $minSliceSize")
+    math.min(maxSliceSize, Int.MaxValue.toLong).toInt
+
+  /** Zero would admit only empty objects, which is never a meaningful limit, so a slice limit must be positive */
+  def minSliceSize: Int = 1
 
   def getSerializedIDATypeLength: Int = 4 // <type><width><writeThreshold>
 
@@ -370,6 +403,19 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
 
   def calculateEncodedSegmentLength(nbytes: Int): Int = nbytes / k + 1
 
+  /** Slice = n / k + 1, so the largest n with a slice of at most maxSliceSize bytes is k * maxSliceSize - 1 */
+  def maxObjectSize(maxSliceSize: Long): Int =
+    require(maxSliceSize >= minSliceSize,
+      s"maxSliceSize ($maxSliceSize) must be at least $minSliceSize")
+    // Divide first so the product cannot overflow a Long
+    if maxSliceSize > (Int.MaxValue.toLong + 1) / k then
+      Int.MaxValue
+    else
+      math.min(k * maxSliceSize - 1, Int.MaxValue.toLong).toInt
+
+  /** Even an empty object has one pad byte in each slice */
+  def minSliceSize: Int = 1
+
   def encode(objectContent: Array[Byte]): Array[Array[Byte]] =
     encodeToShards(objectContent, 0, objectContent.length)
 
@@ -517,6 +563,24 @@ case class AppendingReedSolomon(
     ((nbytes.toLong + AppendingReedSolomon.TrailerSize + rowBytes - 1) / rowBytes).toInt
 
   def calculateEncodedSegmentLength(nbytes: Int): Int = rowsFor(nbytes) * cellSize
+
+  /** Slices hold whole rows of cellSize bytes, so maxSliceSize / cellSize rows fit. Each row carries
+    * rowBytes stream bytes of which the final 8 are the trailer, giving
+    * n = (maxSliceSize / cellSize) * rowBytes - 8. Capped at Int.MaxValue - rowBytes, the bound
+    * enforced by appends and ranged writes.
+    */
+  def maxObjectSize(maxSliceSize: Long): Int =
+    require(maxSliceSize >= minSliceSize,
+      s"maxSliceSize ($maxSliceSize) must be at least $minSliceSize")
+    val cap = Int.MaxValue.toLong - rowBytes
+    val rows = maxSliceSize / cellSize
+    if rows > (cap + AppendingReedSolomon.TrailerSize) / rowBytes + 1 then
+      cap.toInt
+    else
+      math.min(rows * rowBytes - AppendingReedSolomon.TrailerSize, cap).toInt
+
+  /** An empty object still occupies one row, whose slices are cellSize bytes */
+  def minSliceSize: Int = cellSize
 
   def encode(objectContent: Array[Byte]): Array[Array[Byte]] =
     encodeToShards(objectContent, 0, objectContent.length)

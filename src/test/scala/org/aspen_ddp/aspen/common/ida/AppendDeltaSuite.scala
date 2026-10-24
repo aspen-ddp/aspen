@@ -92,8 +92,9 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   test("delta only touches rows from the old final row onward") {
     val ida = AppendingReedSolomon(5, 3, 4, 64)
     ida.appendDeltas(10000, bytes(1024, 3)).foreach { d =>
-      d.xorOffset should be ((10000 / 192) * 64)
-      d.xorBytes.length should be (d.newSliceLength - d.xorOffset)
+      d.regions.length should be (1)
+      d.regions.head.offset should be ((10000 / 192) * 64)
+      d.regions.head.bytes.length should be (d.newSliceLength - d.regions.head.offset)
     }
   }
 
@@ -142,14 +143,63 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
       (0, 8, -1, Array[Byte](1), None),            // negative offset
       (0, 8, 7, Array[Byte](1, 2), None),          // xor range past new length
       (2, 8, 0, Array[Byte](1), tail),             // tail longer than expected slice
-      (0, 8, 0, Array[Byte](1, 2), None),          // xor range does not end at the new slice length
-      (0, 16, 8, Array.fill[Byte](8)(1), None))    // xor starts beyond the expected slice length
+      (0, 8, 0, Array[Byte](), None))              // empty region
     bad.foreach { (e, n, o, x, t) =>
       val enc = ByteBuffer.allocate(22 + x.length + t.map(_.length).getOrElse(0))
-      enc.put(AppendDelta.FormatVersion).putInt(e).putInt(n).putInt(o).putInt(x.length)
+      enc.put(1.toByte).putInt(e).putInt(n).putInt(o).putInt(x.length)
       enc.put(if t.isDefined then 1.toByte else 0.toByte).putInt(t.map(_.length).getOrElse(0))
       enc.put(x)
       t.foreach(a => enc.put(a))
       an [IllegalArgumentException] should be thrownBy AppendDelta.decode(DataBuffer(enc.array()))
     }
+  }
+
+  private def v1Payload(e: Int, n: Int, o: Int, x: Array[Byte], t: Option[Array[Byte]]): DataBuffer =
+    val enc = ByteBuffer.allocate(22 + x.length + t.map(_.length).getOrElse(0))
+    enc.put(1.toByte).putInt(e).putInt(n).putInt(o).putInt(x.length)
+    enc.put(if t.isDefined then 1.toByte else 0.toByte).putInt(t.map(_.length).getOrElse(0))
+    enc.put(x)
+    t.foreach(a => enc.put(a))
+    DataBuffer(enc.array())
+
+  test("decoding a version 1 payload yields one region") {
+    val x = Array.tabulate[Byte](24)(_.toByte)
+    val tail = Array[Byte](9, 8, 7, 6, 5, 4, 3, 2)
+    val d = AppendDelta.decode(v1Payload(16, 32, 8, x, Some(tail)))
+    d.regions should be (List(XorRegion(8, x)))
+    d should be (AppendDelta(16, 32, 8, x, Some(tail)))
+  }
+
+  test("multiple distant regions XOR only their own bytes") {
+    val d = AppendDelta(64, 64, List(XorRegion(2, Array[Byte](1, 1)), XorRegion(50, Array[Byte](3))), None)
+    val src = bytes(64, 11)
+    val out = d.applyTo(DataBuffer(src)).getByteArray
+    out.indices.foreach { i =>
+      val x = if i == 2 || i == 3 then 1 else if i == 50 then 3 else 0
+      out(i) should be ((src(i) ^ x).toByte)
+    }
+  }
+
+  test("version 2 round trip with multiple regions and a region beyond the expected length") {
+    val d = AppendDelta(16, 48,
+      List(XorRegion(4, Array[Byte](1, 2, 3)), XorRegion(40, Array.tabulate[Byte](8)(i => (i + 1).toByte))),
+      Some(Array[Byte](5, 6)))
+    val dec = AppendDelta.decode(d.encode)
+    dec should be (d)
+    dec.hashCode should be (d.hashCode)
+    val enc = d.encode.getByteArray
+    for n <- 0 until enc.length do
+      an [IllegalArgumentException] should be thrownBy AppendDelta.decode(DataBuffer(enc.take(n)))
+    val none = AppendDelta(0, 0, Nil, None)
+    AppendDelta.decode(none.encode) should be (none)
+  }
+
+  test("invalid region lists are rejected") {
+    def r(o: Int, n: Int) = XorRegion(o, Array.fill[Byte](n)(1))
+    an [IllegalArgumentException] should be thrownBy AppendDelta(8, 32, List(r(4, 8), r(8, 2)), None)
+    an [IllegalArgumentException] should be thrownBy AppendDelta(8, 32, List(r(10, 2), r(2, 2)), None)
+    an [IllegalArgumentException] should be thrownBy AppendDelta(8, 32, List(r(2, 0)), None)
+    an [IllegalArgumentException] should be thrownBy AppendDelta(8, 32, List(r(30, 4)), None)
+    an [IllegalArgumentException] should be thrownBy AppendDelta(8, 32, List(r(-1, 4)), None)
+    AppendDelta(8, 32, List(r(2, 2), r(4, 2)), None).regions.length should be (2)
   }

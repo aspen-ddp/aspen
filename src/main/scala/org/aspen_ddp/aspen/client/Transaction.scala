@@ -24,6 +24,22 @@ trait Transaction {
     */
   def append(position: AppendPosition, data: DataBuffer): AppendPosition
 
+  /** Overwrites byte ranges of the object described by `state`, sending only the changed bytes. The update
+    * requires the state's revision, so a stale state aborts the transaction. Writes may be given in any order.
+    * A write may extend the object. One starting beyond its current end requires `zeroFill`, which fills the gap
+    * with zeros.
+    *
+    * Throws IllegalArgumentException if `writes` is empty, any write is empty or has a negative offset, writes
+    * overlap (touching is fine), or `state` lacks the current bytes under a write. Building the transaction fails
+    * with RangeWriteNotSupported if the pool's IDA does not support ranged writes (classic ReedSolomon),
+    * RangeWriteBeyondEnd for a gap without `zeroFill`, and ObjectSizeLimitExceeded if the result would exceed the
+    * pool's maxObjectSize or the IDA's length limit.
+    */
+  def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean = false): Unit
+
+  def rangedWrite(state: RangedWriteState, write: RangedWrite, zeroFill: Boolean = false): Unit =
+    rangedWrites(state, List(write), zeroFill)
+
   def overwrite(objectPointer: DataObjectPointer,
                 requiredRevision: ObjectRevision,
                 data: DataBuffer): Unit

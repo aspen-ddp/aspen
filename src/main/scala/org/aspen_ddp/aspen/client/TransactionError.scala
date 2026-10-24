@@ -18,6 +18,17 @@ final case class ConflictingRequirements(objectPointer:ObjectPointer) extends Tr
 /** Used if an append is attempted on an object whose pool IDA does not support appends (e.g. classic ReedSolomon) */
 final case class AppendNotSupported(objectPointer:ObjectPointer, ida: IDA) extends TransactionCreationError
 
+/** Used if a ranged write is attempted on an object whose pool IDA does not support them (e.g. classic ReedSolomon) */
+final case class RangeWriteNotSupported(objectPointer:ObjectPointer, ida: IDA) extends TransactionCreationError
+
+/** Used if a ranged write starts beyond the current end of the object and zero fill was not requested */
+final case class RangeWriteBeyondEnd(objectPointer:ObjectPointer, currentLength: Int, offset: Int) extends TransactionCreationError
+
+/** Used if a ranged write would grow the object beyond the pool's maxObjectSize, or beyond the largest
+  * length the pool's IDA can represent
+  */
+final case class ObjectSizeLimitExceeded(objectPointer:ObjectPointer, newLength: Long, maxObjectSize: Long) extends TransactionCreationError
+
 /** Used if multiple refcount modifications are attempted on the same object within a single transaction */
 final case class MultipleRefcountUpdatesToObject(objectPointer:ObjectPointer) extends TransactionCreationError
 

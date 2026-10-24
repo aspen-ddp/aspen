@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AbortAfterCommit, AppendPosition, AspenClient, PostCommitTransactionModification, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{AbortAfterCommit, AppendPosition, AspenClient, PostCommitTransactionModification, RangedWrite, RangedWriteState, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
@@ -65,6 +65,11 @@ class TransactionImpl(val client: AspenClient,
       bldr.append(position, data)
     }
     AppendPosition(position.pointer, revision, position.length + data.size)
+
+  def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean = false): Unit = modify { bldr =>
+    bldr.rangedWrites(state, writes, zeroFill)
+    havePendingUpdates = true
+  }
 
   def overwrite(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = modify { bldr =>
     havePendingUpdates = true
@@ -150,17 +155,20 @@ class TransactionImpl(val client: AspenClient,
       } else
         val poolIds = bldr.allReferencedPoolIds
 
-        val poolIDAMapFuture = Future.sequence(
-          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool.ida))
+        val poolsFuture = Future.sequence(
+          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool))
         ).map(_.toMap)
 
-        poolIDAMapFuture.failed.foreach { cause =>
+        poolsFuture.failed.foreach { cause =>
           promise.tryFailure(cause)
         }
 
-        poolIDAMapFuture.foreach { poolIDAMap =>
+        poolsFuture.foreach { pools =>
           try
-            val (txd, transactionData, _) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap)
+            val poolIDAMap = pools.map((poolId, pool) => poolId -> pool.ida)
+            val poolMaxObjectSizeMap = pools.map((poolId, pool) => poolId -> pool.maxObjectSize)
+            val (txd, transactionData, _) = bldr.buildTranaction(client.opportunisticRebuildManager, poolIDAMap,
+              poolMaxObjectSizeMap)
 
             //---- Tx Debugging ----
             result.onComplete {

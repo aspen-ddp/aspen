@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.allocation.DeletionFinalizationAction
-import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject}
+import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction.*
 import org.aspen_ddp.aspen.common.util.printStack
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.{AppendableIDA, IDA}
+import org.aspen_ddp.aspen.common.ida.{AppendableIDA, AppendingReedSolomon, IDA, RangeEdit, Replication}
 import org.aspen_ddp.aspen.common.pool.PoolId
 
 object TransactionBuilder {
@@ -20,6 +20,9 @@ object TransactionBuilder {
                        contentLock: Option[FullContentLock],
                        requirements: List[KeyValueUpdate.KeyRequirement],
                        operations: List[KeyValueOperation])
+
+  /** Ranged writes to one object. `edits` carry the old bytes taken from the state when they were added */
+  case class RangedUpdate(currentLength: Int, edits: List[RangeEdit], zeroFill: Boolean)
 
   case class TransactionData(localUpdates: List[ObjectUpdate],
                              preTransactionRebuilds: List[PreTransactionOpportunisticRebuild])
@@ -39,6 +42,7 @@ class TransactionBuilder(
   private  var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects
   private  var dataObjectUpdates = Map[ObjectPointer, DataBuffer]()
   private  var appendUpdates = Map[ObjectPointer, (AppendPosition, DataBuffer)]()
+  private  var rangedUpdates = Map[ObjectPointer, RangedUpdate]()
   private  var keyValueUpdates = Map[KeyValueObjectPointer, KVUpdate]()
 
   private  var finalizationActions = List[SerializedFinalizationAction]()
@@ -55,11 +59,15 @@ class TransactionBuilder(
       updatingObjects.isEmpty &&
       dataObjectUpdates.isEmpty &&
       appendUpdates.isEmpty &&
+      rangedUpdates.isEmpty &&
       keyValueUpdates.isEmpty &&
       finalizationActions.isEmpty &&
       allocatingObjects.isEmpty
 
-  def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager, poolIDAMap: Map[PoolId, IDA]): (TransactionDescription,
+  /** `poolMaxObjectSizeMap` holds each referenced pool's maxObjectSize. It is enforced only for ranged writes */
+  def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager,
+                      poolIDAMap: Map[PoolId, IDA],
+                      poolMaxObjectSizeMap: Map[PoolId, Option[Int]]): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {
 
     HLCTimestamp.update(minimumTimestamp)
@@ -150,6 +158,32 @@ class TransactionBuilder(
           throw AppendNotSupported(objectPointer, ida)
     }
 
+    rangedUpdates foreach { t =>
+      val (objectPointer, ru) = t
+
+      poolIDAMap(objectPointer.poolId) match
+        case ida: (IDA & AppendableIDA) =>
+          val sorted = ru.edits.sortBy(_.offset)
+          // A write leaves a gap when it starts beyond both the current end and the end of the previous write
+          val newLength = sorted.foldLeft(ru.currentLength.toLong): (end, e) =>
+            if !ru.zeroFill && e.offset > end then
+              throw RangeWriteBeyondEnd(objectPointer, ru.currentLength, e.offset)
+            math.max(end, e.end)
+          poolMaxObjectSizeMap.get(objectPointer.poolId).flatten.foreach: max =>
+            if newLength > max then
+              throw ObjectSizeLimitExceeded(objectPointer, newLength, max)
+
+          val idaLimit: Long = ida match
+            case ars: AppendingReedSolomon => Int.MaxValue.toLong - ars.rowBytes
+            case _: Replication => Int.MaxValue.toLong
+          if newLength > idaLimit then
+            throw ObjectSizeLimitExceeded(objectPointer, newLength, idaLimit)
+
+          addUpdate(objectPointer, ida.rangedWriteDeltas(ru.currentLength, sorted).map(_.encode))
+        case ida =>
+          throw RangeWriteNotSupported(objectPointer, ida)
+    }
+
     keyValueUpdates.valuesIterator.foreach { kvu =>
       addUpdate(kvu.pointer, KeyValueOperation.encode(kvu.operations, poolIDAMap(kvu.pointer.poolId)))
     }
@@ -190,6 +224,34 @@ class TransactionBuilder(
     updatingObjects += objectPointer
     appendUpdates += (objectPointer -> (position, data))
     requirements  = DataUpdate(objectPointer, position.revision, DataUpdateOperation.Append) :: requirements
+  }
+
+  /** Overwrites byte ranges of the object described by `state`. The writes are validated here and the old bytes
+    * under them are taken from `state`, throwing IllegalArgumentException for empty or negative writes, overlaps,
+    * or a state that lacks the needed bytes. Support by the pool's IDA, the zero fill rule and the size limits
+    * are checked when the transaction is built, since the pool is not known here.
+    */
+  def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean): Unit = synchronized {
+    val objectPointer = state.pointer
+    require(writes.nonEmpty, "Ranged write requires at least one write")
+    writes.foreach: w =>
+      require(w.offset >= 0, s"Invalid ranged write offset ${w.offset}")
+      require(w.data.length > 0, s"Empty ranged write at offset ${w.offset}")
+
+    val sorted = writes.sortBy(_.offset)
+    sorted.zip(sorted.tail).foreach: (prev, next) =>
+      require(prev.end <= next.offset, s"Ranged write at ${next.offset} overlaps the write at ${prev.offset}")
+
+    if updatingObjects.contains(objectPointer) then
+      throw MultipleDataUpdatesToObject(objectPointer)
+    if revisionLocks.contains(objectPointer) then
+      throw ConflictingRequirements(objectPointer)
+
+    val edits = sorted.map(w => RangeEdit(w.offset, w.data, state.oldBytes(w.offset, w.data.length)))
+
+    updatingObjects += objectPointer
+    rangedUpdates += (objectPointer -> RangedUpdate(state.length, edits, zeroFill))
+    requirements  = DataUpdate(objectPointer, state.revision, DataUpdateOperation.WriteRange) :: requirements
   }
 
   def overwrite(objectPointer: ObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = synchronized {

@@ -31,7 +31,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private val appended = Array.tabulate[Byte](50)(i => (i * 7 + 1).toByte)
 
   private def build(bldr: TransactionBuilder, ida: IDA) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> ida))
+    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> ida), Map(p1.poolId -> None))
 
   test("append adds an Append DataUpdate with the position's revision") {
     val bldr = mkBuilder()

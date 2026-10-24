@@ -15,7 +15,7 @@ import scribe.Logging
 import java.util.UUID
 import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import scala.util.{Failure, Random, Success}
 
 object MigratePoolToSetDurableTask extends DurableTaskFactory:
 
@@ -72,7 +72,8 @@ class MigratePoolToSetDurableTask(
     val taskPointer: DurableTaskPointer,
     client: AspenClient,
     poolId: PoolId,
-    pollPeriod: Duration
+    pollPeriod: Duration,
+    rng: Random = new Random()  // Destination-selection randomness; a test seam.
 ) extends DurableTask with Logging:
 
   import MigratePoolToSetDurableTask.MigrationSuperseded
@@ -196,11 +197,20 @@ class MigratePoolToSetDurableTask(
                    entry.status == StorageDeviceState.StoreStatus.TransferringOut) => sid
           .toSet
 
+          // Destinations of this pool's in-flight transfers: the TransferringOut entry on the
+          // device of record names it. They are soft-excluded from selection along with the
+          // devices of record, so concurrent transfers do not pile replicas onto one device.
+          val inFlightDestinations: Set[StorageDeviceId] = deviceStates.iterator.flatMap: ds =>
+            ds.stores.collect:
+              case (sid, StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut,
+                                                       Some(dst))) if sid.poolId == poolId => dst
+          .toSet
+
           val candidates = remaining.filter: i =>
             val sid = StoreId(poolId, i)
             !inFlight.contains(sid) && backoff.ready(sid)
 
-          tryStores(poolKvos, poolState, targetSet, candidates)
+          tryStores(poolKvos, poolState, targetSet, inFlightDestinations, candidates)
 
   /** Try to start a transfer for every candidate store, in poolIndex order. Sequential, not
    *  parallel: each start re-reads the pool's state, so it sees the transfers this pass has
@@ -208,11 +218,14 @@ class MigratePoolToSetDurableTask(
   private def tryStores(poolKvos: KeyValueObjectState,
                         poolState: StoragePoolState,
                         targetSet: StorageDeviceSetState,
+                        inFlightDestinations: Set[StorageDeviceId],
                         candidates: List[Byte]): Future[Unit] =
 
     val poolDevices = poolState.stores.map(_.storageDeviceId).toSet
 
-    def attempt(candidates: List[Byte]): Future[Unit] = candidates match
+    // `exclude` grows with each destination started in this pass. It is a SOFT exclude: when no
+    // other device has room, selection still falls back to one of these.
+    def attempt(candidates: List[Byte], exclude: Set[StorageDeviceId]): Future[Unit] = candidates match
       case Nil =>
         scheduleRecheck()
         Future.unit
@@ -228,7 +241,7 @@ class MigratePoolToSetDurableTask(
         // The destination is selected afresh on every attempt, so a store whose transfer was
         // aborted is simply restarted toward whatever the target set offers now.
         val selected =
-          try targetSet.selectDeviceForStore(requiredSize, poolDevices, client)
+          try targetSet.selectDeviceForStore(requiredSize, exclude, client, rng)
           catch
             case err: Throwable => Future.failed(err)
 
@@ -237,13 +250,13 @@ class MigratePoolToSetDurableTask(
             // AllocationError (no device with room) or a read failure: transient from this
             // task's point of view. Try the next store.
             logger.warn(s"Pool migration ${poolId.uuid}: no destination for $storeId: $err")
-            attempt(tail)
+            attempt(tail, exclude)
 
           case Success(destination) if destination == sourceDevice =>
             // Structurally unreachable -- selection only returns target-set devices and this
             // store's device is not one -- but the pool state driving that reasoning can be
             // stale, and transferStore would throw InvalidDestination. Skip instead.
-            attempt(tail)
+            attempt(tail, exclude)
 
           case Success(destination) =>
             // KNOWN RACE -- the admission check inside TransferStarter.start and the start itself
@@ -255,17 +268,17 @@ class MigratePoolToSetDurableTask(
             TransferStarter.start(client, storeId, destination).transformWith:
               case Success(StartResult.Started) =>
                 backoff.succeeded(storeId)
-                attempt(tail)
+                attempt(tail, exclude + destination)
 
               case Success(StartResult.RolledBack) =>
                 logger.info(s"Pool migration ${poolId.uuid}: start of $storeId was rolled back; " +
                   "backing off")
                 backoff.failed(storeId)
-                attempt(tail)
+                attempt(tail, exclude)
 
               case Success(StartResult.Rejected) =>
                 // Not admissible right now; the next poll re-evaluates.
-                attempt(tail)
+                attempt(tail, exclude)
 
               case Failure(err) =>
                 // Ambiguous: transferStore failed (a lost race, a read failure), or the
@@ -274,9 +287,9 @@ class MigratePoolToSetDurableTask(
                 // back off and try the next store.
                 logger.warn(s"Pool migration ${poolId.uuid}: could not start $storeId: $err")
                 backoff.failed(storeId)
-                attempt(tail)
+                attempt(tail, exclude)
 
-    attempt(candidates)
+    attempt(candidates, poolDevices ++ inFlightDestinations)
 
   /** Record the migration as Complete, then finish.
    *

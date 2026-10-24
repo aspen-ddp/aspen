@@ -19,6 +19,7 @@ import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, System
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.util.Random
 
 /** Shared harness for the migration suites; subclasses pick the bootstrap pool's IDA. */
 abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
@@ -46,12 +47,13 @@ abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
   protected val fastPoll = Duration(50, MILLISECONDS)
 
   /** Build a task instance over the state object migratePoolToSet enrolled. */
-  protected def taskForEnrolled(poolId: PoolId): Future[MigratePoolToSetDurableTask] =
+  protected def taskForEnrolled(poolId: PoolId,
+                                rng: Random = new Random()): Future[MigratePoolToSetDurableTask] =
     given ExecutionContext = executionContext
     enrolledTasks().map: enrolled =>
       enrolled.size should be(1)
       val task = new MigratePoolToSetDurableTask(
-        DurableTaskPointer(enrolled.head._2), client, poolId, fastPoll)
+        DurableTaskPointer(enrolled.head._2), client, poolId, fastPoll, rng)
       synchronized { tasks ::= task }
       task
 
@@ -90,8 +92,9 @@ abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
    *
    *  A retarget can leave a transfer in flight toward the set just abandoned, and in a pool whose
    *  floor admits one transfer at a time the task can start nothing new until it clears -- so
-   *  pumping only the new target would deadlock. Sequential rather than parallel: each pump transacts against the same
-   *  pool object, and concurrent passes would collide. Fails on timeout. */
+   *  pumping only the new target would deadlock. Sequential rather than parallel: each pump
+   *  transacts against the same pool object, and concurrent passes would collide. Fails on
+   *  timeout. */
   protected def driveUntilCompleteAcross(task: MigratePoolToSetDurableTask,
                                          destinationSetIds: List[StorageDeviceSetId],
                                          timeout: Duration): Future[Unit] =
@@ -194,7 +197,6 @@ abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
  *  flight at a time. */
 class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
 
-
   atest("MigratePoolToSetDurableTask is registered in the client type registry"):
     given ExecutionContext = executionContext
     // SystemTaskExecutorService reconstructs a task by looking its type UUID up here; an
@@ -203,7 +205,6 @@ class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       MigratePoolToSetDurableTask.typeUUID)
     factory should be(Some(MigratePoolToSetDurableTask))
     TypeFactories.factories should contain(MigratePoolToSetDurableTask)
-
 
   atest("migratePoolToSet flips the pointer, swaps assignedPools, and enrolls one task"):
     given ExecutionContext = executionContext
@@ -548,6 +549,36 @@ class ParallelMigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       poolState.stores.foreach: entry =>
         entry.storageDeviceId should be(net.secondDeviceId)
       poolState.migration.get.status should be(StoragePoolState.MigrationStatus.Complete)
+
+  atest("concurrent transfers are steered to distinct destinations"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val boot = net.storageDeviceId
+    // shuffle never reorders when nextInt(n) always returns n - 1, so selection always tries the
+    // target set's members in list order. Without the in-flight destinations in the exclude set
+    // both starts would therefore land on the same (first) device.
+    val noShuffle = new Random(new java.util.Random:
+      override def nextInt(bound: Int): Int = bound - 1)
+    for
+      targetSetId <- targetWithSecondDevice("distinct-target")
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.thirdDeviceId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.migratePoolToSet(poolId, targetSetId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(poolId, noShuffle)
+      _ <- awaitUntil("two transfers to be in flight together", Duration(20000, MILLISECONDS))(
+             countTransferringOut(boot).map(_ >= 2))
+      bootState <- client.getStorageDeviceState(boot)
+      _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
+    yield
+      val destinations = bootState.stores.values.collect:
+        case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dst)) => dst
+      .toList
+      destinations.size should be(2)
+      destinations.toSet should be(Set(net.secondDeviceId, net.thirdDeviceId))
 
 /** Replication(3, 3): writeThreshold == width, so the floor clamps to width - 1 = 2 and exactly
  *  one store may be in flight at a time. */

@@ -368,54 +368,75 @@ trait RangedWriteIntegrationTests:
       _ <- readsWithStoresDown(dp, expected)
     yield succeed
 
-  /** Content whose byte at index i is a function of i alone, so any revision's prefix is predictable */
-  private def patternAt(i: Int): Byte = (i * 31 + 7).toByte
-
-  /** Appends 37 byte pattern chunks in the background, starting at `start`, `count` times */
-  private def appendPattern(dp: DataObjectPointer, start: Int, count: Int): Future[Unit] =
-    client.readAppendPosition(dp).flatMap: pos0 =>
-      (0 until count).foldLeft(Future.successful(pos0)): (fpos, n) =>
-        fpos.flatMap: pos =>
-          val tx = client.newTransaction()
-          val chunk = Array.tabulate[Byte](37)(i => patternAt(start + n * 37 + i))
-          val next = tx.append(pos, DataBuffer(chunk))
-          tx.commit().map(_ => next)
-      .map(_ => ())
+  /** Background writer. Generation n (1..count) overwrites bytes 3..6 with n and appends ten bytes of n at the end,
+    * so at generation g the object is `base + 10 * g` bytes long, byte 3 is g and the first appended ten bytes are 1
+    */
+  private def writeGenerations(dp: DataObjectPointer, base: Int, count: Int): Future[Unit] =
+    repeat(count): n =>
+      val gen = (n + 1).toByte
+      val writes = List(RangedWrite(3, Array.fill[Byte](4)(gen)), RangedWrite(base + 10 * n, Array.fill[Byte](10)(gen)))
+      fetchAndWrite(dp, writes).map(_ => ())
 
   private def repeat(times: Int)(f: Int => Future[Unit]): Future[Unit] =
     (0 until times).foldLeft(Future.successful(())): (acc, n) =>
       acc.flatMap(_ => f(n))
 
+  /** Runs `readOnce` until it has returned `wanted` distinct revisions, failing if `maxReads` pass first */
+  private def readUntilRevisionsChange(wanted: Int, maxReads: Int)
+                                      (readOnce: () => Future[Set[ObjectRevision]]): Future[Set[ObjectRevision]] =
+    def loop(n: Int, seen: Set[ObjectRevision]): Future[Set[ObjectRevision]] =
+      if seen.size >= wanted then
+        Future.successful(seen)
+      else if n >= maxReads then
+        Future.failed(new AssertionError(s"Only ${seen.size} revisions observed in $maxReads reads"))
+      else
+        readOnce().flatMap(revs => loop(n + 1, seen ++ revs))
+    loop(0, Set.empty)
+
   atest("readRangedWriteState never fails with a mixed revision while a writer appends"):
-    val R = rowBytes
-    val initial = Array.tabulate[Byte](3 * R + 5)(patternAt)
-    val writes = List(RangedWrite(3, Array[Byte](1, 2, 3)), RangedWrite(R + 2, Array.fill[Byte](R)(5)),
-                      RangedWrite(initial.length - 4, Array.fill[Byte](20)(6)))
+    val base = 3 * rowBytes + 5
+    val initial = new Array[Byte](base)
+    val writes = List(RangedWrite(3, new Array[Byte](4)), RangedWrite(base, new Array[Byte](10)))
+    var lengthOf = Map.empty[ObjectRevision, Int]
     for
       dp <- allocateWith(1, initial)
-      appender = appendPattern(dp, initial.length, 25)
-      _ <- repeat(25): _ =>
-             client.readRangedWriteState(dp, writes).map: state =>
-               state.length should be >= initial.length
-               writes.foreach: w =>
-                 val end = math.min(w.end, state.length.toLong).toInt
-                 val expected = (w.offset until end).map(i => patternAt(i)).toList
-                 state.oldBytes(w.offset, w.data.length).toList should be (expected)
-      _ <- appender
-    yield succeed
+      writer = writeGenerations(dp, base, 40)
+      seen <- readUntilRevisionsChange(3, 500): () =>
+                client.readRangedWriteState(dp, writes).map: state =>
+                  // Each revision has exactly one length
+                  lengthOf.get(state.revision).foreach(_ should be (state.length))
+                  lengthOf += state.revision -> state.length
+                  // Every piece must belong to the generation implied by the length
+                  val gen = (state.length - base) / 10
+                  (state.length - base) % 10 should be (0)
+                  state.oldBytes(3, 4).toList should be (List.fill(4)(gen.toByte))
+                  val tail = state.oldBytes(base, 10).toList
+                  tail should be (List.fill(if gen == 0 then 0 else 10)(1.toByte))
+                  Set(state.revision)
+      _ <- writer
+    yield
+      seen.size should be >= 3
+      succeed
 
   atest("readRanges returns every range at one revision"):
-    val R = rowBytes
-    val initial = Array.tabulate[Byte](3 * R + 5)(patternAt)
-    val ranges = List((0, 10), (R, R), (initial.length - 4, 30))
+    val base = 3 * rowBytes + 5
+    val ranges = List((3, 4), (0, 2), (base, 10))
     for
-      dp <- allocateWith(1, initial)
-      appender = appendPattern(dp, initial.length, 25)
-      _ <- repeat(25): _ =>
-             client.readRanges(dp, ranges).map: states =>
-               states.map(_.revision).distinct.length should be (1)
-      _ <- appender
-    yield succeed
+      dp <- allocateWith(1, new Array[Byte](base))
+      writer = writeGenerations(dp, base, 40)
+      seen <- readUntilRevisionsChange(3, 500): () =>
+                client.readRanges(dp, ranges).map: states =>
+                  val revs = states.map(_.revision).toSet
+                  revs.size should be (1)
+                  // The byte at 3 and the appended bytes must agree with each other on the generation
+                  val gen = states.head.data.getByteArray.head.toInt
+                  val tail = states(2).data.getByteArray.toList
+                  tail should be (List.fill(if gen == 0 then 0 else 10)(1.toByte))
+                  revs
+      _ <- writer
+    yield
+      seen.size should be >= 3
+      succeed
 
   atest("two far apart edits in a large object"):
     val rnd = new Random(112)

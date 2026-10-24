@@ -135,9 +135,9 @@ abstract class BaseAspenClient(
       case ida => Future.failed(new RangeReadNotSupported(pointer, ida))
 
   /** The single read path for range reads: one ByteRanges request, so every piece comes from the same revision.
-    * `ranges` are (offset, length) pairs in logical coordinates and `tail` is a number of slice tail bytes
+    * `ranges` are (offset, length) pairs in logical coordinates and `tail` gives the number of slice tail bytes for the resolved IDA
     */
-  private def readByteRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], tail: Int,
+  private def readByteRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], tail: (IDA & AppendableIDA) => Int,
                              comment: String): Future[DataObjectRangesState] =
     // Resolved first so that an empty list still fails for an IDA without range reads
     resolveAppendableIda(pointer).flatMap { ida =>
@@ -147,7 +147,7 @@ abstract class BaseAspenClient(
         val sliceRanges = ranges.map: (offset, length) =>
           val (start, end) = ida.sliceRangeFor(offset, length)
           (start, end - start)
-        rmgr.read(pointer, ida, comment, readType = ByteRanges(sliceRanges, tail)).map(_.asInstanceOf[DataObjectRangesState])
+        rmgr.read(pointer, ida, comment, readType = ByteRanges(sliceRanges, tail(ida))).map(_.asInstanceOf[DataObjectRangesState])
     }
 
   override def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int],
@@ -177,30 +177,29 @@ abstract class BaseAspenClient(
     new DataObjectRangeState(state.pointer, state.revision, state.refcount, state.timestamp, state.readTimestamp,
       state.ida, offset, DataBuffer(trimmed), state.objectLength)
 
+  /** The pieces of a multi-range read, each trimmed to its requested (offset, length) */
+  private def trimmedPieces(state: DataObjectRangesState, ranges: List[(Int, Int)]): List[DataObjectRangeState] =
+    ranges.zip(state.ranges).map((range, piece) => trimRange(piece, range._1, Some(range._2)))
+
   override def readRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)],
                           comment: String): Future[List[DataObjectRangeState]] =
-    readByteRanges(pointer, ranges, 0, comment).map: state =>
-      ranges.zip(state.ranges).map((range, piece) => trimRange(piece, range._1, Some(range._2)))
+    readByteRanges(pointer, ranges, _ => 0, comment).map(trimmedPieces(_, ranges))
 
   override def readRangedWriteState(pointer: DataObjectPointer, writes: List[RangedWrite],
                                     comment: String): Future[RangedWriteState] =
     // The length probe and one range per write are a single request, so they share a revision
-    resolveAppendableIda(pointer).flatMap { ida =>
-      readByteRanges(pointer, writes.map(w => (w.offset, w.data.length)), ida.lengthProbeBytes, comment).flatMap: state =>
-        state.appendPosition match
-          case Some(position) =>
-            val reads = writes.zip(state.ranges).map((w, piece) => trimRange(piece, w.offset, Some(w.data.length)))
-            Future.successful(RangedWriteFetch.combine(pointer, writes, position, reads))
-          case None => Future.failed(new CorruptedObject(pointer))
-    }
+    val ranges = writes.map(w => (w.offset, w.data.length))
+    readByteRanges(pointer, ranges, _.lengthProbeBytes, comment).flatMap: state =>
+      state.appendPosition match
+        case Some(position) =>
+          Future.successful(RangedWriteFetch.combine(pointer, writes, position, trimmedPieces(state, ranges)))
+        case None => Future.failed(new CorruptedObject(pointer))
 
   override def readAppendPosition(pointer: DataObjectPointer, comment: String): Future[AppendPosition] =
-    resolveAppendableIda(pointer).flatMap { ida =>
-      readByteRanges(pointer, Nil, ida.lengthProbeBytes, comment).flatMap: state =>
-        state.appendPosition match
-          case Some(position) => Future.successful(position)
-          case None => Future.failed(new CorruptedObject(pointer))
-    }
+    readByteRanges(pointer, Nil, _.lengthProbeBytes, comment).flatMap: state =>
+      state.appendPosition match
+        case Some(position) => Future.successful(position)
+        case None => Future.failed(new CorruptedObject(pointer))
 
   // ---- Transactions ----
 

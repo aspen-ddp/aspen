@@ -264,6 +264,22 @@ trait AppendIntegrationTests:
           bytesShouldMatch(rs.data.getByteArray, slice(range._1, range._2))
       succeed
 
+  atest("readRange with huge lengths and readRanges with negative arguments"):
+    val rnd = new Random(12)
+    val R = rowBytes
+    val content = chunkOf(rnd, 3 * R + 21)
+    for
+      dp <- allocateWith(1, content)
+      huge <- client.readRange(dp, R + 3, Some(Int.MaxValue))
+      big <- client.readRange(dp, R + 3, Some(Int.MaxValue - R - 3))
+      neg1 <- client.readRanges(dp, List((-1, 4))).map(_ => None).recover { case e => Some(e) }
+      neg2 <- client.readRanges(dp, List((0, 4), (2, -1))).map(_ => None).recover { case e => Some(e) }
+    yield
+      bytesShouldMatch(huge.data.getByteArray, content.drop(R + 3))
+      bytesShouldMatch(big.data.getByteArray, content.drop(R + 3))
+      neg1.exists(_.isInstanceOf[IllegalArgumentException]) should be (true)
+      neg2.exists(_.isInstanceOf[IllegalArgumentException]) should be (true)
+
   atest("readRanges returns each range's bytes in request order"):
     val rnd = new Random(7)
     val R = rowBytes

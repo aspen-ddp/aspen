@@ -48,8 +48,8 @@ trait ObjectReader {
 
   /** Reads several byte ranges of a data object concurrently. Each range is an (offset, length) pair and the
     * results are in the same order, each as `readRange(pointer, offset, Some(length))` would return it. All
-    * ranges are read in a single request and therefore come from the same revision of the object. Fails with RangeReadNotSupported unless the
-    * object's IDA supports append and range reads.
+    * ranges are read in a single request and therefore come from the same revision of the object. Fails with
+    * RangeReadNotSupported unless the object's IDA supports append and range reads.
     */
   def readRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], comment: String): Future[List[DataObjectRangeState]]
 
@@ -57,7 +57,8 @@ trait ObjectReader {
     readRanges(pointer, ranges, "")
 
   /** Reads the state `Transaction.rangedWrites` needs for `writes`: the object's revision, its length and the
-    * current bytes under each write, all taken from a single revision of the object by a single read. Fails with RangeReadNotSupported unless the object's IDA supports range reads.
+    * current bytes under each write, all taken from a single revision of the object by a single read. Fails with
+    * RangeReadNotSupported unless the object's IDA supports range reads.
     */
   def readRangedWriteState(pointer: DataObjectPointer, writes: List[RangedWrite], comment: String): Future[RangedWriteState]
 

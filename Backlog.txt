@@ -1,12 +1,12 @@
-
-Possible bug in AmoebaFS
-  - Looks like UnlinkFileTask may double-decrement the inode number
-  - prepareUnlink method decrements the inode number and creates the UnlinkFileTask atomically
-    if the refcount is zero.
-  - The task always decrements the refcount as the first step
-  - Need to verify that this is a flaw and look for cases where the task doing the decrement is
-    valid. If never valid, just skip the decrement step and move on to freeing resources.
-
+rebalanceStorageDeviceSet now walks the services TKVL on its no-op path
+  - Splitting the entry point so the sweep can pass its own statePointer moved
+    the pointer lookup above the pendingTransfers.nonEmpty short-circuit, so a
+    set with a transfer in flight pays a multi-tier traversal to decide to do
+    nothing, and returns a failed future rather than Future.unit if the service
+    is unregistered
+  - Bootstrap always registers the service, so the failure mode is theoretical;
+    the wasted read is not. Reordering the short-circuit above the lookup fixes
+    both
 
 A pool stuck at migration InProgress cannot be re-driven through the public
 API
@@ -45,6 +45,15 @@ stalls the task permanently
     transient faults, and every fast-fail case is already StopRetrying
     (NoSuchElementException, InvalidDestination, StoreNotActive)
 
+A transfer whose source host dies mid-flight blocks its pool's migration
+forever
+  - The store is left TransferringOut, and MigratePoolToSetDurableTask's
+    in-flight gate then refuses to start any further transfer for that pool.
+    A retarget does not clear it
+  - Pre-existing gap in the transfer subsystem, but migration is the first
+    workflow whose *progress* depends on transfers completing
+  - Related to the abortStoreTransfer note above
+
 StoragePool.getState() and dropCachedState() are now dead API
   - SimpleStoragePool caches its StoragePoolState at construction and
     dropCachedState() has never had a caller, so the cached copy was a
@@ -61,24 +70,13 @@ StoragePool.getState() and dropCachedState() are now dead API
   - So this is now a cleanup, not a correctness issue: either delete
     getState()/dropCachedState() or wire the invalidation up
 
-A transfer whose source host dies mid-flight blocks its pool's migration
-forever
-  - The store is left TransferringOut, and MigratePoolToSetDurableTask's
-    in-flight gate then refuses to start any further transfer for that pool.
-    A retarget does not clear it
-  - Pre-existing gap in the transfer subsystem, but migration is the first
-    workflow whose *progress* depends on transfers completing
-  - Related to the abortStoreTransfer note above
-
-rebalanceStorageDeviceSet now walks the services TKVL on its no-op path
-  - Splitting the entry point so the sweep can pass its own statePointer moved
-    the pointer lookup above the pendingTransfers.nonEmpty short-circuit, so a
-    set with a transfer in flight pays a multi-tier traversal to decide to do
-    nothing, and returns a failed future rather than Future.unit if the service
-    is unregistered
-  - Bootstrap always registers the service, so the failure mode is theoretical;
-    the wasted read is not. Reordering the short-circuit above the lookup fixes
-    both
+Possible bug in AmoebaFS
+  - Looks like UnlinkFileTask may double-decrement the inode number
+  - prepareUnlink method decrements the inode number and creates the UnlinkFileTask atomically
+    if the refcount is zero.
+  - The task always decrements the refcount as the first step
+  - Need to verify that this is a flaw and look for cases where the task doing the decrement is
+    valid. If never valid, just skip the decrement step and move on to freeing resources.
 
 Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"

@@ -701,6 +701,7 @@ enum StorageDeviceStoreStatus {
 message StorageDeviceStoreEntry {
   StorageDeviceStoreStatus status = 1;
   StorageDeviceId transfer_device = 2; // Optional field
+  UUID transfer_id = 3; // Optional field
 }
 
 message StorageDeviceStoreKeyValue {

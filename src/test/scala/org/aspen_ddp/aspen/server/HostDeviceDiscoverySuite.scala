@@ -1159,6 +1159,38 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       t.host.testingOnlyScheduledTransferInRetries should be(Set())
       takeStartTransfers(t.movingStore) should be(Nil)
 
+  atest("a transfer in to another device of the same host replaces an aborted attempt at once"):
+    given ExecutionContext = executionContext
+
+    val hostRoot = newHostDir()
+    writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    val deviceDirB = writeDevice(hostRoot, "dev1", net.thirdDeviceId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    val store = StoreId(PoolId.BootstrapPoolId, 1)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(store, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(startTransferSent(transfers, store, 1))
+
+      // Aborted and retried to the host's other device. Only the new destination is checked, as
+      // when its nudge arrives ahead of the first device's poll.
+      _ <- client.abortStoreTransfer(store)
+      _ <- client.transferStore(store, net.thirdDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyHandleHostMessage(
+            CheckStorageDevice(HostId.BootstrapHostId, client.clientId, net.thirdDeviceId))
+      _ <- pumpUntil(startTransferSent(transfers, store, 2))
+    yield
+      startTransferSent(transfers, store, 2) should be(true)
+      transfers.cancelledTransfersIn.map(_._1) should be(Vector(store))
+      transfers.transfersIn.last._3 should be(deviceDirB / "transferring-in")
+
   atest("an abandon during the retry delay cancels the retry and the staged copy"):
     given ExecutionContext = executionContext
 
@@ -1533,6 +1565,28 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       // Loaded only once the pool names this device, and the marker goes with it.
       host2.loadStoreByIdRequests.toList should be(List((net.secondDeviceId, t.movingStore)))
       os.exists(promoted / StoreTransfer.TransferredInMarkerFile) should be(false)
+
+  atest("a promoted copy left by a different transfer is discarded and the store shipped again"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = t.host.holdTransferOutcomes()
+      promoted = t.deviceDir / t.movingStore.directoryName
+      _ = t.transfers.finishTransferIn(t.movingStore)
+      _ <- pumpUntil(os.exists(promoted))
+      // As if the arrived copy came from an earlier transfer that was aborted: the current
+      // TransferringIn entry carries a different transfer id.
+      _ = os.write.over(promoted / StoreTransfer.TransferredInMarkerFile, java.util.UUID.randomUUID().toString)
+
+      transfers2 = new StagedTransferService
+      host2 = newHost(t.hostRoot, transferService = transfers2)
+      _ = host2.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers2.transfersIn.nonEmpty)
+    yield
+      transfers2.transfersIn.size should be(1)
+      os.exists(promoted) should be(false)
+      host2.transferOutcomes.get(t.movingStore) should be(None)
 
   atest("a store carrying the transferred-in marker is not loaded at startup"):
     // A real Host rather than RecordingHost, whose tryLoadStore records every candidate and

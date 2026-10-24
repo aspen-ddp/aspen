@@ -37,8 +37,12 @@ object StorageDeviceState:
   enum StoreStatus:
     case Initializing, Active, TransferringIn, TransferringOut, Rebuilding
 
+  /** `transferId` identifies one logical transfer and is shared by the source's TransferringOut
+   *  and the destination's TransferringIn entries. It is carried in the on-disk transfer markers
+   *  so a copy left behind by an earlier, aborted transfer is never mistaken for this one's. */
   case class StoreEntry(status: StoreStatus,
-                        transferDevice: Option[StorageDeviceId])
+                        transferDevice: Option[StorageDeviceId],
+                        transferId: Option[UUID] = None)
 
 
 case class StorageDeviceState(storageDeviceId: StorageDeviceId,

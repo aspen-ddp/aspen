@@ -1386,13 +1386,15 @@ object Codec extends Logging:
   def encode(o: StorageDeviceState.StoreEntry): codec.StorageDeviceStoreEntry =
     codec.StorageDeviceStoreEntry(
       status = encodeStorageDeviceStoreStatus(o.status),
-      transferDevice = o.transferDevice.map(encode)
+      transferDevice = o.transferDevice.map(encode),
+      transferId = o.transferId.map(encodeUUID)
     )
 
   def decode(m: codec.StorageDeviceStoreEntry): StorageDeviceState.StoreEntry =
     val status = decodeStorageDeviceStoreStatus(m.status)
     val transferDevice = m.transferDevice.map(decode)
-    StorageDeviceState.StoreEntry(status, transferDevice)
+    val transferId = m.transferId.map(decodeUUID)
+    StorageDeviceState.StoreEntry(status, transferDevice, transferId)
 
 
   def encode(o: StorageDeviceState): codec.StorageDeviceState =

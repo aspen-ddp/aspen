@@ -734,7 +734,8 @@ class Host(val client: AspenClient,
                                       transferUUID: UUID,
                                       fromHostId: HostId,
                                       fromDeviceId: StorageDeviceId,
-                                      toDeviceid: StorageDeviceId): Unit = synchronized {
+                                      toDeviceid: StorageDeviceId,
+                                      transferId: Option[UUID]): Unit = synchronized {
     def current: Boolean =
       transferInRetries.contains(storeId) && transferringIn.get(storeId).contains(transferUUID)
 
@@ -746,7 +747,8 @@ class Host(val client: AspenClient,
           case Success(state) =>
             state.stores.get(storeId).exists: entry =>
               entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
-              entry.transferDevice.contains(fromDeviceId)
+              entry.transferDevice.contains(fromDeviceId) &&
+              entry.transferId == transferId
           case Failure(t) =>
             // No worse than restarting blind: an abandoned attempt's restart is cancelled again
             // once the abandon commits.
@@ -754,7 +756,7 @@ class Host(val client: AspenClient,
                         s"store $storeId. Retrying anyway. Error: $t")
             true
         if stillWanted then
-          startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid)
+          startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid, transferId)
         else
           logger.info(s"Not retrying the transfer in of store $storeId: device $toDeviceid no " +
                       s"longer records it as transferring in from device $fromDeviceId")
@@ -881,13 +883,30 @@ class Host(val client: AspenClient,
   private def startStoreTransferIn(storeId: StoreId,
                                    fromHostId: HostId,
                                    fromDeviceId: StorageDeviceId,
-                                   toDeviceid: StorageDeviceId): Unit = synchronized {
+                                   toDeviceid: StorageDeviceId,
+                                   transferId: Option[UUID]): Unit = synchronized {
     require(fromDeviceId != toDeviceid)
 
     if ! transferringIn.contains(storeId) then
       storageDevices.get(toDeviceid).foreach: toDevice =>
         val devicePath = toDevice.devicePath
         val finalPath = devicePath / storeId.directoryName
+
+        // A promoted copy belongs to the transfer whose id its marker records. One left by an
+        // earlier transfer that was aborted or given up on predates whatever the source has
+        // accepted since, so resuming it would install stale data. Discard it and start over.
+        val promotedMarker = finalPath / StoreTransfer.TransferredInMarkerFile
+        if os.exists(promotedMarker) then
+          val markerId = try os.read(promotedMarker).trim catch case _: Throwable => ""
+          if !transferId.exists(_.toString == markerId) then
+            logger.warn(s"Discarding the arrived copy of store $storeId on device $toDeviceid: it " +
+                        s"belongs to transfer '$markerId', not to the current transfer $transferId")
+            try
+              os.remove.all(finalPath)
+              offlineStores -= storeId
+              toDevice.offlineStores -= storeId
+            catch case t: Throwable =>
+              logger.error(s"Failed to remove the stale arrived copy of store $storeId at $finalPath: $t")
 
         // A copy promoted by an earlier attempt -- normally one that crashed before its metadata
         // step finished -- needs no bytes, only that step.
@@ -958,7 +977,8 @@ class Host(val client: AspenClient,
                   val marker = stagedPath / StoreTransfer.TransferOutMarkerFile
                   if os.exists(marker) then
                     os.remove(marker)
-                  os.write.over(stagedPath / StoreTransfer.TransferredInMarkerFile, "")
+                  os.write.over(stagedPath / StoreTransfer.TransferredInMarkerFile,
+                                transferId.map(_.toString).getOrElse(""))
                   os.move(stagedPath, finalPath)
                   true
                 catch
@@ -972,12 +992,12 @@ class Host(val client: AspenClient,
                 // no different from a transfer that failed in flight. The restart's extraction
                 // replaces the staged copy, and if the failure left a directory at finalPath the
                 // restart refuses with an error rather than retrying forever.
-                scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid)
+                scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid, transferId)
               else
                 recordTransferIn(storeId, transferUUID, fromDeviceId, toDeviceid)
             case Failure(_) =>
               stopRetransmitting()
-              scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid)
+              scheduleTransferInRetry(storeId, transferUUID, fromHostId, fromDeviceId, toDeviceid, transferId)
 
           val msg = StartStoreTransfer(
             fromHostId,
@@ -1060,7 +1080,8 @@ class Host(val client: AspenClient,
               try
                 // Written before archiving, so it travels with the store and keeps this copy
                 // offline across restarts until the transfer is resolved one way or the other.
-                os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
+                os.write.over(storePath / StoreTransfer.TransferOutMarkerFile,
+                              devEntry.transferId.map(_.toString).getOrElse(""))
                 storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
                   toHostState.address, toHostState.storeTransferPort, m.timestamp)
                 // The transfer may have been aborted after the reads above, and the abort's
@@ -1555,14 +1576,30 @@ class Host(val client: AspenClient,
       ).foreach: (storeId, fromDeviceId) =>
         dropAbandonedTransferIn(storeId, fromDeviceId, local.storageDeviceId)
 
+      // The same store can be re-targeted at another device of this host. transferringIn is keyed
+      // by store, so the earlier attempt would block the new one until its own device's next
+      // check noticed the abort. This device's entry is the newer word on who receives the store,
+      // so the other device's attempt is dropped here instead of a poll later.
+      val retargeted =
+        pendingStartTransfers.valuesIterator
+          .filter(_.toDeviceId != local.storageDeviceId)
+          .map(p => (p.msg.storeId, p.msg.fromDevice, p.toDeviceId)).toList ++
+        transferInRetries.iterator
+          .filter((_, r) => r.toDeviceId != local.storageDeviceId)
+          .map((storeId, r) => (storeId, r.fromDeviceId, r.toDeviceId)).toList
+      retargeted.filter((storeId, _, _) =>
+        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.TransferringIn)
+      ).foreach: (storeId, fromDeviceId, toDeviceId) =>
+        dropAbandonedTransferIn(storeId, fromDeviceId, toDeviceId)
+
       //----------------------
       // Transferring In Stores
       //
       remote.stores.filter { (storeId, entry) =>
         entry.status == StorageDeviceState.StoreStatus.TransferringIn
       }.map { (storeId, status) =>
-        (storeId, status.transferDevice)
-      }.toList.foreach: (storeId, ofromDeviceId) =>
+        (storeId, status.transferDevice, status.transferId)
+      }.toList.foreach: (storeId, ofromDeviceId, transferId) =>
         ofromDeviceId.foreach: fromDeviceId =>
           client.getStorageDeviceState(fromDeviceId).foreach: fromDevice =>
             if fromDevice.isFailed then
@@ -1574,7 +1611,7 @@ class Host(val client: AspenClient,
               // invisible to the rebalancer too.
               abandonTransferIn(local.storageDeviceId, storeId, fromDeviceId)
             else
-              startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId)
+              startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId, transferId)
 
       //----------------------
       // Rebuilding Stores

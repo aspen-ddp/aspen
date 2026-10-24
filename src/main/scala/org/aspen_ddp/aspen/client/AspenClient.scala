@@ -394,6 +394,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         if dstState.isFailed then
           throw DeviceFailed(destinationId)
 
+        // Fresh per attempt: only the committed attempt's id is ever recorded.
+        val transferId = UUID.randomUUID()
+
         srcState.stores.get(storeId) match
           case None => throw StoreNotActive(storeId)
           case Some(entry) =>
@@ -403,7 +406,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
             // Update Source Device
             val newSrcEntry = StorageDeviceState.StoreEntry(
               StorageDeviceState.StoreStatus.TransferringOut,
-              Some(destinationId)
+              Some(destinationId),
+              Some(transferId)
             )
             val newSrcStores = srcState.stores + (storeId -> newSrcEntry)
             val newSrcState = srcState.copy(stores = newSrcStores)
@@ -416,7 +420,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
             // Update Destination Device
             val newDstEntry = StorageDeviceState.StoreEntry(
               StorageDeviceState.StoreStatus.TransferringIn,
-              Some(sourceId)
+              Some(sourceId),
+              Some(transferId)
             )
             val newDstStores = dstState.stores + (storeId -> newDstEntry)
             val newDstState = dstState.copy(stores = newDstStores)
@@ -465,7 +470,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         srcKvos <- read(srcPtr)
         srcState = StorageDeviceState(srcKvos)
         outstanding = srcState.stores.get(storeId).collect:
-          case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dstId)) => dstId
+          case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dstId), _) => dstId
         dstRead <- outstanding match
           case None => Future.successful(None)
           case Some(dstId) =>

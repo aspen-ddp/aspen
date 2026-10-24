@@ -716,7 +716,7 @@ class ParallelMigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))
     yield
       val destinations = bootState.stores.values.collect:
-        case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dst)) => dst
+        case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dst), _) => dst
       .toList
       destinations.size should be(2)
       destinations.toSet should be(Set(net.secondDeviceId, net.thirdDeviceId))

@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
+import org.aspen_ddp.aspen.common.util.boundedSingleFlight
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, TaskStopped}
 import scribe.Logging
 
@@ -72,28 +73,45 @@ class SetRebalanceDurableTask(
   private val backoff = new TransferBackoff(() => System.currentTimeMillis(),
     SetRebalanceDurableTask.StartBackoffBase, SetRebalanceDurableTask.StartBackoffMax)
 
+  /** Single-flight guard shared by the poll and wake(). Two passes may overlap (maxInFlight 2) so
+   *  a wake-up arriving mid-pass is not lost, but a pileup is bounded. A pass handles its own
+   *  errors, so a failed Future or synchronous throw only releases the guard. */
+  private val guardedRun: () => Unit =
+    boundedSingleFlight(s"set-rebalance-task $setId", maxInFlight = 2)(processNext())
+
+  /** Every invocation, including one the guard drops, arms the next tick first. Arming at the
+   *  end of a pass instead loses the wakeup whenever a tick fires between that arming and the
+   *  guard's release: the tick is dropped and nothing is left to re-arm, so the task stalls
+   *  for good. */
+  private def run(): Unit =
+    scheduleRecheck()
+    guardedRun()
+
   // Begin driving immediately.
-  processNext()
+  run()
 
   /** External wake-up (e.g. a TransferComplete message arrived). */
-  def wake(): Unit = processNext()
+  def wake(): Unit = run()
 
   override protected def onStop(): Unit = synchronized:
     pollTask.cancel()
     if !promise.isCompleted then promise.failure(new TaskStopped)
 
   private def scheduleRecheck(): Unit = synchronized:
-    if !isStopped then
+    if !isStopped && !promise.isCompleted then
       pollTask.cancel()
       pollTask = client.backgroundTaskManager.schedule(pollPeriod):
-        processNext()
+        run()
 
   private def finishOk(): Unit = synchronized:
-    if !promise.isCompleted then promise.success(None)
+    if !promise.isCompleted then
+      pollTask.cancel()
+      promise.success(None)
 
-  private def processNext(): Unit =
+  private def processNext(): Future[Unit] =
     if isStopped then
       synchronized { if !promise.isCompleted then promise.failure(new TaskStopped) }
+      Future.unit
     else
       val f = client.getStorageDeviceSetState(setId).flatMap: setState =>
         val pending = setState.pendingTransfers
@@ -102,20 +120,19 @@ class SetRebalanceDurableTask(
           Future.unit
         else
           drive(pending)
-      f.failed.foreach: err =>
-        logger.warn(s"Rebalance set $setId: transient error, will retry: $err")
-        scheduleRecheck()
+      f.recover:
+        case err => logger.warn(s"Rebalance set $setId: transient error, will retry: $err")
 
   /** Given a non-empty pending list, either (a) finish an already-completed transfer by
    *  removing it, (b) drop a transfer whose pool has left planning state, or (c) go through
    *  every not-started transfer whose backoff allows it, replacing an unusable destination or
-   *  starting the transfer. In-flight transfers are simply waited for. Ends in scheduleRecheck()
-   *  unless it re-enters processNext(). */
+   *  starting the transfer. In-flight transfers are simply waited for. Re-enters processNext()
+   *  after a removal; the poll was already armed by run(). */
   private def drive(pending: List[Transfer]): Future[Unit] =
     Future.traverse(pending)(t => SetRebalanceDurableTask.classify(client, t).map(t -> _)).flatMap: classified =>
       classified.collectFirst { case (t, Phase.Completed) => t } match
         case Some(t) =>
-          removePending(t).map(_ => processNext())
+          removePending(t).flatMap(_ => processNext())
         case None =>
           client.getStorageDeviceSetState(setId).flatMap: setState =>
             State.getStateForRebalancePlanning(client, setState).flatMap: planningState =>
@@ -131,14 +148,14 @@ class SetRebalanceDurableTask(
                 case Some(t) =>
                   logger.info(s"Rebalance set $setId: dropping transfer for ${t._1}; " +
                     s"its pool is no longer in planning state")
-                  removePending(t).map(_ => processNext())
+                  removePending(t).flatMap(_ => processNext())
 
                 case None =>
                   // Sequential, not parallel: each start re-reads the pool's state, so it sees
                   // the transfers this pass has already started.
                   notStarted.foldLeft(Future.unit): (prev, t) =>
                     prev.flatMap(_ => advance(t, setState, planningState))
-                  .map(_ => scheduleRecheck())
+                  .map(_ => ())
 
   /** Make progress on one not-started transfer: replace its destination if that is no longer
    *  usable, otherwise try to start it. Never fails; errors are logged and retried by the poll. */

@@ -1,19 +1,4 @@
 Follow-ups from parallel store transfers
-  1. SetRebalanceDurableTask passes can overlap (wake() plus the poll, no single-flight
-     guard). Add boundedSingleFlight (maxInFlight 2, arm the poll at pass start).
-     MigratePoolToSetDurableTask lost its end-of-pass wakeup because its guard dropped a
-     tick that fired before the pass released (fixed: run() now arms the poll on every call). SetRebalanceDurableTask does NOT have
-     that race today, since with no guard no tick is ever dropped and every pass ends in
-     scheduleRecheck, a re-entry, or finish. Adding the guard here WOULD introduce it, so
-     arm the poll at the start of every call (as the migration task's run() does) in the
-     same change. finishOk also should cancel pollTask, as the migration task's now does
-  2. Stale resume of a promoted aborted copy: after a crash or StopRetrying, a re-transfer
-     to the same destination resumes the old marked copy (Host.startStoreTransferIn's
-     resume path). Carry the transfer UUID in the device entry, or discard a marked
-     finalPath whose entry is absent
-  3. A retry to a different device on the same host waits up to one device poll. Drop
-     tracked attempts for a store this device's remote records TransferringIn from a
-     different toDeviceId
   4. AspenClient.abortStoreTransfer nudges the destination host even when the entry was not
      ours or the destination is tombstoned; no test for the 'already completed' no-op nudge
   5. TransferStarter: a failed Future from start is ambiguous (document it); RolledBack is

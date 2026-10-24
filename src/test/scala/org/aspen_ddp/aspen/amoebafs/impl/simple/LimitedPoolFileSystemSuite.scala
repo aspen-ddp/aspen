@@ -55,3 +55,18 @@ class LimitedPoolFileSystemSuite extends FilesSystemTestSuite:
     yield
       subContents.map(_.name).toSet should be (Set("nested", "file"))
       readBack should be (data)
+
+  atest("a file using the default segment size can be written past the pool's maxObjectSize"):
+    val data = Array.tabulate[Byte](10000)(i => (i % 251).toByte)
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      filePtr <- mkfile(rootDir, "default-segments")
+      (inode, _, revision) <- fs.readInode(filePtr)
+      // No explicit segment size: the file system's default must be fitted to the pool
+      file = new SimpleFile(filePtr, revision, inode.asInstanceOf[FileInode], fs)
+      _ <- writeAll(file, 0, List(DataBuffer(data)))
+      _ <- waitForTransactionsToComplete()
+      readBack <- file.debugReadFully()
+    yield
+      readBack should be (data)

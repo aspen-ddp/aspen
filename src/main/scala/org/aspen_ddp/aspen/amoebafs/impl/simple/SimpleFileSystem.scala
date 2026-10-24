@@ -21,6 +21,9 @@ object SimpleFileSystem {
   private val TaskExecutorRootKey  = Key(2)
   private val InodeTableRootKey    = Key(3)
 
+  /** Segment size used when the segment allocator's pool allows it (see defaultSegmentSize) */
+  val PreferredSegmentSize: Int = 4 * 1024 * 1024
+
   /** Create a new filesystem and register it under `fsName`.
    *
    *  Returns the new filesystem's UUID and the pointer to its root object. The name is
@@ -136,7 +139,10 @@ class SimpleFileSystem(aclient: AspenClient,
 
   override def shutdown(): Unit = ()
 
-  def defaultSegmentSize: Int = 4 * 1024 * 1024
+  /** 4 MiB, or the segment allocator's maxObjectSize when that is smaller, so a full segment always fits in one
+    * object of the pool it is allocated from
+    */
+  def defaultSegmentSize: Int = NodeAllocator.fittingNodeSize(PreferredSegmentSize, defaultAllocator.maxObjectSize)
   def defaultFileIndexNodeSize(iter: Int): Int = 1024*1024
 
   override protected val fileFactory: FileFactory = new SimpleFileFactory(writeBufferSize)

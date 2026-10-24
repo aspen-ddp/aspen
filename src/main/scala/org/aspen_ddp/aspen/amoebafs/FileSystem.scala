@@ -158,6 +158,9 @@ trait FileSystem extends Logging {
   def openFileHandle(file: File): FileHandle
   def closeFileHandle(fh: FileHandle): Unit
 
+  /** Size of the data objects holding a file's content when the file does not choose its own. Implementations must
+    * keep it at or below the segment allocator's maxObjectSize, or writes that fill a segment fail.
+    */
   def defaultSegmentSize: Int
   def defaultFileIndexNodeSize(iter: Int): Int
 

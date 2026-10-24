@@ -308,7 +308,9 @@ object Main {
     import p.*
     opt[Int]("cell-size").valueName("<bytes>").
       text(s"Cell size for appending-reed-solomon (default: ${AppendingReedSolomon.DefaultCellSize})").
-      validate(x => if x >= 8 then success else failure(s"--cell-size must be at least 8 bytes, got $x")).
+      validate(x =>
+        if x >= AppendingReedSolomon.TrailerSize && x <= AppendingReedSolomon.MaxCellSize then success
+        else failure(s"--cell-size must be between ${AppendingReedSolomon.TrailerSize} and ${AppendingReedSolomon.MaxCellSize} bytes, got $x")).
       action((x, c) => c.copy(cellSize = x))
 
   /** Shared by every argument that names an entity by UUID. The message varies because the

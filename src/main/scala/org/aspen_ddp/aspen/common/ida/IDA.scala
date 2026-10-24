@@ -12,8 +12,6 @@ object IDA {
   val ReedSolomonCode: Byte = 1
   val AppendingReedSolomonCode: Byte = 2
 
-  val EncodedIDASize: Int = 4
-
   /** Deserializes the IDA type and returns the matching IDA instance */
   def deserializeIDAType(bb: ByteBuffer): IDA = {
     val typeCode = bb.get()
@@ -35,7 +33,7 @@ object IDA {
         val width = bb.get()
         val readThreshold = bb.get()
         val writeThreshold = bb.get()
-        val cellSize = bb.getInt()
+        val cellSize = bb.getShort() & 0xFFFF
         AppendingReedSolomon(width, readThreshold, writeThreshold, cellSize)
 
       case _ => throw new IDAEncodingError
@@ -440,6 +438,9 @@ object AppendingReedSolomon:
 
   val DefaultCellSize: Int = 64
 
+  /** The cell size is serialized as an unsigned 16-bit value */
+  val MaxCellSize: Int = 0xFFFF
+
   /** Big-endian logical length stored in the last 8 bytes of the final row */
   val TrailerSize: Int = 8
 
@@ -472,6 +473,8 @@ case class AppendingReedSolomon(
     s"Appending Reed-Solomon writeThreshold ($writeThreshold) must fall within [$restoreThreshold, $width]")
   require(cellSize >= AppendingReedSolomon.TrailerSize,
     s"Appending Reed-Solomon cellSize ($cellSize) must be at least ${AppendingReedSolomon.TrailerSize}")
+  require(cellSize <= AppendingReedSolomon.MaxCellSize,
+    s"Appending Reed-Solomon cellSize ($cellSize) may not exceed ${AppendingReedSolomon.MaxCellSize}")
 
   def name: String = "appending-reed-solomon"
 
@@ -671,11 +674,11 @@ case class AppendingReedSolomon(
       gather(shards, firstRow, rows, arr, logicalOffset)
       RestoredRange(logicalOffset, arr, None)
 
-  def getSerializedIDATypeLength: Int = 8 // <type><width><restoreThreshold><writeThreshold><cellSize:4>
+  def getSerializedIDATypeLength: Int = 6 // <type><width><restoreThreshold><writeThreshold><cellSize:2>
 
   def serializeIDAType(bb: ByteBuffer): Unit =
     bb.put(IDA.AppendingReedSolomonCode)
     bb.put(width.toByte)
     bb.put(restoreThreshold.toByte)
     bb.put(writeThreshold.toByte)
-    bb.putInt(cellSize)
+    bb.putShort(cellSize.toShort)

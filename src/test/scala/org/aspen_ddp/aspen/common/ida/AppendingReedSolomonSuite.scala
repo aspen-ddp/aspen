@@ -29,6 +29,7 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
 
   test("construction rejects invalid parameters") {
     an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(5, 3, 4, 7)
+    an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(5, 3, 4, AppendingReedSolomon.MaxCellSize + 1)
     an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(5, 0, 4, 8)
     an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(3, 4, 4, 8)
     an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(128, 3, 4, 8)
@@ -128,11 +129,12 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
   }
 
   test("serializeIDAType round trips including cellSize") {
-    for ida <- List(AppendingReedSolomon(5, 3, 4, 64), AppendingReedSolomon(3, 2, 3, 4096)) do
+    for ida <- List(AppendingReedSolomon(5, 3, 4, 64), AppendingReedSolomon(3, 2, 3, 4096),
+      AppendingReedSolomon(3, 2, 3, AppendingReedSolomon.MaxCellSize)) do
       val bb = ByteBuffer.allocate(ida.getSerializedIDATypeLength)
-      ida.getSerializedIDATypeLength should be (8)
+      ida.getSerializedIDATypeLength should be (6)
       ida.serializeIDAType(bb)
-      bb.position() should be (8)
+      bb.position() should be (6)
       bb.flip()
       IDA.deserializeIDAType(bb) should be (ida)
   }

@@ -95,7 +95,7 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
   test("the IDA type round trips through serialization"):
     val ida = ReedSolomon(5, 3, 4)
 
-    ida.getSerializedIDATypeLength should be(IDA.EncodedIDASize)
+    ida.getSerializedIDATypeLength should be(4)
 
     val bb = ByteBuffer.allocate(ida.getSerializedIDATypeLength)
     ida.serializeIDAType(bb)

@@ -23,6 +23,12 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
     * width, so no other change is needed to run a suite against a wider pool. */
   def testIda: IDA = Replication(3, 2)
 
+  /** Override to give the bootstrap pool a maxSliceSize. */
+  def testPoolMaxSliceSize: Option[Int] = None
+
+  /** Override to give every store an effective slice size limit (what Host derives from the store config file). */
+  def testStoreMaxSliceSize: Option[Long] = None
+
   def subFixtureSetup(): Unit = {}
   def subFixtureTeardown(): Unit = ()
 
@@ -34,7 +40,7 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   }
 
   override def withFixture(test: NoArgAsyncTest): FutureOutcome = {
-    net = new TestNetwork(executionContext, userTypeFactories, testIda)
+    net = new TestNetwork(executionContext, userTypeFactories, testIda, testPoolMaxSliceSize, testStoreMaxSliceSize)
     client = net.client
     testName = test.name
     radicle = net.radicle

@@ -33,7 +33,7 @@ class Store(val storageDeviceId: StorageDeviceId,
             val maxSliceSize: Option[Long]) extends Logging {
 
   val storeId: StoreId = backend.storeId
-  val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache)
+  val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize)
 
   private var transactionDrivers: Map[TransactionId, TransactionDriver] = Map()
   

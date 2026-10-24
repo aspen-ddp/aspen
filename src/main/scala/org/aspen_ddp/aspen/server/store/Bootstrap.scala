@@ -22,12 +22,16 @@ import org.aspen_ddp.aspen.compute.systemtask.SystemTaskExecutorService
 
 object Bootstrap:
 
+  /** @param maxSliceSize the bootstrap pool's maxSliceSize (see StoragePoolState). The stores' own limits come from
+    *                     their store config files and are not set here.
+    */
   def initialize(aspenSystemId: UUID,
                  ida: IDA,
                  bootstrapHostState: HostState,
                  bootstrapStorageDeviceState: StorageDeviceState,
                  stores: List[Backend],
-                 ca: CertificateAuthority): KeyValueObjectPointer = {
+                 ca: CertificateAuthority,
+                 maxSliceSize: Option[Int] = None): KeyValueObjectPointer = {
 
     require( ida.width == stores.length )
 
@@ -113,7 +117,7 @@ object Bootstrap:
       PoolId.BootstrapPoolId,
       PoolId.BootstrapPoolName,
       ida,
-      None,
+      maxSliceSize,
       storeEntrys,
       RocksDBConfig(),
       StorageDeviceSetId.BootstrapStorageDeviceSetId).encode()

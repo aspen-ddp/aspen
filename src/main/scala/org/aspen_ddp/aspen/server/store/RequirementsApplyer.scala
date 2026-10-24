@@ -27,10 +27,12 @@ object RequirementsApplyer extends Logging {
             timestamp: HLCTimestamp,
             requirements: List[TransactionRequirement],
             objects: Map[ObjectId, ObjectState],
-            objectUpdates: Map[ObjectId, DataBuffer]): Result = {
+            objectUpdates: Map[ObjectId, DataBuffer],
+            maxSliceSize: Option[Long] = None): Result = {
 
     // Get a list of all objects that are unfit for accepting the changes in this transaction
-    val skippedObjects = RequirementsChecker.check(transactionId, timestamp, requirements, objects, objectUpdates)._1.keySet
+    val skippedObjects = RequirementsChecker.check(transactionId, timestamp, requirements, objects, objectUpdates,
+      maxSliceSize)._1.keySet
 
     var failedObjects: Set[ObjectId] = Set()
 

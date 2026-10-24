@@ -1,11 +1,13 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.ida.AppendDelta
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRefcount, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import scribe.Logging
+
+import scala.language.implicitConversions
 
 object RequirementsChecker extends Logging {
 
@@ -13,13 +15,15 @@ object RequirementsChecker extends Logging {
   case class NonObjectErr(err: RequirementError) extends Exception
 
   /**
+    * @param maxSliceSize The store's effective slice size limit. None disables the size check. See checkSliceSize.
     * @return Tuple of object specific errors and a list of non-object errors
     */
   def check(transactionId: TransactionId,
             txTimestamp: HLCTimestamp,
             requirements: List[TransactionRequirement],
             objects: Map[ObjectId, ObjectState],
-            objectUpdates: Map[ObjectId, DataBuffer]):
+            objectUpdates: Map[ObjectId, DataBuffer],
+            maxSliceSize: Option[Long] = None):
   (Map[ObjectId, RequirementError], List[RequirementError]) = {
 
     def getState(oid: ObjectId): ObjectState = {
@@ -61,12 +65,32 @@ object RequirementsChecker extends Logging {
               if !matches then
                 throw ObjectErr(r.objectPointer.id, AppendMismatch())
 
+            maxSliceSize.foreach { limit =>
+              val update = objectUpdates(r.objectPointer.id)
+              val newSize = r.operation match
+                case DataUpdateOperation.Overwrite => update.size.toLong
+                // The delta matched the current slice above, so applying it yields exactly newSliceLength bytes
+                case DataUpdateOperation.Append | DataUpdateOperation.WriteRange =>
+                  AppendDelta.decode(update).newSliceLength.toLong
+              checkSliceSize(r.objectPointer.id, state.data.size.toLong, newSize, limit)
+            }
+
           case r: KeyValueUpdate =>
-            checkKVRequirements(getState(r.objectPointer.id), transactionId, r.requiredRevision,
+            val state = getState(r.objectPointer.id)
+            checkKVRequirements(state, transactionId, r.requiredRevision,
               txTimestamp, r.contentLock, r.requirements)
 
             if (!objectUpdates.contains(r.objectPointer.id))
               throw ObjectErr(r.objectPointer.id, MissingObjectUpdate())
+
+            // checkKVRequirements guarantees kvState is defined. The measure is the serialized KVObjectState,
+            // which is what the store persists for the object (RequirementsApplyer sets data = kvs.encode()).
+            maxSliceSize.foreach { limit =>
+              val kvs = state.kvState.get
+              val ops = KeyValueOperation.decode(objectUpdates(r.objectPointer.id), ObjectRevision(transactionId),
+                txTimestamp)
+              checkSliceSize(r.objectPointer.id, kvs.encodedSize.toLong, kvs.encodedSizeAfter(ops).toLong, limit)
+            }
 
           case r: RefcountUpdate => checkRefcount(getState(r.objectPointer.id), r.requiredRefcount)
 
@@ -99,6 +123,14 @@ object RequirementsChecker extends Logging {
 
     (objectErrors, nonObjectErrors)
   }
+
+  /** Rejects an update whose resulting slice exceeds the limit, unless it is no larger than the current slice.
+    * Allowing non-growing updates means an object that is already oversized (e.g. created before the limit
+    * applied) can always be shrunk or deleted.
+    */
+  def checkSliceSize(objectId: ObjectId, currentSize: Long, newSize: Long, maxSliceSize: Long): Unit =
+    if newSize > maxSliceSize && newSize > currentSize then
+      throw ObjectErr(objectId, SliceSizeExceeded(newSize, maxSliceSize))
 
   def checkLocalTime(tsReq: LocalTimeRequirement): Unit = {
     val now = HLCTimestamp.now

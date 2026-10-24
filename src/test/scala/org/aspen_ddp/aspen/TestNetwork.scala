@@ -90,7 +90,9 @@ object TestNetwork {
 
 class TestNetwork(executionContext: ExecutionContext,
                   userTypeFactories: List[RegisteredTypeFactory] = Nil,
-                  val ida: IDA = Replication(3, 2)) extends ServerMessenger {
+                  val ida: IDA = Replication(3, 2),
+                  poolMaxSliceSize: Option[Int] = None,
+                  storeMaxSliceSize: Option[Long] = None) extends ServerMessenger {
   import TestNetwork._
 
   /** A new cache on each call. A HostObjectCache must not be shared between Hosts */
@@ -132,7 +134,8 @@ class TestNetwork(executionContext: ExecutionContext,
     bootstrapHost,
     bootstrapSD,
     stores,
-    TestTLS.ca)
+    TestTLS.ca,
+    poolMaxSliceSize)
 
   // All transactions will miss the third store. Don't wait long before updating the
   // error tree
@@ -187,7 +190,8 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(5, SECONDS),
     Duration(60, SECONDS))
 
-  stores.foreach(s => smgr.loadStore(storageDeviceId, s, None))
+  // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
+  stores.foreach(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))
 
   // ---- Rebalancing test helpers -------------------------------------------------
 

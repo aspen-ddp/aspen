@@ -5,7 +5,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueOperation, ObjectRevision, SetLeft, SetMax, SetMin, SetRight, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.Varint
 import scala.language.implicitConversions
@@ -24,6 +24,34 @@ class KVObjectState(
   def encode(): DataBuffer = {
     KVObjectState.encode(min, max, left, right, content)
   }
+
+  /** Size in bytes of encode(): the serialized slice this store holds for the object. Lock state is not counted */
+  def encodedSize: Int = KVObjectState.encodedSize(min, max, left, right, content)
+
+  /** encodedSize of the state that applying ops (as RequirementsApplyer does) would produce. This state is not
+    * modified. Every Insert counts the fixed 16-byte revision and 8-byte timestamp, so the transaction's actual
+    * revision and timestamp do not affect the result.
+    */
+  def encodedSizeAfter(ops: List[KeyValueOperation]): Int =
+    var nmin = min
+    var nmax = max
+    var nleft = left
+    var nright = right
+    var ncontent = content
+    ops.foreach {
+      case o: SetMin => nmin = Some(Key(o.value))
+      case o: SetMax => nmax = Some(Key(o.value))
+      case o: SetLeft => nleft = Some(Value(o.value))
+      case o: SetRight => nright = Some(Value(o.value))
+      case _: DeleteMin => nmin = None
+      case _: DeleteMax => nmax = None
+      case _: DeleteLeft => nleft = None
+      case _: DeleteRight => nright = None
+      case o: Insert =>
+        ncontent += (o.key -> new ValueState(Value(o.value), ObjectRevision.Null, HLCTimestamp.Zero, None))
+      case o: Delete => ncontent -= o.key
+    }
+    KVObjectState.encodedSize(nmin, nmax, nleft, nright, ncontent)
 }
 
 object KVObjectState {

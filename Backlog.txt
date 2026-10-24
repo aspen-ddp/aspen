@@ -1,14 +1,7 @@
-MigratePoolToSetSuite is flaky under the full test run
-  - Seen once in a full `sbt test`: "an aborted migration transfer is restarted toward a freshly
-    selected destination" failed, and the log showed it still running past 56 seconds. The same test
-    passes alone (`testOnly *MigratePoolToSetSuite`) and passed in the next two full runs, so it looks
-    timing- or load-dependent (the suites run in parallel inside sbt's JVM)
-  - Not yet known whether it predates the IDA threshold change; that change touched no migration code
-  - To do:
-      * reproduce (loop the full run, or the suite under CPU load) and capture the failure message
-      * find the race or the too-tight awaitUntil/driveUntilComplete deadline and fix the cause
-        rather than lengthening timeouts
-      * check the sibling tests in the suite that share the same abort/restart pattern
+QUIC tests are flaky under the full test run
+  - Seen while looping the full run (1 failure each in 12 runs): "a second host on a port in use
+    fails clearly and leaves nothing behind" and "end-to-end transaction over QUIC". Both pass
+    alone; not investigated
 
 A single stuck transfer start can freeze a pool migration or a set rebalance
   - Both MigratePoolToSetDurableTask (tryStores) and SetRebalanceDurableTask (advance,
@@ -44,7 +37,13 @@ A single stuck transfer start can freeze a pool migration or a set rebalance
 Follow-ups from parallel store transfers
   1. SetRebalanceDurableTask passes can overlap (wake() plus the poll, no single-flight
      guard). Add boundedSingleFlight (maxInFlight 2, arm the poll at pass start)
-     together with the stall decision in the entry above
+     together with the stall decision in the entry above. MigratePoolToSetDurableTask lost its
+     end-of-pass wakeup because its guard dropped a tick that fired before the pass released
+     (fixed: run() now arms the poll on every call). SetRebalanceDurableTask does NOT have
+     that race today, since with no guard no tick is ever dropped and every pass ends in
+     scheduleRecheck, a re-entry, or finish. Adding the guard here WOULD introduce it, so
+     arm the poll at the start of every call (as the migration task's run() does) in the
+     same change. finishOk also should cancel pollTask, as the migration task's now does
   2. Stale resume of a promoted aborted copy: after a crash or StopRetrying, a re-transfer
      to the same destination resumes the old marked copy (Host.startStoreTransferIn's
      resume path). Carry the transfer UUID in the device entry, or discard a marked

@@ -99,8 +99,16 @@ class MigratePoolToSetDurableTask(
    *  period of progress, so processNext should continue to handle its own errors. The remaining
    *  wedge mode is a Future that never completes: the guard reports it (see the pool id in the
    *  name) but cannot break it, because it cannot distinguish it from a slow pass. */
-  private val run: () => Unit =
+  private val guardedRun: () => Unit =
     boundedSingleFlight(s"migrate-pool-task ${poolId.uuid}")(processNext())
+
+  /** Every invocation, including one the guard drops, arms the next tick first. Arming at the
+   *  end of a pass instead loses the wakeup whenever a tick fires between that arming and the
+   *  guard's release: the tick is dropped and nothing is left to re-arm, so the task stalls
+   *  for good. */
+  private def run(): Unit =
+    scheduleRecheck()
+    guardedRun()
 
   // Begin driving immediately.
   run()
@@ -110,13 +118,15 @@ class MigratePoolToSetDurableTask(
     if !promise.isCompleted then promise.failure(new TaskStopped)
 
   private def scheduleRecheck(): Unit = synchronized:
-    if !isStopped then
+    if !isStopped && !promise.isCompleted then
       pollTask.cancel()
       pollTask = client.backgroundTaskManager.schedule(pollPeriod):
         run()
 
   private def finishOk(): Unit = synchronized:
-    if !promise.isCompleted then promise.success(None)
+    if !promise.isCompleted then
+      pollTask.cancel()
+      promise.success(None)
 
   private def processNext(): Future[Unit] =
     if isStopped then
@@ -124,15 +134,14 @@ class MigratePoolToSetDurableTask(
       Future.unit
     else
       // try/catch as well as recover so a synchronous throw out of driveMigration reaches the
-      // same handler as an async one, and gets the same scheduleRecheck. The single-flight
-      // guard releases either way now, but only this path re-arms the poll.
+      // same handler as an async one. The single-flight guard releases either way.
       val pass =
         try driveMigration()
         catch
           case err: Throwable => Future.failed(err)
 
       // transformWith to a constant Future.unit rather than recover: a `recover` body that
-      // itself threw (logger.warn, or pollTask.cancel() inside scheduleRecheck) would fail the
+      // itself threw (logger.warn) would fail the
       // returned future, and a failed future here is reported as a task failure by the guard
       // even though the pass was handled. Nothing below can throw or fail.
       pass.transformWith: outcome =>
@@ -140,7 +149,6 @@ class MigratePoolToSetDurableTask(
           outcome match
             case Failure(err) =>
               logger.warn(s"Pool migration ${poolId.uuid}: transient error, will retry: $err")
-              scheduleRecheck()
 
             case Success(_) => ()
         catch
@@ -214,7 +222,7 @@ class MigratePoolToSetDurableTask(
 
   /** Try to start a transfer for every candidate store, in poolIndex order. Sequential, not
    *  parallel: each start re-reads the pool's state, so it sees the transfers this pass has
-   *  already started. Never fails; ends in scheduleRecheck(). */
+   *  already started. Never fails. */
   private def tryStores(poolKvos: KeyValueObjectState,
                         poolState: StoragePoolState,
                         targetSet: StorageDeviceSetState,
@@ -227,7 +235,6 @@ class MigratePoolToSetDurableTask(
     // other device has room, selection still falls back to one of these.
     def attempt(candidates: List[Byte], exclude: Set[StorageDeviceId]): Future[Unit] = candidates match
       case Nil =>
-        scheduleRecheck()
         Future.unit
 
       case poolIndex :: tail =>
@@ -324,12 +331,9 @@ class MigratePoolToSetDurableTask(
 
       case Failure(_: MigrationSuperseded) =>
         // Retargeted or already complete. Re-drive rather than finish -- a retarget means there
-        // is more work. scheduleRecheck, not run(), because run()'s single-flight flag is still
-        // held by this very pass and the call would be dropped.
-        scheduleRecheck()
+        // is more work; the poll armed by run() picks it up.
         Future.unit
 
       case Failure(err) =>
         logger.warn(s"Pool migration ${poolId.uuid}: completion transaction failed: $err")
-        scheduleRecheck()
         Future.unit

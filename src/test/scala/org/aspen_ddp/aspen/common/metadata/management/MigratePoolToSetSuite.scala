@@ -545,8 +545,13 @@ class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       _ <- waitForTransactionsToComplete()
 
       _ <- client.abortStoreTransfer(s0)
-      _ <- awaitUntil("the store to be restarted toward the third device")(
-             statusOf(net.thirdDeviceId, s0).map(_.contains(StorageDeviceState.StoreStatus.TransferringIn)))
+      // Any store, not necessarily s0: a pass that read the in-flight set just before the abort
+      // skips s0 as still in flight and, with the abort landed, legitimately starts the next
+      // candidate instead.
+      _ <- awaitUntil("a store to be restarted toward the third device")(
+             client.getStorageDeviceState(net.thirdDeviceId).map: ds =>
+               ds.stores.exists((sid, e) => sid.poolId == poolId &&
+                 e.status == StorageDeviceState.StoreStatus.TransferringIn))
       onSecond <- statusOf(net.secondDeviceId, s0)
 
       _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))

@@ -104,6 +104,10 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decodedAppend = Codec.decode(Codec.encode(appendCase))
     decodedAppend.operation shouldBe DataUpdateOperation.Append
 
+    val writeRangeCase = DataUpdate(dataPtr(3), rev(4), DataUpdateOperation.WriteRange)
+    val decodedWriteRange = Codec.decode(Codec.encode(writeRangeCase))
+    decodedWriteRange.operation shouldBe DataUpdateOperation.WriteRange
+
   test("RefcountUpdate round-trip"):
     val original = RefcountUpdate(dataPtr(1), ObjectRefcount(1, 5), ObjectRefcount(2, 6))
     val decoded = Codec.decode(Codec.encode(original))

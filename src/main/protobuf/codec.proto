@@ -84,6 +84,7 @@ enum TransactionDisposition {
 enum DataUpdateOperation {
   DATA_UPDATE_OPERATION_APPEND = 0;
   DATA_UPDATE_OPERATION_OVERWRITE = 1;
+  DATA_UPDATE_OPERATION_WRITE_RANGE = 2;
 }
 
 enum KeyRequirement {

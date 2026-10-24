@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.common.ida.AppendingReedSolomon
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, AppendingReedSolomon, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -168,6 +168,36 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     val delta = ida.appendDeltas(content.length + 40, Array[Byte](1, 2, 3))(0)
 
     val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(DataUpdate(p1, rev1, DataUpdateOperation.Append)),
+      HashMap(oid1 -> o), HashMap(oid1 -> delta.encode))
+
+    assert(result.uncommittable == Set(oid1))
+    assert(o.metadata.revision == rev1)
+    assert(o.data.getByteArray sameElements slice.getByteArray)
+  }
+
+  test("WriteRange XORs a mid-slice delta without changing the length") {
+    val slice = DataBuffer(Array.tabulate[Byte](16)(_.toByte))
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, slice)
+    val delta = AppendDelta(16, 16, List(XorRegion(4, Array[Byte](1, 2, 3))), None)
+
+    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(DataUpdate(p1, rev1, DataUpdateOperation.WriteRange)),
+      HashMap(oid1 -> o), HashMap(oid1 -> delta.encode))
+
+    val expected = Array.tabulate[Byte](16)(_.toByte)
+    expected(4) = (expected(4) ^ 1).toByte
+    expected(5) = (expected(5) ^ 2).toByte
+    expected(6) = (expected(6) ^ 3).toByte
+    assert(result.uncommittable.isEmpty)
+    assert(o.metadata.revision == ObjectRevision(tx1))
+    assert(o.data.getByteArray sameElements expected)
+  }
+
+  test("a mismatched WriteRange leaves state untouched") {
+    val slice = DataBuffer(Array.tabulate[Byte](16)(_.toByte))
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, slice)
+    val delta = AppendDelta(24, 24, List(XorRegion(4, Array[Byte](1, 2, 3))), None)
+
+    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(DataUpdate(p1, rev1, DataUpdateOperation.WriteRange)),
       HashMap(oid1 -> o), HashMap(oid1 -> delta.encode))
 
     assert(result.uncommittable == Set(oid1))

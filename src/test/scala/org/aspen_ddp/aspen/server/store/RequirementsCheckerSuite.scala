@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, AppendingReedSolomon, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -93,10 +93,11 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     (slice, delta)
   }
 
-  private def checkAppend(slice: DataBuffer, payload: Option[DataBuffer], reqRev: ObjectRevision = rev1) = {
+  private def checkAppend(slice: DataBuffer, payload: Option[DataBuffer], reqRev: ObjectRevision = rev1,
+                          op: DataUpdateOperation.Value = DataUpdateOperation.Append) = {
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, slice)
     o.lockedToTransaction = Some(tx1)
-    val req = DataUpdate(p1, reqRev, DataUpdateOperation.Append)
+    val req = DataUpdate(p1, reqRev, op)
     val updates = payload.map(p => HashMap[ObjectId, DataBuffer](oid1 -> p)).getOrElse(HashMap[ObjectId, DataBuffer]())
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), updates)
   }
@@ -138,6 +139,29 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     val (slice, _) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1, 2, 3))
     val (oerrs, errs) = checkAppend(slice, Some(DataBuffer(Array[Byte](1, 2, 3))))
     assert(oerrs == Map(oid1 -> AppendMismatch()))
+    assert(errs.isEmpty)
+  }
+
+  test("WriteRange with a matching mid-slice delta passes") {
+    val (slice, _) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1))
+    val delta = AppendDelta(slice.size, slice.size, List(XorRegion(2, Array[Byte](5, 6))), None)
+    val (oerrs, errs) = checkAppend(slice, Some(delta.encode), op = DataUpdateOperation.WriteRange)
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  test("WriteRange whose expected slice length differs fails with AppendMismatch") {
+    val (slice, _) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1))
+    val delta = AppendDelta(slice.size + 8, slice.size + 8, List(XorRegion(2, Array[Byte](5, 6))), None)
+    val (oerrs, errs) = checkAppend(slice, Some(delta.encode), op = DataUpdateOperation.WriteRange)
+    assert(oerrs == Map(oid1 -> AppendMismatch()))
+    assert(errs.isEmpty)
+  }
+
+  test("WriteRange without an object update fails with MissingObjectUpdate") {
+    val (slice, _) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array[Byte](1))
+    val (oerrs, errs) = checkAppend(slice, None, op = DataUpdateOperation.WriteRange)
+    assert(oerrs == Map(oid1 -> MissingObjectUpdate()))
     assert(errs.isEmpty)
   }
 

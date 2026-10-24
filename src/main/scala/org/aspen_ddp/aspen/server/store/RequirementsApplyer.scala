@@ -54,7 +54,7 @@ object RequirementsApplyer extends Logging {
             r.operation match {
               case DataUpdateOperation.Overwrite => s.data = objectUpdates(ptr.id)
 
-              case DataUpdateOperation.Append =>
+              case DataUpdateOperation.Append | DataUpdateOperation.WriteRange =>
                 s.data = AppendDelta.decode(objectUpdates(ptr.id)).applyTo(s.data)
             }
 

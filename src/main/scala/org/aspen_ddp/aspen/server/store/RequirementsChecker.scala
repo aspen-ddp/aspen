@@ -51,7 +51,7 @@ object RequirementsChecker extends Logging {
             if (!objectUpdates.contains(r.objectPointer.id))
               throw ObjectErr(r.objectPointer.id, MissingObjectUpdate())
 
-            if r.operation == DataUpdateOperation.Append then
+            if r.operation == DataUpdateOperation.Append || r.operation == DataUpdateOperation.WriteRange then
               // A payload that cannot be decoded is a mismatch, not an unexpected failure
               val matches =
                 try

@@ -165,10 +165,12 @@ object Codec extends Logging:
   def encodeDataUpdateOperation(o: DataUpdateOperation.Value): codec.DataUpdateOperation = o match
     case DataUpdateOperation.Append => codec.DataUpdateOperation.DATA_UPDATE_OPERATION_APPEND
     case DataUpdateOperation.Overwrite => codec.DataUpdateOperation.DATA_UPDATE_OPERATION_OVERWRITE
+    case DataUpdateOperation.WriteRange => codec.DataUpdateOperation.DATA_UPDATE_OPERATION_WRITE_RANGE
 
   def decodeDataUpdateOperation(m: codec.DataUpdateOperation): DataUpdateOperation.Value = m match
     case codec.DataUpdateOperation.DATA_UPDATE_OPERATION_APPEND => DataUpdateOperation.Append
     case codec.DataUpdateOperation.DATA_UPDATE_OPERATION_OVERWRITE => DataUpdateOperation.Overwrite
+    case codec.DataUpdateOperation.DATA_UPDATE_OPERATION_WRITE_RANGE => DataUpdateOperation.WriteRange
     case codec.DataUpdateOperation.Unrecognized(v) => throw new EncodingError(f"Invalid DataUpdateOperation: $v")
 
 

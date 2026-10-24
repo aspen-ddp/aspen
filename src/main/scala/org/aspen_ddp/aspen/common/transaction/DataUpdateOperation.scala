@@ -18,6 +18,17 @@ object DataUpdateOperation extends Enumeration {
     */
   val Append: Value    = Value("Append")
 
+  /** Overwrites byte ranges of the object, possibly extending it, by applying a per-store delta to the
+    * store's slice.
+    *
+    * The payload and store-side handling are identical to Append: an encoded AppendDelta computed
+    * client-side through the pool's IDA (see IDA.rangedWriteDeltas), checked with AppendDelta.matches
+    * and applied with AppendDelta.applyTo. The delta may carry any number of XOR regions and may leave
+    * the slice length unchanged. A mismatch fails the requirement with AppendMismatch. Valid only
+    * under appendable IDAs (Replication and AppendingReedSolomon).
+    */
+  val WriteRange: Value = Value("WriteRange")
+
   /** Replaces the object's data with the update data */
   val Overwrite: Value = Value("Overwrite")
 }

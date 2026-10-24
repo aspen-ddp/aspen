@@ -109,9 +109,17 @@ read to complete before the transaction call. Requirements:
 
 - Add a `DataUpdateOperation` value (for example `WriteRange`), plus the matching proto enum value
   in `src/main/protobuf/codec.proto` and both mapping lines in `common/network/Codec.scala`.
-- Each store receives a per-store delta like `AppendDelta` does today. `AppendDelta` assumes the
-  XOR region ends exactly at the new slice length, which a mid-object edit violates. Either relax
-  it or introduce a new delta type with a versioned encoding. Builder's call.
+- Each store receives a per-store delta like `AppendDelta` does today. `AppendDelta` holds one
+  XOR region ending at the new slice length, which a mid-object edit violates. The delta must
+  become **multi-region (sparse)**: a list of (offset, bytes) regions, so distant edits never send
+  the bytes between them (decided: sending the span between distant writes defeats the feature).
+  Use a versioned encoding that still decodes the existing version-1 format.
+- **No alignment-expanded reads are needed.** Parity at a slice offset is a combination of the data
+  bytes at the same offset, and by linearity the parity delta depends only on the data deltas
+  (`old XOR new` at the edited bytes, zero elsewhere), never on the old contents of neighbouring
+  cells. So the client needs only the old bytes under each write plus the object length. For
+  AppendingReedSolomon a store's regions are the affected rows' cells (at most `cellSize` bytes per
+  affected row); for Replication they are exactly the edited bytes.
 - `RequirementsChecker` verifies the revision, that an update payload is present, and that the
   store's slice length (and trailer on the store holding it) matches what the client assumed.
   `RequirementsApplyer` applies it: zero-extend if growing, then XOR/overwrite. Both matches are
@@ -132,6 +140,6 @@ fetched-ranges state versus full-object state, Replication and ARS.
 ## Left to the builder
 
 - Names and exact types (`RangedWrite`, the state type, the helper, exceptions).
-- Delta format and encoding details.
+- Exact delta encoding details (multi-region is required).
 - Where the state-fetching helper lives.
 - Whether Replication applies XOR or direct overwrite.

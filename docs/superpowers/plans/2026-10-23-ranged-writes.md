@@ -4,7 +4,7 @@
 
 **Goal:** Let a transaction overwrite byte ranges of a DataObject in Replication and AppendingReedSolomon pools, sending only the changed bytes.
 
-**Architecture:** Same XOR-delta technique as append. The client computes, per store, a delta of `old XOR new` through the pool's IDA (Reed-Solomon is linear, so XORing the encoded delta into each slice yields the new object's slices). The caller supplies the old bytes up front as a typed `RangedWriteState`, obtained from the full object or from a client helper, so `Transaction` stays synchronous. Stores apply it with the existing `AppendDelta` machinery behind a new `DataUpdateOperation.WriteRange`.
+**Architecture:** Same XOR-delta technique as append. The client computes, per store, a delta of `old XOR new` through the pool's IDA (Reed-Solomon is linear, so XORing the encoded delta into each slice yields the new object's slices). The caller supplies the old bytes up front as a typed `RangedWriteState`, obtained from the full object or from a client helper, so `Transaction` stays synchronous. The delta is sparse: a list of XOR regions per store, so distant edits never send the bytes between them. Stores apply it with an extended `AppendDelta` behind a new `DataUpdateOperation.WriteRange`.
 
 **Tech Stack:** Scala 3, sbt, protobuf codec, Scaffeine/os-lib per CLAUDE.md. Follow the "quiet" Scala 3 syntax and indented if/then/else rules in `CLAUDE.md`.
 
@@ -21,9 +21,12 @@ All source paths below are relative to `src/main/scala/org/aspen_ddp/aspen/` and
 - `maxObjectSize` (on `StoragePoolState` / `StoragePool`) is enforced on the client at build time only; the resulting length may equal but not exceed it.
 - For AppendingReedSolomon keep the bound `newLength <= Int.MaxValue - rowBytes`.
 - All `Transaction` methods stay synchronous. No new backend operations.
+- Deltas are multi-region (sparse). Bytes between distant edits must not be sent. For AppendingReedSolomon the unit is the affected rows' cells per store (at most `cellSize` bytes per affected row per store, trimmed to the touched span where convenient); for Replication it is exactly the edited bytes.
+- No alignment-expanded old-data reads: parity deltas come from the data deltas alone (linearity), so only the old bytes under each write plus the object length are needed.
 
 ## Review Focus
 
+- Two far-apart edits: each store's delta contains no bytes from the untouched rows between them (assert on encoded delta size).
 - Mixed-revision fetch: the helper's parallel reads return different revisions. Expected: retry, then fail; never build a state whose old bytes belong to a different revision than the one claimed (that would silently corrupt parity).
 - Write starting exactly at the current length (`offset == length`) is an extension, not a gap: allowed with `zeroFill = false`.
 - Object of length 0 (bare allocation): first ranged write at offset 0 works in both IDAs.
@@ -32,20 +35,23 @@ All source paths below are relative to `src/main/scala/org/aspen_ddp/aspen/` and
 
 ---
 
-### Task 1: Allow mid-slice XOR regions in AppendDelta
+### Task 1: Multi-region AppendDelta
 
 **Files:**
-- Modify: `common/ida/AppendDelta.scala:21-27` (the `require`s)
+- Modify: `common/ida/AppendDelta.scala` (whole file)
 - Test: `common/ida/AppendDeltaSuite.scala`
 
 **Interfaces:**
-- Produces: `AppendDelta` accepts `xorOffset + xorBytes.length <= newSliceLength` (previously `==`). Wire format unchanged (version 1 stays valid; the relaxation only widens what encodes).
+- Produces: `final case class XorRegion(offset: Int, bytes: Array[Byte])` and `AppendDelta(expectedSliceLength: Int, newSliceLength: Int, regions: List[XorRegion], expectedTail: Option[Array[Byte]])`. Invariants (`require`): regions sorted by offset, non-overlapping, non-empty bytes, offsets `>= 0`, every region ends `<= newSliceLength`, `0 <= expectedSliceLength <= newSliceLength`, tail no longer than `expectedSliceLength`. A region may begin beyond `expectedSliceLength` (it lands in the zero-extended area).
+- Produces: a companion `AppendDelta.apply(expectedSliceLength, newSliceLength, xorOffset, xorBytes, expectedTail)` single-region overload so existing append callers (`Replication.appendDeltas`, `AppendingReedSolomon.appendDeltas`) and tests compile unchanged.
+- Wire format: encode as `FormatVersion = 2` (region count + per-region offset/length + bytes + tail). `decode` still accepts version 1 (becomes one region), so already-written CRL data and old tests keep working. Decode failures stay `IllegalArgumentException`.
+- `matches` and `applyTo` semantics unchanged apart from applying every region after zero-extending to `newSliceLength`.
 
-- [ ] **Step 1: Write failing tests** in `AppendDeltaSuite`: (a) `AppendDelta(8, 8, 2, Array[Byte](1,2), None)` constructs and `applyTo` XORs bytes 2..3 of an 8-byte slice leaving the rest and the length unchanged; (b) encode/decode round-trips it; (c) `xorOffset + length > newSliceLength` still throws `IllegalArgumentException`; (d) the existing tests still pass.
-- [ ] **Step 2:** Run `sbt 'testOnly *AppendDeltaSuite'`. Expected: (a)/(b) FAIL on the `require`.
-- [ ] **Step 3:** Change the third `require` to `xorOffset.toLong + xorBytes.length <= newSliceLength` and update its message and the class doc comment (the XOR region need not reach the end of the slice).
-- [ ] **Step 4:** Run the suite. Expected: PASS.
-- [ ] **Step 5:** Commit `Allow AppendDelta XOR regions that end before the slice end`.
+- [ ] **Step 1: Write failing tests:** (a) two regions at distant offsets with `newSliceLength == expectedSliceLength` XOR only those bytes in `applyTo`; (b) v2 encode/decode round trip, including a region starting beyond `expectedSliceLength`; (c) decoding a hand-built version 1 payload yields one region; (d) overlapping, unsorted, empty-region and region-beyond-`newSliceLength` inputs throw `IllegalArgumentException`; (e) all existing tests still pass.
+- [ ] **Step 2:** Run `sbt 'testOnly *AppendDeltaSuite'`. Expected: FAIL (compile).
+- [ ] **Step 3:** Implement per the Interfaces block. Update `equals`/`hashCode` for the region list and the class doc.
+- [ ] **Step 4:** Run `sbt 'testOnly *AppendDeltaSuite *RequirementsApplyerSuite *RequirementsCheckerSuite *AppendingReedSolomonSuite'`. Expected: PASS.
+- [ ] **Step 5:** Commit `Make AppendDelta multi-region`.
 
 ### Task 2: IDA ranged-write deltas
 
@@ -58,10 +64,10 @@ All source paths below are relative to `src/main/scala/org/aspen_ddp/aspen/` and
 - Produces: `final case class RangeEdit(offset: Int, newBytes: Array[Byte], oldBytes: Array[Byte])` where `oldBytes.length == max(0, min(newBytes.length, currentLength - offset))` (the overlap with existing content; empty beyond the end).
 - Produces: on `AppendableIDA`: `def rangedWriteDeltas(currentLength: Int, edits: List[RangeEdit]): Array[AppendDelta]` — one delta per encoding index. Preconditions (`require`): edits non-empty, sorted-or-not but non-overlapping, offsets `>= 0`, `offset <= currentLength` is NOT required (a gap is zero-filled implicitly because the extended slice region is already zero and the delta carries zeros there). New length is `max(currentLength, max(offset + newBytes.length))`.
 
-- [ ] **Step 1: Write failing tests.** Core property test for ARS (several `(k, nparity, cellSize)` combos including `cellSize` small like 4 so rows are tiny): for random object content and random edit sets (within a row, spanning rows, ending exactly on a row boundary, extending past the end, extending so the trailer moves to a new row, starting at `offset == length`, starting beyond length with a gap, `currentLength == 0`), assert `applyTo`-ing each delta (via `AppendDelta.decode(delta.encode)`) onto the slices of `encode(oldContent)` yields exactly the slices of `encode(expectedNewContent)` for every encoding index. Same property for `Replication`. Plus: deltas for a non-extending write have `newSliceLength == expectedSliceLength`.
+- [ ] **Step 1: Write failing tests.** Core property test for ARS (several `(k, nparity, cellSize)` combos including `cellSize` small like 4 so rows are tiny): for random object content and random edit sets (within a row, spanning rows, ending exactly on a row boundary, extending past the end, extending so the trailer moves to a new row, starting at `offset == length`, starting beyond length with a gap, `currentLength == 0`), assert `applyTo`-ing each delta (via `AppendDelta.decode(delta.encode)`) onto the slices of `encode(oldContent)` yields exactly the slices of `encode(expectedNewContent)` for every encoding index. Same property for `Replication`. Plus: deltas for a non-extending write have `newSliceLength == expectedSliceLength`; two edits many rows apart produce deltas whose encoded size is bounded by `affectedRows * cellSize + header` per store (no bytes from the rows between); Replication deltas carry exactly the edited bytes.
 - [ ] **Step 2:** Run `sbt 'testOnly *RangedWriteDeltaSuite *AppendingReedSolomonSuite'`. Expected: FAIL (method missing).
-- [ ] **Step 3: Implement `Replication.rangedWriteDeltas`:** one contiguous XOR region `[minOffset, newLength)` ... specifically `[minOffset, maxEnd)` where unedited bytes inside the region are zero in the stream; `expectedSliceLength = currentLength`, `newSliceLength = newLength`, no tail. Stream byte = `old ^ new` over overlap, `new` beyond `currentLength`.
-- [ ] **Step 4: Implement `AppendingReedSolomon.rangedWriteDeltas`** by generalising `appendDeltas` (lines 559-583), which should become a thin caller if that falls out naturally. Build the logical XOR stream over rows `startRow..endRow` (contiguous), where `startRow = min(minOffset / rowBytes, trailerRowOf(old length) if length changes)` and `endRow = newRows - 1` if the length changes else the row of the last edited byte. Place `old^new` bytes, `xorLong` the old and new trailer only when the length changes, `scatter` + `addParity`. Each store gets `AppendDelta(oldRows*cellSize, newRows*cellSize, startRow*cellSize, shards(i), tail = if i == k-1 then Some(oldTrailerBytes) else None)`. Keep the overflow `require`. Known v1 limit: one contiguous region per delta, so far-apart edits send the rows between them; accept it and note it in the scaladoc.
+- [ ] **Step 3: Implement `Replication.rangedWriteDeltas`:** one region per edit (merge regions that touch), `expectedSliceLength = currentLength`, `newSliceLength = newLength`, no tail. Region bytes are `old ^ new` over the overlap with existing content and `new` beyond `currentLength`. A gap between the old end and an edit needs no bytes (it is zero after extension).
+- [ ] **Step 4: Implement `AppendingReedSolomon.rangedWriteDeltas`** sparsely, row by row. Find the set of affected rows (rows containing an edited byte, plus the old and new trailer rows when the length changes). For each affected row build that row's `rowBytes` XOR stream (edits' `old ^ new`, `xorLong` of the old and new trailer where they fall), `scatter` + `addParity` it into `cellSize`-byte cells per encoding index, and give each store a `XorRegion(row * cellSize, cell)` (optionally trimmed to the nonzero span; a whole cell is fine). Merge regions that are adjacent in slice offset. Each store gets `AppendDelta(oldRows*cellSize, newRows*cellSize, regions, tail = if i == k-1 then Some(oldTrailerBytes) else None)` (the trailer tail is always sent for shard k-1; it is cheap and keeps the store-side length check). Rows between distant edits contribute nothing. Keep the overflow `require`. `appendDeltas` may be reimplemented on top of this if it falls out naturally, but its output must stay byte-for-byte compatible with the existing append tests.
 - [ ] **Step 5:** Run the suites. Expected: PASS, including existing append tests.
 - [ ] **Step 6:** Commit `Add rangedWriteDeltas to Replication and AppendingReedSolomon`.
 
@@ -72,7 +78,7 @@ All source paths below are relative to `src/main/scala/org/aspen_ddp/aspen/` and
 - Test: `common/network/CodecRoundTripSuite.scala` (~103, ~199), `server/store/RequirementsCheckerSuite.scala` (~90), `server/store/RequirementsApplyerSuite.scala` (~144)
 
 **Interfaces:**
-- Consumes: relaxed `AppendDelta` (Task 1).
+- Consumes: multi-region `AppendDelta` (Task 1).
 - Produces: `DataUpdateOperation.WriteRange`; stores treat it exactly like `Append` (decode `AppendDelta`, `matches`, `applyTo`), mismatch -> existing `AppendMismatch`.
 
 - [ ] **Step 1: Write failing tests:** codec round trip of `DataUpdate(ptr, rev, WriteRange)`; checker accepts a matching `WriteRange` payload and returns `AppendMismatch` for a wrong slice length and `MissingObjectUpdate` for no payload; applier applies a mid-slice delta (length unchanged) and leaves state untouched on mismatch.

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen
 
-import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, RangeReadNotSupported, Transaction}
+import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, RangeReadNotSupported, RangedWrite, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon}
@@ -232,6 +232,91 @@ trait AppendIntegrationTests:
       bytesShouldMatch(state.data.getByteArray, base ++ winner)
       succeed
 
+  atest("readRanges returns each range's bytes in request order"):
+    val rnd = new Random(7)
+    val R = rowBytes
+    val content = chunkOf(rnd, 3 * R + 17)
+    val L = content.length
+    // Unsorted, overlapping, row-crossing, past-the-end and empty ranges
+    val ranges = List((R + 3, 10), (0, 5), (R - 2, R + 4), (L - 4, 10), (L + 50, 7), (L, 3), (5, 0), (0, L))
+    for
+      dp <- allocateWith(1, content)
+      results <- client.readRanges(dp, ranges)
+    yield
+      results.length should be (ranges.length)
+      ranges.zip(results).foreach: (range, rs) =>
+        val (offset, length) = range
+        withClue(s"range $range: "):
+          rs.offset should be (offset)
+          val expected =
+            if offset >= L then Array[Byte]()
+            else content.slice(offset, math.min(offset + length, L))
+          bytesShouldMatch(rs.data.getByteArray, expected)
+      succeed
+
+  /** The content after applying non-overlapping writes, zero filling any gap past the end */
+  private def applyWrites(content: Array[Byte], writes: List[RangedWrite]): Array[Byte] =
+    val newLength = writes.map(_.end.toInt).foldLeft(content.length)(math.max)
+    val result = new Array[Byte](newLength)
+    System.arraycopy(content, 0, result, 0, content.length)
+    writes.foreach(w => System.arraycopy(w.data, 0, result, w.offset, w.data.length))
+    result
+
+  atest("readRangedWriteState feeds ranged writes that commit"):
+    val rnd = new Random(8)
+    val R = rowBytes
+    val content = chunkOf(rnd, 3 * R + 17)
+    val L = content.length
+    // Inside a row, across a row boundary, and extending past the end
+    val writes = List(RangedWrite(2, chunkOf(rnd, 3)), RangedWrite(R - 2, chunkOf(rnd, 5)),
+                      RangedWrite(L - 3, chunkOf(rnd, 10)))
+    for
+      dp <- allocateWith(1, content)
+      state <- client.readRangedWriteState(dp, writes)
+      tx = client.newTransaction()
+      _ = tx.rangedWrites(state, writes)
+      _ <- tx.commit()
+      after <- client.read(dp)
+      next <- client.readAppendPosition(dp)
+    yield
+      state.length should be (L)
+      bytesShouldMatch(after.data.getByteArray, applyWrites(content, writes))
+      next.length should be (L + 7)
+      succeed
+
+  atest("readRangedWriteState supports a zero filled write beyond the end"):
+    val rnd = new Random(9)
+    val content = chunkOf(rnd, 100)
+    val writes = List(RangedWrite(10, chunkOf(rnd, 4)), RangedWrite(130, chunkOf(rnd, 20)))
+    for
+      dp <- allocateWith(1, content)
+      state <- client.readRangedWriteState(dp, writes)
+      tx = client.newTransaction()
+      _ = tx.rangedWrites(state, writes, zeroFill = true)
+      _ <- tx.commit()
+      after <- client.read(dp)
+    yield
+      bytesShouldMatch(after.data.getByteArray, applyWrites(content, writes))
+      succeed
+
+  atest("a ranged write state made stale by a later commit aborts"):
+    val rnd = new Random(10)
+    val content = chunkOf(rnd, 100)
+    val writes = List(RangedWrite(10, chunkOf(rnd, 4)))
+    for
+      dp <- allocateWith(1, content)
+      state <- client.readRangedWriteState(dp, writes)
+      pos <- client.readAppendPosition(dp)
+      _ <- appendTo(pos, Array[Byte](1, 2, 3))
+      tx = client.newTransaction()
+      _ = tx.rangedWrites(state, writes)
+      committed <- tx.commit().map(_ => true).recover(_ => false)
+      after <- client.read(dp)
+    yield
+      committed should be (false)
+      bytesShouldMatch(after.data.getByteArray, content ++ Array[Byte](1, 2, 3))
+      succeed
+
   /** Host.repair queues its work for the harness's event pump, which must run on the test thread */
   private def pumpUntilComplete[T](f: Future[T]): Future[T] =
     if f.isCompleted then
@@ -341,6 +426,18 @@ class ClassicReedSolomonAppendRejectionSuite extends IntegrationTestSuite:
     yield
       r.exists(_.isInstanceOf[RangeReadNotSupported]) should be (true)
       r2.exists(_.isInstanceOf[RangeReadNotSupported]) should be (true)
+
+  atest("readRanges and readRangedWriteState fail with RangeReadNotSupported"):
+    for
+      dp <- allocate()
+      r <- client.readRanges(dp, List((0, 10), (20, 5))).map(_ => None).recover { case e => Some(e) }
+      r2 <- client.readRanges(dp, Nil).map(_ => None).recover { case e => Some(e) }
+      r3 <- client.readRangedWriteState(dp, List(RangedWrite(0, Array[Byte](1)))).map(_ => None)
+              .recover { case e => Some(e) }
+    yield
+      r.exists(_.isInstanceOf[RangeReadNotSupported]) should be (true)
+      r2.exists(_.isInstanceOf[RangeReadNotSupported]) should be (true)
+      r3.exists(_.isInstanceOf[RangeReadNotSupported]) should be (true)
 
   atest("committing an append fails with AppendNotSupported"):
     for

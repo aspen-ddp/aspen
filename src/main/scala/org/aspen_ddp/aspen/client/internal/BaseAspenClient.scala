@@ -161,6 +161,22 @@ abstract class BaseAspenClient(
     new DataObjectRangeState(state.pointer, state.revision, state.refcount, state.timestamp, state.readTimestamp,
       state.ida, offset, DataBuffer(trimmed), state.objectLength)
 
+  override def readRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)],
+                          comment: String): Future[List[DataObjectRangeState]] =
+    // Resolved up front so that an empty list still fails for an IDA without range reads
+    resolveAppendableIda(pointer).flatMap { _ =>
+      Future.sequence(ranges.map((offset, length) => readRange(pointer, offset, Some(length), comment)))
+    }
+
+  override def readRangedWriteState(pointer: DataObjectPointer, writes: List[RangedWrite],
+                                    comment: String): Future[RangedWriteState] =
+    RangedWriteFetch.fetch(pointer, writes) { () =>
+      // Started together: the length read and one range read per write form a single concurrent round
+      val position = readAppendPosition(pointer, comment)
+      val reads = readRanges(pointer, writes.map(w => (w.offset, w.data.length)), comment)
+      position.zip(reads)
+    }
+
   override def readAppendPosition(pointer: DataObjectPointer, comment: String): Future[AppendPosition] =
     resolveAppendableIda(pointer).flatMap { ida =>
       rmgr.read(pointer, ida, comment, readType = SliceTail(ida.lengthProbeBytes)).flatMap { os =>

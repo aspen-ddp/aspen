@@ -33,3 +33,7 @@ class CorruptedContent(pointer: ObjectPointer) extends CorruptedObject(pointer)
 sealed abstract class TransientReadError(msg: String) extends ReadError(msg)
 
 class ReadTimeout(val pointer: ObjectPointer) extends TransientReadError("ReadTimeout")
+
+/** Thrown when the reads behind a ranged write state kept observing different revisions of the object */
+class UnstableRangedWriteState(val pointer: ObjectPointer, val attempts: Int)
+  extends TransientReadError("UnstableRangedWriteState")

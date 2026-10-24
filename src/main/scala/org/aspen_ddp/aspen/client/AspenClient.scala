@@ -449,6 +449,57 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
     fStaged.map(sendBestEffortHostMessage)
 
+  /** Rolls back an outstanding transfer of `storeId`: the source entry goes back to Active with no
+   *  transfer device and the destination's TransferringIn entry is removed, in one transaction.
+   *
+   *  Succeeds and changes nothing when no transfer is outstanding -- the store is Active, or the
+   *  transfer already completed and the pool names the destination. Sends no host message: a host
+   *  that has begun moving bytes notices the withdrawn entries on its next device poll.
+   */
+  def abortStoreTransfer(storeId: StoreId): Future[Unit] =
+    given ExecutionContext = this.clientContext
+
+    def onFail(err: Throwable): Future[Unit] = err match
+      case e: NoSuchElementException => throw StopRetrying(e)
+      case e: DeviceFailed => throw StopRetrying(e)
+      // As in transferStore: an unlisted error must not MatchError out of onFail.
+      case _ => Future.unit
+
+    transactUntilSuccessfulWithRecovery(onFail): tx =>
+      given Transaction = tx
+
+      for
+        // Fresh pool state, not the cached one, for the same reason as in transferStore. After a
+        // completed transfer it names the destination, whose entry is Active: nothing to abort.
+        poolState <- getStoragePoolState(storeId.poolId)
+        sourceId = poolState.stores(storeId.poolIndex).storageDeviceId
+        srcPtr <- getStorageDevicePointer(sourceId)
+        srcKvos <- read(srcPtr)
+        srcState = StorageDeviceState(srcKvos)
+        outstanding = srcState.stores.get(storeId).collect:
+          case StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.TransferringOut, Some(dstId)) => dstId
+        dstRead <- outstanding match
+          case None => Future.successful(None)
+          case Some(dstId) =>
+            for
+              dstPtr <- getStorageDevicePointer(dstId)
+              dstKvos <- read(dstPtr)
+            yield Some((dstPtr, dstKvos))
+      yield
+        for
+          (dstPtr, dstKvos) <- dstRead
+        do
+          val newSrcState = srcState.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Active, None)
+          tx.update(srcPtr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey, newSrcState.encode())))
+
+          val dstState = StorageDeviceState(dstKvos)
+          val newDstState = dstState.removeStore(storeId)
+          tx.update(dstPtr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey, newDstState.encode())))
+
   def getBootstrapConfig(): Future[String] =
     given ExecutionContext = this.clientContext
 

@@ -1,6 +1,8 @@
 package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.{GroupObjectAllocatorId, ObjectAllocator}
+import org.aspen_ddp.aspen.client.internal.ObjectAllocatorManager
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
@@ -16,6 +18,7 @@ import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, System
 import org.aspen_ddp.aspen.compute.{ServiceEntry, TaskExecutor}
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.Duration
 
 class AllocationGroupStateSuite extends IntegrationTestSuite:
 
@@ -621,6 +624,65 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       val m = ags.members.find(_.uuid == poolId.uuid).get
       m.maxSliceSize should be(Some(1000))
       m.maxObjectSize should be(Some(1000))
+
+  // ---- group allocators compute maxObjectSize from live child group states ----
+
+  /** A level-1 parent holding an empty, unlimited level-0 child, then a 1000-byte pool added to the child */
+  private type BeforePoolAdded = (AllocationGroupId, AllocationGroupId) => Future[Unit]
+
+  private def nestedGroupWithLatePool(tag: String, beforePoolAdded: BeforePoolAdded = (_, _) => Future.unit)
+      : Future[(AllocationGroupId, AllocationGroupId)] =
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup(s"child-$tag", level = 0)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup(s"parent-$tag", level = 1)
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      _ <- beforePoolAdded(childId, parentId)
+      poolId <- createPool(s"pool-$tag", Some(1000))
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addPool(client, poolId, childId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+    yield (childId, parentId)
+
+  atest("a parent group's maxObjectSize reflects a pool added to its child after the child joined"):
+    given ExecutionContext = executionContext
+    for
+      (_, parentId) <- nestedGroupWithLatePool("late-pool")
+      parent <- readGroupState(parentId)
+      allocator <- client.getAllocator(GroupObjectAllocatorId(parentId))
+    yield
+      // The child's member entry in the parent is the snapshot taken when it joined, empty and unlimited
+      parent.maximumObjectSize should be(None)
+      allocator.maxObjectSize should be(Some(1000))
+
+  atest("a cached parent group allocator picks up a pool added to its child once the child's state refreshes"):
+    given ExecutionContext = executionContext
+    // Refresh cached group states on every use so the test need not wait out the default interval
+    val manager = new ObjectAllocatorManager(client, Duration.Zero)
+    var allocator: Option[ObjectAllocator] = None
+
+    def cacheParent(childId: AllocationGroupId, parentId: AllocationGroupId): Future[Unit] =
+      manager.getAllocator(GroupObjectAllocatorId(parentId)).map: a =>
+        allocator = Some(a)
+        a.maxObjectSize should be(None)
+        ()
+
+    def awaitLimit(remaining: Int): Future[Option[Int]] =
+      val current = allocator.get.maxObjectSize // also starts a background refresh of the stale cached states
+      if current.isDefined || remaining == 0 then
+        Future.successful(current)
+      else
+        Future(Thread.sleep(20))(using ExecutionContext.global).flatMap(_ => awaitLimit(remaining - 1))
+
+    for
+      _ <- nestedGroupWithLatePool("cached", cacheParent)
+      limit <- awaitLimit(500)
+    yield
+      limit should be(Some(1000))
 
   test("maximumObjectSize is the smallest of the members' maxObjectSize"):
     import AllocationGroupState.{Member, MemberType}

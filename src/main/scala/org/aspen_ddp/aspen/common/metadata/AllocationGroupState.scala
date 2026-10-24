@@ -267,7 +267,7 @@ object AllocationGroupState:
 
 /** @param maxSliceSize the group's declared slice limit, or `None` for no limit. Fixed when the group is created.
   *                     Only pools and groups whose own `maxSliceSize` is no larger may join. Most code should use
-  *                     `maximumObjectSize` (or the group allocator's `maxObjectSize`) instead.
+  *                     the group allocator's `maxObjectSize` instead.
   */
 final case class AllocationGroupState(
                                      groupId: AllocationGroupId,
@@ -315,9 +315,11 @@ final case class AllocationGroupState(
       val sz = if m.uuid == uuid then newMaxSize else m.maximumSize
       acc + sz
   
-  /** Largest object, in bytes, that can be allocated through this group: the smallest `Member.maxObjectSize` among
-    * the members, each of which is derived from that member's `maxSliceSize` and IDA. Members without a limit
-    * do not constrain it. `None` when no member has a limit, including when the group has no members.
+  /** The smallest `Member.maxObjectSize` among the members, or `None` when no member has a limit (including when
+    * the group has no members). This is exact for pool members, but a child group's entry is a snapshot taken when
+    * it joined and is not updated as the child's own membership changes, so for groups with child groups this can
+    * be stale. Code allocating through the group should use the group allocator's `maxObjectSize`
+    * (`ObjectAllocator.maxObjectSize`), which recomputes the value from the child groups' current states.
     */
   def maximumObjectSize: Option[Int] =
     members.flatMap(_.maxObjectSize).minOption

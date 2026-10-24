@@ -332,9 +332,12 @@ The metadata entries for StoragePools contain the following items:
 * Allocation Tree ObjectPointer
 * Error Tree ObjectPointer
 
-The maximum slice size is the most any one DataStore will hold for a single object. How much object data
-that allows depends on the IDA (see "Object Size Limits" in the [Usage Guide](UsageGuide.md)). Each store
-enforces its limit from its own config file, voting to abort any transaction that would exceed it.
+The maximum slice size is the most any one DataStore will hold for a single object. The pool's backend
+configuration may carry its own limit, and the smaller of the two is the pool's effective limit. How much object
+data that allows depends on the IDA (see "Object Size Limits" in the [Usage Guide](UsageGuide.md)). Each store
+enforces the effective limit from its own config file, voting to abort any transaction that would grow a slice
+beyond it. Updates that do not grow a slice that is already over the limit, such as shrinking or deleting the
+object, always pass.
 
 There are a few other items as well but those are the key elements. The array of StoreEnties requires 
 a bit more explanation. The StoreEntry is a tuple of (StorageDeviceId, HostId). The StorageDeviceId 

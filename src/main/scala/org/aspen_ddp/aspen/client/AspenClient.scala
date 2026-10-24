@@ -186,7 +186,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     *
     * @param maxSliceSize the group's slice limit, fixed for the group's lifetime, or `None` for no limit. Only pools
     *                     and groups whose own `maxSliceSize` is no larger may join it. The object size limit users
-    *                     see is the group's derived `maximumObjectSize`.
+    *                     see is the group allocator's derived `maxObjectSize`.
     */
   def createAllocationGroup(groupName: String, level: Int, maxSliceSize: Option[Int] = None): Future[AllocationGroupId]
 

@@ -135,9 +135,14 @@ contention. Thus it is well suited to concurrent updates.
 Pools, allocation groups and storage backends can cap the size of the slice any one DataStore holds for
 an object (`maxSliceSize`). **Applications should code against `maxObjectSize`**, the largest object, in
 bytes, that fits under that cap. It is exposed by `StoragePool` and `ObjectAllocator` and is `None` when
-there is no limit. For an allocation group it is the smallest value among its members.
+there is no limit. A pool's `maxObjectSize` already reflects its backend's limit: it is derived from the pool's
+effective slice limit, the smaller of the pool's and the backend's `maxSliceSize` (which is also what
+`StoragePool.maxSliceSize` reports). For an allocation group it is the smallest value among the pools reachable
+through the group, recursing into child groups. The client computes it from its cached group states, which are
+refreshed in the background, so a pool added anywhere below a group is reflected within that refresh interval
+(20 seconds by default).
 
-`maxObjectSize` is derived from `maxSliceSize` by the pool's IDA, and is exact to the byte:
+`maxObjectSize` is derived from the effective `maxSliceSize` by the pool's IDA, and is exact to the byte:
 * Replication: `maxSliceSize` (every slice is a full copy)
 * ReedSolomon with read-threshold `k`: `k * maxSliceSize - 1`
 * AppendingReedSolomon: `(maxSliceSize / cellSize) * (k * cellSize) - 8`, the 8 being the length trailer
@@ -146,9 +151,13 @@ Results are capped at what an `Int` can address. A `maxSliceSize` below `ida.min
 for AppendingReedSolomon) admits no objects and is rejected.
 
 The limit is enforced twice. The client throws `ObjectSizeLimitExceeded` while building a transaction that
-would overwrite, append to, range-write or allocate an object larger than `maxObjectSize`. Independently,
-each store votes to abort with `SliceSizeExceeded` if a slice would exceed its limit. The client's check is
-the exact inverse of the store's computation, so a transaction that passes it is never aborted for size alone.
+would overwrite, append to, range-write or allocate a data object larger than `maxObjectSize`, or allocate a
+key-value object whose initial content would give a slice larger than the effective `maxSliceSize` (measured
+exactly as the stores measure it). Independently, each store votes to abort with `SliceSizeExceeded` if a slice
+would exceed its limit. The client's check is the exact inverse of the store's computation, so a transaction
+that passes it is never aborted for size alone. Updates that do not grow a slice that is already over the limit,
+such as shrinking or deleting the object, always pass the store's check. Later updates to key-value objects are
+checked only by the stores, since the client does not know the object's current content.
 
 How to set limits:
 * **Pool**: `createNewStoragePool(..., maxSliceSize, ...)`, or `--max-slice-size <bytes>` on `create-pool`.

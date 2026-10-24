@@ -1,26 +1,32 @@
-MigratePoolToSetDurableTask awaits transferStore, so a stalled transfer
-stalls the task permanently
-  - SetRebalanceDurableTask fires transferStore and immediately reschedules;
-    the migration task awaits the result because it needs the boolean to
-    decide whether to advance to the next store
-  - transferStore is transactUntilSuccessfulWithRecovery, i.e. unbounded
-    internal retry. While it retries, the pass never completes, the
-    ignoreExtraCallsWhileRunning flag stays set, and no poll is armed
-  - Self-perpetuating: SystemTaskRunner.heartbeat() bumps every *running*
-    task regardless of progress, so the service never re-dispatches it
-    either, and a retarget cannot rescue it
-  - Accepted for now. The retry loop is the correct recovery for genuinely
-    transient faults, and every fast-fail case is already StopRetrying
-    (NoSuchElementException, InvalidDestination, StoreNotActive)
-
-A transfer whose source host dies mid-flight blocks its pool's migration
-forever
-  - The store is left TransferringOut, and MigratePoolToSetDurableTask's
-    in-flight gate then refuses to start any further transfer for that pool.
-    A retarget does not clear it
-  - Pre-existing gap in the transfer subsystem, but migration is the first
-    workflow whose *progress* depends on transfers completing
-  - Related to the abortStoreTransfer note above
+A single stuck transferStore call can freeze a pool migration permanently
+  - Each migration pass (MigratePoolToSetDurableTask.processNext) starts at most one
+    transfer by calling client.transferStore in tryStores and *waiting for its Future*
+    before the pass is allowed to finish
+  - transferStore is a transaction that updates the source and destination device
+    objects. It runs under transactUntilSuccessfulWithRecovery, which retries forever
+    on any error not classified as StopRetrying. Only NoSuchElementException,
+    InvalidDestination, StoreNotActive and DeviceFailed give up. Anything else
+    (a persistently colliding or unreachable device object, a host that never answers)
+    is retried with no attempt limit and no deadline, so the Future never completes
+  - While that Future is pending the pass never ends, and three things then keep
+    anything else from happening:
+      1. the single-flight guard (boundedSingleFlight) stays set, so every poll tick
+         is dropped
+      2. the next poll is only armed by scheduleRecheck at the end of a pass, so no
+         tick is scheduled at all
+      3. SystemTaskRunner.heartbeat() bumps every *running* task whether or not it is
+         making progress, so the service never decides the task is dead and
+         re-dispatches it. A retarget of the migration cannot rescue it either,
+         because it is only noticed at the start of a pass
+  - The result is a migration that shows as running forever and moves nothing
+  - Contrast SetRebalanceDurableTask, which fires transferStore without waiting
+    and reschedules immediately, so the same stuck call cannot stall it
+  - The retry loop is the right recovery for genuinely transient faults, which is
+    why it was left alone. The fix is to stop the pass from depending on the
+    call's completion (fire and let the next poll observe the device entries, as
+    the rebalance task does) or to give the call a bounded number of attempts
+  - Deliberately split out of the parallel-store-transfers work
+    (docs/superpowers/specs/2026-10-24-parallel-store-transfers-design.md)
 
 StoragePool.getState() and dropCachedState() are now dead API
   - SimpleStoragePool caches its StoragePoolState at construction and

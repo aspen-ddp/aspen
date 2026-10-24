@@ -37,6 +37,7 @@ project/plugins/project/
 Prompt.txt
 .mcp.json
 .claude
+CLAUDE.local.md
 
 # Demo generated files
 demo/bootstrap

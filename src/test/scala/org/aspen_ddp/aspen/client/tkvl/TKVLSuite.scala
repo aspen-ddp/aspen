@@ -1,12 +1,13 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.Transaction
+import org.aspen_ddp.aspen.client.{InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, Value}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 import scala.concurrent.Future
+import scala.util.Success
 import scala.language.implicitConversions
 
 class TKVLSuite extends IntegrationTestSuite {
@@ -450,14 +451,18 @@ class TKVLSuite extends IntegrationTestSuite {
    *  walks get checked against.
    */
   private def tier0NodeMinimums(tree: TieredKeyValueList): Future[List[Key]] =
+    tier0Nodes(tree).map(_.map(_.minimum))
 
-    def walkRight(node: KeyValueListNode): Future[List[Key]] =
+  /** Every tier-0 node, in left-to-right list order. See tier0NodeMinimums. */
+  private def tier0Nodes(tree: TieredKeyValueList): Future[List[KeyValueListNode]] =
+
+    def walkRight(node: KeyValueListNode): Future[List[KeyValueListNode]] =
       node.tail match
-        case None => Future.successful(node.minimum :: Nil)
+        case None => Future.successful(node :: Nil)
         case Some(nodeTail) =>
           client.read(nodeTail.pointer).flatMap: kvos =>
             walkRight(KeyValueListNode(client, nodeTail, node.ordering, kvos))
-              .map(node.minimum :: _)
+              .map(node :: _)
 
     for
       (tier, ordering, oroot) <- tree.rootManager.getRootNode()
@@ -467,9 +472,90 @@ class TKVLSuite extends IntegrationTestSuite {
       leftmost = e match
         case Left(_) => throw new BrokenTree()
         case Right(n) => n
-      mins <- walkRight(leftmost)
+      nodes <- walkRight(leftmost)
     yield
-      mins
+      nodes
+
+  /** Hands out `stale` as a tier-0 root on the first getRootNode call, then defers to `real`.
+   *
+   *  Reproduces a client that read the leftmost tier-0 node just before a join committed, so
+   *  the races below are deterministic.
+   */
+  private class StaleOnceRootManager(real: RootManager, stale: KeyValueListNode) extends RootManager:
+    private var served = false
+    def getRoot(): Future[Root] = real.getRoot()
+    def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] =
+      if served then
+        real.getRootNode()
+      else
+        served = true
+        Future.successful((0, stale.ordering, Some(stale)))
+    def createInitialNode(contents: Map[Key, Value])(using tx: Transaction): Future[Unit] =
+      real.createInitialNode(contents)
+    def getAllocatorForTier(tier: Int): Future[ObjectAllocator] =
+      real.getAllocatorForTier(tier)
+    def getMaxNodeSize(tier: Int): Future[Int] = real.getMaxNodeSize(tier)
+    def prepareRootUpdate(newTier: Int, onewRoot: Option[KeyValueObjectPointer])
+                         (using tx: Transaction): Future[Unit] = real.prepareRootUpdate(newTier, onewRoot)
+    def encode(): Array[Byte] = real.encode()
+    def typeId: RootManagerTypeId = real.typeId
+
+  /** Deletes key 1 from a one-key-per-node tree, joining the leftmost node with its right
+   *  neighbour, and returns the leftmost node as read before the join.
+   */
+  private def joinAfterSnapshot(tree: TieredKeyValueList): Future[KeyValueListNode] =
+    for
+      nodes <- tier0Nodes(tree)
+      tx = client.newTransaction()
+      _ <- tree.delete(Key(1))(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+    yield
+      nodes.head
+
+  atest("A scan restarts when a racing join deletes the next node") {
+    for
+      (tree, root, keys) <- buildSplitTree(3)
+      stale <- joinAfterSnapshot(tree)
+      staleTree = new TieredKeyValueList(client, new StaleOnceRootManager(root, stale))
+      v <- staleTree.get(Key(3))
+    yield
+      // The stale leftmost node still points at the node the join deleted
+      stale.tail.map(_.minimum) should be (Some(Key(2)))
+      v.isEmpty should be (false)
+  }
+
+  atest("A delete restarts when a racing join deletes the node it would join with") {
+    for
+      (tree, root, keys) <- buildSplitTree(3)
+      stale <- joinAfterSnapshot(tree)
+      staleTree = new TieredKeyValueList(client, new StaleOnceRootManager(root, stale))
+      // The stale node still holds key 1 alone, so deleting it reads the deleted neighbour to join
+      _ <- staleTree.delete(Key(1))(using client.newTransaction())
+      v1 <- tree.get(Key(1))
+      v2 <- tree.get(Key(2))
+    yield
+      v1 should be (None)
+      v2.isEmpty should be (false)
+  }
+
+  atest("A scan into a permanently deleted node fails rather than hanging") {
+    for
+      (tree, root, keys) <- buildSplitTree(3)
+      (numTiers, _, _) <- root.getRootNode()
+      nodes <- tier0Nodes(tree)
+      last = nodes.last
+      // Delete the last node without unlinking it, so the descent falls back to its left
+      // neighbour and scans right into it on every attempt
+      tx = client.newTransaction()
+      _ = tx.setRefcount(last.pointer, last.refcount, last.refcount.decrement())
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      result <- tree.get(Key(3)).transform(Success(_))
+    yield
+      numTiers should be >= 1
+      result.failed.get shouldBe a [InvalidObject]
+  }
 
   atest("foreach visits every key exactly once on a split tree") {
     var visits = List[(Key, Boolean)]()

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, Transaction}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -205,26 +205,7 @@ class TieredKeyValueList(val client: AspenClient,
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
     }
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] = {
-      for {
-        e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
-        node = e match {
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-        }
-        _ <- node.delete(key, onJoin)
-      } yield {
-        ()
-      }
-    }
-
-    rootManager.getRootNode().flatMap { t =>
-      val (tier, ordering, oroot) = t
-      oroot match {
-        case None => Future.unit
-        case Some(root) => nonEmpty(tier, ordering, root)
-      }
-    }
+    deleteFromContainingNode(key, _.delete(key, onJoin))
   }
 
   def delete(key: Key, 
@@ -234,28 +215,35 @@ class TieredKeyValueList(val client: AspenClient,
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
     }
-
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] = {
-      for {
-        e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
-        node = e match {
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-        }
-        _ <- node.delete(key, requiredRevision, requirements, onJoin)
-      } yield {
-        ()
-      }
-    }
-
-    rootManager.getRootNode().flatMap { t =>
-      val (tier, ordering, oroot) = t
-      oroot match {
-        case None => Future.unit
-        case Some(root) => nonEmpty(tier, ordering, root)
-      }
-    }
+    deleteFromContainingNode(key, _.delete(key, requiredRevision, requirements, onJoin))
   }
+
+  /** Descends to the tier-0 node containing `key` and hands it to `del`.
+   *
+   *  Deleting a node's last key joins it with its right neighbour, which `del` reads. If a racing
+   *  join already absorbed that neighbour, the containing node was read before the join and the
+   *  read fails with InvalidObject. `del` adds nothing to the transaction before that read, so
+   *  the delete restarts from a fresh root.
+   */
+  private def deleteFromContainingNode(key: Key, del: KeyValueListNode => Future[Unit]): Future[Unit] =
+
+    def attempt(restarts: Int): Future[Unit] =
+      rootManager.getRootNode().flatMap: t =>
+        val (tier, ordering, oroot) = t
+        oroot match
+          case None => Future.unit
+          case Some(root) =>
+            for
+              e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
+              node = e match
+                case Left(_) => throw new BrokenTree()
+                case Right(n) => n
+              _ <- del(node).recoverWith:
+                case _: InvalidObject if restarts < MaxJoinRaceRestarts => attempt(restarts + 1)
+            yield
+              ()
+
+    attempt(0)
 
   def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] = {
 
@@ -360,6 +348,21 @@ object TieredKeyValueList {
     }
   }
 
+  /** How many times a traversal restarts after reading a node that a racing join deleted.
+   *
+   *  A restart only fails again if yet another join races it, so exhausting this means the
+   *  tree really does point at a deleted node.
+   */
+  private[tkvl] val MaxJoinRaceRestarts = 10
+
+  /*
+   A join deletes the right-hand node in the same transaction that rewrites the left node's
+   right pointer, so a right scan that read the left node just before the join reads a deleted
+   node and fails with InvalidObject. Upper-tier reads are already tolerant of this (fetchNode
+   blacklists them), so any InvalidObject here comes from the target-tier scan. currentNode is
+   the leftmost node of its tier, which a join never deletes, so refreshing it and descending
+   again sees the list as the join left it.
+   */
   private[tkvl] def fetchContainingNodePath(client: AspenClient,
                                             currentTier: Int,
                                             targetTier: Int,
@@ -368,6 +371,25 @@ object TieredKeyValueList {
                                             currentNode: KeyValueListNode,
                                             initialBlacklist: Set[ObjectId],
                                             reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], List[KeyValueListNode]]] = {
+
+    given ExecutionContext = client.clientContext
+
+    def attempt(start: KeyValueListNode, restarts: Int): Future[Either[Set[ObjectId], List[KeyValueListNode]]] =
+      descend(client, currentTier, targetTier, ordering, target, start, initialBlacklist, reversePath).recoverWith:
+        case _: InvalidObject if restarts < MaxJoinRaceRestarts =>
+          start.refresh().flatMap(attempt(_, restarts + 1))
+
+    attempt(currentNode, 0)
+  }
+
+  private def descend(client: AspenClient,
+                      currentTier: Int,
+                      targetTier: Int,
+                      ordering: KeyOrdering,
+                      target: Key,
+                      currentNode: KeyValueListNode,
+                      initialBlacklist: Set[ObjectId],
+                      reversePath: List[KeyValueListNode]): Future[Either[Set[ObjectId], List[KeyValueListNode]]] = {
 
     given ExecutionContext = client.clientContext
 
@@ -385,10 +407,11 @@ object TieredKeyValueList {
         } else {
           fetchNode(client, ordering, targetTier, candidates.head._1, candidates.head._2, blacklist) foreach {
             case Left(blklst) => rtry(candidates.tail, blklst)
-            case Right(next) => fetchContainingNodePath(client, currentTier-1, targetTier, ordering, target,
-              next, blacklist, reversePath).foreach {
-              case Left(blklst) => p.success(Left(blklst + next.pointer.id))
-              case Right(rpath) => p.success(Right(rpath))
+            case Right(next) => descend(client, currentTier-1, targetTier, ordering, target,
+              next, blacklist, reversePath).onComplete {
+              case Failure(err) => p.failure(err)
+              case Success(Left(blklst)) => p.success(Left(blklst + next.pointer.id))
+              case Success(Right(rpath)) => p.success(Right(rpath))
             }
           }
         }

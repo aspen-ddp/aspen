@@ -17,8 +17,8 @@ object StopRetrying:
    *  future. An unmatched error in a hand-written handler is no better: the `MatchError` it throws
    *  is caught by the retry strategy, which reschedules.
    *
-   *  Not suitable when the prepare step traverses a tiered key-value list whose entries are
-   *  deleted: a join racing the scan can raise a transient `InvalidObject` there.
+   *  Tiered key-value list traversals and deletes restart internally when a racing join deletes a
+   *  node they were about to read, so the `InvalidObject` such a join produces does not reach here.
    */
   def unlessCollision(err: Throwable): Future[Unit] = err match
     case _: TransactionAborted => Future.unit

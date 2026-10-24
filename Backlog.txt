@@ -1,15 +1,9 @@
-A tiered-list join racing a scan surfaces as a spurious filesystem error
-  - KeyValueListNode.fetchContainingNode scans right along the bottom tier and fails on any read
-    error. A join deletes the right-hand node in the same transaction that rewrites the left
-    node's right pointer, so a scan that read the left node just before the join reads a deleted
-    node and fails with InvalidObject. A retry from the top of the tree would succeed
-  - Directory (retryUntilSuccessfulOr, retryCreation, insert, rename) and the AmoebaNFS rename
-    turn FatalReadError into StopRetrying, so the race reaches the NFS client as an error
-  - MetadataTree is unaffected (it never deletes, so its lists never join).
-    MissedUpdateFinalizationAction's errorTree insert is affected but keeps retrying, since its
-    handler retries everything except UnknownStoragePool and TransactionCreationError
-  - Fix in the traversal (restart from the root on InvalidObject during a right scan) rather than
-    in each caller, so that StopRetrying.unlessCollision becomes usable for these sites too
+A tiered-list scan restart fails if tier reduction deleted the root it restarts from
+  - TieredKeyValueList.fetchContainingNodePath restarts a scan that read a node deleted by a
+    racing join by refreshing the node the descent started from (the tree root). If a
+    JoinFinalizationAction's tier reduction deleted that root after the caller read it, the
+    refresh itself fails with InvalidObject. Rare (needs both races at once). Fix by falling
+    back to the stale root's AbsoluteMinimum child, one tier down, which a join never deletes
 
 Follow-ups from parallel store transfers
   1. SetRebalanceDurableTask passes can overlap (wake() plus the poll, no single-flight

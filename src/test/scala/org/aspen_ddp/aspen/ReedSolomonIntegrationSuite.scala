@@ -47,7 +47,7 @@ trait ReedSolomonIntegrationTests:
 
   /** Every set of stores that can be silenced while still leaving a readable quorum: all subsets
     * up to `width - consistentRestoreThreshold` in size, including the empty one. For
-    * ReedSolomon(5,3,4) that is 16 sets; for ReedSolomon(4,2,3), 11. Enumerating them rather than
+    * ReedSolomon(5,3,4) that is 16 sets; for ReedSolomon(4, 3, 3), 11. Enumerating them rather than
     * hand-picking a few is what guarantees the parity-only and mixed data/parity cases are
     * covered for whichever config the concrete suite bootstraps with.
     */
@@ -373,4 +373,4 @@ class ReedSolomonIntegrationSuite extends IntegrationTestSuite with ReedSolomonI
   * writeThreshold equals its width, so a single missed store would stall every commit.
   */
 class NarrowReedSolomonIntegrationSuite extends IntegrationTestSuite with ReedSolomonIntegrationTests:
-  override def testIda: IDA = ReedSolomon(4, 2, 3)
+  override def testIda: IDA = ReedSolomon(4, 3, 3)

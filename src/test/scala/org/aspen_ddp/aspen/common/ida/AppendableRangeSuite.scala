@@ -82,7 +82,7 @@ class AppendableRangeSuite extends AnyFunSuite with Matchers:
   }
 
   test("sliceRangeFor does not overflow for huge lengths with k=1") {
-    val ida = AppendingReedSolomon(3, 1, 2, 8)
+    val ida = AppendingReedSolomon(1, 1, 1, 8)
     val c = content(100)
     val slices = ida.encode(c)
     val size = slices(0).length

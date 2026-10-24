@@ -182,6 +182,12 @@ sealed abstract class IDA extends Ordered[IDA] {
 
 case class Replication(width: Int, writeThreshold: Int) extends IDA with AppendableIDA {
 
+  // restoreThreshold is 1 only because the data can be restored from a single store once width/2 + 1
+  // stores agree on its metadata, so the effective read threshold is a majority.
+  require(width >= 1, s"Replication width must be at least 1. Got $width")
+  require(writeThreshold >= width / 2 + 1 && writeThreshold <= width,
+    s"Replication writeThreshold ($writeThreshold) must fall within [${width / 2 + 1}, $width]")
+
   def appendDeltas(currentLength: Int, data: Array[Byte]): Array[AppendDelta] =
     require(data.length > 0, "Append data must not be empty")
     Array.fill(width)(AppendDelta(currentLength, currentLength + data.length, currentLength, data, None))
@@ -384,6 +390,8 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
 
   require(restoreThreshold >= 1,
     s"Reed-Solomon restoreThreshold must be at least 1. Got $restoreThreshold")
+  require(restoreThreshold >= width / 2 + 1,
+    s"Reed-Solomon restoreThreshold ($restoreThreshold) must be a majority: at least ${width / 2 + 1}")
   require(restoreThreshold <= width,
     s"Reed-Solomon restoreThreshold ($restoreThreshold) may not exceed width ($width)")
   require(width <= ReedSolomon.MaxWidth,
@@ -536,6 +544,8 @@ case class AppendingReedSolomon(
 
   require(restoreThreshold >= 1,
     s"Appending Reed-Solomon restoreThreshold must be at least 1. Got $restoreThreshold")
+  require(restoreThreshold >= width / 2 + 1,
+    s"Appending Reed-Solomon restoreThreshold ($restoreThreshold) must be a majority: at least ${width / 2 + 1}")
   require(restoreThreshold <= width,
     s"Appending Reed-Solomon restoreThreshold ($restoreThreshold) may not exceed width ($width)")
   require(width <= ReedSolomon.MaxWidth,

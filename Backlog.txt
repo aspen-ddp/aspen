@@ -1,3 +1,15 @@
+MigratePoolToSetSuite is flaky under the full test run
+  - Seen once in a full `sbt test`: "an aborted migration transfer is restarted toward a freshly
+    selected destination" failed, and the log showed it still running past 56 seconds. The same test
+    passes alone (`testOnly *MigratePoolToSetSuite`) and passed in the next two full runs, so it looks
+    timing- or load-dependent (the suites run in parallel inside sbt's JVM)
+  - Not yet known whether it predates the IDA threshold change; that change touched no migration code
+  - To do:
+      * reproduce (loop the full run, or the suite under CPU load) and capture the failure message
+      * find the race or the too-tight awaitUntil/driveUntilComplete deadline and fix the cause
+        rather than lengthening timeouts
+      * check the sibling tests in the suite that share the same abort/restart pattern
+
 A single stuck transfer start can freeze a pool migration or a set rebalance
   - Both MigratePoolToSetDurableTask (tryStores) and SetRebalanceDurableTask (advance,
     folded sequentially over a pass's not-started transfers) *wait for*
@@ -61,39 +73,6 @@ Follow-ups from parallel store transfers
   11. Pre-existing: when the destination finishes after a tombstoned source's entry was
       already drained, Host.updateStateForTransferredStore falls through to PoolRepointed
       and loads a copy the pool does not name
-
-Invalid IDA thresholds are accepted by the code and used by tests
-  - The rules, for every IDA:
-      * the read threshold must be a majority: at least width/2 + 1
-      * the write threshold must be at least the read threshold
-    A write threshold below the read threshold is invalid for all IDAs. Allowing it in
-    the code or in a test is a bug
-  - Replication's restoreThreshold is 1 because the data can be restored from a single
-    store, but only if the metadata from width/2 + 1 stores matches that store's metadata.
-    The effective read threshold is therefore still width/2 + 1, and a Replication
-    writeThreshold must be at least that. The hard-coded restoreThreshold of 1 must not
-    be mistaken for a licence to use a smaller majority
-  - Nothing enforces any of this today: the IDA constructors (Replication, ReedSolomon,
-    AppendingReedSolomon) have no require(), and neither does pool creation
-    (BaseAspenClient.createStoragePool and friends), the IDA decoder (IDA.scala:17-36),
-    or the cmdline pool-creation arguments. Invalid pools can be created and persisted
-  - Known symptom: the test harness hangs in createSecondDevice for Replication(5,1),
-    (5,2), (6,2), (6,3)
-  - Starting inventory, from a grep of literal constructions in src/main and src/test
-    (not exhaustive; non-literal sites such as Replication(hosts.length, 1) and the
-    cmdline args need reading):
-      * Replication: (7,2), (4,2), (6,1), (2,1), (hosts.length, 1)
-      * ReedSolomon: (8,4,6), (6,3,5), (3,1,2)
-      * AppendingReedSolomon: (8,4,6,64), (4,2,3,8), (3,1,2,8)
-  - More complex than a drive-by fix, hence a Backlog item:
-      * decide where the check lives (constructors versus pool creation versus both),
-        remembering that the decoder must not throw on IDAs already persisted
-      * migrate or reject existing persisted pools and configs
-      * fix or justify every test above, and re-check anything that relied on a
-        low-threshold shape (for example the width-10 pools used to get two parallel
-        transfers: the safety floor min(writeThreshold + 2, width - 1) is computed from
-        these thresholds)
-      * add tests that invalid shapes are rejected at each layer
 
 StoragePool.getState() and dropCachedState() are now dead API
   - SimpleStoragePool caches its StoragePoolState at construction and

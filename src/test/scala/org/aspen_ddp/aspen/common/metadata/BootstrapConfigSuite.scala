@@ -113,7 +113,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     // deliberately does not.
     val yaml = BootstrapConfig.generateBootstrapConfig(
       systemId,
-      Replication(4, 2),
+      Replication(4, 3),
       List(host1, host2, host3),
       storeMap,
       TestTLS.caCertificatePem)
@@ -124,7 +124,7 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
       val cfg = BootstrapConfig.loadBootstrapConfig(f)
 
       cfg.aspenSystemId should be(systemId)
-      cfg.bootstrapIDA should be(Replication(4, 2))
+      cfg.bootstrapIDA should be(Replication(4, 3))
       cfg.hosts.length should be(3)
 
       val h1 = cfg.hosts(0)

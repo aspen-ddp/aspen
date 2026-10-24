@@ -83,32 +83,33 @@ class TransferSafetySuite extends AnyFunSuite with Matchers:
     TransferSafety.floor(Replication(5, 3)) shouldBe 4
     TransferSafety.floor(Replication(3, 3)) shouldBe 2
     TransferSafety.floor(Replication(1, 1)) shouldBe 0
-    TransferSafety.floor(Replication(7, 2)) shouldBe 4
+    TransferSafety.floor(Replication(9, 5)) shouldBe 7
 
-  test("width 7 writeThreshold 2 (floor 4): two concurrent TransferringOut still admits a third"):
+  test("width 9 writeThreshold 5 (floor 7): one TransferringOut still admits a second"):
     val (state, _, toDev, _, offline) = build(
-      List(TransferringOut, TransferringOut, Active, Active, Active, Active, Active), Replication(7, 2))
-    TransferSafety.onlineCount(state, offline, poolId) shouldBe 5
+      List(TransferringOut, Active, Active, Active, Active, Active, Active, Active, Active), Replication(9, 5))
+    TransferSafety.onlineCount(state, offline, poolId) shouldBe 8
     TransferSafety.isSafe(state, offline, transfer0(state, toDev, 2)) shouldBe true
 
-  test("width 7 writeThreshold 2 (floor 4): three concurrent TransferringOut refuses a fourth"):
+  test("width 9 writeThreshold 5 (floor 7): two concurrent TransferringOut refuses a third"):
     val (state, _, toDev, _, offline) = build(
-      List(TransferringOut, TransferringOut, TransferringOut, Active, Active, Active, Active), Replication(7, 2))
-    TransferSafety.onlineCount(state, offline, poolId) shouldBe 4
-    TransferSafety.isSafe(state, offline, transfer0(state, toDev, 3)) shouldBe false
+      List(TransferringOut, TransferringOut, Active, Active, Active, Active, Active, Active, Active), Replication(9, 5))
+    TransferSafety.onlineCount(state, offline, poolId) shouldBe 7
+    TransferSafety.isSafe(state, offline, transfer0(state, toDev, 2)) shouldBe false
 
   test("a non-Active candidate is never safe"):
     val (state, _, toDev, _, offline) = build(
-      List(TransferringOut, Active, Active, Active, Active, Active, Active), Replication(7, 2))
+      List(TransferringOut, Active, Active, Active, Active, Active, Active), Replication(7, 4))
     TransferSafety.isSafe(state, offline, transfer0(state, toDev, 0)) shouldBe false
 
   test("unsafe when a Rebuilding store plus an offline-host store push below the floor"):
     val (state, _, toDev, _, _) = build(
-      List(Active, Active, Active, Active, Rebuilding, Active), Replication(6, 1))
-    // floor = min(3, 5) = 3. Online: 5 Active - 1 offline host = 4 Active; 4 - 1 = 3 >= 3 is safe
+      List(Active, Active, Active, Active, Rebuilding, Active, Active, Active, Active, Active, Active, Active),
+      Replication(12, 7))
+    // floor = min(9, 11) = 9. Online: 11 Active - 1 offline host = 10 Active; 10 - 1 = 9 >= 9 is safe
     val oneOff = hostsOf(state, 1)
     TransferSafety.isSafe(state, oneOff, transfer0(state, toDev, 0)) shouldBe true
-    // second offline host: online 3 - 1 = 2 < 3
+    // second offline host: online 9 - 1 = 8 < 9
     val twoOff = hostsOf(state, 1, 2)
     TransferSafety.isSafe(state, twoOff, transfer0(state, toDev, 0)) shouldBe false
 

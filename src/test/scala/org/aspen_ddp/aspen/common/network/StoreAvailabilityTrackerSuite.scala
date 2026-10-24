@@ -121,7 +121,7 @@ class StoreAvailabilityTrackerSuite extends AnyFunSuite with Matchers:
       ExecutionContext.global, ClientMessenger.None, Radicle.pointer, Replication(1, 1)):
 
     override def getStoragePoolState(poolId: PoolId): Future[StoragePoolState] =
-      Future.successful(StoragePoolState(poolId, "pool", Replication(2, 1), None,
+      Future.successful(StoragePoolState(poolId, "pool", Replication(2, 2), None,
         Array(StoragePoolState.StoreEntry(hostId, deviceA), StoragePoolState.StoreEntry(hostId, deviceB)),
         RocksDBConfig(), setId))
 

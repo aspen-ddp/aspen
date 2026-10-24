@@ -453,7 +453,7 @@ class AppendingReedSolomonRangedWriteIntegrationSuite extends IntegrationTestSui
 
 class NarrowAppendingReedSolomonRangedWriteIntegrationSuite extends IntegrationTestSuite
   with RangedWriteIntegrationTests:
-  override def testIda: IDA = AppendingReedSolomon(4, 2, 3, 8)
+  override def testIda: IDA = AppendingReedSolomon(4, 3, 3, 8)
 
 
 class ClassicReedSolomonRangedWriteRejectionSuite extends IntegrationTestSuite:

@@ -888,8 +888,11 @@ object Main {
   }
 
   def createIDA(args: Args): IDA =
-    require(args.width >= args.readThreshold && args.width >= args.writeThreshold)
-    require(args.readThreshold <= args.writeThreshold)
+    require(args.width >= args.readThreshold && args.width >= args.writeThreshold,
+      "read and write thresholds may not exceed the width")
+    require(args.readThreshold <= args.writeThreshold, "the write threshold must be at least the read threshold")
+    require(args.idaType == "replication" || args.readThreshold >= args.width / 2 + 1,
+      s"the read threshold must be a majority: at least ${args.width / 2 + 1}")
     args.idaType match
       case "replication" => Replication(args.width, args.writeThreshold)
       case "reed-solomon" => ReedSolomon(args.width, args.readThreshold, args.writeThreshold)

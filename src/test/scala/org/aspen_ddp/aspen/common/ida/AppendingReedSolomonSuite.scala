@@ -14,12 +14,12 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
 
   private val Configs: List[AppendingReedSolomon] = List(
     AppendingReedSolomon(1, 1, 1, 8),
-    AppendingReedSolomon(3, 1, 2, 8),
+    AppendingReedSolomon(3, 2, 2, 8),
     AppendingReedSolomon(3, 2, 3, 8),
     AppendingReedSolomon(4, 4, 4, 16),
     AppendingReedSolomon(5, 3, 4, 64),
-    AppendingReedSolomon(6, 3, 5, 8),
-    AppendingReedSolomon(8, 4, 6, 64),
+    AppendingReedSolomon(6, 4, 5, 8),
+    AppendingReedSolomon(8, 5, 6, 64),
     AppendingReedSolomon(10, 7, 9, 8))
 
   private def setTrailer(shard: Array[Byte], value: Long): Array[Byte] =
@@ -140,7 +140,7 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
   }
 
   private val RangedConfigs: List[AppendingReedSolomon] = Configs ++ List(
-    AppendingReedSolomon(4, 2, 3, 8),
+    AppendingReedSolomon(4, 3, 3, 8),
     AppendingReedSolomon(7, 4, 5, 9),
     AppendingReedSolomon(3, 3, 3, 13))
 

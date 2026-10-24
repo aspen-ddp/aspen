@@ -34,7 +34,7 @@ class ClientConfigSuite extends AnyFunSuite with Matchers:
       StoreId(poolId, i.toByte) -> hs.hostId
     BootstrapConfig.parseBootstrapConfig(
       BootstrapConfig.generateBootstrapConfig(
-        systemId, Replication(hosts.length, 1), states, storeMap, TestTLS.caCertificatePem))
+        systemId, Replication(hosts.length, hosts.length / 2 + 1), states, storeMap, TestTLS.caCertificatePem))
 
   private def tempFile(): os.Path =
     os.temp.dir(prefix = "client-config-suite") / ClientConfig.configFilename

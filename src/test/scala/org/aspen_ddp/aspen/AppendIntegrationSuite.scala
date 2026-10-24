@@ -437,7 +437,7 @@ class AppendingReedSolomonAppendIntegrationSuite extends IntegrationTestSuite wi
   override def testIda: IDA = AppendingReedSolomon(5, 3, 4, 64)
 
 class NarrowAppendingReedSolomonAppendIntegrationSuite extends IntegrationTestSuite with AppendIntegrationTests:
-  override def testIda: IDA = AppendingReedSolomon(4, 2, 3, 8)
+  override def testIda: IDA = AppendingReedSolomon(4, 3, 3, 8)
 
 
 /** KV objects, including partial reads, must keep working in an AppendingReedSolomon pool */

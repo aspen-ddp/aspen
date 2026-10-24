@@ -18,12 +18,12 @@ object ReedSolomonSuite:
     */
   val Configs: List[ReedSolomon] = List(
     ReedSolomon(1, 1, 1),
-    ReedSolomon(3, 1, 2),
+    ReedSolomon(3, 2, 2),
     ReedSolomon(3, 2, 3),
     ReedSolomon(4, 4, 4),
     ReedSolomon(5, 3, 4),
-    ReedSolomon(6, 3, 5),
-    ReedSolomon(8, 4, 6),
+    ReedSolomon(6, 4, 5),
+    ReedSolomon(8, 5, 6),
     ReedSolomon(10, 7, 9))
 
   val Sizes: List[Int] = ((0 to 40) ++ List(63, 64, 65, 100, 127, 128, 129, 200, 255, 256, 257, 1000)).toList
@@ -236,18 +236,18 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
               an[IDARestoreError] should be thrownBy ida.restoreArray(segments)
             }
 
-  test("parity slices alone restore the original content"):
-    val ida = ReedSolomon(6, 3, 5)
+  test("all parity slices plus data slices restore the original content"):
+    val ida = ReedSolomon(6, 4, 5)
     for n <- List(0, 1, 200, 1001) do
       val src = randomBytes(n, n + 3)
       val shards = ida.encode(src)
-      assertSameBytes(ida.restoreArray(segmentsFor(shards, List(3, 4, 5))), src, s"parity only n=$n")
+      assertSameBytes(ida.restoreArray(segmentsFor(shards, List(2, 3, 4, 5))), src, s"parity heavy n=$n")
 
   test("a mix of data and parity slices restores the original content"):
-    val ida = ReedSolomon(8, 4, 6)
+    val ida = ReedSolomon(8, 5, 6)
     val src = randomBytes(517, 21)
     val shards = ida.encode(src)
-    for subset <- List(List(0, 1, 4, 5), List(0, 3, 6, 7), List(2, 5, 6, 7), List(1, 2, 3, 4)) do
+    for subset <- List(List(0, 1, 4, 5, 7), List(0, 2, 3, 6, 7), List(0, 2, 5, 6, 7), List(1, 2, 3, 4, 5)) do
       assertSameBytes(ida.restoreArray(segmentsFor(shards, subset)), src, s"[${subset.mkString(",")}]")
 
   //---------------------------------------------------------------------------------------------
@@ -255,7 +255,7 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
   //---------------------------------------------------------------------------------------------
 
   test("restore is insensitive to segment order and tolerates extra segments"):
-    val ida = ReedSolomon(8, 4, 6)
+    val ida = ReedSolomon(8, 5, 6)
     val src = randomBytes(431, 17)
     val shards = ida.encode(src)
     val all = segmentsFor(shards, 0 until 8)
@@ -277,8 +277,8 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
   //---------------------------------------------------------------------------------------------
 
   test("encoding is deterministic, including across separately constructed instances"):
-    val a = ReedSolomon(8, 4, 6)
-    val b = ReedSolomon(8, 4, 6)
+    val a = ReedSolomon(8, 5, 6)
+    val b = ReedSolomon(8, 5, 6)
     val src = randomBytes(500, 77)
 
     val first = a.encode(src)
@@ -363,21 +363,21 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
       ida.encodeInto(DataBuffer(new Array[Byte](10)), Array.fill(6)(ByteBuffer.allocate(16)))
 
   test("restore(DataBuffer) agrees with restoreArray"):
-    val ida = ReedSolomon(6, 3, 5)
+    val ida = ReedSolomon(6, 4, 5)
     val src = randomBytes(333, 6)
     val shards = ida.encode(DataBuffer(src))
-    val restored = ida.restore(List(1, 3, 5).map(i => (i.toByte, shards(i))))
+    val restored = ida.restore(List(1, 3, 4, 5).map(i => (i.toByte, shards(i))))
     restored.size should be(333)
     assertSameBytes(restored.getByteArray, src, "restore(DataBuffer)")
 
   test("restore does not modify the caller supplied slices"):
-    val ida = ReedSolomon(6, 3, 5)
+    val ida = ReedSolomon(6, 4, 5)
     val src = randomBytes(200, 8)
     val shards = ida.encode(src)
     val snapshot = shards.map(_.clone())
 
     // omit data shards 1 and 2 to force the decodeMissing path
-    assertSameBytes(ida.restoreArray(segmentsFor(shards, List(0, 4, 5))), src, "restored")
+    assertSameBytes(ida.restoreArray(segmentsFor(shards, List(0, 3, 4, 5))), src, "restored")
 
     for i <- 0 until 6 do
       assertSameBytes(shards(i), snapshot(i), s"shard $i must be left unmodified")
@@ -454,7 +454,7 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
     an[IllegalArgumentException] should be thrownBy ReedSolomon(5, 3, 2)
     an[IllegalArgumentException] should be thrownBy ReedSolomon(5, 3, 6)
 
-    ReedSolomon(ReedSolomon.MaxWidth, 3, 4).width should be(127)
+    ReedSolomon(ReedSolomon.MaxWidth, 64, 64).width should be(127)
 
   test("the IDA attributes are as expected"):
     val ida = ReedSolomon(5, 3, 4)
@@ -473,16 +473,6 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
           an[IDARestoreError] should be thrownBy ida.restoreArray(segmentsFor(shards, subset))
         }
 
-  test("a single data shard configuration behaves as replication plus a pad byte"):
-    val ida = ReedSolomon(3, 1, 2)
-    for n <- List(0, 1, 50) do
-      val src = randomBytes(n, n + 4)
-      val shards = ida.encode(src)
-      ida.calculateEncodedSegmentLength(n) should be(n + 1)
-      for i <- 0 until 3 do
-        assertSameBytes(shards(i), shards(0), s"n=$n shard $i")
-        assertSameBytes(ida.restoreArray(segmentsFor(shards, List(i))), src, s"n=$n restore from $i")
-
   test("a width of one round trips"):
     val ida = ReedSolomon(1, 1, 1)
     val src = randomBytes(64, 1)
@@ -496,8 +486,8 @@ class ReedSolomonSuite extends AnyFunSuite with Matchers:
   //---------------------------------------------------------------------------------------------
 
   test("a large object round trips"):
-    val ida = ReedSolomon(8, 4, 6)
+    val ida = ReedSolomon(8, 5, 6)
     val src = randomBytes(256 * 1024, 0xBEEF)
     val shards = ida.encode(src)
-    shards.foreach(shard => shard.length should be(256 * 1024 / 4 + 1))
-    assertSameBytes(ida.restoreArray(segmentsFor(shards, List(1, 3, 5, 7))), src, "256 KiB")
+    shards.foreach(shard => shard.length should be(ida.calculateEncodedSegmentLength(256 * 1024)))
+    assertSameBytes(ida.restoreArray(segmentsFor(shards, List(1, 3, 5, 6, 7))), src, "256 KiB")

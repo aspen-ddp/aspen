@@ -178,6 +178,32 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
       err.requested should be (sliceLimit * 2)
       err.limit should be (sliceLimit)
 
+  atest("a split finalization whose upper tier exceeds its limit still completes"):
+    val treeKey = Key(Array[Byte](9))
+    // Tier 0 is valid, tier 1 is not. setNewRoot does not validate, standing in for a root written before the
+    // guard or decoded from storage.
+    val na = allocator(sliceLimit, sliceLimit + 1)
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      tx0 = client.newTransaction()
+      host <- pool.allocator.allocateKeyValueObject(Map())(using tx0)
+      rootNode <- pool.allocator.allocateKeyValueObject(Map())(using tx0)
+      newNode <- pool.allocator.allocateKeyValueObject(Map())(using tx0)
+      kvos0 <- client.read(radicle)
+      _ = tx0.bumpVersion(radicle, kvos0.revision)
+      _ <- tx0.commit()
+      tx1 = client.newTransaction()
+      frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true, rootNode, ByteArrayKeyOrdering, na)(using tx1)
+      _ <- tx1.commit()
+      rootManager <- frm
+      action = new SplitFinalizationAction(client, null, rootManager, 1, Key(Array[Byte](5)), newNode)
+      _ = action.execute()
+      // Creating the tier-1 root fails NodeSizeExceedsAllocatorLimit; the action must still complete successfully
+      _ <- action.complete
+      root <- rootManager.getRoot()
+    yield
+      root.tier should be (0)
+
   atest("a node filled to the node code's limit with tiny entries and long bounds fits in a slice"):
     fillNode(Key(Array.fill[Byte](200)(1)), Key(Array.fill[Byte](200)(0x7f)), Array[Byte](2))
 

@@ -68,6 +68,7 @@ object NodeAllocator:
 
     def maxObjectSize: Option[Int] = underlying.maxObjectSize
 
+    // Unchecked: TKVL nodes are always key-value objects, so data objects are never nodes
     protected[client] def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer] =
       underlying.createDataObjectPointer()
 
@@ -111,6 +112,10 @@ class NodeAllocator(val client:AspenClient, config: Seq[(ObjectAllocatorId, Int)
 
   /** Fails with `NodeSizeExceedsAllocatorLimit` for the first configured tier whose `maxNodeSize` is above its
     * allocator's `NodeAllocator.nodeSizeLimit`. Allocators without a limit always pass.
+    *
+    * Group tiers are only partly checked here: a group has no IDA, so only its current `maxObjectSize` is
+    * compared. The full check, against the slice limit of the pool a node lands in, happens when the tier
+    * allocates its first node (see `getAllocatorForTier`).
     */
   def validate(): Future[Unit] =
     given ExecutionContext = client.clientContext

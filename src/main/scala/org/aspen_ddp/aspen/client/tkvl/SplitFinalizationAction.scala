@@ -8,14 +8,13 @@ import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, Transaction
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
-import scribe.Logging
 
 class SplitFinalizationAction(val client: AspenClient,
                               val txd: TransactionDescription,
                               val rootManager: RootManager,
                               val tier: Int,
                               val newMinimum: Key,
-                              val newNode: KeyValueObjectPointer) extends FinalizationAction with Logging {
+                              val newNode: KeyValueObjectPointer) extends FinalizationAction {
 
   given ExecutionContext = client.clientContext
 
@@ -95,10 +94,11 @@ class SplitFinalizationAction(val client: AspenClient,
               insertIntoExistingTier(rootTier, ordering, rootNode)
         }
       }.recover {
-        // A misconfigured tier cannot be fixed by retrying. Fail loudly instead of retrying forever
+        // A misconfigured tier cannot be fixed by retrying, and failing would leave the transaction unfinalized
+        // forever. The split itself already committed and the new node is linked from its left neighbour, so the
+        // tree stays correct; only the upper tier's index entry for the new node is skipped. Log and complete.
         case err: NodeSizeExceedsAllocatorLimit =>
-          logger.error(s"Abandoning TKVL split insert of $newMinimum into tier $tier: ${err.getMessage}")
-          throw StopRetrying(err)
+          logger.error(s"Skipping TKVL split insert of $newMinimum into tier $tier: ${err.getMessage}")
       }
     }
 

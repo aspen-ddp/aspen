@@ -494,11 +494,17 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
             List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision)),
             List(Insert(StorageDeviceState.StateKey, newSrcState.encode())))
 
+          // Only the entry this transfer created. The failed-device drain can leave the destination
+          // Rebuilding, or reassigned to another source, while the source still reads
+          // TransferringOut; that entry belongs to the drain and is left alone.
           val dstState = StorageDeviceState(dstKvos)
-          val newDstState = dstState.removeStore(storeId)
-          tx.update(dstPtr, None, None,
-            List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision)),
-            List(Insert(StorageDeviceState.StateKey, newDstState.encode())))
+          val ours = dstState.stores.get(storeId).exists: entry =>
+            entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+            entry.transferDevice.contains(sourceId)
+          if ours then
+            tx.update(dstPtr, None, None,
+              List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision)),
+              List(Insert(StorageDeviceState.StateKey, dstState.removeStore(storeId).encode())))
 
   def getBootstrapConfig(): Future[String] =
     given ExecutionContext = this.clientContext

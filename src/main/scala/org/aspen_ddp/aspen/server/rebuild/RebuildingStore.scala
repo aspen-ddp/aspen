@@ -138,11 +138,6 @@ class RebuildingStore(client: AspenClient,
 
     os.makeDir.all(stagingPath)
 
-    if !os.exists(stagingPath / StoreConfig.configFilename) then
-      // Written up front so the directory is loadable the instant it is moved into place.
-      os.write.over(stagingPath / StoreConfig.configFilename,
-        StoreConfig(storeId, StoreConfig.RocksDB()).yamlConfig)
-
     resume.foreach: st =>
       synchronized:
         lastKey = st.lastRestoredKey
@@ -152,6 +147,12 @@ class RebuildingStore(client: AspenClient,
 
     for
       pstate <- client.getStoragePoolState(storeId.poolId)
+      _ = if !os.exists(stagingPath / StoreConfig.configFilename) then
+            // Written up front so the directory is loadable the instant it is moved into place.
+            val backendLimit = pstate.backendConfig match
+              case cfg: RocksDBConfig => cfg.maxSliceSize
+            os.write.over(stagingPath / StoreConfig.configFilename,
+              StoreConfig(storeId, StoreConfig.RocksDB(backendLimit), pstate.maxSliceSize).yamlConfig)
       _ = synchronized:
             backend = pstate.backendConfig match
               case _: RocksDBConfig => new RocksDBBackend(stagingPath, storeId, summon)

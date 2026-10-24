@@ -187,7 +187,7 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(5, SECONDS),
     Duration(60, SECONDS))
 
-  stores.foreach(s => smgr.loadStore(storageDeviceId, s))
+  stores.foreach(s => smgr.loadStore(storageDeviceId, s, None))
 
   // ---- Rebalancing test helpers -------------------------------------------------
 

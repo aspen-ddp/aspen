@@ -15,7 +15,7 @@ class StoreConfigSuite extends AnyFunSuite with Matchers:
 
   private val sample = StoreConfig(
     StoreId(PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444")), 3.asInstanceOf[Byte]),
-    StoreConfig.RocksDB())
+    StoreConfig.RocksDB(None), None)
 
   test("configFilename is aspen-store-config.yaml"):
     StoreConfig.configFilename should be("aspen-store-config.yaml")
@@ -45,12 +45,49 @@ backend:
       val cfg = StoreConfig.loadStoreConfig(f)
 
       cfg.storeId should be(StoreId(PoolId(zero), 0.asInstanceOf[Byte]))
-      cfg.backend should be(StoreConfig.RocksDB())
+      cfg.backend should be(StoreConfig.RocksDB(None))
+      cfg.poolMaxSliceSize should be(None)
 
       StoreConfig(StoreId(PoolId(zero), 0.asInstanceOf[Byte]),
-                  StoreConfig.RocksDB()).yamlConfig should be(docExampleYaml)
+                  StoreConfig.RocksDB(None), None).yamlConfig should be(docExampleYaml)
     finally
       os.remove(f)
+
+  private val storeId0 = StoreId(PoolId(zero), 0.asInstanceOf[Byte])
+
+  private def roundTrip(cfg: StoreConfig): StoreConfig =
+    val f = os.temp(prefix = "aspen-store-limits", suffix = ".yaml")
+    try
+      os.write.over(f, cfg.yamlConfig)
+      StoreConfig.loadStoreConfig(f)
+    finally
+      os.remove(f)
+
+  test("yaml round trip with both limits"):
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096))
+    cfg.yamlConfig should include("pool-max-slice-size: 4096")
+    cfg.yamlConfig should include("max-slice-size: 2048")
+    roundTrip(cfg) should be(cfg)
+
+  test("yaml round trip with only the pool limit"):
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), Some(4096))
+    roundTrip(cfg) should be(cfg)
+
+  test("yaml round trip with only the backend limit"):
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), None)
+    roundTrip(cfg) should be(cfg)
+
+  test("yaml round trip with neither limit"):
+    val cfg = StoreConfig(storeId0, StoreConfig.RocksDB(None), None)
+    cfg.yamlConfig should not include "max-slice-size"
+    roundTrip(cfg) should be(cfg)
+
+  test("effectiveMaxSliceSize is the smaller, the only one, or None"):
+    StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096)).effectiveMaxSliceSize should be(Some(2048))
+    StoreConfig(storeId0, StoreConfig.RocksDB(Some(8192)), Some(4096)).effectiveMaxSliceSize should be(Some(4096))
+    StoreConfig(storeId0, StoreConfig.RocksDB(None), Some(4096)).effectiveMaxSliceSize should be(Some(4096))
+    StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), None).effectiveMaxSliceSize should be(Some(2048))
+    StoreConfig(storeId0, StoreConfig.RocksDB(None), None).effectiveMaxSliceSize should be(None)
 
   test("an empty config file is reported as a FormatError rather than an NPE"):
     val f = os.temp(prefix = "aspen-store-empty", suffix = ".yaml")

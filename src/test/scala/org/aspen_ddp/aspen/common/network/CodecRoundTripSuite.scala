@@ -540,6 +540,13 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decoded = Codec.decode(Codec.encode(original))
     decoded shouldBe original
 
+  test("StoragePoolState round-trip keeps the backend max slice size"):
+    def pool(limit: Option[Int]) = StoragePoolState(
+      PoolId(uuid(1)), "p", Replication(3, 2), Some(4096), Array.empty, RocksDBConfig(limit),
+      storageDeviceSet = StorageDeviceSetId(uuid(8)))
+    Codec.decode(Codec.encode(pool(Some(2048)))).backendConfig shouldBe RocksDBConfig(Some(2048))
+    Codec.decode(Codec.encode(pool(None))).backendConfig shouldBe RocksDBConfig(None)
+
   test("StoragePoolState round-trip"):
     val original = StoragePoolState(
       PoolId(uuid(1)), "test-pool", Replication(3, 2), Some(1024 * 1024),

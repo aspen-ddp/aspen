@@ -1185,10 +1185,10 @@ object Codec extends Logging:
 
 
   def encodeBackendConfig(o: BackendConfig): codec.BackendConfig = o match
-    case RocksDBConfig() => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
+    case _: RocksDBConfig => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
 
-  def decodeBackendConfig(m: codec.BackendConfig): BackendConfig = m match
-    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig()
+  def decodeBackendConfig(m: codec.BackendConfig, maxSliceSize: Option[Int]): BackendConfig = m match
+    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig(maxSliceSize)
     case codec.BackendConfig.Unrecognized(v) => throw new EncodingError(f"Invalid Backend Config: $v")
 
   def encodePoolMigrationStatus(o: StoragePoolState.MigrationStatus): codec.PoolMigrationStatus = o match
@@ -1224,7 +1224,9 @@ object Codec extends Logging:
       maximumStoreSize = o.maximumStoreSize,
       allocationGroups = o.allocationGroups.map(encodeUUID),
       storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid)),
-      migration = o.migration.map(encode)
+      migration = o.migration.map(encode),
+      backendMaxSliceSize = o.backendConfig match
+        case RocksDBConfig(limit) => limit.getOrElse(0)
     )
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
@@ -1233,7 +1235,8 @@ object Codec extends Logging:
     val ida = decode(m.ida.get)
     val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
     val stores = m.stores.map(decode).toArray
-    val backendConfig = decodeBackendConfig(m.backendConfig)
+    val backendConfig = decodeBackendConfig(m.backendConfig,
+      if m.backendMaxSliceSize == 0 then None else Some(m.backendMaxSliceSize))
     val currentUsage = m.currentUsage
     val maximumStoreSize = m.maximumStoreSize
     val allocationGroups = m.allocationGroups.map(decodeUUID).toList

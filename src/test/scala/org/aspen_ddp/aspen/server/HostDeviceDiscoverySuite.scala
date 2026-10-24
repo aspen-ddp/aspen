@@ -1232,7 +1232,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val storeDir = deviceDir / storeId.directoryName
     os.makeDir.all(storeDir)
-    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB()).yamlConfig)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
     os.write.over(storeDir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
 
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,

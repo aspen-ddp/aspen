@@ -28,7 +28,9 @@ class Store(val storageDeviceId: StorageDeviceId,
             val txStatusCache: TransactionStatusCache,
             val finalizerFactory: TransactionFinalizer.Factory,
             val txDriverFactory: TransactionDriver.Factory,
-            val txHeartbeatTimeout: Duration) extends Logging {
+            val txHeartbeatTimeout: Duration,
+            /** The store's effective slice size limit (StoreConfig.effectiveMaxSliceSize). None means unlimited. */
+            val maxSliceSize: Option[Long]) extends Logging {
 
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache)

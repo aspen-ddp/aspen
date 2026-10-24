@@ -1401,7 +1401,7 @@ object Main {
 
         val storeId = StoreId(PoolId.BootstrapPoolId, poolIndex.toByte)
         val storeRoot = bootstrapDevDir / storeId.toString
-        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB())
+        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None)
 
         println(s"Creating data store $storeId. Path $storeRoot")
         os.makeDir.all(storeRoot)

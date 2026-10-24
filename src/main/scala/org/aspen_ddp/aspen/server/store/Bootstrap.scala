@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 
 import java.util.UUID
 import java.nio.charset.StandardCharsets
-import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
+import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -49,7 +49,9 @@ object Bootstrap:
       HLCTimestamp.now
     )
     
-    val treeNodeSize =  1 * 1024 * 1024
+    // The bootstrap trees' nodes live in the bootstrap pool, so their node size must fit its slice limit
+    val treeNodeSize = NodeAllocator.fittingNodeSize(SinglePoolNodeAllocator.DefaultMaxNodeSize,
+      NodeAllocator.nodeSizeLimit(ida, maxSliceSize))
     
     val bootstrapNodeAllocator = new NodeAllocator(null, List((PoolObjectAllocatorId(Radicle.poolId), treeNodeSize)))
 

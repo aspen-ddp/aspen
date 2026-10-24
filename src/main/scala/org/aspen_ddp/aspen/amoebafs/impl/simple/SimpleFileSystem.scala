@@ -56,12 +56,13 @@ object SimpleFileSystem {
         // key already present, so a taken name costs nothing beyond the containing node's read.
         _ <- client.prepareRegisterId(FileSystem.RegistryNamespace, fsName, fileSystemUUID)
         taskRoot <- allocator.allocateKeyValueObject(Map())
-        rootRoot = new Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(client, taskRoot.poolId))
+        taskPool <- client.getStoragePool(taskRoot.poolId)
+        rootRoot = new Root(0, LexicalKeyOrdering, None, SinglePoolNodeAllocator.forPool(client, taskPool))
         rootDirInode = DirectoryInode.init(rootDirMode, 0, 0, None, Some(1), rootRoot)
         rootDirectory <- allocator.allocateDataObject(rootDirInode.toArray)
         rootDirectoryPointer = new DirectoryPointer(1, rootDirectory)
         inodeTableContentRoot <- allocator.allocateKeyValueObject(Map(Key(1) -> Value(rootDirectoryPointer.toArray)))
-        inodeTableRoot = new Root(0, IntegerKeyOrdering, Some(inodeTableContentRoot), new SinglePoolNodeAllocator(client, taskRoot.poolId) )
+        inodeTableRoot = new Root(0, IntegerKeyOrdering, Some(inodeTableContentRoot), SinglePoolNodeAllocator.forPool(client, taskPool))
         content = Map( FileSystemUUIDKey -> Value(uuid2byte(fileSystemUUID)),
           TaskExecutorRootKey -> Value(taskRoot.toArray),
           InodeTableRootKey -> Value(inodeTableRoot.encode()))

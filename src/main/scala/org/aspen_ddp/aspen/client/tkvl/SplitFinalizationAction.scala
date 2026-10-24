@@ -8,13 +8,14 @@ import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, Transaction
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
+import scribe.Logging
 
 class SplitFinalizationAction(val client: AspenClient,
                               val txd: TransactionDescription,
                               val rootManager: RootManager,
                               val tier: Int,
                               val newMinimum: Key,
-                              val newNode: KeyValueObjectPointer) extends FinalizationAction {
+                              val newNode: KeyValueObjectPointer) extends FinalizationAction with Logging {
 
   given ExecutionContext = client.clientContext
 
@@ -93,6 +94,11 @@ class SplitFinalizationAction(val client: AspenClient,
             else
               insertIntoExistingTier(rootTier, ordering, rootNode)
         }
+      }.recover {
+        // A misconfigured tier cannot be fixed by retrying. Fail loudly instead of retrying forever
+        case err: NodeSizeExceedsAllocatorLimit =>
+          logger.error(s"Abandoning TKVL split insert of $newMinimum into tier $tier: ${err.getMessage}")
+          throw StopRetrying(err)
       }
     }
 

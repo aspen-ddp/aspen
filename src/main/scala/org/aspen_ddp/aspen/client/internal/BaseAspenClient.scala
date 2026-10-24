@@ -472,7 +472,8 @@ abstract class BaseAspenClient(
           errTreeRoot <- alloc.allocateKeyValueObject(Map())
           allocTreeRoot <- alloc.allocateKeyValueObject(Map())
 
-          nodeAllocator = SinglePoolNodeAllocator(this, radicle.poolId)
+          radiclePool <- getStoragePool(radicle.poolId)
+          nodeAllocator = SinglePoolNodeAllocator.forPool(this, radiclePool)
 
           poolConfig = config.encode()
           errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), nodeAllocator).encode()

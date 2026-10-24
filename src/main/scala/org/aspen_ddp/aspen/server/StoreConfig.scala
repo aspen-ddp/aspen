@@ -57,7 +57,7 @@ object StoreConfig extends YObject[StoreConfig]:
 
     val attrs: List[Attr] = maxSliceSize :: Nil
 
-    def create(o: Object): RocksDB = RocksDB(maxSliceSize.get(o))
+    def create(o: Object): RocksDB = RocksDB(positiveLimit("backend.max-slice-size", maxSliceSize.get(o)))
 
 
   val storeId: Required[StoreId] = Required("store-id", StoreId.YStoreId)
@@ -67,7 +67,17 @@ object StoreConfig extends YObject[StoreConfig]:
 
   val attrs: List[Attr] = storeId :: backend :: poolMaxSliceSize :: Nil
 
-  def create(o: Object): StoreConfig = StoreConfig(storeId.get(o), backend.get(o), poolMaxSliceSize.get(o))
+  def create(o: Object): StoreConfig =
+    StoreConfig(storeId.get(o), backend.get(o), positiveLimit("pool-max-slice-size", poolMaxSliceSize.get(o)))
+
+  /** `limit` unchanged, or a FormatError if it is present but not positive: a slice limit of zero or less admits
+    * nothing, so such a file is corrupt rather than a deliberate setting
+    */
+  private def positiveLimit(key: String, limit: Option[Int]): Option[Int] =
+    limit.foreach: v =>
+      if v <= 0 then
+        throw new FormatError(s"$key must be positive, got $v")
+    limit
   
   def loadStoreConfig(file: os.Path): StoreConfig =
     create(loadYamlFile(file))

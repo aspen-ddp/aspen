@@ -89,6 +89,26 @@ backend:
     StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), None).effectiveMaxSliceSize should be(Some(2048))
     StoreConfig(storeId0, StoreConfig.RocksDB(None), None).effectiveMaxSliceSize should be(None)
 
+  test("zero or negative slice limits are reported as a FormatError"):
+    def load(backendLimit: String, poolLimit: String): StoreConfig =
+      val f = os.temp(prefix = "aspen-store-limit", suffix = ".yaml")
+      try
+        os.write.over(f,
+          s"""store-id: 00000000-0000-0000-0000-000000000000:0
+             |backend:
+             |  storage-engine: rocksdb$backendLimit$poolLimit
+             |""".stripMargin)
+        StoreConfig.loadStoreConfig(f)
+      finally
+        os.remove(f)
+
+    List("0", "-5").foreach: v =>
+      val e1 = the[YamlFormat.FormatError] thrownBy load(s"\n  max-slice-size: $v", "")
+      e1.msg should include("backend.max-slice-size")
+      val e2 = the[YamlFormat.FormatError] thrownBy load("", s"\npool-max-slice-size: $v")
+      e2.msg should include("pool-max-slice-size")
+    load("\n  max-slice-size: 1", "\npool-max-slice-size: 1").effectiveMaxSliceSize should be(Some(1))
+
   test("an empty config file is reported as a FormatError rather than an NPE"):
     val f = os.temp(prefix = "aspen-store-empty", suffix = ".yaml")
     try

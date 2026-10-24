@@ -403,6 +403,10 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val tail = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, SliceTail(64))
     Codec.decode(Codec.encode(tail)).readType shouldBe SliceTail(64)
 
+    for br <- List(ByteRanges(List((0, 8), (40, 16)), 8), ByteRanges(Nil, 0), ByteRanges(Nil, 64)) do
+      val r = Read(storeId(10), ClientId(uuid(20)), uuid(30), ptr, br)
+      Codec.decode(Codec.encode(r)).readType shouldBe br
+
     val singleKey = Read(storeId(10), ClientId(uuid(20)), uuid(30), kvPtr(1), SingleKey(Key(Array[Byte](1, 2)), LexicalKeyOrdering))
     val decodedSK = Codec.decode(Codec.encode(singleKey)).readType.asInstanceOf[SingleKey]
     decodedSK.key.bytes shouldBe Array[Byte](1, 2)

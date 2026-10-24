@@ -15,6 +15,12 @@ case class ByteRangeToEnd(offset: Int) extends ReadType
 /** The last length bytes of the slice, or the whole slice when it is shorter */
 case class SliceTail(length: Int) extends ReadType
 
+/** Several byte ranges, each an (offset, length) pair in slice coordinates, optionally followed by the last
+  * tail bytes of the slice. The result is the clipped ranges in request order, then the tail, concatenated.
+  * Ranges are not merged or de-duplicated so overlapping ranges repeat bytes. tail = 0 reads no tail
+  */
+case class ByteRanges(ranges: List[(Int, Int)], tail: Int) extends ReadType
+
 case class SingleKey(key: Key, ordering: KeyOrdering) extends ReadType
 
 case class LargestKeyLessThan(key: Key, ordering: KeyOrdering) extends ReadType

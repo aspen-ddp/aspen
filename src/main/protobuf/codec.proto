@@ -313,6 +313,7 @@ enum ReadType {
   READ_TYPE_KEY_SET = 7;
   READ_TYPE_BYTE_RANGE_TO_END = 8;
   READ_TYPE_SLICE_TAIL = 9;
+  READ_TYPE_BYTE_RANGES = 10;
 }
 
 message Read {
@@ -328,6 +329,8 @@ message Read {
   uint32 offset = 10;
   uint32 length = 11;
   repeated bytes keys = 12;
+  repeated uint32 range_offsets = 13;
+  repeated uint32 range_lengths = 14;
 }
 
 message ReadResponse {

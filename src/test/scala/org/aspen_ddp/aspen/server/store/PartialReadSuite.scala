@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, ByteRangeToEnd, FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, MetadataOnly, ObjectRevision, ObjectType, ReadType, SliceTail, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRange, ByteRanges, ByteRangeToEnd, FullObject, IntegerKeyOrdering, Key, KeyRange, KeySet, MetadataOnly, ObjectRevision, ObjectType, ReadType, SliceTail, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -62,6 +62,20 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
     bytesOf(SliceTail(100)) shouldBe (0 until 100).toList
     bytesOf(SliceTail(500)) shouldBe (0 until 100).toList
     bytesOf(SliceTail(0)) shouldBe Nil
+  }
+
+  test("ByteRanges returns clipped ranges in request order followed by the tail") {
+    bytesOf(ByteRanges(List((10, 5), (90, 20)), 8)) shouldBe ((10 until 15) ++ (90 until 100) ++ (92 until 100)).toList
+    bytesOf(ByteRanges(List((200, 5)), 0)) shouldBe Nil
+    bytesOf(ByteRanges(List((10, 5), (12, 5)), 0)) shouldBe ((10 until 15) ++ (12 until 17)).toList
+    bytesOf(ByteRanges(List((95, Int.MaxValue)), 0)) shouldBe (95 until 100).toList
+    bytesOf(ByteRanges(List((0, 0)), 500)) shouldBe (0 until 100).toList
+    bytesOf(ByteRanges(Nil, 0)) shouldBe Nil
+  }
+
+  test("ByteRanges leaves KeyValue objects unchanged") {
+    val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, ByteRanges(List((0, 1)), 1)))
+    keysOf(r) shouldBe (1 to 5).toSet
   }
 
   test("byte-range read types leave KeyValue objects unchanged") {

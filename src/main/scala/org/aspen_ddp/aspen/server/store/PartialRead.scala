@@ -1,13 +1,13 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{ByteRange, ByteRangeToEnd, Key, KeyRange, KeySet, MetadataOnly, ObjectType, ReadType, SliceTail}
+import org.aspen_ddp.aspen.common.objects.{ByteRange, ByteRanges, ByteRangeToEnd, Key, KeyRange, KeySet, MetadataOnly, ObjectType, ReadType, SliceTail}
 
 /** Reduces a store's object data to just what a partial read asked for.
   *
   * MetadataOnly reads return no data. KeyValue objects read with KeySet or KeyRange are reduced; the
-  * object's min, max, left, and right are always kept. Data objects read with ByteRange, ByteRangeToEnd or
-  * SliceTail are clipped to the requested part of the slice. Everything else is returned unchanged.
+  * object's min, max, left, and right are always kept. Data objects read with ByteRange, ByteRangeToEnd,
+  * SliceTail or ByteRanges are clipped to the requested part of the slice. Everything else is returned unchanged.
   */
 object PartialRead:
 
@@ -32,6 +32,12 @@ object PartialRead:
 
       case (ObjectType.Data, rt: SliceTail) =>
         Some(clip(data, data.size.toLong - rt.length.toLong, data.size.toLong))
+
+      case (ObjectType.Data, rt: ByteRanges) =>
+        val size = data.size.toLong
+        val parts = rt.ranges.map((offset, length) => clip(data, offset.toLong, offset.toLong + length.toLong)) :+
+          clip(data, size - rt.tail.toLong, size)
+        Some(parts.foldLeft(DataBuffer())(_.append(_)))
 
       case _ => Some(data)
 

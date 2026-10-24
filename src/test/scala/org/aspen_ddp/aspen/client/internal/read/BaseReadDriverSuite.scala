@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.client.{KeyValueObjectState, MetadataObjectState, Obj
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, OpportunisticRebuild, Read, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError, ReadType, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ReadError, ReadType, Value}
 import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState => StoreValueState}
 import org.aspen_ddp.aspen.common.transaction.PreTransactionOpportunisticRebuild
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -268,6 +268,15 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     kvos.partial should be (true)
     kvos.contents.contains(kvKey) should be (true)
     kvos.getRebuildDataForStore(ds1) should be (None)
+    m.puts should be (Nil)
+    m.repairMarks should be (Nil)
+    rebuildsSent(m) should be (Nil)
+  }
+
+  test("partial Data ByteRanges read neither caches nor rebuilds") {
+    val (m, result) = runStaleStoreReadOf(ByteRanges(List((0, 4)), 0), ptr)
+    val dos = Await.result(result, awaitDuration)
+    dos.getRebuildDataForStore(ds1) should be (None)
     m.puts should be (Nil)
     m.repairMarks should be (Nil)
     rebuildsSent(m) should be (Nil)

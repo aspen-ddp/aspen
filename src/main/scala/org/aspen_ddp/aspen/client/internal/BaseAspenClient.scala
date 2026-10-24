@@ -134,8 +134,9 @@ abstract class BaseAspenClient(
       case ida: (IDA & AppendableIDA) => Future.successful(ida)
       case ida => Future.failed(new RangeReadNotSupported(pointer, ida))
 
-  /** The single read path for range reads: one ByteRanges request, so every piece comes from the same revision.
-    * `ranges` are (offset, length) pairs in logical coordinates and `tail` gives the number of slice tail bytes for the resolved IDA
+  /** Reads several ranges plus a tail with one ByteRanges request, so every piece comes from the same revision.
+    * `ranges` are (offset, length) pairs in logical coordinates and `tail` gives the number of slice tail bytes
+    * for the resolved IDA
     */
   private def readByteRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], tail: (IDA & AppendableIDA) => Int,
                              comment: String): Future[DataObjectRangesState] =

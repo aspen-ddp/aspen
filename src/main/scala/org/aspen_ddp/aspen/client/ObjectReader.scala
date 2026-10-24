@@ -46,9 +46,9 @@ trait ObjectReader {
   def readRange(pointer: DataObjectPointer, offset: Int, length: Option[Int]): Future[DataObjectRangeState] =
     readRange(pointer, offset, length, "")
 
-  /** Reads several byte ranges of a data object concurrently. Each range is an (offset, length) pair and the
+  /** Reads several byte ranges of a data object in a single request. Each range is an (offset, length) pair and the
     * results are in the same order, each as `readRange(pointer, offset, Some(length))` would return it. All
-    * ranges are read in a single request and therefore come from the same revision of the object. Fails with
+    * ranges therefore come from the same revision of the object. Fails with
     * RangeReadNotSupported unless the object's IDA supports append and range reads.
     */
   def readRanges(pointer: DataObjectPointer, ranges: List[(Int, Int)], comment: String): Future[List[DataObjectRangeState]]

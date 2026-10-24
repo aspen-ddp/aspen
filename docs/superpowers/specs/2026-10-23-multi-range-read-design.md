@@ -122,8 +122,9 @@ Additive only.
 
 ## Calls made (mine, not discussed with the user)
 
-- `ByteRanges` always includes a tail rather than making it optional-by-caller; `readRanges` callers
-  get the object length for free and `readRangedWriteState` needs it.
+- `ByteRanges` always carries a tail field rather than making it optional. `readRange` and `readRanges`
+  send `tail = 0`; `readAppendPosition` and `readRangedWriteState` send `tail = lengthProbeBytes` because
+  they need the object length.
 - Store-side concatenation with no merge, rather than a structured multi-part response (avoids any
   `ReadResponse` change).
 - Removing the retry loop outright rather than keeping it as a fallback.

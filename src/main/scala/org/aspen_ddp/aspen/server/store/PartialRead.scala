@@ -6,7 +6,8 @@ import org.aspen_ddp.aspen.common.objects.{ByteRanges, Key, KeyRange, KeySet, Me
 /** Reduces a store's object data to just what a partial read asked for.
   *
   * MetadataOnly reads return no data. KeyValue objects read with KeySet or KeyRange are reduced; the
-  * object's min, max, left, and right are always kept. Data objects read with ByteRanges are clipped to the requested part of the slice. Everything else is returned unchanged.
+  * object's min, max, left, and right are always kept. Data objects read with ByteRanges are clipped to the
+  * requested part of the slice. Everything else is returned unchanged.
   */
 object PartialRead:
 
@@ -27,9 +28,25 @@ object PartialRead:
         val size = data.size.toLong
         val parts = rt.ranges.map((offset, length) => clip(data, offset.toLong, offset.toLong + length.toLong)) :+
           clip(data, size - rt.tail.toLong, size)
-        Some(parts.foldLeft(DataBuffer())(_.append(_)))
+        Some(concat(parts))
 
       case _ => Some(data)
+
+  /** Concatenates the parts with a single allocation. A lone non-empty part is returned as is (a zero-copy view).
+    * Throws IllegalStateException when the combined size would not fit in a DataBuffer.
+    */
+  private def concat(parts: List[DataBuffer]): DataBuffer =
+    parts.filter(!_.isEmpty) match
+      case Nil => DataBuffer()
+      case single :: Nil => single
+      case nonEmpty =>
+        val total = nonEmpty.foldLeft(0L)(_ + _.size.toLong)
+        if total > Int.MaxValue then
+          throw new IllegalStateException(s"ByteRanges read of $total bytes exceeds the maximum of ${Int.MaxValue}")
+        val bb = java.nio.ByteBuffer.allocate(total.toInt)
+        nonEmpty.foreach(part => bb.put(part.asReadOnlyBuffer()))
+        bb.flip()
+        DataBuffer(bb)
 
   /** Returns [start, end) of the data with both ends clamped to [0, size] */
   private def clip(data: DataBuffer, start: Long, end: Long): DataBuffer =

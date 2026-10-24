@@ -73,6 +73,20 @@ class PartialReadSuite extends AnyFunSuite with Matchers {
     bytesOf(ByteRanges(Nil, 0)) shouldBe Nil
   }
 
+  test("a single non-empty part is returned as a view of the original bytes") {
+    val r = filtered(ObjectType.Data, bytes100, ByteRanges(List((10, 5), (200, 5)), 0))
+    r.getByteArray.toList shouldBe (10 until 15).map(_.toByte).toList
+    filtered(ObjectType.Data, bytes100, ByteRanges(Nil, 0)).isEmpty shouldBe true
+  }
+
+  test("a combined size past Int.MaxValue fails rather than overflowing") {
+    val big = DataBuffer(new Array[Byte](1 << 20))
+    val ranges = List.fill(2049)((0, 1 << 20))
+    val e = intercept[IllegalStateException]:
+      PartialRead.filter(ObjectType.Data, big, ByteRanges(ranges, 0))
+    e.getMessage should include ("exceeds")
+  }
+
   test("ByteRanges leaves KeyValue objects unchanged") {
     val r = KVObjectState.decode(filtered(ObjectType.KeyValue, data, ByteRanges(List((0, 1)), 1)))
     keysOf(r) shouldBe (1 to 5).toSet

@@ -128,7 +128,9 @@ class DataObjectRangeState(
 }
 
 /** The result of a multi-range read of a data object. `ranges` holds one restored (row-aligned, untrimmed) state per
-  * requested range, in request order. `objectLength` is the object's logical length, taken from the tail piece.
+  * requested range, in request order. `objectLength` is the object's logical length, taken from the tail piece, so it
+  * is None on AppendingReedSolomon when the read had `tail = 0` (the empty tail piece does not report it; the
+  * per-piece `DataObjectRangeState.objectLength` still may).
   */
 class DataObjectRangesState(
                              override val pointer: DataObjectPointer,

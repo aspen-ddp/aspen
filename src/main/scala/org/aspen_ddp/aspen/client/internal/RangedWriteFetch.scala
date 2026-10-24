@@ -8,8 +8,8 @@ import org.aspen_ddp.aspen.common.objects.DataObjectPointer
   */
 private[aspen] object RangedWriteFetch:
 
-  /** Combines one round of reads. `reads` holds the result of `readRange(w.offset, Some(w.data.length))` for
-    * each write, in the same order. Returns None when the reads disagree on the object's revision.
+  /** Combines the reads into a RangedWriteState. `reads` holds the result of
+    * `readRange(w.offset, Some(w.data.length))` for each write, in the same order.
     *
     * The length read is authoritative: each piece is clipped to it, and a write starting at or past the end
     * contributes no piece. `oldBytes` clips to the length the same way, so the state holds every byte that

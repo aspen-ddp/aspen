@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 
 import java.util.UUID
 import java.nio.charset.StandardCharsets
-import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
+import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -22,14 +22,40 @@ import org.aspen_ddp.aspen.compute.systemtask.SystemTaskExecutorService
 
 object Bootstrap:
 
+  /** @param maxSliceSize        the bootstrap pool's maxSliceSize (see StoragePoolState)
+    * @param backendMaxSliceSize the bootstrap pool backend's own limit (RocksDBConfig.maxSliceSize)
+    *
+    * Both must be at least `ida.minSliceSize`. The stores' enforced limits come from their store config files,
+    * which the caller writes, and are not set here; they must match the pool state's `effectiveMaxSliceSize`.
+    */
   def initialize(aspenSystemId: UUID,
                  ida: IDA,
                  bootstrapHostState: HostState,
                  bootstrapStorageDeviceState: StorageDeviceState,
                  stores: List[Backend],
-                 ca: CertificateAuthority): KeyValueObjectPointer = {
+                 ca: CertificateAuthority,
+                 maxSliceSize: Option[Int] = None,
+                 backendMaxSliceSize: Option[Int] = None): KeyValueObjectPointer = {
 
     require( ida.width == stores.length )
+    maxSliceSize.foreach: limit =>
+      require(limit >= ida.minSliceSize, s"maxSliceSize ($limit) must be at least ${ida.minSliceSize} for $ida")
+    backendMaxSliceSize.foreach: limit =>
+      require(limit >= ida.minSliceSize,
+        s"backend maxSliceSize ($limit) must be at least ${ida.minSliceSize} for $ida")
+
+    val storeEntrys = (0 until ida.width).map{ _ => 
+      StoragePoolState.StoreEntry(bootstrapHostState.hostId, bootstrapStorageDeviceState.storageDeviceId)
+    }.toArray
+    
+    val bootstrapPoolState = StoragePoolState(
+      PoolId.BootstrapPoolId,
+      PoolId.BootstrapPoolName,
+      ida,
+      maxSliceSize,
+      storeEntrys,
+      RocksDBConfig(backendMaxSliceSize),
+      StorageDeviceSetId.BootstrapStorageDeviceSetId)
 
     val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
       aspenSystemId = aspenSystemId,
@@ -45,7 +71,9 @@ object Bootstrap:
       HLCTimestamp.now
     )
     
-    val treeNodeSize =  1 * 1024 * 1024
+    // The bootstrap trees' nodes live in the bootstrap pool, so their node size must fit its slice limit
+    val treeNodeSize = NodeAllocator.fittingNodeSize(SinglePoolNodeAllocator.DefaultMaxNodeSize,
+      NodeAllocator.nodeSizeLimit(ida, bootstrapPoolState.effectiveMaxSliceSize))
     
     val bootstrapNodeAllocator = new NodeAllocator(null, List((PoolObjectAllocatorId(Radicle.poolId), treeNodeSize)))
 
@@ -105,18 +133,7 @@ object Bootstrap:
 
       p
 
-    val storeEntrys = (0 until ida.width).map{ _ => 
-      StoragePoolState.StoreEntry(bootstrapHostState.hostId, bootstrapStorageDeviceState.storageDeviceId)
-    }.toArray
-    
-    val poolState = StoragePoolState(
-      PoolId.BootstrapPoolId,
-      PoolId.BootstrapPoolName,
-      ida,
-      None,
-      storeEntrys,
-      RocksDBConfig(),
-      StorageDeviceSetId.BootstrapStorageDeviceSetId).encode()
+    val poolState = bootstrapPoolState.encode()
 
     val errTreeRoot = allocate()
     val allocTreeRoot = allocate()

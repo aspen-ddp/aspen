@@ -131,6 +131,54 @@ implementation. It's a general-purpose data structure and may be used by end-use
 characteristic is that set() operations targeting different keys will not result in transaction
 contention. Thus it is well suited to concurrent updates.
 
+### Object Size Limits
+Pools, allocation groups and storage backends can cap the size of the slice any one DataStore holds for
+an object (`maxSliceSize`). **Applications should code against `maxObjectSize`**, the largest object, in
+bytes, that fits under that cap. It is exposed by `StoragePool` and `ObjectAllocator` and is `None` when
+there is no limit. A pool's `maxObjectSize` already reflects its backend's limit: it is derived from the pool's
+effective slice limit, the smaller of the pool's and the backend's `maxSliceSize` (which is also what
+`StoragePool.maxSliceSize` reports). For an allocation group it is the smallest value among the pools reachable
+through the group, recursing into child groups. The client computes it from its cached group states, which are
+refreshed in the background, so a pool added anywhere below a group is reflected within that refresh interval
+(20 seconds by default).
+
+`maxObjectSize` is derived from the effective `maxSliceSize` by the pool's IDA, and is exact to the byte:
+* Replication: `maxSliceSize` (every slice is a full copy)
+* ReedSolomon with read-threshold `k`: `k * maxSliceSize - 1`
+* AppendingReedSolomon: `(maxSliceSize / cellSize) * (k * cellSize) - 8`, the 8 being the length trailer
+
+Results are capped at what an `Int` can address. A `maxSliceSize` below `ida.minSliceSize` (1, or `cellSize`
+for AppendingReedSolomon) admits no objects and is rejected.
+
+The limit is enforced twice. The client throws `ObjectSizeLimitExceeded` while building a transaction that
+would overwrite, append to, range-write or allocate a data object larger than `maxObjectSize`, or allocate a
+key-value object whose initial content would give a slice larger than the effective `maxSliceSize` (measured
+exactly as the stores measure it). Independently, each store votes to abort with `SliceSizeExceeded` if a slice
+would exceed its limit. The client's check is the exact inverse of the store's computation, so a transaction
+that passes it is never aborted for size alone. Updates that do not grow a slice that is already over the limit,
+such as shrinking or deleting the object, always pass the store's check. Later updates to key-value objects are
+checked only by the stores, since the client does not know the object's current content.
+
+How to set limits:
+* **Pool**: `createNewStoragePool(..., maxSliceSize, ...)`, or `--max-slice-size <bytes>` on `create-pool`.
+* **Allocation group**: `createAllocationGroup(name, level, maxSliceSize)`, or `--max-slice-size <bytes>` on
+  `create-allocation-group`.
+* **Store**: each store's `aspen-store-config.yaml` holds `pool-max-slice-size` (copied from the pool) and
+  `backend.max-slice-size` (the backend's own limit, from the pool's `RocksDBConfig`). The store enforces the
+  smaller of the two and never consults network state or the transaction for it.
+
+Pool and group limits are fixed at creation and cannot be changed. A group's limit is either explicit or
+absent. A pool or group may join a group only if its own limit is no larger than the group's, and a member
+with no limit cannot join a limited group; otherwise joining fails with `MemberLimitExceedsGroup` before
+any state changes.
+
+A TKVL tier's `maxNodeSize` may never exceed what its allocator can store, and violating this fails loudly
+with `NodeSizeExceedsAllocatorLimit` naming the tier, requested size and limit. For a tier allocating from a
+pool the limit is `min(maxSliceSize, maxObjectSize)`. Key-value objects replicate their keys in every slice
+and IDA-slice only the values, so a KV object's effective limit is about `maxSliceSize` regardless of `k`.
+Tiers allocating from a group are checked against the group's current `maxObjectSize`, and again, in full,
+when each node is allocated in the pool that was chosen.
+
 ## Code examples
 ### A Guided Tour
 If you're new to Aspen, start here. This example builds a toy "bookmark store" out of two objects

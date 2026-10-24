@@ -10,8 +10,9 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction.*
 import org.aspen_ddp.aspen.common.util.printStack
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.{AppendableIDA, AppendingReedSolomon, IDA, RangeEdit, Replication}
+import org.aspen_ddp.aspen.common.ida.{AppendableIDA, IDA, RangeEdit}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.server.store.KVObjectState
 
 object TransactionBuilder {
   case class KVUpdate(
@@ -64,10 +65,21 @@ class TransactionBuilder(
       finalizationActions.isEmpty &&
       allocatingObjects.isEmpty
 
-  /** `poolMaxObjectSizeMap` holds each referenced pool's maxObjectSize. It is enforced only for ranged writes */
+  /** `poolMaxObjectSizeMap` holds each referenced pool's derived maxObjectSize (`StoragePool.maxObjectSize`). It is
+    * enforced for data object overwrites, appends, ranged writes and allocations with initial content.
+    *
+    * `poolMaxSliceSizeMap` holds each referenced pool's effective slice limit (`StoragePool.maxSliceSize`). It is
+    * enforced for the initial content of allocated key-value objects, measured exactly as the stores measure it
+    * (`KVObjectState.allocationSliceSize`), since a key-value object's slice is not a simple function of its
+    * logical size. Other key-value updates are checked by the stores, since the client does not know the object's
+    * current content.
+    *
+    * A pool missing from either map is treated as unlimited by that map.
+    */
   def buildTranaction(opportunisticRebuildManager: OpportunisticRebuildManager,
                       poolIDAMap: Map[PoolId, IDA],
-                      poolMaxObjectSizeMap: Map[PoolId, Option[Int]]): (TransactionDescription,
+                      poolMaxObjectSizeMap: Map[PoolId, Option[Int]],
+                      poolMaxSliceSizeMap: Map[PoolId, Option[Int]]): (TransactionDescription,
     Map[StoreId, TransactionData], HLCTimestamp) = synchronized {
 
     HLCTimestamp.update(minimumTimestamp)
@@ -142,8 +154,21 @@ class TransactionBuilder(
       }
     }
 
+    /** Throws ObjectSizeLimitExceeded if `newLength` exceeds the pool's maxObjectSize or, for a pool without a
+      * limit, the largest length the pool's IDA can represent
+      */
+    def checkObjectSize(pointer: ObjectPointer, newLength: Long): Unit =
+      val idaLimit: Long = poolIDAMap(pointer.poolId).maxObjectSize(Long.MaxValue)
+      val limit: Long = poolMaxObjectSizeMap.get(pointer.poolId).flatten match
+        case Some(max) => math.min(max.toLong, idaLimit)
+        case None => idaLimit
+      if newLength > limit then
+        throw ObjectSizeLimitExceeded(pointer, newLength, limit)
+
     dataObjectUpdates foreach { t =>
       val (objectPointer, buf) = t
+
+      checkObjectSize(objectPointer, buf.size)
 
       addUpdate(objectPointer, poolIDAMap(objectPointer.poolId).encode(buf))
     }
@@ -153,6 +178,7 @@ class TransactionBuilder(
 
       poolIDAMap(objectPointer.poolId) match
         case ida: (IDA & AppendableIDA) =>
+          checkObjectSize(objectPointer, position.length.toLong + buf.size)
           addUpdate(objectPointer, ida.appendDeltas(position.length, buf.getByteArray).map(_.encode))
         case ida =>
           throw AppendNotSupported(objectPointer, ida)
@@ -169,22 +195,20 @@ class TransactionBuilder(
             if !ru.zeroFill && e.offset > end then
               throw RangeWriteBeyondEnd(objectPointer, ru.currentLength, e.offset)
             math.max(end, e.end)
-          poolMaxObjectSizeMap.get(objectPointer.poolId).flatten.foreach: max =>
-            if newLength > max then
-              throw ObjectSizeLimitExceeded(objectPointer, newLength, max)
-
-          val idaLimit: Long = ida match
-            case ars: AppendingReedSolomon => Int.MaxValue.toLong - ars.rowBytes
-            case _: Replication => Int.MaxValue.toLong
-          if newLength > idaLimit then
-            throw ObjectSizeLimitExceeded(objectPointer, newLength, idaLimit)
-
+          checkObjectSize(objectPointer, newLength)
           addUpdate(objectPointer, ida.rangedWriteDeltas(ru.currentLength, sorted).map(_.encode))
         case ida =>
           throw RangeWriteNotSupported(objectPointer, ida)
     }
 
     keyValueUpdates.valuesIterator.foreach { kvu =>
+      if allocatingObjects.contains(kvu.pointer) then
+        // Only the initial content of a new object is known here. Later updates are checked by the stores
+        poolMaxSliceSizeMap.get(kvu.pointer.poolId).flatten.foreach: limit =>
+          val sliceSize = KVObjectState.allocationSliceSize(poolIDAMap(kvu.pointer.poolId), kvu.operations)
+          // Same rule as the stores' RequirementsChecker.checkSliceSize, against the empty state of a new object
+          if sliceSize > limit && sliceSize > KVObjectState.EmptyEncodedSize then
+            throw ObjectSizeLimitExceeded(kvu.pointer, sliceSize, limit)
       addUpdate(kvu.pointer, KeyValueOperation.encode(kvu.operations, poolIDAMap(kvu.pointer.poolId)))
     }
 

@@ -24,8 +24,13 @@ final case class RangeWriteNotSupported(objectPointer:ObjectPointer, ida: IDA) e
 /** Used if a ranged write starts beyond the current end of the object and zero fill was not requested */
 final case class RangeWriteBeyondEnd(objectPointer:ObjectPointer, currentLength: Int, offset: Int) extends TransactionCreationError
 
-/** Used if a ranged write would grow the object beyond the pool's maxObjectSize, or beyond the largest
-  * length the pool's IDA can represent
+/** Used if an overwrite, append, ranged write or allocation's initial content would make an object larger than
+  * the pool's derived `maxObjectSize` (its `maxSliceSize` converted through the pool's IDA), or larger than the
+  * largest length the pool's IDA can represent when the pool has no limit. `maxObjectSize` is the limit that applied.
+  *
+  * For the initial content of a key-value object allocation the check is made on slices instead: `newLength` is
+  * the slice each store would hold (`KVObjectState.allocationSliceSize`) and `maxObjectSize` is the pool's
+  * effective slice limit (`StoragePool.maxSliceSize`), since that is what the stores enforce for key-value objects.
   */
 final case class ObjectSizeLimitExceeded(objectPointer:ObjectPointer, newLength: Long, maxObjectSize: Long) extends TransactionCreationError
 

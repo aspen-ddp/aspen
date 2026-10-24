@@ -108,7 +108,8 @@ class Tx( trs: TransactionRecoveryState,
     // Determine local disposition
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
-    val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, txd.requirements, objects, ou)
+    val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, txd.requirements, objects, ou,
+      frontend.maxSliceSize)
 
     // Find all objects with transaction collisions for inclusion into the response message
     m.foreach { t => t._2 match {
@@ -154,7 +155,7 @@ class Tx( trs: TransactionRecoveryState,
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
     val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, txd.requirements,
-      objects, ou)
+      objects, ou, frontend.maxSliceSize)
 
     // Objects that threw partway through their update hold partially-applied, potentially
     // corrupt state. Drop them from the cache so the next access reloads the last durable

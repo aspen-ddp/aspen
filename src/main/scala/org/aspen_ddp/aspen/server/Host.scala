@@ -54,7 +54,8 @@ object Host:
       case _ => false
 
     override def hashCode: Int = (storeId, objectId, java.util.Arrays.hashCode(storePointer), completion).##
-  private case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend, completion: Promise[Unit]) extends Event
+  private case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend,
+                                  maxSliceSize: Option[Long], completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   private case class Exit() extends Event
   private case class RecoveryEvent() extends Event
@@ -415,7 +416,7 @@ class Host(val client: AspenClient,
           sds.offlineStores -= backend.storeId
           offlineStores -= backend.storeId
           logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
-          loadStore(sds.storageDeviceId, backend)
+          loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong))
       catch
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
@@ -1151,10 +1152,16 @@ class Host(val client: AspenClient,
         Future.unit
       else
         client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
-          val backend = pstate.backendConfig match
-            case cfg: RocksDBConfig => new RocksDBBackend(storePath, storeId, ec)
+          val storeConfig = pstate.backendConfig match
+            case cfg: RocksDBConfig => StoreConfig(storeId, StoreConfig.RocksDB(cfg.maxSliceSize), pstate.maxSliceSize)
 
-          loadStore(local.storageDeviceId, backend)
+          os.makeDir.all(storePath)
+          os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)
+
+          val backend = storeConfig.backend match
+            case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
+
+          loadStore(local.storageDeviceId, backend, storeConfig.effectiveMaxSliceSize.map(_.toLong))
 
       client.transactUntilSuccessful: tx =>
         for
@@ -1844,9 +1851,10 @@ class Host(val client: AspenClient,
     stores.values.foreach(_.logTransactionStatus(log))
   }
 
-  def loadStore(storageDeviceId: StorageDeviceId, backend: Backend): Future[Unit] = {
+  /** @param maxSliceSize the store's effective slice size limit, from its StoreConfig. None means unlimited. */
+  def loadStore(storageDeviceId: StorageDeviceId, backend: Backend, maxSliceSize: Option[Long]): Future[Unit] = {
     val p = Promise[Unit]()
-    events.put(LoadStore(storageDeviceId, backend, p))
+    events.put(LoadStore(storageDeviceId, backend, maxSliceSize, p))
     p.future
   }
 
@@ -2048,9 +2056,9 @@ class Host(val client: AspenClient,
       case RecoveryEvent() =>
         handleRecoveryEvent()
 
-      case LoadStore(storageDeviceId, backend, p) =>
+      case LoadStore(storageDeviceId, backend, maxSliceSize, p) =>
         val store = new Store(storageDeviceId, ec, backend, objectCacheFactory(backend.storeId), net, backgroundTasks, crl,
-          txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8)
+          txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8, maxSliceSize)
         backend.setCompletionHandler(ioHandler)
         stores += (backend.storeId -> store)
         offlineStores -= backend.storeId

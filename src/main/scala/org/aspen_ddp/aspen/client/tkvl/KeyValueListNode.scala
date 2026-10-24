@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.transaction.{KeyValueUpdate, RevisionLock}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, FullContentLock, KeyObjectRevision, KeyRequirement, KeyRevision, WithinRange}
 import org.aspen_ddp.aspen.server.store.KVObjectState
+import org.aspen_ddp.aspen.common.util.Varint
 import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -302,6 +303,22 @@ object KeyValueListNode extends Logging {
       kvos.refcount, kvos.contents, kvos.right.map(v => KeyValueListPointer(v.bytes)))
   }
 
+  /** Bytes of a node's stored slice that are not content entries, counted exactly as the store measures a slice
+    * (`KVObjectState.encodedSizeIDA`): the mask byte, the minimum and maximum keys, the IDA-encoded right pointer
+    * and the content-count varint, sized for `contentCount + 1` entries. The minimum is always counted, even for a
+    * node that does not store one. Content pairs are sized with `KVObjectState.idaEncodedPairSize`, which also
+    * matches the store, so a node whose pairs fit in `maxNodeSize - nodeOverhead(...)` has slices of at most
+    * `maxNodeSize` bytes. This is what lets `NodeAllocator` compare `maxNodeSize` directly against a slice limit.
+    */
+  def nodeOverhead(ida: IDA,
+                   minimum: Key,
+                   maximum: Option[Key],
+                   tail: Option[KeyValueListPointer],
+                   contentCount: Int): Int =
+    val withoutContent = KVObjectState.encodedSizeIDA(ida, Some(minimum), maximum, None,
+      tail.map(p => Value(p.toArray)), Map())
+    withoutContent - Varint.getUnsignedIntEncodingLength(0) + Varint.getUnsignedIntEncodingLength(contentCount + 1)
+
   // Implemented as a non-class member to prevent accidental use of member variables instead of "node." attributes
   private def insert(node: KeyValueListNode,
                      ordering: KeyOrdering,
@@ -319,9 +336,7 @@ object KeyValueListNode extends Logging {
 
     val newPairSize = KVObjectState.idaEncodedPairSize(node.ida, key, value)
 
-    val maxSize = maxNodeSize - 4 - 4 - node.minimum.bytes.length - node.maximum.map(_.bytes.length).getOrElse(0) - node.tail.map{ p =>
-      p.encodedSize
-    }.getOrElse(0)
+    val maxSize = maxNodeSize - nodeOverhead(node.ida, node.minimum, node.maximum, node.tail, node.contents.size)
 
     if (newPairSize > maxSize)
       throw new NodeSizeExceeded
@@ -420,9 +435,7 @@ object KeyValueListNode extends Logging {
 
     val newSize = newPairSize - oldPairSize
 
-    val maxSize = maxNodeSize - 4 - 4 - node.minimum.bytes.length - node.maximum.map(_.bytes.length).getOrElse(0) - node.tail.map{ p =>
-      p.encodedSize
-    }.getOrElse(0)
+    val maxSize = maxNodeSize - nodeOverhead(node.ida, node.minimum, node.maximum, node.tail, node.contents.size)
 
     if (newSize > maxSize)
       throw new NodeSizeExceeded

@@ -186,10 +186,15 @@ trait Directory extends BaseFile with Logging {
       setCachedInode(updatedInode, tx.revision)
 
   def prepareCreateDirectory(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[DirectoryPointer]] = {
-    val root = Root(0, LexicalKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, pointer.pointer.poolId))
-    val newInode = DirectoryInode.init(mode, uid, gid, Some(pointer), None, root)
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
-    val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
+    val raw = for
+      _ <- fcheck
+      // The new tree's nodes live in this directory's pool, so its node size must fit that pool's limit
+      pool <- fs.client.getStoragePool(pointer.pointer.poolId)
+      root = Root(0, LexicalKeyOrdering, None, SinglePoolNodeAllocator.forPool(fs.client, pool))
+      newInode = DirectoryInode.init(mode, uid, gid, Some(pointer), None, root)
+      task <- CreateFileTask.prepareTask(fs, pointer, name, newInode)
+    yield task
     val fdp = for
       fof <-  raw
       of <- fof
@@ -200,10 +205,15 @@ trait Directory extends BaseFile with Logging {
   }
 
   def prepareCreateFile(name: String, mode: Int, uid: Int, gid: Int)(using tx: Transaction): Future[Future[FilePointer]] = {
-    val root = Root(0, IntegerKeyOrdering, None, new SinglePoolNodeAllocator(fs.client, pointer.pointer.poolId))
-    val newInode = FileInode.init(mode, uid, gid, root)
     val fcheck = getEntry(name).map { optr => optr.map( _ => throw DirectoryEntryExists(this.pointer, name))}
-    val raw = fcheck.flatMap(_ => CreateFileTask.prepareTask(fs, pointer, name, newInode))
+    val raw = for
+      _ <- fcheck
+      // The new tree's nodes live in this directory's pool, so its node size must fit that pool's limit
+      pool <- fs.client.getStoragePool(pointer.pointer.poolId)
+      root = Root(0, IntegerKeyOrdering, None, SinglePoolNodeAllocator.forPool(fs.client, pool))
+      newInode = FileInode.init(mode, uid, gid, root)
+      task <- CreateFileTask.prepareTask(fs, pointer, name, newInode)
+    yield task
     val fdp = for
       fof <- raw
       of <- fof

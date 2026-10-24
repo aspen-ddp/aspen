@@ -23,6 +23,18 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
     * width, so no other change is needed to run a suite against a wider pool. */
   def testIda: IDA = Replication(3, 2)
 
+  /** Override to give the bootstrap pool a maxSliceSize. */
+  def testPoolMaxSliceSize: Option[Int] = None
+
+  /** Override to give the bootstrap pool's backend a maxSliceSize (RocksDBConfig.maxSliceSize). */
+  def testBackendMaxSliceSize: Option[Int] = None
+
+  /** Every store's effective slice size limit (what Host derives from the store config file). Defaults to the
+    * smaller of the pool and backend limits, as Host computes it; override only to model misconfigured stores.
+    */
+  def testStoreMaxSliceSize: Option[Long] =
+    (testPoolMaxSliceSize.toList ++ testBackendMaxSliceSize.toList).minOption.map(_.toLong)
+
   def subFixtureSetup(): Unit = {}
   def subFixtureTeardown(): Unit = ()
 
@@ -34,7 +46,8 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   }
 
   override def withFixture(test: NoArgAsyncTest): FutureOutcome = {
-    net = new TestNetwork(executionContext, userTypeFactories, testIda)
+    net = new TestNetwork(executionContext, userTypeFactories, testIda, testPoolMaxSliceSize, testStoreMaxSliceSize,
+      testBackendMaxSliceSize)
     client = net.client
     testName = test.name
     radicle = net.radicle

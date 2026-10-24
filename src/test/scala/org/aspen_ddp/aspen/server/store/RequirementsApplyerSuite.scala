@@ -204,4 +204,17 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     assert(o.metadata.revision == rev1)
     assert(o.data.getByteArray sameElements slice.getByteArray)
   }
+
+  test("an object whose update would exceed the max slice size is skipped and not applied") {
+    val o = mkDataObject()
+    val req = DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)
+
+    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o),
+      HashMap(oid1 -> DataBuffer(new Array[Byte](5))), maxSliceSize = Some(4))
+
+    assert(result.skipped == Set(oid1))
+    assert(result.failed.isEmpty)
+    assert(o.metadata.revision == rev1)
+    assert(o.data.getByteArray sameElements Array[Byte](1, 2, 3))
+  }
 }

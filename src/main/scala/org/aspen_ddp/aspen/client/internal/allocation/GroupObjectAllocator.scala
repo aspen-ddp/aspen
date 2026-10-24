@@ -20,7 +20,10 @@ class GroupObjectAllocator private[internal] (val groupId: AllocationGroupId,
 
   val client: AspenClient = manager.client
 
-  override def maxObjectSize: Option[Int] = manager.getState(groupId).maximumObjectSize
+  /** Computed live from the cached states of this group and of every group below it (see
+    * ObjectAllocatorManager.groupMaxObjectSize), not from the snapshots stored in the group's member entries
+    */
+  override def maxObjectSize: Option[Int] = manager.groupMaxObjectSize(groupId)
   
   private def getSubAllocator(): Future[ObjectAllocator] =
     val state = manager.getState(groupId)

@@ -83,7 +83,8 @@ abstract class BaseAspenClient(
   // protected so subclass allocator-cache overrides can delegate to it
   protected val allocatorManager = new ObjectAllocatorManager(this)
 
-  private val txManager = new TransactionManager(this, txDriverFactory)
+  // private[client] so tests can run a raw TransactionBuilder, bypassing TransactionImpl's client-side checks
+  private[client] val txManager = new TransactionManager(this, txDriverFactory)
 
   def clientContext: ExecutionContext = executionContext
 
@@ -289,13 +290,20 @@ abstract class BaseAspenClient(
 
   // ---- Creates (all routed through the runCreate seam) ----
 
-  override def createAllocationGroup(groupName: String, level: Int): Future[AllocationGroupId] =
+  override def createAllocationGroup(groupName: String, level: Int,
+                                     maxSliceSize: Option[Int]): Future[AllocationGroupId] =
+    // A limit of 0 would admit no members, and the encoding uses 0 for "no limit"
+    maxSliceSize.foreach: limit =>
+      if limit <= 0 then
+        throw new IllegalArgumentException(s"maxSliceSize ($limit) must be positive")
+
     val ags = AllocationGroupState(
       AllocationGroupId(UUID.randomUUID()),
       level,
       groupName,
       Nil,
-      Nil
+      Nil,
+      maxSliceSize
     )
 
     // KeyAlreadyExists, not Registry.DuplicateRegistration: prepareRegisterObject reaches the
@@ -465,7 +473,8 @@ abstract class BaseAspenClient(
           errTreeRoot <- alloc.allocateKeyValueObject(Map())
           allocTreeRoot <- alloc.allocateKeyValueObject(Map())
 
-          nodeAllocator = SinglePoolNodeAllocator(this, radicle.poolId)
+          radiclePool <- getStoragePool(radicle.poolId)
+          nodeAllocator = SinglePoolNodeAllocator.forPool(this, radiclePool)
 
           poolConfig = config.encode()
           errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), nodeAllocator).encode()

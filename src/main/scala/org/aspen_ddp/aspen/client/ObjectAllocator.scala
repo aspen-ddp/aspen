@@ -13,6 +13,12 @@ trait ObjectAllocator:
 
   val allocatorId: ObjectAllocatorId
 
+  /** Largest object, in bytes, that this allocator can place, or `None` for no limit. For a pool allocator it is
+    * the pool's `maxObjectSize` (its effective `maxSliceSize`, which includes the backend's limit, converted through
+    * the pool's IDA). For an allocation group it is the smallest such value among the pools reachable through the
+    * group, recursing into child groups. It is computed from the client's cached group states, which are refreshed
+    * in the background, so a pool added anywhere below the group is reflected within the cache refresh interval.
+    */
   def maxObjectSize: Option[Int]
 
   protected[client] def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer]

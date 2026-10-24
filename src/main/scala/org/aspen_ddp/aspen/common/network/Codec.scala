@@ -1185,10 +1185,10 @@ object Codec extends Logging:
 
 
   def encodeBackendConfig(o: BackendConfig): codec.BackendConfig = o match
-    case RocksDBConfig() => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
+    case _: RocksDBConfig => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
 
-  def decodeBackendConfig(m: codec.BackendConfig): BackendConfig = m match
-    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig()
+  def decodeBackendConfig(m: codec.BackendConfig, maxSliceSize: Option[Int]): BackendConfig = m match
+    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig(maxSliceSize)
     case codec.BackendConfig.Unrecognized(v) => throw new EncodingError(f"Invalid Backend Config: $v")
 
   def encodePoolMigrationStatus(o: StoragePoolState.MigrationStatus): codec.PoolMigrationStatus = o match
@@ -1217,30 +1217,33 @@ object Codec extends Logging:
       poolId = Some(encodeUUID(o.poolId.uuid)),
       name = o.name,
       ida = Some(encode(o.ida)),
-      maxObjectSize = o.maxObjectSize.getOrElse(0),
+      maxSliceSize = o.maxSliceSize.getOrElse(0),
       stores = o.stores.map(encode).toSeq,
       backendConfig = encodeBackendConfig(o.backendConfig),
       currentUsage = o.currentUsage,
       maximumStoreSize = o.maximumStoreSize,
       allocationGroups = o.allocationGroups.map(encodeUUID),
       storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid)),
-      migration = o.migration.map(encode)
+      migration = o.migration.map(encode),
+      backendMaxSliceSize = o.backendConfig match
+        case RocksDBConfig(limit) => limit.getOrElse(0)
     )
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
     val poolId = PoolId(decodeUUID(m.poolId.get))
     val name = m.name
     val ida = decode(m.ida.get)
-    val maxObjectSize = if m.maxObjectSize == 0 then None else Some(m.maxObjectSize)
+    val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
     val stores = m.stores.map(decode).toArray
-    val backendConfig = decodeBackendConfig(m.backendConfig)
+    val backendConfig = decodeBackendConfig(m.backendConfig,
+      if m.backendMaxSliceSize == 0 then None else Some(m.backendMaxSliceSize))
     val currentUsage = m.currentUsage
     val maximumStoreSize = m.maximumStoreSize
     val allocationGroups = m.allocationGroups.map(decodeUUID).toList
     val storageDeviceSet = StorageDeviceSetId(decodeUUID(m.storageDeviceSet.get))
     val migration = m.migration.map(decode)
 
-    StoragePoolState(poolId, name, ida, maxObjectSize, stores, backendConfig,
+    StoragePoolState(poolId, name, ida, maxSliceSize, stores, backendConfig,
       storageDeviceSet, currentUsage, maximumStoreSize, allocationGroups, migration)
 
 
@@ -1257,16 +1260,17 @@ object Codec extends Logging:
     codec.AllocationGroupMember(
       memberType = encodeAllocationGroupMemberType(o.memberType),
       uuid = Some(encodeUUID(o.uuid)),
-      maxObjectSize = o.maxObjectSize.getOrElse(0),
+      maxSliceSize = o.maxSliceSize.getOrElse(0),
       currentUsage = o.currentUsage,
-      maximumSize = o.maximumSize
+      maximumSize = o.maximumSize,
+      maxObjectSize = o.maxObjectSize
     )
 
   def decode(m: codec.AllocationGroupMember): AllocationGroupState.Member =
     val memberType = decodeAllocationGroupMemberType(m.memberType)
     val uuid = decodeUUID(m.uuid.get)
-    val maxObjectSize = if m.maxObjectSize == 0 then None else Some(m.maxObjectSize)
-    AllocationGroupState.Member(memberType, uuid, maxObjectSize, m.currentUsage, m.maximumSize)
+    val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
+    AllocationGroupState.Member(memberType, uuid, maxSliceSize, m.maxObjectSize, m.currentUsage, m.maximumSize)
 
   def encode(o: AllocationGroupState): codec.AllocationGroupState =
     codec.AllocationGroupState(
@@ -1274,7 +1278,8 @@ object Codec extends Logging:
       level = o.level,
       name = o.name,
       members = o.members.map(encode),
-      parentGroups = o.parentGroups.map(g => encodeUUID(g.uuid))
+      parentGroups = o.parentGroups.map(g => encodeUUID(g.uuid)),
+      maxSliceSize = o.maxSliceSize.getOrElse(0)
     )
 
   def decode(m: codec.AllocationGroupState): AllocationGroupState =
@@ -1283,7 +1288,8 @@ object Codec extends Logging:
     val name = m.name
     val members = m.members.map(decode).toList
     val parentGroups = m.parentGroups.map(u => AllocationGroupId(decodeUUID(u))).toList
-    new AllocationGroupState(groupId, level, name, members, parentGroups)
+    val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
+    new AllocationGroupState(groupId, level, name, members, parentGroups, maxSliceSize)
 
   def encode(o: StorageDeviceSetState): codec.StorageDeviceSetState =
     codec.StorageDeviceSetState(

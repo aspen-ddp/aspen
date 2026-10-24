@@ -93,6 +93,12 @@ class SplitFinalizationAction(val client: AspenClient,
             else
               insertIntoExistingTier(rootTier, ordering, rootNode)
         }
+      }.recover {
+        // A misconfigured tier cannot be fixed by retrying, and failing would leave the transaction unfinalized
+        // forever. The split itself already committed and the new node is linked from its left neighbour, so the
+        // tree stays correct; only the upper tier's index entry for the new node is skipped. Log and complete.
+        case err: NodeSizeExceedsAllocatorLimit =>
+          logger.error(s"Skipping TKVL split insert of $newMinimum into tier $tier: ${err.getMessage}")
       }
     }
 

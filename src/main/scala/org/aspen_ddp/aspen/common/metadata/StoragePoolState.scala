@@ -36,11 +36,16 @@ object StoragePoolState:
   def apply(kvos: KeyValueObjectState): StoragePoolState = StoragePoolState(kvos.contents(ConfigKey).value.bytes)
 
 
+/** @param maxSliceSize the pool's declared slice limit, in bytes, or `None` for no limit. Fixed when the pool is
+  *                     created. Stores enforce `effectiveMaxSliceSize`, which also accounts for the backend's own
+  *                     limit. Most code should use `maxObjectSize` instead, which converts the effective limit into
+  *                     the largest object the pool accepts.
+  */
 final case class StoragePoolState(
                                    poolId: PoolId,
                                    name: String,
                                    ida: IDA,
-                                   maxObjectSize: Option[Int],
+                                   maxSliceSize: Option[Int],
                                    stores: Array[StoragePoolState.StoreEntry],
                                    backendConfig: BackendConfig,
                                    storageDeviceSet: StorageDeviceSetId,
@@ -52,8 +57,21 @@ final case class StoragePoolState(
 
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
 
+  /** The slice limit every store of this pool actually enforces: the smaller of the pool's declared `maxSliceSize`
+    * and the backend's (`backendConfig.maxSliceSize`), or whichever one is set, or `None` when neither is. Both are
+    * fixed at pool creation, so this never changes. Stores compute the same value from their config file
+    * (`StoreConfig.effectiveMaxSliceSize`). Most code should use `maxObjectSize` instead.
+    */
+  def effectiveMaxSliceSize: Option[Int] = (maxSliceSize.toList ++ backendConfig.maxSliceSize.toList).minOption
+
+  /** Largest object, in bytes, this pool accepts: `effectiveMaxSliceSize` converted through `ida.maxObjectSize`, so
+    * an object of exactly this size encodes to slices no larger than any store of the pool accepts, and one byte
+    * more would not. `None` when neither the pool nor its backend has a slice limit.
+    */
+  def maxObjectSize: Option[Int] = effectiveMaxSliceSize.map(ida.maxObjectSize(_))
+
   /** Every field, with `stores` as a Seq so it compares by content */
-  private def contentFields = (poolId, name, ida, maxObjectSize, stores.toSeq, backendConfig, storageDeviceSet,
+  private def contentFields = (poolId, name, ida, maxSliceSize, stores.toSeq, backendConfig, storageDeviceSet,
     currentUsage, maximumStoreSize, allocationGroups, migration)
 
   override def equals(other: Any): Boolean = other match

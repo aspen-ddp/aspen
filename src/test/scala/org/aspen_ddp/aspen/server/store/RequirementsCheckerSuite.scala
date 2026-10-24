@@ -4,10 +4,10 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.ida.{AppendDelta, AppendingReedSolomon, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SliceSizeExceeded, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -859,5 +859,124 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs == List(RequirementCheckFailure()))
   }
 
-}
+  // --- Max slice size ---------------------------------------------------------------------------
 
+  private def checkSized(op: DataUpdateOperation.Value, current: DataBuffer, payload: DataBuffer,
+                         maxSliceSize: Option[Long]) =
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, current)
+    val req = DataUpdate(p1, rev1, op)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload),
+      maxSliceSize)
+
+  test("Overwrite exactly at the max slice size passes") {
+    val (oerrs, errs) = checkSized(DataUpdateOperation.Overwrite, DataBuffer(new Array[Byte](0)),
+      DataBuffer(new Array[Byte](100)), Some(100))
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  test("Overwrite one byte over the max slice size fails with SliceSizeExceeded") {
+    val (oerrs, errs) = checkSized(DataUpdateOperation.Overwrite, DataBuffer(new Array[Byte](0)),
+      DataBuffer(new Array[Byte](101)), Some(100))
+    assert(oerrs == Map(oid1 -> SliceSizeExceeded(101, 100)))
+    assert(errs.isEmpty)
+  }
+
+  test("shrinking Overwrite of an object already above the max slice size passes") {
+    val (oerrs, errs) = checkSized(DataUpdateOperation.Overwrite, DataBuffer(new Array[Byte](200)),
+      DataBuffer(new Array[Byte](150)), Some(100))
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  test("growing Overwrite of an object already above the max slice size fails") {
+    val (oerrs, errs) = checkSized(DataUpdateOperation.Overwrite, DataBuffer(new Array[Byte](200)),
+      DataBuffer(new Array[Byte](201)), Some(100))
+    assert(oerrs == Map(oid1 -> SliceSizeExceeded(201, 100)))
+    assert(errs.isEmpty)
+  }
+
+  test("Append whose new slice length crosses the max slice size fails with SliceSizeExceeded") {
+    val (slice, delta) = appendFixture(Array.tabulate[Byte](20)(_.toByte), Array.tabulate[Byte](30)(_.toByte))
+    assert(delta.newSliceLength > slice.size)
+    val atLimit = checkSized(DataUpdateOperation.Append, slice, delta.encode, Some(delta.newSliceLength.toLong))
+    assert(atLimit._1.isEmpty)
+    assert(atLimit._2.isEmpty)
+    val (oerrs, errs) = checkSized(DataUpdateOperation.Append, slice, delta.encode,
+      Some(delta.newSliceLength.toLong - 1))
+    assert(oerrs == Map(oid1 -> SliceSizeExceeded(delta.newSliceLength, delta.newSliceLength - 1)))
+    assert(errs.isEmpty)
+  }
+
+  test("WriteRange whose new slice length crosses the max slice size fails with SliceSizeExceeded") {
+    val slice = DataBuffer(Array.tabulate[Byte](16)(_.toByte))
+    val delta = AppendDelta(16, 20, List(XorRegion(16, Array[Byte](1, 2, 3, 4))), None)
+    val atLimit = checkSized(DataUpdateOperation.WriteRange, slice, delta.encode, Some(20))
+    assert(atLimit._1.isEmpty)
+    assert(atLimit._2.isEmpty)
+    val (oerrs, errs) = checkSized(DataUpdateOperation.WriteRange, slice, delta.encode, Some(19))
+    assert(oerrs == Map(oid1 -> SliceSizeExceeded(20, 19)))
+    assert(errs.isEmpty)
+  }
+
+  test("WriteRange inside an object already above the max slice size passes") {
+    val slice = DataBuffer(Array.tabulate[Byte](16)(_.toByte))
+    val delta = AppendDelta(16, 16, List(XorRegion(2, Array[Byte](1, 2))), None)
+    val (oerrs, errs) = checkSized(DataUpdateOperation.WriteRange, slice, delta.encode, Some(8))
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  private def checkKVSized(kvos: KVObjectState, ops: List[KeyValueOperation], maxSliceSize: Option[Long]) =
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
+    o.kvState = Some(kvos)
+    val req = KeyValueUpdate(kp1, Some(rev1), None, Nil)
+    val payload = KeyValueOperation.encode(ops, Replication(3, 2))(0)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload),
+      maxSliceSize)
+
+  test("KeyValue insert that pushes the serialized size over the max slice size fails") {
+    val k = Key(Array[Byte](1))
+    val v = Array.fill[Byte](10)(7)
+    // Empty state: mask byte + 1-byte count. Entry: 16-byte revision + 8-byte timestamp
+    // + (1 + 1) key + (1 + 10) value.
+    val newSize = 2 + 24 + 2 + 11
+    assert(KVObjectState.encodedSize(None, None, None, None,
+      Map(k -> new ValueState(Value(v), rev1, ts1, None))) == newSize)
+
+    val atLimit = checkKVSized(new KVObjectState, List(Insert(k, v)), Some(newSize.toLong))
+    assert(atLimit._1.isEmpty)
+    assert(atLimit._2.isEmpty)
+
+    val (oerrs, errs) = checkKVSized(new KVObjectState, List(Insert(k, v)), Some(newSize.toLong - 1))
+    assert(oerrs == Map(oid1 -> SliceSizeExceeded(newSize, newSize - 1)))
+    assert(errs.isEmpty)
+  }
+
+  test("KeyValue delete from an object already above the max slice size passes") {
+    val kvos = new KVObjectState
+    kvos.content = Map(
+      Key(Array[Byte](1)) -> new ValueState(Value(Array.fill[Byte](50)(1)), rev1, ts1, None),
+      Key(Array[Byte](2)) -> new ValueState(Value(Array.fill[Byte](50)(2)), rev1, ts1, None))
+    val (oerrs, errs) = checkKVSized(kvos, List(new Delete(Key(Array[Byte](1)))), Some(10))
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  test("maxSliceSize None never fails on size") {
+    val big = DataBuffer(new Array[Byte](1 << 20))
+    val ow = checkSized(DataUpdateOperation.Overwrite, DataBuffer(new Array[Byte](0)), big, None)
+    assert(ow._1.isEmpty)
+    assert(ow._2.isEmpty)
+
+    val (slice, delta) = appendFixture(Array.tabulate[Byte](20)(_.toByte), new Array[Byte](10000))
+    val ap = checkSized(DataUpdateOperation.Append, slice, delta.encode, None)
+    assert(ap._1.isEmpty)
+    assert(ap._2.isEmpty)
+
+    val kv = checkKVSized(new KVObjectState, List(Insert(Key(Array[Byte](1)), new Array[Byte](10000))), None)
+    assert(kv._1.isEmpty)
+    assert(kv._2.isEmpty)
+  }
+
+}

@@ -573,7 +573,7 @@ message StoragePoolState {
   UUID poolId = 1;
   string name = 2;
   IDA ida = 3;
-  uint32 maxObjectSize = 4;
+  uint32 maxSliceSize = 4;
   repeated PoolStoreEntry stores = 5;
   BackendConfig backendConfig = 6;
   int64 currentUsage = 7;
@@ -581,6 +581,8 @@ message StoragePoolState {
   repeated UUID allocationGroups = 9;
   UUID storageDeviceSet = 10;
   PoolMigration migration = 11;
+  // the backend's own slice limit; 0 means none
+  uint32 backendMaxSliceSize = 12;
 }
 
 enum AllocationGroupMemberType {
@@ -591,9 +593,11 @@ enum AllocationGroupMemberType {
 message AllocationGroupMember {
   AllocationGroupMemberType memberType = 1;
   UUID uuid = 2;
-  uint32 maxObjectSize = 3;
+  uint32 maxSliceSize = 3;
   int64 currentUsage = 4;
   int64 maximumSize = 5;
+  // optional: a derived limit of 0 bytes is possible for tiny slice limits, so 0 cannot mean "none"
+  optional uint32 maxObjectSize = 6;
 }
 
 message AllocationGroupState {
@@ -602,6 +606,7 @@ message AllocationGroupState {
   string name = 3;
   repeated AllocationGroupMember members = 4;
   repeated UUID parentGroups = 5;
+  uint32 maxSliceSize = 6;
 }
 
 message PendingTransfer {

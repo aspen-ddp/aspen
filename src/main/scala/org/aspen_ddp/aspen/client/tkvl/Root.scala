@@ -44,18 +44,21 @@ object Root {
 
     given ExecutionContext = client.clientContext
 
-    if (initialContent.isEmpty) {
-      Future.successful(new Root(0, ordering, None, nodeAllocator))
-    } else {
-      for {
-        alloc <- nodeAllocator.getAllocatorForTier(0)
-        rp <- alloc.allocateKeyValueObject(initialContent)
-      } yield {
-        new Root(0, ordering, Some(rp), nodeAllocator)
-      }
-    }
+    // Every tier is checked up front, not only the tier-0 node allocated here
+    nodeAllocator.validate().flatMap: _ =>
+      if initialContent.isEmpty then
+        Future.successful(new Root(0, ordering, None, nodeAllocator))
+      else
+        for
+          alloc <- nodeAllocator.getAllocatorForTier(0)
+          rp <- alloc.allocateKeyValueObject(initialContent)
+        yield
+          new Root(0, ordering, Some(rp), nodeAllocator)
   }
 
+  /** Decodes a Root. Synchronous, so the node allocator is not validated here: every use that writes a node goes
+    * through `NodeAllocator.getAllocatorForTier`, which checks the tier against its allocator's current limit.
+    */
   def apply(client: AspenClient, arr: Array[Byte]): Root = {
     val bb = ByteBuffer.wrap(arr)
     bb.order(ByteOrder.BIG_ENDIAN)

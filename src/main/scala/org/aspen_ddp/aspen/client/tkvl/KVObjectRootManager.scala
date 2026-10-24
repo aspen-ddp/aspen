@@ -181,6 +181,7 @@ object KVObjectRootManager extends RootManagerFactory {
     //       in unit tests complaining about transactions having no requirements
     //       if this method doesn't do anything.
     for
+      _ <- nodeAllocator.validate()
       alloc <- nodeAllocator.getAllocatorForTier(0)
       kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
       rptr <- alloc.allocateKeyValueObject(initialContent)

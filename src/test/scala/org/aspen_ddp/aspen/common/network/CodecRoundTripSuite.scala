@@ -540,6 +540,13 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decoded = Codec.decode(Codec.encode(original))
     decoded shouldBe original
 
+  test("StoragePoolState round-trip keeps the backend max slice size"):
+    def pool(limit: Option[Int]) = StoragePoolState(
+      PoolId(uuid(1)), "p", Replication(3, 2), Some(4096), Array.empty, RocksDBConfig(limit),
+      storageDeviceSet = StorageDeviceSetId(uuid(8)))
+    Codec.decode(Codec.encode(pool(Some(2048)))).backendConfig shouldBe RocksDBConfig(Some(2048))
+    Codec.decode(Codec.encode(pool(None))).backendConfig shouldBe RocksDBConfig(None)
+
   test("StoragePoolState round-trip"):
     val original = StoragePoolState(
       PoolId(uuid(1)), "test-pool", Replication(3, 2), Some(1024 * 1024),
@@ -557,7 +564,7 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.poolId shouldBe original.poolId
     decoded.name shouldBe "test-pool"
     decoded.ida shouldBe Replication(3, 2)
-    decoded.maxObjectSize shouldBe Some(1024 * 1024)
+    decoded.maxSliceSize shouldBe Some(1024 * 1024)
     decoded.stores.length shouldBe 2
     decoded.currentUsage shouldBe 500L
     decoded.maximumStoreSize shouldBe 10000L
@@ -569,7 +576,7 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       Array.empty, RocksDBConfig(), StorageDeviceSetId(uuid(11))
     )
     val decodedNoMax = Codec.decode(Codec.encode(noMaxSize))
-    decodedNoMax.maxObjectSize shouldBe None
+    decodedNoMax.maxSliceSize shouldBe None
 
   test("StoragePoolState migration field round-trip"):
     val withMigration = StoragePoolState(
@@ -600,22 +607,26 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       level = 2,
       name = "test-group",
       members = List(
-        AllocationGroupState.Member(AllocationGroupState.MemberType.Pool, uuid(2), Some(1024), 500L, 10000L),
-        AllocationGroupState.Member(AllocationGroupState.MemberType.Group, uuid(3), None, 200L, 5000L)
+        AllocationGroupState.Member(AllocationGroupState.MemberType.Pool, uuid(2), Some(1024), Some(2047), 500L, 10000L),
+        AllocationGroupState.Member(AllocationGroupState.MemberType.Group, uuid(3), None, None, 200L, 5000L)
       ),
-      parentGroups = List(AllocationGroupId(uuid(4)), AllocationGroupId(uuid(5)))
+      parentGroups = List(AllocationGroupId(uuid(4)), AllocationGroupId(uuid(5))),
+      maxSliceSize = Some(4096)
     )
     val decoded = Codec.decode(Codec.encode(original))
+    decoded.maxSliceSize shouldBe Some(4096)
     decoded.groupId shouldBe original.groupId
     decoded.level shouldBe 2
     decoded.name shouldBe "test-group"
     decoded.members.size shouldBe 2
     decoded.members.head.memberType shouldBe AllocationGroupState.MemberType.Pool
     decoded.members.head.uuid shouldBe uuid(2)
-    decoded.members.head.maxObjectSize shouldBe Some(1024)
+    decoded.members.head.maxSliceSize shouldBe Some(1024)
+    decoded.members.head.maxObjectSize shouldBe Some(2047)
     decoded.members.head.currentUsage shouldBe 500L
     decoded.members.head.maximumSize shouldBe 10000L
     decoded.members(1).memberType shouldBe AllocationGroupState.MemberType.Group
+    decoded.members(1).maxSliceSize shouldBe None
     decoded.members(1).maxObjectSize shouldBe None
     decoded.parentGroups shouldBe List(AllocationGroupId(uuid(4)), AllocationGroupId(uuid(5)))
 
@@ -630,6 +641,7 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decodedEmpty = Codec.decode(Codec.encode(empty))
     decodedEmpty.members shouldBe Nil
     decodedEmpty.parentGroups shouldBe Nil
+    decodedEmpty.maxSliceSize shouldBe None
 
   test("HostState round-trip"):
     val original = HostState(

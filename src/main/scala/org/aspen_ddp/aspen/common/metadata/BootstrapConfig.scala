@@ -77,16 +77,6 @@ object BootstrapConfig:
     "appending-reed-solomon" -> AppendingReedSolomonFormat
   )
 
-  case class BootstrapIDA(ida: IDA, maxObjectSize: Option[Int])
-
-  object BootstrapIDA extends YObject[BootstrapIDA]:
-    val ida: Required[IDA]           = Required("ida",  Choice("type", IDAOptions))
-    val maxObjectSize: Optional[Int] = Optional("max-object-size", YInt)
-
-    val attrs: List[Attr] = ida :: maxObjectSize :: Nil
-
-    def create(o: Object): BootstrapIDA = BootstrapIDA(ida.get(o), maxObjectSize.get(o))
-
   case class BootstrapHost(hostId: HostId,
                            name: String,
                            address: String,

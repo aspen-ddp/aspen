@@ -14,6 +14,13 @@ class CorruptedLinkedList extends KeyValueError
 /** Thrown when a single split is insufficient to insert all requested content */
 class NodeSizeExceeded extends KeyValueError
 
+/** A TKVL tier is configured with a `maxNodeSize` larger than its allocator can hold. `limit` is the largest
+  * node size allowed for `tier` (see `NodeAllocator.nodeSizeLimit`). Raised rather than clamping the node size.
+  */
+final case class NodeSizeExceedsAllocatorLimit(tier: Int, requested: Int, limit: Int) extends KeyValueError:
+  override def getMessage: String =
+    s"TKVL tier $tier has maxNodeSize $requested, above its allocator's limit of $limit bytes"
+
 class KeyDoesNotExist(val key: Key) extends KeyValueError
 
 /** `cause` carries the underlying decode failure when the root could not be read out of an

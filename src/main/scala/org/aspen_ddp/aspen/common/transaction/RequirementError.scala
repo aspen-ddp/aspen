@@ -29,3 +29,14 @@ case class RequirementCheckFailure() extends RequirementError
   * what the store holds. See DataUpdateOperation.Append.
   */
 case class AppendMismatch() extends RequirementError
+
+/** An update would grow the store's slice of an object beyond the store's max slice size.
+  *
+  * Updates that leave the slice no larger than it currently is are never rejected, so shrinking or deleting an
+  * object that is already oversized always succeeds. Clients should check against the pool's maxObjectSize
+  * instead of relying on this error.
+  *
+  * @param newSize      Size in bytes of the slice the update would produce
+  * @param maxSliceSize The store's effective slice size limit
+  */
+case class SliceSizeExceeded(newSize: Long, maxSliceSize: Long) extends RequirementError

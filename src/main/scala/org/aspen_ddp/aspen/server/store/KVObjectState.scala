@@ -5,7 +5,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{Delete, DeleteLeft, DeleteMax, DeleteMin, DeleteRight, Insert, Key, KeyValueOperation, ObjectRevision, SetLeft, SetMax, SetMin, SetRight, Value}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.util.Varint
 import scala.language.implicitConversions
@@ -24,11 +24,66 @@ class KVObjectState(
   def encode(): DataBuffer = {
     KVObjectState.encode(min, max, left, right, content)
   }
+
+  /** Size in bytes of encode(): the serialized slice this store holds for the object. Lock state is not counted */
+  def encodedSize: Int = KVObjectState.encodedSize(min, max, left, right, content)
+
+  /** encodedSize of the state that applying ops (as RequirementsApplyer does) would produce. This state is not
+    * modified. Every Insert counts the fixed 16-byte revision and 8-byte timestamp, so the transaction's actual
+    * revision and timestamp do not affect the result.
+    */
+  def encodedSizeAfter(ops: List[KeyValueOperation]): Int =
+    val (nmin, nmax, nleft, nright, ncontent) = KVObjectState.applyOps(min, max, left, right, content, ops)
+    KVObjectState.encodedSize(nmin, nmax, nleft, nright, ncontent)
 }
 
 object KVObjectState {
 
   def apply(dataBuffer: DataBuffer): KVObjectState = decode(dataBuffer)
+
+  /** The min, max, left, right and content that applying `ops` in order (as RequirementsApplyer does) to the given
+    * ones produces. Inserted entries get a null revision and zero timestamp: only their sizes matter here.
+    */
+  def applyOps(min: Option[Key],
+               max: Option[Key],
+               left: Option[Value],
+               right: Option[Value],
+               content: Map[Key, ValueState],
+               ops: List[KeyValueOperation])
+      : (Option[Key], Option[Key], Option[Value], Option[Value], Map[Key, ValueState]) =
+    var nmin = min
+    var nmax = max
+    var nleft = left
+    var nright = right
+    var ncontent = content
+    ops.foreach {
+      case o: SetMin => nmin = Some(Key(o.value))
+      case o: SetMax => nmax = Some(Key(o.value))
+      case o: SetLeft => nleft = Some(Value(o.value))
+      case o: SetRight => nright = Some(Value(o.value))
+      case _: DeleteMin => nmin = None
+      case _: DeleteMax => nmax = None
+      case _: DeleteLeft => nleft = None
+      case _: DeleteRight => nright = None
+      case o: Insert =>
+        ncontent += (o.key -> new ValueState(Value(o.value), ObjectRevision.Null, HLCTimestamp.Zero, None))
+      case o: Delete => ncontent -= o.key
+    }
+    (nmin, nmax, nleft, nright, ncontent)
+
+  /** Size in bytes of the slice each store of a pool using `ida` holds for a new key-value object whose initial
+    * content is `ops` (given with full, unencoded values). This is exactly the `encodedSizeAfter` measure stores
+    * apply to an allocation: SetMin/SetMax keys and entry keys are replicated, while Insert, SetLeft and SetRight
+    * values are IDA-encoded to `ida.calculateEncodedSegmentLength` bytes per store.
+    */
+  /** encodedSize of an empty state: the slice a store holds for a newly allocated key-value object before its
+    * initial content is applied (mask byte plus a zero entry count)
+    */
+  val EmptyEncodedSize: Int = encodedSize(None, None, None, None, Map())
+
+  def allocationSliceSize(ida: IDA, ops: List[KeyValueOperation]): Int =
+    val (min, max, left, right, content) = applyOps(None, None, None, None, Map(), ops)
+    encodedSizeIDA(ida, min, max, left, right, content)
 
   // <mask byte> min 0 max << 1 left << 2 right << 3
   // <vartint len><nbytes>

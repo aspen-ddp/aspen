@@ -20,14 +20,52 @@ object AllocationGroupState:
   enum MemberType:
     case Pool, Group
 
+  /** A pool or child group within an allocation group.
+    *
+    * @param maxSliceSize  the member's slice limit, or `None` for no limit: for a pool its effective limit
+    *                      (`StoragePoolState.effectiveMaxSliceSize`, which includes the backend's), for a child group
+    *                      its declared `maxSliceSize`. Used to enforce the membership rule; most code should use
+    *                      `maxObjectSize`.
+    * @param maxObjectSize largest object, in bytes, that can be allocated through this member. For a pool it is the
+    *                      pool's `maxObjectSize`, which is fixed for the pool's lifetime. For a child group it is a
+    *                      snapshot of the child's `maximumObjectSize` taken when it joined, which can go stale as the
+    *                      child's membership changes; group allocators compute the live value from the child's own
+    *                      state instead (see `ObjectAllocator.maxObjectSize`). `None` when unlimited.
+    */
   case class Member(memberType: MemberType,
                     uuid: UUID,
+                    maxSliceSize: Option[Int],
                     maxObjectSize: Option[Int],
                     currentUsage: Long,
                     maximumSize: Long)
-  
+
+  object Member:
+    /** The Member entry for pool `ps`, with its limits taken from the pool's effective slice limit and IDA */
+    def forPool(ps: StoragePoolState): Member =
+      Member(MemberType.Pool, ps.poolId.uuid, ps.effectiveMaxSliceSize, ps.maxObjectSize, ps.currentUsage,
+        ps.maximumStoreSize)
+
+    /** The Member entry for child group `ags` */
+    def forGroup(ags: AllocationGroupState): Member =
+      Member(MemberType.Group, ags.groupId.uuid, ags.maxSliceSize, ags.maximumObjectSize,
+        ags.currentUsage, ags.maximumSize)
+
   /** Thrown if attempting to add a group to one of an equal or lower level */
   class InvalidLevel extends Throwable
+
+  /** Thrown when a pool or group cannot join a group because its slice limit is larger than the group's, or
+    * because it has no limit (`memberLimit == None`) while the group does. Raised before any state changes.
+    */
+  final case class MemberLimitExceedsGroup(memberId: UUID, memberLimit: Option[Int], groupLimit: Int)
+    extends Exception(s"Member $memberId with maxSliceSize ${memberLimit.getOrElse("unlimited")} cannot join a " +
+      s"group whose maxSliceSize is $groupLimit")
+
+  /** Throws `MemberLimitExceedsGroup` unless a member with slice limit `memberLimit` may join `group` */
+  private def checkMemberLimit(memberId: UUID, memberLimit: Option[Int], group: AllocationGroupState): Unit =
+    group.maxSliceSize.foreach: groupLimit =>
+      memberLimit match
+        case Some(limit) if limit <= groupLimit => ()
+        case _ => throw MemberLimitExceedsGroup(memberId, memberLimit, groupLimit)
 
   def apply(cfg: Array[Byte]): AllocationGroupState = Codec.decode(codec.AllocationGroupState.parseFrom(cfg))
   def apply(dos: DataObjectState): AllocationGroupState = apply(dos.data.getByteArray)
@@ -44,14 +82,15 @@ object AllocationGroupState:
       if ps.allocationGroups.contains(parentId.uuid) && ags.members.exists(_.uuid == poolId.uuid) then
         None
       else
+        checkMemberLimit(ps.poolId.uuid, ps.effectiveMaxSliceSize, ags)
+
         val nps = ps.copy(allocationGroups = parentId.uuid :: ps.allocationGroups)
         val reqs = List(KeyRevision(StoragePoolState.ConfigKey, psKvos.contents(StoragePoolState.ConfigKey).revision))
         val ops = List(Insert(StoragePoolState.ConfigKey, nps.encode()))
 
         tx.update(psPtr, None, None, reqs, ops)
 
-        val m = Member(MemberType.Pool, ps.poolId.uuid, ps.maxObjectSize, ps.currentUsage, ps.maximumStoreSize)
-        val nags = ags.copy(members = m :: ags.members)
+        val nags = ags.copy(members = Member.forPool(ps) :: ags.members)
 
         tx.overwrite(agsPtr, agsDos.revision, DataBuffer(nags.toBytes))
 
@@ -132,6 +171,7 @@ object AllocationGroupState:
     def onFail(err: Throwable): Future[Unit] = err match
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
+      case e: MemberLimitExceedsGroup => throw StopRetrying(e)
 
     client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prep(tx)
@@ -152,13 +192,13 @@ object AllocationGroupState:
         if child.level >= parent.level then
           throw new InvalidLevel()
 
+        checkMemberLimit(child.groupId.uuid, child.maxSliceSize, parent)
+
         val nchild = child.copy(parentGroups = parentId :: child.parentGroups)
 
         tx.overwrite(childPtr, childDos.revision, DataBuffer(nchild.toBytes))
 
-        val m = Member(MemberType.Group, child.groupId.uuid, child.maximumObjectSize,
-          child.currentUsage, child.maximumSize)
-        val nags = parent.copy(members = m :: parent.members)
+        val nags = parent.copy(members = Member.forGroup(child) :: parent.members)
 
         tx.overwrite(parentPtr, parentDos.revision, DataBuffer(nags.toBytes))
 
@@ -219,17 +259,23 @@ object AllocationGroupState:
       case e: NoSuchElementException => throw StopRetrying(e)
       case e: ReadError => throw StopRetrying(e)
       case e: InvalidLevel => throw StopRetrying(e)
+      case e: MemberLimitExceedsGroup => throw StopRetrying(e)
 
     client.transactUntilSuccessfulWithRecovery(onFail): tx =>
       prep(tx)
 
 
+/** @param maxSliceSize the group's declared slice limit, or `None` for no limit. Fixed when the group is created.
+  *                     Only pools and groups whose own `maxSliceSize` is no larger may join. Most code should use
+  *                     the group allocator's `maxObjectSize` instead.
+  */
 final case class AllocationGroupState(
                                      groupId: AllocationGroupId,
                                      level: Int,
                                      name: String,
                                      members: List[AllocationGroupState.Member],
-                                     parentGroups: List[AllocationGroupId]
+                                     parentGroups: List[AllocationGroupId],
+                                     maxSliceSize: Option[Int] = None
                                      ):
 
   private var wselector: Option[WeightedSelector[AllocationGroupState.Member]] = None
@@ -269,15 +315,11 @@ final case class AllocationGroupState(
       val sz = if m.uuid == uuid then newMaxSize else m.maximumSize
       acc + sz
   
-  /** Returns the smallest maximumObjectSize for all members */
+  /** The smallest `Member.maxObjectSize` among the members, or `None` when no member has a limit (including when
+    * the group has no members). This is exact for pool members, but a child group's entry is a snapshot taken when
+    * it joined and is not updated as the child's own membership changes, so for groups with child groups this can
+    * be stale. Code allocating through the group should use the group allocator's `maxObjectSize`
+    * (`ObjectAllocator.maxObjectSize`), which recomputes the value from the child groups' current states.
+    */
   def maximumObjectSize: Option[Int] =
-    members.foldLeft[Option[Int]](None): (acc, m) => 
-      acc match
-        case None => m.maxObjectSize 
-        case Some(min) => 
-          if m.maxObjectSize.getOrElse(Int.MaxValue) < min then 
-            m.maxObjectSize 
-          else 
-            acc
-      
-          
+    members.flatMap(_.maxObjectSize).minOption

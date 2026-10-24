@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyAlreadyExists}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.aspen_ddp.aspen.common.DataBuffer
 
@@ -125,6 +125,63 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       // Registry.DuplicateRegistration belongs to the non-transactional register() path.
       err shouldBe a[KeyAlreadyExists]
       after should be(before)
+
+  atest("createNewStoragePool rejects a maxSliceSize below the IDA's minSliceSize"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    for
+      before <- client.listStoragePools()
+      _ = an[IllegalArgumentException] should be thrownBy
+        client.createNewStoragePool("tiny-slice-pool", ida, Some(1), RocksDBConfig(), setId, 0L)
+      _ <- waitForTransactionsToComplete()
+      after <- client.listStoragePools()
+    yield
+      after should be(before)
+
+  atest("createNewStoragePool rejects a backend maxSliceSize below the IDA's minSliceSize"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    for
+      before <- client.listStoragePools()
+      _ = an[IllegalArgumentException] should be thrownBy
+        client.createNewStoragePool("tiny-backend-pool", ida, Some(1000), RocksDBConfig(Some(7)), setId, 0L)
+      _ <- waitForTransactionsToComplete()
+      after <- client.listStoragePools()
+    yield
+      after should be(before)
+
+  atest("a backend maxSliceSize below the pool's sets the pool's effective limit"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    val ida = ReedSolomon(5, 3, 4)
+    for
+      poolId <- client.createNewStoragePool("backend-limited", ida, Some(2000), RocksDBConfig(Some(1000)), setId, 0L)
+      _ <- waitForTransactionsToComplete()
+      poolState <- client.getStoragePoolState(poolId)
+      pool <- client.getStoragePool(poolId)
+    yield
+      poolState.maxSliceSize should be(Some(2000))
+      poolState.effectiveMaxSliceSize should be(Some(1000))
+      poolState.maxObjectSize should be(Some(ida.maxObjectSize(1000)))
+      pool.maxSliceSize should be(Some(1000))
+      pool.maxObjectSize should be(Some(ida.maxObjectSize(1000)))
+      pool.allocator.maxObjectSize should be(Some(ida.maxObjectSize(1000)))
+
+  atest("createNewStoragePool records maxSliceSize and derives maxObjectSize"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    for
+      poolId <- client.createNewStoragePool("sliced-pool", Replication(1, 1), Some(1000), RocksDBConfig(), setId, 0L)
+      _ <- waitForTransactionsToComplete()
+      poolState <- client.getStoragePoolState(poolId)
+      pool <- client.getStoragePool(poolId)
+    yield
+      poolState.maxSliceSize should be(Some(1000))
+      pool.maxSliceSize should be(Some(1000))
+      pool.maxObjectSize should be(Some(1000))
+      pool.allocator.maxObjectSize should be(Some(1000))
 
   atest("createStorageDeviceSet rejects a parent at an equal or lower level"):
     given ExecutionContext = executionContext

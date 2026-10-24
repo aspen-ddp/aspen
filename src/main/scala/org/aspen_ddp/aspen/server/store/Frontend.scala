@@ -35,7 +35,9 @@ class Frontend(val storeId: StoreId,
                val objectCache: ObjectCache,
                val net: Messenger,
                val crl: CrashRecoveryLog,
-               val statusCache: TransactionStatusCache) extends Logging {
+               val statusCache: TransactionStatusCache,
+               /** The store's effective slice size limit, enforced by its transactions. None means unlimited. */
+               val maxSliceSize: Option[Long] = None) extends Logging {
 
   import Frontend._
 

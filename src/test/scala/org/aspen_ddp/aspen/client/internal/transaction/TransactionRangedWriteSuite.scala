@@ -35,7 +35,7 @@ class TransactionRangedWriteSuite extends AnyFunSuite with Matchers {
       ars, 0, DataBuffer(bytes)))
 
   private def build(bldr: TransactionBuilder, ida: IDA, maxObjectSize: Option[Int] = None) =
-    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> ida), Map(p1.poolId -> maxObjectSize))
+    bldr.buildTranaction(OpportunisticRebuildManager.None, Map(p1.poolId -> ida), Map(p1.poolId -> maxObjectSize), Map())
 
   private def bytes(s: String): Array[Byte] = s.getBytes("UTF-8")
 
@@ -161,7 +161,7 @@ class TransactionRangedWriteSuite extends AnyFunSuite with Matchers {
     bldr.rangedWrites(fullState(), List(RangedWrite(Int.MaxValue - ars.rowBytes, bytes("a"))), true)
     val err = intercept[ObjectSizeLimitExceeded]:
       build(bldr, ars)
-    err.maxObjectSize should be (Int.MaxValue - ars.rowBytes)
+    err.maxObjectSize should be (ars.maxObjectSize(Long.MaxValue))
   }
 
   test("the requirement is DataUpdate(ptr, state.revision, WriteRange)") {

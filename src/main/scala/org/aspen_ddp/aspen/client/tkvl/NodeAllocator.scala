@@ -1,11 +1,10 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import java.nio.ByteBuffer
-import java.util.UUID
-import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectAllocatorId}
+import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -24,19 +23,115 @@ object NodeAllocator:
 
     new NodeAllocator(client, tiers.reverse)
 
+  /** Largest `maxNodeSize` a node stored in a pool with this IDA and slice limit may use, or `None` for no limit.
+    *
+    * `KeyValueListNode` sizes a node the way the store measures it: every byte it counts (the per-entry
+    * revision, timestamp and varints, the IDA-encoded value slices and the node overhead) is a byte of the
+    * slice each store holds. A node of `maxNodeSize` bytes therefore needs a slice limit of at least
+    * `maxNodeSize`, so the limit is `maxSliceSize`. It is also kept at or below the pool's `maxObjectSize`
+    * (`ida.maxObjectSize(maxSliceSize)`), which for every IDA but a single-data-shard one is the larger of the two.
+    */
+  def nodeSizeLimit(ida: IDA, maxSliceSize: Option[Int]): Option[Int] =
+    maxSliceSize.map(s => math.min(s, ida.maxObjectSize(s)))
 
+  /** Largest `maxNodeSize` a tier allocating through `allocator` may use, or `None` for no limit. A pool allocator
+    * uses its pool's `nodeSizeLimit`. Any other allocator (an allocation group) only knows its current
+    * `maxObjectSize`, so that is the limit here; the slice limit of the pool a node actually lands in is checked
+    * when the node is allocated.
+    */
+  def nodeSizeLimit(allocator: ObjectAllocator): Option[Int] = allocator match
+    case p: PoolObjectAllocator => nodeSizeLimit(p.pool.ida, p.pool.maxSliceSize)
+    case a => a.maxObjectSize
+
+  /** `preferred`, or the limit when that is smaller. For code choosing its own default node size for a pool; a
+    * configured node size is never adjusted, it is checked.
+    */
+  def fittingNodeSize(preferred: Int, limit: Option[Int]): Int =
+    limit match
+      case Some(l) if l < preferred => l
+      case _ => preferred
+
+  /** Throws `NodeSizeExceedsAllocatorLimit` if `maxNodeSize` is above `limit` */
+  def checkNodeSize(tier: Int, maxNodeSize: Int, limit: Option[Int]): Unit =
+    limit.foreach: l =>
+      if maxNodeSize > l then
+        throw NodeSizeExceedsAllocatorLimit(tier, maxNodeSize, l)
+
+  /** Allocator handed out for a tier. After the underlying allocator picks a pool for a new node, checks the
+    * tier's node size against that pool's limit. This catches allocators whose reported limit overstates the pool
+    * a node lands in, such as a group holding a stale snapshot of a child group's limit. Pool limits never change,
+    * so a node that passes stays valid.
+    */
+  private class TierAllocator(tier: Int, maxNodeSize: Int, val underlying: ObjectAllocator) extends ObjectAllocator:
+    val client: AspenClient = underlying.client
+    val allocatorId: ObjectAllocatorId = underlying.allocatorId
+
+    def maxObjectSize: Option[Int] = underlying.maxObjectSize
+
+    // Unchecked: TKVL nodes are always key-value objects, so data objects are never nodes
+    protected[client] def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer] =
+      underlying.createDataObjectPointer()
+
+    protected[client] def createKeyValueObjectPointer()(using t: Transaction): Future[KeyValueObjectPointer] =
+      given ExecutionContext = client.clientContext
+      underlying.createKeyValueObjectPointer().flatMap: ptr =>
+        client.getStoragePool(ptr.poolId).map: pool =>
+          checkNodeSize(tier, maxNodeSize, nodeSizeLimit(pool.ida, pool.maxSliceSize))
+          ptr
+
+
+/** Per-tier node allocation configuration for a TKVL: the allocator each tier allocates nodes from and the
+  * tier's `maxNodeSize`. Tiers beyond the configured ones use the last tier's configuration.
+  *
+  * A tier's `maxNodeSize` may never exceed `NodeAllocator.nodeSizeLimit` of its allocator. `validate` checks every
+  * configured tier and `Root.create` calls it. Decoding (`NodeAllocator.apply`, `Root.apply`) is synchronous and
+  * does not check; instead `getAllocatorForTier`, which every node insert, split and allocation goes through,
+  * re-checks the tier against the allocator's current limit each time and fails with
+  * `NodeSizeExceedsAllocatorLimit` before anything is written.
+  */
 class NodeAllocator(val client:AspenClient, config: Seq[(ObjectAllocatorId, Int)]):
 
   val tiers: Array[(ObjectAllocatorId, Int)] = config.toArray
 
   def encodedSize: Int = 1 + (NodeAllocator.encodedTierSize * tiers.length)
 
-  def getAllocatorForTier(tier: Int): Future[ObjectAllocator] =
-    val allocatorId = if tier < tiers.length then tiers(tier)._1 else tiers.last._1
+  private def tierConfig(tier: Int): (ObjectAllocatorId, Int) =
+    if tier < tiers.length then tiers(tier) else tiers.last
+
+  /** Looks up an allocator. Overridable for tests */
+  protected def lookupAllocator(allocatorId: ObjectAllocatorId): Future[ObjectAllocator] =
     client.getAllocator(allocatorId)
 
-  def getMaxNodeSize(tier: Int): Int =
-    if tier < tiers.length then tiers(tier)._2 else tiers.last._2
+  /** The tier's allocator, after checking the tier's node size against the allocator's current limit */
+  private def checkedAllocator(tier: Int): Future[ObjectAllocator] =
+    given ExecutionContext = client.clientContext
+    val (allocatorId, maxNodeSize) = tierConfig(tier)
+    lookupAllocator(allocatorId).map: allocator =>
+      NodeAllocator.checkNodeSize(tier, maxNodeSize, NodeAllocator.nodeSizeLimit(allocator))
+      allocator
+
+  /** Fails with `NodeSizeExceedsAllocatorLimit` for the first configured tier whose `maxNodeSize` is above its
+    * allocator's `NodeAllocator.nodeSizeLimit`. Allocators without a limit always pass.
+    *
+    * Group tiers are only partly checked here: a group has no IDA, so only its current `maxObjectSize` is
+    * compared. The full check, against the slice limit of the pool a node lands in, happens when the tier
+    * allocates its first node (see `getAllocatorForTier`).
+    */
+  def validate(): Future[Unit] =
+    given ExecutionContext = client.clientContext
+    tiers.indices.foldLeft(Future.unit): (prev, tier) =>
+      prev.flatMap(_ => checkedAllocator(tier).map(_ => ()))
+
+  /** The allocator for new nodes in `tier`. Fails with `NodeSizeExceedsAllocatorLimit` if the tier's node size is
+    * above the allocator's current limit, and the returned allocator fails the same way if a node lands in a pool
+    * whose limit is below the node size.
+    */
+  def getAllocatorForTier(tier: Int): Future[ObjectAllocator] =
+    given ExecutionContext = client.clientContext
+    checkedAllocator(tier).map: allocator =>
+      new NodeAllocator.TierAllocator(tier, getMaxNodeSize(tier), allocator)
+
+  def getMaxNodeSize(tier: Int): Int = tierConfig(tier)._2
 
   def encodeInto(bb:ByteBuffer): Unit =
     bb.put(tiers.length.toByte)

@@ -323,7 +323,7 @@ are considered lost as well.
 #### Storage Pools
 The metadata entries for StoragePools contain the following items:
 * IDA
-* Optional maximum object size
+* Optional maximum slice size (fixed at creation)
 * Storage Device Set Id the pool is assigned to
 * Maximum store size in bytes
 * Approximate current usage in bytes
@@ -331,6 +331,13 @@ The metadata entries for StoragePools contain the following items:
 * Array of StoreEntries with one entry per DataStore
 * Allocation Tree ObjectPointer
 * Error Tree ObjectPointer
+
+The maximum slice size is the most any one DataStore will hold for a single object. The pool's backend
+configuration may carry its own limit, and the smaller of the two is the pool's effective limit. How much object
+data that allows depends on the IDA (see "Object Size Limits" in the [Usage Guide](UsageGuide.md)). Each store
+enforces the effective limit from its own config file, voting to abort any transaction that would grow a slice
+beyond it. Updates that do not grow a slice that is already over the limit, such as shrinking or deleting the
+object, always pass.
 
 There are a few other items as well but those are the key elements. The array of StoreEnties requires 
 a bit more explanation. The StoreEntry is a tuple of (StorageDeviceId, HostId). The StorageDeviceId 
@@ -381,6 +388,9 @@ mechanism is also used to gracefully add and remove StorageDevices from the set.
 AllocationGroups exist to spread object allocations across a group of StoragePools or other 
 AllocationGroups. Similar to StorageDeviceSets, AllocationGroups use the same Leveling strategy to 
 form groups of groups for allocation purposes.
+
+An AllocationGroup may carry a maximum slice size, fixed at creation. A pool or group may only join a group
+whose limit is at least as large as its own, so every allocation from the group fits whichever member is chosen.
 
 Allocation groups track the approximate usage of all group members and employs a weighted selection 
 method when choosing a pool or group to allocate an object from. Pools and groups that are relatively 

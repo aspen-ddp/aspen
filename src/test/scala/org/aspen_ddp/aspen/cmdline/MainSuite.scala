@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.cmdline
 
+import java.io.OutputStream
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -599,13 +600,15 @@ class MainSuite extends AnyFunSuite with Matchers:
         Main.Args()).getOrElse(fail("create-pool did not parse"))
       parsed.idaType shouldBe "appending-reed-solomon"
       parsed.cellSize shouldBe 128
-      Main.buildParser.parse(
-        Seq("create-pool", cfgs, "mypool", "bogus", "5", "3", "4", "myset"), Main.Args()) shouldBe None
+      Console.withErr(OutputStream.nullOutputStream()):
+        Main.buildParser.parse(
+          Seq("create-pool", cfgs, "mypool", "bogus", "5", "3", "4", "myset"), Main.Args()) shouldBe None
 
   test("--cell-size below 8 is rejected"):
-    def parse(size: String) = Main.buildParser.parse(
-      Seq("bootstrap", "/tmp/target", "10.0.0.1", "appending-reed-solomon", "3", "4", "5", "--cell-size", size),
-      Main.Args())
+    def parse(size: String) = Console.withErr(OutputStream.nullOutputStream()):
+      Main.buildParser.parse(
+        Seq("bootstrap", "/tmp/target", "10.0.0.1", "appending-reed-solomon", "3", "4", "5", "--cell-size", size),
+        Main.Args())
     parse("7") shouldBe None
     parse("0") shouldBe None
     parse("-1") shouldBe None

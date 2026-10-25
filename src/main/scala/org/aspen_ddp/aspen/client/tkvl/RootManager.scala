@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, Value}
 
 import scala.concurrent.Future
 
@@ -21,7 +21,7 @@ trait RootManager {
 
   def getMaxNodeSize(tier: Int): Future[Int]
 
-  def prepareRootUpdate(newTier: Int, onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit]
+  def prepareRootUpdate(newTier: Int, onewRoot: Option[ObjectPointer])(using tx: Transaction): Future[Unit]
 
   def encode(): Array[Byte]
 

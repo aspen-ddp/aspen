@@ -38,7 +38,7 @@ class SimpleFileRootManager(client: AspenClient,
           val inode = FileInode(client, inodeDos.data)
           val root = inode.contents
 
-          root.orootObject match
+          root.rootKeyValuePointer match
             case None => p.success(RData(root, inodeDos.revision, None))
             case Some(rootObject) =>
               client.read(rootObject).onComplete:
@@ -79,7 +79,7 @@ class SimpleFileRootManager(client: AspenClient,
     arr
 
   override def prepareRootUpdate(newTier: Int,
-                                 onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit] =
+                                 onewRoot: Option[ObjectPointer])(using tx: Transaction): Future[Unit] =
     val p = Promise[Unit]()
 
     client.read(inodePointer).onComplete:

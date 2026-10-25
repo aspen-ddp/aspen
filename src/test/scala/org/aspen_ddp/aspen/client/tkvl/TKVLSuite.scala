@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, Value}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 
 import scala.concurrent.Future
@@ -498,7 +498,7 @@ class TKVLSuite extends IntegrationTestSuite {
     def getAllocatorForTier(tier: Int): Future[ObjectAllocator] =
       real.getAllocatorForTier(tier)
     def getMaxNodeSize(tier: Int): Future[Int] = real.getMaxNodeSize(tier)
-    def prepareRootUpdate(newTier: Int, onewRoot: Option[KeyValueObjectPointer])
+    def prepareRootUpdate(newTier: Int, onewRoot: Option[ObjectPointer])
                          (using tx: Transaction): Future[Unit] = real.prepareRootUpdate(newTier, onewRoot)
     def encode(): Array[Byte] = real.encode()
     def typeId: RootManagerTypeId = real.typeId

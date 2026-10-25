@@ -4,7 +4,7 @@ import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, RegisteredTypeFactory, Transaction}
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyOrdering, KeyValueObjectPointer, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -35,7 +35,7 @@ class KVObjectRootManager(val client: AspenClient,
           case Some(v) => try {
             val root = Root(client, v.value.bytes)
 
-            root.orootObject match {
+            root.rootKeyValuePointer match {
               case None => p.success(RData(root, v.revision, None))
               case Some(rootObject) =>
                 client.read(rootObject, s"Root node for TKVL tree $treeKey").onComplete {
@@ -87,7 +87,7 @@ class KVObjectRootManager(val client: AspenClient,
     arr
   }
 
-  def prepareRootUpdate(newTier: Int, onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit] = {
+  def prepareRootUpdate(newTier: Int, onewRoot: Option[ObjectPointer])(using tx: Transaction): Future[Unit] = {
     getRData().map { rd =>
       val data = rd.root.copy(tier=newTier, orootObject=onewRoot).encode()
       val reqs = KeyValueUpdate.KeyRevision(treeKey, rd.rootRevision) :: Nil

@@ -3,16 +3,22 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
 
 case class Root(tier: Int,
                 ordering: KeyOrdering,
-                orootObject: Option[KeyValueObjectPointer],
-                nodeAllocator: NodeAllocator) {
+                orootObject: Option[ObjectPointer],
+                nodeAllocator: NodeAllocator,
+                kind: TreeKind = TreeKind.KeyValueObjects) {
 
-  def encodedSize: Int = 1 + 1 + nodeAllocator.encodedSize + 1 + orootObject.map(_.encodedSize).getOrElse(0)
+  /** The root node pointer for callers that only deal with key-value object trees */
+  def rootKeyValuePointer: Option[KeyValueObjectPointer] = orootObject.map:
+    case kvp: KeyValueObjectPointer => kvp
+    case other => throw new InvalidRoot(new IllegalStateException(s"Root pointer is not a KeyValueObjectPointer: $other"))
+
+  def encodedSize: Int = 1 + 1 + 1 + nodeAllocator.encodedSize + 1 + orootObject.map(_.encodedSize).getOrElse(0)
 
   def encode(): Array[Byte] = {
     val arr = new Array[Byte](encodedSize)
@@ -20,6 +26,7 @@ case class Root(tier: Int,
     bb.order(ByteOrder.BIG_ENDIAN)
     bb.put(tier.toByte)
     bb.put(ordering.code)
+    bb.put(kind.code)
     nodeAllocator.encodeInto(bb)
     orootObject match {
       case None => bb.put(0.toByte)
@@ -40,20 +47,21 @@ object Root {
   def create(client: AspenClient,
              ordering: KeyOrdering,
              nodeAllocator: NodeAllocator,
-             initialContent: Map[Key, Value] = Map())(using t: Transaction): Future[Root] = {
+             initialContent: Map[Key, Value] = Map(),
+             kind: TreeKind = TreeKind.KeyValueObjects)(using t: Transaction): Future[Root] = {
 
     given ExecutionContext = client.clientContext
 
     // Every tier is checked up front, not only the tier-0 node allocated here
     nodeAllocator.validate().flatMap: _ =>
       if initialContent.isEmpty then
-        Future.successful(new Root(0, ordering, None, nodeAllocator))
+        Future.successful(new Root(0, ordering, None, nodeAllocator, kind))
       else
         for
           alloc <- nodeAllocator.getAllocatorForTier(0)
           rp <- alloc.allocateKeyValueObject(initialContent)
         yield
-          new Root(0, ordering, Some(rp), nodeAllocator)
+          new Root(0, ordering, Some(rp), nodeAllocator, kind)
   }
 
   /** Decodes a Root. Synchronous, so the node allocator is not validated here: every use that writes a node goes
@@ -69,13 +77,17 @@ object Root {
     bb.order(ByteOrder.BIG_ENDIAN)
     val tier = bb.get()
     val ordering = KeyOrdering.fromCode(bb.get())
+    val kind = TreeKind.fromCode(bb.get())
     val nodeAllocator = NodeAllocator(client, bb)
 
     val oroot = bb.get() match {
-      case 1 => Some(KeyValueObjectPointer(bb))
+      case 1 =>
+        kind match
+          case TreeKind.KeyValueObjects => Some(KeyValueObjectPointer(bb))
+          case TreeKind.DataObjects => Some(DataObjectPointer(bb))
       case _ => None
     }
 
-    Root(tier, ordering, oroot, nodeAllocator)
+    Root(tier, ordering, oroot, nodeAllocator, kind)
   }
 }

@@ -38,7 +38,7 @@ class SimpleDirectoryRootManager(client: AspenClient,
           val inode = DirectoryInode(client, inodeDos.data)
           val root = inode.contents
 
-          root.orootObject match {
+          root.rootKeyValuePointer match {
             case None => p.success(RData(root, inodeDos.revision, None))
             case Some(rootObject) =>
               client.read(rootObject).onComplete {
@@ -88,7 +88,7 @@ class SimpleDirectoryRootManager(client: AspenClient,
   }
 
   override def prepareRootUpdate(newTier: Int, 
-                                 onewRoot: Option[KeyValueObjectPointer])(using tx: Transaction): Future[Unit] = {
+                                 onewRoot: Option[ObjectPointer])(using tx: Transaction): Future[Unit] = {
     val p = Promise[Unit]()
 
     client.read(inodePointer).onComplete {

@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.common.metadata.management
 
+import org.aspen_ddp.aspen.common.metadata.IDAPolicy
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.Radicle
@@ -46,7 +47,7 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0)
+      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -79,9 +80,9 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId1 <- client.createAllocationGroup("group-1", level = 0)
+      groupId1 <- client.createAllocationGroup("group-1", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      groupId2 <- client.createAllocationGroup("group-2", level = 0)
+      groupId2 <- client.createAllocationGroup("group-2", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId1, Some(executor))
@@ -118,7 +119,7 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     val unknownChildUUID = java.util.UUID.randomUUID()
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0)
+      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -147,9 +148,9 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     for
       executor <- setup()
 
-      childGroupId <- client.createAllocationGroup("child-group", level = 0)
+      childGroupId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentGroupId <- client.createAllocationGroup("parent-group", level = 1)
+      parentGroupId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, Some(executor))
@@ -195,9 +196,9 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     for
       executor <- setup()
 
-      childGroupId <- client.createAllocationGroup("child-group", level = 0)
+      childGroupId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentGroupId <- client.createAllocationGroup("parent-group", level = 1)
+      parentGroupId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, Some(executor))
@@ -254,9 +255,9 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     val unknownChildUUID = java.util.UUID.randomUUID()
     for
       executor <- setup()
-      groupId1 <- client.createAllocationGroup("group-1", level = 0)
+      groupId1 <- client.createAllocationGroup("group-1", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      groupId2 <- client.createAllocationGroup("group-2", level = 0)
+      groupId2 <- client.createAllocationGroup("group-2", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       kvos <- client.read(radicle)

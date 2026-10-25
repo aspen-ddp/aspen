@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPolicy, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, ClientResponse, HostMessage, ServiceMessage}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer}
@@ -187,8 +187,16 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     * @param maxSliceSize the group's slice limit, fixed for the group's lifetime, or `None` for no limit. Only pools
     *                     and groups whose own `maxSliceSize` is no larger may join it. The object size limit users
     *                     see is the group allocator's derived `maxObjectSize`.
+    * @param idaPolicy   `ExactMatch` (the default) requires every member's IDA to equal `ida`; `AllowAll` accepts
+    *                    any member. Fixed for the group's lifetime.
+    * @param ida         the IDA members must equal. Required for `ExactMatch` and must be `None` for `AllowAll`;
+    *                    anything else throws `IllegalArgumentException`.
     */
-  def createAllocationGroup(groupName: String, level: Int, maxSliceSize: Option[Int] = None): Future[AllocationGroupId]
+  def createAllocationGroup(groupName: String,
+                            level: Int,
+                            maxSliceSize: Option[Int] = None,
+                            idaPolicy: IDAPolicy = IDAPolicy.ExactMatch,
+                            ida: Option[IDA] = None): Future[AllocationGroupId]
 
   def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId]
 

@@ -319,11 +319,21 @@ abstract class BaseAspenClient(
   // ---- Creates (all routed through the runCreate seam) ----
 
   override def createAllocationGroup(groupName: String, level: Int,
-                                     maxSliceSize: Option[Int]): Future[AllocationGroupId] =
+                                     maxSliceSize: Option[Int],
+                                     idaPolicy: IDAPolicy,
+                                     ida: Option[IDA]): Future[AllocationGroupId] =
     // A limit of 0 would admit no members, and the encoding uses 0 for "no limit"
     maxSliceSize.foreach: limit =>
       if limit <= 0 then
         throw new IllegalArgumentException(s"maxSliceSize ($limit) must be positive")
+
+    idaPolicy match
+      case IDAPolicy.ExactMatch =>
+        if ida.isEmpty then
+          throw new IllegalArgumentException("An ExactMatch allocation group requires an ida")
+      case IDAPolicy.AllowAll =>
+        if ida.nonEmpty then
+          throw new IllegalArgumentException("An AllowAll allocation group may not specify an ida")
 
     val ags = AllocationGroupState(
       AllocationGroupId(UUID.randomUUID()),
@@ -331,7 +341,9 @@ abstract class BaseAspenClient(
       groupName,
       Nil,
       Nil,
-      maxSliceSize
+      maxSliceSize,
+      idaPolicy,
+      ida
     )
 
     runCreate(StopRetrying.unlessCollision): tx =>

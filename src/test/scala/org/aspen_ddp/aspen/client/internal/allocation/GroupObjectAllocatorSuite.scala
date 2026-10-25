@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
+import org.aspen_ddp.aspen.common.metadata.IDAPolicy
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AllocationError, GroupObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
@@ -32,7 +33,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
   atest("allocation from empty group fails with AllocationError for DataObject"):
     given ExecutionContext = executionContext
     for
-      groupId <- client.createAllocationGroup("empty-group", level = 0)
+      groupId <- client.createAllocationGroup("empty-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
@@ -45,7 +46,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
   atest("allocation from empty group fails with AllocationError for KeyValueObject"):
     given ExecutionContext = executionContext
     for
-      groupId <- client.createAllocationGroup("empty-group", level = 0)
+      groupId <- client.createAllocationGroup("empty-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       allocator <- client.getAllocator(GroupObjectAllocatorId(groupId))
@@ -59,7 +60,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("pool-group", level = 0)
+      groupId <- client.createAllocationGroup("pool-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -83,7 +84,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
     val value = Value(Array[Byte](7, 8, 9))
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("pool-group", level = 0)
+      groupId <- client.createAllocationGroup("pool-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -107,9 +108,9 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
     for
       executor <- setup()
 
-      group0Id <- client.createAllocationGroup("group0", level = 0)
+      group0Id <- client.createAllocationGroup("group0", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      group1Id <- client.createAllocationGroup("group1", level = 1)
+      group1Id <- client.createAllocationGroup("group1", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, group0Id, Some(executor))
@@ -135,11 +136,11 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
     for
       executor <- setup()
 
-      group0Id <- client.createAllocationGroup("group0", level = 0)
+      group0Id <- client.createAllocationGroup("group0", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      group1Id <- client.createAllocationGroup("group1", level = 1)
+      group1Id <- client.createAllocationGroup("group1", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      group2Id <- client.createAllocationGroup("group2", level = 2)
+      group2Id <- client.createAllocationGroup("group2", level = 2, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, group0Id, Some(executor))
@@ -167,7 +168,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("multi-alloc-group", level = 0)
+      groupId <- client.createAllocationGroup("multi-alloc-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -196,7 +197,7 @@ class GroupObjectAllocatorSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("readback-group", level = 0)
+      groupId <- client.createAllocationGroup("readback-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))

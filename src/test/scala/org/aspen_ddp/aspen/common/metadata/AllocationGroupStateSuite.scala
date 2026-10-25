@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
-import org.aspen_ddp.aspen.common.ida.{ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyAlreadyExists}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
@@ -55,7 +55,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0)
+      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -71,7 +71,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0)
+      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       psBefore <- readPoolState()
@@ -92,7 +92,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0)
+      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -111,7 +111,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0)
+      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
@@ -130,9 +130,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId1 <- client.createAllocationGroup("group-1", level = 0)
+      groupId1 <- client.createAllocationGroup("group-1", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      groupId2 <- client.createAllocationGroup("group-2", level = 0)
+      groupId2 <- client.createAllocationGroup("group-2", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId1, Some(executor))
@@ -164,9 +164,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-group", level = 0)
+      childId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      parentId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
@@ -182,9 +182,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-group", level = 0)
+      childId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      parentId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
@@ -204,9 +204,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-group", level = 0)
+      childId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      parentId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
@@ -225,9 +225,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-group", level = 0)
+      childId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-group", level = 1)
+      parentId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
@@ -246,9 +246,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupA <- client.createAllocationGroup("group-a", level = 0)
+      groupA <- client.createAllocationGroup("group-a", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      groupB <- client.createAllocationGroup("group-b", level = 0)
+      groupB <- client.createAllocationGroup("group-b", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- recoverToSucceededIf[AllocationGroupState.InvalidLevel](
@@ -260,9 +260,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-group", level = 1)
+      childId <- client.createAllocationGroup("child-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-group", level = 0)
+      parentId <- client.createAllocationGroup("parent-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- recoverToSucceededIf[AllocationGroupState.InvalidLevel](
@@ -274,11 +274,11 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-group", level = 0)
+      childId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId1 <- client.createAllocationGroup("parent-1", level = 1)
+      parentId1 <- client.createAllocationGroup("parent-1", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId2 <- client.createAllocationGroup("parent-2", level = 1)
+      parentId2 <- client.createAllocationGroup("parent-2", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addGroup(client, childId, parentId1, Some(executor))
@@ -310,9 +310,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-noop", level = 0)
+      childId <- client.createAllocationGroup("child-noop", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-noop", level = 1)
+      parentId <- client.createAllocationGroup("parent-noop", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
@@ -337,9 +337,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
     for
       executor <- setup()
-      childId <- client.createAllocationGroup("child-sys", level = 0)
+      childId <- client.createAllocationGroup("child-sys", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-sys", level = 1)
+      parentId <- client.createAllocationGroup("parent-sys", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
@@ -365,7 +365,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
   atest("addPoolToGroup resolves names and adds the pool"):
     given ExecutionContext = executionContext
     for
-      groupId <- client.createAllocationGroup("named-group", level = 0)
+      groupId <- client.createAllocationGroup("named-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       // Radicle bootstrap pool is registered under a known name; resolve it dynamically.
@@ -384,9 +384,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
   atest("addGroupToGroup resolves names and nests the source group"):
     given ExecutionContext = executionContext
     for
-      childId <- client.createAllocationGroup("child-named", level = 0)
+      childId <- client.createAllocationGroup("child-named", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup("parent-named", level = 1)
+      parentId <- client.createAllocationGroup("parent-named", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       _ <- client.addGroupToGroup("child-named", "parent-named")
@@ -401,9 +401,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
   atest("addGroupToGroup fails with InvalidLevel when source level is not lower"):
     given ExecutionContext = executionContext
     for
-      _ <- client.createAllocationGroup("src-same", level = 1)
+      _ <- client.createAllocationGroup("src-same", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      _ <- client.createAllocationGroup("dst-same", level = 1)
+      _ <- client.createAllocationGroup("dst-same", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
 
       err <- client.addGroupToGroup("src-same", "dst-same").failed
@@ -413,11 +413,11 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
   atest("createAllocationGroup fails with KeyAlreadyExists when the name is taken"):
     given ExecutionContext = executionContext
     for
-      _      <- client.createAllocationGroup("dup-group", level = 0)
+      _      <- client.createAllocationGroup("dup-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _      <- waitForTransactionsToComplete()
 
       before <- client.listAllocationGroups()
-      err    <- client.createAllocationGroup("dup-group", level = 1).failed
+      err    <- client.createAllocationGroup("dup-group", level = 1, idaPolicy = IDAPolicy.AllowAll).failed
       _      <- waitForTransactionsToComplete()
       after  <- client.listAllocationGroups()
     yield
@@ -449,7 +449,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       executor <- setup()
       poolId <- createPool(s"pool-$tag", poolLimit)
       _ <- waitForTransactionsToComplete()
-      groupId <- client.createAllocationGroup(s"group-$tag", level = 0, maxSliceSize = groupLimit)
+      groupId <- client.createAllocationGroup(s"group-$tag", level = 0, maxSliceSize = groupLimit, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
       psBefore <- readPool(poolId)
       agsBefore <- readGroupState(groupId)
@@ -465,9 +465,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup(s"child-$tag", level = 0, maxSliceSize = childLimit)
+      childId <- client.createAllocationGroup(s"child-$tag", level = 0, maxSliceSize = childLimit, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup(s"parent-$tag", level = 1, maxSliceSize = parentLimit)
+      parentId <- client.createAllocationGroup(s"parent-$tag", level = 1, maxSliceSize = parentLimit, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
       childBefore <- readGroupState(childId)
       parentBefore <- readGroupState(parentId)
@@ -570,7 +570,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
   atest("createAllocationGroup records the declared maxSliceSize"):
     given ExecutionContext = executionContext
     for
-      groupId <- client.createAllocationGroup("declared-limit", level = 0, maxSliceSize = Some(1000))
+      groupId <- client.createAllocationGroup("declared-limit", level = 0, maxSliceSize = Some(1000), idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
       ags <- readGroupState(groupId)
     yield
@@ -615,7 +615,7 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       poolId <- client.createNewStoragePool("backend-limited-member", Replication(1, 1), Some(2000),
         RocksDBConfig(Some(1000)), StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
       _ <- waitForTransactionsToComplete()
-      groupId <- client.createAllocationGroup("effective-limit-group", level = 0, maxSliceSize = Some(1000))
+      groupId <- client.createAllocationGroup("effective-limit-group", level = 0, maxSliceSize = Some(1000), idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
       _ <- AllocationGroupState.addPool(client, poolId, groupId, Some(executor))
       _ <- waitForTransactionsToComplete()
@@ -635,9 +635,9 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      childId <- client.createAllocationGroup(s"child-$tag", level = 0)
+      childId <- client.createAllocationGroup(s"child-$tag", level = 0, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
-      parentId <- client.createAllocationGroup(s"parent-$tag", level = 1)
+      parentId <- client.createAllocationGroup(s"parent-$tag", level = 1, idaPolicy = IDAPolicy.AllowAll)
       _ <- waitForTransactionsToComplete()
       _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
       _ <- waitForTransactionsToComplete()
@@ -693,3 +693,146 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
         Member(MemberType.Pool, java.util.UUID.randomUUID(), Some(500), Some(4999), 0L, 0L)),
       Nil)
     ags.maximumObjectSize should be(Some(4999))
+
+  // ---- IDA policy ----
+
+  /** An IDA guaranteed to differ from `ida` in type, so it can never be equal to the bootstrap pool's */
+  private def differentIda(ida: IDA): IDA = ida match
+    case _: Replication => ReedSolomon(5, 4, 4)
+    case _ => Replication(3, 2)
+
+  private def expectMismatch(f: Future[Unit]): Future[org.scalatest.Assertion] =
+    given ExecutionContext = executionContext
+    f.map(_ => fail("expected MemberIDAMismatch")).recover:
+      case _: AllocationGroupState.MemberIDAMismatch => succeed
+
+  atest("createAllocationGroup ExactMatch without an ida fails"):
+    intercept[IllegalArgumentException]:
+      client.createAllocationGroup("g", level = 0)
+    succeed
+
+  atest("createAllocationGroup AllowAll with an ida fails"):
+    intercept[IllegalArgumentException]:
+      client.createAllocationGroup("g", level = 0, idaPolicy = IDAPolicy.AllowAll, ida = Some(Replication(3, 2)))
+    succeed
+
+  atest("ExactMatch group persists its policy and ida"):
+    given ExecutionContext = executionContext
+    val ida = RandomAccessReedSolomon(5, 3, 4, 4096)
+    for
+      groupId <- client.createAllocationGroup("exact", level = 0, ida = Some(ida))
+      _ <- waitForTransactionsToComplete()
+      ags <- readGroupState(groupId)
+    yield
+      ags.idaPolicy should be(IDAPolicy.ExactMatch)
+      ags.ida should be(Some(ida))
+
+  atest("addPool accepts a pool whose ida equals the group's"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      ps <- readPoolState()
+      groupId <- client.createAllocationGroup("exact", level = 0, ida = Some(ps.ida))
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      ags <- readGroupState(groupId)
+    yield
+      ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
+
+  atest("addPool rejects a pool whose ida differs and leaves state unchanged"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      psBefore <- readPoolState()
+      groupId <- client.createAllocationGroup("exact", level = 0, ida = Some(differentIda(psBefore.ida)))
+      _ <- waitForTransactionsToComplete()
+      _ <- expectMismatch(AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor)))
+      _ <- waitForTransactionsToComplete()
+      psAfter <- readPoolState()
+      ags <- readGroupState(groupId)
+    yield
+      psAfter.allocationGroups should not contain groupId.uuid
+      ags.members should be(Nil)
+
+  atest("addPool rejects a pool whose ida has the same type but different parameters"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      ps <- readPoolState()
+      near = ps.ida match
+        case r: Replication => Replication(r.width + 2, r.writeThreshold + 1)
+        case r: ReedSolomon => ReedSolomon(r.width + 2, r.restoreThreshold + 1, r.writeThreshold + 1)
+        case r: RandomAccessReedSolomon => r.copy(cellSize = r.cellSize * 2)
+      groupId <- client.createAllocationGroup("exact", level = 0, ida = Some(near))
+      _ <- waitForTransactionsToComplete()
+      _ <- expectMismatch(AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor)))
+    yield succeed
+
+  atest("addPool to an AllowAll group accepts any ida"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      groupId <- client.createAllocationGroup("any", level = 0, idaPolicy = IDAPolicy.AllowAll)
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      ags <- readGroupState(groupId)
+    yield
+      ags.members.exists(_.uuid == Radicle.poolId.uuid) should be(true)
+
+  atest("addGroup accepts a child with an equal ida"):
+    given ExecutionContext = executionContext
+    val ida = Replication(3, 2)
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child", level = 0, ida = Some(ida))
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent", level = 1, ida = Some(Replication(3, 2)))
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      parent <- readGroupState(parentId)
+    yield
+      parent.members.exists(_.uuid == childId.uuid) should be(true)
+
+  atest("addGroup rejects a child with a different ida"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child", level = 0, ida = Some(Replication(3, 2)))
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent", level = 1, ida = Some(ReedSolomon(5, 4, 4)))
+      _ <- waitForTransactionsToComplete()
+      _ <- expectMismatch(AllocationGroupState.addGroup(client, childId, parentId, Some(executor)))
+      _ <- waitForTransactionsToComplete()
+      child <- readGroupState(childId)
+      parent <- readGroupState(parentId)
+    yield
+      child.parentGroups should be(Nil)
+      parent.members should be(Nil)
+
+  atest("addGroup rejects an AllowAll child in an ExactMatch parent"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child", level = 0, idaPolicy = IDAPolicy.AllowAll)
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent", level = 1, ida = Some(Replication(3, 2)))
+      _ <- waitForTransactionsToComplete()
+      _ <- expectMismatch(AllocationGroupState.addGroup(client, childId, parentId, Some(executor)))
+    yield succeed
+
+  atest("addGroup accepts an ExactMatch child in an AllowAll parent"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("child", level = 0, ida = Some(Replication(3, 2)))
+      _ <- waitForTransactionsToComplete()
+      parentId <- client.createAllocationGroup("parent", level = 1, idaPolicy = IDAPolicy.AllowAll)
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addGroup(client, childId, parentId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      parent <- readGroupState(parentId)
+    yield
+      parent.members.exists(_.uuid == childId.uuid) should be(true)

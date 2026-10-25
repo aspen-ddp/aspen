@@ -1,7 +1,4 @@
 Follow-ups from parallel store transfers
-  6. Rebalance minors: requiredSize falls back to 0; one random candidate per poll; the
-     classify traverse is unbounded and each ready transfer reads the whole pool per poll
-     (use runBoundedParallel); a stuck Rebuilding entry keeps the task InFlight forever
   7. Migration: a selection failure (AllocationError) does not back off
   8. Tests: a rebuild landing on a device other than the planned destination is untested;
      the 'no competing transfer' check is a single snapshot after a fixed sleep;

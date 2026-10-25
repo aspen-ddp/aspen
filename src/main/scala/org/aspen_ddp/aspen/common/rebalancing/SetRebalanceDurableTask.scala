@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.{NoTask, ScheduledTask}
-import org.aspen_ddp.aspen.common.util.boundedSingleFlight
+import org.aspen_ddp.aspen.common.util.{boundedSingleFlight, runBoundedParallel}
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, TaskStopped}
 import scribe.Logging
 
@@ -21,6 +21,13 @@ object SetRebalanceDurableTask:
   val StartBackoffBase: FiniteDuration = Duration(1, SECONDS)
   val StartBackoffMax: FiniteDuration = Duration(2, MINUTES)
   val StartBackoffJitter: Double = 0.25
+
+  /** How long a transfer may stay InFlight before the task starts warning about it, and the
+   *  interval between further warnings. */
+  val StuckWarnAfter: Duration = Duration(30, MINUTES)
+
+  /** Selection attempts per poll when replacing an unusable destination. */
+  val ReplacementAttempts: Int = 3
 
   private[rebalancing] enum Phase:
     case Completed, InFlight, NotStarted
@@ -124,13 +131,40 @@ class SetRebalanceDurableTask(
       f.recover:
         case err => logger.warn(s"Rebalance set $setId: transient error, will retry: $err")
 
+  // When each store was first seen InFlight, and when it was last warned about. In memory only,
+  // like the backoff. Passes may overlap, hence the monitor.
+  private var inFlightSince: Map[StoreId, Long] = Map.empty
+  private var lastStuckWarning: Map[StoreId, Long] = Map.empty
+
+  /** Warns, every StuckWarnAfter, about a transfer that has stayed InFlight that long. The task
+   *  only waits for these: an InFlight transfer or a Rebuilding destination is owned by the
+   *  transfer machinery or by FailedStorageDeviceDurableTask, and acting on it from here could
+   *  fight them. A rebuild that never finishes would otherwise stall the set's rebalance
+   *  without a trace. */
+  private def warnIfStuck(classified: Seq[(Transfer, Phase)]): Unit = synchronized:
+    val now = System.currentTimeMillis()
+    val warnAfterMs = SetRebalanceDurableTask.StuckWarnAfter.toMillis
+    val current = classified.collect { case (t, Phase.InFlight) => t._1 }.toSet
+    inFlightSince = current.map(sid => sid -> inFlightSince.getOrElse(sid, now)).toMap
+    lastStuckWarning = lastStuckWarning.filter((sid, _) => current.contains(sid))
+    inFlightSince.foreach: (sid, since) =>
+      val last = lastStuckWarning.getOrElse(sid, since)
+      if now - since >= warnAfterMs && now - last >= warnAfterMs then
+        lastStuckWarning += sid -> now
+        logger.warn(s"Rebalance set $setId: transfer of $sid has been in flight for " +
+          s"${(now - since) / 60000} minutes. If its destination is Rebuilding, the rebuild " +
+          s"may be stuck; this task only waits for it")
+
   /** Given a non-empty pending list, either (a) finish an already-completed transfer by
    *  removing it, (b) drop a transfer whose pool has left planning state, or (c) go through
    *  every not-started transfer whose backoff allows it, replacing an unusable destination or
    *  starting the transfer. In-flight transfers are simply waited for. Re-enters processNext()
    *  after a removal; the poll was already armed by run(). */
   private def drive(pending: List[Transfer]): Future[Unit] =
-    Future.traverse(pending)(t => SetRebalanceDurableTask.classify(client, t).map(t -> _)).flatMap: classified =>
+    runBoundedParallel(pending, State.DefaultMaxConcurrentReads): t =>
+      SetRebalanceDurableTask.classify(client, t).map(t -> _)
+    .flatMap: classified =>
+      warnIfStuck(classified)
       classified.collectFirst { case (t, Phase.Completed) => t } match
         case Some(t) =>
           removePending(t).flatMap(_ => processNext())
@@ -220,7 +254,6 @@ class SetRebalanceDurableTask(
     val requiredSize = planningState.pools.get(storeId.poolId)
       .flatMap(_.stores.get(storeId))
       .map(_.currentSize)
-      .getOrElse(0L)
     val currentDevice = planningState.devices.values.find(_.stores.contains(storeId)).map(_.deviceId)
 
     def skip(why: String): Future[Unit] =
@@ -228,25 +261,41 @@ class SetRebalanceDurableTask(
         s"unusable): $why; will retry")
       Future.unit
 
-    setState.selectDeviceForStore(requiredSize, poolDevices ++ pendingDestinations, client, rng)
-      .map(Some(_))
-      .recover { case _ => None }
-      .flatMap:
-        case None =>
-          skip("selection found no device with room")
-        case Some(candidate) =>
-          // Selection falls back to soft-excluded devices, so it can return the store's own
-          // device, which is not a legal destination.
-          if candidate == fromDevice || currentDevice.contains(candidate) || candidate == toDevice then
-            skip(s"only $candidate was selectable")
-          else
-            client.getStorageDeviceState(candidate).flatMap: dev =>
-              if !usable(dev) then
-                skip(s"selected $candidate is itself unusable")
-              else
-                logger.info(s"Rebalance set $setId: replacing unusable destination $toDevice " +
-                  s"of $storeId with $candidate")
-                replacePending(t, (storeId, fromDevice, candidate))
+    // Never guess a size: a requirement of 0 would accept a device with no room for the store.
+    requiredSize match
+      case None =>
+        skip("the store is not in the planning state, so its size is unknown")
+      case Some(size) =>
+        // A rejected candidate is soft-excluded from the next attempt, so one unusable pick does
+        // not cost a whole poll period.
+        def attempt(n: Int, excluded: Set[StorageDeviceId]): Future[Unit] =
+          setState.selectDeviceForStore(size, excluded, client, rng)
+            .map(Some(_))
+            .recover { case _ => None }
+            .flatMap:
+              case None =>
+                skip("selection found no device with room")
+              case Some(candidate) =>
+                def next(why: String): Future[Unit] =
+                  if n < SetRebalanceDurableTask.ReplacementAttempts then
+                    attempt(n + 1, excluded + candidate)
+                  else
+                    skip(why)
+
+                // Selection falls back to soft-excluded devices, so it can return the store's own
+                // device, which is not a legal destination.
+                if candidate == fromDevice || currentDevice.contains(candidate) || candidate == toDevice then
+                  next(s"only $candidate was selectable")
+                else
+                  client.getStorageDeviceState(candidate).flatMap: dev =>
+                    if !usable(dev) then
+                      next(s"selected $candidate is itself unusable")
+                    else
+                      logger.info(s"Rebalance set $setId: replacing unusable destination $toDevice " +
+                        s"of $storeId with $candidate")
+                      replacePending(t, (storeId, fromDevice, candidate))
+
+        attempt(1, poolDevices ++ pendingDestinations)
 
   /** Remove one completed transfer from the set's pendingTransfers, revision-checked. */
   private def removePending(t: Transfer): Future[Unit] =

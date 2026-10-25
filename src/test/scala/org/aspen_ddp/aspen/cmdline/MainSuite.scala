@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.metadata.ClientConfig.BootstrapEndpoint
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
@@ -584,21 +584,21 @@ class MainSuite extends AnyFunSuite with Matchers:
       parsed.deviceSetName shouldBe "myset"
       parsed.maximumStoreSize shouldBe 4096L
 
-  test("createIDA builds AppendingReedSolomon with the requested cell size"):
+  test("createIDA builds RandomAccessReedSolomon with the requested cell size"):
     val parsed = Main.buildParser.parse(
-      Seq("bootstrap", "/tmp/target", "10.0.0.1", "appending-reed-solomon", "3", "4", "5",
+      Seq("bootstrap", "/tmp/target", "10.0.0.1", "random-access-reed-solomon", "3", "4", "5",
           "--cell-size", "4096"),
       Main.Args()).getOrElse(fail("bootstrap did not parse"))
-    Main.createIDA(parsed) shouldBe AppendingReedSolomon(5, 3, 4, 4096)
-    Main.createIDA(parsed.copy(cellSize = 64)) shouldBe AppendingReedSolomon(5, 3, 4)
+    Main.createIDA(parsed) shouldBe RandomAccessReedSolomon(5, 3, 4, 4096)
+    Main.createIDA(parsed.copy(cellSize = 64)) shouldBe RandomAccessReedSolomon(5, 3, 4)
 
-  test("validateIdaType accepts appending-reed-solomon"):
+  test("validateIdaType accepts random-access-reed-solomon"):
     withTempDir("parse-ida"): dir =>
       val cfgs = emptyFile(dir / "bootstrap.yaml")
       val parsed = Main.buildParser.parse(
-        Seq("create-pool", cfgs, "mypool", "Appending-Reed-Solomon", "5", "3", "4", "myset", "--cell-size", "128"),
+        Seq("create-pool", cfgs, "mypool", "Random-Access-Reed-Solomon", "5", "3", "4", "myset", "--cell-size", "128"),
         Main.Args()).getOrElse(fail("create-pool did not parse"))
-      parsed.idaType shouldBe "appending-reed-solomon"
+      parsed.idaType shouldBe "random-access-reed-solomon"
       parsed.cellSize shouldBe 128
       Console.withErr(OutputStream.nullOutputStream()):
         Main.buildParser.parse(
@@ -607,7 +607,7 @@ class MainSuite extends AnyFunSuite with Matchers:
   test("--cell-size below 8 is rejected"):
     def parse(size: String) = Console.withErr(OutputStream.nullOutputStream()):
       Main.buildParser.parse(
-        Seq("bootstrap", "/tmp/target", "10.0.0.1", "appending-reed-solomon", "3", "4", "5", "--cell-size", size),
+        Seq("bootstrap", "/tmp/target", "10.0.0.1", "random-access-reed-solomon", "3", "4", "5", "--cell-size", size),
         Main.Args())
     parse("7") shouldBe None
     parse("0") shouldBe None

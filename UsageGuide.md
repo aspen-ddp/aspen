@@ -145,10 +145,10 @@ refreshed in the background, so a pool added anywhere below a group is reflected
 `maxObjectSize` is derived from the effective `maxSliceSize` by the pool's IDA, and is exact to the byte:
 * Replication: `maxSliceSize` (every slice is a full copy)
 * ReedSolomon with read-threshold `k`: `k * maxSliceSize - 1`
-* AppendingReedSolomon: `(maxSliceSize / cellSize) * (k * cellSize) - 8`, the 8 being the length trailer
+* RandomAccessReedSolomon: `(maxSliceSize / cellSize) * (k * cellSize) - 8`, the 8 being the length trailer
 
 Results are capped at what an `Int` can address. A `maxSliceSize` below `ida.minSliceSize` (1, or `cellSize`
-for AppendingReedSolomon) admits no objects and is rejected.
+for RandomAccessReedSolomon) admits no objects and is rejected.
 
 The limit is enforced twice. The client throws `ObjectSizeLimitExceeded` while building a transaction that
 would overwrite, append to, range-write or allocate a data object larger than `maxObjectSize`, or allocate a

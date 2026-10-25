@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.common.ida.{AppendDelta, AppendingReedSolomon, Replication, XorRegion}
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -87,7 +87,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
   // Slice of data store `store` holding `content`, plus a delta appending `more` to it
   private def appendFixture(content: Array[Byte], more: Array[Byte], store: Int = 0) = {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     val slice = ida.encode(DataBuffer(content))(store)
     val delta = ida.appendDeltas(content.length, more)(store)
     (slice, delta)

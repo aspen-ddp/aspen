@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.{AppendPosition, ConflictingRequirements, DataObjectState, MultipleDataUpdatesToObject, ObjectSizeLimitExceeded, RangeWriteBeyondEnd, RangeWriteNotSupported, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.common.ida.{AppendDelta, AppendingReedSolomon, IDA, RangeEdit, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, IDA, RangeEdit, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -22,7 +22,7 @@ class TransactionRangedWriteSuite extends AnyFunSuite with Matchers {
   private val rev1 = ObjectRevision(TransactionId(new UUID(0, 3)))
   private val p1 = DataObjectPointer(oid1, PoolId(new UUID(0, 0)), Array[Byte]())
 
-  private val ars = AppendingReedSolomon(5, 3, 4, 8)
+  private val ars = RandomAccessReedSolomon(5, 3, 4, 8)
   private val repl = Replication(3, 2)
   private val L = 30
   private val content = Array.tabulate[Byte](L)(i => (i * 7 + 1).toByte)

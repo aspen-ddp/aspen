@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.common.ida.{AppendDelta, AppendingReedSolomon, XorRegion}
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -142,7 +142,7 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
   }
 
   test("Append XORs the delta into the zero-extended slice and bumps the revision") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     val content = Array.tabulate[Byte](20)(_.toByte)
     val more = Array.tabulate[Byte](30)(i => (i + 50).toByte)
 
@@ -160,7 +160,7 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
   }
 
   test("a mismatched Append leaves state untouched") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     val content = Array.tabulate[Byte](20)(_.toByte)
     val slice = ida.encode(DataBuffer(content))(0)
     val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, slice)

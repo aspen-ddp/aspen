@@ -29,7 +29,7 @@ message ReedSolomon {
   uint32 write_threshold = 3;
 }
 
-message AppendingReedSolomon {
+message RandomAccessReedSolomon {
   uint32 width = 1;
   uint32 restore_threshold = 2;
   uint32 write_threshold = 3;
@@ -40,7 +40,7 @@ message IDA {
   oneof ida {
     Replication replication = 1;
     ReedSolomon reed_solomon = 2;
-    AppendingReedSolomon appending_reed_solomon = 3;
+    RandomAccessReedSolomon random_access_reed_solomon = 3;
   }
 }
 

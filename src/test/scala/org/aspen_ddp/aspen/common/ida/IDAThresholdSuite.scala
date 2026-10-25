@@ -31,15 +31,15 @@ class IDAThresholdSuite extends AnyFunSuite with Matchers:
           else
             an[IllegalArgumentException] should be thrownBy ReedSolomon(width, rt, wt)
 
-  test("Appending Reed-Solomon read threshold must be a majority and write at least read"):
+  test("Random-Access Reed-Solomon read threshold must be a majority and write at least read"):
     for width <- 1 to 9 do
       for rt <- 1 to width do
         for wt <- 1 to width do
           val valid = rt >= majority(width) && wt >= rt
           if valid then
-            AppendingReedSolomon(width, rt, wt, 8).restoreThreshold should be(rt)
+            RandomAccessReedSolomon(width, rt, wt, 8).restoreThreshold should be(rt)
           else
-            an[IllegalArgumentException] should be thrownBy AppendingReedSolomon(width, rt, wt, 8)
+            an[IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(width, rt, wt, 8)
 
   test("deserializing an encoded invalid IDA is rejected"):
     val bb = ByteBuffer.allocate(16)

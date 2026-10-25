@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.StoragePool
 import scribe.Logging
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRanges, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
@@ -65,30 +65,30 @@ object Codec extends Logging:
     ReedSolomon(m.width, m.restoreThreshold, m.writeThreshold)
 
 
-  def encode(o: AppendingReedSolomon): codec.AppendingReedSolomon =
-    codec.AppendingReedSolomon(
+  def encode(o: RandomAccessReedSolomon): codec.RandomAccessReedSolomon =
+    codec.RandomAccessReedSolomon(
       width = o.width,
       restoreThreshold = o.restoreThreshold,
       writeThreshold = o.writeThreshold,
       cellSize = o.cellSize
     )
 
-  def decode(m: codec.AppendingReedSolomon): AppendingReedSolomon =
-    AppendingReedSolomon(m.width, m.restoreThreshold, m.writeThreshold, m.cellSize)
+  def decode(m: codec.RandomAccessReedSolomon): RandomAccessReedSolomon =
+    RandomAccessReedSolomon(m.width, m.restoreThreshold, m.writeThreshold, m.cellSize)
 
 
   def encode(o: IDA): codec.IDA =
     val ida = o match
       case r: Replication => codec.IDA.Ida.Replication(encode(r))
       case r: ReedSolomon => codec.IDA.Ida.ReedSolomon(encode(r))
-      case r: AppendingReedSolomon => codec.IDA.Ida.AppendingReedSolomon(encode(r))
+      case r: RandomAccessReedSolomon => codec.IDA.Ida.RandomAccessReedSolomon(encode(r))
     codec.IDA(ida = ida)
 
   def decode(m: codec.IDA): IDA =
     m.ida match
       case codec.IDA.Ida.Replication(r) => decode(r)
       case codec.IDA.Ida.ReedSolomon(r) => decode(r)
-      case codec.IDA.Ida.AppendingReedSolomon(r) => decode(r)
+      case codec.IDA.Ida.RandomAccessReedSolomon(r) => decode(r)
       case codec.IDA.Ida.Empty => throw new EncodingError("Unknown IDA")
 
 

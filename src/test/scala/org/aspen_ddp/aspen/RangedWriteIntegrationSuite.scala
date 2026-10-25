@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.{DataObjectState, RangeReadNotSupported, Range
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.transaction.TransactionBuilder
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -27,7 +27,7 @@ trait RangedWriteIntegrationTests:
 
   /** Bytes per row for slicing IDAs. Replication has no rows; any row size exercises it equally. */
   private def rowBytes: Int = ida match
-    case a: AppendingReedSolomon => a.rowBytes
+    case a: RandomAccessReedSolomon => a.rowBytes
     case _ => 64
 
   private def bytesShouldMatch(actual: Array[Byte], expected: Array[Byte]): Unit =
@@ -448,12 +448,12 @@ trait RangedWriteIntegrationTests:
 
 class ReplicationRangedWriteIntegrationSuite extends IntegrationTestSuite with RangedWriteIntegrationTests
 
-class AppendingReedSolomonRangedWriteIntegrationSuite extends IntegrationTestSuite with RangedWriteIntegrationTests:
-  override def testIda: IDA = AppendingReedSolomon(5, 3, 4, 64)
+class RandomAccessReedSolomonRangedWriteIntegrationSuite extends IntegrationTestSuite with RangedWriteIntegrationTests:
+  override def testIda: IDA = RandomAccessReedSolomon(5, 3, 4, 64)
 
-class NarrowAppendingReedSolomonRangedWriteIntegrationSuite extends IntegrationTestSuite
+class NarrowRandomAccessReedSolomonRangedWriteIntegrationSuite extends IntegrationTestSuite
   with RangedWriteIntegrationTests:
-  override def testIda: IDA = AppendingReedSolomon(4, 3, 3, 8)
+  override def testIda: IDA = RandomAccessReedSolomon(4, 3, 3, 8)
 
 
 class ClassicReedSolomonRangedWriteRejectionSuite extends IntegrationTestSuite:
@@ -514,8 +514,8 @@ class RangedWritePayloadSuite extends AnyFunSuite with Matchers:
   private val content = Array.fill[Byte](256 * 1024)(rnd.nextInt.toByte)
   private val writes = List(RangedWrite(1000, Array.fill[Byte](16)(1)), RangedWrite(200000, Array.fill[Byte](16)(2)))
 
-  test("two far apart edits send small per-store payloads with AppendingReedSolomon"):
-    val ida = AppendingReedSolomon(5, 3, 4, 64)
+  test("two far apart edits send small per-store payloads with RandomAccessReedSolomon"):
+    val ida = RandomAccessReedSolomon(5, 3, 4, 64)
     val sliceSize = ida.encode(content)(0).length
     val sizes = payloadSizes(ida, content, writes)
     // Two touched rows: at most one cell per row per store, plus the delta's headers

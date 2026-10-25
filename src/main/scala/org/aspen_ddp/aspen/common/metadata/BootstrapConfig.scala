@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
@@ -59,7 +59,7 @@ object BootstrapConfig:
 
     def create(o: Object): IDA = ReedSolomon(width.get(o), readThreshold.get(o), writeThreshold.get(o))
 
-  object AppendingReedSolomonFormat extends YObject[IDA]:
+  object RandomAccessReedSolomonFormat extends YObject[IDA]:
     val readThreshold: Required[Int]  = Required("read-threshold", YInt)
     val writeThreshold: Required[Int] = Required("write-threshold", YInt)
     val width: Required[Int]          = Required("width", YInt)
@@ -68,13 +68,13 @@ object BootstrapConfig:
     val attrs: List[Attr] = readThreshold :: writeThreshold :: width :: cellSize :: Nil
 
     def create(o: Object): IDA =
-      AppendingReedSolomon(width.get(o), readThreshold.get(o), writeThreshold.get(o),
-        cellSize.get(o).getOrElse(AppendingReedSolomon.DefaultCellSize))
+      RandomAccessReedSolomon(width.get(o), readThreshold.get(o), writeThreshold.get(o),
+        cellSize.get(o).getOrElse(RandomAccessReedSolomon.DefaultCellSize))
 
   val IDAOptions =  Map(
     "replication" -> ReplicationFormat,
     "reed-solomon" -> ReedSolomonFormat,
-    "appending-reed-solomon" -> AppendingReedSolomonFormat
+    "random-access-reed-solomon" -> RandomAccessReedSolomonFormat
   )
 
   case class BootstrapHost(hostId: HostId,
@@ -167,7 +167,7 @@ object BootstrapConfig:
       case _:Replication =>
       case _:ReedSolomon =>
         sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
-      case a:AppendingReedSolomon =>
+      case a:RandomAccessReedSolomon =>
         sb.append(s"  read-threshold: ${ida.consistentRestoreThreshold}\n")
         sb.append(s"  cell-size: ${a.cellSize}\n")
     sb.append(s"  write-threshold: ${ida.writeThreshold}\n")

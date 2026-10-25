@@ -10,7 +10,7 @@ import scala.language.implicitConversions
 object IDA {
   val ReplicationCode: Byte = 0
   val ReedSolomonCode: Byte = 1
-  val AppendingReedSolomonCode: Byte = 2
+  val RandomAccessReedSolomonCode: Byte = 2
 
   /** Deserializes the IDA type and returns the matching IDA instance */
   def deserializeIDAType(bb: ByteBuffer): IDA = {
@@ -29,12 +29,12 @@ object IDA {
         val writeThreshold = bb.get()
         ReedSolomon(width, readThreshold, writeThreshold)
 
-      case AppendingReedSolomonCode =>
+      case RandomAccessReedSolomonCode =>
         val width = bb.get()
         val readThreshold = bb.get()
         val writeThreshold = bb.get()
         val cellSize = bb.getShort() & 0xFFFF
-        AppendingReedSolomon(width, readThreshold, writeThreshold, cellSize)
+        RandomAccessReedSolomon(width, readThreshold, writeThreshold, cellSize)
 
       case _ => throw new IDAEncodingError
     }
@@ -157,7 +157,7 @@ sealed abstract class IDA extends Ordered[IDA] {
     *   - Replication: every slice is a full copy, so n = maxSliceSize
     *   - ReedSolomon: slice = n / k + 1 bytes (k = restoreThreshold, with at least one pad byte),
     *     so n = k * maxSliceSize - 1
-    *   - AppendingReedSolomon: slices are whole rows of cellSize bytes and the stream holds the content
+    *   - RandomAccessReedSolomon: slices are whole rows of cellSize bytes and the stream holds the content
     *     plus an 8 byte trailer, so n = (maxSliceSize / cellSize) * rowBytes - 8, where
     *     rowBytes = k * cellSize. Capped at Int.MaxValue - rowBytes, the largest length supported by
     *     appends and ranged writes.
@@ -513,7 +513,7 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
     bb.put(writeThreshold.toByte)
 
 
-object AppendingReedSolomon:
+object RandomAccessReedSolomon:
 
   val DefaultCellSize: Int = 64
 
@@ -536,28 +536,28 @@ object AppendingReedSolomon:
   *
   * Unlike ReedSolomon, the slice length is always a multiple of cellSize.
   */
-case class AppendingReedSolomon(
+case class RandomAccessReedSolomon(
     width: Int,
     restoreThreshold: Int,
     writeThreshold: Int,
-    cellSize: Int = AppendingReedSolomon.DefaultCellSize) extends IDA with AppendableIDA:
+    cellSize: Int = RandomAccessReedSolomon.DefaultCellSize) extends IDA with AppendableIDA:
 
   require(restoreThreshold >= 1,
-    s"Appending Reed-Solomon restoreThreshold must be at least 1. Got $restoreThreshold")
+    s"Random-Access Reed-Solomon restoreThreshold must be at least 1. Got $restoreThreshold")
   require(restoreThreshold >= width / 2 + 1,
-    s"Appending Reed-Solomon restoreThreshold ($restoreThreshold) must be a majority: at least ${width / 2 + 1}")
+    s"Random-Access Reed-Solomon restoreThreshold ($restoreThreshold) must be a majority: at least ${width / 2 + 1}")
   require(restoreThreshold <= width,
-    s"Appending Reed-Solomon restoreThreshold ($restoreThreshold) may not exceed width ($width)")
+    s"Random-Access Reed-Solomon restoreThreshold ($restoreThreshold) may not exceed width ($width)")
   require(width <= ReedSolomon.MaxWidth,
-    s"Appending Reed-Solomon width ($width) may not exceed ${ReedSolomon.MaxWidth}")
+    s"Random-Access Reed-Solomon width ($width) may not exceed ${ReedSolomon.MaxWidth}")
   require(writeThreshold >= restoreThreshold && writeThreshold <= width,
-    s"Appending Reed-Solomon writeThreshold ($writeThreshold) must fall within [$restoreThreshold, $width]")
-  require(cellSize >= AppendingReedSolomon.TrailerSize,
-    s"Appending Reed-Solomon cellSize ($cellSize) must be at least ${AppendingReedSolomon.TrailerSize}")
-  require(cellSize <= AppendingReedSolomon.MaxCellSize,
-    s"Appending Reed-Solomon cellSize ($cellSize) may not exceed ${AppendingReedSolomon.MaxCellSize}")
+    s"Random-Access Reed-Solomon writeThreshold ($writeThreshold) must fall within [$restoreThreshold, $width]")
+  require(cellSize >= RandomAccessReedSolomon.TrailerSize,
+    s"Random-Access Reed-Solomon cellSize ($cellSize) must be at least ${RandomAccessReedSolomon.TrailerSize}")
+  require(cellSize <= RandomAccessReedSolomon.MaxCellSize,
+    s"Random-Access Reed-Solomon cellSize ($cellSize) may not exceed ${RandomAccessReedSolomon.MaxCellSize}")
 
-  def name: String = "appending-reed-solomon"
+  def name: String = "random-access-reed-solomon"
 
   def consistentRestoreThreshold: Int = restoreThreshold
 
@@ -570,7 +570,7 @@ case class AppendingReedSolomon(
 
   /** Smallest row count that holds nbytes of content plus the trailer */
   def rowsFor(nbytes: Int): Int =
-    ((nbytes.toLong + AppendingReedSolomon.TrailerSize + rowBytes - 1) / rowBytes).toInt
+    ((nbytes.toLong + RandomAccessReedSolomon.TrailerSize + rowBytes - 1) / rowBytes).toInt
 
   def calculateEncodedSegmentLength(nbytes: Int): Int = rowsFor(nbytes) * cellSize
 
@@ -584,10 +584,10 @@ case class AppendingReedSolomon(
       s"maxSliceSize ($maxSliceSize) must be at least $minSliceSize")
     val cap = Int.MaxValue.toLong - rowBytes
     val rows = maxSliceSize / cellSize
-    if rows > (cap + AppendingReedSolomon.TrailerSize) / rowBytes + 1 then
+    if rows > (cap + RandomAccessReedSolomon.TrailerSize) / rowBytes + 1 then
       cap.toInt
     else
-      math.min(rows * rowBytes - AppendingReedSolomon.TrailerSize, cap).toInt
+      math.min(rows * rowBytes - RandomAccessReedSolomon.TrailerSize, cap).toInt
 
   /** An empty object still occupies one row, whose slices are cellSize bytes */
   def minSliceSize: Int = cellSize
@@ -623,7 +623,7 @@ case class AppendingReedSolomon(
     val sliceLength = rows * cellSize
     val shards = scatter(src, offset, length, rows)
 
-    ByteBuffer.wrap(shards(k - 1)).putLong(sliceLength - AppendingReedSolomon.TrailerSize, length.toLong)
+    ByteBuffer.wrap(shards(k - 1)).putLong(sliceLength - RandomAccessReedSolomon.TrailerSize, length.toLong)
 
     addParity(shards, sliceLength)
 
@@ -669,12 +669,12 @@ case class AppendingReedSolomon(
     val stream = new Array[Byte](deltaRows * rowBytes)
 
     System.arraycopy(data, 0, stream, currentLength - base, data.length)
-    xorLong(stream, oldRows * rowBytes - AppendingReedSolomon.TrailerSize - base, currentLength.toLong)
-    xorLong(stream, newRows * rowBytes - AppendingReedSolomon.TrailerSize - base, newLength.toLong)
+    xorLong(stream, oldRows * rowBytes - RandomAccessReedSolomon.TrailerSize - base, currentLength.toLong)
+    xorLong(stream, newRows * rowBytes - RandomAccessReedSolomon.TrailerSize - base, newLength.toLong)
 
     val shards = addParity(scatter(stream, 0, stream.length, deltaRows), deltaRows * cellSize)
 
-    val oldTrailer = ByteBuffer.allocate(AppendingReedSolomon.TrailerSize).putLong(currentLength.toLong).array()
+    val oldTrailer = ByteBuffer.allocate(RandomAccessReedSolomon.TrailerSize).putLong(currentLength.toLong).array()
 
     Array.tabulate(width) { i =>
       AppendDelta(oldRows * cellSize, newRows * cellSize, startRow * cellSize, shards(i),
@@ -723,9 +723,9 @@ case class AppendingReedSolomon(
       // Each trailer lies entirely within its final row
       if lengthChanges then
         if oldRows - 1 >= firstRow && oldRows - 1 <= lastRow then
-          xorLong(stream, (oldRows.toLong * rowBytes - AppendingReedSolomon.TrailerSize - base).toInt, currentLength.toLong)
+          xorLong(stream, (oldRows.toLong * rowBytes - RandomAccessReedSolomon.TrailerSize - base).toInt, currentLength.toLong)
         if newRows - 1 >= firstRow && newRows - 1 <= lastRow then
-          xorLong(stream, (newRows.toLong * rowBytes - AppendingReedSolomon.TrailerSize - base).toInt, newLength.toLong)
+          xorLong(stream, (newRows.toLong * rowBytes - RandomAccessReedSolomon.TrailerSize - base).toInt, newLength.toLong)
 
       val shards = addParity(scatter(stream, 0, stream.length, nrows), nrows * cellSize)
 
@@ -743,7 +743,7 @@ case class AppendingReedSolomon(
         i += 1
     }
 
-    val oldTrailer = ByteBuffer.allocate(AppendingReedSolomon.TrailerSize).putLong(currentLength.toLong).array()
+    val oldTrailer = ByteBuffer.allocate(RandomAccessReedSolomon.TrailerSize).putLong(currentLength.toLong).array()
 
     Array.tabulate(width) { i =>
       AppendDelta(oldRows * cellSize, newRows * cellSize, regions(i).result(),
@@ -752,8 +752,8 @@ case class AppendingReedSolomon(
 
   private def xorLong(arr: Array[Byte], at: Int, value: Long): Unit =
     var i = 0
-    while i < AppendingReedSolomon.TrailerSize do
-      arr(at + i) = (arr(at + i) ^ (value >>> (8 * (AppendingReedSolomon.TrailerSize - 1 - i))).toByte).toByte
+    while i < RandomAccessReedSolomon.TrailerSize do
+      arr(at + i) = (arr(at + i) ^ (value >>> (8 * (RandomAccessReedSolomon.TrailerSize - 1 - i))).toByte).toByte
       i += 1
 
   /** Recovers any missing data shards, validates the trailer, and gathers the content */
@@ -775,10 +775,10 @@ case class AppendingReedSolomon(
     * shard k-1 and validates it against the total row count of the full slices
     */
   private def trailerLength(shards: Array[Array[Byte]], segmentLength: Int, totalRows: Int): Int =
-    val nbytes = ByteBuffer.wrap(shards(k - 1)).getLong(segmentLength - AppendingReedSolomon.TrailerSize)
+    val nbytes = ByteBuffer.wrap(shards(k - 1)).getLong(segmentLength - RandomAccessReedSolomon.TrailerSize)
 
     // Checked as a long so a corrupt trailer cannot overflow the row arithmetic
-    if nbytes < 0 || nbytes + AppendingReedSolomon.TrailerSize > totalRows.toLong * rowBytes ||
+    if nbytes < 0 || nbytes + RandomAccessReedSolomon.TrailerSize > totalRows.toLong * rowBytes ||
         rowsFor(nbytes.toInt) != totalRows then
       throw new IDARestoreError(s"Invalid trailer length $nbytes for a slice of $totalRows rows")
 
@@ -845,7 +845,7 @@ case class AppendingReedSolomon(
   def getSerializedIDATypeLength: Int = 6 // <type><width><restoreThreshold><writeThreshold><cellSize:2>
 
   def serializeIDAType(bb: ByteBuffer): Unit =
-    bb.put(IDA.AppendingReedSolomonCode)
+    bb.put(IDA.RandomAccessReedSolomonCode)
     bb.put(width.toByte)
     bb.put(restoreThreshold.toByte)
     bb.put(writeThreshold.toByte)

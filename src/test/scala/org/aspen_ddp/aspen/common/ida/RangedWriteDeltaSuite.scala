@@ -105,7 +105,7 @@ class RangedWriteDeltaSuite extends AnyFunSuite with Matchers:
 
   test("rangedWriteDeltas rejects invalid edits") {
     val old = new Array[Byte](100)
-    for ida <- List[IDA & AppendableIDA](Replication(3, 2), AppendingReedSolomon(5, 3, 4, 8)) do
+    for ida <- List[IDA & AppendableIDA](Replication(3, 2), RandomAccessReedSolomon(5, 3, 4, 8)) do
       an [IllegalArgumentException] should be thrownBy ida.rangedWriteDeltas(100, Nil)
       an [IllegalArgumentException] should be thrownBy
         ida.rangedWriteDeltas(100, List(edit(old, 10, new Array[Byte](5)), edit(old, 12, new Array[Byte](5))))

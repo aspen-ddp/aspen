@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, RangeReadNotSupported, RangedWrite, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, ObjectId, ObjectRevision}
 import org.aspen_ddp.aspen.server.repair.{RepairPolicy, StoreRepairer}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -21,7 +21,7 @@ trait AppendIntegrationTests:
 
   /** Bytes per row for slicing IDAs. Replication has no rows; any row size exercises it equally. */
   private def rowBytes: Int = ida match
-    case a: AppendingReedSolomon => a.rowBytes
+    case a: RandomAccessReedSolomon => a.rowBytes
     case _ => 64
 
   private def bytesShouldMatch(actual: Array[Byte], expected: Array[Byte]): Unit =
@@ -433,16 +433,16 @@ trait AppendIntegrationTests:
 
 class ReplicationAppendIntegrationSuite extends IntegrationTestSuite with AppendIntegrationTests
 
-class AppendingReedSolomonAppendIntegrationSuite extends IntegrationTestSuite with AppendIntegrationTests:
-  override def testIda: IDA = AppendingReedSolomon(5, 3, 4, 64)
+class RandomAccessReedSolomonAppendIntegrationSuite extends IntegrationTestSuite with AppendIntegrationTests:
+  override def testIda: IDA = RandomAccessReedSolomon(5, 3, 4, 64)
 
-class NarrowAppendingReedSolomonAppendIntegrationSuite extends IntegrationTestSuite with AppendIntegrationTests:
-  override def testIda: IDA = AppendingReedSolomon(4, 3, 3, 8)
+class NarrowRandomAccessReedSolomonAppendIntegrationSuite extends IntegrationTestSuite with AppendIntegrationTests:
+  override def testIda: IDA = RandomAccessReedSolomon(4, 3, 3, 8)
 
 
-/** KV objects, including partial reads, must keep working in an AppendingReedSolomon pool */
-class AppendingReedSolomonBasicIntegrationSuite extends BasicIntegrationSuite:
-  override def testIda: IDA = AppendingReedSolomon(5, 3, 4, 64)
+/** KV objects, including partial reads, must keep working in an RandomAccessReedSolomon pool */
+class RandomAccessReedSolomonBasicIntegrationSuite extends BasicIntegrationSuite:
+  override def testIda: IDA = RandomAccessReedSolomon(5, 3, 4, 64)
 
 
 class ClassicReedSolomonAppendRejectionSuite extends IntegrationTestSuite:

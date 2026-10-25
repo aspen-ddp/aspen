@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.TestTLS
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -65,18 +65,18 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     BootstrapConfig.generateBootstrapConfig(
       systemId, ida, List(hostState), List(storeId -> hostId), TestTLS.caCertificatePem)
 
-  test("appending-reed-solomon bootstrap IDA round-trips including cell-size"):
-    val ida = AppendingReedSolomon(1, 1, 1, cellSize = 4096)
+  test("random-access-reed-solomon bootstrap IDA round-trips including cell-size"):
+    val ida = RandomAccessReedSolomon(1, 1, 1, cellSize = 4096)
     val yaml = generatedWith(ida)
-    yaml should include("type: appending-reed-solomon")
+    yaml should include("type: random-access-reed-solomon")
     yaml should include("cell-size: 4096")
     BootstrapConfig.parseBootstrapConfig(yaml).bootstrapIDA should be(ida)
 
   test("cell-size defaults to 64"):
-    val yaml = generatedWith(AppendingReedSolomon(1, 1, 1))
+    val yaml = generatedWith(RandomAccessReedSolomon(1, 1, 1))
       .linesIterator.filterNot(_.contains("cell-size")).mkString("\n")
     yaml should not include "cell-size"
-    BootstrapConfig.parseBootstrapConfig(yaml).bootstrapIDA should be(AppendingReedSolomon(1, 1, 1, 64))
+    BootstrapConfig.parseBootstrapConfig(yaml).bootstrapIDA should be(RandomAccessReedSolomon(1, 1, 1, 64))
 
   test("loadBootstrapConfig round-trips generateBootstrapConfig"):
     val f = os.temp(prefix = "aspen-bootstrap-config", suffix = ".yaml")

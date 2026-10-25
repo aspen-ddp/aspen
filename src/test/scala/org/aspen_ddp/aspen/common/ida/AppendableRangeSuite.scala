@@ -7,16 +7,16 @@ import scala.util.Random
 
 class AppendableRangeSuite extends AnyFunSuite with Matchers:
 
-  private val Configs: List[AppendingReedSolomon] = List(
-    AppendingReedSolomon(5, 3, 4, 8),
-    AppendingReedSolomon(3, 2, 3, 16))
+  private val Configs: List[RandomAccessReedSolomon] = List(
+    RandomAccessReedSolomon(5, 3, 4, 8),
+    RandomAccessReedSolomon(3, 2, 3, 16))
 
   private val Sizes = List(0, 23, 24, 100, 777)
 
   private def content(n: Int): Array[Byte] = Array.tabulate(n)(i => (i * 31 + n).toByte)
 
   /** Simulates stores returning [start, end) of each slice, using the last `width` slices to mix in parity */
-  private def window(ida: AppendingReedSolomon, slices: Array[Array[Byte]], start: Int, end: Int) =
+  private def window(ida: RandomAccessReedSolomon, slices: Array[Array[Byte]], start: Int, end: Int) =
     slices.indices.takeRight(ida.restoreThreshold).map(i => (i.toByte, slices(i).slice(start, end))).toList
 
   test("every row-aligned window decodes to the matching logical bytes") {
@@ -82,7 +82,7 @@ class AppendableRangeSuite extends AnyFunSuite with Matchers:
   }
 
   test("sliceRangeFor does not overflow for huge lengths with k=1") {
-    val ida = AppendingReedSolomon(1, 1, 1, 8)
+    val ida = RandomAccessReedSolomon(1, 1, 1, 8)
     val c = content(100)
     val slices = ida.encode(c)
     val size = slices(0).length

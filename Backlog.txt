@@ -1,6 +1,6 @@
 Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
-that talks about things like IDA + Backend combinations. AppendingReedSolmon + RocksDB is a poor
+that talks about things like IDA + Backend combinations. RandomAccessReedSolomon + RocksDB is a poor
 combination.
 
 Need a way to connect AllocationGroups to App-defined Allocators

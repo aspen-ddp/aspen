@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectAllocatorId, PoolObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState}
@@ -214,11 +214,11 @@ class NodeAllocatorUnlimitedSuite extends IntegrationTestSuite:
     new NodeAllocator(client, List((PoolObjectAllocatorId(Radicle.poolId), Int.MaxValue))).validate().map(_ => succeed)
 
 
-/** AppendingReedSolomon slices hold whole cells, so a short right pointer occupies a full cell of every slice */
-class NodeAllocatorAppendingFillSuite extends IntegrationTestSuite with NodeFillBehaviour:
-  override def testIda: IDA = AppendingReedSolomon(3, 2, 2, 256)
+/** RandomAccessReedSolomon slices hold whole cells, so a short right pointer occupies a full cell of every slice */
+class NodeAllocatorRandomAccessFillSuite extends IntegrationTestSuite with NodeFillBehaviour:
+  override def testIda: IDA = RandomAccessReedSolomon(3, 2, 2, 256)
 
-  atest("a node filled to the node code's limit fits in an appending reed-solomon slice"):
+  atest("a node filled to the node code's limit fits in an random-access reed-solomon slice"):
     fillNode(Key(Array[Byte](1)), Key(Array[Byte](0x7f)), Array[Byte](2))
 
 
@@ -228,7 +228,7 @@ class NodeOverheadSuite extends AnyFunSuite with Matchers:
   private val ptr = KeyValueObjectPointer(org.aspen_ddp.aspen.common.objects.ObjectId(new UUID(1, 2)),
     org.aspen_ddp.aspen.common.pool.PoolId(new UUID(3, 4)))
 
-  private val idas: List[IDA] = List(Replication(3, 2), ReedSolomon(5, 3, 4), AppendingReedSolomon(3, 2, 2, 256))
+  private val idas: List[IDA] = List(Replication(3, 2), ReedSolomon(5, 3, 4), RandomAccessReedSolomon(3, 2, 2, 256))
 
   test("a node filled to maxNodeSize less the node overhead never exceeds maxNodeSize as the store measures it"):
     for

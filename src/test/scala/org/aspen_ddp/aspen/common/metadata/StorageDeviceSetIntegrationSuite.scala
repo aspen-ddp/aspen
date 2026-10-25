@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyAlreadyExists}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.aspen_ddp.aspen.common.DataBuffer
 
@@ -129,7 +129,7 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
   atest("createNewStoragePool rejects a maxSliceSize below the IDA's minSliceSize"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     for
       before <- client.listStoragePools()
       _ = an[IllegalArgumentException] should be thrownBy
@@ -142,7 +142,7 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
   atest("createNewStoragePool rejects a backend maxSliceSize below the IDA's minSliceSize"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     for
       before <- client.listStoragePools()
       _ = an[IllegalArgumentException] should be thrownBy

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, ConflictingRequirements, MultipleDataUpdatesToObject}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.common.ida.{AppendDelta, AppendingReedSolomon, IDA, ReedSolomon}
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, IDA, ReedSolomon}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation}
 import org.aspen_ddp.aspen.common.DataBuffer
@@ -25,7 +25,7 @@ class TransactionBuilderSuite extends AnyFunSuite with Matchers {
   private def mkBuilder(): TransactionBuilder =
     new TransactionBuilder(tx1, (_, _) => 0.toByte, ClientId(new UUID(0, 4)))
 
-  private val rs = AppendingReedSolomon(5, 3, 4, 8)
+  private val rs = RandomAccessReedSolomon(5, 3, 4, 8)
   private val L = 30
   private val pos = AppendPosition(p1, rev1, L)
   private val appended = Array.tabulate[Byte](50)(i => (i * 7 + 1).toByte)

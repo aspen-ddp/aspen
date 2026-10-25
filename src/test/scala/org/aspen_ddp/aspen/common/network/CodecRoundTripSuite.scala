@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.common.network
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.*
@@ -45,10 +45,10 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decoded = Codec.decode(Codec.encode(original))
     decoded shouldBe original
 
-  test("AppendingReedSolomon round-trip"):
-    val original = AppendingReedSolomon(5, 3, 4)
+  test("RandomAccessReedSolomon round-trip"):
+    val original = RandomAccessReedSolomon(5, 3, 4)
     Codec.decode(Codec.encode(original)) shouldBe original
-    val big: IDA = AppendingReedSolomon(5, 3, 4, cellSize = 4096)
+    val big: IDA = RandomAccessReedSolomon(5, 3, 4, cellSize = 4096)
     Codec.decode(Codec.encode(big)) shouldBe big
 
   test("IDA round-trip"):

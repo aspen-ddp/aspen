@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.client.internal.SimpleAspenClient
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.client.*
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.common.rebalancing.{RebalancingDurableService, StartResult, TransferStarter}
 import io.netty.handler.codec.quic.Quic
@@ -107,7 +107,7 @@ object Main {
                   width:Int=0,
                   readThreshold:Int=0,
                   writeThreshold:Int=0,
-                  cellSize:Int=AppendingReedSolomon.DefaultCellSize,
+                  cellSize:Int=RandomAccessReedSolomon.DefaultCellSize,
                   deviceSetName:String="",
                   maximumStoreSize:Long=0L,
                   maxSliceSize:Option[Int]=None,
@@ -302,19 +302,19 @@ object Main {
   /** Shared by the <ida-type> arguments of bootstrap and create-pool. */
   private val validateIdaType: String => Either[String, Unit] = x =>
     val xl = x.toLowerCase
-    if xl == "replication" || xl == "reed-solomon" || xl == "appending-reed-solomon" then
+    if xl == "replication" || xl == "reed-solomon" || xl == "random-access-reed-solomon" then
       Right(())
     else
-      Left("IDA type must be Replication, Reed-Solomon, or Appending-Reed-Solomon")
+      Left("IDA type must be Replication, Reed-Solomon, or Random-Access-Reed-Solomon")
 
-  /** Row cell size for appending-reed-solomon pools; ignored by the other IDA types. */
+  /** Row cell size for random-access-reed-solomon pools; ignored by the other IDA types. */
   private def cellSizeOption(p: ArgParser): OptionDef[?, Args] =
     import p.*
     opt[Int]("cell-size").valueName("<bytes>").
-      text(s"Cell size for appending-reed-solomon (default: ${AppendingReedSolomon.DefaultCellSize})").
+      text(s"Cell size for random-access-reed-solomon (default: ${RandomAccessReedSolomon.DefaultCellSize})").
       validate(x =>
-        if x >= AppendingReedSolomon.TrailerSize && x <= AppendingReedSolomon.MaxCellSize then success
-        else failure(s"--cell-size must be between ${AppendingReedSolomon.TrailerSize} and ${AppendingReedSolomon.MaxCellSize} bytes, got $x")).
+        if x >= RandomAccessReedSolomon.TrailerSize && x <= RandomAccessReedSolomon.MaxCellSize then success
+        else failure(s"--cell-size must be between ${RandomAccessReedSolomon.TrailerSize} and ${RandomAccessReedSolomon.MaxCellSize} bytes, got $x")).
       action((x, c) => c.copy(cellSize = x))
 
   /** Slice size limit for a new pool or allocation group. Omitted means no limit. */
@@ -362,7 +362,7 @@ object Main {
         action((x, c) => c.copy(address = x)).
         validate(x => validateHostAddress(x).fold(success)(failure)),
 
-      arg[String]("<ida-type>").text("IDA type. Must be Replication, Reed-Solomon, or Appending-Reed-Solomon").
+      arg[String]("<ida-type>").text("IDA type. Must be Replication, Reed-Solomon, or Random-Access-Reed-Solomon").
         action((x, c) => c.copy(idaType = x.toLowerCase())).
         validate(validateIdaType),
 
@@ -412,7 +412,7 @@ object Main {
       arg[String]("<pool-name>").text("Name of the new Pool").
         action((x, c) => c.copy(newPoolName = x)),
 
-      arg[String]("<ida-type>").text("IDA type. Must be Replication, Reed-Solomon, or Appending-Reed-Solomon").
+      arg[String]("<ida-type>").text("IDA type. Must be Replication, Reed-Solomon, or Random-Access-Reed-Solomon").
         action((x, c) => c.copy(idaType = x.toLowerCase())).
         validate(validateIdaType),
 
@@ -903,8 +903,8 @@ object Main {
     args.idaType match
       case "replication" => Replication(args.width, args.writeThreshold)
       case "reed-solomon" => ReedSolomon(args.width, args.readThreshold, args.writeThreshold)
-      case "appending-reed-solomon" =>
-        AppendingReedSolomon(args.width, args.readThreshold, args.writeThreshold, args.cellSize)
+      case "random-access-reed-solomon" =>
+        RandomAccessReedSolomon(args.width, args.readThreshold, args.writeThreshold, args.cellSize)
       case _ => throw new Exception(s"Invalid IDA type: ${args.idaType}")
 
   /** QUIC settings for a host (`ohost` defined) or a client command. A client command gets a single event loop. */

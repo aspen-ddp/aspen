@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.client.{AppendNotSupported, AppendPosition, DataObjectState, ObjectSizeLimitExceeded, RangedWrite, RangedWriteState}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.ClientId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, SetLeft, SetMin}
@@ -24,7 +24,7 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
   private val rev1 = ObjectRevision(TransactionId(new UUID(0, 3)))
 
   private val maxSliceSize = 64L
-  private val idas: List[IDA] = List(Replication(3, 2), ReedSolomon(5, 3, 4), AppendingReedSolomon(5, 3, 4, 8))
+  private val idas: List[IDA] = List(Replication(3, 2), ReedSolomon(5, 3, 4), RandomAccessReedSolomon(5, 3, 4, 8))
   private val appendable: List[IDA] = List(idas.head, idas.last)
 
   private def mkBuilder(): TransactionBuilder =
@@ -143,7 +143,7 @@ class TransactionMaxSizeSuite extends AnyFunSuite with Matchers {
   }
 
   test("a pool without a limit still enforces the IDA's own bound") {
-    val ars = AppendingReedSolomon(5, 3, 4, 8)
+    val ars = RandomAccessReedSolomon(5, 3, 4, 8)
     val ceiling = ars.maxObjectSize(Long.MaxValue)
     ceiling should be (Int.MaxValue - ars.rowBytes)
 

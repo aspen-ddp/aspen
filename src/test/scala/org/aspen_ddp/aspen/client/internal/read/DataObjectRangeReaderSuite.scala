@@ -4,7 +4,7 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.client.DataObjectRangesState
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, Replication}
+import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, ObjectId, ObjectRefcount, ObjectRevision, ReadType}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -16,7 +16,7 @@ import org.scalatest.matchers.should.Matchers
 class DataObjectRangeReaderSuite extends AnyFunSuite with Matchers:
 
   // cellSize 8 and k 3 give 24 byte rows
-  private val ida = AppendingReedSolomon(5, 3, 4, 8)
+  private val ida = RandomAccessReedSolomon(5, 3, 4, 8)
   private val pool = PoolId(new UUID(0, 1))
   private val pointer = DataObjectPointer(ObjectId(new UUID(1, 3)), pool, Array[Byte]())
   private val client = ClientId(new UUID(0, 4))

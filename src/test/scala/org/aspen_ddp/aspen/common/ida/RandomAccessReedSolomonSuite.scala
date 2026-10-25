@@ -8,19 +8,19 @@ import org.scalatest.matchers.should.Matchers
 
 import scala.language.implicitConversions
 
-class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
+class RandomAccessReedSolomonSuite extends AnyFunSuite with Matchers:
 
   import ReedSolomonSuite.{Sizes, Generators, kSubsets, segmentsFor}
 
-  private val Configs: List[AppendingReedSolomon] = List(
-    AppendingReedSolomon(1, 1, 1, 8),
-    AppendingReedSolomon(3, 2, 2, 8),
-    AppendingReedSolomon(3, 2, 3, 8),
-    AppendingReedSolomon(4, 4, 4, 16),
-    AppendingReedSolomon(5, 3, 4, 64),
-    AppendingReedSolomon(6, 4, 5, 8),
-    AppendingReedSolomon(8, 5, 6, 64),
-    AppendingReedSolomon(10, 7, 9, 8))
+  private val Configs: List[RandomAccessReedSolomon] = List(
+    RandomAccessReedSolomon(1, 1, 1, 8),
+    RandomAccessReedSolomon(3, 2, 2, 8),
+    RandomAccessReedSolomon(3, 2, 3, 8),
+    RandomAccessReedSolomon(4, 4, 4, 16),
+    RandomAccessReedSolomon(5, 3, 4, 64),
+    RandomAccessReedSolomon(6, 4, 5, 8),
+    RandomAccessReedSolomon(8, 5, 6, 64),
+    RandomAccessReedSolomon(10, 7, 9, 8))
 
   private def setTrailer(shard: Array[Byte], value: Long): Array[Byte] =
     val copy = shard.clone()
@@ -28,16 +28,16 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
     copy
 
   test("construction rejects invalid parameters") {
-    an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(5, 3, 4, 7)
-    an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(5, 3, 4, AppendingReedSolomon.MaxCellSize + 1)
-    an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(5, 0, 4, 8)
-    an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(3, 4, 4, 8)
-    an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(128, 3, 4, 8)
-    an [IllegalArgumentException] should be thrownBy AppendingReedSolomon(5, 3, 2, 8)
+    an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(5, 3, 4, 7)
+    an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(5, 3, 4, RandomAccessReedSolomon.MaxCellSize + 1)
+    an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(5, 0, 4, 8)
+    an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(3, 4, 4, 8)
+    an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(128, 3, 4, 8)
+    an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(5, 3, 2, 8)
   }
 
   test("segment length is rows times cellSize") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     ida.rowBytes should be (24)
     ida.calculateEncodedSegmentLength(0) should be (8)
     ida.calculateEncodedSegmentLength(16) should be (8)
@@ -88,7 +88,7 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
   }
 
   test("layout places stream byte p at its row and cell") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     val shards = ida.encode(Array.tabulate(100)(_.toByte))
     for p <- 0 until 100 do
       val shard = shards((p % 24) / 8)
@@ -96,7 +96,7 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
   }
 
   test("restore rejects a corrupt trailer") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     val shards = ida.encode(Array.tabulate(50)(_.toByte)) // 3 rows of 24 bytes
     val rows = ida.rowsFor(50)
     rows should be (3)
@@ -129,8 +129,8 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
   }
 
   test("serializeIDAType round trips including cellSize") {
-    for ida <- List(AppendingReedSolomon(5, 3, 4, 64), AppendingReedSolomon(3, 2, 3, 4096),
-      AppendingReedSolomon(3, 2, 3, AppendingReedSolomon.MaxCellSize)) do
+    for ida <- List(RandomAccessReedSolomon(5, 3, 4, 64), RandomAccessReedSolomon(3, 2, 3, 4096),
+      RandomAccessReedSolomon(3, 2, 3, RandomAccessReedSolomon.MaxCellSize)) do
       val bb = ByteBuffer.allocate(ida.getSerializedIDATypeLength)
       ida.getSerializedIDATypeLength should be (6)
       ida.serializeIDAType(bb)
@@ -139,12 +139,12 @@ class AppendingReedSolomonSuite extends AnyFunSuite with Matchers:
       IDA.deserializeIDAType(bb) should be (ida)
   }
 
-  private val RangedConfigs: List[AppendingReedSolomon] = Configs ++ List(
-    AppendingReedSolomon(4, 3, 3, 8),
-    AppendingReedSolomon(7, 4, 5, 9),
-    AppendingReedSolomon(3, 3, 3, 13))
+  private val RangedConfigs: List[RandomAccessReedSolomon] = Configs ++ List(
+    RandomAccessReedSolomon(4, 3, 3, 8),
+    RandomAccessReedSolomon(7, 4, 5, 9),
+    RandomAccessReedSolomon(3, 3, 3, 13))
 
-  private def checkRanged(ida: AppendingReedSolomon, old: Array[Byte], writes: List[(Int, Array[Byte])]): Unit =
+  private def checkRanged(ida: RandomAccessReedSolomon, old: Array[Byte], writes: List[(Int, Array[Byte])]): Unit =
     import RangedWriteDeltaSuite.{applyDeltas, applyWrites}
     val expected = ida.encode(applyWrites(old, writes))
     val actual = applyDeltas(ida, old, writes)

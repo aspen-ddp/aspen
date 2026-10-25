@@ -14,17 +14,17 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   import ReedSolomonSuite.segmentsFor
 
   private val Configs: List[IDA & AppendableIDA] = List(
-    AppendingReedSolomon(1, 1, 1, 8),
-    AppendingReedSolomon(3, 2, 2, 8),
-    AppendingReedSolomon(3, 2, 3, 8),
-    AppendingReedSolomon(4, 4, 4, 16),
-    AppendingReedSolomon(5, 3, 4, 64),
-    AppendingReedSolomon(5, 3, 4, 8),
-    AppendingReedSolomon(8, 5, 6, 64),
+    RandomAccessReedSolomon(1, 1, 1, 8),
+    RandomAccessReedSolomon(3, 2, 2, 8),
+    RandomAccessReedSolomon(3, 2, 3, 8),
+    RandomAccessReedSolomon(4, 4, 4, 16),
+    RandomAccessReedSolomon(5, 3, 4, 64),
+    RandomAccessReedSolomon(5, 3, 4, 8),
+    RandomAccessReedSolomon(8, 5, 6, 64),
     Replication(3, 2))
 
   private def rowBytesOf(ida: IDA): Int = ida match
-    case a: AppendingReedSolomon => a.rowBytes
+    case a: RandomAccessReedSolomon => a.rowBytes
     case _ => 24
 
   private def bytes(n: Int, seed: Int): Array[Byte] =
@@ -59,7 +59,7 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   }
 
   test("trailer boundary appends") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     for
       initial <- List(15, 16, 17, 24)
       m <- List(1, 8, 9)
@@ -71,7 +71,7 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
 
   test("long sequences of 1-byte appends") {
     val idas = List[IDA & AppendableIDA](
-      AppendingReedSolomon(5, 3, 4, 8), AppendingReedSolomon(3, 2, 2, 8), Replication(3, 2))
+      RandomAccessReedSolomon(5, 3, 4, 8), RandomAccessReedSolomon(3, 2, 2, 8), Replication(3, 2))
     for ida <- idas do
       val data = bytes(300, 7)
       val slices = appendAll(ida, new Array[Byte](0), data.toSeq.map(b => Array(b)))
@@ -90,7 +90,7 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   }
 
   test("delta only touches rows from the old final row onward") {
-    val ida = AppendingReedSolomon(5, 3, 4, 64)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 64)
     ida.appendDeltas(10000, bytes(1024, 3)).foreach { d =>
       d.regions.length should be (1)
       d.regions.head.offset should be ((10000 / 192) * 64)
@@ -99,7 +99,7 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   }
 
   test("matches rejects wrong slice length and wrong trailer") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     val slices = ida.encode(bytes(50, 1))
     val deltas = ida.appendDeltas(50, bytes(10, 2))
     for i <- 0 until ida.width do
@@ -112,7 +112,7 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
   }
 
   test("applyTo throws when the delta does not match") {
-    val ida = AppendingReedSolomon(5, 3, 4, 8)
+    val ida = RandomAccessReedSolomon(5, 3, 4, 8)
     val slices = ida.encode(bytes(50, 1))
     val deltas = ida.appendDeltas(50, bytes(10, 2))
     an [IllegalArgumentException] should be thrownBy deltas(0).applyTo(DataBuffer(slices(0).take(8)))

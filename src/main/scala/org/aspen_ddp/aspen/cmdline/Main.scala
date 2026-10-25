@@ -111,6 +111,7 @@ object Main {
                   deviceSetName:String="",
                   maximumStoreSize:Long=0L,
                   maxSliceSize:Option[Int]=None,
+                  allowAnyIda:Boolean=false,
                   setId:String="",
                   newSetName:String="",
                   newSetLevel:Int=0,
@@ -466,6 +467,25 @@ object Main {
         action((x, c) => c.copy(newGroupLevel = x)).
         validate(x => if (x >= 0) success else failure("Level must be >= 0")),
 
+      // Optional only so that --allow-any-ida can omit them; checkConfig requires all four otherwise
+      arg[String]("[ida-type]").optional().text("IDA every member must equal. Replication, Reed-Solomon, or Random-Access-Reed-Solomon").
+        action((x, c) => c.copy(idaType = x.toLowerCase())).
+        validate(validateIdaType),
+
+      arg[Int]("[width]").optional().text("Total number of slices/replicas").
+        action((x, c) => c.copy(width = x)),
+
+      arg[Int]("[read-threshold]").optional().text("Minimum number of slices/replicas that must be read to reconstruct an object").
+        action((x, c) => c.copy(readThreshold = x)),
+
+      arg[Int]("[write-threshold]").optional().text("Minimum number of slices/replicas that must be written to successfully write an object").
+        action((x, c) => c.copy(writeThreshold = x)),
+
+      cellSizeOption(p),
+
+      opt[Unit]("allow-any-ida").text("Accept members with any IDA instead of requiring the IDA given above").
+        action((_, c) => c.copy(allowAnyIda = true)),
+
       maxSliceSizeOption(p),
     )
 
@@ -755,6 +775,8 @@ object Main {
         failure("Invalid command")
       else if Set(c.dataPort, c.httpPort, c.storeTransferPort).size != 3 then
         failure("data-port, http-port, and store-transfer-port must all be different")
+      else if c.mode == "create-allocation-group" then
+        validateGroupIda(c)
       else if c.mode == "system-rebalance-period" then
         // Validated here rather than in the handler so a malformed period is a usage error,
         // reported before any client or network is built.
@@ -847,7 +869,11 @@ object Main {
             case "create-pool" => create_pool(session, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize,
               cfg.maxSliceSize)
             case "create-device-set" => create_device_set(session, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
-            case "create-allocation-group" => create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel, cfg.maxSliceSize)
+            case "create-allocation-group" =>
+              val (policy, ida) =
+                if cfg.allowAnyIda then (IDAPolicy.AllowAll, None)
+                else (IDAPolicy.ExactMatch, Some(createIDA(cfg)))
+              create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel, cfg.maxSliceSize, policy, ida)
             case "create-filesystem" => create_filesystem(session, cfg.fsName, cfg.poolName)
             case "add-pool-to-group" => add_pool_to_group(session, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(session, cfg.srcGroupName, cfg.newGroupName)
@@ -893,6 +919,22 @@ object Main {
     drainAndShutdown()
     System.exit(exitCode)
   }
+
+  /** A group needs either the four IDA arguments or --allow-any-ida, never both. Reported as a usage error. */
+  private def validateGroupIda(c: Args): Either[String, Unit] =
+    val gaveIda = c.idaType.nonEmpty || c.width != 0 || c.readThreshold != 0 || c.writeThreshold != 0
+    if c.allowAnyIda && gaveIda then
+      Left("--allow-any-ida cannot be combined with IDA arguments")
+    else if c.allowAnyIda then
+      Right(())
+    else if c.idaType.isEmpty || c.width == 0 || c.readThreshold == 0 || c.writeThreshold == 0 then
+      Left("<ida-type> <width> <read-threshold> <write-threshold> are required unless --allow-any-ida is given")
+    else
+      try
+        createIDA(c)
+        Right(())
+      catch
+        case e: IllegalArgumentException => Left(e.getMessage)
 
   def createIDA(args: Args): IDA =
     require(args.width >= args.readThreshold && args.width >= args.writeThreshold,
@@ -1575,7 +1617,9 @@ object Main {
   def create_allocation_group(session: ClientSession,
                               name: String,
                               level: Int,
-                              maxSliceSize: Option[Int] = None): Int = {
+                              maxSliceSize: Option[Int] = None,
+                              idaPolicy: IDAPolicy = IDAPolicy.ExactMatch,
+                              ida: Option[IDA] = None): Int = {
 
     configureLogging()
 
@@ -1585,7 +1629,7 @@ object Main {
 
     given ExecutionContext = client.clientContext
 
-    val f = client.createAllocationGroup(name, level, maxSliceSize)
+    val f = client.createAllocationGroup(name, level, maxSliceSize, idaPolicy, ida)
 
     // Translate the known failure mode into human-readable messages. The client's retry
     // strategy unwraps StopRetrying, so the future fails with the underlying cause.
@@ -2317,6 +2361,8 @@ object Main {
     lines += s"Allocation Group: ${s.name}"
     lines += s"  UUID:  ${s.groupId.uuid}"
     lines += s"  Level: ${s.level}"
+    lines += s"  IDA Policy: ${s.idaPolicy}"
+    lines += s"  IDA: ${s.ida.map(_.toString).getOrElse("any")}"
     lines += s"  Usage: ${formatBytes(s.currentUsage)} / ${formatBytes(s.maximumSize)}"
     lines += s"  Max Slice Size:  ${s.maxSliceSize.map(_.toString).getOrElse("unbounded")}"
     lines += s"  Max Object Size: ${s.maximumObjectSize.map(_.toString).getOrElse("unbounded")}"

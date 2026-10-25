@@ -194,6 +194,46 @@ class MainSuite extends AnyFunSuite with Matchers:
     out should include ("Members: none")
     out should include ("Parent Groups: none")
 
+  test("formatAllocationGroupState renders the IDA policy and ida"):
+    val groupId = AllocationGroupId(UUID.fromString("66666666-6666-6666-6666-666666666666"))
+    val exact = AllocationGroupState(groupId, 0, "gold", Nil, Nil,
+      idaPolicy = IDAPolicy.ExactMatch, ida = Some(Replication(3, 2)))
+    val exactOut = Main.formatAllocationGroupState(exact)
+    exactOut should include ("IDA Policy: ExactMatch")
+    exactOut should include (s"IDA: ${Replication(3, 2)}")
+    val any = Main.formatAllocationGroupState(AllocationGroupState(groupId, 0, "any", Nil, Nil))
+    any should include ("IDA Policy: AllowAll")
+    any should include ("IDA: any")
+
+  private def parseGroup(args: String*): Option[Main.Args] =
+    withTempDir("parse-group"): dir =>
+      val cfgs = emptyFile(dir / "bootstrap.yaml")
+      Console.withErr(OutputStream.nullOutputStream()):
+        Main.buildParser.parse(Seq("create-allocation-group", cfgs) ++ args, Main.Args())
+
+  test("create-allocation-group takes the create-pool IDA arguments"):
+    val parsed = parseGroup("g", "0", "Random-Access-Reed-Solomon", "5", "3", "4", "--cell-size", "128")
+      .getOrElse(fail("create-allocation-group did not parse"))
+    parsed.newGroupName shouldBe "g"
+    parsed.newGroupLevel shouldBe 0
+    parsed.allowAnyIda shouldBe false
+    Main.createIDA(parsed) shouldBe RandomAccessReedSolomon(5, 3, 4, 128)
+
+  test("create-allocation-group --allow-any-ida needs no IDA arguments"):
+    val parsed = parseGroup("g", "1", "--allow-any-ida").getOrElse(fail("did not parse"))
+    parsed.allowAnyIda shouldBe true
+    parsed.idaType shouldBe ""
+
+  test("create-allocation-group requires an IDA or --allow-any-ida, never both"):
+    parseGroup("g", "0") shouldBe None
+    parseGroup("g", "0", "replication", "3", "2", "2", "--allow-any-ida") shouldBe None
+
+  test("create-allocation-group rejects incomplete or invalid IDA arguments"):
+    parseGroup("g", "0", "replication") shouldBe None
+    parseGroup("g", "0", "replication", "3", "2") shouldBe None
+    parseGroup("g", "0", "bogus", "3", "2", "2") shouldBe None
+    parseGroup("g", "0", "reed-solomon", "5", "2", "4") shouldBe None  // read threshold not a majority
+
   // The host command reads both files out of the host directory rather than taking the
   // bootstrap config on the command line, so bootstrap must leave both of them behind.
   test("bootstrap writes host and bootstrap config files into the host directory"):

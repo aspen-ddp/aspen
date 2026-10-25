@@ -79,7 +79,7 @@ class SplitFinalizationAction(val client: AspenClient,
         } yield ()
       }
 
-      rootManager.getRootNode().flatMap { t =>
+      rootManager.getKeyValueRootNode().flatMap { t =>
         val (rootTier, ordering, orootNode) = t
 
         orootNode match {

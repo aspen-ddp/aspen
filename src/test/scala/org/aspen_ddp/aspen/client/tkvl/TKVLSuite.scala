@@ -465,7 +465,7 @@ class TKVLSuite extends IntegrationTestSuite {
               .map(node :: _)
 
     for
-      (tier, ordering, oroot) <- tree.rootManager.getRootNode()
+      (tier, ordering, oroot) <- tree.rootManager.getKeyValueRootNode()
       root = oroot.getOrElse(throw new BrokenTree())
       e <- TieredKeyValueList.fetchContainingNode(client, tier, 0, ordering,
              Key.AbsoluteMinimum, root, Set())
@@ -489,7 +489,7 @@ class TKVLSuite extends IntegrationTestSuite {
     def getRoot(): Future[Root] = real.getRoot()
     def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] =
       if served then
-        real.getRootNode()
+        real.getKeyValueRootNode()
       else
         served = true
         Future.successful((staleTier, stale.ordering, Some(stale)))

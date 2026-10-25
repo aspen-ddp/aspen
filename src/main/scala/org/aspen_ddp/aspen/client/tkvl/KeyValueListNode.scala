@@ -22,11 +22,20 @@ class KeyValueListNode(val reader: ObjectReader,
                        val revision: ObjectRevision,
                        val refcount: ObjectRefcount,
                        val contents: Map[Key, ValueState],
-                       val tail: Option[KeyValueListPointer]) extends Logging {
+                       val tail: Option[KeyValueListPointer]) extends ListNode with Logging {
 
   given ExecutionContext = reader.client.clientContext
 
   def maximum: Option[Key] = tail.map(rp => rp.minimum)
+
+  def link: Option[NodeLink] = tail.map(rp => NodeLink(rp.minimum, rp.pointer))
+
+  def entries: List[(Key, Value)] =
+    contents.iterator.map((k, vs) => (k, vs.value)).toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+
+  def get(key: Key): Option[Value] = contents.get(key).map(_.value)
+
+  def size: Int = contents.size
 
   def refresh(): Future[KeyValueListNode] = reader.read(pointer, s"Refresh KVListNode node ${pointer.id}. Minimum: $minimum").map { kvos =>
     new KeyValueListNode(reader, kvos.ida, pointer, ordering, minimum,
@@ -371,20 +380,7 @@ object KeyValueListNode extends Logging {
         (k, KVObjectState.idaEncodedPairSize(node.ida, k, vs.value))
       }.toList
 
-      val fullSize = sizes.foldLeft(0)((sz, t) => sz + t._2)
-
-      val halfSize = fullSize / 2
-
-      def rmove(rsizes: List[(Key,Int)], moveList: List[Key], moveSize: Int): List[Key] = {
-        val (k, sz) = rsizes.head
-        if (moveSize + sz >= halfSize)
-          moveList
-        else
-          rmove(rsizes.tail, k :: moveList, moveSize + sz)
-      }
-
-      val rsizes = sizes.reverse
-      val moveList = rmove(rsizes.tail, rsizes.head._1 :: Nil, rsizes.head._2) // Ensure at least 1 move
+      val moveList = SplitPlan.keysToMove(sizes)
       val moves = moveList.toSet
 
       val deletes: List[Delete] = moveList.map(Delete(_))
@@ -459,20 +455,7 @@ object KeyValueListNode extends Logging {
         (k, KVObjectState.idaEncodedPairSize(node.ida, k, vs.value))
       }.toList
 
-      val fullSize = sizes.foldLeft(0)((sz, t) => sz + t._2)
-
-      val halfSize = fullSize / 2
-
-      def rmove(rsizes: List[(Key,Int)], moveList: List[Key], moveSize: Int): List[Key] = {
-        val (k, sz) = rsizes.head
-        if (moveSize + sz >= halfSize)
-          moveList
-        else
-          rmove(rsizes.tail, k :: moveList, moveSize + sz)
-      }
-
-      val rsizes = sizes.reverse
-      val moveList = rmove(rsizes.tail, rsizes.head._1 :: Nil, rsizes.head._2) // Ensure at least 1 move
+      val moveList = SplitPlan.keysToMove(sizes)
       val moves = moveList.toSet
 
       val deletes: List[Delete] = moveList.map(Delete(_))

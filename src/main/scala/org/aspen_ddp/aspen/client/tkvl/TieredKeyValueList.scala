@@ -17,7 +17,7 @@ class TieredKeyValueList(val client: AspenClient,
   import TieredKeyValueList._
 
   def get(key: Key): Future[Option[ValueState]] = {
-    rootManager.getRootNode().flatMap { t =>
+    rootManager.getKeyValueRootNode().flatMap { t =>
       val (tier, ordering, onode) = t
       onode match {
         case None => Future.successful(None)
@@ -31,7 +31,7 @@ class TieredKeyValueList(val client: AspenClient,
   }
 
   def getContainingNode(key: Key): Future[Option[TieredKeyValueListNode]] = {
-    rootManager.getRootNode().flatMap { t =>
+    rootManager.getKeyValueRootNode().flatMap { t =>
       val (tier, ordering, onode) = t
       onode match {
         case None => Future.successful(None)
@@ -77,7 +77,7 @@ class TieredKeyValueList(val client: AspenClient,
           ()
     
     for
-      (tier, ordering, onode) <- rootManager.getRootNode()
+      (tier, ordering, onode) <- rootManager.getKeyValueRootNode()
       
       _ <- onode match
         case None => Future.unit
@@ -148,7 +148,7 @@ class TieredKeyValueList(val client: AspenClient,
 
     for
       oldRoot <- rootManager.getRoot()
-      (tier, ordering, oroot) <- rootManager.getRootNode()
+      (tier, ordering, oroot) <- rootManager.getKeyValueRootNode()
       (newTier, ptr) <- oroot match
         case Some(root) => nonEmpty(tier, ordering, root)
         case None =>
@@ -193,7 +193,7 @@ class TieredKeyValueList(val client: AspenClient,
         ()
     }
 
-    rootManager.getRootNode().flatMap { t =>
+    rootManager.getKeyValueRootNode().flatMap { t =>
       val (tier, ordering, oroot) = t
       oroot match {
         case None => empty(tier, ordering)
@@ -230,7 +230,7 @@ class TieredKeyValueList(val client: AspenClient,
   private def deleteFromContainingNode(key: Key, del: KeyValueListNode => Future[Unit]): Future[Unit] =
 
     def attempt(restarts: Int): Future[Unit] =
-      rootManager.getRootNode().flatMap: t =>
+      rootManager.getKeyValueRootNode().flatMap: t =>
         val (tier, ordering, oroot) = t
         oroot match
           case None => Future.unit
@@ -261,7 +261,7 @@ class TieredKeyValueList(val client: AspenClient,
         result
       }
     }
-    rootManager.getRootNode().flatMap { t =>
+    rootManager.getKeyValueRootNode().flatMap { t =>
       val (tier, ordering, oroot) = t
       oroot match {
         case None => Future.successful(z)
@@ -289,7 +289,7 @@ class TieredKeyValueList(val client: AspenClient,
       yield
         ()
 
-    rootManager.getRootNode().flatMap: t =>
+    rootManager.getKeyValueRootNode().flatMap: t =>
       val (tier, ordering, oroot) = t
       oroot match
         case None => Future.unit

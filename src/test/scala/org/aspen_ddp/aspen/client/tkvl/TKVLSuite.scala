@@ -545,7 +545,7 @@ class TKVLSuite extends IntegrationTestSuite {
   atest("A scan restart falls back a tier when tier reduction deleted the root") {
     for
       (tree, root, keys) <- buildSplitTree(3)
-      (numTiers, ordering, oroot) <- root.getRootNode()
+      (numTiers, ordering, oroot) <- root.getKeyValueRootNode()
       realRoot = oroot.getOrElse(throw new BrokenTree())
       ikvos <- client.read(radicle)
       pool <- client.getStoragePool(Radicle.poolId)
@@ -616,7 +616,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       newTreeRoot <- fnewTreeRoot
       newTree <- newTreeRoot.getTree()
-      (_, _, ooldRoot) <- root.getRootNode()
+      (_, _, ooldRoot) <- root.getKeyValueRootNode()
       oldValues <- Future.sequence(keys.map(tree.get))
       newValues <- Future.sequence(keys.map(newTree.get))
     yield

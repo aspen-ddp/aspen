@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, ObjectAllocator, RegisteredTypeFactory, Transaction}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -13,7 +13,7 @@ class JoinFinalizationAction(val client: AspenClient,
                              val rootManager: RootManager,
                              val tier: Int,
                              val deleteMinimum: Key,
-                             val deleteNode: KeyValueObjectPointer) extends FinalizationAction {
+                             val deleteNode: ObjectPointer) extends FinalizationAction {
 
   given ExecutionContext = client.clientContext
 
@@ -25,11 +25,11 @@ class JoinFinalizationAction(val client: AspenClient,
 
     val fcomplete = client.retryStrategy.retryUntilSuccessful {
 
-      def setNewRoot(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
+      def setNewRoot(rootTier: Int, ordering: KeyOrdering, rootNode: ListNode): Future[Unit] = {
         given tx: Transaction = client.newTransaction()
 
         // Root node always has a pointer to the AbsoluteMinimum node
-        val newRoot = KeyValueObjectPointer(rootNode.contents(Key.AbsoluteMinimum).value.bytes)
+        val newRoot = ObjectPointer(rootNode.get(Key.AbsoluteMinimum).get.bytes)
 
         tx.setRefcount(rootNode.pointer, rootNode.refcount, rootNode.refcount.decrement())
 
@@ -39,26 +39,26 @@ class JoinFinalizationAction(val client: AspenClient,
         } yield ()
       }
 
-      def deleteFromExistingTier(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
+      def deleteFromExistingTier(rootTier: Int, ordering: KeyOrdering, rootNode: ListNode): Future[Unit] = {
 
-        val fe = TieredKeyValueList.fetchContainingNode(client, rootTier, tier, ordering, deleteMinimum, rootNode, Set())
+        val fe = TierEngine.fetchContainingNode(client, rootTier, tier, ordering, deleteMinimum, rootNode, Set())
 
-        def delete(e: Either[Set[ObjectId], KeyValueListNode]): Future[Unit] = {
+        def delete(e: Either[Set[ObjectId], ListNode]): Future[Unit] = {
           e match {
             case Left(_) => Future.failed(new BrokenTree)
             case Right(node) =>
 
-              if (!node.contents.contains(deleteMinimum))
+              if (node.get(deleteMinimum).isEmpty)
                 Future.unit
               else {
                 given tx: Transaction = client.newTransaction()
 
-                def onJoin(min: Key, ptr: KeyValueObjectPointer): Future[Unit] = {
+                def onJoin(min: Key, ptr: ObjectPointer): Future[Unit] = {
                   JoinFinalizationAction.addToTransaction(rootManager, tier + 1, min, ptr, tx)
                   Future.unit
                 }
 
-                node.delete(deleteMinimum, onJoin)
+                TierEngine.encodingFor(node).delete(node, deleteMinimum, onJoin)
 
                 tx.commit().map(_=>())
               }
@@ -71,12 +71,12 @@ class JoinFinalizationAction(val client: AspenClient,
         } yield ()
       }
 
-      rootManager.getKeyValueRootNode().flatMap { t =>
+      rootManager.getRootNode().flatMap { t =>
         val (rootTier, ordering, orootNode) = t
         orootNode match {
           case None =>  Future.unit// Nothing to do
           case Some(rootNode) =>
-            if (tier == rootTier && rootNode.contents.size == 2)
+            if (tier == rootTier && rootNode.size == 2)
               setNewRoot(rootTier, ordering, rootNode)
             else
               deleteFromExistingTier(rootTier, ordering, rootNode)
@@ -99,13 +99,16 @@ object JoinFinalizationAction extends RegisteredTypeFactory with FinalizationAct
     val msb = bb.getLong()
     val lsb = bb.getLong()
     val tier = bb.getInt()
+    val kind = TreeKind.fromCode(bb.get())
     val elen = bb.getInt()
     val klen = bb.getInt()
     val emgr = new Array[Byte](elen)
     val karr = new Array[Byte](klen)
     bb.get(emgr)
     bb.get(karr)
-    val ptr = KeyValueObjectPointer(bb)
+    val ptr = ObjectPointer.fromByteBuffer(bb)
+    if !Root.pointerMatchesKind(kind, ptr) then
+      throw new IllegalArgumentException(s"Node pointer $ptr does not match tree kind $kind")
 
     val rootManagerTypeUUID = new UUID(msb, lsb)
 
@@ -119,21 +122,26 @@ object JoinFinalizationAction extends RegisteredTypeFactory with FinalizationAct
   def addToTransaction(mgr: RootManager,
                        tier: Int,
                        deleteMinimum: Key,
-                       deleteNode: KeyValueObjectPointer,
-                       tx: Transaction): Unit = {
+                       deleteNode: ObjectPointer,
+                       tx: Transaction): Unit =
+    tx.addFinalizationAction(FinalizationActionId(typeUUID), Some(encode(mgr, tier, deleteMinimum, deleteNode)))
+
+  /** The finalization action's payload. The tree kind is written so the node pointer can be checked against it. */
+  private[tkvl] def encode(mgr: RootManager, tier: Int, deleteMinimum: Key, deleteNode: ObjectPointer): Array[Byte] = {
     val emgr = mgr.encode()
-    val arr = new Array[Byte](8 + 8 + 4 + 4 + 4 + emgr.length + deleteMinimum.bytes.length + deleteNode.encodedSize)
+    val arr = new Array[Byte](8 + 8 + 4 + 1 + 4 + 4 + emgr.length + deleteMinimum.bytes.length + deleteNode.encodedSize)
     val bb = ByteBuffer.wrap(arr)
     bb.order(ByteOrder.BIG_ENDIAN)
     bb.putLong(mgr.typeId.uuid.getMostSignificantBits)
     bb.putLong(mgr.typeId.uuid.getLeastSignificantBits)
     bb.putInt(tier)
+    bb.put(TreeKind.of(deleteNode).code)
     bb.putInt(emgr.length)
     bb.putInt(deleteMinimum.bytes.length)
     bb.put(emgr)
     bb.put(deleteMinimum.bytes)
     deleteNode.encodeInto(bb)
-    tx.addFinalizationAction(FinalizationActionId(typeUUID), Some(arr))
+    arr
   }
 
 }

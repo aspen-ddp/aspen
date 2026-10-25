@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.*
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -14,7 +14,7 @@ class SplitFinalizationAction(val client: AspenClient,
                               val rootManager: RootManager,
                               val tier: Int,
                               val newMinimum: Key,
-                              val newNode: KeyValueObjectPointer) extends FinalizationAction {
+                              val newNode: ObjectPointer) extends FinalizationAction {
 
   given ExecutionContext = client.clientContext
 
@@ -26,7 +26,7 @@ class SplitFinalizationAction(val client: AspenClient,
 
     val fcomplete = client.retryStrategy.retryUntilSuccessful {
 
-      def createNewRoot(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
+      def createNewRoot(rootTier: Int, ordering: KeyOrdering, rootNode: ListNode): Future[Unit] = {
 
         given tx: Transaction = client.newTransaction()
 
@@ -37,33 +37,34 @@ class SplitFinalizationAction(val client: AspenClient,
 
         for {
           alloc <- rootManager.getAllocatorForTier(tier)
-          nroot <- alloc.allocateKeyValueObject(rootContent)
+          nroot <- TierEngine.encodingFor(rootNode).allocate(alloc, rootContent)
           _ <- rootManager.prepareRootUpdate(tier, Some(nroot))
           _ <- tx.commit()
         } yield ()
       }
 
-      def insertIntoExistingTier(rootTier: Int, ordering: KeyOrdering, rootNode: KeyValueListNode): Future[Unit] = {
+      def insertIntoExistingTier(rootTier: Int, ordering: KeyOrdering, rootNode: ListNode): Future[Unit] = {
 
         given tx: Transaction = client.newTransaction()
 
-        val fe = TieredKeyValueList.fetchContainingNode(client, rootTier, tier, ordering, newMinimum, rootNode, Set())
+        val fe = TierEngine.fetchContainingNode(client, rootTier, tier, ordering, newMinimum, rootNode, Set())
         val fnodeSize = rootManager.getMaxNodeSize(tier)
         val falloc = rootManager.getAllocatorForTier(tier)
 
-        def prepareInsert(e: Either[Set[ObjectId], KeyValueListNode], nodeSize: Int, alloc: ObjectAllocator): Future[Unit] = {
+        def prepareInsert(e: Either[Set[ObjectId], ListNode], nodeSize: Int, alloc: ObjectAllocator): Future[Unit] = {
           e match {
             case Left(_) =>
               // Tree is likely being deleted. Not much we can do
               Future.unit
               
             case Right(node) =>
-              def onSplit(min: Key, ptr: KeyValueObjectPointer): Future[Unit] = {
+              def onSplit(min: Key, ptr: ObjectPointer): Future[Unit] = {
                 SplitFinalizationAction.addToTransaction(rootManager, tier+1, min, ptr, tx)
                 Future.unit
               }
 
-              node.insert(newMinimum, Value(newNode.toArray), nodeSize, alloc, onSplit).map(_=>())
+              TierEngine.encodingFor(node).insert(node, newMinimum, Value(newNode.toArray), nodeSize, alloc, onSplit,
+                None).map(_=>())
           }
         }
 
@@ -79,7 +80,7 @@ class SplitFinalizationAction(val client: AspenClient,
         } yield ()
       }
 
-      rootManager.getKeyValueRootNode().flatMap { t =>
+      rootManager.getRootNode().flatMap { t =>
         val (rootTier, ordering, orootNode) = t
 
         orootNode match {
@@ -117,13 +118,16 @@ object SplitFinalizationAction extends RegisteredTypeFactory with FinalizationAc
     val msb = bb.getLong()
     val lsb = bb.getLong()
     val tier = bb.getInt()
+    val kind = TreeKind.fromCode(bb.get())
     val elen = bb.getInt()
     val klen = bb.getInt()
     val emgr = new Array[Byte](elen)
     val karr = new Array[Byte](klen)
     bb.get(emgr)
     bb.get(karr)
-    val ptr = KeyValueObjectPointer(bb)
+    val ptr = ObjectPointer.fromByteBuffer(bb)
+    if !Root.pointerMatchesKind(kind, ptr) then
+      throw new IllegalArgumentException(s"Node pointer $ptr does not match tree kind $kind")
 
     val rootManagerTypeUUID = new UUID(msb, lsb)
 
@@ -137,21 +141,26 @@ object SplitFinalizationAction extends RegisteredTypeFactory with FinalizationAc
   def addToTransaction(mgr: RootManager,
                        tier: Int,
                        newMinimum: Key,
-                       newNode: KeyValueObjectPointer,
-                       tx: Transaction): Unit = {
+                       newNode: ObjectPointer,
+                       tx: Transaction): Unit =
+    tx.addFinalizationAction(FinalizationActionId(typeUUID), Some(encode(mgr, tier, newMinimum, newNode)))
+
+  /** The finalization action's payload. The tree kind is written so the node pointer can be checked against it. */
+  private[tkvl] def encode(mgr: RootManager, tier: Int, newMinimum: Key, newNode: ObjectPointer): Array[Byte] = {
     val emgr = mgr.encode()
-    val arr = new Array[Byte](8 + 8 + 4 + 4 + 4 + emgr.length + newMinimum.bytes.length + newNode.encodedSize)
+    val arr = new Array[Byte](8 + 8 + 4 + 1 + 4 + 4 + emgr.length + newMinimum.bytes.length + newNode.encodedSize)
     val bb = ByteBuffer.wrap(arr)
     bb.order(ByteOrder.BIG_ENDIAN)
     bb.putLong(mgr.typeId.uuid.getMostSignificantBits)
     bb.putLong(mgr.typeId.uuid.getLeastSignificantBits)
     bb.putInt(tier)
+    bb.put(TreeKind.of(newNode).code)
     bb.putInt(emgr.length)
     bb.putInt(newMinimum.bytes.length)
     bb.put(emgr)
     bb.put(newMinimum.bytes)
     newNode.encodeInto(bb)
-    tx.addFinalizationAction(FinalizationActionId(typeUUID), Some(arr))
+    arr
   }
 
 }

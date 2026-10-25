@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject}
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, Transaction}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, ObjectRevision, Value}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
@@ -49,6 +49,74 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
    */
   def walkFrom(startKey: Key, walk: ListNode => Future[Unit]): Future[Unit] =
     withContainingNode(startKey, ())(walk)
+
+  def set(key: Key,
+          value: Value,
+          requirement: Option[Either[Boolean, ObjectRevision]] = None)
+         (using t: Transaction): Future[Unit] =
+
+    def onSplit(newMinimum: Key, newNode: ObjectPointer): Future[Unit] =
+      SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
+      Future.unit
+
+    def empty(): Future[Unit] =
+      // `requirement` is intentionally dropped. createInitialNode only commits
+      // if the tree is still empty, in which case the key cannot exist and a
+      // DoesNotExist requirement is already satisfied.
+      rootManager.createInitialNode(Map(key -> value)).map(_=>())
+
+    def nonEmpty(tier: Int, ordering: KeyOrdering, root: ListNode): Future[Unit] =
+      val encoding = encodingFor(root)
+      for
+        alloc <- rootManager.getAllocatorForTier(0)
+        maxNodeSize <- rootManager.getMaxNodeSize(0)
+
+        e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
+
+        node = e match
+          case Left(_) => throw new BrokenTree()
+          case Right(n) => n
+
+        _ <- encoding.insert(node, key, value, maxNodeSize, alloc, onSplit, requirement)
+      yield
+        ()
+
+    rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
+      oroot match
+        case None => empty()
+        case Some(root) => nonEmpty(tier, ordering, root)
+
+  def delete(key: Key)(using t: Transaction): Future[Unit] =
+    def onJoin(delMinimum: Key, delNode: ObjectPointer): Future[Unit] =
+      JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
+      Future.unit
+    deleteFromContainingNode(key, node => encodingFor(node).delete(node, key, onJoin))
+
+  /** Descends to the tier-0 node containing `key` and hands it to `del`.
+   *
+   *  Deleting a node's last key joins it with its right neighbour, which `del` reads. If a racing
+   *  join already absorbed that neighbour, the containing node was read before the join and the
+   *  read fails with InvalidObject. `del` adds nothing to the transaction before that read, so
+   *  the delete restarts from a fresh root.
+   */
+  def deleteFromContainingNode(key: Key, del: ListNode => Future[Unit]): Future[Unit] =
+
+    def attempt(restarts: Int): Future[Unit] =
+      rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
+        oroot match
+          case None => Future.unit
+          case Some(root) =>
+            for
+              e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
+              node = e match
+                case Left(_) => throw new BrokenTree()
+                case Right(n) => n
+              _ <- del(node).recoverWith:
+                case _: InvalidObject if restarts < MaxJoinRaceRestarts => attempt(restarts + 1)
+            yield
+              ()
+
+    attempt(0)
 
 object TierEngine:
 

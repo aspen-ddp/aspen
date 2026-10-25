@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -144,51 +144,12 @@ class TieredKeyValueList(val client: AspenClient,
   def set(key: Key,
           value: Value,
           requirement: Option[Either[Boolean, ObjectRevision]] = None)
-         (using t: Transaction): Future[Unit] = {
+         (using t: Transaction): Future[Unit] =
+    engine.set(key, value, requirement)
 
-    def onSplit(newMinimum: Key, newNode: KeyValueObjectPointer): Future[Unit] = {
-      SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
-      Future.unit
-    }
-    def empty(tier: Int, ordering: KeyOrdering): Future[Unit] = {
-      // `requirement` is intentionally dropped. createInitialNode only commits
-      // if the tree is still empty, in which case the key cannot exist and a
-      // DoesNotExist requirement is already satisfied.
-      rootManager.createInitialNode(Map(key -> value)).map(_=>())
-    }
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] = {
-      for
-        alloc <- rootManager.getAllocatorForTier(0)
-        maxNodeSize <- rootManager.getMaxNodeSize(0)
+  def delete(key: Key)(using t: Transaction): Future[Unit] = engine.delete(key)
 
-        e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
-
-        node = e match
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-
-        _ <- node.insert(key, value, maxNodeSize, alloc, onSplit, requirement)
-      yield
-        ()
-    }
-
-    rootManager.getKeyValueRootNode().flatMap { t =>
-      val (tier, ordering, oroot) = t
-      oroot match {
-        case None => empty(tier, ordering)
-        case Some(root) => nonEmpty(tier, ordering, root)
-      }
-    }
-  }
-
-  def delete(key: Key)(using t: Transaction): Future[Unit] = {
-    def onJoin(delMinimum: Key, delNode: KeyValueObjectPointer): Future[Unit] = {
-      JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
-      Future.unit
-    }
-    deleteFromContainingNode(key, _.delete(key, onJoin))
-  }
-
+  /** KeyValue-object trees only: the requirements are key-value requirements on the containing node */
   def delete(key: Key, 
              requiredRevision: Option[ObjectRevision],
              requirements: List[KeyValueUpdate.KeyRequirement])(using t: Transaction): Future[Unit] = {
@@ -196,35 +157,8 @@ class TieredKeyValueList(val client: AspenClient,
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
     }
-    deleteFromContainingNode(key, _.delete(key, requiredRevision, requirements, onJoin))
+    engine.deleteFromContainingNode(key, node => kvNode(node).delete(key, requiredRevision, requirements, onJoin))
   }
-
-  /** Descends to the tier-0 node containing `key` and hands it to `del`.
-   *
-   *  Deleting a node's last key joins it with its right neighbour, which `del` reads. If a racing
-   *  join already absorbed that neighbour, the containing node was read before the join and the
-   *  read fails with InvalidObject. `del` adds nothing to the transaction before that read, so
-   *  the delete restarts from a fresh root.
-   */
-  private def deleteFromContainingNode(key: Key, del: KeyValueListNode => Future[Unit]): Future[Unit] =
-
-    def attempt(restarts: Int): Future[Unit] =
-      rootManager.getKeyValueRootNode().flatMap: t =>
-        val (tier, ordering, oroot) = t
-        oroot match
-          case None => Future.unit
-          case Some(root) =>
-            for
-              e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
-              node = e match
-                case Left(_) => throw new BrokenTree()
-                case Right(n) => n
-              _ <- del(node).recoverWith:
-                case _: InvalidObject if restarts < TierEngine.MaxJoinRaceRestarts => attempt(restarts + 1)
-            yield
-              ()
-
-    attempt(0)
 
   def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] =
     engine.foldLeft(z)(node => kvNode(node).foldLeft(z)(fn))

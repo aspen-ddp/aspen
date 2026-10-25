@@ -35,19 +35,17 @@ class KVObjectRootManager(val client: AspenClient,
           case Some(v) => try {
             val root = Root(client, v.value.bytes)
 
-            root.rootKeyValuePointer match {
+            root.orootObject match {
               case None => p.success(RData(root, v.revision, None))
               case Some(rootObject) =>
-                client.read(rootObject, s"Root node for TKVL tree $treeKey").onComplete {
+                NodeEncoding(root.kind).read(client, rootObject, Key.AbsoluteMinimum, root.ordering,
+                  s"Root node for TKVL tree $treeKey").onComplete {
                   case Failure(err) =>
                     // Tree has been deleted but the root has not yet been updated
                     // Return an empty tree root
                     p.success(RData(root.copy(tier=0, orootObject=None), v.revision, None))
                     
-                  case Success(rootKvos) =>
-                    val rootLp = KeyValueListPointer(Key.AbsoluteMinimum, rootObject)
-                    val node = KeyValueListNode(client, rootLp, root.ordering, rootKvos)
-
+                  case Success(node) =>
                     p.success(RData(root, v.revision, Some(node)))
                 }
             }
@@ -66,10 +64,10 @@ class KVObjectRootManager(val client: AspenClient,
   }
 
   def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = getRData().flatMap { rd =>
-    rd.root.nodeAllocator.getAllocatorForTier(tier)
+    rd.root.nodeAllocator.getAllocatorForTier(tier, rd.root.kind)
   }
 
-  def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] = getRData().map { rd =>
+  def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = getRData().map { rd =>
     (rd.root.tier, rd.root.ordering, rd.onode)
   }
 
@@ -107,10 +105,10 @@ class KVObjectRootManager(val client: AspenClient,
       _ = if onode.isDefined then
             tx.abortAndThrow(new Exception("Initial TKVL node already exists."))
 
-      alloc <- root.nodeAllocator.getAllocatorForTier(0)
-      rptr <- alloc.allocateKeyValueObject(contents)
+      alloc <- root.nodeAllocator.getAllocatorForTier(0, root.kind)
+      rptr <- NodeEncoding(root.kind).allocate(alloc, contents)
     } yield {
-      val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator)
+      val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator, root.kind)
       // Pin the revision at which the tree was observed to be empty. Callers
       // such as TieredKeyValueList.set rely on this to make key requirements
       // unnecessary for the initial node's contents.
@@ -125,7 +123,7 @@ class KVObjectRootManager(val client: AspenClient,
 
 object KVObjectRootManager extends RootManagerFactory {
 
-  private case class RData(root: Root, rootRevision: ObjectRevision, onode: Option[KeyValueListNode])
+  private case class RData(root: Root, rootRevision: ObjectRevision, onode: Option[ListNode])
 
   val typeUUID: UUID = UUID.fromString("CE36789D-42F1-43F9-9464-E9B44419D8C4")
 

@@ -72,9 +72,10 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     efficiently store and retrieve data in Aspen
   - Every Transaction that allocates an object should also store the resulting ObjectPointer in another object
     to prevent data loss in the event of a crash.
-  - A TKVL tree is either KeyValue-object or DataObject based (`TreeKind` in its `Root`; kinds never mix). Shared tree
-    logic lives in `TierEngine`, driven through a pluggable `NodeEncoding`. `DataObjectTKVL` stores values only
-    (no per-key revisions/requirements), is more compact, and uses whole-node revision checks: single-writer use only.
+  - A TKVL tree is KeyValue-object or DataObject based (`TreeKind` in its `Root`); shared logic is `TierEngine` over a
+    pluggable `NodeEncoding`. `DataObjectTKVL` is more compact, stores values only (no per-key revisions/requirements)
+    and uses whole-node revision checks: intended for single-writer / low-contention use. A second update to one of its
+    nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
 - Aspen is designed and implemented largely as a logical system
   - Messages are addressed to logical entities like DataStores rather than physical hosts
   - The last step prior to sending a message is to look up the address of the network endpoint currently

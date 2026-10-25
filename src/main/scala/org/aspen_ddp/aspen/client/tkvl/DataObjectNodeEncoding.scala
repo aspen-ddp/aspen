@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.tkvl
 
 import java.nio.ByteBuffer
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, ObjectAllocator, ObjectReader, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, ConflictingRequirements, InvalidObject, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectAllocator, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, ObjectPointer, ObjectRevision, Value}
@@ -16,6 +16,10 @@ import scala.util.Failure
 /** Nodes stored as DataObjects. A DataObject has no side fields, so the node's minimum and right link live in its
   * bytes. Every update is a whole-node rewrite guarded by the node's revision; there are no per-entry revisions, so
   * insert requirements are not supported.
+  *
+  * A transaction can modify a node only once, so an update to a node the transaction already modifies fails with
+  * `NodeAlreadyModified` (see `writeNode`). It stages nothing unless an earlier part of the same update is already
+  * staged, as in a split or join, in which case the transaction is aborted.
   *
   * Layout, with every length an unsigned varint:
   * {{{
@@ -117,9 +121,25 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     case p => throw new IllegalArgumentException(
       s"DataObjectNodeEncoding requires a DataObjectPointer, got ${p.getClass.getName}")
 
-  /** Every update of an existing node goes through here */
+  /** Every update of an existing node goes through here. A transaction can update a node only once: the transaction
+    * itself rejects a second data update to an object, or one to an object it holds a revision lock on (a node a join
+    * absorbed). Both are reported as `NodeAlreadyModified`, with nothing staged by this write. Newly allocated nodes
+    * get their content from the allocation, not from here.
+    */
   private def writeNode(node: DataObjectListNode, content: Array[Byte])(using tx: Transaction): Unit =
-    tx.overwrite(node.pointer, node.revision, DataBuffer(content))
+    try
+      tx.overwrite(node.pointer, node.revision, DataBuffer(content))
+    catch
+      case _: MultipleDataUpdatesToObject | _: ConflictingRequirements => throw NodeAlreadyModified(node.pointer)
+
+  /** Runs `stage`, which adds to `tx` after an earlier part of the same update is already staged. A
+    * `NodeAlreadyModified` from it would leave that earlier part staged without the rest, so it aborts the transaction.
+    */
+  private def abortIfAlreadyModified(tx: Transaction)(stage: => Unit): Unit =
+    try
+      stage
+    catch
+      case e: NodeAlreadyModified => tx.abortAndThrow(e)
 
   /** `entries` with `key` set to `value`, kept ascending */
   private def withEntry(entries: List[(Key, Value)], key: Key, value: Value, ordering: KeyOrdering): List[(Key, Value)] =
@@ -171,7 +191,8 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
         if encodedSize(left, n.minimum, leftLink) > maxNodeSize then
           tx.abortAndThrow(new NodeSizeExceeded)
 
-        writeNode(n, encode(left, n.minimum, leftLink))
+        // The new right node is already staged
+        abortIfAlreadyModified(tx)(writeNode(n, encode(left, n.minimum, leftLink)))
         prepareForSplit(newMinimum, rightPointer)
 
   /** As `KeyValueListNode.delete`. A join rewrites this node with the right node's entries and link, locks the right
@@ -200,8 +221,15 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
               Future.unit
             else
               writeNode(n, encode(r.entries, n.minimum, r.link))
-              tx.lockRevision(r.pointer, r.revision)
-              tx.setRefcount(r.pointer, r.refcount, r.refcount.decrement())
+              // This node's rewrite is already staged. The transaction rejects the lock if it already updates the
+              // right node, and the refcount update if it already changes the right node's refcount.
+              abortIfAlreadyModified(tx):
+                try
+                  tx.lockRevision(r.pointer, r.revision)
+                  tx.setRefcount(r.pointer, r.refcount, r.refcount.decrement())
+                catch
+                  case _: ConflictingRequirements | _: MultipleRefcountUpdatesToObject =>
+                    throw NodeAlreadyModified(r.pointer)
               prepareForJoin(right.minimum, right.pointer)
 
         case _ =>

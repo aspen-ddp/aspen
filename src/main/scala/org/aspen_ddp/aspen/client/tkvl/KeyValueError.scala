@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.AspenError
-import org.aspen_ddp.aspen.common.objects.Key
+import org.aspen_ddp.aspen.common.objects.{Key, ObjectPointer}
 
 sealed abstract class KeyValueError(cause: Throwable = null) extends AspenError(cause = cause)
 
@@ -38,3 +38,9 @@ class BrokenTree extends KeyValueError
 /** The tree's node encoding cannot enforce the requested insert requirement (see `NodeEncoding.insert`) */
 class UnsupportedRequirement(val kind: TreeKind) extends KeyValueError:
   override def getMessage: String = s"Insert requirements are not supported by $kind trees"
+
+/** A DataObject-tree update would modify `pointer`, a node the same transaction already modifies. DataObject nodes
+  * are rewritten whole, so one transaction can change a node only once.
+  */
+final case class NodeAlreadyModified(pointer: ObjectPointer) extends KeyValueError:
+  override def getMessage: String = s"TKVL node ${pointer.id} is already modified in this transaction"

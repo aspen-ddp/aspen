@@ -424,3 +424,108 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       _ <- enc.deleteList(client, head, ordering, None)
     yield
       assert(remaining.forall(_.isEmpty))
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Same-node guard
+
+  private def alreadyModified(err: Throwable, node: ListNode): Boolean = err match
+    case NodeAlreadyModified(p) => p == node.pointer
+    case _ => false
+
+  atest("a second insert into a node already written in the transaction fails and leaves the first staged"):
+    for
+      n0 <- makeNode(List(key(1) -> vbytes(1)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, None)(using tx)
+      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, None)(using tx)).failed
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer)
+    yield
+      assert(alreadyModified(err, n0))
+      assert(asBytes(n1.entries) == asBytes(List(key(1) -> vbytes(1), key(2) -> vbytes(2))))
+
+  atest("a delete from a node already written in the transaction fails"):
+    for
+      n0 <- makeNode(List(key(1) -> vbytes(1), key(2) -> vbytes(2)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, None)(using tx)
+      err <- Future.delegate(enc.delete(n0, key(1), noJoin)(using tx)).failed
+    yield
+      assert(alreadyModified(err, n0))
+
+  atest("a split of a node already written in the transaction aborts it, since its new node is already staged"):
+    val original = List(key(1) -> vbytes(1, 100), key(2) -> vbytes(2, 100))
+    // Room for the two original entries plus a link, but not for a third entry
+    val maxNodeSize = enc.encodedSize(original, Key.AbsoluteMinimum, None) + 80
+    assert(enc.encodedSize(original :+ (key(3) -> vbytes(3, 100)), Key.AbsoluteMinimum, None) > maxNodeSize)
+    for
+      n0 <- makeNode(original)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.delete(n0, key(2), noJoin)(using tx)
+      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3, 100), maxNodeSize, alloc, noSplit, None)(using tx))
+        .failed
+      txErr <- tx.result.failed
+      n1 <- readNode(n0.pointer)
+    yield
+      assert(alreadyModified(err, n0))
+      assert(alreadyModified(txErr, n0))
+      assert(n1.revision == n0.revision)
+
+  atest("a join whose left node is already written in the transaction fails"):
+    for
+      right <- makeNode(List(key(50) -> vbytes(50)), key(50))
+      left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.insert(left, key(2), vbytes(2), 4096, alloc, noSplit, None)(using tx)
+      err <- Future.delegate(enc.delete(left, key(1), noJoin)(using tx)).failed
+    yield
+      assert(alreadyModified(err, left))
+
+  atest("a join whose right node is already written in the transaction aborts it"):
+    for
+      right <- makeNode(List(key(50) -> vbytes(50)), key(50))
+      left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, None)(using tx)
+      err <- Future.delegate(enc.delete(left, key(1), noJoin)(using tx)).failed
+      txErr <- tx.result.failed
+      l1 <- readNode(left.pointer)
+    yield
+      assert(alreadyModified(err, right))
+      assert(alreadyModified(txErr, right))
+      assert(l1.revision == left.revision)
+
+  atest("writing a node a join in the same transaction absorbed fails"):
+    var joined = false
+    val onJoin: (Key, ObjectPointer) => Future[Unit] = (_, _) =>
+      joined = true
+      Future.unit
+    for
+      right <- makeNode(List(key(50) -> vbytes(50)), key(50))
+      left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.delete(left, key(1), onJoin)(using tx)
+      err <- Future.delegate(enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, None)(using tx)).failed
+    yield
+      assert(joined)
+      assert(alreadyModified(err, right))
+
+  atest("splitAt of a node already written in the transaction fails before allocating"):
+    val original = (1 to 6).toList.map(i => key(i) -> vbytes(i))
+    for
+      n0 <- makeNode(original)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.delete(n0, key(1), noJoin)(using tx)
+      err <- Future.delegate(enc.splitAt(n0, key(4), false, None, alloc)(using tx)).failed
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer)
+    yield
+      assert(alreadyModified(err, n0))
+      assert(asBytes(n1.entries) == asBytes(original.drop(1)))

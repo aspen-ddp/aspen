@@ -42,10 +42,22 @@ trait ObjectAllocator:
   def allocateDataObject(initialContent: DataBuffer,
                          initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[DataObjectPointer] =
     given ExecutionContext = client.clientContext
-    allocateDataObject().map: ptr =>
-      t.overwrite(ptr, ObjectRevision.Allocating, initialContent)
-      t.setRefcount(ptr, ObjectRefcount.Allocating, initialRefcount)
+    createDataObjectPointer().map: ptr =>
+      stageDataObjectAllocation(ptr, initialContent, initialRefcount)
       ptr
+
+  /** Adds the allocation of `ptr`, a pointer from `createDataObjectPointer`, with its initial content to the
+    * transaction. Creating the pointer stages nothing, so together they let a caller size the content by the new
+    * object's pointer before adding anything to the transaction.
+    */
+  protected[client] def stageDataObjectAllocation(ptr: DataObjectPointer,
+                                                  initialContent: DataBuffer,
+                                                  initialRefcount: ObjectRefcount = ObjectRefcount(0,1))
+                                                 (using t: Transaction): Unit =
+    t.addAllocatingObject(ptr)
+    AllocationFinalizationAction.addToTransaction(ptr, t)
+    t.overwrite(ptr, ObjectRevision.Allocating, initialContent)
+    t.setRefcount(ptr, ObjectRefcount.Allocating, initialRefcount)
 
   def allocateKeyValueObject(initialContent: Map[Key,Value],
                              minimum: Option[Key] = None,

@@ -177,21 +177,118 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       assert(leftBytes.size <= maxNodeSize)
       assert(rightBytes.size <= maxNodeSize)
 
-  atest("a split whose left node would not fit with its new link aborts with NodeSizeExceeded"):
-    // Only key(3) moves right, leaving the big entry in a left node that now needs a link
+  /** Records each split's new minimum and node */
+  private class SplitRecorder:
+    var splits: List[(Key, ObjectPointer)] = Nil
+    val onSplit: (Key, ObjectPointer) => Future[Unit] = (k, p) =>
+      splits = (k, p) :: splits
+      Future.unit
+
+  /** Inserts and commits, then returns the left node and the split's new right node */
+  private def insertAndSplit(n0: DataObjectListNode, k: Key, v: Value,
+                             maxNodeSize: Int): Future[(DataObjectListNode, DataObjectListNode)] =
+    val rec = new SplitRecorder
+    for
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.insert(n0, k, v, maxNodeSize, alloc, rec.onSplit, None)(using tx)
+      _ <- tx.commit()
+      left <- readNode(n0.pointer)
+      right <- readNode(rec.splits.head._2)
+    yield
+      assert(rec.splits.size == 1)
+      (left, right)
+
+  private def objectSize(node: ListNode): Future[Int] =
+    client.read(node.pointer.asInstanceOf[DataObjectPointer]).map(_.size)
+
+  atest("a split that SplitPlan would leave with an oversized left node uses another split point"):
+    // SplitPlan moves only key(3), leaving the big entry in a left node that now needs a link
     val original = List(key(1) -> vbytes(1, 10), key(2) -> vbytes(2, 900))
     val maxNodeSize = enc.encodedSize(original, Key.AbsoluteMinimum, None) + 5
     for
       n0 <- makeNode(original)
+      (left, right) <- insertAndSplit(n0, key(3), vbytes(3, 10), maxNodeSize)
+      leftSize <- objectSize(left)
+      rightSize <- objectSize(right)
+    yield
+      assert(left.entries.map(_._1) == List(key(1)))
+      assert(right.entries.map(_._1) == List(key(2), key(3)))
+      assert(sameLink(left.link, Some(NodeLink(key(2), right.pointer))))
+      assert(leftSize <= maxNodeSize)
+      assert(rightSize <= maxNodeSize)
+
+  atest("the largest accepted entry still lets a later key above it split off into its own node"):
+    val maxNodeSize = 1000
+    val a = key(10)
+    val b = key(20)
+    for
+      n0 <- makeNode(Nil)
+      alloc <- allocator()
+      // Room is kept for a link as long as one to the entry's own key
+      reserve = enc.nodeOverhead(Key.AbsoluteMinimum, Some(NodeLink(a, n0.pointer)))
+      vlen = (0 to maxNodeSize).filter(v => enc.entrySize(a, vbytes(1, v)) <= maxNodeSize - reserve).max
+      tx0 = client.newTransaction()
+      tooBig <- Future.delegate(enc.insert(n0, a, vbytes(1, vlen + 1), maxNodeSize, alloc, noSplit,
+        None)(using tx0)).failed
+      tx1 = client.newTransaction()
+      _ <- enc.insert(n0, a, vbytes(1, vlen), maxNodeSize, alloc, noSplit, None)(using tx1)
+      _ <- tx1.commit()
+      n1 <- readNode(n0.pointer)
+      (left, right) <- insertAndSplit(n1, b, vbytes(2, 100), maxNodeSize)
+      leftSize <- objectSize(left)
+    yield
+      assert(vlen > 900)
+      assert(tooBig.isInstanceOf[NodeSizeExceeded])
+      assert(tx0.isEmpty)
+      assert(left.entries.map(_._1) == List(a))
+      assert(right.entries.map(_._1) == List(b))
+      assert(leftSize <= maxNodeSize)
+
+  atest("an insert below a long-keyed big entry splits where both nodes fit"):
+    val a = key(1)
+    val s = key(2)
+    val bigKey = Key(Array[Byte](3) ++ Array.fill[Byte](199)(7))
+    val bigValue = vbytes(3, 300)
+    val nodeLink = Some(NodeLink(Key(Array.fill[Byte](20)(9)), fakePointer(1)))
+    for
+      n0 <- makeNode(List(a -> vbytes(1), bigKey -> bigValue), Key.AbsoluteMinimum, nodeLink)
+      // The big entry is exactly as large as the node accepts
+      maxNodeSize = math.max(enc.nodeOverhead(Key.AbsoluteMinimum, nodeLink),
+        enc.nodeOverhead(Key.AbsoluteMinimum, Some(NodeLink(bigKey, n0.pointer)))) + enc.entrySize(bigKey, bigValue)
+      // s overflows the node, but s and the big entry fit together in a node whose minimum is s
+      sv = (1 to 1000).map(v => vbytes(2, v)).find: v =>
+        enc.encodedSize(List(a -> vbytes(1), s -> v, bigKey -> bigValue), Key.AbsoluteMinimum, nodeLink) > maxNodeSize &&
+          enc.encodedSize(List(s -> v, bigKey -> bigValue), s, nodeLink) <= maxNodeSize
+      (left, right) <- insertAndSplit(n0, s, sv.get, maxNodeSize)
+      leftSize <- objectSize(left)
+      rightSize <- objectSize(right)
+    yield
+      // SplitPlan alone would move only the big entry, into a node too large with the long key as its minimum
+      assert(enc.encodedSize(List(bigKey -> bigValue), bigKey, nodeLink) > maxNodeSize)
+      assert(left.entries.map(_._1) == List(a))
+      assert(right.entries.map(_._1) == List(s, bigKey))
+      assert(right.minimum == s)
+      assert(sameLink(right.link, nodeLink))
+      assert(leftSize <= maxNodeSize)
+      assert(rightSize <= maxNodeSize)
+
+  atest("an insert that no split can hold throws NodeSizeExceeded with nothing staged"):
+    // Built directly: a node this full could not be reached through insert
+    val maxNodeSize = 1000
+    val original = List(key(1) -> vbytes(1, 990))
+    for
+      n0 <- makeNode(original)
       alloc <- allocator()
       tx = client.newTransaction()
-      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3, 10), maxNodeSize, alloc, noSplit, None)(using tx))
-        .failed
-      txErr <- tx.result.failed
+      err <- Future.delegate(enc.insert(n0, key(2), vbytes(2, 10), maxNodeSize, alloc, noSplit,
+        None)(using tx)).failed
       n1 <- readNode(n0.pointer)
     yield
+      assert(enc.encodedSize(original, Key.AbsoluteMinimum, None) <= maxNodeSize)
+      assert(enc.encodedSize(original :+ (key(2) -> vbytes(2, 10)), Key.AbsoluteMinimum, None) > maxNodeSize)
       assert(err.isInstanceOf[NodeSizeExceeded])
-      assert(txErr.isInstanceOf[NodeSizeExceeded])
+      assert(tx.isEmpty)
       assert(n1.revision == n0.revision)
 
   atest("insert with a defined requirement throws UnsupportedRequirement"):

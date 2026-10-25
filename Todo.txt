@@ -1,12 +1,6 @@
 TODO
 ====
 
-Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
-encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs
-and tombstones until the object is full. If compaction frees up enough space, the object can be
-overwritten and append operations can resume until a split is eventually required. The encoding is a
-pluggable NodeEncoding so it plugs in without touching the tree logic in TierEngine.
-
 Known issues found while building DataObject TKVL:
   - When a KeyValue-object join absorbs a node (KeyValueListNode.delete) the left node keeps its old stored
     maximum, so later inserts at or above that old maximum into the joined node are rejected by the store
@@ -46,6 +40,19 @@ Need to add an upper-tier node caching capability to speed up future tree naviga
     - Whenever a scan-right operation is done in a tier, drop the cache on the tier above it.
       - reread the root if the scan-right is done on the top tier
 
+Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
+encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs
+and tombstones until the object is full. If compaction frees up enough space, the object can be
+overwritten and append operations can resume until a split is eventually required. The encoding is a
+pluggable NodeEncoding so it plugs in without touching the tree logic in TierEngine.
+  - Note that appending to the object saves write bandwidth but comes at the cost of increasing read
+    bandwidth.
+    - The implementation should balance the two. Rather than blindly appending, calculate the cost
+      of doing a subsequent read when choosing to append or a compacted overwrite. There probably
+      isn't a single solution that is ideal in all cases. If possible, design the code such that
+      a plugin (or just a callback) can be provided that optimize to specific use cases but default to
+      a good, general-purpose implementation.
+
 Think through some options for new DataStore backends
   - Need some options that play well with RandomAccessReedSolomon
   - Single-Allocator solutions are valid
@@ -60,4 +67,3 @@ Think through some options for new DataStore backends
         the KV object in the same transaction.
       - On Failure, retry
       - On Success, delete the index and replace with a new one pulled from higher-level available indicies list
-      

@@ -392,6 +392,10 @@ form groups of groups for allocation purposes.
 An AllocationGroup may carry a maximum slice size, fixed at creation. A pool or group may only join a group
 whose limit is at least as large as its own, so every allocation from the group fits whichever member is chosen.
 
+An AllocationGroup also has an IDA policy, fixed at creation. Under the default `ExactMatch` policy the group is
+created with an IDA and every member pool or group must have an IDA equal to it (same type and every parameter);
+mixing IDAs is almost always a mistake. `AllowAll` groups accept any member.
+
 Allocation groups track the approximate usage of all group members and employs a weighted selection 
 method when choosing a pool or group to allocate an object from. Pools and groups that are relatively 
 empty will receive proportionately more allocations than those that are more full.

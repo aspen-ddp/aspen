@@ -1,10 +1,6 @@
 TODO
 ====
 
-AllocationGroups probably ought to default to requiring an exact IDA match on all members.
-  - Mixing IDAs is probably a mistake
-  - Allow creation to override this. Maybe an IDAPolicy enum with ExactMatch and AllowAll members
-
 The TKVL as it currently exists is useful but has poor storage efficiency an identical data structure
 composed of DataObjects would be useful for low-contention use cases like single-writer. Proposed
 solution, generalize the TKVL code such that the important logic such as content management,

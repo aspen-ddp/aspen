@@ -172,6 +172,20 @@ absent. A pool or group may join a group only if its own limit is no larger than
 with no limit cannot join a limited group; otherwise joining fails with `MemberLimitExceedsGroup` before
 any state changes.
 
+### Allocation Group IDA Policy
+
+An allocation group is created with an IDA policy and, for the default `ExactMatch` policy, an IDA. Both are
+fixed at creation. A pool or child group may join only if its IDA is equal (`==`: same type and every parameter)
+to the group's; otherwise joining fails with `MemberIDAMismatch` before any state changes. A child group's IDA
+is the one it was created with, so an `AllowAll` child cannot join an `ExactMatch` group. An `AllowAll` group has
+no IDA and accepts any member.
+
+* **Client**: `createAllocationGroup(name, level, maxSliceSize, idaPolicy = ExactMatch, ida = Some(ida))`, or
+  `idaPolicy = IDAPolicy.AllowAll` with no `ida`. Any other combination throws `IllegalArgumentException`.
+* **CLI**: `create-allocation-group <name> <level> <ida-type> <width> <read-threshold> <write-threshold>`, taking
+  the same IDA arguments and `--cell-size` as `create-pool`, or `create-allocation-group <name> <level>
+  --allow-any-ida`.
+
 A TKVL tier's `maxNodeSize` may never exceed what its allocator can store, and violating this fails loudly
 with `NodeSizeExceedsAllocatorLimit` naming the tier, requested size and limit. For a tier allocating from a
 pool the limit is `min(maxSliceSize, maxObjectSize)`. Key-value objects replicate their keys in every slice

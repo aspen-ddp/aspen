@@ -257,6 +257,27 @@ class NodeAllocatorKindLimitSuite extends IntegrationTestSuite:
       assert(kv == NodeSizeExceedsAllocatorLimit(1, sliceLimit + 1, sliceLimit))
       assert(kvTier == kv)
 
+  atest("Root.create and createNewTree validate the node allocator for the tree's kind"):
+    val content = Map(Key(Array[Byte](1)) -> Value(Array[Byte](1)))
+    given tx: Transaction = client.newTransaction()
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      host <- pool.allocator.allocateKeyValueObject()
+      root <- Root.create(client, ByteArrayKeyOrdering, allocator(dataLimit), content, TreeKind.DataObjects)
+      kv <- limitError(Root.create(client, ByteArrayKeyOrdering, allocator(dataLimit), content))
+      _ <- KVObjectRootManager.createNewTree(client, host, Key(Array[Byte](1)), ByteArrayKeyOrdering,
+        allocator(dataLimit), content, TreeKind.DataObjects)
+      kvTree <- limitError(KVObjectRootManager.createNewTree(client, host, Key(Array[Byte](2)), ByteArrayKeyOrdering,
+        allocator(dataLimit), content))
+      data <- limitError(KVObjectRootManager.createNewTree(client, host, Key(Array[Byte](3)), ByteArrayKeyOrdering,
+        allocator(dataLimit + 1), Map(), TreeKind.DataObjects))
+    yield
+      assert(root.kind == TreeKind.DataObjects)
+      assert(root.orootObject.exists(_.isInstanceOf[DataObjectPointer]))
+      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, sliceLimit))
+      assert(kvTree == kv)
+      assert(data == NodeSizeExceedsAllocatorLimit(0, dataLimit + 1, dataLimit))
+
   atest("a DataObject node allocated in a pool below the tier's node size fails where the node lands"):
     given tx: Transaction = client.newTransaction()
     for

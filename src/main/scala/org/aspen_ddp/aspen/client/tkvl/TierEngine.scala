@@ -13,8 +13,8 @@ import scala.util.{Failure, Success}
   * the `NodeEncoding` of the tree's kind. The kind comes from the root node's pointer (see `TreeKind.of`), which
   * `Root` guarantees matches `Root.kind`.
   *
-  * The kind-specific facades (`TieredKeyValueList`) sit on top of this and convert nodes and entries to the types
-  * their callers see.
+  * The kind-specific facades (`TieredKeyValueList`, `DataObjectTKVL`) sit on top of this and convert nodes and
+  * entries to the types their callers see.
   */
 private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootManager) extends Logging:
 

@@ -60,14 +60,14 @@ object Root {
 
     given ExecutionContext = client.clientContext
 
-    // Every tier is checked up front, not only the tier-0 node allocated here
-    nodeAllocator.validate().flatMap: _ =>
+    // Every tier is checked up front, for the tree's kind, not only the tier-0 node allocated here
+    nodeAllocator.validate(kind).flatMap: _ =>
       if initialContent.isEmpty then
         Future.successful(new Root(0, ordering, None, nodeAllocator, kind))
       else
         for
-          alloc <- nodeAllocator.getAllocatorForTier(0)
-          rp <- alloc.allocateKeyValueObject(initialContent)
+          alloc <- nodeAllocator.getAllocatorForTier(0, kind)
+          rp <- NodeEncoding(kind).allocate(alloc, ordering, initialContent)
         yield
           new Root(0, ordering, Some(rp), nodeAllocator, kind)
   }

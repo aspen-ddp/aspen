@@ -63,6 +63,9 @@ class KVObjectRootManager(val client: AspenClient,
     new TieredKeyValueList(client, this)
   }
 
+  /** The tree as a DataObjectTKVL. Fails with `WrongTreeKind` if it is not a DataObjects tree. */
+  def getDataObjectTree(): Future[DataObjectTKVL] = DataObjectTKVL.open(client, this)
+
   def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = getRData().flatMap { rd =>
     rd.root.nodeAllocator.getAllocatorForTier(tier, rd.root.kind)
   }
@@ -161,28 +164,22 @@ object KVObjectRootManager extends RootManagerFactory {
   /** Outter future is for ready to commit transaction. Inner future is to the root manager after successful
     * transaction completion.
     *
-    * Note that the key must not already exist within the object
+    * Note that the key must not already exist within the object. The root is hosted in `pointer` under `key` for
+    * either `kind`; the nodes, including the initial one holding `initialContent`, are objects of that kind.
     */
   def createNewTree(client: AspenClient,
                     pointer: KeyValueObjectPointer,
                     key: Key,
                     ordering: KeyOrdering,
                     nodeAllocator: NodeAllocator,
-                    initialContent: Map[Key,Value])(using tx: Transaction): Future[Future[KVObjectRootManager]] =
+                    initialContent: Map[Key,Value],
+                    kind: TreeKind = TreeKind.KeyValueObjects)(using tx: Transaction): Future[Future[KVObjectRootManager]] =
 
     given ExecutionContext = client.clientContext
 
     // The root entry must always be written: it is what makes the tree exist, and its DoesNotExist
     // requirement is what guards against clobbering an existing tree. An empty tree needs no root node
     // object, so Root.orootObject is None until the first insert.
-    if initialContent.isEmpty then
-      nodeAllocator.validate().map: _ =>
-        setNewRoot(client, pointer, key, true, Root(0, ordering, None, nodeAllocator))
-    else
-      for
-        _ <- nodeAllocator.validate()
-        alloc <- nodeAllocator.getAllocatorForTier(0)
-        rptr <- alloc.allocateKeyValueObject(initialContent)
-      yield
-        setNewRoot(client, pointer, key, true, Root(0, ordering, Some(rptr), nodeAllocator))
+    Root.create(client, ordering, nodeAllocator, initialContent, kind).map: root =>
+      setNewRoot(client, pointer, key, true, root)
 }

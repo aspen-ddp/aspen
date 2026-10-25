@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -89,13 +89,16 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
       srcBefore <- client.getStorageDeviceState(sourceId)
       dstBefore <- client.getStorageDeviceState(net.secondDeviceId)
       poolBefore <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      _ = takeNudges()
       _ <- client.abortStoreTransfer(storeId)
+      nudges = takeNudges()
       _ <- waitForTransactionsToComplete()
       srcAfter <- client.getStorageDeviceState(sourceId)
       dstAfter <- client.getStorageDeviceState(net.secondDeviceId)
       poolAfter <- client.getStoragePoolState(PoolId.BootstrapPoolId)
     yield
       poolBefore.stores(storeId.poolIndex).storageDeviceId should be(net.secondDeviceId)
+      nudges should be(Nil)
       srcAfter should be(srcBefore)
       dstAfter should be(dstBefore)
       poolAfter.stores(storeId.poolIndex).storageDeviceId should be(net.secondDeviceId)
@@ -119,11 +122,41 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
                  List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
                  List(Insert(StorageDeviceState.StateKey, st.encode())))
       _ <- waitForTransactionsToComplete()
+      _ = takeNudges()
       _ <- client.abortStoreTransfer(storeId)
+      nudges = takeNudges()
       _ <- waitForTransactionsToComplete()
       src <- client.getStorageDeviceState(sourceId)
       dst <- client.getStorageDeviceState(net.secondDeviceId)
     yield
+      // Only the source changed, so only it is nudged.
+      nudges.map(_.deviceId) should be(List(sourceId))
       src.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)
       src.stores(storeId).transferDevice should be(None)
       dst.stores(storeId).status should be(StorageDeviceState.StoreStatus.Rebuilding)
+
+  atest("abortStoreTransfer does not nudge a tombstoned destination"):
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(storeId, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transactUntilSuccessful: tx =>
+             for
+               ptr <- client.getStorageDevicePointer(net.secondDeviceId)
+               kvos <- client.read(ptr)
+             yield
+               val st = StorageDeviceState(kvos).copy(hostId = fixed_ids.FailedHostId)
+               tx.update(ptr, None, None,
+                 List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+                 List(Insert(StorageDeviceState.StateKey, st.encode())))
+      _ <- waitForTransactionsToComplete()
+      _ = takeNudges()
+      _ <- client.abortStoreTransfer(storeId)
+      nudges = takeNudges()
+      _ <- waitForTransactionsToComplete()
+      src <- client.getStorageDeviceState(sourceId)
+    yield
+      nudges.map(_.deviceId) should be(List(sourceId))
+      src.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)

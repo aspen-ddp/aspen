@@ -1,6 +1,4 @@
 Follow-ups from parallel store transfers
-  4. AspenClient.abortStoreTransfer nudges the destination host even when the entry was not
-     ours or the destination is tombstoned; no test for the 'already completed' no-op nudge
   5. TransferStarter: a failed Future from start is ambiguous (document it); RolledBack is
      returned even when the abort was a no-op; TransferBackoff has no jitter and does not
      use FiniteDuration

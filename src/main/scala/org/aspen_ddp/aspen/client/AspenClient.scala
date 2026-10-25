@@ -499,9 +499,13 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
               List(KeyRevision(StorageDeviceState.StateKey, dstKvos.contents(StorageDeviceState.StateKey).revision)),
               List(Insert(StorageDeviceState.StateKey, dstState.removeStore(storeId).encode())))
 
-          List(
-            CheckStorageDevice(srcState.hostId, clientId, sourceId),
-            CheckStorageDevice(dstState.hostId, clientId, outstanding.get))
+          // The destination is nudged only when this call changed its entry, and never when it is
+          // tombstoned: its hostId is then the zeroed FailedHostId, which no host answers to.
+          CheckStorageDevice(srcState.hostId, clientId, sourceId) ::
+            (if ours && !dstState.isFailed then
+               List(CheckStorageDevice(dstState.hostId, clientId, outstanding.get))
+             else
+               Nil)
 
     fStaged.map(_.foreach(sendBestEffortHostMessage))
 

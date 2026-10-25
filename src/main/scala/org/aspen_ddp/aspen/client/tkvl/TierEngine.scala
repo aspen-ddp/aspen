@@ -445,7 +445,10 @@ object TierEngine:
             case Right(next) => descend(client, encoding, currentTier-1, targetTier, ordering, target,
               next, blacklist, currentNode :: reversePath).onComplete {
               case Failure(err) => p.failure(err)
-              case Success(Left(blklst)) => p.success(Left(blklst + next.pointer.id))
+              // `next` holds nothing to descend into, as when joins removed its first entries but left its
+              // minimum. Fall back to the next candidate to the left: the scan right from below it reaches the
+              // target, since navigation within a tier is consistent.
+              case Success(Left(blklst)) => rtry(candidates.tail, blklst + next.pointer.id)
               case Success(Right(rpath)) => p.success(Right(rpath))
             }
           }

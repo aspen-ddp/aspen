@@ -67,6 +67,10 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
 
   /** As `TieredKeyValueList.splitTree`. The left tree's last node has no maximum afterwards, so unlike a KeyValue
     * left tree it keeps accepting keys at or above `splitAtKey` (see `DataObjectNodeEncoding.splitAt`).
+    *
+    * The same-node guard applies per tier: each tier's split fails with `NodeAlreadyModified` if its node is already
+    * modified in the transaction, but splits of the tiers below it are already staged by then. Upper-tier nodes are
+    * normally written only by finalization actions, in transactions of their own.
     */
   def splitTree(splitAtKey: Key, inclusive: Boolean = false)(using Transaction): Future[Root] =
     checked(engine.splitTree(splitAtKey, inclusive))

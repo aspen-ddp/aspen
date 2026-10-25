@@ -57,31 +57,27 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
     yield
       (tree, rm)
 
-  /** Commits each update in its own transaction, one after another.
-    *
-    * Sets commit without waiting for their split finalization in between: tier-0 updates never write an upper tier
-    * and tier-0 navigation does not depend on it, so the tier-0 shape is the same either way, and everything is
-    * finalized before this completes. Deletes (`settleEach`) wait after each one, since a descent over upper tiers
-    * that joins are still emptying can hit the descent limitation described above the delete tests.
+  /** Commits each update in its own transaction, one after another, without waiting for split and join
+    * finalization in between: tier-0 updates never write an upper tier and a descent tolerates upper tiers that
+    * finalization has not caught up with, so the tier-0 shape is the same either way. Everything is finalized
+    * before this completes.
     */
-  private def sequentially(ks: List[Key], settleEach: Boolean)
-                          (update: (Key, Transaction) => Future[Unit]): Future[Unit] =
+  private def sequentially(ks: List[Key])(update: (Key, Transaction) => Future[Unit]): Future[Unit] =
     ks.foldLeft(Future.unit): (prev, k) =>
       prev.flatMap: _ =>
         val tx = client.newTransaction()
         for
           _ <- update(k, tx)
           _ <- tx.commit()
-          _ <- if settleEach then waitForTransactionsToComplete() else Future.unit
         yield
           ()
     .flatMap(_ => waitForTransactionsToComplete())
 
   private def setAll(tree: DataObjectTKVL, ks: List[Key]): Future[Unit] =
-    sequentially(ks, settleEach = false)((k, tx) => tree.set(k, value(k.bytes.last))(using tx))
+    sequentially(ks)((k, tx) => tree.set(k, value(k.bytes.last))(using tx))
 
   private def deleteAll(tree: DataObjectTKVL, ks: List[Key]): Future[Unit] =
-    sequentially(ks, settleEach = true)((k, tx) => tree.delete(k)(using tx))
+    sequentially(ks)((k, tx) => tree.delete(k)(using tx))
 
   private def readNode(ptr: ObjectPointer): Future[ListNode] =
     DataObjectNodeEncoding.read(client, ptr, Key.AbsoluteMinimum, ordering, "test read")
@@ -234,32 +230,34 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       assert(entries == all.map(k => k -> value(k.bytes.last).bytes.toList))
       assert(visited == all)
 
-  // Known TierEngine descent limitation, shared with KeyValue-object trees: when the upper-tier node a descent picks
-  // holds no entry at or below the target (its first entries were removed by joins, but its minimum stays), the
-  // descent reports BrokenTree instead of falling back to the node's left neighbour. So these tests delete from the
-  // highest key down, which keeps every lookup below the emptied upper-tier nodes, and only look up surviving keys.
+  // Ascending deletes empty the leftmost tier-0 node again and again, so every join absorbs its right neighbour into
+  // it, and each absorbed node's entry leaves the tier above (see TierEngineDescentSuite for lookups that then pass
+  // through an upper-tier node whose first entries are gone).
 
   atest("deleting keys joins nodes across a multi-tier tree"):
     val all = keys(1 to 24)
+    val (deleted, kept) = all.splitAt(21)
     for
       (tree, rm) <- newTree()
       _ <- setAll(tree, all)
       before <- tier0Nodes(rm)
       tiersBefore <- numTiers(rm)
-      _ <- deleteAll(tree, all.drop(3).reverse)
+      _ <- deleteAll(tree, deleted)
       after <- tier0Nodes(rm)
       entries <- entriesOf(tree)
       remaining <- Future.sequence(before.map(n => client.readOptional(dataPointer(n.pointer))))
-      values <- Future.sequence(all.take(3).map(tree.get))
+      values <- Future.sequence(all.map(tree.get))
     yield
       assert(tiersBefore >= 2)
       assert(after.size < before.size)
-      // Every node but the head and the one it is linked to was joined into its left neighbour and deleted
-      assert(after.size == 2)
+      // Every node that was joined into its left neighbour is deleted
       assert(remaining.count(_.isDefined) == after.size)
-      assert(entries.map(_._1) == all.take(3))
-      assert(values.forall(_.isDefined))
+      assert(after.map(_.pointer).toSet.subsetOf(before.map(_.pointer).toSet))
+      assert(entries.map(_._1) == kept)
+      assert(values.map(_.isDefined) == all.map(kept.contains))
 
+  // Tier reduction only ever goes from tier 1 to tier 0: the leftmost upper-tier node keeps its AbsoluteMinimum entry
+  // and never empties, so a root above tier 1 never drops to the two entries a reduction needs.
   atest("deleting every key of a two-tier tree reduces it to a single empty node"):
     val all = keys(1 to 9)
     for
@@ -267,7 +265,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       _ <- setAll(tree, all)
       before <- tier0Nodes(rm)
       tiersBefore <- numTiers(rm)
-      _ <- deleteAll(tree, all.reverse)
+      _ <- deleteAll(tree, all)
       after <- allTiers(rm)
       tiersAfter <- numTiers(rm)
       visited <- visitsOf(tree.foreach)

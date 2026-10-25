@@ -39,10 +39,13 @@ trait NodeEncoding:
 
   /** Splits the list at `splitAtKey`, keeping keys below it (and it too when `inclusive`) in `node`. Returns the
     * head of the new list holding the rest, whose minimum is `Key.AbsoluteMinimum` (see `KeyValueListNode.splitAt`).
+    * `maxNodeSize` is the node's tier's. An encoding that cannot fit the rest of the list within it throws
+    * `NodeSizeExceeded` before staging anything.
     */
   def splitAt(node: ListNode,
               splitAtKey: Key,
               inclusive: Boolean,
+              maxNodeSize: Int,
               optionalDownPointer: Option[ObjectPointer],
               allocator: ObjectAllocator)(using Transaction): Future[NodeLink]
 

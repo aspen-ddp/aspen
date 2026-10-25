@@ -48,6 +48,7 @@ object KeyValueNodeEncoding extends NodeEncoding:
   def splitAt(node: ListNode,
               splitAtKey: Key,
               inclusive: Boolean,
+              maxNodeSize: Int,
               optionalDownPointer: Option[ObjectPointer],
               allocator: ObjectAllocator)(using Transaction): Future[NodeLink] =
     val n = kvNode(node)

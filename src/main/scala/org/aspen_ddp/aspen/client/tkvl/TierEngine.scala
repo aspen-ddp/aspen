@@ -255,9 +255,10 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     def splitContaining(encoding: NodeEncoding,
                         node: ListNode,
                         odown: Option[ObjectPointer],
-                        alloc: ObjectAllocator): Future[NodeLink] =
+                        alloc: ObjectAllocator,
+                        maxNodeSize: Int): Future[NodeLink] =
       scanToContainingNode(client, encoding, node, splitAtKey).flatMap: containing =>
-        encoding.splitAt(containing, splitAtKey, inclusive, odown, alloc)
+        encoding.splitAt(containing, splitAtKey, inclusive, maxNodeSize, odown, alloc)
 
     def rinsert(encoding: NodeEncoding,
                 tier: Int,
@@ -269,7 +270,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         val odown = if tier > 0 then Some(downPointer) else None
         for
           alloc <- rootManager.getAllocatorForTier(tier)
-          down <- splitContaining(encoding, rpath.head, odown, alloc)
+          maxNodeSize <- rootManager.getMaxNodeSize(tier)
+          down <- splitContaining(encoding, rpath.head, odown, alloc, maxNodeSize)
           kvp <- rinsert(encoding, tier + 1, rpath.tail, down.pointer)
         yield
           kvp
@@ -290,8 +292,9 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         // There will always be a tier0 entry, split that then recurse through
         // the full path
         alloc <- rootManager.getAllocatorForTier(0)
+        maxNodeSize <- rootManager.getMaxNodeSize(0)
 
-        down <- splitContaining(encoding, rpath.head, None, alloc)
+        down <- splitContaining(encoding, rpath.head, None, alloc, maxNodeSize)
 
         kvp <- rinsert(encoding, 1, rpath.tail, down.pointer)
       yield

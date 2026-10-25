@@ -459,7 +459,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(original, Key.AbsoluteMinimum, originalLink)
       alloc <- allocator()
       tx = client.newTransaction()
-      head <- enc.splitAt(n0, key(4), false, Some(down), alloc)(using tx)
+      head <- enc.splitAt(n0, key(4), false, 4096, Some(down), alloc)(using tx)
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
       newLeft <- readNode(head.pointer)
@@ -481,7 +481,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(original)
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.splitAt(n0, key(4), false, None, alloc)(using tx)
+      _ <- enc.splitAt(n0, key(4), false, 4096, None, alloc)(using tx)
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
       tx2 = client.newTransaction()
@@ -499,7 +499,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(original)
       alloc <- allocator()
       tx = client.newTransaction()
-      head <- enc.splitAt(n0, key(4), true, None, alloc)(using tx)
+      head <- enc.splitAt(n0, key(4), true, 4096, None, alloc)(using tx)
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
       newLeft <- readNode(head.pointer)
@@ -509,6 +509,41 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       assert(newLeft.entries.isEmpty)
       assert(asBytes(newRight.entries) == asBytes(original.drop(4)))
       assert(newRight.link.isEmpty)
+
+  // A node whose minimum is the empty absolute minimum splits at a long key: the right node's minimum is that key, so
+  // the right node is larger than the node it came from
+  private val longSplitKey = Key(Array.fill[Byte](100)(7))
+
+  atest("splitAt allows a right node that exactly fits maxNodeSize"):
+    val original = List(key(1) -> vbytes(1, 10), key(8) -> vbytes(8, 10))
+    val right = original.drop(1)
+    val maxNodeSize = enc.encodedSize(right, longSplitKey, None)
+    for
+      n0 <- makeNode(original)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      head <- enc.splitAt(n0, longSplitKey, false, maxNodeSize, None, alloc)(using tx)
+      _ <- tx.commit()
+      newLeft <- readNode(head.pointer)
+      newRight <- readNode(newLeft.link.get.pointer, longSplitKey)
+    yield
+      assert(enc.encodedSize(original, Key.AbsoluteMinimum, None) < maxNodeSize)
+      assert(asBytes(newRight.entries) == asBytes(right))
+
+  atest("splitAt of a right node past maxNodeSize throws NodeSizeExceeded with nothing staged"):
+    val original = List(key(1) -> vbytes(1, 10), key(8) -> vbytes(8, 10))
+    val maxNodeSize = enc.encodedSize(original.drop(1), longSplitKey, None) - 1
+    for
+      n0 <- makeNode(original)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      err <- Future.delegate(enc.splitAt(n0, longSplitKey, false, maxNodeSize, None, alloc)(using tx)).failed
+      n1 <- readNode(n0.pointer)
+    yield
+      assert(enc.encodedSize(original, Key.AbsoluteMinimum, None) <= maxNodeSize)
+      assert(err.isInstanceOf[NodeSizeExceeded])
+      assert(tx.isEmpty)
+      assert(n1.revision == n0.revision)
 
   // ---------------------------------------------------------------------------------------------------------------
   // deleteList
@@ -645,7 +680,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       _ <- enc.delete(n0, key(1), 4096, noJoin)(using tx)
-      err <- Future.delegate(enc.splitAt(n0, key(4), false, None, alloc)(using tx)).failed
+      err <- Future.delegate(enc.splitAt(n0, key(4), false, 4096, None, alloc)(using tx)).failed
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
     yield

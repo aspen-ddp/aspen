@@ -265,13 +265,14 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     * keeps accepting keys at or above `splitAtKey`. A KeyValue left tree keeps the split key as its stored maximum and
     * aborts such inserts.
     *
-    * Limitation: the new right node's minimum is `splitAtKey`, which may be longer than this node's minimum, so the
-    * right node can be larger than this node was and is not checked against `maxNodeSize`, which is not available
-    * here. The KeyValue encoding has the same limitation.
+    * The new right node's minimum is `splitAtKey`, which may be longer than this node's minimum, so the right node
+    * can be larger than this node was. Nothing is staged or allocated and `NodeSizeExceeded` is thrown if it would
+    * not fit within `maxNodeSize`.
     */
   def splitAt(node: ListNode,
               splitAtKey: Key,
               inclusive: Boolean,
+              maxNodeSize: Int,
               optionalDownPointer: Option[ObjectPointer],
               allocator: ObjectAllocator)(using tx: Transaction): Future[NodeLink] =
     val n = dataNode(node)
@@ -288,10 +289,12 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     val (left, right) = n.entries.partition(e => stays(e._1))
     val headEntries = optionalDownPointer.map(p => Key.AbsoluteMinimum -> Value(dataPointer(p).toArray)).toList
 
+    if encodedSize(right, splitAtKey, n.link) > maxNodeSize then
+      throw new NodeSizeExceeded
+
     writeNode(n, encode(left, n.minimum, None))
 
     for
-      // TODO: the right node is not checked against maxNodeSize (see the limitation above)
       rightPointer <- allocator.allocateDataObject(DataBuffer(encode(right, splitAtKey, n.link)))
       headPointer <- allocator.allocateDataObject(DataBuffer(
         encode(headEntries, Key.AbsoluteMinimum, Some(NodeLink(splitAtKey, rightPointer)))))

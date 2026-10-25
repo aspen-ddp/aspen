@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.client.*
 import org.aspen_ddp.aspen.common.ida.{AppendingReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.metadata.*
-import org.aspen_ddp.aspen.common.rebalancing.RebalancingDurableService
+import org.aspen_ddp.aspen.common.rebalancing.{RebalancingDurableService, StartResult, TransferStarter}
 import io.netty.handler.codec.quic.Quic
 import org.aspen_ddp.aspen.common.network.implementations.quic.{QuicConfig, QuicNet, TlsCredentials}
 import org.aspen_ddp.aspen.common.network.*
@@ -71,6 +71,8 @@ object Main {
   // user how long an un-notified host may take to pick up a new device, so the two cannot
   // drift.
   val CheckStorageDevicesPeriod: Duration = Duration(1, HOURS)
+  /** How long transfer-store waits for the hosts' online state before giving up on the safety check. */
+  val LivenessTimeout: Duration = Duration(10, SECONDS)
 
   // How long a terminating command waits for outbound messages to leave the network plugin, and
   // how long the plugin's transport is then given to put them on the wire before the process
@@ -91,6 +93,7 @@ object Main {
                   bootstrapHost:Option[ClientConfig.BootstrapEndpoint]=None,
                   hostName:String="",
                   storeName:String="",
+                  force:Boolean=false,
                   deviceId:String="",
                   deviceName:String="",
                   address:String="",
@@ -605,6 +608,10 @@ object Main {
           else failure("Store name must match the format \"pool-uuid:storeNumber\"")
         },
 
+      p.opt[Unit]("force").
+        text("Transfer without checking that it is safe. The pool may be left below its redundancy floor").
+        action((_, c) => c.copy(force = true)),
+
       arg[String]("<target-storage-device-id>").text("UUID of the storage device to receive the store").
         action((x, c) => c.copy(host = x)).
         validate(validateUUID("Target storage device id must be a valid UUID")),
@@ -852,7 +859,7 @@ object Main {
             case "create-storage-device" => create_storage_device(session,
                                                                   cfg.hostDirectory, cfg.deviceName,
                                                                   cfg.deviceSetName)
-            case "transfer-store" => transfer_store(session, cfg.storeName, cfg.host)
+            case "transfer-store" => transfer_store(session, cfg.storeName, cfg.host, cfg.force)
             case "rebalance" => rebalance(session, cfg.setId)
             case "system-rebalance-period" =>
               systemRebalancePeriod(session, cfg.rebalancePeriod, cfg.rebalancePeriodUnit)
@@ -1921,7 +1928,8 @@ object Main {
 
   def transfer_store(session: ClientSession,
                      storeName: String,
-                     targetDeviceIdStr: String): Int = {
+                     targetDeviceIdStr: String,
+                     force: Boolean = false): Int = {
 
     configureLogging()
 
@@ -1949,6 +1957,30 @@ object Main {
         .recover:
           case _: Throwable => Left(f"Target storage device ${targetDeviceIdStr} not found")
 
+    // The same admission rule every automatic initiator uses. It needs to know which hosts are
+    // online, which a client only learns from a relay host after it starts, so wait for that
+    // rather than checking against an empty answer.
+    def awaitLiveness: Future[Boolean] =
+      val timedOut = Promise[Boolean]()
+      client.backgroundTaskManager.schedule(LivenessTimeout)(timedOut.trySuccess(false))
+      Future.firstCompletedOf(List(client.hostLivenessReady.map(_ => true), timedOut.future))
+
+    def safeStart: Future[Either[String, Unit]] =
+      awaitLiveness.flatMap:
+        case false =>
+          Future.successful(Left(
+            "Could not determine which hosts are online. Retry, or use --force to skip the safety check"))
+        case true =>
+          TransferStarter.start(client, storeId, targetDeviceId).map:
+            case StartResult.Started => Right(())
+            case StartResult.Rejected => Left(
+              "The transfer is not safe right now: the store is not Active, the destination host is " +
+              "offline, or moving it would take the pool below its redundancy floor. " +
+              "Use --force to transfer anyway")
+            case StartResult.RolledBack => Left(
+              "A competing transfer took the pool to its redundancy floor, so this transfer was " +
+              "rolled back. Retry later, or use --force to transfer anyway")
+
     // transferStore atomically marks the store as transferring-out on its current
     // device and transferring-in on the target device, then nudges the destination
     // host with a CheckStorageDevice message so it begins the transfer immediately
@@ -1975,8 +2007,13 @@ object Main {
                               Future.successful(Left(
                                 f"Source and destination devices are the same " +
                                 f"(${targetDeviceIdStr}); nothing to transfer"))
-                            else
+                            else if force then
+                              // An operator override. It skips TransferSafety and the post-start
+                              // rollback, so it can leave the pool below its redundancy floor.
+                              println("--force given: the transfer is not being checked for safety")
                               client.transferStore(storeId, targetDeviceId).map(Right(_))
+                            else
+                              safeStart
     yield result
 
     Await.ready(f, Duration(30, SECONDS)).value.get match

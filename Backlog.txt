@@ -1,9 +1,4 @@
 Follow-ups from parallel store transfers
-  9. The CLI transfer-store (cmdline/Main.scala ~1976) bypasses TransferSafety. Add a comment
-     that it is an operator override that can push a pool below the floor
-  10. The createSecondDevice test harness hangs for Replication pools with
-      writeThreshold <= width/2 (tried (5,1), (5,2), (6,2), (6,3)). Those shapes are invalid
-      IDAs, not a harness bug; see "Invalid IDA thresholds" below
   11. Pre-existing: when the destination finishes after a tombstoned source's entry was
       already drained, Host.updateStateForTransferredStore falls through to PoolRepointed
       and loads a copy the pool does not name

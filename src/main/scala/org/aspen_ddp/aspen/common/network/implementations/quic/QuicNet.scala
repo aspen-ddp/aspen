@@ -30,7 +30,7 @@ import java.util.UUID
 import java.util.concurrent.{ConcurrentHashMap, ExecutorService, Executors, RejectedExecutionException, TimeUnit,
   TimeoutException}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
 import scala.util.Random
@@ -72,6 +72,10 @@ object QuicNet:
     override def isStoreOffline(storeId: StoreId): Boolean = net.isStoreOffline(storeId)
 
     override def isStoreHostOnline(storeId: StoreId): Boolean = net.isStoreHostOnline(storeId)
+
+    override def isHostOnline(hostId: HostId): Boolean = net.isHostOnline(hostId)
+
+    override def hostLivenessReady: Future[Unit] = net.livenessReady.future
 
   private class SrvMessenger(net: QuicNet) extends ServerMessenger:
     def sendClientResponse(msg: ClientResponse): Unit = net.sendToClient(msg)
@@ -215,6 +219,13 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** Client mode: the hosts our relays last reported online. Written on loops, read by `createHostEntry`. */
   private val relayedOnline = ConcurrentHashMap.newKeySet[HostId]()
+
+  /** Completes once host liveness is loaded: at once in host mode, which is part of the membership and sees changes as
+   *  they happen, and in client mode when the first report from a relay has been applied.
+   */
+  private val livenessReady = Promise[Unit]()
+  if ohost.isDefined then
+    livenessReady.success(())
 
   /** Client mode: our current gossip relay hosts. Only touched on `loops(0)`. See `renewRelays`. */
   private var relays: Set[HostId] = Set()
@@ -518,7 +529,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   /** True if `storeId` is mapped to this host, or to one membership or our relays last reported online */
   def isStoreHostOnline(storeId: StoreId): Boolean =
-    metadataManager.peekStoreHost(storeId).exists(h => ohost.exists(_._1 == h) || reportedOnline(h))
+    metadataManager.peekStoreHost(storeId).exists(isHostOnline)
+
+  /** True if `hostId` is this host, or one membership or our relays last reported online */
+  def isHostOnline(hostId: HostId): Boolean =
+    ohost.exists(_._1 == hostId) || reportedOnline(hostId)
 
   def joinIoThread(): Unit = group.terminationFuture().awaitUninterruptibly()
 
@@ -1201,6 +1216,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     m.offline.foreach: h =>
       relayedOnline.remove(h)
       metadataManager.peekHostEntry(h).foreach(_.setOffline())
+    // After the report is in memory, so isHostOnline is accurate by the time a waiter wakes
+    livenessReady.trySuccess(())
     if m.offline.nonEmpty then
       try
         loops(0).execute: () =>

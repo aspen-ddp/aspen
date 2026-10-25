@@ -328,6 +328,19 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val c = fx.client()
     eventually("the client sees the store offline", WaitMillis)(c.net.isStoreOffline(store))
 
+  test("host liveness is ready at once on a host, and on a client only once a relay has reported"):
+    awaitOnline()
+    fx.a.net.clientMessenger.hostLivenessReady.isCompleted shouldBe true
+    fx.a.net.clientMessenger.isHostOnline(fx.hostIdB) shouldBe true
+
+    // No relays, so no report ever arrives
+    val silent = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 0)))
+    val c = fx.client()
+    eventually("the client has had its first report", WaitMillis)(c.net.clientMessenger.hostLivenessReady.isCompleted)
+    c.net.clientMessenger.isHostOnline(fx.hostIdA) shouldBe true
+    c.net.clientMessenger.isHostOnline(fx.hostIdB) shouldBe true
+    silent.net.clientMessenger.hostLivenessReady.isCompleted shouldBe false
+
   test("a client learns host liveness from its relays and replaces a relay that goes offline"):
     awaitOnline()
     val c = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 1)))

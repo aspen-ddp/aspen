@@ -152,6 +152,9 @@ class TestNetwork(executionContext: ExecutionContext,
     }
   }
 
+  /** Hosts the client messenger reports offline. Everything is online unless a test says otherwise. */
+  @volatile var offlineHostIds: Set[HostId] = Set.empty
+
   private val cliMessenger = new ClientMessenger {
 
     def sendClientRequest(msg: ClientRequest): Unit = {
@@ -172,6 +175,8 @@ class TestNetwork(executionContext: ExecutionContext,
       capturedHostMessages = capturedHostMessages :+ msg
 
     def dropCacheForStore(storeId: StoreId): Unit = ()
+
+    override def isHostOnline(hostId: HostId): Boolean = !offlineHostIds.contains(hostId)
   }
 
   val client: AspenClient = new TClient(executionContext, cliMessenger, radicle, ida, userTypeFactories)

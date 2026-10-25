@@ -228,6 +228,34 @@ abstract class BaseAspenClient(
   override def listStoragePools(): Future[List[(String, PoolId)]] =
     namespacedRegistry.getAllEntries(Namespaces.Pool).map(_.map((n, u) => n -> PoolId(u)))
 
+  // ---- Host liveness ----
+
+  // Registered host ids, so that "offline" can be answered for hosts the network layer has not
+  // heard of at all. Loaded before hostLivenessReady completes and refreshed in the background.
+  @volatile private var knownHostIds: Set[HostId] = Set.empty
+  @volatile private var knownHostsStamp: Long = System.nanoTime()
+  private val refreshingKnownHosts = new java.util.concurrent.atomic.AtomicBoolean(false)
+  private val KnownHostsRefreshNanos = 60L * 1000 * 1000 * 1000
+
+  private def refreshKnownHosts(): Future[Unit] =
+    listHosts().map: hosts =>
+      knownHostIds = hosts.map(_._2).toSet
+      knownHostsStamp = System.nanoTime()
+
+  override lazy val hostLivenessReady: Future[Unit] =
+    messenger.hostLivenessReady.flatMap(_ => refreshKnownHosts())
+
+  override def isHostOnline(hostId: HostId): Boolean = messenger.isHostOnline(hostId)
+
+  override def offlineHosts(): Set[HostId] =
+    if !hostLivenessReady.isCompleted then
+      Set.empty
+    else
+      if System.nanoTime() - knownHostsStamp > KnownHostsRefreshNanos &&
+         refreshingKnownHosts.compareAndSet(false, true) then
+        refreshKnownHosts().onComplete(_ => refreshingKnownHosts.set(false))
+      knownHostIds.filterNot(messenger.isHostOnline)
+
   override def listHosts(): Future[List[(String, HostId)]] =
     namespacedRegistry.getAllEntries(Namespaces.Host).map(_.map((n, u) => n -> HostId(u)))
 

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.rebalancing
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
-import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 
@@ -43,6 +43,36 @@ abstract class TransferStarterSuiteBase extends IntegrationTestSuite:
       result should be(StartResult.Started)
       src should be(Some(StorageDeviceState.StoreStatus.TransferringOut))
       dst should be(Some(StorageDeviceState.StoreStatus.TransferringIn))
+
+  atest("offlineHosts is the registered hosts the network reports offline"):
+    given ExecutionContext = executionContext
+    val host = HostId.BootstrapHostId
+    for
+      _ <- client.hostLivenessReady
+      before = client.offlineHosts()
+      _ = net.offlineHostIds = Set(host)
+      after = client.offlineHosts()
+      // Unaffected by a host the registry has never heard of
+      _ = net.offlineHostIds = Set(host, HostId(java.util.UUID.randomUUID()))
+      withUnknown = client.offlineHosts()
+    yield
+      before should be(Set.empty)
+      after should be(Set(host))
+      withUnknown should be(Set(host))
+
+  atest("start is Rejected, and starts nothing, when the destination's host is offline"):
+    given ExecutionContext = executionContext
+    for
+      _ <- setup()
+      _ <- client.hostLivenessReady
+      _ = net.offlineHostIds = Set(HostId.BootstrapHostId)
+      result <- TransferStarter.start(client, store0, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      src <- statusOf(sourceId, store0)
+    yield
+      net.offlineHostIds = Set.empty
+      result should be(StartResult.Rejected)
+      src should be(Some(StorageDeviceState.StoreStatus.Active))
 
   atest("a started transfer stays started"):
     given ExecutionContext = executionContext

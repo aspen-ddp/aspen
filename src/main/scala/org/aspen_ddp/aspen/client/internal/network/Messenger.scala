@@ -1,7 +1,10 @@
 package org.aspen_ddp.aspen.client.internal.network
 
+import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, TxMessage}
 import org.aspen_ddp.aspen.common.store.StoreId
+
+import scala.concurrent.Future
 
 trait Messenger:
 
@@ -30,6 +33,18 @@ trait Messenger:
    *  report every host online.
    */
   def isStoreHostOnline(storeId: StoreId): Boolean = true
+
+  /** True unless `hostId` is known to be offline. Accurate once `hostLivenessReady` has completed; before
+   *  that a host not yet reported online may read as offline. Networks without liveness tracking report every
+   *  host online.
+   */
+  def isHostOnline(hostId: HostId): Boolean = true
+
+  /** Completes once the online/offline state of hosts has been loaded into memory. Immediate for networks that
+   *  take part in host membership or track no liveness; a client waits for its first report from a relay, so it
+   *  never completes if no relay answers.
+   */
+  def hostLivenessReady: Future[Unit] = Future.unit
 
 
 object Messenger:

@@ -544,9 +544,19 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   def retryStrategy: RetryStrategy
 
-  /** Hosts currently believed to be offline. Stub returns empty until host
-   *  liveness tracking exists; used by rebalancing to avoid moving stores onto,
-   *  or counting availability from, offline hosts. */
+  /** Completes once host online/offline state has been loaded into memory and the registry of hosts has
+   *  been read, after which `isHostOnline` and `offlineHosts` are accurate. Hosts take part in the gossip
+   *  protocol and complete at once; a client has to ask a relay host for the state first, so it completes
+   *  when that report has been applied, and never if no relay answers. Callers that depend on the answer
+   *  wait for this with a timeout.
+   */
+  def hostLivenessReady: Future[Unit] = Future.unit
+
+  /** True unless `hostId` is known to be offline. Accurate once `hostLivenessReady` has completed. */
+  def isHostOnline(hostId: HostId): Boolean = true
+
+  /** Registered hosts currently believed to be offline; used by rebalancing to avoid moving stores onto,
+   *  or counting availability from, offline hosts. Empty until `hostLivenessReady` has completed. */
   def offlineHosts(): Set[HostId] = Set()
 
   private[aspen] val radicle: KeyValueObjectPointer

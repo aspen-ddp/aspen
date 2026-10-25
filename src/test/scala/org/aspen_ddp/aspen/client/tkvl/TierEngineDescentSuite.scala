@@ -109,12 +109,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
       vm <- tree.get(m)
       _ <- sequentially(List(m))((k, tx) => tree.delete(k)(using tx))
       vmDeleted <- tree.get(m)
-      // A KeyValue-object join does not carry the absorbed node's stored maximum over to the left node, so the store's
-      // WithinRange check rejects any insert into the left node at or above its old maximum, m among them. That is a
-      // separate KeyValueListNode.delete defect, so only the DataObject tree inserts in the gap here.
-      insertsInGap = kind == TreeKind.DataObjects
-      _ <- sequentially(if insertsInGap then List(m) else Nil):
-             (k, tx) => tree.set(k, value(99))(using tx)
+      _ <- sequentially(List(m))((k, tx) => tree.set(k, value(99))(using tx))
       vmSet <- tree.get(m)
       above <- Future.sequence(all.filter(k => ordering.compare(k, m) > 0).map(tree.get))
     yield
@@ -126,10 +121,10 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
 
       assert(vm == Some(value(m.bytes.last).bytes.toList))
       assert(vmDeleted.isEmpty)
-      assert(vmSet == (if insertsInGap then Some(value(99).bytes.toList) else None))
+      assert(vmSet == Some(value(99).bytes.toList))
       assert(above.forall(_.isDefined))
 
-  atest("a KeyValue-object tree finds and deletes keys below an upper-tier node's first entry"):
+  atest("a KeyValue-object tree finds, deletes and inserts keys below an upper-tier node's first entry"):
     lookupsInTheGap(TreeKind.KeyValueObjects, 500, 60)
 
   atest("a DataObject tree finds, deletes and inserts keys below an upper-tier node's first entry"):

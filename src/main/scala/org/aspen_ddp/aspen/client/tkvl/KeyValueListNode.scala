@@ -482,6 +482,23 @@ object KeyValueListNode extends Logging {
     }
   }
 
+  /** Operations that delete `key` from the left node and absorb the right node `kvos` into it. The left node takes
+    * over the right node's right pointer and stored maximum so that later inserts into the joined node pass the
+    * store's range check.
+    */
+  private def joinOperations(key: Key, kvos: KeyValueObjectState): List[KeyValueOperation] = {
+    val rightOp = kvos.right match {
+      case None => DeleteRight()
+      case Some(rp) => SetRight(rp.bytes)
+    }
+    val maxOp = kvos.maximum match {
+      case None => DeleteMax()
+      case Some(m) => SetMax(m)
+    }
+    val inserts = kvos.contents.iterator.map(t => Insert(t._1, t._2.value.bytes)).toList
+    maxOp :: rightOp :: Delete(key) :: inserts
+  }
+
   def delete(node: KeyValueListNode,
              key: Key,
              reader: ObjectReader,
@@ -501,14 +518,7 @@ object KeyValueListNode extends Logging {
 
           case Some(rp) =>
             reader.read(rp.pointer, s"Deleting key from KVListNode node ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
-              var ops: List[KeyValueOperation] = Delete(key) :: Nil
-              kvos.right match {
-                case None => ops = DeleteRight() :: ops
-                case Some(rp) => ops = SetRight(rp.bytes) :: ops
-              }
-              kvos.contents.foreach{ t =>
-                ops = Insert(t._1, t._2.value.bytes) :: ops
-              }
+              val ops = joinOperations(key, kvos)
 
               tx.update(node.pointer, Some(node.revision), None, List(KeyValueUpdate.Exists(key)), ops)
 
@@ -545,14 +555,7 @@ object KeyValueListNode extends Logging {
 
           case Some(rp) =>
             reader.read(rp.pointer, s"Deleting key from KVListNode node ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
-              var ops: List[KeyValueOperation] = Delete(key) :: Nil
-              kvos.right match {
-                case None => ops = DeleteRight() :: ops
-                case Some(rp) => ops = SetRight(rp.bytes) :: ops
-              }
-              kvos.contents.foreach { t =>
-                ops = Insert(t._1, t._2.value.bytes) :: ops
-              }
+              val ops = joinOperations(key, kvos)
 
               tx.update(node.pointer, Some(node.revision), None, requirements, ops)
 

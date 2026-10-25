@@ -129,3 +129,26 @@ class TransferSafetySuite extends AnyFunSuite with Matchers:
     val (state, _, _, _, _) = build(List(Active, Active, Active), Replication(3, 3))
     TransferSafety.isBelowFloor(state, hostsOf(state, 0), poolId) shouldBe false
     TransferSafety.isBelowFloor(state, hostsOf(state, 0, 1), poolId) shouldBe true
+
+  // Replication(1, 1) has floor 0, so there is no redundancy to protect: its only store may move
+  // while Active, but every other precondition still applies.
+  test("width 1: the only Active store may be moved"):
+    val (state, _, toDev, _, offline) = build(List(Active), Replication(1, 1))
+    TransferSafety.isSafe(state, offline, transfer0(state, toDev, 0)) shouldBe true
+
+  test("width 1: a store that is not Active is never safe to move"):
+    List(TransferringOut, Rebuilding, Initializing).foreach: status =>
+      val (state, _, toDev, _, offline) = build(List(status), Replication(1, 1))
+      TransferSafety.isSafe(state, offline, transfer0(state, toDev, 0)) shouldBe false
+
+  test("width 1: an offline source host or destination host is unsafe"):
+    val (state, _, toDev, toHost, _) = build(List(Active), Replication(1, 1))
+    TransferSafety.isSafe(state, Set(toHost), transfer0(state, toDev, 0)) shouldBe false
+    TransferSafety.isSafe(state, hostsOf(state, 0), transfer0(state, toDev, 0)) shouldBe false
+
+  test("width 1: isBelowFloor is never true"):
+    val (state, _, _, _, _) = build(List(Active), Replication(1, 1))
+    TransferSafety.isBelowFloor(state, Set.empty, poolId) shouldBe false
+    TransferSafety.isBelowFloor(state, hostsOf(state, 0), poolId) shouldBe false
+    val (state2, _, _, _, _) = build(List(TransferringOut), Replication(1, 1))
+    TransferSafety.isBelowFloor(state2, Set.empty, poolId) shouldBe false

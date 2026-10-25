@@ -18,7 +18,8 @@ import scala.util.Random
 
 /** Drives SetRebalanceDurableTask directly over a hand-written `pendingTransfers` list, so each
  *  test controls exactly which transfers are planned and to where. */
-abstract class SetRebalanceDurableTaskSuiteBase extends IntegrationTestSuite:
+abstract class SetRebalanceDurableTaskSuiteBase extends IntegrationTestSuite
+                                                   with FailedStorageDeviceTestHarness:
 
   protected val setId: StorageDeviceSetId = StorageDeviceSetId.BootstrapStorageDeviceSetId
   protected val boot: StorageDeviceId = StorageDeviceId.BootstrapStorageDeviceId
@@ -58,35 +59,6 @@ abstract class SetRebalanceDurableTaskSuiteBase extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     client.getStorageDeviceSetState(setId).map(_.pendingTransfers)
 
-  protected def statusOf(deviceId: StorageDeviceId,
-                         sid: StoreId): Future[Option[StorageDeviceState.StoreStatus]] =
-    given ExecutionContext = executionContext
-    client.getStorageDeviceState(deviceId).map(_.stores.get(sid).map(_.status))
-
-  protected def countTransferringOut(deviceId: StorageDeviceId): Future[Int] =
-    given ExecutionContext = executionContext
-    client.getStorageDeviceState(deviceId).map: ds =>
-      ds.stores.values.count(_.status == StorageDeviceState.StoreStatus.TransferringOut)
-
-  protected def sleep(d: Duration): Future[Unit] =
-    val p = Promise[Unit]()
-    client.backgroundTaskManager.schedule(d)(p.success(()))
-    p.future
-
-  /** Poll `cond` until it holds or `timeout` elapses. Fails the test on timeout. */
-  protected def awaitUntil(what: String, timeout: Duration = Duration(60000, MILLISECONDS))
-                          (cond: => Future[Boolean]): Future[Unit] =
-    given ExecutionContext = executionContext
-    val deadline = System.nanoTime() + timeout.toNanos
-    def loop(): Future[Unit] =
-      cond.flatMap: ok =>
-        if ok then Future.unit
-        else if System.nanoTime() > deadline then
-          Future.failed(new AssertionError(s"timed out waiting for: $what"))
-        else
-          sleep(Duration(50, MILLISECONDS)).flatMap(_ => loop())
-    loop()
-
   /** Complete in-flight transfers until the task finishes (pendingTransfers drained). */
   protected def driveToCompletion(task: SetRebalanceDurableTask): Future[Unit] =
     given ExecutionContext = executionContext
@@ -95,8 +67,7 @@ abstract class SetRebalanceDurableTaskSuiteBase extends IntegrationTestSuite:
     .flatMap(_ => task.completed.map(_ => ()))
 
 /** Default Replication(3, 2): floor 2, so one transfer of the pool may be in flight at a time. */
-class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase
-                                     with FailedStorageDeviceTestHarness:
+class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase:
 
   /** Rewrite one device's state object in place. Metadata only: no Host reacts to it here. */
   private def updateDevice(deviceId: StorageDeviceId)
@@ -200,7 +171,7 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase
       _ <- tombstone(net.secondDeviceId)
       _ <- writePending(List(planned))
       task = startTask()
-      _ <- sleep(Duration(1000, MILLISECONDS))
+      _ <- awaitPasses(task.testingOnlyCompletedPasses, 5)
       remaining <- pendingTransfers()
       src <- statusOf(boot, s0)
     yield
@@ -225,16 +196,6 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase
       phase should be(SetRebalanceDurableTask.Phase.InFlight)
 
   // ---- Device death mid-transfer, through the real FailedStorageDeviceDurableTask ------
-
-  /** Declare `deviceId` failed and run the real drain until its store map is empty. */
-  private def failAndDrain(deviceId: StorageDeviceId): Future[Unit] =
-    given ExecutionContext = executionContext
-    for
-      _ <- client.failStorageDevice(deviceId)
-      _ <- waitForTransactionsToComplete()
-      drain <- taskForEnrolled(deviceId)
-      _ <- withTimeout(drain.completed.map(_ => ()), Duration(60000, MILLISECONDS), "the drain")
-    yield ()
 
   /** The TransferringIn and TransferringOut entries on `deviceId`: the halves of transfers. */
   private def transferEntries(deviceId: StorageDeviceId): Future[Map[StoreId, StorageDeviceState.StoreEntry]] =
@@ -299,7 +260,7 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase
       rebuilding <- statusOf(net.thirdDeviceId, s0)
 
       // Many passes while the store rebuilds. Nothing may start, replace, or drop anything.
-      _ <- sleep(Duration(1000, MILLISECONDS))
+      _ <- awaitPasses(task.testingOnlyCompletedPasses, 5)
       duringRebuild <- pendingTransfers()
       bootTransfers <- transferEntries(boot)
       thirdTransfers <- transferEntries(net.thirdDeviceId)
@@ -307,7 +268,7 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase
       doneEarly = task.completed.isCompleted
 
       // The destination host finishes the rebuild, as Host.markRebuiltStoreActive does.
-      _ <- updateDevice(net.thirdDeviceId)(_.setStoreEntry(s0, StorageDeviceState.StoreStatus.Active, None))
+      _ <- completeRebuild(net.thirdDeviceId, s0)
       _ <- driveToCompletion(task)
       remaining <- pendingTransfers()
       dst <- statusOf(net.thirdDeviceId, s0)
@@ -339,7 +300,7 @@ class ParallelSetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteB
       task = startTask()
       _ <- awaitUntil("two transfers to be in flight together")(countTransferringOut(boot).map(_ >= 2))
       // Several more passes: the third must still be held back by the floor.
-      _ <- sleep(Duration(500, MILLISECONDS))
+      _ <- awaitPasses(task.testingOnlyCompletedPasses, 5)
       inFlight <- countTransferringOut(boot)
       _ <- driveToCompletion(task)
       remaining <- pendingTransfers()

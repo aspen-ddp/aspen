@@ -1,8 +1,4 @@
 Follow-ups from parallel store transfers
-  8. Tests: a rebuild landing on a device other than the planned destination is untested;
-     the 'no competing transfer' check is a single snapshot after a fixed sleep;
-     failAndDrain/completeRebuild are duplicated across suites; no isSafe test for a
-     width-1 pool
   9. The CLI transfer-store (cmdline/Main.scala ~1976) bypasses TransferSafety. Add a comment
      that it is an operator override that can push a pool below the floor
   10. The createSecondDevice test harness hangs for Replication pools with

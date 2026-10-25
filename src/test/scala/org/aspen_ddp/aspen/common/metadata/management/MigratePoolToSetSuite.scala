@@ -24,7 +24,7 @@ import scala.concurrent.duration.{Duration, MILLISECONDS}
 import scala.util.Random
 
 /** Shared harness for the migration suites; subclasses pick the bootstrap pool's IDA. */
-abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
+abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite with FailedStorageDeviceTestHarness:
 
   private var tasks: List[DurableTask] = Nil
 
@@ -34,19 +34,6 @@ abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
   override def subFixtureTeardown(): Unit = synchronized:
     tasks.foreach(_.stop())
     tasks = Nil
-
-  /** The task state objects currently enrolled with the system task executor. */
-  protected def enrolledTasks(): Future[List[(java.util.UUID, KeyValueObjectPointer)]] =
-    given ExecutionContext = executionContext
-    val tkvl = TieredKeyValueList(client,
-      KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
-    for
-      vs <- tkvl.get(Key(SystemTaskExecutorService.ServiceUUID))
-      statePtr = ServiceEntry.decode(vs.get.value.bytes).statePointer
-      enrolled <- SystemTaskServiceState.scan(client, statePtr)
-    yield enrolled
-
-  protected val fastPoll = Duration(50, MILLISECONDS)
 
   /** Build a task instance over the state object migratePoolToSet enrolled. */
   protected def taskForEnrolled(poolId: PoolId,
@@ -153,72 +140,6 @@ abstract class MigratePoolToSetSuiteBase extends IntegrationTestSuite:
               p.future.flatMap(_ => loop())
       yield result
     loop()
-
-  protected def sleep(d: Duration): Future[Unit] =
-    val p = Promise[Unit]()
-    client.backgroundTaskManager.schedule(d)(p.success(()))
-    p.future
-
-  /** Poll `cond` until it holds or `timeout` elapses. Fails the test on timeout. */
-  protected def awaitUntil(what: String, timeout: Duration = Duration(60000, MILLISECONDS))
-                          (cond: => Future[Boolean]): Future[Unit] =
-    given ExecutionContext = executionContext
-    val deadline = System.nanoTime() + timeout.toNanos
-    def loop(): Future[Unit] =
-      cond.flatMap: ok =>
-        if ok then Future.unit
-        else if System.nanoTime() > deadline then
-          Future.failed(new AssertionError(s"timed out waiting for: $what"))
-        else
-          sleep(fastPoll).flatMap(_ => loop())
-    loop()
-
-  protected def statusOf(deviceId: StorageDeviceId,
-                         sid: StoreId): Future[Option[StorageDeviceState.StoreStatus]] =
-    given ExecutionContext = executionContext
-    client.getStorageDeviceState(deviceId).map(_.stores.get(sid).map(_.status))
-
-  protected def countTransferringOut(deviceId: StorageDeviceId): Future[Int] =
-    given ExecutionContext = executionContext
-    client.getStorageDeviceState(deviceId).map: ds =>
-      ds.stores.values.count(_.status == StorageDeviceState.StoreStatus.TransferringOut)
-
-  /** Declare `deviceId` failed and run the real FailedStorageDeviceDurableTask until its store
-   *  map is empty. The migration task is enrolled too, so the drain's state object is the one
-   *  failStorageDevice added. */
-  protected def failAndDrain(deviceId: StorageDeviceId): Future[Unit] =
-    given ExecutionContext = executionContext
-    for
-      before <- enrolledTasks()
-      _ <- client.failStorageDevice(deviceId)
-      _ <- waitForTransactionsToComplete()
-      after <- enrolledTasks()
-      added = after.filterNot(e => before.exists(_._1 == e._1))
-      _ = added.size should be(1)
-      drain = new FailedStorageDeviceDurableTask(
-                DurableTaskPointer(added.head._2), client, deviceId, fastPoll)
-      _ = synchronized { tasks ::= drain }
-      _ <- Future.firstCompletedOf(List(
-             drain.completed.map(_ => ()),
-             sleep(Duration(60000, MILLISECONDS)).flatMap(_ =>
-               Future.failed(new AssertionError(s"the drain of ${deviceId.uuid} did not complete")))))
-    yield ()
-
-  /** Flip `sid`'s Rebuilding entry on `deviceId` to Active, as Host.markRebuiltStoreActive does
-   *  once the destination host has reconstructed the store. */
-  protected def completeRebuild(deviceId: StorageDeviceId, sid: StoreId): Future[Unit] =
-    given ExecutionContext = executionContext
-    client.transactUntilSuccessful: tx =>
-      for
-        ptr <- client.getStorageDevicePointer(deviceId)
-        kvos <- client.read(ptr)
-      yield
-        val state = StorageDeviceState(kvos)
-        state.stores.get(sid).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
-        tx.update(ptr, None, None,
-          List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
-          List(Insert(StorageDeviceState.StateKey,
-            state.setStoreEntry(sid, StorageDeviceState.StoreStatus.Active, None).encode())))
 
   /** A new level-0 set holding only the second device, ready to be a migration target. */
   protected def targetWithSecondDevice(name: String): Future[StorageDeviceSetId] =
@@ -657,7 +578,7 @@ class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
 
       // Many passes while the store rebuilds. A Rebuilding store does not count toward the
       // floor, so neither remaining store may be started, and nothing may touch store 0.
-      _ <- sleep(Duration(1000, MILLISECONDS))
+      _ <- awaitPasses(task.testingOnlyCompletedPasses, 5)
       bootOut <- countTransferringOut(boot)
       stillRebuilding <- statusOf(net.thirdDeviceId, s0)
       midPool <- client.getStoragePoolState(poolId)
@@ -696,7 +617,7 @@ class ParallelMigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       _ <- awaitUntil("two transfers to be in flight together", Duration(20000, MILLISECONDS))(
              countTransferringOut(boot).map(_ >= 2))
       // Several more passes: a third must still be held back by the floor.
-      _ <- sleep(Duration(500, MILLISECONDS))
+      _ <- awaitPasses(task.testingOnlyCompletedPasses, 5)
       inFlight <- countTransferringOut(boot)
 
       _ <- driveUntilComplete(task, targetSetId, Duration(120000, MILLISECONDS))

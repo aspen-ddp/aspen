@@ -85,7 +85,16 @@ class SetRebalanceDurableTask(
    *  a wake-up arriving mid-pass is not lost, but a pileup is bounded. A pass handles its own
    *  errors, so a failed Future or synchronous throw only releases the guard. */
   private val guardedRun: () => Unit =
-    boundedSingleFlight(s"set-rebalance-task $setId", maxInFlight = 2)(processNext())
+    boundedSingleFlight(s"set-rebalance-task $setId", maxInFlight = 2)(countedPass())
+
+  private val passes = new java.util.concurrent.atomic.AtomicInteger(0)
+
+  private def countedPass(): Future[Unit] =
+    processNext().andThen(_ => passes.incrementAndGet())
+
+  /** Testing hook: how many polling passes have finished, for waiting on "N more passes ran"
+   *  instead of sleeping. */
+  private[rebalancing] def testingOnlyCompletedPasses: Int = passes.get
 
   /** Every invocation, including one the guard drops, arms the next tick first. Arming at the
    *  end of a pass instead loses the wakeup whenever a tick fires between that arming and the

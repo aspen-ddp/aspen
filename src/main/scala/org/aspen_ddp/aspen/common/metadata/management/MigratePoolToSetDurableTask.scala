@@ -91,6 +91,15 @@ class MigratePoolToSetDurableTask(
   private val backoff = new TransferBackoff(() => System.currentTimeMillis(),
     MigratePoolToSetDurableTask.StartBackoffBase, MigratePoolToSetDurableTask.StartBackoffMax, new Random(), MigratePoolToSetDurableTask.StartBackoffJitter)
 
+  private val passes = new java.util.concurrent.atomic.AtomicInteger(0)
+
+  private def countedPass(): Future[Unit] =
+    processNext().andThen(_ => passes.incrementAndGet())
+
+  /** Testing hook: how many polling passes have finished, for waiting on "N more passes ran"
+   *  instead of sleeping. */
+  private[management] def testingOnlyCompletedPasses: Int = passes.get
+
   /** Testing hook: whether the store's start backoff has elapsed. */
   private[management] def testingOnlyBackoffReady(storeId: StoreId): Boolean = backoff.ready(storeId)
 
@@ -104,7 +113,7 @@ class MigratePoolToSetDurableTask(
    *  wedge mode is a Future that never completes: the guard reports it (see the pool id in the
    *  name) but cannot break it, because it cannot distinguish it from a slow pass. */
   private val guardedRun: () => Unit =
-    boundedSingleFlight(s"migrate-pool-task ${poolId.uuid}")(processNext())
+    boundedSingleFlight(s"migrate-pool-task ${poolId.uuid}")(countedPass())
 
   /** Every invocation, including one the guard drops, arms the next tick first. Arming at the
    *  end of a pass instead loses the wakeup whenever a tick fires between that arming and the

@@ -9,6 +9,7 @@ object SplitPlan:
    *  `sizes` holds every key of the node, including the pending insert, with its encoded size, ascending by
    *  key ordering. Keys are taken from the top until the moved size reaches half the total. At least the last
    *  key always moves. The result is ascending, so its head is the new node's minimum.
+   *  A one-key input returns that key. Empty input is not allowed and throws.
    */
   def keysToMove(sizes: List[(Key, Int)]): List[Key] =
     val halfSize = sizes.foldLeft(0)((sz, t) => sz + t._2) / 2

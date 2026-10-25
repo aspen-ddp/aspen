@@ -1,21 +1,19 @@
 TODO
 ====
 
-The TKVL as it currently exists is useful but has poor storage efficiency an identical data structure
-composed of DataObjects would be useful for low-contention use cases like single-writer. Proposed
-solution, generalize the TKVL code such that the important logic such as content management,
-tree navigation, splitting/joining, etcetera can be shared by trees built on top of DataObjects
-as well as KeyValue objects. KeyValue pairs stored in DataObjects wouldn't have identical semantics
-as they lack the metadata associated with KeyValueObject pairs but most of the navigation and
-management code should be able to handle that. The end-user facing API cannot hide that but
-the behind-the-scenes logic probably can.
-Thoughts on implementation:
-  - The Root object probably gains an Enum saying which kind of tree it stores
-  - It'd be really nice if the DataObject TKVL implementation could be further specialized for
-    RandomAccessReedSolomon encoded objects.
-    - Rather than a full overwrite on every kv insert/delete, append operations could be used insert kv pairs
-      and tombstones until the object is full. If compaction frees up enough space, it can be
-      overwritten and append operations can resume until a split is eventually required.
+Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
+encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs
+and tombstones until the object is full. If compaction frees up enough space, the object can be
+overwritten and append operations can resume until a split is eventually required. The encoding is a
+pluggable NodeEncoding so it plugs in without touching the tree logic in TierEngine.
+
+Known issues found while building DataObject TKVL:
+  - When a KeyValue-object join absorbs a node (KeyValueListNode.delete) the left node keeps its old stored
+    maximum, so later inserts at or above that old maximum into the joined node are rejected by the store
+    range check.
+  - Tier reduction only ever goes from tier 1 to tier 0.
+  - DataObject splitAt does not size-check the new right node against maxNodeSize (see the TODO in
+    DataObjectNodeEncoding.splitAt).
 
 Need to audit the slice size calculation code in KeyValueListNode to ensure that we never attempt
 to exceed the size of a fixed-sized object. I suspect there are mistakes in the calculations

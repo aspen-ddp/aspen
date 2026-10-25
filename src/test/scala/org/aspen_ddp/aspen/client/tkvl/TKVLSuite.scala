@@ -787,4 +787,66 @@ class TKVLSuite extends IntegrationTestSuite {
       numTiers should be >= 1
       visitedKeys should be (Nil)
   }
+
+  atest("foldLeft hands every tier-0 node's contents to fn, left to right") {
+    for
+      (tree, root, keys) <- buildSplitTree(12, 128 * 1024)
+      nodes <- tier0Nodes(tree)
+      perNode <- tree.foldLeft(List[List[Key]]()): (acc, contents) =>
+        contents.keys.toList.sortWith((a, b) => IntegerKeyOrdering.compare(a, b) < 0) :: acc
+    yield
+      assert(nodes.length > 1)
+      assert(perNode.reverse == nodes.map(_.entries.map(_._1)))
+      assert(perNode.reverse.flatten == keys)
+  }
+
+  atest("A failing fn is logged and the walk continues, including a synchronous throw") {
+    // One list per walk, each built by prepending
+    var visits = Map[String, List[Key]]()
+
+    def record(walk: String)(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visits = visits + (walk -> (key :: visits.getOrElse(walk, Nil)))
+      if key == Key(3) then
+        Future.failed(new Exception("fn failure"))
+      else if key == Key(5) then
+        throw new Exception("synchronous fn failure")
+      else
+        Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(6)
+      _ <- tree.foreach(record("foreach"))
+      _ <- tree.foreachFrom(Key(2), record("from"))
+      _ <- tree.foreachInRange(Key(2), Key(6), record("range"))
+    yield
+      assert(visits("foreach").reverse == keys)
+      assert(visits("from").reverse == keys.drop(1))
+      assert(visits("range").reverse == List(Key(2), Key(3), Key(4), Key(5)))
+  }
+
+  atest("foreachInRange stops before reading a node at or past maxKey, and a failing read fails the walk") {
+    var visited = List[Key]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visited = key :: visited
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(4)
+      nodes <- tier0Nodes(tree)
+      last = nodes.last
+      // Delete the last node without unlinking it, so any walk that reads it fails
+      tx = client.newTransaction()
+      _ = tx.setRefcount(last.pointer, last.refcount, last.refcount.decrement())
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      _ <- tree.foreachInRange(Key(1), last.minimum, record)
+      foreachResult <- tree.foreach((_, _, _) => Future.unit).transform(Success(_))
+      foldResult <- tree.foldLeft(0)((n, _) => n + 1).transform(Success(_))
+    yield
+      assert(nodes.length > 1)
+      assert(visited.reverse == keys.filter(k => IntegerKeyOrdering.compare(k, last.minimum) < 0))
+      assert(foreachResult.failed.get.isInstanceOf[InvalidObject])
+      assert(foldResult.failed.get.isInstanceOf[InvalidObject])
+  }
 }

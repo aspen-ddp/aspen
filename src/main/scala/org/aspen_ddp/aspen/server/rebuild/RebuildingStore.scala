@@ -77,7 +77,7 @@ class RebuildingStore(client: AspenClient,
   private var failed: List[ObjectId] = Nil
 
   /** Abort latch: when a fatal condition fires (out of space or too many failures), we record
-   *  the cause here. KeyValueListNode.walkFrom swallows a failing fn by design -- it logs and
+   *  the cause here. The TKVL walks swallow a failing fn by design -- they log and
    *  continues -- so a fatal condition has to be carried out of band. Once set, restoreObject
    *  returns Future.unit immediately, making the remainder of the walk a cheap no-op. The
    *  latched cause is checked after the walk returns, and if set, the pass fails before
@@ -188,10 +188,10 @@ class RebuildingStore(client: AspenClient,
     if synchronized(abortCause).isDefined then
       Future.unit
     else
-      // Everything below is inside the try, not just the decode: a synchronous throw out of this
-      // method is absorbed by ExecutionContext.reportFailure -- walkFrom calls fn from inside its
-      // own onComplete recursion -- which stops the recursion, leaves walkFrom's promise never
-      // completed, and so holds the rebuild slot forever. ObjectPointer decoding is the reachable
+      // Everything below is inside the try, not just the decode: the walk logs a synchronous
+      // throw out of this method and steps past it, which would skip the object without
+      // recording it as failed. (Before the walks moved onto TierEngine such a throw stopped the
+      // walk outright and held the rebuild slot forever.) ObjectPointer decoding is the reachable
       // way to get one: it throws BufferUnderflowException out of the Varint readers and
       // MatchError out of its non-exhaustive typeCode match. Treating an undecodable pointer as
       // one more failed object subjects it to the existing cap and retry machinery instead.

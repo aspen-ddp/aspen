@@ -3,6 +3,8 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, ObjectRevision, Value}
 
+import scribe.Logging
+
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
@@ -14,7 +16,7 @@ import scala.util.{Failure, Success}
   * The kind-specific facades (`TieredKeyValueList`) sit on top of this and convert nodes and entries to the types
   * their callers see.
   */
-private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootManager):
+private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootManager) extends Logging:
 
   given ExecutionContext = client.clientContext
 
@@ -37,18 +39,83 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
   def get(key: Key): Future[Option[Value]] =
     getContainingNode(key).map(_.flatMap(_.get(key)))
 
-  /** Hands the leftmost tier-0 node to `fold`, which walks the tier rightward. An empty tree yields `z`. */
-  def foldLeft[B](z: B)(fold: ListNode => Future[B]): Future[B] =
-    withContainingNode(Key.AbsoluteMinimum, z)(fold)
+  /** Hands every tier-0 node to `fn`, left to right, starting from `z`. An empty tree yields `z`. A failing read
+    * or a throwing `fn` fails the result.
+    */
+  def foldLeft[B](z: B)(fn: (B, ListNode) => B): Future[B] =
+    def fold(acc: B, node: ListNode): Future[B] =
+      val next = fn(acc, node)
+      node.link match
+        case None => Future.successful(next)
+        case Some(link) => readRight(node, link, "foldLeft").flatMap(fold(next, _))
 
-  /** Descends to the tier-0 node containing `startKey` and hands it to `walk`.
-   *
-   *  The tier-0 walks of the facades differ only in which node-level method they delegate to;
-   *  sharing the descent keeps that the only difference between them. Each keeps its own name
-   *  so the node-level diagnostics still report the method the caller invoked.
-   */
-  def walkFrom(startKey: Key, walk: ListNode => Future[Unit]): Future[Unit] =
-    withContainingNode(startKey, ())(walk)
+    withContainingNode(Key.AbsoluteMinimum, z)(node => Future.delegate(fold(z, node)))
+
+  /** Visits every entry in the tree, in ascending key order. Exactly `foreachFrom(Key.AbsoluteMinimum, fn)`:
+    * every KeyOrdering compares every key as greater than or equal to the empty key.
+    *
+    * A failing `fn`, whether it returns a failed future or throws, is logged and the walk continues to the next
+    * key. A failing read fails the returned future. `fn` is handed the node holding the key.
+    */
+  def foreach(fn: (ListNode, Key, Value) => Future[Unit]): Future[Unit] =
+    walk(Key.AbsoluteMinimum, "foreach", (_, _) => true, (_, _) => false, fn)
+
+  /** Visits every entry at or above `minKey`, in ascending key order. The bound is inclusive. See `foreach`. */
+  def foreachFrom(minKey: Key, fn: (ListNode, Key, Value) => Future[Unit]): Future[Unit] =
+    walk(minKey, "foreachFrom", (_, _) => true, (_, _) => false, fn)
+
+  /** Visits every entry in `[minKey, maxKey)`, in ascending key order. A node whose minimum is at or above `maxKey`
+    * holds nothing in range and neither does anything to its right, so the walk ends without reading it.
+    * See `foreach`.
+    */
+  def foreachInRange(minKey: Key, maxKey: Key, fn: (ListNode, Key, Value) => Future[Unit]): Future[Unit] =
+    walk(minKey, "foreachInRange", (k, o) => o.compare(k, maxKey) < 0, (m, o) => o.compare(maxKey, m) <= 0, fn)
+
+  /** Shared body of the entry walks. Descends to the tier-0 node holding `minKey` and walks right from it, handing
+    * `fn` each entry at or above `minKey` for which `below` holds. The walk ends at the end of the tier or before
+    * reading a node whose minimum satisfies `past`. `label` names the walk the caller invoked, in read diagnostics
+    * and the `fn`-failure log.
+    *
+    * Every node's entries are filtered by `minKey`, not just the first node's, so the walk stays correct however
+    * it is started.
+    */
+  private def walk(minKey: Key,
+                   label: String,
+                   below: (Key, KeyOrdering) => Boolean,
+                   past: (Key, KeyOrdering) => Boolean,
+                   fn: (ListNode, Key, Value) => Future[Unit]): Future[Unit] =
+
+    def inRange(node: ListNode): List[(Key, Value)] =
+      node.entries.filter((k, _) => node.ordering.compare(k, minKey) >= 0 && below(k, node.ordering))
+
+    // The only place a node is paired with a list of entries, so the walk has nowhere to pair a node with some
+    // other node's entries.
+    def advance(node: ListNode): Future[Unit] = visit(node, inRange(node))
+
+    def visit(node: ListNode, entries: List[(Key, Value)]): Future[Unit] = entries match
+      case (key, value) :: rest =>
+        Future.delegate(fn(node, key, value)).transformWith:
+          case Failure(err) =>
+            logger.error(s"Failure in TKVL $label: $err", err)
+            visit(node, rest)
+          case Success(_) =>
+            visit(node, rest)
+
+      case Nil =>
+        node.link match
+          case None => Future.unit
+          case Some(link) =>
+            if past(link.minimum, node.ordering) then
+              Future.unit
+            else
+              readRight(node, link, label).flatMap(advance)
+
+    withContainingNode(minKey, ())(advance)
+
+  /** Reads the node `link` points to, the right neighbour of `node`. `label` names the walk, for diagnostics. */
+  private def readRight(node: ListNode, link: NodeLink, label: String): Future[ListNode] =
+    encodingFor(node).read(client, link.pointer, link.minimum, node.ordering,
+      s"$label() TKVL node ${node.pointer.id}. Minimum: ${node.minimum}.")
 
   def set(key: Key,
           value: Value,

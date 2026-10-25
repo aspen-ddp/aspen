@@ -65,23 +65,23 @@ class TieredKeyValueList(val client: AspenClient,
   }
 
   def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] =
-    engine.foldLeft(z)(node => kvNode(node).foldLeft(z)(fn))
+    engine.foldLeft(z)((acc, node) => fn(acc, kvNode(node).contents))
 
   /** Visit every entry in the tree, in ascending key order.
    *
-   *  Exactly `foreachFrom(Key.AbsoluteMinimum, fn)` at both this level and the node level.
+   *  Exactly `foreachFrom(Key.AbsoluteMinimum, fn)`.
    *
-   *  A failing `fn` is logged and the walk continues to the next key. A failing read fails the
-   *  returned future.
+   *  A failing `fn`, whether it returns a failed future or throws, is logged and the walk
+   *  continues to the next key. A failing read fails the returned future.
    */
   def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    engine.walkFrom(Key.AbsoluteMinimum, node => kvNode(node).foreach(fn))
+    engine.foreach(withValueState(fn))
 
   /** Visit every entry in `[minKey, maxKey)`, in ascending key order. */
   def foreachInRange(minKey: Key,
                      maxKey: Key,
                      fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    engine.walkFrom(minKey, node => kvNode(node).foreachInRange(minKey, maxKey, fn))
+    engine.foreachInRange(minKey, maxKey, withValueState(fn))
 
   /** Visit every entry at or above `minKey`, in ascending key order. The open-ended
    *  counterpart to foreachInRange, used to resume an interrupted walk from a checkpointed
@@ -95,7 +95,14 @@ class TieredKeyValueList(val client: AspenClient,
    */
   def foreachFrom(minKey: Key,
                   fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    engine.walkFrom(minKey, node => kvNode(node).foreachFrom(minKey, fn))
+    engine.foreachFrom(minKey, withValueState(fn))
+
+  /** `fn` as a TierEngine walk callback, handed the KeyValueListNode and the entry's ValueState */
+  private def withValueState(fn: (KeyValueListNode, Key, ValueState) => Future[Unit])
+                            : (ListNode, Key, Value) => Future[Unit] =
+    (node, key, _) =>
+      val kvn = kvNode(node)
+      fn(kvn, key, kvn.contents(key))
 }
 
 object TieredKeyValueList {

@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, RegisteredTypeFactory, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, ConflictingRequirements, MultipleDataUpdatesToObject, ObjectAllocator, RegisteredTypeFactory, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
@@ -116,7 +116,14 @@ class KVObjectRootManager(val client: AspenClient,
       // such as TieredKeyValueList.set rely on this to make key requirements
       // unnecessary for the initial node's contents.
       val kreqs = KeyValueUpdate.KeyRevision(treeKey, rootRevision) :: Nil
-      tx.update(pointer, None, None, kreqs, Insert(treeKey, newRoot.encode()) :: Nil)
+      // The transaction rejects this if it already updates the hosting object, as when an earlier update of the
+      // same transaction already created the initial node. The node allocated above is staged by then, so abort
+      // rather than leave it unreferenced.
+      try
+        tx.update(pointer, None, None, kreqs, Insert(treeKey, newRoot.encode()) :: Nil)
+      catch
+        case _: MultipleDataUpdatesToObject | _: ConflictingRequirements =>
+          tx.abortAndThrow(RootAlreadyModified(pointer))
       tx.result.map { _ =>
         new KVObjectRootManager(client, treeKey, pointer)
       }

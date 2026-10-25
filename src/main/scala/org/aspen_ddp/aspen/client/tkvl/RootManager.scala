@@ -22,7 +22,8 @@ trait RootManager {
       (tier, ordering, kvNode)
 
   /** Implementations must only commit if the tree is still empty at commit time.
-   *  TieredKeyValueList.set relies on this in place of key requirements.
+   *  TieredKeyValueList.set relies on this in place of key requirements. Fails with RootAlreadyModified, aborting
+   *  the transaction, if the transaction already updates the root.
    */
   def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit]
 

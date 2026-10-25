@@ -12,6 +12,8 @@ import scala.concurrent.{ExecutionContext, Future}
   *  - Entries are plain values. There are no per-key revisions or timestamps and no key-level requirements.
   *  - A transaction can modify each node only once. A `set` or `delete` reaching a node the same transaction already
   *    modifies fails with `NodeAlreadyModified`, so two keys that share a node cannot be changed in one transaction.
+  *    Two `set`s on an empty tree in one transaction would both create the initial node; the second fails with
+  *    `RootAlreadyModified` and aborts the transaction.
   *
   * The root's kind can only be read asynchronously, so the constructor cannot check it. Every operation checks it
   * first and fails with `WrongTreeKind` for a root that is not a `DataObjects` root, before touching the

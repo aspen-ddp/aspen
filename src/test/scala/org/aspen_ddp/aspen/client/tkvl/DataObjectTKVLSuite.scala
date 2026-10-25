@@ -463,3 +463,22 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       assert(visited == keys(1 to perNode + 1))
 
 
+
+  atest("two sets on an empty tree in one transaction fail with RootAlreadyModified and abort it"):
+    for
+      (tree, rm) <- newTree()
+      tx = client.newTransaction()
+      _ <- tree.set(Key(1), value(1))(using tx)
+      err <- tree.set(Key(2), value(2))(using tx).failed
+      txErr <- tx.result.failed
+      root <- rm.getRoot()
+      v1 <- tree.get(Key(1))
+      _ <- setAll(tree, List(Key(3)))
+      v3 <- tree.get(Key(3))
+    yield
+      assert(err == RootAlreadyModified(rm.pointer))
+      // The aborted transaction commits neither initial node, so neither allocation is left unreferenced
+      assert(txErr == err)
+      assert(root.orootObject.isEmpty)
+      assert(v1.isEmpty)
+      assert(bytesOf(v3) == bytesOf(Some(value(3))))

@@ -48,3 +48,9 @@ final case class NodeAlreadyModified(pointer: ObjectPointer) extends KeyValueErr
 /** A tree was opened through the facade for `expected` trees, but its root is of kind `actual` */
 final case class WrongTreeKind(expected: TreeKind, actual: TreeKind) extends KeyValueError:
   override def getMessage: String = s"Expected a $expected tree but the root is a $actual tree"
+
+/** A tree update would modify the object hosting the tree's root, `pointer`, which the same transaction already
+  * modifies, as when two updates of one transaction both create the initial node of an empty tree
+  */
+final case class RootAlreadyModified(pointer: ObjectPointer) extends KeyValueError:
+  override def getMessage: String = s"TKVL root object ${pointer.id} is already modified in this transaction"

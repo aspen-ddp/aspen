@@ -58,7 +58,7 @@ class TierEngineSuite extends IntegrationTestSuite:
     assert(TierEngine.encodingFor(kvStub) eq KeyValueNodeEncoding)
     assert(TierEngine.encodingFor(doStub) eq DataObjectNodeEncoding)
 
-  atest("TierEngine reads a DataObjects root"):
+  atest("TierEngine.get serves a single-node DataObjects root without reading any node"):
     val stub = new StubNode(DataObjectPointer(ObjectId(new UUID(1, 2)), poolId))
     new TierEngine(client, new StubRootManager(stub)).get(theKey).map: v =>
       assert(v.map(_.bytes.toList) == Some(theValue.bytes.toList))

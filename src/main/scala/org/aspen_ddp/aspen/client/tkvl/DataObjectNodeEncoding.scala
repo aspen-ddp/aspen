@@ -176,6 +176,10 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
 
   /** As `KeyValueListNode.delete`. A join rewrites this node with the right node's entries and link, locks the right
     * node's revision and drops its refcount.
+    *
+    * The joined node takes this node's minimum, which may be longer than the right node's, so it can be larger than
+    * the right node. No size limit is available here, so the join happens only when the joined node is no larger
+    * than the right node is now. Otherwise this node is left empty, keeping its link, and no join is made.
     */
   def delete(node: ListNode, key: Key, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
             (using tx: Transaction): Future[Unit] =
@@ -191,16 +195,29 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
           n.reader.read(dataPointer(right.pointer),
             s"Joining DataObject TKVL node ${right.pointer.id}. Minimum: ${right.minimum}. target: $key").flatMap: rs =>
             val r = new DataObjectListNode(n.reader, n.ordering, rs)
-            writeNode(n, encode(r.entries, n.minimum, r.link))
-            tx.lockRevision(r.pointer, r.revision)
-            tx.setRefcount(r.pointer, r.refcount, r.refcount.decrement())
-            prepareForJoin(right.minimum, right.pointer)
+            if encodedSize(r.entries, n.minimum, r.link) > rs.size then
+              writeNode(n, encode(Nil, n.minimum, n.link))
+              Future.unit
+            else
+              writeNode(n, encode(r.entries, n.minimum, r.link))
+              tx.lockRevision(r.pointer, r.revision)
+              tx.setRefcount(r.pointer, r.refcount, r.refcount.decrement())
+              prepareForJoin(right.minimum, right.pointer)
 
         case _ =>
           writeNode(n, encode(remaining, n.minimum, n.link))
           Future.unit
 
-  /** The two-node scheme of `KeyValueListNode.splitAt`. This node keeps the lower keys and loses its link. */
+  /** The two-node scheme of `KeyValueListNode.splitAt`. This node keeps the lower keys and loses its link.
+    *
+    * Nodes store no maximum apart from their link, so after `splitTree` the left tree's last node has no maximum and
+    * keeps accepting keys at or above `splitAtKey`. A KeyValue left tree keeps the split key as its stored maximum and
+    * aborts such inserts.
+    *
+    * Limitation: the new right node's minimum is `splitAtKey`, which may be longer than this node's minimum, so the
+    * right node can be larger than this node was and is not checked against `maxNodeSize`, which is not available
+    * here. The KeyValue encoding has the same limitation.
+    */
   def splitAt(node: ListNode,
               splitAtKey: Key,
               inclusive: Boolean,
@@ -223,6 +240,7 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     writeNode(n, encode(left, n.minimum, None))
 
     for
+      // TODO: the right node is not checked against maxNodeSize (see the limitation above)
       rightPointer <- allocator.allocateDataObject(DataBuffer(encode(right, splitAtKey, n.link)))
       headPointer <- allocator.allocateDataObject(DataBuffer(
         encode(headEntries, Key.AbsoluteMinimum, Some(NodeLink(splitAtKey, rightPointer)))))

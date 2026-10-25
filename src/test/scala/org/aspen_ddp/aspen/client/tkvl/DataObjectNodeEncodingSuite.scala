@@ -267,6 +267,54 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       assert(sameLink(l1.link, rightLink))
       assert(oright.isEmpty)
 
+  atest("a join that would be larger than the right node leaves the left node empty and linked instead"):
+    // The left minimum is much longer than the right one, so the joined node would outgrow the right node
+    val leftMinimum = Key(Array.fill[Byte](60)(1))
+    val rightLink = Some(NodeLink(key(90), fakePointer(1)))
+    val rightEntries = List(key(50) -> vbytes(50), key(60) -> vbytes(60))
+    for
+      right <- makeNode(rightEntries, key(50), rightLink)
+      rightLinkFromLeft = Some(NodeLink(key(50), right.pointer))
+      left <- makeNode(List(leftMinimum -> vbytes(1)), leftMinimum, rightLinkFromLeft)
+      tx = client.newTransaction()
+      _ <- enc.delete(left, leftMinimum, noJoin)(using tx)
+      _ <- tx.commit()
+      l1 <- readNode(left.pointer)
+      r1 <- readNode(right.pointer)
+    yield
+      assert(enc.encodedSize(rightEntries, leftMinimum, rightLink) > enc.encodedSize(rightEntries, key(50), rightLink))
+      assert(l1.entries.isEmpty)
+      assert(l1.minimum == leftMinimum)
+      assert(sameLink(l1.link, rightLinkFromLeft))
+      assert(r1.revision == right.revision)
+      assert(asBytes(r1.entries) == asBytes(rightEntries))
+      assert(sameLink(r1.link, rightLink))
+
+  atest("a join aborts if the right node changes before it commits"):
+    val rightEntries = List(key(50) -> vbytes(50))
+    for
+      right <- makeNode(rightEntries, key(50))
+      left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      // Modify the right node after the join has read and staged it
+      _ <- enc.delete(left, key(1), (_, _) =>
+        for
+          r <- readNode(right.pointer, key(50))
+          tx2 = client.newTransaction()
+          _ <- enc.insert(r, key(70), vbytes(70), 4096, alloc, noSplit, None)(using tx2)
+          _ <- tx2.commit()
+        yield
+          ())(using tx)
+      joinResult <- tx.commit().map(_ => true).recover(_ => false)
+      l1 <- readNode(left.pointer)
+      r1 <- readNode(right.pointer, key(50))
+    yield
+      assert(!joinResult)
+      assert(asBytes(l1.entries) == asBytes(List(key(1) -> vbytes(1))))
+      assert(asBytes(r1.entries) == asBytes(rightEntries :+ (key(70) -> vbytes(70))))
+      assert(r1.refcount == right.refcount)
+
   atest("deleting the last key of the last node leaves an empty node"):
     for
       n0 <- makeNode(List(key(1) -> vbytes(1)))
@@ -304,6 +352,24 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       assert(asBytes(newRight.entries) == asBytes(original.drop(3)))
       assert(newRight.minimum == key(4))
       assert(sameLink(newRight.link, originalLink))
+
+  atest("after splitAt the left node has no maximum and accepts keys at or above the split key"):
+    val original = (1 to 6).toList.map(i => key(i) -> vbytes(i))
+    for
+      n0 <- makeNode(original)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.splitAt(n0, key(4), false, None, alloc)(using tx)
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer)
+      tx2 = client.newTransaction()
+      _ <- enc.insert(n1, key(9), vbytes(9), 4096, alloc, noSplit, None)(using tx2)
+      _ <- tx2.commit()
+      n2 <- readNode(n0.pointer)
+    yield
+      assert(n1.maximum.isEmpty)
+      assert(n1.keyInRange(key(9)))
+      assert(asBytes(n2.entries) == asBytes(original.take(3) :+ (key(9) -> vbytes(9))))
 
   atest("inclusive splitAt without a down pointer keeps the split key and leaves the new head empty"):
     val original = (1 to 6).toList.map(i => key(i) -> vbytes(i))

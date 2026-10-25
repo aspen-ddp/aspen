@@ -1,11 +1,3 @@
-Possible bug in AmoebaFS
-  - Looks like UnlinkFileTask may double-decrement the inode number
-  - prepareUnlink method decrements the inode number and creates the UnlinkFileTask atomically
-    if the refcount is zero.
-  - The task always decrements the refcount as the first step
-  - Need to verify that this is a flaw and look for cases where the task doing the decrement is
-    valid. If never valid, just skip the decrement step and move on to freeing resources.
-
 Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
 that talks about things like IDA + Backend combinations. AppendingReedSolmon + RocksDB is a poor

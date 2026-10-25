@@ -38,6 +38,9 @@ object UnlinkFileTask extends DurableTaskFactory:
     fileSystem.taskExecutor.prepareTask(this, istate)
 
 
+/** Removes one link to an inode. The task owns the link count decrement and frees the inode's
+  * resources once the count reaches zero, so callers must not decrement the link count themselves.
+  */
 class UnlinkFileTask(
   taskPointer: DurableTaskPointer,
   val fs: FileSystem,

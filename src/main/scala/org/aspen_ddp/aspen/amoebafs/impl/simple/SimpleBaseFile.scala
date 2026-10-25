@@ -156,19 +156,6 @@ abstract class SimpleBaseFile(val pointer: InodePointer,
     }
   }
 
-  def prepareUnlink()(using tx: Transaction): Future[Future[Unit]] = synchronized {
-    val updatedInode = inode.update(links=Some(inode.links-1))
-
-    tx.overwrite(pointer.pointer, cachedInodeRevision, updatedInode.toDataBuffer)
-
-    tx.result.foreach(_ => setCachedInode(updatedInode, tx.revision))
-
-    if (inode.links == 1)
-      UnlinkFileTask.prepareTask(fs, pointer).map(f => f.map(_=>()))
-    else
-      Future.successful(Future.unit)
-  }
-
   def setattr(
                newUID: Int,
                newGID: Int,

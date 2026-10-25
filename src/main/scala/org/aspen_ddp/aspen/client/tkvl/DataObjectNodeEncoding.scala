@@ -341,22 +341,19 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
           yield
             ()
 
-    // Empties the node and returns its link, or None if it is already deleted
-    def deleteContents(ptr: DataObjectPointer): Future[Option[NodeLink]] =
+    // Empties the node, if it still exists
+    def deleteContents(ptr: DataObjectPointer): Future[Unit] =
       readNode(ptr).flatMap { node =>
-        val fdeleted = odeleteEntry match
+        odeleteEntry match
           case None => if node.entries.isEmpty then Future.unit else rewrite(node, Nil)
           case Some(deleteEntry) => deleteOneAtATime(ptr, node.entries, deleteEntry)
-        fdeleted.map(_ => node.link)
       }.recover {
-        case _: InvalidObject => None
+        case _: InvalidObject => ()
       }.andThen:
         case Failure(err) => logger.warn(s"Failed to delete DataObject TKVL node content ${ptr.id}: $err")
 
-    // Deletes the empty node at `ptr` and links `headNode` past it. Returns the link `head` now has.
-    def deleteNode(ptr: DataObjectPointer,
-                   headNode: DataObjectListNode,
-                   olink: Option[NodeLink]): Future[Option[NodeLink]] =
+    // Deletes the empty node at `ptr`, if it still exists, and links `headNode` past it
+    def deleteNode(ptr: DataObjectPointer, headNode: DataObjectListNode): Future[Unit] =
       readNode(ptr).flatMap { node =>
         val tx = client.newTransaction()
 
@@ -367,23 +364,28 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
         tx.lockRevision(node.pointer, node.revision)
         tx.setRefcount(node.pointer, node.refcount, node.refcount.decrement())
         writeNode(headNode, encode(headNode.entries, headNode.minimum, node.link))(using tx)
-        tx.commit().map(_ => node.link)
+        tx.commit().map(_ => ())
       }.recover:
-        case _: InvalidObject => olink
+        case _: InvalidObject => ()
 
-    // None ends the walk: either the list is done or `head` is already deleted
-    def deleteRight(link: NodeLink): Future[Option[NodeLink]] =
+    // Deletes the node `head` currently links to. False ends the walk: either `head` has no link left or it is
+    // already deleted. The link is read from `head` each time rather than remembered from the previous step, so a
+    // step whose commit outcome was lost cannot end the walk early.
+    def deleteRight(): Future[Boolean] =
       client.retryStrategy.retryUntilSuccessful:
         // reread the head node each time to ensure an accurate revision
         readOptionalNode(headPointer).flatMap:
-          case None => Future.successful(None)
+          case None => Future.successful(false)
           case Some(headNode) =>
-            val ptr = dataPointer(link.pointer)
-            deleteContents(ptr).flatMap(olink => deleteNode(ptr, headNode, olink))
+            headNode.link match
+              case None => Future.successful(false)
+              case Some(link) =>
+                val ptr = dataPointer(link.pointer)
+                deleteContents(ptr).flatMap(_ => deleteNode(ptr, headNode)).map(_ => true)
 
-    def deleteRights(olink: Option[NodeLink]): Future[Unit] = olink match
-      case None => Future.unit
-      case Some(link) => deleteRight(link).flatMap(deleteRights)
+    def deleteRights(): Future[Unit] =
+      deleteRight().flatMap: more =>
+        if more then deleteRights() else Future.unit
 
     def deleteHead(): Future[Unit] =
       client.retryStrategy.retryUntilSuccessful:
@@ -404,7 +406,7 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
 
     readOptionalNode(headPointer).flatMap:
       case None => Future.unit
-      case Some(headNode) => deleteRights(headNode.link).flatMap(_ => deleteHead())
+      case Some(_) => deleteRights().flatMap(_ => deleteHead())
 
   def nodeSizeLimit(ida: IDA, maxSliceSize: Option[Int]): Option[Int] =
     NodeAllocator.nodeSizeLimit(ida, maxSliceSize, TreeKind.DataObjects)

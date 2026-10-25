@@ -184,9 +184,11 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
   /** Creates a new allocation group.
     *
-    * @param maxSliceSize the group's slice limit, fixed for the group's lifetime, or `None` for no limit. Only pools
-    *                     and groups whose own `maxSliceSize` is no larger may join it. The object size limit users
-    *                     see is the group allocator's derived `maxObjectSize`.
+    * @param maxSliceSize the group's slice limit, fixed for the group's lifetime, or `None` for no limit. Allowed
+    *                     only with `ExactMatch` and must be at least `ida.minSliceSize`; anything else throws
+    *                     `IllegalArgumentException`. It is a floor: only pools and groups with no limit or one at
+    *                     least as large may join, and an unlimited group accepts only unlimited members. The object
+    *                     size limit users see is the group's derived `maxObjectSize`.
     * @param idaPolicy   `ExactMatch` (the default) requires every member's IDA to equal `ida`; `AllowAll` accepts
     *                    any member. Fixed for the group's lifetime.
     * @param ida         the IDA members must equal. Required for `ExactMatch` and must be `None` for `AllowAll`;

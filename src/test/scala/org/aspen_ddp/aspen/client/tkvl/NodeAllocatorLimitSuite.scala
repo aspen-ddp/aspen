@@ -1,7 +1,8 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectAllocatorId, PoolObjectAllocatorId, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, GroupObjectAllocatorId, ObjectAllocator, ObjectAllocatorId, PoolObjectAllocatorId, Transaction}
+import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
@@ -24,8 +25,8 @@ object NodeAllocatorLimitSuite:
       case Failure(e: NodeSizeExceedsAllocatorLimit) => Success(e)
       case other => Failure(new Exception(s"Expected NodeSizeExceedsAllocatorLimit, got $other"))
 
-  /** An allocator whose reported limit can be changed, standing in for a group whose limit shrank or whose
-    * snapshot of a member is stale. Objects are created through `delegate`.
+  /** An allocator whose reported limit can be changed, standing in for one whose limit overstates or understates
+    * the pools it allocates from. Objects are created through `delegate`.
     */
   class StubAllocator(val delegate: ObjectAllocator, var limit: Option[Int]) extends ObjectAllocator:
     val client: AspenClient = delegate.client
@@ -276,6 +277,20 @@ class NodeAllocatorKindLimitSuite extends IntegrationTestSuite:
       assert(root.orootObject.exists(_.isInstanceOf[DataObjectPointer]))
       assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, sliceLimit))
       assert(kvTree == kv)
+      assert(data == NodeSizeExceedsAllocatorLimit(0, dataLimit + 1, dataLimit))
+
+  atest("a group tier is fully checked against the group's slice limit and IDA for each kind"):
+    for
+      groupId <- client.createAllocationGroup("node-limit-group", level = 0, maxSliceSize = Some(sliceLimit),
+        ida = Some(testIda))
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId)
+      groupTier = (sz: Int) => new NodeAllocator(client, List((GroupObjectAllocatorId(groupId), sz)))
+      _ <- groupTier(dataLimit).validate(TreeKind.DataObjects)
+      _ <- groupTier(sliceLimit).validate(TreeKind.KeyValueObjects)
+      kv <- limitError(groupTier(dataLimit).validate(TreeKind.KeyValueObjects))
+      data <- limitError(groupTier(dataLimit + 1).validate(TreeKind.DataObjects))
+    yield
+      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, sliceLimit))
       assert(data == NodeSizeExceedsAllocatorLimit(0, dataLimit + 1, dataLimit))
 
   atest("a DataObject node allocated in a pool below the tier's node size fails where the node lands"):

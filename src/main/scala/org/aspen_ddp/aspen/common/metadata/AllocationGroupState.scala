@@ -21,45 +21,32 @@ object AllocationGroupState:
   enum MemberType:
     case Pool, Group
 
-  /** A pool or child group within an allocation group.
-    *
-    * @param maxSliceSize  the member's slice limit, or `None` for no limit: for a pool its effective limit
-    *                      (`StoragePoolState.effectiveMaxSliceSize`, which includes the backend's), for a child group
-    *                      its declared `maxSliceSize`. Used to enforce the membership rule; most code should use
-    *                      `maxObjectSize`.
-    * @param maxObjectSize largest object, in bytes, that can be allocated through this member. For a pool it is the
-    *                      pool's `maxObjectSize`, which is fixed for the pool's lifetime. For a child group it is a
-    *                      snapshot of the child's `maximumObjectSize` taken when it joined, which can go stale as the
-    *                      child's membership changes; group allocators compute the live value from the child's own
-    *                      state instead (see `ObjectAllocator.maxObjectSize`). `None` when unlimited.
+  /** A pool or child group within an allocation group. Slice and object size limits are not recorded here: a
+    * member's limit is checked against the group's when it joins (see `MemberLimitIncompatible`), and the group's
+    * own `maxSliceSize` is the only limit code allocating through the group needs.
     */
   case class Member(memberType: MemberType,
                     uuid: UUID,
-                    maxSliceSize: Option[Int],
-                    maxObjectSize: Option[Int],
                     currentUsage: Long,
                     maximumSize: Long)
 
   object Member:
-    /** The Member entry for pool `ps`, with its limits taken from the pool's effective slice limit and IDA */
     def forPool(ps: StoragePoolState): Member =
-      Member(MemberType.Pool, ps.poolId.uuid, ps.effectiveMaxSliceSize, ps.maxObjectSize, ps.currentUsage,
-        ps.maximumStoreSize)
+      Member(MemberType.Pool, ps.poolId.uuid, ps.currentUsage, ps.maximumStoreSize)
 
-    /** The Member entry for child group `ags` */
     def forGroup(ags: AllocationGroupState): Member =
-      Member(MemberType.Group, ags.groupId.uuid, ags.maxSliceSize, ags.maximumObjectSize,
-        ags.currentUsage, ags.maximumSize)
+      Member(MemberType.Group, ags.groupId.uuid, ags.currentUsage, ags.maximumSize)
 
   /** Thrown if attempting to add a group to one of an equal or lower level */
   class InvalidLevel extends Throwable
 
-  /** Thrown when a pool or group cannot join a group because its slice limit is larger than the group's, or
-    * because it has no limit (`memberLimit == None`) while the group does. Raised before any state changes.
+  /** Thrown when a pool or group cannot join a group because of its slice limit: the group has a limit and the
+    * member's is smaller, or the group has none (`groupLimit == None`) and the member does. Raised before any state
+    * changes.
     */
-  final case class MemberLimitExceedsGroup(memberId: UUID, memberLimit: Option[Int], groupLimit: Int)
+  final case class MemberLimitIncompatible(memberId: UUID, memberLimit: Option[Int], groupLimit: Option[Int])
     extends Exception(s"Member $memberId with maxSliceSize ${memberLimit.getOrElse("unlimited")} cannot join a " +
-      s"group whose maxSliceSize is $groupLimit")
+      s"group whose maxSliceSize is ${groupLimit.getOrElse("unlimited")}")
 
   /** Thrown when a pool or group cannot join an `ExactMatch` group because its IDA is not equal to the group's, or
     * because it has none (an `AllowAll` child group). Raised before any state changes.
@@ -78,12 +65,17 @@ object AllocationGroupState:
         if memberIda != group.ida then
           throw MemberIDAMismatch(memberId, memberIda, group.ida)
 
-  /** Throws `MemberLimitExceedsGroup` unless a member with slice limit `memberLimit` may join `group` */
+  /** Throws `MemberLimitIncompatible` unless a member with slice limit `memberLimit` may join `group`. A group's
+    * limit is a floor every pool below it meets, so a limited group accepts members with no limit or one at least as
+    * large, and an unlimited group accepts only unlimited members.
+    */
   private def checkMemberLimit(memberId: UUID, memberLimit: Option[Int], group: AllocationGroupState): Unit =
-    group.maxSliceSize.foreach: groupLimit =>
-      memberLimit match
-        case Some(limit) if limit <= groupLimit => ()
-        case _ => throw MemberLimitExceedsGroup(memberId, memberLimit, groupLimit)
+    val ok = (group.maxSliceSize, memberLimit) match
+      case (Some(groupLimit), Some(limit)) => limit >= groupLimit
+      case (Some(_), None)                 => true
+      case (None, limit)                   => limit.isEmpty
+    if !ok then
+      throw MemberLimitIncompatible(memberId, memberLimit, group.maxSliceSize)
 
   def apply(cfg: Array[Byte]): AllocationGroupState = Codec.decode(codec.AllocationGroupState.parseFrom(cfg))
   def apply(dos: DataObjectState): AllocationGroupState = apply(dos.data.getByteArray)
@@ -277,9 +269,11 @@ object AllocationGroupState:
 /** @param idaPolicy whether members must share the group's IDA. Fixed when the group is created.
   * @param ida       the IDA every member must equal: `Some` exactly when `idaPolicy` is `ExactMatch`. Fixed when the
   *                  group is created.
-  * @param maxSliceSize the group's declared slice limit, or `None` for no limit. Fixed when the group is created.
-  *                     Only pools and groups whose own `maxSliceSize` is no larger may join. Most code should use
-  *                     the group allocator's `maxObjectSize` instead.
+  * @param maxSliceSize the group's slice limit, or `None` for no limit. Fixed when the group is created and allowed
+  *                     only with the `ExactMatch` policy. It is a floor: every pool below the group accepts slices
+  *                     at least this large, so only pools and groups with no limit or one at least as large may
+  *                     join, and an unlimited group accepts only unlimited members. Most code should use the derived
+  *                     `maxObjectSize` instead.
   */
 final case class AllocationGroupState(
                                      groupId: AllocationGroupId,
@@ -329,11 +323,11 @@ final case class AllocationGroupState(
       val sz = if m.uuid == uuid then newMaxSize else m.maximumSize
       acc + sz
   
-  /** The smallest `Member.maxObjectSize` among the members, or `None` when no member has a limit (including when
-    * the group has no members). This is exact for pool members, but a child group's entry is a snapshot taken when
-    * it joined and is not updated as the child's own membership changes, so for groups with child groups this can
-    * be stale. Code allocating through the group should use the group allocator's `maxObjectSize`
-    * (`ObjectAllocator.maxObjectSize`), which recomputes the value from the child groups' current states.
+  /** Largest object, in bytes, that can be allocated through this group, or `None` for no limit. Derived from
+    * `maxSliceSize` and the group's IDA: every pool below the group accepts an object of this size.
     */
-  def maximumObjectSize: Option[Int] =
-    members.flatMap(_.maxObjectSize).minOption
+  def maxObjectSize: Option[Int] =
+    for
+      limit <- maxSliceSize
+      i <- ida
+    yield i.maxObjectSize(limit)

@@ -22,6 +22,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Identified by UUID
   - Contains a fixed IDA and the number of DataStores exactly matches the width of the IDA
   - Objects allocated within the pool have their data dispersed amongst the enclosing stores
+- **AllocationGroups**:
+  - Allocate from member pools and child groups. An optional `maxSliceSize`, fixed at creation and allowed only
+    with `IDAPolicy.ExactMatch`, is a floor: members must have no limit or one at least as large, and an unlimited
+    group accepts only unlimited members
+  - `maxSliceSize` is the source of truth for pools and groups; every `maxObjectSize` is derived from it and the IDA
 - **Information Dispersal Algorithm (IDA)**:
   - Defines the replication/erasure-coding strategy used to provide robustness against data loss
   - Currently Replication, ReedSolomon and RandomAccessReedSolomon are supported

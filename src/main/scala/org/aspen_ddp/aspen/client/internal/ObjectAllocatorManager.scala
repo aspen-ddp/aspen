@@ -26,53 +26,16 @@ class ObjectAllocatorManager(val client:AspenClient, groupRefreshDuration: Durat
     ags
 
   private def refresh(groupId: AllocationGroupId, newDos: DataObjectState): Unit =
-    val newState = synchronized:
+    synchronized:
       refreshing -= groupId
       val (_, currentRevision, currentState) = states(groupId)
 
       if currentRevision != newDos.revision then
         val ags = AllocationGroupState(newDos)
         states += groupId -> (System.currentTimeMillis(), newDos.revision, ags)
-        Some(ags)
       else
         // Restart the staleness clock so the next refresh waits a full groupRefreshDuration
         states += groupId -> (System.currentTimeMillis(), currentRevision, currentState)
-        None
-
-    // A child group that joined since the last read must be cached for groupMaxObjectSize to see it live
-    newState.foreach(loadChildGroups)
-
-  /** Loads (and so caches, with their own children) the states of `ags`'s child groups that are not cached yet.
-    * Failures are ignored: groupMaxObjectSize falls back to the member's snapshot for a child it cannot see.
-    */
-  private def loadChildGroups(ags: AllocationGroupState): Future[Unit] =
-    val missing = ags.members.filter(_.memberType == AllocationGroupState.MemberType.Group)
-      .map(m => AllocationGroupId(m.uuid))
-      .filter(id => synchronized(!states.contains(id)))
-    Future.sequence(missing.map(id => getAllocator(GroupObjectAllocatorId(id)).map(_ => ()).recover(_ => ())))
-      .map(_ => ())
-
-  /** Largest object that can be allocated through group `groupId`, computed from the live cached states: the
-    * smallest limit among its members, where a pool member contributes its `maxObjectSize` (fixed for the pool's
-    * lifetime, so the value recorded in the member entry is exact) and a child group member contributes this same
-    * computation over the child's cached state. Cached states are refreshed in the background once older than
-    * `groupRefreshDuration`, so a membership change anywhere below is seen within about that long. A child group
-    * whose state has not been loaded yet contributes its member entry's snapshot, taken when it joined, while its
-    * state is loaded in the background. `None` when nothing below the group has a limit.
-    */
-  private[internal] def groupMaxObjectSize(groupId: AllocationGroupId): Option[Int] =
-    val state = getState(groupId)
-    val memberLimits = state.members.flatMap: m =>
-      m.memberType match
-        case AllocationGroupState.MemberType.Pool => m.maxObjectSize
-        case AllocationGroupState.MemberType.Group =>
-          val childId = AllocationGroupId(m.uuid)
-          if synchronized(states.contains(childId)) then
-            groupMaxObjectSize(childId)
-          else
-            loadChildGroups(state)
-            m.maxObjectSize
-    memberLimits.minOption
 
   private[internal] def getState(groupId: AllocationGroupId): AllocationGroupState =
     synchronized:
@@ -112,10 +75,9 @@ class ObjectAllocatorManager(val client:AspenClient, groupRefreshDuration: Durat
           new PoolObjectAllocator(client, pool)
         case g: GroupObjectAllocatorId => client.getAllocationGroupPointer(g.groupId).flatMap: ptr =>
           synchronized(pointers += g.groupId -> ptr)
-          client.read(ptr).flatMap: dos =>
-            val ags = putState(dos.revision, AllocationGroupState(dos))
-            // Child groups are loaded before the allocator is handed out so its maxObjectSize is live at once
-            loadChildGroups(ags).map(_ => new GroupObjectAllocator(g.groupId, this))
+          client.read(ptr).map: dos =>
+            putState(dos.revision, AllocationGroupState(dos))
+            new GroupObjectAllocator(g.groupId, this)
 
       falloc.foreach: alloc =>
         synchronized(allocators += allocId -> alloc)

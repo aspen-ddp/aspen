@@ -178,7 +178,7 @@ class MainSuite extends AnyFunSuite with Matchers:
     val member = AllocationGroupState.Member(
       AllocationGroupState.MemberType.Pool,
       UUID.fromString("44444444-4444-4444-4444-444444444444"),
-      None, None, 1024L, 4096L)
+      1024L, 4096L)
     val s = AllocationGroupState(groupId, 0, "gold", List(member), Nil)
     val out = Main.formatAllocationGroupState(s)
     out should include ("Allocation Group: gold")

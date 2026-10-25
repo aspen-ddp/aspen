@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client.internal.allocation
 import org.aspen_ddp.aspen.client.internal.ObjectAllocatorManager
 import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, GroupObjectAllocatorId, ObjectAllocator, ObjectAllocatorId, PoolObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
 import org.aspen_ddp.aspen.common.metadata.AllocationGroupState.MemberType
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -20,11 +21,12 @@ class GroupObjectAllocator private[internal] (val groupId: AllocationGroupId,
 
   val client: AspenClient = manager.client
 
-  /** Computed live from the cached states of this group and of every group below it (see
-    * ObjectAllocatorManager.groupMaxObjectSize), not from the snapshots stored in the group's member entries
-    */
-  override def maxObjectSize: Option[Int] = manager.groupMaxObjectSize(groupId)
-  
+  /** The group's current cached state. Its slice limit and IDA are fixed when the group is created */
+  def state: AllocationGroupState = manager.getState(groupId)
+
+  /** Derived from the group's fixed slice limit and IDA (see AllocationGroupState.maxObjectSize) */
+  override def maxObjectSize: Option[Int] = state.maxObjectSize
+
   private def getSubAllocator(): Future[ObjectAllocator] =
     val state = manager.getState(groupId)
 

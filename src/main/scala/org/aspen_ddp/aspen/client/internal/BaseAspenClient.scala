@@ -322,11 +322,6 @@ abstract class BaseAspenClient(
                                      maxSliceSize: Option[Int],
                                      idaPolicy: IDAPolicy,
                                      ida: Option[IDA]): Future[AllocationGroupId] =
-    // A limit of 0 would admit no members, and the encoding uses 0 for "no limit"
-    maxSliceSize.foreach: limit =>
-      if limit <= 0 then
-        throw new IllegalArgumentException(s"maxSliceSize ($limit) must be positive")
-
     idaPolicy match
       case IDAPolicy.ExactMatch =>
         if ida.isEmpty then
@@ -334,6 +329,17 @@ abstract class BaseAspenClient(
       case IDAPolicy.AllowAll =>
         if ida.nonEmpty then
           throw new IllegalArgumentException("An AllowAll allocation group may not specify an ida")
+        // Members may use any IDA, so a slice limit would not determine an object size limit
+        if maxSliceSize.nonEmpty then
+          throw new IllegalArgumentException("An AllowAll allocation group may not specify a maxSliceSize")
+
+    // A limit below the IDA's minimum admits no objects at all
+    for
+      limit <- maxSliceSize
+      i <- ida
+    do
+      if limit < i.minSliceSize then
+        throw new IllegalArgumentException(s"maxSliceSize ($limit) must be at least ${i.minSliceSize} for $i")
 
     val ags = AllocationGroupState(
       AllocationGroupId(UUID.randomUUID()),

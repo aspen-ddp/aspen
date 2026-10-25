@@ -1262,17 +1262,14 @@ object Codec extends Logging:
     codec.AllocationGroupMember(
       memberType = encodeAllocationGroupMemberType(o.memberType),
       uuid = Some(encodeUUID(o.uuid)),
-      maxSliceSize = o.maxSliceSize.getOrElse(0),
       currentUsage = o.currentUsage,
-      maximumSize = o.maximumSize,
-      maxObjectSize = o.maxObjectSize
+      maximumSize = o.maximumSize
     )
 
   def decode(m: codec.AllocationGroupMember): AllocationGroupState.Member =
     val memberType = decodeAllocationGroupMemberType(m.memberType)
     val uuid = decodeUUID(m.uuid.get)
-    val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
-    AllocationGroupState.Member(memberType, uuid, maxSliceSize, m.maxObjectSize, m.currentUsage, m.maximumSize)
+    AllocationGroupState.Member(memberType, uuid, m.currentUsage, m.maximumSize)
 
   def encodeIDAPolicy(o: IDAPolicy): codec.AllocationGroupIDAPolicy = o match
     case IDAPolicy.ExactMatch => codec.AllocationGroupIDAPolicy.ALLOCATION_GROUP_IDA_POLICY_EXACT_MATCH

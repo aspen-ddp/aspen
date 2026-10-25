@@ -2365,7 +2365,7 @@ object Main {
     lines += s"  IDA: ${s.ida.map(_.toString).getOrElse("any")}"
     lines += s"  Usage: ${formatBytes(s.currentUsage)} / ${formatBytes(s.maximumSize)}"
     lines += s"  Max Slice Size:  ${s.maxSliceSize.map(_.toString).getOrElse("unbounded")}"
-    lines += s"  Max Object Size: ${s.maximumObjectSize.map(_.toString).getOrElse("unbounded")}"
+    lines += s"  Max Object Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"
     if s.members.isEmpty then
       lines += "  Members: none"
     else

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.tkvl
 
 import java.nio.ByteBuffer
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectAllocatorId, Transaction}
-import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.{GroupObjectAllocator, PoolObjectAllocator}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectPointer}
 
@@ -41,12 +41,15 @@ object NodeAllocator:
       case TreeKind.DataObjects => maxSliceSize.map(s => ida.maxObjectSize(s))
 
   /** Largest `maxNodeSize` a tier of a `kind` tree allocating through `allocator` may use, or `None` for no limit.
-    * A pool allocator uses its pool's `nodeSizeLimit`. Any other allocator (an allocation group) only knows its
-    * current `maxObjectSize`, so that is the limit here; the slice limit of the pool a node actually lands in is
-    * checked when the node is allocated.
+    * A pool allocator uses its pool's `nodeSizeLimit`. A group allocator uses the same computation over the group's
+    * fixed slice limit and IDA, which every pool below the group meets. Any other allocator falls back to its
+    * `maxObjectSize`.
     */
   def nodeSizeLimit(allocator: ObjectAllocator, kind: TreeKind): Option[Int] = allocator match
     case p: PoolObjectAllocator => nodeSizeLimit(p.pool.ida, p.pool.maxSliceSize, kind)
+    case g: GroupObjectAllocator =>
+      val state = g.state
+      state.ida.flatMap(ida => nodeSizeLimit(ida, state.maxSliceSize, kind))
     case a => a.maxObjectSize
 
   /** `preferred`, or the limit when that is smaller. For code choosing its own default node size for a pool; a
@@ -64,9 +67,9 @@ object NodeAllocator:
         throw NodeSizeExceedsAllocatorLimit(tier, maxNodeSize, l)
 
   /** Allocator handed out for a tier. After the underlying allocator picks a pool for a new node, checks the
-    * tier's node size against that pool's limit. This catches allocators whose reported limit overstates the pool
-    * a node lands in, such as a group holding a stale snapshot of a child group's limit. Pool limits never change,
-    * so a node that passes stays valid. Only objects of the tree's node kind are checked; the other kind is never a
+    * tier's node size against that pool's limit. A backstop: a group's limit is a floor its pools meet, so this
+    * should only fail for an allocator whose reported limit overstates its pools. Pool limits never change, so a
+    * node that passes stays valid. Only objects of the tree's node kind are checked; the other kind is never a
     * node of a `kind` tree.
     */
   private class TierAllocator(tier: Int, maxNodeSize: Int, kind: TreeKind, val underlying: ObjectAllocator)
@@ -126,10 +129,6 @@ class NodeAllocator(val client:AspenClient, config: Seq[(ObjectAllocatorId, Int)
 
   /** Fails with `NodeSizeExceedsAllocatorLimit` for the first configured tier whose `maxNodeSize` is above its
     * allocator's `NodeAllocator.nodeSizeLimit` for a `kind` tree. Allocators without a limit always pass.
-    *
-    * Group tiers are only partly checked here: a group has no IDA, so only its current `maxObjectSize` is
-    * compared. The full check, against the slice limit of the pool a node lands in, happens when the tier
-    * allocates its first node (see `getAllocatorForTier`).
     */
   def validate(kind: TreeKind = TreeKind.KeyValueObjects): Future[Unit] =
     given ExecutionContext = client.clientContext

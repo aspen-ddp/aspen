@@ -607,11 +607,13 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       level = 2,
       name = "test-group",
       members = List(
-        AllocationGroupState.Member(AllocationGroupState.MemberType.Pool, uuid(2), Some(1024), Some(2047), 500L, 10000L),
-        AllocationGroupState.Member(AllocationGroupState.MemberType.Group, uuid(3), None, None, 200L, 5000L)
+        AllocationGroupState.Member(AllocationGroupState.MemberType.Pool, uuid(2), 500L, 10000L),
+        AllocationGroupState.Member(AllocationGroupState.MemberType.Group, uuid(3), 200L, 5000L)
       ),
       parentGroups = List(AllocationGroupId(uuid(4)), AllocationGroupId(uuid(5))),
-      maxSliceSize = Some(4096)
+      maxSliceSize = Some(4096),
+      idaPolicy = IDAPolicy.ExactMatch,
+      ida = Some(Replication(3, 2))
     )
     val decoded = Codec.decode(Codec.encode(original))
     decoded.maxSliceSize shouldBe Some(4096)
@@ -621,13 +623,11 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.members.size shouldBe 2
     decoded.members.head.memberType shouldBe AllocationGroupState.MemberType.Pool
     decoded.members.head.uuid shouldBe uuid(2)
-    decoded.members.head.maxSliceSize shouldBe Some(1024)
-    decoded.members.head.maxObjectSize shouldBe Some(2047)
     decoded.members.head.currentUsage shouldBe 500L
     decoded.members.head.maximumSize shouldBe 10000L
     decoded.members(1).memberType shouldBe AllocationGroupState.MemberType.Group
-    decoded.members(1).maxSliceSize shouldBe None
-    decoded.members(1).maxObjectSize shouldBe None
+    decoded.members(1).currentUsage shouldBe 200L
+    decoded.members(1).maximumSize shouldBe 5000L
     decoded.parentGroups shouldBe List(AllocationGroupId(uuid(4)), AllocationGroupId(uuid(5)))
 
     val bytes = original.toBytes

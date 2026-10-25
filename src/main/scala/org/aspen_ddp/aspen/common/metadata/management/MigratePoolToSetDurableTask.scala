@@ -91,6 +91,9 @@ class MigratePoolToSetDurableTask(
   private val backoff = new TransferBackoff(() => System.currentTimeMillis(),
     MigratePoolToSetDurableTask.StartBackoffBase, MigratePoolToSetDurableTask.StartBackoffMax, new Random(), MigratePoolToSetDurableTask.StartBackoffJitter)
 
+  /** Testing hook: whether the store's start backoff has elapsed. */
+  private[management] def testingOnlyBackoffReady(storeId: StoreId): Boolean = backoff.ready(storeId)
+
   /** Single-flight guard: a tick arriving while a pass is still running is dropped
    *  (TODO.txt's "protect against pileups", on the async-body side; the cancel-then-schedule
    *  in scheduleRecheck covers the timer side).
@@ -258,6 +261,7 @@ class MigratePoolToSetDurableTask(
             // AllocationError (no device with room) or a read failure: transient from this
             // task's point of view. Try the next store.
             logger.warn(s"Pool migration ${poolId.uuid}: no destination for $storeId: $err")
+            backoff.failed(storeId)
             attempt(tail, exclude)
 
           case Success(destination) if destination == sourceDevice =>

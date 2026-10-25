@@ -521,6 +521,23 @@ class MigratePoolToSetSuite extends MigratePoolToSetSuiteBase:
       poolState.migration should be(Some(StoragePoolState.Migration(
         bootstrapSetId, StoragePoolState.MigrationStatus.Complete)))
 
+  atest("a destination selection failure backs the store off"):
+    given ExecutionContext = executionContext
+    val poolId = PoolId.BootstrapPoolId
+    val stores = (0 until 3).map(i => StoreId(poolId, i.toByte))
+    for
+      // No member devices, so every selection fails with AllocationError.
+      emptySetId <- client.createStorageDeviceSet("empty-target", level = 0, parent = None)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.migratePoolToSet(poolId, emptySetId)
+      _ <- waitForTransactionsToComplete()
+
+      task <- taskForEnrolled(poolId)
+      _ <- awaitUntil("every store to back off", Duration(5000, MILLISECONDS))(
+             Future.successful(stores.forall(s => !task.testingOnlyBackoffReady(s))))
+    yield
+      stores.map(task.testingOnlyBackoffReady) should be(List.fill(3)(false))
+
   atest("an aborted migration transfer is restarted toward a freshly selected destination"):
     given ExecutionContext = executionContext
     val poolId = PoolId.BootstrapPoolId

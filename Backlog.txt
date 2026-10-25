@@ -1,5 +1,4 @@
 Follow-ups from parallel store transfers
-  7. Migration: a selection failure (AllocationError) does not back off
   8. Tests: a rebuild landing on a device other than the planned destination is untested;
      the 'no competing transfer' check is a single snapshot after a fixed sleep;
      failAndDrain/completeRebuild are duplicated across suites; no isSafe test for a

@@ -54,34 +54,46 @@ class TailRemovalFinalizationAction(val client: AspenClient,
       encoding.read(client, pointer, minimum, ordering, s"Removing empty tail node ${tailNode.id}")
 
     // The node whose link is the tail, or None if nothing links to it
-    def findPredecessor(node: ListNode): Future[Option[ListNode]] = node.link match {
-      case None => Future.successful(None)
-      case Some(l) if l.pointer.id == tailNode.id => Future.successful(Some(node))
-      case Some(l) => read(l.pointer, l.minimum).flatMap(findPredecessor)
-    }
+    def findPredecessor(): Future[Option[ListNode]] =
+      TierEngine.fetchPredecessor(client, rootTier, nodeTier, ordering, tailMinimum, tailNode.id, rootNode).flatMap {
+        case Right(opred) => Future.successful(opred)
+        case Left(_) => findPredecessorFromHead()
+      }
 
-    def unlink(tail: ListNode): Future[Unit] =
+    // Only when the search through the tiers above runs out of candidates, as when racing joins deleted the nodes it
+    // was following. A scan of the whole tier is the correct, if slow, way to look.
+    def findPredecessorFromHead(): Future[Option[ListNode]] = {
+      def scan(node: ListNode): Future[Option[ListNode]] = node.link match {
+        case None => Future.successful(None)
+        case Some(l) if l.pointer.id == tailNode.id => Future.successful(Some(node))
+        case Some(l) => read(l.pointer, l.minimum).flatMap(scan)
+      }
+
       TierEngine.fetchContainingNode(client, rootTier, nodeTier, ordering, Key.AbsoluteMinimum, rootNode, Set())
         .flatMap {
           case Left(_) => Future.failed(new BrokenTree)
-          case Right(head) => findPredecessor(head).flatMap {
-            case None => Future.unit // Already unlinked
-            case Some(pred) =>
-              given tx: Transaction = client.newTransaction()
-
-              encoding.unlinkRight(pred)
-              tx.lockRevision(tail.pointer, tail.revision)
-              tx.setRefcount(tail.pointer, tail.refcount, tail.refcount.decrement())
-
-              JoinFinalizationAction.addToTransaction(rootManager, tier, tailMinimum, tailNode, tx)
-
-              // The predecessor is now the last node of the tier, so it too is removable if it was already empty
-              if pred.entries.isEmpty then
-                TierEngine.prepareTailRemoval(rootManager, nodeTier, pred)
-
-              tx.commit().map(_ => ())
-          }
+          case Right(head) => scan(head)
         }
+    }
+
+    def unlink(tail: ListNode): Future[Unit] =
+      findPredecessor().flatMap {
+        case None => Future.unit // Already unlinked
+        case Some(pred) =>
+          given tx: Transaction = client.newTransaction()
+
+          encoding.unlinkRight(pred)
+          tx.lockRevision(tail.pointer, tail.revision)
+          tx.setRefcount(tail.pointer, tail.refcount, tail.refcount.decrement())
+
+          JoinFinalizationAction.addToTransaction(rootManager, tier, tailMinimum, tailNode, tx)
+
+          // The predecessor is now the last node of the tier, so it too is removable if it was already empty
+          if pred.entries.isEmpty then
+            TierEngine.prepareTailRemoval(rootManager, nodeTier, pred)
+
+          tx.commit().map(_ => ())
+      }
 
     Future.delegate(read(tailNode, tailMinimum)).map(Some(_)).recover {
       case _: InvalidObject => None

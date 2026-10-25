@@ -159,3 +159,60 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
 
   atest("a DataObject tree drops every upper tier once its nodes have joined away"):
     reduceToTierZero(TreeKind.DataObjects, 200, 24)
+
+  /** For every node below the root that is not the head of its tier, the search through the upper tiers finds the node
+    * just before it. A node nothing links to, here the node before the one searched for, yields None.
+    */
+  private def checkPredecessors(kind: TreeKind, rm: RootManager): Future[org.scalatest.Assertion] =
+    for
+      tiers <- allTiers(kind, rm)
+      (rootTier, _, oroot) <- rm.getRootNode()
+      found <- Future.sequence(
+        for
+          (nodes, i) <- tiers.zipWithIndex
+          nodeTier = rootTier - i
+          if nodeTier < rootTier
+          j <- 1 until nodes.size
+        yield
+          for
+            pred <- TierEngine.fetchPredecessor(client, rootTier, nodeTier, ordering, nodes(j).minimum,
+              nodes(j).pointer.id, oroot.get)
+            none <- TierEngine.fetchPredecessor(client, rootTier, nodeTier, ordering, nodes(j).minimum,
+              nodes(j - 1).pointer.id, oroot.get)
+          yield
+            (pred.toOption.flatten.map(_.pointer.id), nodes(j - 1).pointer.id, none.toOption.flatten))
+    yield
+      assert(tiers.size >= 3)
+      assert(found.nonEmpty)
+      assert(found.forall((p, expected, none) => p.contains(expected) && none.isEmpty))
+
+  private def predecessorsOfWideTree(kind: TreeKind, maxNodeSize: Int, numKeys: Int) =
+    val all = (1 to numKeys).toList.map(i => Key(i))
+    for
+      (tree, rm) <- newTree(kind, maxNodeSize)
+      _ <- sequentially(all)((k, tx) => tree.set(k, value(k.bytes.last))(using tx))
+      result <- checkPredecessors(kind, rm)
+    yield result
+
+  // Ascending deletes leave the second tier-1 node's first entry above its minimum, as in lookupsInTheGap
+  private def predecessorsInTheGap(kind: TreeKind, maxNodeSize: Int, numKeys: Int) =
+    val all = (1 to numKeys).toList.map(i => Key(i))
+    for
+      (tree, rm) <- newTree(kind, maxNodeSize)
+      _ <- sequentially(all)((k, tx) => tree.set(k, value(k.bytes.last))(using tx))
+      b <- secondTier1Node(kind, rm)
+      _ <- sequentially(all.filter(k => ordering.compare(k, b.minimum) < 0))((k, tx) => tree.delete(k)(using tx))
+      result <- checkPredecessors(kind, rm)
+    yield result
+
+  atest("a KeyValue-object tree finds the node to the left of any non-head node through its upper tiers"):
+    predecessorsOfWideTree(TreeKind.KeyValueObjects, 500, 60)
+
+  atest("a DataObject tree finds the node to the left of any non-head node through its upper tiers"):
+    predecessorsOfWideTree(TreeKind.DataObjects, 200, 24)
+
+  atest("a KeyValue-object tree finds left neighbors past an upper-tier node whose first entry is above its minimum"):
+    predecessorsInTheGap(TreeKind.KeyValueObjects, 500, 60)
+
+  atest("a DataObject tree finds left neighbors past an upper-tier node whose first entry is above its minimum"):
+    predecessorsInTheGap(TreeKind.DataObjects, 200, 24)

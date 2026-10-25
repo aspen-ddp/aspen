@@ -346,7 +346,10 @@ object TierEngine:
   private[tkvl] val MaxJoinRaceRestarts = 10
 
   /*
-   Returns Left if the tree is broken or Right with the node on targetTier whose range holds target
+   Returns Left if the tree is broken or Right with the node on targetTier whose range holds target.
+
+   With linksTo, which names a node on targetTier whose minimum is target, this instead finds the node on
+   targetTier immediately to its left. See fetchPredecessor.
    */
   private[tkvl] def fetchContainingNode(client: AspenClient,
                                         currentTier: Int,
@@ -355,11 +358,12 @@ object TierEngine:
                                         target: Key,
                                         currentNode: ListNode,
                                         initialBlacklist: Set[ObjectId],
-                                        reversePath: List[ListNode] = Nil): Future[Either[Set[ObjectId], ListNode]] =
+                                        reversePath: List[ListNode] = Nil,
+                                        linksTo: Option[ObjectId] = None): Future[Either[Set[ObjectId], ListNode]] =
     given ExecutionContext = client.clientContext
 
     fetchContainingNodePath(client, currentTier, targetTier, ordering, target,
-      currentNode, initialBlacklist).map:
+      currentNode, initialBlacklist, reversePath, linksTo).map:
       case Left(l) => Left(l)
       case Right(rpath) => Right(rpath.head)
 
@@ -386,7 +390,8 @@ object TierEngine:
                                             target: Key,
                                             currentNode: ListNode,
                                             initialBlacklist: Set[ObjectId],
-                                            reversePath: List[ListNode] = Nil): Future[Either[Set[ObjectId], List[ListNode]]] =
+                                            reversePath: List[ListNode] = Nil,
+                                            linksTo: Option[ObjectId] = None): Future[Either[Set[ObjectId], List[ListNode]]] =
 
     given ExecutionContext = client.clientContext
 
@@ -405,7 +410,8 @@ object TierEngine:
                 tier: Int,
                 start: ListNode,
                 restarts: Int): Future[Either[Set[ObjectId], List[ListNode]]] =
-      descend(client, encoding, tier, targetTier, ordering, target, start, initialBlacklist, reversePath).recoverWith:
+      descend(client, encoding, tier, targetTier, ordering, target, start, initialBlacklist, reversePath, linksTo)
+        .recoverWith:
         case _: InvalidObject if restarts < MaxJoinRaceRestarts =>
           refresh(encoding, start).map(n => (tier, n)).recoverWith:
             case _: InvalidObject if tier > targetTier => leftmostChild(encoding, start).map(n => (tier - 1, n))
@@ -437,6 +443,47 @@ object TierEngine:
     else
       scan(node)
 
+  /** Scans right from `node`, whose minimum must be below `target`, for the node whose link points at `linkedId`.
+    * `target` is that linked node's minimum. Returns the node that links to it or, when nothing in the scanned range
+    * does (it was already unlinked), the last node scanned.
+    */
+  private def scanToLinkingNode(client: AspenClient,
+                                encoding: NodeEncoding,
+                                node: ListNode,
+                                target: Key,
+                                linkedId: ObjectId): Future[ListNode] =
+    given ExecutionContext = client.clientContext
+
+    def scan(n: ListNode): Future[ListNode] = n.link match
+      case Some(right) if right.pointer.id != linkedId && n.ordering.compare(right.minimum, target) < 0 =>
+        encoding.read(client, right.pointer, right.minimum, n.ordering,
+          s"Scanning right TKVL node ${right.pointer.id} for the node linking to $linkedId").flatMap(scan)
+      case _ => Future.successful(n)
+
+    scan(node)
+
+  /** The node on `nodeTier` whose link points at `linkedNode`, whose minimum is `linkedMinimum`. None if no node links
+    * to it, as when it is the head of its tier or was already unlinked. Left if the search ran out of candidates in the
+    * tiers above, as when racing joins deleted the nodes it was following, and the caller has to look from the head of
+    * `nodeTier` instead.
+    *
+    * Descends through the tiers above `nodeTier` like a lookup of `linkedMinimum`, except that it takes the entry
+    * strictly below `linkedMinimum`, so the work is a descent plus a short scan right instead of a walk of the tier.
+    */
+  private[tkvl] def fetchPredecessor(client: AspenClient,
+                                     rootTier: Int,
+                                     nodeTier: Int,
+                                     ordering: KeyOrdering,
+                                     linkedMinimum: Key,
+                                     linkedNode: ObjectId,
+                                     rootNode: ListNode): Future[Either[Set[ObjectId], Option[ListNode]]] =
+    given ExecutionContext = client.clientContext
+
+    fetchContainingNode(client, rootTier, nodeTier, ordering, linkedMinimum, rootNode, Set(),
+      linksTo = Some(linkedNode)).map:
+      case Left(l) => Left(l)
+      case Right(n) => Right(n.link.filter(_.pointer.id == linkedNode).map(_ => n))
+
   private def descend(client: AspenClient,
                       encoding: NodeEncoding,
                       currentTier: Int,
@@ -445,14 +492,18 @@ object TierEngine:
                       target: Key,
                       currentNode: ListNode,
                       initialBlacklist: Set[ObjectId],
-                      reversePath: List[ListNode]): Future[Either[Set[ObjectId], List[ListNode]]] = {
+                      reversePath: List[ListNode],
+                      linksTo: Option[ObjectId]): Future[Either[Set[ObjectId], List[ListNode]]] = {
 
     given ExecutionContext = client.clientContext
 
     if (currentTier == targetTier) {
       // Once we're on the right tier, we can rely on consistent right pointers to scan to the
       // containing node
-      scanToContainingNode(client, encoding, currentNode, target).map(n => Right(n :: reversePath))
+      val fscan = linksTo match
+        case None => scanToContainingNode(client, encoding, currentNode, target)
+        case Some(id) => scanToLinkingNode(client, encoding, currentNode, target, id)
+      fscan.map(n => Right(n :: reversePath))
     } else {
 
       val p = Promise[Either[Set[ObjectId], List[ListNode]]]()
@@ -464,7 +515,7 @@ object TierEngine:
           fetchNode(client, encoding, ordering, targetTier, candidates.head._1, candidates.head._2, blacklist) foreach {
             case Left(blklst) => rtry(candidates.tail, blklst)
             case Right(next) => descend(client, encoding, currentTier-1, targetTier, ordering, target,
-              next, blacklist, currentNode :: reversePath).onComplete {
+              next, blacklist, currentNode :: reversePath, linksTo).onComplete {
               case Failure(err) => p.failure(err)
               // `next` holds nothing to descend into, as when joins removed its first entries but left its
               // minimum. Fall back to the next candidate to the left: the scan right from below it reaches the
@@ -476,8 +527,9 @@ object TierEngine:
         }
       }
 
+      // A predecessor search excludes target's own entry so the greatest candidate lies strictly to its left
       val initialCandidates = currentNode.entries.iterator.
-        filter(t => ordering.compare(t._1, target) <= 0).
+        filter(t => if linksTo.isDefined then ordering.compare(t._1, target) < 0 else ordering.compare(t._1, target) <= 0).
         map(t => t._1 -> ObjectPointer(t._2.bytes)).
         filter(t => !initialBlacklist.contains(t._2.id)).
         toList.

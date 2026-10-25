@@ -259,6 +259,10 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
           writeNode(n, encode(remaining, n.minimum, n.link))
           Future.unit
 
+  def unlinkRight(node: ListNode)(using tx: Transaction): Unit =
+    val n = dataNode(node)
+    writeNode(n, encode(n.entries, n.minimum, None))
+
   /** The two-node scheme of `KeyValueListNode.splitAt`. This node keeps the lower keys and loses its link.
     *
     * Nodes store no maximum apart from their link, so after `splitTree` the left tree's last node has no maximum and

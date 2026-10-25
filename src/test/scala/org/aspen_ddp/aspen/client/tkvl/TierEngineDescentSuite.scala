@@ -129,3 +129,33 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
 
   atest("a DataObject tree finds, deletes and inserts keys below an upper-tier node's first entry"):
     lookupsInTheGap(TreeKind.DataObjects, 200, 24)
+
+  /** Deleting all but the last key joins every node away except an emptied rightmost node at each tier. Removing
+    * those empty tail nodes lets the tree give up all of its upper tiers.
+    */
+  private def reduceToTierZero(kind: TreeKind, maxNodeSize: Int, numKeys: Int): Future[org.scalatest.Assertion] =
+    val all = (1 to numKeys).toList.map(i => Key(i))
+    for
+      (tree, rm) <- newTree(kind, maxNodeSize)
+      _ <- sequentially(all)((k, tx) => tree.set(k, value(k.bytes.last))(using tx))
+      tiersBefore <- allTiers(kind, rm)
+      _ <- sequentially(all.init)((k, tx) => tree.delete(k)(using tx))
+      (rootTier, _, _) <- rm.getRootNode()
+      tiersAfter <- allTiers(kind, rm)
+      last <- tree.get(all.last)
+      // The shrunken tree still takes inserts above and below what is left
+      _ <- sequentially(List(Key(0), Key(numKeys + 1)))((k, tx) => tree.set(k, value(77))(using tx))
+      above <- tree.get(Key(numKeys + 1))
+      below <- tree.get(Key(0))
+    yield
+      assert(tiersBefore.size >= 3)
+      assert(rootTier == 0)
+      assert(above == Some(value(77).bytes.toList) && below == Some(value(77).bytes.toList))
+      assert(tiersAfter.size == 1 && tiersAfter.head.size == 1)
+      assert(last == Some(value(all.last.bytes.last).bytes.toList))
+
+  atest("a KeyValue-object tree drops every upper tier once its nodes have joined away"):
+    reduceToTierZero(TreeKind.KeyValueObjects, 500, 60)
+
+  atest("a DataObject tree drops every upper tier once its nodes have joined away"):
+    reduceToTierZero(TreeKind.DataObjects, 200, 24)

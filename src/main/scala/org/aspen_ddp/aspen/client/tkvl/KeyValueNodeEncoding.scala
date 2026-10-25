@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{DeleteMax, DeleteRight, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -44,6 +44,10 @@ object KeyValueNodeEncoding extends NodeEncoding:
     val n = kvNode(node)
     given ExecutionContext = n.reader.client.clientContext
     KeyValueListNode.delete(n, key, n.reader, prepareForJoin)
+
+  def unlinkRight(node: ListNode)(using tx: Transaction): Unit =
+    val n = kvNode(node)
+    tx.update(n.pointer, Some(n.revision), None, Nil, List(DeleteRight(), DeleteMax()))
 
   def splitAt(node: ListNode,
               splitAtKey: Key,

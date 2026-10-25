@@ -46,7 +46,9 @@ class TieredKeyValueListNode(val tkvl: TieredKeyValueList,
       Future.unit
     }
 
-    node.delete(key, onJoin)
+    node.delete(key, onJoin).map { _ =>
+      TierEngine.prepareTailRemoval(tkvl.rootManager, 0, node, key)
+    }
   }
 
   /** May only be used on nodes that contain both the old and new key */

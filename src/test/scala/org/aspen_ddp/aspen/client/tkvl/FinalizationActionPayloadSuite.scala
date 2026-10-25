@@ -55,6 +55,17 @@ class FinalizationActionPayloadSuite extends IntegrationTestSuite:
       assert(a.rootManager.encode().toList == mgr.encode().toList)
       Future.successful(succeed)
 
+  for node <- List(kvNode, dataNode) do
+    atest(s"Tail removal payload round-trips a ${TreeKind.of(node)} node"):
+      val payload = JoinFinalizationAction.encode(mgr, 3, minimum, node)
+      val a = TailRemovalFinalizationAction.createFinalizationAction(client, null, payload)
+        .asInstanceOf[TailRemovalFinalizationAction]
+      assert(a.tier == 3)
+      assert(a.tailMinimum.bytes.toList == minimum.bytes.toList)
+      checkPointer(a.tailNode, node)
+      assert(a.rootManager.encode().toList == mgr.encode().toList)
+      Future.successful(succeed)
+
   atest("A payload whose kind does not match its node pointer is rejected"):
     val splitPayload = SplitFinalizationAction.encode(mgr, 1, minimum, kvNode)
     splitPayload(kindOffset) = TreeKind.DataObjects.code

@@ -7,3 +7,6 @@
 - The root of the tree is replaced every time the current root node is split into two nodes
 - FinalizationActions are used to insert/remove entries in upper tiers as nodes are split/joined
 - Left to right navigation in a tier is guaranteed to be consistent. Navigation between tiers is not
+- A join absorbs a node's right neighbor, so a tier's rightmost node is never joined away. When its last key is
+  deleted, `TailRemovalFinalizationAction` unlinks it from its left neighbor and removes its upper-tier entry, which
+  lets `JoinFinalizationAction` reduce the root by as many tiers as are left with a single entry.

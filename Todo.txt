@@ -1,13 +1,6 @@
 TODO
 ====
 
-Known issues found while building DataObject TKVL:
-  - Tier reduction only ever goes from tier 1 to tier 0. Found while investigating: an emptied rightmost node
-    is never removed because a join only absorbs a right neighbor. Deleting all but the last key of a
-    three-tier tree therefore leaves an empty tail node at tier 1 and the root stays at tier 2. Removing
-    empty tail nodes needs the left neighbor's link (and a KeyValue node's max) cleared in the same
-    transaction as the tail's deletion and its upper-tier entry removal.
-
 Need to audit the slice size calculation code in KeyValueListNode to ensure that we never attempt
 to exceed the size of a fixed-sized object. I suspect there are mistakes in the calculations
   - This is follow-on work from the recent addition of enforcement of maximum object sizes at both

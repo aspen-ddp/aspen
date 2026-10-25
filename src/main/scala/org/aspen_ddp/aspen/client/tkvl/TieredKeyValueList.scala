@@ -61,7 +61,10 @@ class TieredKeyValueList(val client: AspenClient,
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
     }
-    engine.deleteFromContainingNode(key, node => kvNode(node).delete(key, requiredRevision, requirements, onJoin))
+    engine.deleteFromContainingNode(key, node =>
+      kvNode(node).delete(key, requiredRevision, requirements, onJoin).map { _ =>
+        TierEngine.prepareTailRemoval(rootManager, 0, node, key)
+      })
   }
 
   def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] =

@@ -37,6 +37,11 @@ trait NodeEncoding:
   def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
             (using Transaction): Future[Unit]
 
+  /** Stages the removal of `node`'s link so it becomes the last node of its list (and, for a KeyValue node, drops its
+    * stored maximum). The unlinked node is not touched.
+    */
+  def unlinkRight(node: ListNode)(using Transaction): Unit
+
   /** Splits the list at `splitAtKey`, keeping keys below it (and it too when `inclusive`) in `node`. Returns the
     * head of the new list holding the rest, whose minimum is `Key.AbsoluteMinimum` (see `KeyValueListNode.splitAt`).
     * `maxNodeSize` is the node's tier's. An encoding that cannot fit the rest of the list within it throws

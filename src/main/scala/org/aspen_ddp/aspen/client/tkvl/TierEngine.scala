@@ -158,7 +158,9 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
     rootManager.getMaxNodeSize(0).flatMap: maxNodeSize =>
-      deleteFromContainingNode(key, node => encodingFor(node).delete(node, key, maxNodeSize, onJoin))
+      deleteFromContainingNode(key, node =>
+        encodingFor(node).delete(node, key, maxNodeSize, onJoin).map: _ =>
+          prepareTailRemoval(rootManager, 0, node, key))
 
   /** Descends to the tier-0 node containing `key` and hands it to `del`.
    *
@@ -317,6 +319,21 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       Root(newTier, ordering, Some(ptr), oldRoot.nodeAllocator, oldRoot.kind)
 
 object TierEngine:
+
+  /** Registers a `TailRemovalFinalizationAction` if deleting `key` leaves `node` an empty rightmost node that is not
+    * the head of its tier (a tier's head has the absolute minimum and is never removed). `tier` is `node`'s own.
+    * Call after the delete is staged.
+    */
+  private[tkvl] def prepareTailRemoval(rootManager: RootManager, tier: Int, node: ListNode, key: Key)
+                                      (using tx: Transaction): Unit =
+    if node.size == 1 && node.get(key).isDefined then
+      prepareTailRemoval(rootManager, tier, node)
+
+  /** As above for a node that is already empty */
+  private[tkvl] def prepareTailRemoval(rootManager: RootManager, tier: Int, node: ListNode)
+                                      (using tx: Transaction): Unit =
+    if node.link.isEmpty && node.ordering.compare(node.minimum, Key.AbsoluteMinimum) != 0 then
+      TailRemovalFinalizationAction.addToTransaction(rootManager, tier + 1, node.minimum, node.pointer, tx)
 
   /** The encoding of the tree `node` belongs to */
   private[tkvl] def encodingFor(node: ListNode): NodeEncoding = NodeEncoding(TreeKind.of(node.pointer))

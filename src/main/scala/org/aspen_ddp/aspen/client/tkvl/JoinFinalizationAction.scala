@@ -29,12 +29,31 @@ class JoinFinalizationAction(val client: AspenClient,
         given tx: Transaction = client.newTransaction()
 
         // Root node always has a pointer to the AbsoluteMinimum node
-        val newRoot = ObjectPointer(rootNode.get(Key.AbsoluteMinimum).get.bytes)
+        def firstChild(node: ListNode): ObjectPointer = ObjectPointer(node.get(Key.AbsoluteMinimum).get.bytes)
 
-        tx.setRefcount(rootNode.pointer, rootNode.refcount, rootNode.refcount.decrement())
+        // The new root may itself be an upper-tier node left with a single entry and no right neighbor. It is then a
+        // needless tier, so keep descending past it. The revision lock keeps that single-entry check honest.
+        def reduce(nodeTier: Int, node: ListNode): Future[(Int, ObjectPointer)] = {
+          tx.setRefcount(node.pointer, node.refcount, node.refcount.decrement())
+          val child = firstChild(node)
+          val childTier = nodeTier - 1
+
+          if (childTier == 0)
+            Future.successful((childTier, child))
+          else
+            TierEngine.encodingFor(node).read(client, child, Key.AbsoluteMinimum, ordering,
+              s"Reducing tier $nodeTier root").flatMap { childNode =>
+              if (childNode.size == 1 && childNode.link.isEmpty) {
+                tx.lockRevision(childNode.pointer, childNode.revision)
+                reduce(childTier, childNode)
+              } else
+                Future.successful((childTier, child))
+            }
+        }
 
         for {
-          _ <- rootManager.prepareRootUpdate(tier-1, Some(newRoot))
+          (newTier, newRoot) <- reduce(rootTier, rootNode)
+          _ <- rootManager.prepareRootUpdate(newTier, Some(newRoot))
           _ <- tx.commit()
         } yield ()
       }
@@ -62,6 +81,7 @@ class JoinFinalizationAction(val client: AspenClient,
                 for {
                   maxNodeSize <- rootManager.getMaxNodeSize(tier)
                   _ <- TierEngine.encodingFor(node).delete(node, deleteMinimum, maxNodeSize, onJoin)
+                  _ = TierEngine.prepareTailRemoval(rootManager, tier, node, deleteMinimum)
                   _ <- tx.commit()
                 } yield ()
               }
@@ -97,6 +117,12 @@ object JoinFinalizationAction extends RegisteredTypeFactory with FinalizationAct
   def createFinalizationAction(client: AspenClient,
                                txd: TransactionDescription,
                                data: Array[Byte]): FinalizationAction = {
+    val (rootManager, tier, minimum, ptr) = decode(client, data)
+    new JoinFinalizationAction(client, txd, rootManager, tier, minimum, ptr)
+  }
+
+  /** Reads the payload written by `encode`. Also used by `TailRemovalFinalizationAction`, which shares the format. */
+  private[tkvl] def decode(client: AspenClient, data: Array[Byte]): (RootManager, Int, Key, ObjectPointer) = {
     val bb = ByteBuffer.wrap(data)
     bb.order(ByteOrder.BIG_ENDIAN)
     val msb = bb.getLong()
@@ -117,9 +143,7 @@ object JoinFinalizationAction extends RegisteredTypeFactory with FinalizationAct
 
     val factory = client.typeRegistry.getType[RootManagerFactory](rootManagerTypeUUID).get
 
-    val rootManager = factory.createRootManager(client, emgr)
-
-    new JoinFinalizationAction(client, txd, rootManager, tier, Key(karr), ptr)
+    (factory.createRootManager(client, emgr), tier, Key(karr), ptr)
   }
 
   def addToTransaction(mgr: RootManager,

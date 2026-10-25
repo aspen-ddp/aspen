@@ -40,10 +40,11 @@ class MapBackend(val storeId: StoreId) extends Backend {
   override def rebuildWrite(objectId: ObjectId,
                    objectType: ObjectType.Value,
                    metadata: Metadata,
-                   data: DataBuffer): Unit = ???
+                   data: DataBuffer): Unit =
+    m += (objectId -> new ObjectState(objectId, metadata, objectType, data))
 
   /** Force all cached/in-memory data to stable storage before returning */
-  def rebuildFlush(): Unit = ???
+  def rebuildFlush(): Unit = ()
 
   override def read(pointer: ObjectPointer): Unit = {
     chandler.foreach { handler =>

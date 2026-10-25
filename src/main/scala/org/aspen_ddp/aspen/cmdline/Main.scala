@@ -1728,10 +1728,8 @@ object Main {
     awaitAndReport(f):
       case Success(_) =>
         println(s"Storage device '$deviceIdStr' declared failed.")
-        println("Its stores have been marked for rebuild onto live devices, but server-side")
-        println("reconstruction is NOT YET IMPLEMENTED: nothing acts on those marks, so the")
-        println("slices that lived on this device are unavailable until it is. The tombstone")
-        println("is one-way.")
+        println("Its stores have been marked for rebuild onto live devices; hosts reconstruct")
+        println("the lost slices from the rest of each pool. The tombstone is one-way.")
         println("Watch the marks with:")
         println(s"  show-device <client-config-file> $deviceIdStr")
       case Failure(err) => reportError(err)

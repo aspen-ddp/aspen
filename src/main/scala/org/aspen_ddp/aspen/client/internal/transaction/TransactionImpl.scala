@@ -186,7 +186,6 @@ class TransactionImpl(val client: AspenClient,
 
               txManager.runTransaction(txd, transactionData, transactionDriverStrategy) onComplete {
                 case Failure(cause) =>
-                  // TODO Catch transaction timeout from lower layer and convert to TransactionError.TransactionTimedOut
                   client.txStatusCache.transactionAborted(txd.transactionId)
                   promise.failure(cause)
                 case Success(committed) =>

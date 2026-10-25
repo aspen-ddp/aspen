@@ -63,4 +63,3 @@ abstract class TransactionProcessingError extends TransactionError {
 
 final case class TransactionAborted(txd: TransactionDescription) extends TransactionProcessingError
 
-final case class TransactionTimedOut(txd: TransactionDescription) extends TransactionProcessingError

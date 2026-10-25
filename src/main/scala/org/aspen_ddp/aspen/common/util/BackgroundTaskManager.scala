@@ -40,8 +40,7 @@ class BackgroundTaskManager(protected val executionContext: ExecutionContext) {
   }
 
   def scheduleRandomlyWithinWindow(window: Duration)(fn: => Unit): ScheduledTask = synchronized {
-    // TODO: Fix Long -> Int conversion
-    val actualDelay = rand.nextInt(window.length.toInt)
+    val actualDelay = rand.nextLong(math.max(window.length, 1L))
 
     try
       BGTask(sched.schedule(() => Future.unit.map(_ => fn), actualDelay, window.unit))

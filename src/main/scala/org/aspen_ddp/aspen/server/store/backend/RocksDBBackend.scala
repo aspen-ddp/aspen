@@ -15,6 +15,10 @@ import scala.util.{Failure, Success}
 import scala.language.implicitConversions
 
 object RocksDBBackend extends Logging {
+
+  /** Thrown by `decodeDBValue` when a stored value does not have a valid encoding */
+  class CorruptedObjectEncoding(msg: String) extends RuntimeException(msg)
+
   val NullArray: Array[Byte] = new Array[Byte](0)
   val MetadataIndex:Byte = 0
   val DataIndex:Byte = 1
@@ -179,7 +183,7 @@ object RocksDBBackend extends Logging {
     val otype = bb.get() match {
       case 0 => ObjectType.Data
       case 1 => ObjectType.KeyValue
-      case _ => ObjectType.Data // TODO handle corrupted object encoding
+      case b => throw new CorruptedObjectEncoding(s"Unknown object type byte: $b")
     }
     val metadata = Metadata(bb)
     (otype, metadata, bb)
@@ -250,9 +254,14 @@ class RocksDBBackend(dbPath: os.Path,
               handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
             case Some(value) =>
               logger.debug(s"RocksDBBackend loaded object: $objectId")
-              val (objectType, metadata, data) = decodeDBValue(value)
-              val rs = ReadState(objectId, metadata, objectType, data, Set())
-              handler.complete(Read(storeId, objectId, Left(rs)))
+              try
+                val (objectType, metadata, data) = decodeDBValue(value)
+                val rs = ReadState(objectId, metadata, objectType, data, Set())
+                handler.complete(Read(storeId, objectId, Left(rs)))
+              catch
+                case e: RocksDBBackend.CorruptedObjectEncoding =>
+                  logger.error(s"RocksDBBackend found corrupted object $objectId: ${e.getMessage}")
+                  handler.complete(Read(storeId, objectId, Right(ReadError.CorruptedObject)))
           }
         }
     }

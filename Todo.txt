@@ -1,7 +1,5 @@
 TODO
 ====
 
-Audit the code for stubs and other placeholders that do not have a proper implementation. The purpose
-is to identify any oversights that may have gone unnoticed so far.
-
-
+AmoebaFS is limited to a single SinglePoolNodeAllocator
+  - Need plan for using ObjectAllocators tied to AllocationGroups

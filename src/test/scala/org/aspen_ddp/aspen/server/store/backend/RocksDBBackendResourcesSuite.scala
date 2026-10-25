@@ -31,3 +31,7 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
     an [IllegalArgumentException] should be thrownBy ResourceConfig(0L, 0L, 4)
     an [IllegalArgumentException] should be thrownBy ResourceConfig(100L, 200L, 4)
     an [IllegalArgumentException] should be thrownBy ResourceConfig(100L, 50L, 1)
+
+  test("decodeDBValue rejects an unknown object type byte"):
+    an [RocksDBBackend.CorruptedObjectEncoding] should be thrownBy
+      RocksDBBackend.decodeDBValue(Array[Byte](7, 0, 0, 0, 0))

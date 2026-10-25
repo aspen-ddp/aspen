@@ -550,16 +550,17 @@ class AmoebaNFS(val fs: FileSystem,
     if (stat.isDefined(Stat.StatAttribute.GROUP))
       blockingCall { i.setGID(stat.getGid) }
 
+    // st_dev identifies the containing file system and is not settable, so it is accepted and ignored
+    // on devices
     if (stat.isDefined(Stat.StatAttribute.DEV)) i match {
-      case _: BlockDevice => // TODO what to do with this?
-      case _: CharacterDevice => // TODO what to do with this?
-      case _ => new InvalException("Can't set device attribute on non-device file")
+      case _: BlockDevice | _: CharacterDevice => ()
+      case _ => throw new InvalException("Can't set device attribute on non-device file")
     }
 
     if (stat.isDefined(Stat.StatAttribute.RDEV)) i match {
       case d: BlockDevice => blockingCall { d.setrdev(stat.getRdev) }
       case d: CharacterDevice => blockingCall { d.setrdev(stat.getRdev) }
-      case _ => new InvalException("Can't set rdevice attribute on non-device file")
+      case _ => throw new InvalException("Can't set rdevice attribute on non-device file")
     }
 
     if (stat.isDefined(Stat.StatAttribute.MODE))
@@ -596,7 +597,8 @@ class AmoebaNFS(val fs: FileSystem,
     * @throws IOException meh
     */
   @throws[IOException]
-  def setAcl(inode: Inode, acl: Array[nfsace4]): Unit = ()
+  def setAcl(inode: Inode, acl: Array[nfsace4]): Unit =
+    throw new NotSuppException("ACLs are not supported")
 
   /**
     * Returns true if file system object eligible for pNFS operations.

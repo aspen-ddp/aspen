@@ -174,25 +174,17 @@ object KVObjectRootManager extends RootManagerFactory {
 
     given ExecutionContext = client.clientContext
 
-    // TODO: Re-evaluate this. Unconditionally create the root node due to errors
-    //       in unit tests complaining about transactions having no requirements
-    //       if this method doesn't do anything.
-    for
-      _ <- nodeAllocator.validate()
-      alloc <- nodeAllocator.getAllocatorForTier(0)
-      kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
-      rptr <- alloc.allocateKeyValueObject(initialContent)
-    yield
-      setNewRoot(client, pointer, key, true, Root(0, ordering, Some(rptr), nodeAllocator))
-    /*
+    // The root entry must always be written: it is what makes the tree exist, and its DoesNotExist
+    // requirement is what guards against clobbering an existing tree. An empty tree needs no root node
+    // object, so Root.orootObject is None until the first insert.
     if initialContent.isEmpty then
-      Future.successful(Future.successful(new KVObjectRootManager(client, key, pointer)))
+      nodeAllocator.validate().map: _ =>
+        setNewRoot(client, pointer, key, true, Root(0, ordering, None, nodeAllocator))
     else
       for
+        _ <- nodeAllocator.validate()
         alloc <- nodeAllocator.getAllocatorForTier(0)
-        kvos <- client.read(pointer, s"Reading node hosting new TKVL tree $key")
         rptr <- alloc.allocateKeyValueObject(initialContent)
       yield
         setNewRoot(client, pointer, key, true, Root(0, ordering, Some(rptr), nodeAllocator))
-     */
 }

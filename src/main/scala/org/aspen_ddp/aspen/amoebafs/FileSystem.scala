@@ -39,8 +39,8 @@ trait FileSystem extends Logging {
         pload.failure(InvalidInode(iptr.number))
 
       case Failure(e: CorruptedObject) =>
-        // TODO: If pointer fails to read, we'll need to read the inode table (could be stale pointer). If new pointer
-        //       for that inode exists, we'll need to use a callback function to update the stale pointer
+        // ObjectPointers encode logical location and stores migrate transparently, so a corrupted read
+        // is not evidence of a stale pointer. Nothing to re-resolve through the inode table.
         pload.failure(e)
         logger.error(s"Corrupted Inode: $iptr")
 

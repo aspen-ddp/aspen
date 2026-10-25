@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.amoebafs.impl.simple
 
 import java.nio.charset.StandardCharsets
 import org.aspen_ddp.aspen.client.Transaction
+import org.aspen_ddp.aspen.client.tkvl.RootAlreadyModified
 import org.aspen_ddp.aspen.common.objects.{ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.amoebafs.error.{DirectoryEntryDoesNotExist, DirectoryEntryExists, DirectoryNotEmpty}
 import org.aspen_ddp.aspen.amoebafs.{Directory, DirectoryPointer, FileMode, FileSystem, Timespec}
@@ -628,3 +629,19 @@ class DirectorySuite extends FilesSystemTestSuite:
       contents.head.name should be ("cleanup_test")
       subContents.length should be (1)
       subContents.head.name should be ("subcontent")
+
+  atest("two initial-node creations in one transaction fail with RootAlreadyModified and abort it"):
+    for
+      fs <- bootstrap()
+      rootDir <- fs.loadRoot()
+      dirPointer <- cdir(rootDir, "foo", mode=0, uid=1, gid=2)
+      rm = new SimpleDirectoryRootManager(client, dirPointer.pointer)
+      tx = client.newTransaction()
+      _ <- rm.createInitialNode(Map())(using tx)
+      err <- rm.createInitialNode(Map())(using tx).failed
+      txErr <- tx.result.failed
+      (_, _, oroot) <- rm.getRootNode()
+    yield
+      assert(err == RootAlreadyModified(dirPointer.pointer))
+      assert(txErr == err)
+      assert(oroot.isEmpty)

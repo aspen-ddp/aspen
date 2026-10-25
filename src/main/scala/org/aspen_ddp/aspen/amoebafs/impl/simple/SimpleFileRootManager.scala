@@ -115,7 +115,8 @@ class SimpleFileRootManager(client: AspenClient,
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator)
       val newInode = finode.setContentTree(newRoot)
 
-      tx.overwrite(inodePointer, dos.revision, newInode.toArray)
+      RootManager.updateInitialRoot(inodePointer, tx):
+        tx.overwrite(inodePointer, dos.revision, newInode.toArray)
 
 object SimpleFileRootManager extends RootManagerFactory:
   val typeUUID: UUID = UUID.fromString("51936423-bbd1-4500-b60d-b4c557b69f24")

@@ -126,7 +126,8 @@ class SimpleDirectoryRootManager(client: AspenClient,
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator)
       val newInode = dinode.setContentTree(newRoot)
 
-      tx.overwrite(inodePointer, dos.revision, newInode.toArray)
+      RootManager.updateInitialRoot(inodePointer, tx):
+        tx.overwrite(inodePointer, dos.revision, newInode.toArray)
     }
   }
 }

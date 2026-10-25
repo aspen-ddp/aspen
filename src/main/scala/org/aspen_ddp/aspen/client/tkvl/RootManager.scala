@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
+import org.aspen_ddp.aspen.client.{ConflictingRequirements, MultipleDataUpdatesToObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -37,3 +37,17 @@ trait RootManager {
 
   def typeId: RootManagerTypeId
 }
+
+object RootManager:
+
+  /** Runs `update`, a `createInitialNode` write of `host`, the object holding the tree's root. The transaction
+    * rejects it if it already updates `host`, as when an earlier update of the same transaction already created the
+    * initial node. The new node is staged by then, so this aborts the transaction with `RootAlreadyModified` rather
+    * than leave the node unreferenced.
+    */
+  def updateInitialRoot(host: ObjectPointer, tx: Transaction)(update: => Unit): Unit =
+    try
+      update
+    catch
+      case _: MultipleDataUpdatesToObject | _: ConflictingRequirements =>
+        tx.abortAndThrow(RootAlreadyModified(host))

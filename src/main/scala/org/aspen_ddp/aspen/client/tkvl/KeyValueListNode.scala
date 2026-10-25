@@ -46,6 +46,9 @@ class KeyValueListNode(val reader: ObjectReader,
     ordering.compare(key, minimum) >= 0 && maximum.forall( ordering.compare(key, _) < 0 )
   }
 
+  def shape: KeyValueListNode.NodeShape =
+    KeyValueListNode.NodeShape(pointer, ida, ordering, minimum, maximum, tail, contents)
+
   def fullContentLock: FullContentLock = FullContentLock(contents.iterator.map(t => KeyRevision(t._1, t._2.revision)).toList)
 
   def fetchContainingNode(target: Key,
@@ -110,9 +113,12 @@ class KeyValueListNode(val reader: ObjectReader,
     KeyValueListNode.rename(node, ordering, oldKey, newKey, maxNodeSize, allocator, prepareForSplit)
   }
 
+  /** Deletes `key`. The result is true if the node is left empty, as when its join with the right node was
+    * declined. See `KeyValueListNode.delete`.
+    */
   def delete(key: Key,
              prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit
-            )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
+            )(using tx: Transaction): Future[Boolean] = fetchContainingNode(key).flatMap { node =>
     KeyValueListNode.delete(node, key, reader, prepareForJoin)
   }
 
@@ -120,7 +126,7 @@ class KeyValueListNode(val reader: ObjectReader,
              requiredRevision: Option[ObjectRevision],
              requirements: List[KeyValueUpdate.KeyRequirement],
              prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit]
-            )(using tx: Transaction): Future[Unit] = fetchContainingNode(key).flatMap { node =>
+            )(using tx: Transaction): Future[Boolean] = fetchContainingNode(key).flatMap { node =>
     KeyValueListNode.delete(node, key, requiredRevision, requirements, reader, prepareForJoin)
   }
 
@@ -312,6 +318,61 @@ object KeyValueListNode extends Logging {
       kvos.refcount, kvos.contents, kvos.right.map(v => KeyValueListPointer(v.bytes)))
   }
 
+  // ---------------------------------------------------------------------------------------------------------------
+  // Planning. Everything in this section is a pure function of the node's shape: it decides what an insert, rename,
+  // delete or relink must do (fit in place, split, join, or fail) and returns that as a plan, touching no Transaction,
+  // allocator or reader.
+  //
+  // This separation exists FOR TESTING. The size arithmetic and split/join decisions are subtle (a split changes the
+  // overhead of both nodes, a join changes the minimum, and every node must stay within the store's slice limit), and
+  // they are easy to get wrong in ways only many edge cases reveal. Written inline with the transaction calls, they
+  // could only be exercised through a full Aspen system, which is slow and cannot explore enough cases. As plain
+  // functions they are tested directly, over thousands of randomized operations, in KeyValueNodePlanSuite. Keep
+  // decision logic here and keep the executors below limited to applying a plan.
+
+  /** What the planning functions need to know about a node */
+  final case class NodeShape(pointer: KeyValueObjectPointer,
+                             ida: IDA,
+                             ordering: KeyOrdering,
+                             minimum: Key,
+                             maximum: Option[Key],
+                             tail: Option[KeyValueListPointer],
+                             contents: Map[Key, ValueState])
+
+  /** The outcome of planning an insert or rename */
+  sealed abstract class ChangePlan
+
+  /** The change fits in the node. `ops` are applied to it as is */
+  final case class InPlace(requirements: List[KeyRequirement], ops: List[KeyValueOperation]) extends ChangePlan
+
+  /** The node must split. The keys of `newContent` move to a new node allocated with `newMinimum` as its minimum
+    * and `newTail` as its right pointer. Once allocated, the node is updated with `SetMax(newMinimum)`,
+    * `SetRight(pointer to the new node)` and `leftOps`.
+    */
+  final case class Split(requirements: List[KeyRequirement],
+                         newMinimum: Key,
+                         newContent: Map[Key, Value],
+                         newTail: Option[Value],
+                         leftOps: List[KeyValueOperation]) extends ChangePlan
+
+  /** The outcome of planning a delete once the last key of a node is known to need the right neighbor */
+  sealed abstract class DeletePlan
+
+  /** The key is not in the node */
+  case object NothingToDelete extends DeletePlan
+
+  /** Delete the key from the node. If it was the node's last key the node is left empty */
+  final case class RemoveKey(key: Key) extends DeletePlan
+
+  /** The node's last key is deleted and the node needs its right neighbor to decide whether to join with it */
+  final case class ConsiderJoin(right: KeyValueListPointer) extends DeletePlan
+
+  /** The right neighbor, as read, that a node may absorb */
+  final case class JoinSource(pointer: KeyValueListPointer,
+                              maximum: Option[Key],
+                              right: Option[KeyValueListPointer],
+                              contents: Map[Key, ValueState])
+
   /** Bytes of a node's stored slice that are not content entries, counted exactly as the store measures a slice
     * (`KVObjectState.encodedSizeIDA`): the mask byte, the minimum and maximum keys, the IDA-encoded right pointer
     * and the content-count varint, sized for `contentCount + 1` entries. The minimum is always counted, even for a
@@ -324,9 +385,213 @@ object KeyValueListNode extends Logging {
                    maximum: Option[Key],
                    tail: Option[KeyValueListPointer],
                    contentCount: Int): Int =
+    exactOverhead(ida, minimum, maximum, tail, contentCount + 1)
+
+  /** As `nodeOverhead` for a node holding exactly `contentCount` entries */
+  private def exactOverhead(ida: IDA,
+                            minimum: Key,
+                            maximum: Option[Key],
+                            tail: Option[KeyValueListPointer],
+                            contentCount: Int): Int =
     val withoutContent = KVObjectState.encodedSizeIDA(ida, Some(minimum), maximum, None,
       tail.map(p => Value(p.toArray)), Map())
-    withoutContent - Varint.getUnsignedIntEncodingLength(0) + Varint.getUnsignedIntEncodingLength(contentCount + 1)
+    withoutContent - Varint.getUnsignedIntEncodingLength(0) + Varint.getUnsignedIntEncodingLength(contentCount)
+
+  private def pairsSize(ida: IDA, contents: Map[Key, ValueState]): Int =
+    contents.foldLeft(0)((sz, t) => sz + KVObjectState.idaEncodedPairSize(ida, t._1, t._2.value))
+
+  /** Placeholder for an entry that is not stored yet. Only its value's size matters to the planning functions */
+  private def pendingEntry(value: Value): ValueState = ValueState(value, ObjectRevision.Null, HLCTimestamp.now)
+
+  /** The keys that move to the new right node when a node splits with `fullContent` (the node's content plus the
+    * pending change). Starts from `SplitPlan.keysToMove`, which balances the pairs alone. Splitting also changes
+    * the overhead of both nodes: the left node's stored maximum and right pointer become the new minimum and a
+    * pointer carrying it, and the right node's minimum becomes the new minimum. When a long new minimum leaves
+    * either node above `maxNodeSize`, the split point nearest the balanced one that fits both nodes is used.
+    * Throws NodeSizeExceeded if no split point fits.
+    */
+  def planSplit(shape: NodeShape,
+                fullContent: Map[Key, ValueState],
+                maxNodeSize: Int): List[Key] = {
+    val keys = fullContent.keysIterator.toArray
+
+    scala.util.Sorting.quickSort(keys)(using shape.ordering)
+
+    val sizes = keys.iterator.map { k =>
+      (k, KVObjectState.idaEncodedPairSize(shape.ida, k, fullContent(k).value))
+    }.toList
+
+    // Both nodes must fit with the split at `index`: the left node keeps keys(0 until index)
+    def fits(index: Int): Boolean = {
+      val newMinimum = keys(index)
+      val leftPairs = sizes.iterator.take(index).map(_._2).sum
+      val rightPairs = sizes.iterator.drop(index).map(_._2).sum
+      // The new node's pointer is not known yet. This node's is the same size for a node of the same pool
+      val rightPtr = KeyValueListPointer(newMinimum, shape.pointer)
+      val leftOverhead = nodeOverhead(shape.ida, shape.minimum, Some(newMinimum), Some(rightPtr), index)
+      val rightOverhead = nodeOverhead(shape.ida, newMinimum, None, shape.tail, keys.length - index)
+      leftPairs + leftOverhead <= maxNodeSize && rightPairs + rightOverhead <= maxNodeSize
+    }
+
+    val preferred = keys.length - SplitPlan.keysToMove(sizes).length
+
+    if (keys.length > 1 && preferred >= 1 && fits(preferred))
+      keys.iterator.drop(preferred).toList
+    else {
+      val candidates = (1 until keys.length).filter(fits)
+
+      if (candidates.isEmpty)
+        throw new NodeSizeExceeded
+
+      keys.iterator.drop(candidates.minBy(i => math.abs(i - preferred))).toList
+    }
+  }
+
+  /** Plans an insert of `key`/`value`. Throws NodeSizeExceeded if the pair cannot fit in any node and
+    * KeyAlreadyExists if `requirement` demands the key be new and it is not
+    */
+  def planInsert(shape: NodeShape,
+                 key: Key,
+                 value: Value,
+                 maxNodeSize: Int,
+                 requirement: Option[Either[Boolean, ObjectRevision]]): ChangePlan = {
+    val currentSize = pairsSize(shape.ida, shape.contents)
+    val newPairSize = KVObjectState.idaEncodedPairSize(shape.ida, key, value)
+    val maxSize = maxNodeSize - nodeOverhead(shape.ida, shape.minimum, shape.maximum, shape.tail, shape.contents.size)
+
+    if (newPairSize > maxSize)
+      throw new NodeSizeExceeded
+
+    val reqs: List[KeyRequirement] = requirement match {
+      case None => Nil
+      case Some(Left(mustNotExist)) =>
+        if (mustNotExist) {
+          if (shape.contents.contains(key))
+            throw new KeyAlreadyExists(key)
+          DoesNotExist(key) :: Nil
+        } else
+          Nil
+      case Some(Right(revision)) => KeyRevision(key, revision) :: Nil
+    }
+
+    if (newPairSize + currentSize < maxSize)
+      InPlace(WithinRange(key, shape.ordering) :: reqs, List(Insert(key, value.bytes)))
+    else {
+      val fullContent = shape.contents + (key -> pendingEntry(value))
+      val moveList = planSplit(shape, fullContent, maxNodeSize)
+      val oldOps = if (moveList.contains(key)) Nil else List(Insert(key, value.bytes))
+      split(shape, reqs, fullContent, moveList, oldOps)
+    }
+  }
+
+  /** Plans a rename of `oldKey`, which must be in the node, to `newKey` */
+  def planRename(shape: NodeShape,
+                 oldKey: Key,
+                 newKey: Key,
+                 maxNodeSize: Int): ChangePlan = {
+    assert(shape.contents.contains(oldKey))
+
+    val currentSize = pairsSize(shape.ida, shape.contents)
+    val value = shape.contents(oldKey).value
+    val oldPairSize = KVObjectState.idaEncodedPairSize(shape.ida, oldKey, value)
+    val newPairSize = KVObjectState.idaEncodedPairSize(shape.ida, newKey, value)
+    val maxSize = maxNodeSize - nodeOverhead(shape.ida, shape.minimum, shape.maximum, shape.tail, shape.contents.size)
+
+    if (newPairSize - oldPairSize > maxSize)
+      throw new NodeSizeExceeded
+
+    val reqs: List[KeyRequirement] = KeyRevision(oldKey, shape.contents(oldKey).revision) :: Nil
+
+    if (newPairSize + currentSize < maxSize)
+      InPlace(WithinRange(newKey, shape.ordering) :: reqs, List(Delete(oldKey), Insert(newKey, value.bytes)))
+    else {
+      val fullContent = shape.contents - oldKey + (newKey -> pendingEntry(value))
+      val moveList = planSplit(shape, fullContent, maxNodeSize)
+      val oldOps =
+        if (moveList.contains(newKey)) List(Delete(oldKey)) else List(Delete(oldKey), Insert(newKey, value.bytes))
+      split(shape, reqs, fullContent, moveList, oldOps)
+    }
+  }
+
+  private def split(shape: NodeShape,
+                    reqs: List[KeyRequirement],
+                    fullContent: Map[Key, ValueState],
+                    moveList: List[Key],
+                    oldOps: List[KeyValueOperation]): Split =
+    Split(reqs,
+      newMinimum = moveList.head,
+      newContent = moveList.map(k => k -> fullContent(k).value).toMap,
+      newTail = shape.tail.map(p => Value(p.toArray)),
+      leftOps = oldOps ++ moveList.map(Delete(_)))
+
+  /** Plans a delete of `key`. A node whose last key is deleted may absorb its right neighbor, which the caller
+    * reads before calling `planJoin`.
+    */
+  def planDelete(shape: NodeShape, key: Key): DeletePlan =
+    if (!shape.contents.contains(key))
+      NothingToDelete
+    else if (shape.contents.size > 1)
+      RemoveKey(key)
+    else
+      shape.tail match {
+        case None => RemoveKey(key)
+        case Some(rp) => ConsiderJoin(rp)
+      }
+
+  /** Plans pointing `shape`, the predecessor of a node being removed from the list, at `newLink`, the removed node's
+    * link. Only the stored maximum and right pointer change. Fits unless `newLink`'s minimum is longer than the
+    * removed node's, which is not the case for a node whose join was declined but can be if its right neighbor changed
+    * since. Then the node splits in the normal manner so that both halves, the second now pointing at `newLink`, fit.
+    * Throws NodeSizeExceeded if no split point fits.
+    */
+  def planRelink(shape: NodeShape, newLink: Option[KeyValueListPointer], maxNodeSize: Int): ChangePlan = {
+    val relinked = shape.copy(maximum = newLink.map(_.minimum), tail = newLink)
+    val size = pairsSize(shape.ida, shape.contents) +
+      exactOverhead(shape.ida, shape.minimum, relinked.maximum, relinked.tail, shape.contents.size)
+
+    if (size <= maxNodeSize)
+      InPlace(Nil, newLink match {
+        case None => List(DeleteRight(), DeleteMax())
+        case Some(l) => List(SetMax(l.minimum), SetRight(l.toArray))
+      })
+    else {
+      val moveList = planSplit(relinked, shape.contents, maxNodeSize)
+      split(relinked, Nil, shape.contents, moveList, Nil)
+    }
+  }
+
+  /** Operations that delete `key` from the node and absorb the right node `source` into it, or None when the
+    * joined node would be larger than `source` is, since only `source` is known to fit. That happens when the node's
+    * minimum key is longer than the right node's. The node then simply loses the key.
+    *
+    * The node takes over the right node's right pointer and stored maximum so that later inserts into the joined
+    * node pass the store's range check.
+    */
+  def planJoin(shape: NodeShape, key: Key, source: JoinSource): Option[List[KeyValueOperation]] = {
+    val joinedOverhead = nodeOverhead(shape.ida, shape.minimum, source.maximum, source.right, source.contents.size)
+    val sourceOverhead = nodeOverhead(shape.ida, source.pointer.minimum, source.maximum, source.right,
+      source.contents.size)
+
+    if (joinedOverhead > sourceOverhead)
+      None
+    else {
+      val rightOp = source.right match {
+        case None => DeleteRight()
+        case Some(rp) => SetRight(rp.toArray)
+      }
+      val maxOp = source.maximum match {
+        case None => DeleteMax()
+        case Some(m) => SetMax(m)
+      }
+      val inserts = source.contents.iterator.map(t => Insert(t._1, t._2.value.bytes)).toList
+      Some(maxOp :: rightOp :: Delete(key) :: inserts)
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Executors. Apply a plan to a transaction. These only stage what the plan dictates (tx.update, allocation, reads
+  // of the right neighbor, finalization callbacks); anything that decides what to do belongs in the planning section
+  // above, where it can be tested without a Transaction.
 
   // Implemented as a non-class member to prevent accidental use of member variables instead of "node." attributes
   private[tkvl] def insert(node: KeyValueListNode,
@@ -337,74 +602,12 @@ object KeyValueListNode extends Logging {
                      allocator: ObjectAllocator,
                      prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
                      requirement: Option[Either[Boolean, ObjectRevision]] = None
-                    )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
+                    )(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
+    val plan =
+      try planInsert(node.shape, key, value, maxNodeSize, requirement)
+      catch case e: KeyAlreadyExists => tx.abortAndThrow(e)
 
-    val currentSize = node.contents.foldLeft(0) { (sz, t) =>
-      sz + KVObjectState.idaEncodedPairSize(node.ida, t._1, t._2.value)
-    }
-
-    val newPairSize = KVObjectState.idaEncodedPairSize(node.ida, key, value)
-
-    val maxSize = maxNodeSize - nodeOverhead(node.ida, node.minimum, node.maximum, node.tail, node.contents.size)
-
-    if (newPairSize > maxSize)
-      throw new NodeSizeExceeded
-
-    val reqs: List[KeyRequirement] = requirement match {
-      case None => Nil
-      case Some(e) => e match {
-        case Left(req) => if (req) {
-          if (node.contents.contains(key))
-            tx.abortAndThrow(new KeyAlreadyExists(key))
-          DoesNotExist(key) :: Nil
-        } else
-          Nil
-        case Right(revision) => KeyRevision(key, revision) :: Nil
-      }
-    }
-
-    if (newPairSize + currentSize < maxSize) {
-
-      tx.update(node.pointer, None, None,
-        WithinRange(key, ordering) :: reqs, List(Insert(key, value.bytes)))
-
-      Future.unit
-    } else {
-      val fullContent = node.contents + (key -> ValueState(value, tx.revision, HLCTimestamp.now))
-      val keys = fullContent.keysIterator.toArray
-
-      scala.util.Sorting.quickSort(keys)(using ordering)
-
-      val sizes = keys.iterator.map { k =>
-        val vs = fullContent(k)
-        (k, KVObjectState.idaEncodedPairSize(node.ida, k, vs.value))
-      }.toList
-
-      val moveList = SplitPlan.keysToMove(sizes)
-      val moves = moveList.toSet
-
-      val deletes: List[Delete] = moveList.map(Delete(_))
-
-      val oldOps = if (moves.contains(key))
-        deletes
-      else
-        Insert(key, value.bytes) :: deletes
-
-      val newMinimum = moveList.head
-
-      val newContent = moveList.map(k => k -> fullContent(k).value).toMap
-
-      allocator.allocateKeyValueObject(newContent,
-        Some(newMinimum), None, None, node.tail.map(p => Value(p.toArray))).flatMap { newObjectPointer =>
-
-        val rightPtr = KeyValueListPointer(newMinimum, newObjectPointer)
-
-        tx.update(node.pointer, Some(node.revision), Some(node.fullContentLock), reqs,
-          SetMax(newMinimum) :: SetRight(rightPtr.toArray) :: oldOps)
-
-        prepareForSplit(newMinimum, newObjectPointer)
-      }
-    }
+    applyChange(node, plan, allocator, prepareForSplit)
   }
 
   // Implemented as a non-class member to prevent accidental use of member variables instead of "node." attributes
@@ -415,148 +618,64 @@ object KeyValueListNode extends Logging {
                      maxNodeSize: Int,
                      allocator: ObjectAllocator,
                      prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit,
-                    )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =  {
+                    )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =
+    applyChange(node, planRename(node.shape, oldKey, newKey, maxNodeSize), allocator, prepareForSplit)
 
-    assert(node.contents.contains(oldKey))
-
-    val currentSize = node.contents.foldLeft(0) { (sz, t) =>
-      sz + KVObjectState.idaEncodedPairSize(node.ida, t._1, t._2.value)
-    }
-
-    val value = node.contents(oldKey).value
-    val klenDelta = newKey.bytes.length - oldKey.bytes.length
-
-    val oldPairSize = KVObjectState.idaEncodedPairSize(node.ida, oldKey, value)
-    val newPairSize = KVObjectState.idaEncodedPairSize(node.ida, newKey, value)
-
-    val newSize = newPairSize - oldPairSize
-
-    val maxSize = maxNodeSize - nodeOverhead(node.ida, node.minimum, node.maximum, node.tail, node.contents.size)
-
-    if (newSize > maxSize)
-      throw new NodeSizeExceeded
-
-    val reqs: List[KeyRequirement] = KeyRevision(oldKey, node.contents(oldKey).revision) :: Nil
-
-    if (newPairSize + currentSize < maxSize) {
-
-      tx.update(node.pointer, None, None,
-        WithinRange(newKey, ordering) :: reqs, List(Delete(oldKey), Insert(newKey, value.bytes)))
-
+  private def applyChange(node: KeyValueListNode,
+                          plan: ChangePlan,
+                          allocator: ObjectAllocator,
+                          prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit]
+                         )(using tx: Transaction, ec: ExecutionContext): Future[Unit] = plan match {
+    case InPlace(reqs, ops) =>
+      tx.update(node.pointer, None, None, reqs, ops)
       Future.unit
-    } else {
-      val fullContent = node.contents - oldKey + (newKey -> ValueState(value, tx.revision, HLCTimestamp.now))
-      val keys = fullContent.keysIterator.toArray
 
-      scala.util.Sorting.quickSort(keys)(using ordering)
-
-      val sizes = keys.iterator.map { k =>
-        val vs = fullContent(k)
-        (k, KVObjectState.idaEncodedPairSize(node.ida, k, vs.value))
-      }.toList
-
-      val moveList = SplitPlan.keysToMove(sizes)
-      val moves = moveList.toSet
-
-      val deletes: List[Delete] = moveList.map(Delete(_))
-
-      val oldOps = if (moves.contains(newKey))
-        Delete(oldKey) :: deletes
-      else
-        Delete(oldKey) :: Insert(newKey, value.bytes) :: deletes
-
-      val newMinimum = moveList.head
-
-      val newContent = moveList.map(k => k -> fullContent(k).value).toMap
-
-      allocator.allocateKeyValueObject(newContent,
-        Some(newMinimum), None, None, node.tail.map(p => Value(p.toArray))).flatMap { newObjectPointer =>
-
+    case Split(reqs, newMinimum, newContent, newTail, leftOps) =>
+      allocator.allocateKeyValueObject(newContent, Some(newMinimum), None, None, newTail).flatMap { newObjectPointer =>
         val rightPtr = KeyValueListPointer(newMinimum, newObjectPointer)
 
         tx.update(node.pointer, Some(node.revision), Some(node.fullContentLock), reqs,
-          SetMax(newMinimum) :: SetRight(rightPtr.toArray) :: oldOps)
+          SetMax(newMinimum) :: SetRight(rightPtr.toArray) :: leftOps)
 
         prepareForSplit(newMinimum, newObjectPointer)
       }
-    }
-  }
-
-  /** Operations that delete `key` from the left node and absorb the right node `kvos` into it. The left node takes
-    * over the right node's right pointer and stored maximum so that later inserts into the joined node pass the
-    * store's range check.
-    */
-  private def joinOperations(key: Key, kvos: KeyValueObjectState): List[KeyValueOperation] = {
-    val rightOp = kvos.right match {
-      case None => DeleteRight()
-      case Some(rp) => SetRight(rp.bytes)
-    }
-    val maxOp = kvos.maximum match {
-      case None => DeleteMax()
-      case Some(m) => SetMax(m)
-    }
-    val inserts = kvos.contents.iterator.map(t => Insert(t._1, t._2.value.bytes)).toList
-    maxOp :: rightOp :: Delete(key) :: inserts
   }
 
   def delete(node: KeyValueListNode,
              key: Key,
              reader: ObjectReader,
-             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit)(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
+             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit] = (_,_) => Future.unit)(using tx: Transaction, ec: ExecutionContext): Future[Boolean] =
+    delete(node, key, None, List(KeyValueUpdate.Exists(key)), reader, prepareForJoin)
 
-    if (! node.contents.contains(key))
-      Future.unit
-    else {
-      if (node.contents.size > 1) {
-        tx.update(node.pointer, None, None, List(KeyValueUpdate.Exists(key)), List(Delete(key)))
-        Future.unit
-      } else {
-        node.tail match {
-          case None =>
-            tx.update(node.pointer, None, None, List(KeyValueUpdate.Exists(key)), List(Delete(key)))
-            Future.unit
-
-          case Some(rp) =>
-            reader.read(rp.pointer, s"Deleting key from KVListNode node ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
-              val ops = joinOperations(key, kvos)
-
-              tx.update(node.pointer, Some(node.revision), None, List(KeyValueUpdate.Exists(key)), ops)
-
-              val rightContentLock = FullContentLock(kvos.contents.iterator.map(t => KeyRevision(t._1, t._2.revision)).toList)
-              tx.update(rp.pointer, Some(kvos.revision), Some(rightContentLock), Nil, Nil)
-
-              tx.setRefcount(rp.pointer, kvos.refcount, kvos.refcount.decrement())
-
-              prepareForJoin(rp.minimum, rp.pointer)
-            }
-        }
-      }
-    }
-  }
-
+  /** Deletes `key` from `node`. The result is true if the node is left empty: its last key was deleted and the
+    * join with the right node was declined (see `planJoin`), or the right node was empty too. The caller removes
+    * such a node from its list, see `TailRemovalFinalizationAction`.
+    */
   def delete(node: KeyValueListNode,
              key: Key,
              requiredRevision: Option[ObjectRevision],
              requirements: List[KeyValueUpdate.KeyRequirement],
              reader: ObjectReader,
-             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit])(using tx: Transaction, ec: ExecutionContext): Future[Unit] = {
+             prepareForJoin: (Key, KeyValueObjectPointer) => Future[Unit])(using tx: Transaction, ec: ExecutionContext): Future[Boolean] = {
 
-    if (!node.contents.contains(key))
-      Future.unit
-    else {
-      if (node.contents.size > 1) {
-        tx.update(node.pointer, requiredRevision, None, requirements, List(Delete(key)))
-        Future.unit
-      } else {
-        node.tail match {
-          case None =>
-            tx.update(node.pointer, requiredRevision, None, requirements, List(Delete(key)))
-            Future.unit
+    def remove(): Future[Boolean] = {
+      tx.update(node.pointer, requiredRevision, None, requirements, List(Delete(key)))
+      Future.successful(node.contents.size == 1)
+    }
 
-          case Some(rp) =>
-            reader.read(rp.pointer, s"Deleting key from KVListNode node ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
-              val ops = joinOperations(key, kvos)
+    planDelete(node.shape, key) match {
+      case NothingToDelete => Future.successful(false)
 
+      case RemoveKey(_) => remove()
+
+      case ConsiderJoin(rp) =>
+        reader.read(rp.pointer, s"Deleting key from KVListNode node ${rp.pointer.id}. Minimum: ${rp.minimum}. target: $key").flatMap { kvos =>
+          val source = JoinSource(rp, kvos.maximum, kvos.right.map(v => KeyValueListPointer(v.bytes)), kvos.contents)
+
+          planJoin(node.shape, key, source) match {
+            case None => remove()
+
+            case Some(ops) =>
               tx.update(node.pointer, Some(node.revision), None, requirements, ops)
 
               val rightContentLock = FullContentLock(kvos.contents.iterator.map(t => KeyRevision(t._1, t._2.revision)).toList)
@@ -564,12 +683,29 @@ object KeyValueListNode extends Logging {
 
               tx.setRefcount(rp.pointer, kvos.refcount, kvos.refcount.decrement())
 
-              prepareForJoin(rp.minimum, rp.pointer)
-            }
+              prepareForJoin(rp.minimum, rp.pointer).map(_ => kvos.contents.isEmpty)
+          }
         }
-      }
     }
   }
+
+  /** Points `node`, the predecessor of a node being removed from the list, at `newLink`, the removed node's link.
+    * Splits `node` if the new link does not fit, calling `prepareForSplit` for the new node. See `planRelink`.
+    */
+  def relink(node: KeyValueListNode,
+             newLink: Option[KeyValueListPointer],
+             maxNodeSize: Int,
+             allocator: ObjectAllocator,
+             prepareForSplit: (Key, KeyValueObjectPointer) => Future[Unit]
+            )(using tx: Transaction, ec: ExecutionContext): Future[Unit] =
+    planRelink(node.shape, newLink, maxNodeSize) match {
+      case InPlace(reqs, ops) =>
+        tx.update(node.pointer, Some(node.revision), None, reqs, ops)
+        Future.unit
+
+      case split: Split =>
+        applyChange(node, split, allocator, prepareForSplit)
+    }
 
   def deleteList(client: AspenClient,
                  nodePointer: KeyValueListPointer,

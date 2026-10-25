@@ -10,7 +10,7 @@ class DataObjectListNode(val reader: ObjectReader,
                          val ordering: KeyOrdering,
                          val state: DataObjectState) extends ListNode:
 
-  private val content = DataObjectNodeEncoding.decode(state.data.getByteArray)
+  val content: DataObjectNodeEncoding.NodeContent = DataObjectNodeEncoding.decode(state.data.getByteArray)
 
   private lazy val byKey: Map[Key, Value] = content.entries.toMap
 

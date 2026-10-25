@@ -152,6 +152,131 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     given ExecutionContext = reader.client.clientContext
     reader.read(dataPointer(pointer), comment).map(s => new DataObjectListNode(reader, ordering, s))
 
+  // --------------------------------------------------------------------------------------------------------------
+  // Planning. Everything in this section is a pure function of a node's decoded bytes: it decides what an insert,
+  // delete, relink or splitAt must do (rewrite in place, split, join, leave empty, or fail) and returns that as a plan,
+  // touching no Transaction, allocator or reader.
+  //
+  // This separation exists FOR TESTING. The size arithmetic and split/join decisions are subtle (a split gives the new
+  // node a longer minimum and a link, a join changes the minimum, and every node must stay within maxNodeSize), and
+  // they are easy to get wrong in ways only many edge cases reveal. Written inline with the transaction calls, they
+  // could only be exercised through a full Aspen system, which is slow and cannot explore enough cases. As plain
+  // functions they are tested directly, over thousands of randomized operations, in DataObjectNodePlanSuite. Keep
+  // decision logic here and keep the NodeEncoding methods below limited to applying a plan.
+
+  /** The outcome of planning an insert or relink */
+  sealed abstract class RewritePlan
+
+  /** The node still fits: rewrite it with `entries` */
+  final case class Rewrite(entries: List[(Key, Value)]) extends RewritePlan
+
+  /** The node no longer fits and must split. `all` is every entry the two nodes will hold */
+  final case class NeedsSplit(all: List[(Key, Value)]) extends RewritePlan
+
+  /** A split: the node keeps `left` and links to a new node, which holds `right` with minimum `newMinimum` */
+  final case class NodeSplit(left: List[(Key, Value)], right: List[(Key, Value)], newMinimum: Key)
+
+  /** Plans an insert of `key`/`value` into the node at `pointer`. An entry is accepted only if it fits in the node
+    * with a link as long as one to its own key, so that it still fits alone in a node that a later split gives a
+    * link. The new node's pointer is not known yet, so the node's own `pointer` stands in for the link's. Throws
+    * `NodeSizeExceeded` if the entry is not accepted.
+    */
+  def planInsert(pointer: DataObjectPointer,
+                 content: NodeContent,
+                 ordering: KeyOrdering,
+                 key: Key,
+                 value: Value,
+                 maxNodeSize: Int): RewritePlan =
+    val reserved = math.max(nodeOverhead(content.minimum, content.link),
+      nodeOverhead(content.minimum, Some(NodeLink(key, pointer))))
+    if entrySize(key, value) > maxNodeSize - reserved then
+      throw new NodeSizeExceeded
+
+    val all = withEntry(content.entries, key, value, ordering)
+
+    if encodedSize(all, content.minimum, content.link) <= maxNodeSize then
+      Rewrite(all)
+    else
+      NeedsSplit(all)
+
+  /** Plans pointing a node, the predecessor of an empty node being removed from its list, at `newLink` */
+  def planRelink(content: NodeContent, newLink: Option[NodeLink], maxNodeSize: Int): RewritePlan =
+    if encodedSize(content.entries, content.minimum, newLink) <= maxNodeSize then
+      Rewrite(content.entries)
+    else if content.entries.size < 2 then
+      throw new NodeSizeExceeded
+    else
+      NeedsSplit(content.entries)
+
+  /** Splits the node's `all` entries between it and a new node at `rightPointer` that takes `link` as its own. Takes
+    * SplitPlan's choice of keys if both nodes fit and otherwise the nearest split point where they do. Throws
+    * `NodeSizeExceeded` if none does.
+    */
+  def planSplit(minimum: Key,
+                link: Option[NodeLink],
+                all: List[(Key, Value)],
+                rightPointer: DataObjectPointer,
+                maxNodeSize: Int): NodeSplit =
+    val index = splitIndex(minimum, all, link, rightPointer, maxNodeSize).getOrElse(throw new NodeSizeExceeded)
+    val (left, right) = all.splitAt(index)
+    NodeSplit(left, right, right.head._1)
+
+  /** The outcome of planning a delete */
+  sealed abstract class DeletePlan
+
+  case object NothingToDelete extends DeletePlan
+
+  /** Rewrite the node with `remaining`, which may be empty if the node has no link */
+  final case class RemoveEntry(remaining: List[(Key, Value)]) extends DeletePlan
+
+  /** The node's last entry is deleted and the node has a right link, so `planJoin` decides whether to absorb it */
+  final case class ConsiderJoin(right: NodeLink) extends DeletePlan
+
+  def planDelete(content: NodeContent, key: Key): DeletePlan =
+    if !content.entries.exists(_._1 == key) then
+      NothingToDelete
+    else
+      val remaining = content.entries.filterNot(_._1 == key)
+      content.link match
+        case Some(right) if remaining.isEmpty => ConsiderJoin(right)
+        case _ => RemoveEntry(remaining)
+
+  /** The node's new bytes when its last entry is deleted and its right neighbor `right` is considered for joining:
+    * the neighbor's entries and link under this node's minimum, or None if that is larger than `maxNodeSize`, in which
+    * case the node is left empty.
+    */
+  def planJoin(content: NodeContent, right: NodeContent, maxNodeSize: Int): Option[NodeContent] =
+    if encodedSize(right.entries, content.minimum, right.link) > maxNodeSize then
+      None
+    else
+      Some(NodeContent(content.minimum, right.link, right.entries))
+
+  /** The entries `splitAt` keeps and moves. Throws `NodeSizeExceeded` if the node holding the moved entries, whose
+    * minimum is `splitAtKey`, would not fit within `maxNodeSize`.
+    */
+  def planSplitAt(content: NodeContent,
+                  ordering: KeyOrdering,
+                  splitAtKey: Key,
+                  inclusive: Boolean,
+                  maxNodeSize: Int): (List[(Key, Value)], List[(Key, Value)]) =
+    def stays(k: Key): Boolean =
+      if inclusive then
+        ordering.compare(k, splitAtKey) <= 0
+      else
+        ordering.compare(k, splitAtKey) < 0
+
+    val (left, right) = content.entries.partition(e => stays(e._1))
+
+    if encodedSize(right, splitAtKey, content.link) > maxNodeSize then
+      throw new NodeSizeExceeded
+
+    (left, right)
+
+  // --------------------------------------------------------------------------------------------------------------
+  // Executors. Apply a plan to a transaction. These only stage what the plan dictates (writeNode, allocation, reads of
+  // the right neighbor, locks and refcounts, finalization callbacks); anything that decides what to do belongs in the
+  // planning section above, where it can be tested without a Transaction.
+
   /** As `KeyValueListNode.insert`, rewriting the whole node.
     *
     * An entry is accepted only if it fits in this node with a link as long as one to its own key, so that it still
@@ -172,45 +297,48 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     if requirement.isDefined then
       throw new UnsupportedRequirement(kind)
 
-    // The new node's pointer is not known yet, so this node's own pointer stands in for the link's
-    val reserved = math.max(nodeOverhead(n.minimum, n.link), nodeOverhead(n.minimum, Some(NodeLink(key, n.pointer))))
-    if entrySize(key, value) > maxNodeSize - reserved then
-      throw new NodeSizeExceeded
+    planInsert(n.pointer, n.content, n.ordering, key, value, maxNodeSize) match
+      case Rewrite(entries) =>
+        writeNode(n, encode(entries, n.minimum, n.link))
+        Future.unit
 
-    val all = withEntry(n.entries, key, value, n.ordering)
+      case NeedsSplit(all) =>
+        // Creating the pointer stages nothing, so the split can be sized with it before anything is staged
+        allocator.createDataObjectPointer().flatMap: rightPointer =>
+          stageSplit(n, planSplit(n.minimum, n.link, all, rightPointer, maxNodeSize), n.link, rightPointer, allocator,
+            prepareForSplit)
 
-    if encodedSize(all, n.minimum, n.link) <= maxNodeSize then
-      writeNode(n, encode(all, n.minimum, n.link))
-      Future.unit
-    else
-      // Creating the pointer stages nothing, so the split can be sized with it before anything is staged
-      allocator.createDataObjectPointer().flatMap: rightPointer =>
-        val index = splitIndex(n, all, rightPointer, maxNodeSize).getOrElse(throw new NodeSizeExceeded)
-        val (left, right) = all.splitAt(index)
-        val newMinimum = right.head._1
+  private def stageSplit(n: DataObjectListNode,
+                         split: NodeSplit,
+                         rightLink: Option[NodeLink],
+                         rightPointer: DataObjectPointer,
+                         allocator: ObjectAllocator,
+                         prepareForSplit: (Key, ObjectPointer) => Future[Unit])(using tx: Transaction): Future[Unit] =
+    allocator.stageDataObjectAllocation(rightPointer, DataBuffer(encode(split.right, split.newMinimum, rightLink)))
 
-        allocator.stageDataObjectAllocation(rightPointer, DataBuffer(encode(right, newMinimum, n.link)))
-
-        // The new right node is already staged
-        abortIfAlreadyModified(tx)(writeNode(n, encode(left, n.minimum, Some(NodeLink(newMinimum, rightPointer)))))
-        prepareForSplit(newMinimum, rightPointer)
+    // The new right node is already staged
+    abortIfAlreadyModified(tx)(
+      writeNode(n, encode(split.left, n.minimum, Some(NodeLink(split.newMinimum, rightPointer)))))
+    prepareForSplit(split.newMinimum, rightPointer)
 
   /** Where to split `all`, the node's entries with the new one, which do not fit in `n`: the number of entries
-    * `n` keeps, the rest moving to the new node at `rightPointer`. SplitPlan's choice comes first, then the other
-    * split points nearest it. None if no split point leaves both nodes within `maxNodeSize`.
+    * `n` keeps, the rest moving to the new node at `rightPointer` and taking `link` as its own. SplitPlan's choice
+    * comes first, then the other split points nearest it. None if no split point leaves both nodes within
+    * `maxNodeSize`.
     */
-  private def splitIndex(n: DataObjectListNode,
-                         all: List[(Key, Value)],
-                         rightPointer: DataObjectPointer,
-                         maxNodeSize: Int): Option[Int] =
+  private[tkvl] def splitIndex(minimum: Key,
+                                all: List[(Key, Value)],
+                                link: Option[NodeLink],
+                                rightPointer: DataObjectPointer,
+                                maxNodeSize: Int): Option[Int] =
     val keys = all.map(_._1).toArray
     val sizes = all.map((k, v) => entrySize(k, v))
     val prefix = sizes.scanLeft(0)(_ + _).toArray
     val total = prefix.last
 
     def fits(i: Int): Boolean =
-      val leftSize = nodeOverhead(n.minimum, Some(NodeLink(keys(i), rightPointer))) + prefix(i)
-      val rightSize = nodeOverhead(keys(i), n.link) + total - prefix(i)
+      val leftSize = nodeOverhead(minimum, Some(NodeLink(keys(i), rightPointer))) + prefix(i)
+      val rightSize = nodeOverhead(keys(i), link) + total - prefix(i)
       leftSize <= maxNodeSize && rightSize <= maxNodeSize
 
     // The moved keys are always a suffix of `all`
@@ -223,27 +351,32 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     *
     * The joined node takes this node's minimum, which may be longer than the right node's, so it can be larger than
     * the right node. The join happens only when the joined node fits within `maxNodeSize`. Otherwise this node is
-    * left empty, keeping its link, and no join is made, so the delete always succeeds.
+    * left empty, keeping its link, and no join is made, so the delete always succeeds. The result is true if the node
+    * is left empty.
     */
   def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
-            (using tx: Transaction): Future[Unit] =
+            (using tx: Transaction): Future[Boolean] =
     val n = dataNode(node)
     given ExecutionContext = n.reader.client.clientContext
 
-    if n.get(key).isEmpty then
-      Future.unit
-    else
-      val remaining = n.entries.filterNot(_._1 == key)
-      n.link match
-        case Some(right) if remaining.isEmpty =>
-          n.reader.read(dataPointer(right.pointer),
-            s"Joining DataObject TKVL node ${right.pointer.id}. Minimum: ${right.minimum}. target: $key").flatMap: rs =>
-            val r = new DataObjectListNode(n.reader, n.ordering, rs)
-            if encodedSize(r.entries, n.minimum, r.link) > maxNodeSize then
+    planDelete(n.content, key) match
+      case NothingToDelete => Future.successful(false)
+
+      case RemoveEntry(remaining) =>
+        writeNode(n, encode(remaining, n.minimum, n.link))
+        Future.successful(remaining.isEmpty)
+
+      case ConsiderJoin(right) =>
+        n.reader.read(dataPointer(right.pointer),
+          s"Joining DataObject TKVL node ${right.pointer.id}. Minimum: ${right.minimum}. target: $key").flatMap: rs =>
+          val r = new DataObjectListNode(n.reader, n.ordering, rs)
+          planJoin(n.content, r.content, maxNodeSize) match
+            case None =>
               writeNode(n, encode(Nil, n.minimum, n.link))
-              Future.unit
-            else
-              writeNode(n, encode(r.entries, n.minimum, r.link))
+              Future.successful(true)
+
+            case Some(joined) =>
+              writeNode(n, encode(joined.entries, joined.minimum, joined.link))
               // This node's rewrite is already staged. The transaction rejects the lock if it already updates the
               // right node, and the refcount update if it already changes the right node's refcount.
               abortIfAlreadyModified(tx):
@@ -253,15 +386,28 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
                 catch
                   case _: ConflictingRequirements | _: MultipleRefcountUpdatesToObject =>
                     throw NodeAlreadyModified(r.pointer)
-              prepareForJoin(right.minimum, right.pointer)
+              prepareForJoin(right.minimum, right.pointer).map(_ => r.entries.isEmpty)
 
-        case _ =>
-          writeNode(n, encode(remaining, n.minimum, n.link))
-          Future.unit
-
-  def unlinkRight(node: ListNode)(using tx: Transaction): Unit =
+  /** As `KeyValueListNode.relink`: this node's entries are rewritten with `newLink`, or split in two if that does not
+    * fit within `maxNodeSize`.
+    */
+  def relink(node: ListNode,
+             newLink: Option[NodeLink],
+             maxNodeSize: Int,
+             allocator: ObjectAllocator,
+             prepareForSplit: (Key, ObjectPointer) => Future[Unit])(using tx: Transaction): Future[Unit] =
     val n = dataNode(node)
-    writeNode(n, encode(n.entries, n.minimum, None))
+    given ExecutionContext = n.reader.client.clientContext
+
+    planRelink(n.content, newLink, maxNodeSize) match
+      case Rewrite(entries) =>
+        writeNode(n, encode(entries, n.minimum, newLink))
+        Future.unit
+
+      case NeedsSplit(all) =>
+        allocator.createDataObjectPointer().flatMap: rightPointer =>
+          stageSplit(n, planSplit(n.minimum, newLink, all, rightPointer, maxNodeSize), newLink, rightPointer,
+            allocator, prepareForSplit)
 
   /** The two-node scheme of `KeyValueListNode.splitAt`. This node keeps the lower keys and loses its link.
     *
@@ -284,17 +430,8 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
 
     require(n.ordering.compare(splitAtKey, Key.AbsoluteMinimum) > 0)
 
-    def stays(k: Key): Boolean =
-      if inclusive then
-        n.ordering.compare(k, splitAtKey) <= 0
-      else
-        n.ordering.compare(k, splitAtKey) < 0
-
-    val (left, right) = n.entries.partition(e => stays(e._1))
+    val (left, right) = planSplitAt(n.content, n.ordering, splitAtKey, inclusive, maxNodeSize)
     val headEntries = optionalDownPointer.map(p => Key.AbsoluteMinimum -> Value(dataPointer(p).toArray)).toList
-
-    if encodedSize(right, splitAtKey, n.link) > maxNodeSize then
-      throw new NodeSizeExceeded
 
     writeNode(n, encode(left, n.minimum, None))
 

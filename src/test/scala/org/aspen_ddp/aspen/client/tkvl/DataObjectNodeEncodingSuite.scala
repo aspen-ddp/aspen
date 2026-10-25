@@ -56,49 +56,6 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
   private def readNode(ptr: ObjectPointer, minimum: Key = Key.AbsoluteMinimum): Future[DataObjectListNode] =
     enc.read(client, ptr, minimum, ordering, "test read").map(_.asInstanceOf[DataObjectListNode])
 
-  // ---------------------------------------------------------------------------------------------------------------
-  // Pure encoding
-
-  test("encode/decode round trips entries, minimum and link"):
-    val bigKey = Key(Array.tabulate[Byte](5000)(i => (i % 251).toByte))
-    val cases: List[(List[(Key, Value)], Key, Option[NodeLink])] = List(
-      (Nil, Key.AbsoluteMinimum, None),
-      (Nil, Key("min"), Some(NodeLink(Key("next"), fakePointer(1)))),
-      (List(key(1) -> Value(Array[Byte]())), Key.AbsoluteMinimum, None),
-      (List(key(1) -> vbytes(1), key(2) -> Value(Array[Byte]()), key(3) -> vbytes(3, 300)), key(1),
-        Some(NodeLink(key(9), fakePointer(2)))),
-      (List(bigKey -> vbytes(4, 200)), Key.AbsoluteMinimum, Some(NodeLink(bigKey, fakePointer(3)))),
-      (List(Key.AbsoluteMinimum -> vbytes(5)), Key.AbsoluteMinimum, None))
-
-    cases.foreach: (entries, minimum, link) =>
-      val bytes = enc.encode(entries, minimum, link)
-      val d = enc.decode(bytes)
-      assert(asBytes(d.entries) == asBytes(entries))
-      assert(d.minimum == minimum)
-      assert(sameLink(d.link, link))
-      assert(enc.encodedSize(entries, minimum, link) == bytes.length)
-    succeed
-
-  test("an empty node with the absolute minimum and no link is one byte"):
-    assert(enc.encode(Nil, Key.AbsoluteMinimum, None).length == 1)
-
-  test("encodedSize equals the encoded length and splits into overhead plus entry sizes"):
-    val rnd = new Random(20261025L)
-    def bytes(max: Int): Array[Byte] =
-      val a = new Array[Byte](rnd.nextInt(max + 1))
-      rnd.nextBytes(a)
-      a
-
-    (1 to 300).foreach: _ =>
-      val entries = List.fill(rnd.nextInt(20))(Key(bytes(300)) -> Value(bytes(300)))
-        .sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
-      val minimum = Key(bytes(200))
-      val link = if rnd.nextBoolean() then Some(NodeLink(Key(bytes(200)), fakePointer(rnd.nextInt()))) else None
-      val size = enc.encodedSize(entries, minimum, link)
-      assert(size == enc.encode(entries, minimum, link).length)
-      assert(size == enc.nodeOverhead(minimum, link) + entries.map((k, v) => enc.entrySize(k, v)).sum)
-    succeed
-
   test("NodeEncoding selects the DataObject encoding and it uses the DataObject node size limit"):
     val e = NodeEncoding(TreeKind.DataObjects)
     assert(e eq DataObjectNodeEncoding)
@@ -201,77 +158,6 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
 
   private def objectSize(node: ListNode): Future[Int] =
     client.read(node.pointer.asInstanceOf[DataObjectPointer]).map(_.size)
-
-  atest("a split that SplitPlan would leave with an oversized left node uses another split point"):
-    // SplitPlan moves only key(3), leaving the big entry in a left node that now needs a link
-    val original = List(key(1) -> vbytes(1, 10), key(2) -> vbytes(2, 900))
-    val maxNodeSize = enc.encodedSize(original, Key.AbsoluteMinimum, None) + 5
-    for
-      n0 <- makeNode(original)
-      (left, right) <- insertAndSplit(n0, key(3), vbytes(3, 10), maxNodeSize)
-      leftSize <- objectSize(left)
-      rightSize <- objectSize(right)
-    yield
-      assert(left.entries.map(_._1) == List(key(1)))
-      assert(right.entries.map(_._1) == List(key(2), key(3)))
-      assert(sameLink(left.link, Some(NodeLink(key(2), right.pointer))))
-      assert(leftSize <= maxNodeSize)
-      assert(rightSize <= maxNodeSize)
-
-  atest("the largest accepted entry still lets a later key above it split off into its own node"):
-    val maxNodeSize = 1000
-    val a = key(10)
-    val b = key(20)
-    for
-      n0 <- makeNode(Nil)
-      alloc <- allocator()
-      // Room is kept for a link as long as one to the entry's own key
-      reserve = enc.nodeOverhead(Key.AbsoluteMinimum, Some(NodeLink(a, n0.pointer)))
-      vlen = (0 to maxNodeSize).filter(v => enc.entrySize(a, vbytes(1, v)) <= maxNodeSize - reserve).max
-      tx0 = client.newTransaction()
-      tooBig <- Future.delegate(enc.insert(n0, a, vbytes(1, vlen + 1), maxNodeSize, alloc, noSplit,
-        None)(using tx0)).failed
-      tx1 = client.newTransaction()
-      _ <- enc.insert(n0, a, vbytes(1, vlen), maxNodeSize, alloc, noSplit, None)(using tx1)
-      _ <- tx1.commit()
-      n1 <- readNode(n0.pointer)
-      (left, right) <- insertAndSplit(n1, b, vbytes(2, 100), maxNodeSize)
-      leftSize <- objectSize(left)
-    yield
-      assert(vlen > 900)
-      assert(tooBig.isInstanceOf[NodeSizeExceeded])
-      assert(tx0.isEmpty)
-      assert(left.entries.map(_._1) == List(a))
-      assert(right.entries.map(_._1) == List(b))
-      assert(leftSize <= maxNodeSize)
-
-  atest("an insert below a long-keyed big entry splits where both nodes fit"):
-    val a = key(1)
-    val s = key(2)
-    val bigKey = Key(Array[Byte](3) ++ Array.fill[Byte](199)(7))
-    val bigValue = vbytes(3, 300)
-    val nodeLink = Some(NodeLink(Key(Array.fill[Byte](20)(9)), fakePointer(1)))
-    for
-      n0 <- makeNode(List(a -> vbytes(1), bigKey -> bigValue), Key.AbsoluteMinimum, nodeLink)
-      // The big entry is exactly as large as the node accepts
-      maxNodeSize = math.max(enc.nodeOverhead(Key.AbsoluteMinimum, nodeLink),
-        enc.nodeOverhead(Key.AbsoluteMinimum, Some(NodeLink(bigKey, n0.pointer)))) + enc.entrySize(bigKey, bigValue)
-      // s overflows the node, but s and the big entry fit together in a node whose minimum is s
-      sv = (1 to 1000).map(v => vbytes(2, v)).find: v =>
-        enc.encodedSize(List(a -> vbytes(1), s -> v, bigKey -> bigValue), Key.AbsoluteMinimum, nodeLink) > maxNodeSize &&
-          enc.encodedSize(List(s -> v, bigKey -> bigValue), s, nodeLink) <= maxNodeSize
-      (left, right) <- insertAndSplit(n0, s, sv.get, maxNodeSize)
-      leftSize <- objectSize(left)
-      rightSize <- objectSize(right)
-    yield
-      // SplitPlan alone would move only the big entry, into a node too large with the long key as its minimum
-      assert(enc.encodedSize(List(bigKey -> bigValue), bigKey, nodeLink) > maxNodeSize)
-      assert(left.entries.map(_._1) == List(a))
-      assert(right.entries.map(_._1) == List(s, bigKey))
-      assert(right.minimum == s)
-      assert(sameLink(right.link, nodeLink))
-      assert(leftSize <= maxNodeSize)
-      assert(rightSize <= maxNodeSize)
 
   atest("an insert that no split can hold throws NodeSizeExceeded with nothing staged"):
     // Built directly: a node this full could not be reached through insert

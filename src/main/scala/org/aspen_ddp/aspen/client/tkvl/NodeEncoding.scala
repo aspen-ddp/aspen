@@ -32,15 +32,26 @@ trait NodeEncoding:
 
   /** Deletes `key` from `node`. Deleting the last key of a node with a right link joins the right node into it
     * and calls `prepareForJoin` with the right node's minimum and pointer. `maxNodeSize` is the node's tier's; an
-    * encoding whose joined node can outgrow the right node uses it to decide whether the join fits.
+    * encoding whose joined node can outgrow the right node uses it to decide whether the join fits. If it does not,
+    * the node is left empty with its link.
+    *
+    * The result is true if the node is left empty. The caller then removes it from its list, see
+    * `TierEngine.prepareEmptyNodeRemoval`.
     */
   def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
-            (using Transaction): Future[Unit]
+            (using Transaction): Future[Boolean]
 
-  /** Stages the removal of `node`'s link so it becomes the last node of its list (and, for a KeyValue node, drops its
-    * stored maximum). The unlinked node is not touched.
+  /** Stages pointing `node`, the predecessor of an empty node being removed from the list, at `newLink`, the removed
+    * node's link. `newLink` can be longer than the old link, in which case `node` splits if it no longer fits
+    * within `maxNodeSize`: the new node is allocated from `allocator` and `prepareForSplit` is called as for an
+    * insert. Throws `NodeSizeExceeded` before staging anything if no split point fits. The removed node is not
+    * touched.
     */
-  def unlinkRight(node: ListNode)(using Transaction): Unit
+  def relink(node: ListNode,
+             newLink: Option[NodeLink],
+             maxNodeSize: Int,
+             allocator: ObjectAllocator,
+             prepareForSplit: (Key, ObjectPointer) => Future[Unit])(using Transaction): Future[Unit]
 
   /** Splits the list at `splitAtKey`, keeping keys below it (and it too when `inclusive`) in `node`. Returns the
     * head of the new list holding the rest, whose minimum is `Key.AbsoluteMinimum` (see `KeyValueListNode.splitAt`).

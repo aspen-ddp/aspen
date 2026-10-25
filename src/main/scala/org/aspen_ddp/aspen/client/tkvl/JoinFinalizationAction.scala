@@ -80,8 +80,8 @@ class JoinFinalizationAction(val client: AspenClient,
                 // A join reads the right node before staging its updates, so commit only once the delete is staged
                 for {
                   maxNodeSize <- rootManager.getMaxNodeSize(tier)
-                  _ <- TierEngine.encodingFor(node).delete(node, deleteMinimum, maxNodeSize, onJoin)
-                  _ = TierEngine.prepareTailRemoval(rootManager, tier, node, deleteMinimum)
+                  empty <- TierEngine.encodingFor(node).delete(node, deleteMinimum, maxNodeSize, onJoin)
+                  _ = if empty then TierEngine.prepareEmptyNodeRemoval(rootManager, tier, node)
                   _ <- tx.commit()
                 } yield ()
               }

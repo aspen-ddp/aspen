@@ -255,7 +255,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0, 1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- lst.insert(key, value, 170, alloc)(using tx)
 
       _ <- tx.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -263,7 +263,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst1 <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst1.insert(key2, value2, 100, alloc)(using tx2)
+      _ <- lst1.insert(key2, value2, 170, alloc)(using tx2)
 
       _ <- tx2.commit().map(_ => ())
       _ <- waitForTransactionsToComplete()
@@ -305,13 +305,13 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0, 1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- lst.insert(key, value, 170, alloc)(using tx)
       _ <- tx.commit()
 
       lst1 <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst1.insert(key2, value2, 100, alloc)(using tx2)
+      _ <- lst1.insert(key2, value2, 170, alloc)(using tx2)
       _ <- tx2.commit()
 
       lst2 <- lst.refresh()
@@ -361,18 +361,18 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0, 1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- lst.insert(key, value, 170, alloc)(using tx)
       _ <- tx.commit()
 
       lst1 <- lst.refresh()
       tx2 = client.newTransaction()
-      _ <- lst1.insert(key2, value, 100, alloc)(using tx2)
+      _ <- lst1.insert(key2, value, 170, alloc)(using tx2)
       _ <- tx2.commit()
 
       lst2 <- lst.refresh()
       node2 <- lst2.fetchContainingNode(key3)
       tx3 = client.newTransaction()
-      _ <- node2.insert(key3, value, 100, alloc)(using tx3)
+      _ <- node2.insert(key3, value, 170, alloc)(using tx3)
       _ <- tx3.commit()
 
       node2 <- node2.refresh()
@@ -390,10 +390,10 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
   atest("End split") {
     val key = Key(Array[Byte](1))
-    val value = Value(Array[Byte](2))
+    val value = Value(Array.fill[Byte](100)(2))
 
     val key2 = Key(Array[Byte](2))
-    val value2 = Value(Array[Byte](5))
+    val value2 = Value(Array.fill[Byte](100)(5))
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
@@ -406,7 +406,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- lst.insert(key, value, 210, alloc)(using tx)
 
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -414,7 +414,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 40, alloc)(using tx2)
+      _ <- lst.insert(key2, value2, 210, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -426,17 +426,17 @@ class KeyValueListSuite extends IntegrationTestSuite {
     } yield {
       v.isEmpty should be (false)
       val vs = v.get
-      vs.value.bytes.length should be (1)
+      vs.value.bytes.length should be (100)
       vs.value.bytes(0) should be (5)
     }
   }
 
   atest("Push out split") {
     val key = Key(Array[Byte](2))
-    val value = Value(Array[Byte](2))
+    val value = Value(Array.fill[Byte](100)(2))
 
     val key2 = Key(Array[Byte](0))
-    val value2 = Value(Array[Byte](5))
+    val value2 = Value(Array.fill[Byte](100)(5))
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
@@ -449,7 +449,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- lst.insert(key, value, 210, alloc)(using tx)
 
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -457,7 +457,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 40, alloc)(using tx2)
+      _ <- lst.insert(key2, value2, 210, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -469,20 +469,20 @@ class KeyValueListSuite extends IntegrationTestSuite {
     } yield {
       v.isEmpty should be (false)
       val vs = v.get
-      vs.value.bytes.length should be (1)
+      vs.value.bytes.length should be (100)
       vs.value.bytes(0) should be (2)
     }
   }
 
   atest("Multiple push out split") {
     val key = Key(Array[Byte](5))
-    val value = Value(Array[Byte](2))
+    val value = Value(Array.fill[Byte](40)(2))
 
     val key2 = Key(Array[Byte](2))
-    val value2 = Value(Array[Byte](5))
+    val value2 = Value(Array.fill[Byte](40)(5))
 
     val key3 = Key(Array[Byte](0))
-    val value3 = Value(Array[Byte](5))
+    val value3 = Value(Array.fill[Byte](1)(5))
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
@@ -495,7 +495,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- lst.insert(key, value, 150, alloc)(using tx)
 
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -503,7 +503,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 100, alloc)(using tx2)
+      _ <- lst.insert(key2, value2, 150, alloc)(using tx2)
 
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -511,7 +511,7 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst <- lst.refresh()
 
       tx3 = client.newTransaction()
-      _ <- lst.insert(key3, value3, 60, alloc)(using tx3)
+      _ <- lst.insert(key3, value3, 150, alloc)(using tx3)
 
       _ <- tx3.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
@@ -523,20 +523,20 @@ class KeyValueListSuite extends IntegrationTestSuite {
     } yield {
       v.isEmpty should be (false)
       val vs = v.get
-      vs.value.bytes.length should be (1)
+      vs.value.bytes.length should be (40)
       vs.value.bytes(0) should be (2)
     }
   }
 
   atest("Join on delete to empty node") {
     val key = Key(Array[Byte](1))
-    val value = Value(Array[Byte](2))
+    val value = Value(Array.fill[Byte](100)(2))
 
     val key2 = Key(Array[Byte](2))
-    val value2 = Value(Array[Byte](5))
+    val value2 = Value(Array.fill[Byte](100)(5))
 
     val key3 = Key(Array[Byte](3))
-    val value3 = Value(Array[Byte](6))
+    val value3 = Value(Array.fill[Byte](20)(6))
 
     for {
       pool <- client.getStoragePool(Radicle.poolId)
@@ -549,19 +549,19 @@ class KeyValueListSuite extends IntegrationTestSuite {
       lst = new KeyValueListNode(client, pool.ida, lptr, ByteArrayKeyOrdering, Key.AbsoluteMinimum, tx.revision,
         ObjectRefcount(0,1), Map(), None)
 
-      _ <- lst.insert(key, value, 100, alloc)(using tx)
+      _ <- lst.insert(key, value, 210, alloc)(using tx)
       _ <- tx.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
 
       tx2 = client.newTransaction()
-      _ <- lst.insert(key2, value2, 40, alloc)(using tx2)
+      _ <- lst.insert(key2, value2, 210, alloc)(using tx2)
       _ <- tx2.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
 
       tx3 = client.newTransaction()
-      _ <- lst.insert(key3, value3, 200, alloc)(using tx3)
+      _ <- lst.insert(key3, value3, 210, alloc)(using tx3)
       _ <- tx3.commit().map(_=>())
       _ <- waitForTransactionsToComplete()
       lst <- lst.refresh()
@@ -585,12 +585,12 @@ class KeyValueListSuite extends IntegrationTestSuite {
 
       v2.isEmpty should be (false)
       val vs2 = v2.get
-      vs2.value.bytes.length should be (1)
+      vs2.value.bytes.length should be (100)
       vs2.value.bytes(0) should be (5)
 
       v3.isEmpty should be (false)
       val vs3 = v3.get
-      vs3.value.bytes.length should be (1)
+      vs3.value.bytes.length should be (20)
       vs3.value.bytes(0) should be (6)
 
       preNuc.right.isEmpty should be (false)

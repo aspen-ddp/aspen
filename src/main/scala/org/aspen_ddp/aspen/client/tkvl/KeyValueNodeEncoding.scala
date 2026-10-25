@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{DeleteMax, DeleteRight, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -38,16 +38,22 @@ object KeyValueNodeEncoding extends NodeEncoding:
     given ExecutionContext = n.reader.client.clientContext
     KeyValueListNode.insert(n, n.ordering, key, value, maxNodeSize, allocator, prepareForSplit, requirement)
 
-  /** `maxNodeSize` is not needed: a KeyValue join is never larger than the two nodes it joins */
+  /** `maxNodeSize` is not needed: `KeyValueListNode.planJoin` only joins when the result is no larger than the right node */
   def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
-            (using Transaction): Future[Unit] =
+            (using Transaction): Future[Boolean] =
     val n = kvNode(node)
     given ExecutionContext = n.reader.client.clientContext
     KeyValueListNode.delete(n, key, n.reader, prepareForJoin)
 
-  def unlinkRight(node: ListNode)(using tx: Transaction): Unit =
+  def relink(node: ListNode,
+             newLink: Option[NodeLink],
+             maxNodeSize: Int,
+             allocator: ObjectAllocator,
+             prepareForSplit: (Key, ObjectPointer) => Future[Unit])(using Transaction): Future[Unit] =
     val n = kvNode(node)
-    tx.update(n.pointer, Some(n.revision), None, Nil, List(DeleteRight(), DeleteMax()))
+    given ExecutionContext = n.reader.client.clientContext
+    KeyValueListNode.relink(n, newLink.map(l => KeyValueListPointer(l.minimum, kvPointer(l.pointer))), maxNodeSize,
+      allocator, prepareForSplit)
 
   def splitAt(node: ListNode,
               splitAtKey: Key,

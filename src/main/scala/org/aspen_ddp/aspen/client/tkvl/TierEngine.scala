@@ -159,8 +159,9 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       Future.unit
     rootManager.getMaxNodeSize(0).flatMap: maxNodeSize =>
       deleteFromContainingNode(key, node =>
-        encodingFor(node).delete(node, key, maxNodeSize, onJoin).map: _ =>
-          prepareTailRemoval(rootManager, 0, node, key))
+        encodingFor(node).delete(node, key, maxNodeSize, onJoin).map: empty =>
+          if empty then
+            prepareEmptyNodeRemoval(rootManager, 0, node))
 
   /** Descends to the tier-0 node containing `key` and hands it to `del`.
    *
@@ -320,19 +321,13 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
 object TierEngine:
 
-  /** Registers a `TailRemovalFinalizationAction` if deleting `key` leaves `node` an empty rightmost node that is not
-    * the head of its tier (a tier's head has the absolute minimum and is never removed). `tier` is `node`'s own.
-    * Call after the delete is staged.
+  /** Registers a `TailRemovalFinalizationAction` for an empty `node` that is not the head of its tier (a tier's head
+    * has the absolute minimum and is never removed), to remove it from its list. `tier` is `node`'s own. Call after
+    * the delete that emptied it is staged. The action does nothing if the node is no longer empty by then.
     */
-  private[tkvl] def prepareTailRemoval(rootManager: RootManager, tier: Int, node: ListNode, key: Key)
-                                      (using tx: Transaction): Unit =
-    if node.size == 1 && node.get(key).isDefined then
-      prepareTailRemoval(rootManager, tier, node)
-
-  /** As above for a node that is already empty */
-  private[tkvl] def prepareTailRemoval(rootManager: RootManager, tier: Int, node: ListNode)
-                                      (using tx: Transaction): Unit =
-    if node.link.isEmpty && node.ordering.compare(node.minimum, Key.AbsoluteMinimum) != 0 then
+  private[tkvl] def prepareEmptyNodeRemoval(rootManager: RootManager, tier: Int, node: ListNode)
+                                           (using tx: Transaction): Unit =
+    if node.ordering.compare(node.minimum, Key.AbsoluteMinimum) != 0 then
       TailRemovalFinalizationAction.addToTransaction(rootManager, tier + 1, node.minimum, node.pointer, tx)
 
   /** The encoding of the tree `node` belongs to */

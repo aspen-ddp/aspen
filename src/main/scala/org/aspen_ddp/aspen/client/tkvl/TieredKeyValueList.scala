@@ -62,8 +62,9 @@ class TieredKeyValueList(val client: AspenClient,
       Future.unit
     }
     engine.deleteFromContainingNode(key, node =>
-      kvNode(node).delete(key, requiredRevision, requirements, onJoin).map { _ =>
-        TierEngine.prepareTailRemoval(rootManager, 0, node, key)
+      kvNode(node).delete(key, requiredRevision, requirements, onJoin).map { empty =>
+        if empty then
+          TierEngine.prepareEmptyNodeRemoval(rootManager, 0, node)
       })
   }
 

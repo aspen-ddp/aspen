@@ -7,17 +7,23 @@ import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, Transaction
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
-/** Removes an emptied rightmost node from its tier.
+/** Removes an emptied node from its tier.
   *
-  * A join absorbs a node's right neighbor, so the rightmost node of a tier can never be joined away and is left empty
-  * when its last key is deleted. Such a node keeps its entry in the tier above, which stops tier reduction. This action
-  * unlinks the empty node from its left neighbor, drops its refcount and, in the same transaction, adds a
-  * `JoinFinalizationAction` that removes its entry from the tier above (reducing tiers if that empties the root).
+  * A node is left empty when its last key is deleted and it cannot be joined with its right neighbor: the rightmost
+  * node of a tier has no neighbor to absorb, and the joined node would be too large if the empty node's minimum is
+  * longer than the neighbor's. Such a node keeps its entry in the tier above, which stops tier reduction. This action
+  * points the empty node's predecessor at the empty node's link, drops its refcount and, in the same transaction, adds
+  * a `JoinFinalizationAction` that removes its entry from the tier above (reducing tiers if that empties the root).
+  *
+  * The predecessor now stores the neighbor's minimum in place of the empty node's. That is smaller whenever the join
+  * was declined for size, but the neighbor may have changed since. If the predecessor no longer fits it splits in the
+  * normal manner, and a `SplitFinalizationAction` adds the new node to the tier above. If no split point fits, the
+  * node is left empty.
   *
   * `tier` is the tier of that entry, one above the node's own, matching `JoinFinalizationAction`.
   *
-  * Nothing is done if the node is gone, is no longer empty or is no longer the last node of its tier. Because the
-  * node's revision is locked, a racing insert into it fails this transaction and the retry re-checks.
+  * Nothing is done if the node is gone, is no longer empty or has no predecessor. Because the node's revision is
+  * locked, a racing insert into it fails this transaction and the retry re-checks.
   */
 class TailRemovalFinalizationAction(val client: AspenClient,
                                     val txd: TransactionDescription,
@@ -37,7 +43,7 @@ class TailRemovalFinalizationAction(val client: AspenClient,
       rootManager.getRootNode().flatMap { t =>
         val (rootTier, ordering, orootNode) = t
         orootNode match {
-          case Some(rootNode) if tier <= rootTier => removeTail(rootTier, ordering, rootNode)
+          case Some(rootNode) if tier <= rootTier => removeEmptyNode(rootTier, ordering, rootNode)
           case _ => Future.unit // The tree shrank past this node
         }
       }
@@ -46,14 +52,14 @@ class TailRemovalFinalizationAction(val client: AspenClient,
     completionPromise.completeWith(fcomplete)
   }
 
-  private def removeTail(rootTier: Int, ordering: KeyOrdering, rootNode: ListNode): Future[Unit] = {
+  private def removeEmptyNode(rootTier: Int, ordering: KeyOrdering, rootNode: ListNode): Future[Unit] = {
     val encoding = TierEngine.encodingFor(rootNode)
     val nodeTier = tier - 1
 
     def read(pointer: ObjectPointer, minimum: Key): Future[ListNode] =
-      encoding.read(client, pointer, minimum, ordering, s"Removing empty tail node ${tailNode.id}")
+      encoding.read(client, pointer, minimum, ordering, s"Removing empty node ${tailNode.id}")
 
-    // The node whose link is the tail, or None if nothing links to it
+    // The node whose link is the empty node, or None if nothing links to it
     def findPredecessor(): Future[Option[ListNode]] =
       TierEngine.fetchPredecessor(client, rootTier, nodeTier, ordering, tailMinimum, tailNode.id, rootNode).flatMap {
         case Right(opred) => Future.successful(opred)
@@ -82,23 +88,40 @@ class TailRemovalFinalizationAction(val client: AspenClient,
         case Some(pred) =>
           given tx: Transaction = client.newTransaction()
 
-          encoding.unlinkRight(pred)
-          tx.lockRevision(tail.pointer, tail.revision)
-          tx.setRefcount(tail.pointer, tail.refcount, tail.refcount.decrement())
+          def onSplit(min: Key, ptr: ObjectPointer): Future[Unit] = {
+            SplitFinalizationAction.addToTransaction(rootManager, tier, min, ptr, tx)
+            Future.unit
+          }
 
-          JoinFinalizationAction.addToTransaction(rootManager, tier, tailMinimum, tailNode, tx)
+          for {
+            maxNodeSize <- rootManager.getMaxNodeSize(nodeTier)
+            alloc <- rootManager.getAllocatorForTier(nodeTier)
+            _ <- encoding.relink(pred, tail.link, maxNodeSize, alloc, onSplit)
+            _ = tx.lockRevision(tail.pointer, tail.revision)
+            _ = tx.setRefcount(tail.pointer, tail.refcount, tail.refcount.decrement())
+            _ = JoinFinalizationAction.addToTransaction(rootManager, tier, tailMinimum, tailNode, tx)
 
-          // The predecessor is now the last node of the tier, so it too is removable if it was already empty
-          if pred.entries.isEmpty then
-            TierEngine.prepareTailRemoval(rootManager, nodeTier, pred)
+            // The predecessor may itself be empty, as when its own removal is still pending
+            _ = if pred.entries.isEmpty then
+              TierEngine.prepareEmptyNodeRemoval(rootManager, nodeTier, pred)
 
-          tx.commit().map(_ => ())
+            _ <- tx.commit()
+          } yield ()
+      }.recover {
+        // A predecessor that cannot be split to hold the link, or a misconfigured tier, cannot be fixed by retrying,
+        // and failing would leave the transaction unfinalized forever. The empty node stays in the tier, which is
+        // correct, only slower to scan, and keeps its entry above.
+        case err: NodeSizeExceedsAllocatorLimit =>
+          logger.error(s"Leaving empty TKVL node ${tailNode.id} in tier $nodeTier: ${err.getMessage}")
+        case _: NodeSizeExceeded =>
+          logger.error(s"Leaving empty TKVL node ${tailNode.id} in tier $nodeTier: its predecessor cannot hold the " +
+            "link to the node's right neighbor")
       }
 
     Future.delegate(read(tailNode, tailMinimum)).map(Some(_)).recover {
       case _: InvalidObject => None
     }.flatMap {
-      case Some(tail) if tail.entries.isEmpty && tail.link.isEmpty => unlink(tail)
+      case Some(tail) if tail.entries.isEmpty => unlink(tail)
       case _ => Future.unit
     }
   }

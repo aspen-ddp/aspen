@@ -21,3 +21,45 @@ Need to audit the slice size calculation code in KeyValueListNode to ensure that
 to exceed the size of a fixed-sized object. I suspect there are mistakes in the calculations
   - This is follow-on work from the recent addition of enforcement of maximum object sizes at both
     the transaction and store levels.
+
+Need to audit the KeyValueListNode, TKVL, and root manager tests. Several bugs in these areas have
+been uncovered recently which leads me to suspect that the current coverage is far from complete. I
+suspect many edge cases are currently unaccounted for.
+
+Need KeyValueListNode & TKVL prepareUpdates(inserts: List[(Key,Value)], deletes: List[Key]): Future[Unit]
+  - Applies all changes in a single transaction
+  - May want to consider reimplement individual prepareInsert/prepareDelete operations in terms of this
+    more general-purpose method
+  - First step is to create a list of insert/delete operations sorted by key
+  - At KeyValueListNode level, just scan right and update/split/join nodes along the way
+  - At TKVL level, we can branch off and parallelize operations as we descend the tree
+    - can split off a subset of operations that will apply to a down pointer, and split off another set that
+      applies to another down-pointer. Both descent operations will result in a pointer so upper tiers return
+      sequences of futures to lower-level operations completing.
+    - Should result in good performance
+
+Need to add an upper-tier node caching capability to speed up future tree navigations
+  - Upper tiers change very slowly so caching can be very beneficial
+  - Cache misses don't affect correctness because we can always scan right on a tier
+  - No one solution will be best in all cases so this should be an interface with pluggable implementations
+  - Start super simple with a fixed LRU cache of 5 nodes for each tier-1+
+    - TKVLs default to this implementation
+    - No caching of tier-0 nodes
+    - Whenever a scan-right operation is done in a tier, drop the cache on the tier above it.
+      - reread the root if the scan-right is done on the top tier
+
+Think through some options for new DataStore backends
+  - Need some options that play well with RandomAccessReedSolomon
+  - Single-Allocator solutions are valid
+  - Multi-Allocator solutions are also needed
+    - Can go with leased preallocated ranges
+  - Solutions need to jive with AllocationGroups being the primary allocation mechanism
+    - how does this map down to stores... it's unclear
+  - For AllocGroup allocations w/ fixed-sized stores & indicies
+    - can take advantage of spreading allocations 10x across pools
+    - each pool has a KeyValue object of "allocatable indicies"
+      - Allocating client chooses one at random and writes the data to that object and updates it as claimed in
+        the KV object in the same transaction.
+      - On Failure, retry
+      - On Success, delete the index and replace with a new one pulled from higher-level available indicies list
+      

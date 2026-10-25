@@ -6,8 +6,11 @@ to exceed the size of a fixed-sized object. I suspect there are mistakes in the 
   - This is follow-on work from the recent addition of enforcement of maximum object sizes at both
     the transaction and store levels.
   - The maxNodeSize defined at the Tree level is an upper logical bound. However, if the object itself
-    has a smaller size limit, then that is the value that must be enforced. It should be possible to
-    obtain the maximum node size from the AllocationGroup assigned to the node allocator.
+    has a smaller size limit, then that is the value that must be enforced. The maxObjectSize of the
+    AllocationGroup used to allocate objects from should be used if it is smaller than maxNodeSize.
+  - Add tests to ensure that the resulting object sizes are always less than or equal to the max size
+    supported by the AllocationGroup. In particular, I have concerns about the KeyValue sizes being
+    calculated correctly. They may be mistaken and generate oversized objects.
 
 Need to audit the KeyValueListNode, TKVL, and root manager tests. Several bugs in these areas have
 been uncovered recently which leads me to suspect that the current coverage is far from complete. I

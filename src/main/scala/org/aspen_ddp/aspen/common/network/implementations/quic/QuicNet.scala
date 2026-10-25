@@ -1186,7 +1186,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         val now = System.nanoTime()
         val previous = subscribers.put(m.fromClient, Subscription(conn, now + config.gossip.relayLease.toNanos))
         if previous == null || (previous.conn ne conn) || now - previous.expiresNanos >= 0 then
-          forward(conn, HostOnlineStatus(hostId :: hm.onlineHosts.toList, Nil, storeAvailability.snapshot))
+          forward(conn, HostOnlineStatus(hostId :: hm.onlineHosts.toList, Nil, storeAvailability.snapshot, snapshot = true))
 
   /** Client mode, on `loops(0)`. Keeps `relayCount` relays among the hosts we have resolved and renews each one's
     * subscription. With `rotate`, one relay is first swapped for a host not currently a relay, when there is one.
@@ -1217,7 +1217,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       relayedOnline.remove(h)
       metadataManager.peekHostEntry(h).foreach(_.setOffline())
     // After the report is in memory, so isHostOnline is accurate by the time a waiter wakes
-    livenessReady.trySuccess(())
+    if m.snapshot then livenessReady.trySuccess(())
     if m.offline.nonEmpty then
       try
         loops(0).execute: () =>

@@ -198,6 +198,7 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val m = HostOnlineStatus(List(HostId(UUID.randomUUID()), HostId(UUID.randomUUID())), List(HostId(UUID.randomUUID())))
     roundTrip(m) shouldBe m
     roundTrip(HostOnlineStatus(Nil, Nil)) shouldBe HostOnlineStatus(Nil, Nil)
+    roundTrip(HostOnlineStatus(m.online, Nil, snapshot = true)) shouldBe HostOnlineStatus(m.online, Nil, snapshot = true)
 
   test("HostOnlineStatus carrying store availability round trips through the QUIC codec"):
     val poolId = PoolId(UUID.randomUUID())

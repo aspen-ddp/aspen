@@ -61,10 +61,13 @@ final case class GossipSubscribe(fromClient: ClientId) extends Message
   * offline. The snapshot sent when a subscription starts lists every host the relay sees online, and none offline,
   * plus the relay's store availability (`stores`); changes after that carry no `stores`, since store availability
   * travels as gossip. Handled by QuicNet itself.
+  *
+  * `snapshot` is true only for the subscription snapshot, which lets a client know it holds the relay's complete view.
   */
 final case class HostOnlineStatus(online: List[HostId],
                                   offline: List[HostId],
-                                  stores: Map[StoreId, StoreAvailability] = Map()) extends Message
+                                  stores: Map[StoreId, StoreAvailability] = Map(),
+                                  snapshot: Boolean = false) extends Message
 
 /** Carries an opaque scalecube transport payload between hosts. Handled by QuicNet itself; it is not a
   * HostMessage and never reaches the MessageHandler.

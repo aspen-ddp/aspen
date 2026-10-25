@@ -1052,14 +1052,16 @@ object Codec extends Logging:
       online = o.online.map(h => encodeUUID(h.uuid)),
       offline = o.offline.map(h => encodeUUID(h.uuid)),
       stores = o.stores.toList.map: (storeId, a) =>
-        codec.StoreAvailability(storeId = Some(encode(storeId)), offline = a.offline, timestamp = a.timestamp.asLong)
+        codec.StoreAvailability(storeId = Some(encode(storeId)), offline = a.offline, timestamp = a.timestamp.asLong),
+      snapshot = o.snapshot
     )
 
   def decode(m: codec.HostOnlineStatus): HostOnlineStatus =
     HostOnlineStatus(
       m.online.map(u => HostId(decodeUUID(u))).toList,
       m.offline.map(u => HostId(decodeUUID(u))).toList,
-      m.stores.map(a => decode(a.storeId.get) -> StoreAvailability(a.offline, HLCTimestamp(a.timestamp))).toMap
+      m.stores.map(a => decode(a.storeId.get) -> StoreAvailability(a.offline, HLCTimestamp(a.timestamp))).toMap,
+      m.snapshot
     )
 
 

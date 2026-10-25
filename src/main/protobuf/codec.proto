@@ -457,6 +457,7 @@ message HostOnlineStatus {
   repeated UUID online = 1;
   repeated UUID offline = 2;
   repeated StoreAvailability stores = 3;
+  bool snapshot = 4;
 }
 
 message CheckStorageDevice {

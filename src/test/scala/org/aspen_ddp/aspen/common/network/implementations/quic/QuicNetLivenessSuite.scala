@@ -341,6 +341,18 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     c.net.clientMessenger.isHostOnline(fx.hostIdB) shouldBe true
     silent.net.clientMessenger.hostLivenessReady.isCompleted shouldBe false
 
+  test("host liveness becomes ready on a snapshot, not on an incremental update"):
+    awaitOnline()
+    val silent = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 0)))
+    val ready = silent.net.clientMessenger.hostLivenessReady
+    silent.net.dispatchForTests(HostOnlineStatus(List(fx.hostIdA), Nil))
+    eventually("the update is applied", WaitMillis)(silent.net.clientMessenger.isHostOnline(fx.hostIdA))
+    ready.isCompleted shouldBe false
+    silent.net.dispatchForTests(HostOnlineStatus(List(fx.hostIdB), Nil, snapshot = true))
+    eventually("the snapshot is applied", WaitMillis)(ready.isCompleted)
+    silent.net.clientMessenger.isHostOnline(fx.hostIdA) shouldBe true
+    silent.net.clientMessenger.isHostOnline(fx.hostIdB) shouldBe true
+
   test("a client learns host liveness from its relays and replaces a relay that goes offline"):
     awaitOnline()
     val c = fx.client(QuicConfig(idleTimeout = Some(IdleTimeout), gossip = GossipConfig.ForTests.copy(relayCount = 1)))

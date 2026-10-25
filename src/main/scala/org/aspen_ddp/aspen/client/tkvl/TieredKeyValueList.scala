@@ -6,8 +6,7 @@ import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, KeyValueObjectPoint
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import scribe.Logging
 
-import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success}
+import scala.concurrent.{ExecutionContext, Future}
 
 class TieredKeyValueList(val client: AspenClient,
                          val rootManager: RootManager) extends Logging {
@@ -16,33 +15,13 @@ class TieredKeyValueList(val client: AspenClient,
 
   import TieredKeyValueList._
 
-  def get(key: Key): Future[Option[ValueState]] = {
-    rootManager.getKeyValueRootNode().flatMap { t =>
-      val (tier, ordering, onode) = t
-      onode match {
-        case None => Future.successful(None)
-        case Some(node) =>
-          fetchContainingNode(client, tier, 0, ordering, key, node, Set()).map {
-            case Left(_) => throw new BrokenTree()
-            case Right(node) => node.contents.get(key)
-          }
-      }
-    }
-  }
+  private val engine = new TierEngine(client, rootManager)
 
-  def getContainingNode(key: Key): Future[Option[TieredKeyValueListNode]] = {
-    rootManager.getKeyValueRootNode().flatMap { t =>
-      val (tier, ordering, onode) = t
-      onode match {
-        case None => Future.successful(None)
-        case Some(node) =>
-          fetchContainingNode(client, tier, 0, ordering, key, node, Set()).map {
-            case Left(_) => throw new BrokenTree()
-            case Right(node) => Some(new TieredKeyValueListNode(this, node))
-          }
-      }
-    }
-  }
+  def get(key: Key): Future[Option[ValueState]] =
+    engine.getContainingNode(key).map(_.flatMap(node => kvNode(node).contents.get(key)))
+
+  def getContainingNode(key: Key): Future[Option[TieredKeyValueListNode]] =
+    engine.getContainingNode(key).map(_.map(node => new TieredKeyValueListNode(this, kvNode(node))))
   
   def deleteTree(odeleteKVPair: Option[(Key, ValueState) => Future[Unit]]): Future[Unit] =
     def fetchRootNodes(path: List[(Int, KeyValueListNode)]): Future[List[(Int, KeyValueListNode)]] =
@@ -241,59 +220,14 @@ class TieredKeyValueList(val client: AspenClient,
                 case Left(_) => throw new BrokenTree()
                 case Right(n) => n
               _ <- del(node).recoverWith:
-                case _: InvalidObject if restarts < MaxJoinRaceRestarts => attempt(restarts + 1)
+                case _: InvalidObject if restarts < TierEngine.MaxJoinRaceRestarts => attempt(restarts + 1)
             yield
               ()
 
     attempt(0)
 
-  def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] = {
-
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[B] = {
-      for {
-        e <- fetchContainingNode(client, tier, 0, ordering, Key.AbsoluteMinimum, root, Set())
-        node = e match {
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-        }
-        result <- node.foldLeft(z)(fn)
-      } yield {
-        result
-      }
-    }
-    rootManager.getKeyValueRootNode().flatMap { t =>
-      val (tier, ordering, oroot) = t
-      oroot match {
-        case None => Future.successful(z)
-        case Some(root) => nonEmpty(tier, ordering, root)
-      }
-    }
-  }
-
-  /** Descends to the tier-0 node containing `startKey` and hands it to `walk`.
-   *
-   *  The three tier-0 walks below differ only in which node-level method they delegate to;
-   *  sharing the descent keeps that the only difference between them. Each keeps its own name
-   *  so the node-level diagnostics still report the method the caller invoked.
-   */
-  private def walkFromContainingNode(startKey: Key,
-                                     walk: KeyValueListNode => Future[Unit]): Future[Unit] =
-
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: KeyValueListNode): Future[Unit] =
-      for
-        e <- fetchContainingNode(client, tier, 0, ordering, startKey, root, Set())
-        node = e match
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-        _ <- walk(node)
-      yield
-        ()
-
-    rootManager.getKeyValueRootNode().flatMap: t =>
-      val (tier, ordering, oroot) = t
-      oroot match
-        case None => Future.unit
-        case Some(root) => nonEmpty(tier, ordering, root)
+  def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] =
+    engine.foldLeft(z)(node => kvNode(node).foldLeft(z)(fn))
 
   /** Visit every entry in the tree, in ascending key order.
    *
@@ -303,13 +237,13 @@ class TieredKeyValueList(val client: AspenClient,
    *  returned future.
    */
   def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    walkFromContainingNode(Key.AbsoluteMinimum, _.foreach(fn))
+    engine.walkFrom(Key.AbsoluteMinimum, node => kvNode(node).foreach(fn))
 
   /** Visit every entry in `[minKey, maxKey)`, in ascending key order. */
   def foreachInRange(minKey: Key,
                      maxKey: Key,
                      fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    walkFromContainingNode(minKey, _.foreachInRange(minKey, maxKey, fn))
+    engine.walkFrom(minKey, node => kvNode(node).foreachInRange(minKey, maxKey, fn))
 
   /** Visit every entry at or above `minKey`, in ascending key order. The open-ended
    *  counterpart to foreachInRange, used to resume an interrupted walk from a checkpointed
@@ -323,16 +257,17 @@ class TieredKeyValueList(val client: AspenClient,
    */
   def foreachFrom(minKey: Key,
                   fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    walkFromContainingNode(minKey, _.foreachFrom(minKey, fn))
+    engine.walkFrom(minKey, node => kvNode(node).foreachFrom(minKey, fn))
 }
 
 object TieredKeyValueList {
 
-  /*
-   Returns Left if the tree is broken or Right with a list of nodes for each
-   tier in the path down to the requested node in reverse order. The top of
-   the tree will be the last node in the list
-   */
+  /** The KeyValueListNode view of a node of a KeyValue-object tree */
+  private[tkvl] def kvNode(node: ListNode): KeyValueListNode = node match
+    case kvn: KeyValueListNode => kvn
+    case other => throw new IllegalStateException(s"Expected a KeyValueListNode but found ${other.getClass.getName}")
+
+  /** TierEngine.fetchContainingNode for KeyValue-object trees */
   private[tkvl] def fetchContainingNode(client: AspenClient,
                                         currentTier: Int,
                                         targetTier: Int,
@@ -340,35 +275,12 @@ object TieredKeyValueList {
                                         target: Key,
                                         currentNode: KeyValueListNode,
                                         initialBlacklist: Set[ObjectId],
-                                        reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], KeyValueListNode]] = {
+                                        reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], KeyValueListNode]] =
     given ExecutionContext = client.clientContext
+    TierEngine.fetchContainingNode(client, currentTier, targetTier, ordering, target, currentNode,
+      initialBlacklist, reversePath).map(_.map(kvNode))
 
-    fetchContainingNodePath(client, currentTier, targetTier, ordering, target,
-      currentNode, initialBlacklist).map {
-      case Left(l) => Left(l)
-      case Right(rpath) => Right(rpath.head)
-    }
-  }
-
-  /** How many times a traversal restarts after reading a node that a racing join deleted.
-   *
-   *  A restart only fails again if yet another join races it, so exhausting this means the
-   *  tree really does point at a deleted node.
-   */
-  private[tkvl] val MaxJoinRaceRestarts = 10
-
-  /*
-   A join deletes the right-hand node in the same transaction that rewrites the left node's
-   right pointer, so a right scan that read the left node just before the join reads a deleted
-   node and fails with InvalidObject. Upper-tier reads are already tolerant of this (fetchNode
-   blacklists them), so any InvalidObject here comes from the target-tier scan. currentNode is
-   the leftmost node of its tier, which a join never deletes, so refreshing it and descending
-   again sees the list as the join left it.
-
-   Tier reduction does delete the root, though, so the refresh fails if one ran after the caller
-   read it. The deleted root held only its AbsoluteMinimum child, which became the new root, so
-   the restart descends from that child one tier down instead.
-   */
+  /** TierEngine.fetchContainingNodePath for KeyValue-object trees */
   private[tkvl] def fetchContainingNodePath(client: AspenClient,
                                             currentTier: Int,
                                             targetTier: Int,
@@ -376,108 +288,8 @@ object TieredKeyValueList {
                                             target: Key,
                                             currentNode: KeyValueListNode,
                                             initialBlacklist: Set[ObjectId],
-                                            reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], List[KeyValueListNode]]] = {
-
+                                            reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], List[KeyValueListNode]]] =
     given ExecutionContext = client.clientContext
-
-    def leftmostChild(stale: KeyValueListNode): Future[KeyValueListNode] =
-      stale.contents.get(Key.AbsoluteMinimum) match
-        case None => Future.failed(new BrokenTree())
-        case Some(vs) =>
-          val lp = KeyValueListPointer(Key.AbsoluteMinimum, KeyValueObjectPointer(vs.value.bytes))
-          client.read(lp.pointer, s"TKVL restart below deleted root ${stale.pointer.id}").map: kvos =>
-            KeyValueListNode(client, lp, ordering, kvos)
-
-    def attempt(tier: Int,
-                start: KeyValueListNode,
-                restarts: Int): Future[Either[Set[ObjectId], List[KeyValueListNode]]] =
-      descend(client, tier, targetTier, ordering, target, start, initialBlacklist, reversePath).recoverWith:
-        case _: InvalidObject if restarts < MaxJoinRaceRestarts =>
-          start.refresh().map(n => (tier, n)).recoverWith:
-            case _: InvalidObject if tier > targetTier => leftmostChild(start).map(n => (tier - 1, n))
-          .flatMap((t, n) => attempt(t, n, restarts + 1))
-
-    attempt(currentTier, currentNode, 0)
-  }
-
-  private def descend(client: AspenClient,
-                      currentTier: Int,
-                      targetTier: Int,
-                      ordering: KeyOrdering,
-                      target: Key,
-                      currentNode: KeyValueListNode,
-                      initialBlacklist: Set[ObjectId],
-                      reversePath: List[KeyValueListNode]): Future[Either[Set[ObjectId], List[KeyValueListNode]]] = {
-
-    given ExecutionContext = client.clientContext
-
-    if (currentTier == targetTier) {
-      // Once we're on the right tier, we can rely on consistent right pointers to scan to the
-      // containing node
-      currentNode.fetchContainingNode(target).map(n => Right(n :: reversePath))
-    } else {
-
-      val p = Promise[Either[Set[ObjectId], List[KeyValueListNode]]]()
-
-      def rtry(candidates: List[(Key, KeyValueObjectPointer)], blacklist: Set[ObjectId]): Unit = {
-        if (candidates.isEmpty) {
-          p.success(Left(blacklist + currentNode.pointer.id))
-        } else {
-          fetchNode(client, ordering, targetTier, candidates.head._1, candidates.head._2, blacklist) foreach {
-            case Left(blklst) => rtry(candidates.tail, blklst)
-            case Right(next) => descend(client, currentTier-1, targetTier, ordering, target,
-              next, blacklist, currentNode :: reversePath).onComplete {
-              case Failure(err) => p.failure(err)
-              case Success(Left(blklst)) => p.success(Left(blklst + next.pointer.id))
-              case Success(Right(rpath)) => p.success(Right(rpath))
-            }
-          }
-        }
-      }
-
-      val initialCandidates = currentNode.contents.iterator.
-        filter(t => ordering.compare(t._1, target) <= 0).
-        map(t => t._1 -> KeyValueObjectPointer(t._2.value.bytes)).
-        filter(t => !initialBlacklist.contains(t._2.id)).
-        toList.
-        sortWith((l, r) => ordering.compare(l._1, r._1) < 0).
-        reverse
-
-      rtry(initialCandidates, initialBlacklist)
-
-      p.future
-    }
-
-  }
-
-  private def fetchNode(client: AspenClient,
-                        ordering: KeyOrdering,
-                        targetTier: Int,
-                        minimum: Key,
-                        pointer: KeyValueObjectPointer,
-                        blacklist: Set[ObjectId]): Future[Either[Set[ObjectId], KeyValueListNode]] = {
-
-    given ExecutionContext = client.clientContext
-
-    if (blacklist.contains(pointer.id)) {
-      Future.successful(Left(blacklist))
-    } else {
-      val p = Promise[Either[Set[ObjectId], KeyValueListNode]]()
-
-      client.read(pointer, s"TKVL read of tier $targetTier, key: $minimum") onComplete {
-        case Failure(_) => p.success(Left(blacklist + pointer.id))
-
-        case Success(kvos) =>
-
-          val tail = kvos.right.map(right => KeyValueListPointer(right.bytes))
-
-          val node = new KeyValueListNode(client, kvos.ida, pointer, ordering, minimum,
-            kvos.revision, kvos.refcount, kvos.contents, tail)
-          p.success(Right(node))
-      }
-
-      p.future
-    }
-  }
-
+    TierEngine.fetchContainingNodePath(client, currentTier, targetTier, ordering, target, currentNode,
+      initialBlacklist, reversePath).map(_.map(_.map(kvNode)))
 }

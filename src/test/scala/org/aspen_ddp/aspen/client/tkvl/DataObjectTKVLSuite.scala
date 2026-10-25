@@ -1,11 +1,14 @@
 package org.aspen_ddp.aspen.client.tkvl
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{InvalidObject, Transaction}
-import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.client.{InvalidObject, PoolObjectAllocatorId, Transaction}
+import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, ObjectPointer, Value}
 
-import scala.concurrent.Future
+import java.util.{Timer, TimerTask}
+import java.util.concurrent.TimeoutException
+
+import scala.concurrent.{Future, Promise}
 import scala.util.{Random, Success}
 
 class DataObjectTKVLSuite extends IntegrationTestSuite:
@@ -499,3 +502,52 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       assert(root.orootObject.isEmpty)
       assert(v1.isEmpty)
       assert(bytesOf(v3) == bytesOf(Some(value(3))))
+
+  /** `f`, or a TimeoutException after `ms`. Turns a finalization action that never completes into a failure. */
+  private def withTimeout[T](f: Future[T], ms: Long = 10000): Future[T] =
+    val p = Promise[T]()
+    val timer = new Timer(true)
+    timer.schedule(new TimerTask:
+      def run(): Unit = p.tryFailure(new TimeoutException(s"Did not complete within ${ms}ms"))
+    , ms)
+    f.onComplete: result =>
+      timer.cancel()
+      p.tryComplete(result)
+    p.future
+
+  atest("a split finalization whose key is too long for the upper tier's nodes completes and the tree stays readable"):
+    val enc = DataObjectNodeEncoding
+    val k1 = Key(1)
+    val longKey = Key(Array[Byte](5) ++ Array.fill[Byte](79)(1))
+    // Tier 1's nodes are too small for an entry holding longKey and a pointer
+    val upperNodeSize = 100
+    val nodeAllocator = new NodeAllocator(client,
+      List((PoolObjectAllocatorId(Radicle.poolId), 4096), (PoolObjectAllocatorId(Radicle.poolId), upperNodeSize)))
+    for
+      host <- rootHost()
+      pool <- client.getStoragePool(Radicle.poolId)
+      tx0 = client.newTransaction()
+      // Tier 0 is t0 -> t1, as a committed split of t0 at longKey leaves it. Tier 1 indexes only t0.
+      t1 <- pool.allocator.allocateDataObject(DataBuffer(enc.encode(List(longKey -> value(2)), longKey, None)))(using tx0)
+      t0 <- pool.allocator.allocateDataObject(DataBuffer(enc.encode(List(k1 -> value(1)), Key.AbsoluteMinimum,
+        Some(NodeLink(longKey, t1)))))(using tx0)
+      u <- pool.allocator.allocateDataObject(DataBuffer(enc.encode(List(Key.AbsoluteMinimum -> Value(t0.toArray)),
+        Key.AbsoluteMinimum, None)))(using tx0)
+      _ <- tx0.commit()
+      tx1 = client.newTransaction()
+      frm = KVObjectRootManager.setNewRoot(client, host, treeKey, true,
+        Root(1, ordering, Some(u), nodeAllocator, TreeKind.DataObjects))(using tx1)
+      _ <- tx1.commit()
+      rm <- frm
+      action = new SplitFinalizationAction(client, null, rm, 1, longKey, t1)
+      _ = action.execute()
+      _ <- withTimeout(action.complete)
+      tree <- rm.getDataObjectTree()
+      v1 <- tree.get(k1)
+      v2 <- tree.get(longKey)
+      upper <- readNode(u)
+    yield
+      assert(enc.entrySize(longKey, Value(t1.toArray)) > upperNodeSize)
+      assert(bytesOf(v1) == bytesOf(Some(value(1))))
+      assert(bytesOf(v2) == bytesOf(Some(value(2))))
+      assert(upper.entries.map(_._1) == List(Key.AbsoluteMinimum))

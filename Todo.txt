@@ -1,5 +1,27 @@
 TODO
 ====
 
-AmoebaFS is limited to a single SinglePoolNodeAllocator
-  - Need plan for using ObjectAllocators tied to AllocationGroups
+AllocationGroups probably ought to default to requiring an exact IDA match on all members.
+  - Mixing IDAs is probably a mistake
+  - Allow creation to override this. Maybe an IDAPolicy enum with ExactMatch and AllowAll members
+
+The TKVL as it currently exists is useful but has poor storage efficiency an identical data structure
+composed of DataObjects would be useful for low-contention use cases like single-writer. Proposed
+solution, generalize the TKVL code such that the important logic such as content management,
+tree navigation, splitting/joining, etcetera can be shared by trees built on top of DataObjects
+as well as KeyValue objects. KeyValue pairs stored in DataObjects wouldn't have identical semantics
+as they lack the metadata associated with KeyValueObject pairs but most of the navigation and
+management code should be able to handle that. The end-user facing API cannot hide that but
+the behind-the-scenes logic probably can.
+Thoughts on implementation:
+  - The Root object probably gains an Enum saying which kind of tree it stores
+  - It'd be really nice if the DataObject TKVL implementation could be further specialized for
+    RandomAccessReedSolomon encoded objects.
+    - Rather than a full overwrite on every kv insert/delete, append operations could be used insert kv pairs
+      and tombstones until the object is full. If compaction frees up enough space, it can be
+      overwritten and append operations can resume until a split is eventually required.
+
+Need to audit the slice size calculation code in KeyValueListNode to ensure that we never attempt
+to exceed the size of a fixed-sized object. I suspect there are mistakes in the calculations
+  - This is follow-on work from the recent addition of enforcement of maximum object sizes at both
+    the transaction and store levels.

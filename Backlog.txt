@@ -1,3 +1,6 @@
+AmoebaFS is limited to a single SinglePoolNodeAllocator
+  - Need plan for using ObjectAllocators tied to AllocationGroups
+
 Generate IDA document to discuss pros and cons of each IDA algorithm and what they're best suited to
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
 that talks about things like IDA + Backend combinations. RandomAccessReedSolomon + RocksDB is a poor

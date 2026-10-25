@@ -82,7 +82,10 @@ object Host:
 
     /** The transfer was aborted (AspenClient.abortStoreTransfer) before its bytes were recorded:
      *  the source's entry is no longer TransferringOut to the destination. The pool still names
-     *  the source, which kept its copy, so the arrived copy belongs to nobody. */
+     *  the source, which kept its copy, so the arrived copy belongs to nobody.
+     *
+     *  Also the outcome when the source was tombstoned and drained first: the store was rebuilt on
+     *  another device, the pool names that one, and the destination's stale entry is removed. */
     case Aborted
 
   /** What markRebuiltStoreActive decided about a rebuilt store, so its caller knows whether the
@@ -616,11 +619,34 @@ class Host(val client: AspenClient,
 
           TransferOutcome.PoolRepointed
 
-        else
-          // The source has already dropped the store, so a concurrent call to this method
-          // repointed the pool at the destination. The destination owns the arrived copy either
-          // way, so this is the same outcome -- just reached by somebody else.
+        // The source has already dropped the store. Either a concurrent call to this method
+        // repointed the pool at the destination, which owns the arrived copy either way, so this
+        // is the same outcome reached by somebody else. Or the source was tombstoned and its
+        // drain rebuilt the store elsewhere, in which case the pool names some other device and
+        // loading the arrived copy would serve a store nobody routes to.
+        else if poolCfg.stores(storeId.poolIndex).storageDeviceId == toDeviceid then
           TransferOutcome.PoolRepointed
+
+        else
+          logger.info(s"Transfer of store $storeId from device $fromDeviceId onto device " +
+                      s"$toDeviceid finished after the source was drained and the pool repointed " +
+                      s"to ${poolCfg.stores(storeId.poolIndex).storageDeviceId}. Discarding the " +
+                      s"arrived copy")
+
+          // The drain touches only the tombstone and the rebuild device, so this half of the
+          // transfer is still recorded here. Guarded on the entry so a concurrent call, or an
+          // entry that has since become something else, writes nothing.
+          toDev.stores.get(storeId)
+            .filter: entry =>
+              entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
+              entry.transferDevice.contains(fromDeviceId)
+            .foreach: _ =>
+              tx.update(toDevPtr, None, None,
+                List(KeyRevision(StorageDeviceState.StateKey,
+                  toDevKvos.contents(StorageDeviceState.StateKey).revision)),
+                List(Insert(StorageDeviceState.StateKey, toDev.removeStore(storeId).encode())))
+
+          TransferOutcome.Aborted
 
   /** Makes this host's HostState endpoint match the configured one, gossiping
    *  HostEndpointChanged once the change has committed.
@@ -716,7 +742,7 @@ class Host(val client: AspenClient,
   private def discardArrivedTransferIn(storeId: StoreId,
                                        toDeviceId: StorageDeviceId): Unit =
     discardStoreDirectory(storeId, toDeviceId,
-      "The pool still names the transfer source, which kept its copy, so this one belongs to nobody")
+      "The pool does not name this device, so this copy belongs to nobody")
 
   /** Restarts a failed transfer in after TransferInRetryDelay rather than at once. A deterministic
    *  failure (the sender's archiver exiting non-zero, a full disk here) would otherwise loop hot,

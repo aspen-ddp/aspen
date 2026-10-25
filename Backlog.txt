@@ -1,8 +1,3 @@
-Follow-ups from parallel store transfers
-  11. Pre-existing: when the destination finishes after a tombstoned source's entry was
-      already drained, Host.updateStateForTransferredStore falls through to PoolRepointed
-      and loads a copy the pool does not name
-
 StoragePool.getState() and dropCachedState() are now dead API
   - SimpleStoragePool caches its StoragePoolState at construction and
     dropCachedState() has never had a caller, so the cached copy was a

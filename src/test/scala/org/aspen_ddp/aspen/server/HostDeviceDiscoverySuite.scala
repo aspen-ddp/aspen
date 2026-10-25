@@ -795,6 +795,55 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
         _ <- pumpUntil(condition, rounds - 1)
       yield ()
 
+  atest("a transfer finishing after its source was drained is discarded, not loaded"):
+    given ExecutionContext = executionContext
+
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", net.secondDeviceId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    val arrived = deviceDir / movingStore.directoryName
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
+      _ = transfers.startedTransfersIn should contain(movingStore)
+
+      // What the source's drain leaves behind: the store is gone from the source's map and the
+      // pool names a device other than the destination. Done by hand, as the pool is left
+      // naming the source and only its entry is dropped, which is all this method can see.
+      _ <- client.transactUntilSuccessful: tx =>
+        for
+          ptr <- client.getStorageDevicePointer(sourceId)
+          kvos <- client.read(ptr)
+        yield
+          tx.update(ptr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey,
+              kvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey,
+              StorageDeviceState(kvos).removeStore(movingStore).encode())))
+      _ <- waitForTransactionsToComplete()
+
+      _ = transfers.finishTransferIn(movingStore)
+      _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
+      _ <- pumpUntil(!os.exists(arrived))
+
+      dest <- client.getStorageDeviceState(net.secondDeviceId)
+      poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield
+      host.transferOutcomes.get(movingStore) should be(Some(Host.TransferOutcome.Aborted))
+      poolState.stores(movingStore.poolIndex).storageDeviceId should not be(net.secondDeviceId)
+      dest.stores.contains(movingStore) should be(false)
+      os.exists(arrived) should be(false)
+
   atest("a transfer arriving on a tombstoned destination is discarded, not loaded"):
     given ExecutionContext = executionContext
 

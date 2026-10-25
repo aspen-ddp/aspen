@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.util.boundedSingleFlight
 import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskPointer, TaskStopped}
 import scribe.Logging
 
-import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, MINUTES, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Random, Success}
 
@@ -18,8 +18,9 @@ object SetRebalanceDurableTask:
   private[rebalancing] type Transfer = (StoreId, StorageDeviceId, StorageDeviceId)
 
   /** Backoff for starts that were RolledBack or failed (see TransferBackoff). */
-  val StartBackoffBase: Duration = Duration(1, SECONDS)
-  val StartBackoffMax: Duration = Duration(2, MINUTES)
+  val StartBackoffBase: FiniteDuration = Duration(1, SECONDS)
+  val StartBackoffMax: FiniteDuration = Duration(2, MINUTES)
+  val StartBackoffJitter: Double = 0.25
 
   private[rebalancing] enum Phase:
     case Completed, InFlight, NotStarted
@@ -71,7 +72,7 @@ class SetRebalanceDurableTask(
   // In memory only, which is fine for a crash-only task: the durable progress is
   // pendingTransfers, and a restarted task merely retries a little sooner.
   private val backoff = new TransferBackoff(() => System.currentTimeMillis(),
-    SetRebalanceDurableTask.StartBackoffBase, SetRebalanceDurableTask.StartBackoffMax)
+    SetRebalanceDurableTask.StartBackoffBase, SetRebalanceDurableTask.StartBackoffMax, new Random(), SetRebalanceDurableTask.StartBackoffJitter)
 
   /** Single-flight guard shared by the poll and wake(). Two passes may overlap (maxInFlight 2) so
    *  a wake-up arriving mid-pass is not lost, but a pileup is bounded. A pass handles its own

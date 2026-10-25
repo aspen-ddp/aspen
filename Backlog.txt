@@ -1,7 +1,4 @@
 Follow-ups from parallel store transfers
-  5. TransferStarter: a failed Future from start is ambiguous (document it); RolledBack is
-     returned even when the abort was a no-op; TransferBackoff has no jitter and does not
-     use FiniteDuration
   6. Rebalance minors: requiredSize falls back to 0; one random candidate per poll; the
      classify traverse is unbounded and each ready transfer reads the whole pool per poll
      (use runBoundedParallel); a stuck Rebuilding entry keeps the task InFlight forever

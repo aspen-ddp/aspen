@@ -448,13 +448,15 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   /** Rolls back an outstanding transfer of `storeId`: the source entry goes back to Active with no
    *  transfer device and the destination's TransferringIn entry is removed, in one transaction.
    *
+   *  Completes with true when it rolled a transfer back and false when it found nothing to do.
+   *
    *  Succeeds and changes nothing when no transfer is outstanding -- the store is Active, or the
    *  transfer already completed and the pool names the destination. When it does change something,
    *  best-effort CheckStorageDevice nudges go to the source and destination hosts once the
    *  transaction has committed, so a host that has begun moving bytes sees the withdrawn entries
    *  promptly rather than on its next device poll. Nothing is sent when nothing changed.
    */
-  def abortStoreTransfer(storeId: StoreId): Future[Unit] =
+  def abortStoreTransfer(storeId: StoreId): Future[Boolean] =
     given ExecutionContext = this.clientContext
 
     // As in transferStore: only a collision is retried.
@@ -507,7 +509,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
              else
                Nil)
 
-    fStaged.map(_.foreach(sendBestEffortHostMessage))
+    fStaged.map: nudges =>
+      nudges.foreach(sendBestEffortHostMessage)
+      nudges.nonEmpty
 
   def getBootstrapConfig(): Future[String] =
     given ExecutionContext = this.clientContext

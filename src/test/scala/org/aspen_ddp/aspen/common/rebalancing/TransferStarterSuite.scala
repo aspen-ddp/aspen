@@ -142,6 +142,23 @@ class TransferStarterSuite extends TransferStarterSuiteBase:
       b.ready(store0) should be(true)
     succeed
 
+  test("TransferBackoff: jitter shortens the delay within its bound and never lengthens it"):
+    val clock = FakeClock(0L)
+    val low = new TransferBackoff(() => clock.now(), base, max, new scala.util.Random(1) { override def nextDouble() = 1.0 }, 0.5)
+    low.failed(store0)
+    clock.t = 49L
+    low.ready(store0) should be(false)
+    clock.t = 50L
+    low.ready(store0) should be(true)
+
+    val none = new TransferBackoff(() => clock.now(), base, max, new scala.util.Random(1) { override def nextDouble() = 0.0 }, 0.5)
+    clock.t = 0L
+    none.failed(store0)
+    clock.t = 99L
+    none.ready(store0) should be(false)
+    clock.t = 100L
+    none.ready(store0) should be(true)
+
   test("TransferBackoff: succeeded resets"):
     val clock = FakeClock(0L)
     val b = new TransferBackoff(() => clock.now(), base, max)

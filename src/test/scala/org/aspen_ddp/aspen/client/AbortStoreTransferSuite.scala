@@ -27,11 +27,12 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
       _ <- client.transferStore(storeId, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
       _ = takeNudges()
-      _ <- client.abortStoreTransfer(storeId)
+      rolledBack <- client.abortStoreTransfer(storeId)
       nudges = takeNudges()
       src <- client.getStorageDeviceState(sourceId)
       dst <- client.getStorageDeviceState(net.secondDeviceId)
     yield
+      rolledBack should be(true)
       nudges.map(n => (n.deviceId, n.toHost)).toSet should be(
         Set((sourceId, src.hostId), (net.secondDeviceId, dst.hostId)))
       nudges.size should be(2)
@@ -42,9 +43,10 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
     for
       _ <- waitForTransactionsToComplete()
       _ = takeNudges()
-      _ <- client.abortStoreTransfer(storeId)
+      rolledBack <- client.abortStoreTransfer(storeId)
       nudges = takeNudges()
     yield
+      rolledBack should be(false)
       nudges should be(Nil)
 
   atest("abortStoreTransfer rolls back an outstanding transfer on both devices"):

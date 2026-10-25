@@ -5,13 +5,16 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 
 import scala.concurrent.{ExecutionContext, Future}
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration.FiniteDuration
+import scala.util.Random
 
 /** Outcome of `TransferStarter.start`. */
 enum StartResult:
   /** The admission rule failed on fresh state; nothing was started. */
   case Rejected
-  /** The transfer was started and the pool is still at or above the floor. */
+  /** The transfer was started and the pool is still at or above the floor. Also returned when the
+   *  pool was found below the floor but the rollback found nothing to undo, because the transfer
+   *  had already been aborted or completed by someone else. */
   case Started
   /** The transfer was started, the pool was then found below the floor (a competing initiator
    *  started another transfer in the same pool), and the transfer was aborted again. The caller
@@ -41,7 +44,11 @@ object TransferStarter:
    *  immediately can keep two initiators rolling each other back.
    *
    *  A failure of `transferStore` or of the rollback's `abortStoreTransfer` is returned as a failed
-   *  future; callers decide how to retry.
+   *  future; callers decide how to retry. The failure is AMBIGUOUS: it does not say whether the
+   *  transfer was started. A failed `transferStore` leaves nothing started, but a failed rollback
+   *  leaves the transfer started and the pool possibly below the floor. Callers must not assume
+   *  either; they should back off and re-read the transfer's real state (as the rebalance and
+   *  migration polls' classify does) before acting again.
    */
   def start(client: AspenClient,
             storeId: StoreId,
@@ -62,7 +69,11 @@ object TransferStarter:
     def verify(): Future[StartResult] =
       readState().flatMap: after =>
         if TransferSafety.isBelowFloor(after, client.offlineHosts(), storeId.poolId) then
-          client.abortStoreTransfer(storeId).map(_ => StartResult.RolledBack)
+          client.abortStoreTransfer(storeId).map:
+            case true => StartResult.RolledBack
+            // Someone else aborted or completed the transfer first, so there is no rollback of
+            // ours to back off from. The caller's next classify reads the true state.
+            case false => StartResult.Started
         else
           Future.successful(StartResult.Started)
 
@@ -83,11 +94,17 @@ object TransferStarter:
  *
  *  In-memory and pure apart from the injected clock. The tasks that use it are poll-driven, so
  *  `ready` is consulted on each poll rather than scheduling a timer. After the n-th consecutive
- *  `failed`, the store is not ready for `min(base * 2^(n-1), max)`; `succeeded` forgets it.
+ *  `failed`, the store is not ready for `min(base * 2^(n-1), max)`, shortened by a random fraction
+ *  of up to `jitter`; `succeeded` forgets it.
  *
  *  @param now current time in milliseconds
  */
-class TransferBackoff(now: () => Long, base: Duration, max: Duration):
+class TransferBackoff(now: () => Long,
+                      base: FiniteDuration,
+                      max: FiniteDuration,
+                      rng: Random = new Random(),
+                      jitter: Double = 0.0):
+  require(jitter >= 0.0 && jitter <= 1.0, s"jitter must be within [0, 1], got $jitter")
 
   private case class Entry(failures: Int, readyAt: Long)
 
@@ -107,4 +124,7 @@ class TransferBackoff(now: () => Long, base: Duration, max: Duration):
     val maxMs = max.toMillis
     // Cap the shift so the doubling cannot overflow; anything that large is clamped to max anyway.
     val shift = math.min(failures - 1, 30)
-    math.min(base.toMillis << shift, maxMs)
+    val delay = math.min(base.toMillis << shift, maxMs)
+    // Shortened by up to `jitter` of itself, never lengthened, so max stays a hard bound. Without
+    // it, initiators that collided are ready again at the same instant and collide again.
+    delay - (delay * jitter * rng.nextDouble()).toLong

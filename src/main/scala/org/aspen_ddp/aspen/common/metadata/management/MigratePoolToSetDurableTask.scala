@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.compute.{DurableTask, DurableTaskFactory, DurableTask
 import scribe.Logging
 
 import java.util.UUID
-import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
+import scala.concurrent.duration.{Duration, FiniteDuration, MINUTES, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Random, Success}
 
@@ -34,8 +34,9 @@ object MigratePoolToSetDurableTask extends DurableTaskFactory:
 
   /** Backoff for starts that were RolledBack or failed (see TransferBackoff). Same values as
    *  SetRebalanceDurableTask. */
-  val StartBackoffBase: Duration = Duration(1, SECONDS)
-  val StartBackoffMax: Duration = Duration(2, MINUTES)
+  val StartBackoffBase: FiniteDuration = Duration(1, SECONDS)
+  val StartBackoffMax: FiniteDuration = Duration(2, MINUTES)
+  val StartBackoffJitter: Double = 0.25
 
   /** The recorded migration changed under us (retargeted, or already completed by another
    *  instance). Not an error: the completion write is simply skipped. */
@@ -88,7 +89,7 @@ class MigratePoolToSetDurableTask(
   // In memory only, which is fine for a crash-only task: a restarted instance merely retries a
   // little sooner.
   private val backoff = new TransferBackoff(() => System.currentTimeMillis(),
-    MigratePoolToSetDurableTask.StartBackoffBase, MigratePoolToSetDurableTask.StartBackoffMax)
+    MigratePoolToSetDurableTask.StartBackoffBase, MigratePoolToSetDurableTask.StartBackoffMax, new Random(), MigratePoolToSetDurableTask.StartBackoffJitter)
 
   /** Single-flight guard: a tick arriving while a pass is still running is dropped
    *  (TODO.txt's "protect against pileups", on the async-body side; the cancel-then-schedule

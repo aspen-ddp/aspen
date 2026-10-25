@@ -369,10 +369,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       given Transaction = tx
 
       for
-        // getStoragePoolState, not getStoragePool(...).getState(): SimpleStoragePool caches its
-        // StoragePoolState from construction and nothing ever calls dropCachedState(), so the
-        // cached copy is a permanent snapshot of where the stores were when this client first
-        // touched the pool. The source device must be read fresh -- a store that has already
+        // The pool state must be read fresh: a StoragePool object holds no store-to-device mapping,
+        // and a snapshot would show where the stores were when it was taken. The source device must be read fresh -- a store that has already
         // moved once (a migration retarget, or two successive rebalances) would otherwise be
         // transferred out of the device it used to live on. When the stale source happens to
         // equal the true destination this surfaces as a StopRetrying InvalidDestination and

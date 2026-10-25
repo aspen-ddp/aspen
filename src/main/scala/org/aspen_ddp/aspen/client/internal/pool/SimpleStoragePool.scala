@@ -10,7 +10,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.util.byte2uuid
 
 import java.util.UUID
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.ExecutionContext
 
 object SimpleStoragePool:
 
@@ -42,23 +42,6 @@ class SimpleStoragePool(val client: AspenClient,
     
   private val allocStrategyConfig: Option[Array[Byte]] = kvos.contents.get(StoragePoolState.AllocationStrategyConfigKey).map(_.value.bytes)
   
-  private var cachedState: Option[StoragePoolState] = Some(initialState)
-
-  def getState(): Future[StoragePoolState] =
-    synchronized:
-      cachedState match 
-        case Some(state) => Future.successful(state)
-        case None =>
-          client.read(pointer).map: kvos =>
-            val state = StoragePoolState(kvos)
-            synchronized:
-              cachedState = Some(state)
-            state
-  
-  def dropCachedState(): Unit =
-    synchronized:
-      cachedState = None
-
   override def allocator: ObjectAllocator =
     client.getCachedAllocator(PoolObjectAllocatorId(poolId)) match
       case Some(allocator) => allocator

@@ -1054,10 +1054,8 @@ class Host(val client: AspenClient,
     // that arrives before this host's own device check has noticed the transfer needs no
     // separate scan.
     for
-      // getStoragePoolState, not getStoragePool(...).getState(): SimpleStoragePool caches its
-      // StoragePoolState from construction and nothing ever calls dropCachedState(), so the
-      // cached copy is a permanent snapshot of where the stores were when this client first
-      // touched the pool. The source device must be read fresh -- for a store that has already
+      // The pool state must be read fresh: a StoragePool object holds no store-to-device mapping,
+      // and a snapshot would show where the stores were when it was taken. The source device must be read fresh -- for a store that has already
       // moved once (a migration retarget, or two successive rebalances) the snapshot names the
       // device it used to live on, that device no longer lists the store, and the transfer-out
       // dies below on "Transfer probably completed" without ever starting.

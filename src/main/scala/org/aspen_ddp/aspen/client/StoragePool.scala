@@ -2,11 +2,9 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.metadata.StoragePoolState
 import org.aspen_ddp.aspen.common.pool.PoolId
 
 import java.util.UUID
-import scala.concurrent.Future
 
 trait StoragePool:
 
@@ -29,10 +27,6 @@ trait StoragePool:
   val maxObjectSize: Option[Int]
 
   def allocator: ObjectAllocator
-
-  def getState(): Future[StoragePoolState]
-
-  def dropCachedState(): Unit
 
   private[aspen] def allocationTree: TieredKeyValueList
 

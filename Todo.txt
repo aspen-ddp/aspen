@@ -13,6 +13,9 @@ Need to audit the slice size calculation code in KeyValueListNode to ensure that
 to exceed the size of a fixed-sized object. I suspect there are mistakes in the calculations
   - This is follow-on work from the recent addition of enforcement of maximum object sizes at both
     the transaction and store levels.
+  - The maxNodeSize defined at the Tree level is an upper logical bound. However, if the object itself
+    has a smaller size limit, then that is the value that must be enforced. It should be possible to
+    obtain the maximum node size from the AllocationGroup assigned to the node allocator.
 
 Need to audit the KeyValueListNode, TKVL, and root manager tests. Several bugs in these areas have
 been uncovered recently which leads me to suspect that the current coverage is far from complete. I

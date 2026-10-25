@@ -58,9 +58,11 @@ class JoinFinalizationAction(val client: AspenClient,
                   Future.unit
                 }
 
-                TierEngine.encodingFor(node).delete(node, deleteMinimum, onJoin)
-
-                tx.commit().map(_=>())
+                // A join reads the right node before staging its updates, so commit only once the delete is staged
+                for {
+                  _ <- TierEngine.encodingFor(node).delete(node, deleteMinimum, onJoin)
+                  _ <- tx.commit()
+                } yield ()
               }
           }
         }

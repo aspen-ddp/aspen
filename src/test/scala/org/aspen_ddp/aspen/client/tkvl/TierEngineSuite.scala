@@ -58,7 +58,8 @@ class TierEngineSuite extends IntegrationTestSuite:
     recoverToSucceededIf[UnsupportedOperationException]:
       new TierEngine(client, new StubRootManager(stub)).get(theKey)
 
-  atest("TierEngine.get descends a multi-tier KeyValueObjects tree"):
+  /** A KeyValueObjects tree holding keys 1 to 30 in nodes small enough to need more than one tier */
+  private def multiTierTree(): Future[KVObjectRootManager] =
     val treeKey = Key(Array[Byte](0))
     def insert(tree: TieredKeyValueList, i: Int): Future[Unit] =
       val tx = client.newTransaction()
@@ -82,12 +83,35 @@ class TierEngineSuite extends IntegrationTestSuite:
       tree <- root.getTree()
       _ <- (1 to 30).foldLeft(Future.unit)((f, i) => f.flatMap(_ => insert(tree, i)))
       _ <- waitForTransactionsToComplete()
-
       (numTiers, _, _) <- root.getRootNode()
+    yield
+      assert(numTiers > 0)
+      root
+
+  atest("TierEngine.get descends a multi-tier KeyValueObjects tree"):
+    for
+      root <- multiTierTree()
       engine = new TierEngine(client, root)
       found <- Future.sequence((1 to 30).map(i => engine.get(Key(i))))
       missing <- engine.get(Key(99))
     yield
-      assert(numTiers > 0)
       assert(found.forall(_.isDefined))
       assert(missing.isEmpty)
+
+  atest("TierEngine.deleteTree hands only the leftmost tier-0 node to deleteDataList"):
+    var handed: List[ListNode] = Nil
+    for
+      root <- multiTierTree()
+      engine = new TierEngine(client, root)
+      leftmost <- engine.getContainingNode(Key.AbsoluteMinimum)
+      _ <- engine.deleteTree: node =>
+        handed = node :: handed
+        NodeEncoding(TreeKind.KeyValueObjects).deleteList(client, NodeLink(Key.AbsoluteMinimum, node.pointer),
+          node.ordering, None)
+      (numTiers, _, oroot) <- root.getRootNode()
+      upperRoot <- root.getRoot()
+    yield
+      assert(handed.map(_.pointer.id) == leftmost.map(_.pointer.id).toList)
+      assert(numTiers == 0)
+      assert(oroot.isEmpty)
+      assert(upperRoot.orootObject.isEmpty)

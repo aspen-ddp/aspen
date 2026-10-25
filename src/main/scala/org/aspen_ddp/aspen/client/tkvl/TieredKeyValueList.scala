@@ -24,54 +24,10 @@ class TieredKeyValueList(val client: AspenClient,
     engine.getContainingNode(key).map(_.map(node => new TieredKeyValueListNode(this, kvNode(node))))
   
   def deleteTree(odeleteKVPair: Option[(Key, ValueState) => Future[Unit]]): Future[Unit] =
-    def fetchRootNodes(path: List[(Int, KeyValueListNode)]): Future[List[(Int, KeyValueListNode)]] =
-      val (tier, node) = path.head
-      if tier == 0 then
-        Future.successful(path)
-      else
-        node.contents.get(Key.AbsoluteMinimum) match 
-          case None => Future.successful(path)
-          case Some(vs) =>
-            val downPtr = KeyValueObjectPointer(vs.value.bytes)
-            client.readOptional(downPtr).flatMap:
-              case None => Future.successful(path)
-              case Some(kvos) =>
-                val downlp = KeyValueListPointer(Key.AbsoluteMinimum, downPtr)
-                val downNode = KeyValueListNode(client, downlp, node.ordering, kvos)
-                val nextTierDown = tier - 1
-                fetchRootNodes((nextTierDown, downNode) :: path)
+    engine.deleteTree: node =>
+      val kvlp = KeyValueListPointer(Key.AbsoluteMinimum, kvNode(node).pointer)
+      KeyValueListNode.deleteList(client, kvlp, node.ordering, odeleteKVPair)
 
-    def rdelete(path: List[(Int, KeyValueListNode)]): Future[Unit] = 
-      if path.isEmpty then
-        Future.unit
-      else 
-        val (tier, node) = path.head
-        val odkv = if tier == 0 then odeleteKVPair else None
-        val kvlp = KeyValueListPointer(Key.AbsoluteMinimum, node.pointer)
-
-        for 
-          _ <- KeyValueListNode.deleteList(client, kvlp, node.ordering, odkv)
-          _ <- rdelete(path.tail)
-        yield 
-          ()
-    
-    for
-      (tier, ordering, onode) <- rootManager.getKeyValueRootNode()
-      
-      _ <- onode match
-        case None => Future.unit
-        case Some(node) =>
-          for
-            path <- fetchRootNodes(List((tier, node)))
-            _ <- rdelete(path)
-            tx = client.newTransaction()
-            _ <- rootManager.prepareRootUpdate(0, None)(using tx)
-            _ <- tx.commit()
-          yield
-            ()
-    yield
-      ()
-      
   /**
    * Splits the tree into two trees at the supplied key. All keys comparing
    * less than splitAtKey will remain in the original tree, the rest will be
@@ -86,60 +42,8 @@ class TieredKeyValueList(val client: AspenClient,
    * Use with caution.
    */
   def splitTree(splitAtKey: Key, inclusive: Boolean = false)
-               (using t: Transaction): Future[Root] = {
-
-    def rinsert(tier: Int,
-                ordering: KeyOrdering,
-                rpath: List[KeyValueListNode],
-                downPointer: KeyValueObjectPointer): Future[KeyValueObjectPointer] =
-      if rpath.isEmpty then
-        Future.successful(downPointer)
-      else
-        val odown = if tier > 0 then Some(downPointer) else None
-        for
-          alloc <- rootManager.getAllocatorForTier(tier)
-          down <- rpath.head.splitAt(ordering, splitAtKey, inclusive, odown, alloc)
-          kvp <- rinsert(tier + 1, ordering, rpath.tail, down.pointer)
-        yield
-          kvp
-
-    // Returns the new tree's tier along with its root. The path has one node per tier, and it
-    // can be a tier shorter than `tier` if a tier reduction raced the descent.
-    def nonEmpty(tier: Int,
-                 ordering: KeyOrdering,
-                 root: KeyValueListNode): Future[(Int, KeyValueObjectPointer)] =
-      for
-        e <- fetchContainingNodePath(client, tier, 0, ordering, splitAtKey, root, Set())
-
-        rpath = e match
-          case Left(_) => throw new BrokenTree()
-          case Right(p) => p
-
-        // There will always be a tier0 entry, split that then recurse through
-        // the full path
-        alloc <- rootManager.getAllocatorForTier(0)
-
-        down <- rpath.head.splitAt(ordering, splitAtKey, inclusive, None, alloc)
-
-        kvp <- rinsert(1, ordering, rpath.tail, down.pointer)
-      yield
-        (rpath.length - 1, kvp)
-
-    for
-      oldRoot <- rootManager.getRoot()
-      (tier, ordering, oroot) <- rootManager.getKeyValueRootNode()
-      (newTier, ptr) <- oroot match
-        case Some(root) => nonEmpty(tier, ordering, root)
-        case None =>
-          for
-            _ <- rootManager.createInitialNode(Map())
-            alloc <- rootManager.getAllocatorForTier(0)
-            ptr <- alloc.allocateKeyValueObject(Map[Key, Value]())
-          yield
-            (tier, ptr)
-    yield
-      Root(newTier, ordering, Some(ptr), oldRoot.nodeAllocator)
-  }
+               (using t: Transaction): Future[Root] =
+    engine.splitTree(splitAtKey, inclusive)
 
   def set(key: Key,
           value: Value,
@@ -213,17 +117,4 @@ object TieredKeyValueList {
     given ExecutionContext = client.clientContext
     TierEngine.fetchContainingNode(client, currentTier, targetTier, ordering, target, currentNode,
       initialBlacklist, reversePath).map(_.map(kvNode))
-
-  /** TierEngine.fetchContainingNodePath for KeyValue-object trees */
-  private[tkvl] def fetchContainingNodePath(client: AspenClient,
-                                            currentTier: Int,
-                                            targetTier: Int,
-                                            ordering: KeyOrdering,
-                                            target: Key,
-                                            currentNode: KeyValueListNode,
-                                            initialBlacklist: Set[ObjectId],
-                                            reversePath: List[KeyValueListNode] = Nil): Future[Either[Set[ObjectId], List[KeyValueListNode]]] =
-    given ExecutionContext = client.clientContext
-    TierEngine.fetchContainingNodePath(client, currentTier, targetTier, ordering, target, currentNode,
-      initialBlacklist, reversePath).map(_.map(_.map(kvNode)))
 }

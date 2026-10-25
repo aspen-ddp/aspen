@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectId, ObjectPointer, ObjectRevision, Value}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -117,6 +117,133 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
               ()
 
     attempt(0)
+
+  /** Deletes every node of the tree, then updates the root to an empty tree. `deleteDataList` deletes the tier-0
+    * list starting at the leftmost tier-0 node it is handed, which lets a facade visit each entry in its own
+    * terms. Upper tiers are deleted through the tree's encoding.
+    */
+  def deleteTree(deleteDataList: ListNode => Future[Unit]): Future[Unit] =
+
+    def readOptional(encoding: NodeEncoding, pointer: ObjectPointer, ordering: KeyOrdering): Future[Option[ListNode]] =
+      Future.delegate(encoding.read(client, pointer, Key.AbsoluteMinimum, ordering, "")).map(Some(_)).recover:
+        case _: InvalidObject => None
+
+    def fetchRootNodes(encoding: NodeEncoding, path: List[(Int, ListNode)]): Future[List[(Int, ListNode)]] =
+      val (tier, node) = path.head
+      if tier == 0 then
+        Future.successful(path)
+      else
+        node.get(Key.AbsoluteMinimum) match
+          case None => Future.successful(path)
+          case Some(v) =>
+            readOptional(encoding, ObjectPointer(v.bytes), node.ordering).flatMap:
+              case None => Future.successful(path)
+              case Some(downNode) =>
+                val nextTierDown = tier - 1
+                fetchRootNodes(encoding, (nextTierDown, downNode) :: path)
+
+    def rdelete(encoding: NodeEncoding, path: List[(Int, ListNode)]): Future[Unit] =
+      if path.isEmpty then
+        Future.unit
+      else
+        val (tier, node) = path.head
+
+        val fdelete =
+          if tier == 0 then
+            deleteDataList(node)
+          else
+            encoding.deleteList(client, NodeLink(Key.AbsoluteMinimum, node.pointer), node.ordering, None)
+
+        for
+          _ <- fdelete
+          _ <- rdelete(encoding, path.tail)
+        yield
+          ()
+
+    for
+      (tier, ordering, onode) <- rootManager.getRootNode()
+
+      _ <- onode match
+        case None => Future.unit
+        case Some(node) =>
+          val encoding = encodingFor(node)
+          for
+            path <- fetchRootNodes(encoding, List((tier, node)))
+            _ <- rdelete(encoding, path)
+            tx = client.newTransaction()
+            _ <- rootManager.prepareRootUpdate(0, None)(using tx)
+            _ <- tx.commit()
+          yield
+            ()
+    yield
+      ()
+
+  /** See `TieredKeyValueList.splitTree` */
+  def splitTree(splitAtKey: Key, inclusive: Boolean = false)
+               (using t: Transaction): Future[Root] =
+
+    // Nodes above tier 0 on the descent path need not hold splitAtKey, since navigation between
+    // tiers is not consistent, so each split first scans right to the node that does.
+    def splitContaining(encoding: NodeEncoding,
+                        node: ListNode,
+                        odown: Option[ObjectPointer],
+                        alloc: ObjectAllocator): Future[NodeLink] =
+      scanToContainingNode(client, encoding, node, splitAtKey).flatMap: containing =>
+        encoding.splitAt(containing, splitAtKey, inclusive, odown, alloc)
+
+    def rinsert(encoding: NodeEncoding,
+                tier: Int,
+                rpath: List[ListNode],
+                downPointer: ObjectPointer): Future[ObjectPointer] =
+      if rpath.isEmpty then
+        Future.successful(downPointer)
+      else
+        val odown = if tier > 0 then Some(downPointer) else None
+        for
+          alloc <- rootManager.getAllocatorForTier(tier)
+          down <- splitContaining(encoding, rpath.head, odown, alloc)
+          kvp <- rinsert(encoding, tier + 1, rpath.tail, down.pointer)
+        yield
+          kvp
+
+    // Returns the new tree's tier along with its root. The path has one node per tier, and it
+    // can be a tier shorter than `tier` if a tier reduction raced the descent.
+    def nonEmpty(encoding: NodeEncoding,
+                 tier: Int,
+                 ordering: KeyOrdering,
+                 root: ListNode): Future[(Int, ObjectPointer)] =
+      for
+        e <- fetchContainingNodePath(client, tier, 0, ordering, splitAtKey, root, Set())
+
+        rpath = e match
+          case Left(_) => throw new BrokenTree()
+          case Right(p) => p
+
+        // There will always be a tier0 entry, split that then recurse through
+        // the full path
+        alloc <- rootManager.getAllocatorForTier(0)
+
+        down <- splitContaining(encoding, rpath.head, None, alloc)
+
+        kvp <- rinsert(encoding, 1, rpath.tail, down.pointer)
+      yield
+        (rpath.length - 1, kvp)
+
+    for
+      oldRoot <- rootManager.getRoot()
+      encoding = NodeEncoding(oldRoot.kind)
+      (tier, ordering, oroot) <- rootManager.getRootNode()
+      (newTier, ptr) <- oroot match
+        case Some(root) => nonEmpty(encoding, tier, ordering, root)
+        case None =>
+          for
+            _ <- rootManager.createInitialNode(Map())
+            alloc <- rootManager.getAllocatorForTier(0)
+            ptr <- encoding.allocate(alloc, Map[Key, Value]())
+          yield
+            (tier, ptr)
+    yield
+      Root(newTier, ordering, Some(ptr), oldRoot.nodeAllocator, oldRoot.kind)
 
 object TierEngine:
 

@@ -13,6 +13,9 @@ case class Root(tier: Int,
                 nodeAllocator: NodeAllocator,
                 kind: TreeKind = TreeKind.KeyValueObjects) {
 
+  require(orootObject.forall(Root.pointerMatchesKind(kind, _)),
+    s"Root pointer ${orootObject.get} does not match tree kind $kind")
+
   /** The root node pointer for callers that only deal with key-value object trees */
   def rootKeyValuePointer: Option[KeyValueObjectPointer] = orootObject.map:
     case kvp: KeyValueObjectPointer => kvp
@@ -43,6 +46,11 @@ case class Root(tier: Int,
 }
 
 object Root {
+
+  def pointerMatchesKind(kind: TreeKind, ptr: ObjectPointer): Boolean = (kind, ptr) match
+    case (TreeKind.KeyValueObjects, _: KeyValueObjectPointer) => true
+    case (TreeKind.DataObjects, _: DataObjectPointer) => true
+    case _ => false
 
   def create(client: AspenClient,
              ordering: KeyOrdering,
@@ -81,10 +89,7 @@ object Root {
     val nodeAllocator = NodeAllocator(client, bb)
 
     val oroot = bb.get() match {
-      case 1 =>
-        kind match
-          case TreeKind.KeyValueObjects => Some(KeyValueObjectPointer(bb))
-          case TreeKind.DataObjects => Some(DataObjectPointer(bb))
+      case 1 => Some(ObjectPointer.fromByteBuffer(bb))
       case _ => None
     }
 

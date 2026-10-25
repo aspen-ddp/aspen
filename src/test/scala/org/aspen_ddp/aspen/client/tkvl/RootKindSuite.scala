@@ -44,6 +44,25 @@ class RootKindSuite extends AnyFunSuite with Matchers:
     Root(0, ByteArrayKeyOrdering, Some(kvPointer), allocator).rootKeyValuePointer.map(_.id) should be (Some(kvPointer.id))
     Root(0, ByteArrayKeyOrdering, None, allocator).rootKeyValuePointer should be (None)
 
+  private def withKindByte(root: Root, kind: TreeKind): Array[Byte] =
+    val bytes = root.encode()
+    bytes(2) = kind.code // tier, ordering, kind
+    bytes
+
   test("decoding a DataObjects root holding a KeyValueObjectPointer fails"):
-    val bytes = Root(1, ByteArrayKeyOrdering, Some(kvPointer), allocator, TreeKind.DataObjects).encode()
-    an [Exception] should be thrownBy Root(null, bytes)
+    val bytes = withKindByte(Root(1, ByteArrayKeyOrdering, Some(kvPointer), allocator), TreeKind.DataObjects)
+    an [IllegalArgumentException] should be thrownBy Root(null, bytes)
+
+  test("decoding a KeyValueObjects root holding a DataObjectPointer fails"):
+    val bytes = withKindByte(Root(1, ByteArrayKeyOrdering, Some(dataPointer), allocator, TreeKind.DataObjects),
+      TreeKind.KeyValueObjects)
+    an [IllegalArgumentException] should be thrownBy Root(null, bytes)
+
+  test("building a Root whose pointer does not match its kind fails"):
+    an [IllegalArgumentException] should be thrownBy
+      Root(0, ByteArrayKeyOrdering, Some(dataPointer), allocator, TreeKind.KeyValueObjects)
+    an [IllegalArgumentException] should be thrownBy
+      Root(0, ByteArrayKeyOrdering, Some(kvPointer), allocator, TreeKind.DataObjects)
+
+  test("TreeKind.fromCode rejects an unknown code"):
+    an [IllegalArgumentException] should be thrownBy TreeKind.fromCode(9)

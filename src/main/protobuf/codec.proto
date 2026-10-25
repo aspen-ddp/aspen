@@ -601,6 +601,11 @@ message AllocationGroupMember {
   optional uint32 maxObjectSize = 6;
 }
 
+enum AllocationGroupIDAPolicy {
+  ALLOCATION_GROUP_IDA_POLICY_EXACT_MATCH = 0;
+  ALLOCATION_GROUP_IDA_POLICY_ALLOW_ALL = 1;
+}
+
 message AllocationGroupState {
   UUID groupId = 1;
   int32 level = 2;
@@ -608,6 +613,9 @@ message AllocationGroupState {
   repeated AllocationGroupMember members = 4;
   repeated UUID parentGroups = 5;
   uint32 maxSliceSize = 6;
+  AllocationGroupIDAPolicy idaPolicy = 7;
+  // present only for the EXACT_MATCH policy
+  optional IDA ida = 8;
 }
 
 message PendingTransfer {

@@ -5,7 +5,7 @@ import org.scalatest.matchers.should.Matchers
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPolicy, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.*
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -642,6 +642,16 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedEmpty.members shouldBe Nil
     decodedEmpty.parentGroups shouldBe Nil
     decodedEmpty.maxSliceSize shouldBe None
+    decodedEmpty.idaPolicy shouldBe IDAPolicy.AllowAll
+    decodedEmpty.ida shouldBe None
+
+    val ida = RandomAccessReedSolomon(5, 3, 4, 4096)
+    val exact = AllocationGroupState(AllocationGroupId(uuid(11)), level = 0, name = "exact", members = Nil,
+      parentGroups = Nil, idaPolicy = IDAPolicy.ExactMatch, ida = Some(ida))
+    val decodedExact = Codec.decode(Codec.encode(exact))
+    decodedExact.idaPolicy shouldBe IDAPolicy.ExactMatch
+    decodedExact.ida shouldBe Some(ida)
+    AllocationGroupState(exact.toBytes).ida shouldBe Some(ida)
 
   test("HostState round-trip"):
     val original = HostState(

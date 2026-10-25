@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, IDAPolicy, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, ByteRanges, DataObjectPointer, FullObject, IntegerKeyOrdering, Key, KeyOrdering, KeyRange, KeyValueObjectPointer, LargestKeyLessThan, LargestKeyLessThanOrEqualTo, KeySet, LexicalKeyOrdering, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, SingleKey}
 import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -1274,6 +1274,15 @@ object Codec extends Logging:
     val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
     AllocationGroupState.Member(memberType, uuid, maxSliceSize, m.maxObjectSize, m.currentUsage, m.maximumSize)
 
+  def encodeIDAPolicy(o: IDAPolicy): codec.AllocationGroupIDAPolicy = o match
+    case IDAPolicy.ExactMatch => codec.AllocationGroupIDAPolicy.ALLOCATION_GROUP_IDA_POLICY_EXACT_MATCH
+    case IDAPolicy.AllowAll => codec.AllocationGroupIDAPolicy.ALLOCATION_GROUP_IDA_POLICY_ALLOW_ALL
+
+  def decodeIDAPolicy(m: codec.AllocationGroupIDAPolicy): IDAPolicy = m match
+    case codec.AllocationGroupIDAPolicy.ALLOCATION_GROUP_IDA_POLICY_EXACT_MATCH => IDAPolicy.ExactMatch
+    case codec.AllocationGroupIDAPolicy.ALLOCATION_GROUP_IDA_POLICY_ALLOW_ALL => IDAPolicy.AllowAll
+    case codec.AllocationGroupIDAPolicy.Unrecognized(v) => throw new EncodingError(f"Invalid AllocationGroup IDAPolicy: $v")
+
   def encode(o: AllocationGroupState): codec.AllocationGroupState =
     codec.AllocationGroupState(
       groupId = Some(encodeUUID(o.groupId.uuid)),
@@ -1281,7 +1290,9 @@ object Codec extends Logging:
       name = o.name,
       members = o.members.map(encode),
       parentGroups = o.parentGroups.map(g => encodeUUID(g.uuid)),
-      maxSliceSize = o.maxSliceSize.getOrElse(0)
+      maxSliceSize = o.maxSliceSize.getOrElse(0),
+      idaPolicy = encodeIDAPolicy(o.idaPolicy),
+      ida = o.ida.map(encode)
     )
 
   def decode(m: codec.AllocationGroupState): AllocationGroupState =
@@ -1291,7 +1302,8 @@ object Codec extends Logging:
     val members = m.members.map(decode).toList
     val parentGroups = m.parentGroups.map(u => AllocationGroupId(decodeUUID(u))).toList
     val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
-    new AllocationGroupState(groupId, level, name, members, parentGroups, maxSliceSize)
+    val idaPolicy = decodeIDAPolicy(m.idaPolicy)
+    new AllocationGroupState(groupId, level, name, members, parentGroups, maxSliceSize, idaPolicy, m.ida.map(decode))
 
   def encode(o: StorageDeviceSetState): codec.StorageDeviceSetState =
     codec.StorageDeviceSetState(

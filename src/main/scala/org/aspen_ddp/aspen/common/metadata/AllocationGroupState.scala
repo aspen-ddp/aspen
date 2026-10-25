@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.common.metadata
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectState, KeyValueObjectState, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
 import org.aspen_ddp.aspen.common.network.Codec
@@ -60,6 +61,23 @@ object AllocationGroupState:
     extends Exception(s"Member $memberId with maxSliceSize ${memberLimit.getOrElse("unlimited")} cannot join a " +
       s"group whose maxSliceSize is $groupLimit")
 
+  /** Thrown when a pool or group cannot join an `ExactMatch` group because its IDA is not equal to the group's, or
+    * because it has none (an `AllowAll` child group). Raised before any state changes.
+    */
+  final case class MemberIDAMismatch(memberId: UUID, memberIda: Option[IDA], groupIda: Option[IDA])
+    extends Exception(s"Member $memberId with IDA ${memberIda.getOrElse("none (AllowAll)")} cannot join a " +
+      s"group requiring IDA ${groupIda.getOrElse("none")}")
+
+  /** Throws `MemberIDAMismatch` unless a member with IDA `memberIda` may join `group`. Uses `==`, which compares
+    * the IDA type and every parameter. `IDA.compare` orders by failure tolerance only and must not be used here.
+    */
+  private def checkMemberIda(memberId: UUID, memberIda: Option[IDA], group: AllocationGroupState): Unit =
+    group.idaPolicy match
+      case IDAPolicy.AllowAll => ()
+      case IDAPolicy.ExactMatch =>
+        if memberIda != group.ida then
+          throw MemberIDAMismatch(memberId, memberIda, group.ida)
+
   /** Throws `MemberLimitExceedsGroup` unless a member with slice limit `memberLimit` may join `group` */
   private def checkMemberLimit(memberId: UUID, memberLimit: Option[Int], group: AllocationGroupState): Unit =
     group.maxSliceSize.foreach: groupLimit =>
@@ -83,6 +101,7 @@ object AllocationGroupState:
         None
       else
         checkMemberLimit(ps.poolId.uuid, ps.effectiveMaxSliceSize, ags)
+        checkMemberIda(ps.poolId.uuid, Some(ps.ida), ags)
 
         val nps = ps.copy(allocationGroups = parentId.uuid :: ps.allocationGroups)
         val reqs = List(KeyRevision(StoragePoolState.ConfigKey, psKvos.contents(StoragePoolState.ConfigKey).revision))
@@ -188,6 +207,7 @@ object AllocationGroupState:
           throw new InvalidLevel()
 
         checkMemberLimit(child.groupId.uuid, child.maxSliceSize, parent)
+        checkMemberIda(child.groupId.uuid, child.ida, parent)
 
         val nchild = child.copy(parentGroups = parentId :: child.parentGroups)
 
@@ -254,7 +274,10 @@ object AllocationGroupState:
       prep(tx)
 
 
-/** @param maxSliceSize the group's declared slice limit, or `None` for no limit. Fixed when the group is created.
+/** @param idaPolicy whether members must share the group's IDA. Fixed when the group is created.
+  * @param ida       the IDA every member must equal: `Some` exactly when `idaPolicy` is `ExactMatch`. Fixed when the
+  *                  group is created.
+  * @param maxSliceSize the group's declared slice limit, or `None` for no limit. Fixed when the group is created.
   *                     Only pools and groups whose own `maxSliceSize` is no larger may join. Most code should use
   *                     the group allocator's `maxObjectSize` instead.
   */
@@ -264,7 +287,9 @@ final case class AllocationGroupState(
                                      name: String,
                                      members: List[AllocationGroupState.Member],
                                      parentGroups: List[AllocationGroupId],
-                                     maxSliceSize: Option[Int] = None
+                                     maxSliceSize: Option[Int] = None,
+                                     idaPolicy: IDAPolicy = IDAPolicy.AllowAll,
+                                     ida: Option[IDA] = None
                                      ):
 
   private var wselector: Option[WeightedSelector[AllocationGroupState.Member]] = None

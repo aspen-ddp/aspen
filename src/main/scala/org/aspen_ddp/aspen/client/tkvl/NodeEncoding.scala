@@ -1,6 +1,69 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import org.aspen_ddp.aspen.common.objects.Key
+import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectReader, Transaction}
+import org.aspen_ddp.aspen.common.ida.IDA
+import org.aspen_ddp.aspen.common.objects.{Key, KeyOrdering, ObjectPointer, ObjectRevision, Value}
+
+import scala.concurrent.Future
+
+/** How the nodes of a TKVL are stored. Each `TreeKind` has one encoding; the tree code above it works only with
+  * `ListNode`, `ObjectPointer` and `NodeLink`. Handing an encoding a node or pointer of another kind is a
+  * programmer error and fails with `IllegalArgumentException`.
+  */
+trait NodeEncoding:
+  def kind: TreeKind
+
+  /** Reads the node at `pointer`, whose minimum key is `minimum`. Also used to refresh a node. */
+  def read(reader: ObjectReader, pointer: ObjectPointer, minimum: Key, ordering: KeyOrdering,
+           comment: String): Future[ListNode]
+
+  /** Inserts or replaces `key` in `node`, which must be the node whose range holds `key`. A node that would grow
+    * past `maxNodeSize` is split: the new right node is allocated from `allocator` and `prepareForSplit` is called
+    * with its minimum and pointer. `requirement` is `Left(true)` for "key must not exist" or `Right(revision)` for
+    * "key must be at this revision"; encodings that cannot enforce it throw `UnsupportedRequirement`.
+    */
+  def insert(node: ListNode,
+             key: Key,
+             value: Value,
+             maxNodeSize: Int,
+             allocator: ObjectAllocator,
+             prepareForSplit: (Key, ObjectPointer) => Future[Unit],
+             requirement: Option[Either[Boolean, ObjectRevision]])(using Transaction): Future[Unit]
+
+  /** Deletes `key` from `node`. Deleting the last key of a node with a right link joins the right node into it
+    * and calls `prepareForJoin` with the right node's minimum and pointer.
+    */
+  def delete(node: ListNode, key: Key, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
+            (using Transaction): Future[Unit]
+
+  /** Splits the list at `splitAtKey`, keeping keys below it (and it too when `inclusive`) in `node`. Returns the
+    * head of the new list holding the rest, whose minimum is `Key.AbsoluteMinimum` (see `KeyValueListNode.splitAt`).
+    */
+  def splitAt(node: ListNode,
+              splitAtKey: Key,
+              inclusive: Boolean,
+              optionalDownPointer: Option[ObjectPointer],
+              allocator: ObjectAllocator)(using Transaction): Future[NodeLink]
+
+  /** Allocates the first node of a tree holding `entries` */
+  def allocate(allocator: ObjectAllocator, entries: Map[Key, Value])(using Transaction): Future[ObjectPointer]
+
+  /** Deletes every node of the list starting at `head`, calling `odeleteEntry` for each entry first if given */
+  def deleteList(client: AspenClient,
+                 head: NodeLink,
+                 ordering: KeyOrdering,
+                 odeleteEntry: Option[(Key, Value) => Future[Unit]]): Future[Unit]
+
+  /** Largest `maxNodeSize` a node of this kind stored in a pool with this IDA and slice limit may use, or `None`
+    * for no limit. See `NodeAllocator.nodeSizeLimit`.
+    */
+  def nodeSizeLimit(ida: IDA, maxSliceSize: Option[Int]): Option[Int]
+
+object NodeEncoding:
+  def apply(kind: TreeKind): NodeEncoding = kind match
+    case TreeKind.KeyValueObjects => KeyValueNodeEncoding
+    case TreeKind.DataObjects =>
+      throw new UnsupportedOperationException("The DataObject node encoding is not implemented yet")
 
 object SplitPlan:
 

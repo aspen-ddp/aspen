@@ -35,3 +35,6 @@ class EmptyTree extends KeyValueError
 
 class BrokenTree extends KeyValueError
 
+/** The tree's node encoding cannot enforce the requested insert requirement (see `NodeEncoding.insert`) */
+class UnsupportedRequirement(val kind: TreeKind) extends KeyValueError:
+  override def getMessage: String = s"Insert requirements are not supported by $kind trees"

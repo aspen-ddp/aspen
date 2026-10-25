@@ -329,7 +329,7 @@ object KeyValueListNode extends Logging {
     withoutContent - Varint.getUnsignedIntEncodingLength(0) + Varint.getUnsignedIntEncodingLength(contentCount + 1)
 
   // Implemented as a non-class member to prevent accidental use of member variables instead of "node." attributes
-  private def insert(node: KeyValueListNode,
+  private[tkvl] def insert(node: KeyValueListNode,
                      ordering: KeyOrdering,
                      key: Key,
                      value: Value,
@@ -721,7 +721,7 @@ object KeyValueListNode extends Logging {
    * implementation is aimed at partitioning trees for the purpose of
    * slow deletion so it should be a non-issue.
    */
-  private def splitAt(node: KeyValueListNode,
+  private[tkvl] def splitAt(node: KeyValueListNode,
                       ordering: KeyOrdering,
                       splitAtKey: Key,
                       inclusive: Boolean,

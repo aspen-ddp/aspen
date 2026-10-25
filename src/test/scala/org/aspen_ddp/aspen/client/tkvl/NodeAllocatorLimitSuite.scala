@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, ObjectAllocatorId, PoolObjectAllocatorId, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyValueObjectPointer, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.server.store.{KVObjectState, ValueState}
 import org.scalatest.compatible.Assertion
@@ -212,6 +212,136 @@ class NodeAllocatorLimitSuite extends IntegrationTestSuite with NodeFillBehaviou
 class NodeAllocatorUnlimitedSuite extends IntegrationTestSuite:
   atest("an unlimited allocator accepts any node size"):
     new NodeAllocator(client, List((PoolObjectAllocatorId(Radicle.poolId), Int.MaxValue))).validate().map(_ => succeed)
+
+
+/** Kind-aware node size limits. ReedSolomon(5, 3, 4) gives an object limit about three times the slice limit, so
+  * the KeyValue-object limit (slice bytes) and the DataObject limit (object bytes) differ.
+  */
+class NodeAllocatorKindLimitSuite extends IntegrationTestSuite:
+  import NodeAllocatorLimitSuite.*
+
+  override def testIda: IDA = ReedSolomon(5, 3, 4)
+  override def testPoolMaxSliceSize: Option[Int] = Some(sliceLimit)
+  override def testStoreMaxSliceSize: Option[Long] = Some(sliceLimit.toLong)
+
+  private val dataLimit: Int = testIda.maxObjectSize(sliceLimit.toLong)
+
+  private def allocator(sizes: Int*): NodeAllocator =
+    new NodeAllocator(client, sizes.map(sz => (PoolObjectAllocatorId(Radicle.poolId), sz)).toList)
+
+  test("the DataObject limit is the pool's object limit and the KeyValue limit its slice limit"):
+    assert(dataLimit > sliceLimit)
+    assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit), TreeKind.DataObjects) == Some(dataLimit))
+    assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit), TreeKind.KeyValueObjects) == Some(sliceLimit))
+    assert(NodeAllocator.nodeSizeLimit(testIda, Some(sliceLimit)) == Some(sliceLimit))
+    assert(NodeAllocator.nodeSizeLimit(testIda, None, TreeKind.DataObjects) == None)
+
+  atest("a tier at the DataObject limit validates for DataObjects but not for KeyValue objects"):
+    for
+      _ <- allocator(dataLimit).validate(TreeKind.DataObjects)
+      kv <- limitError(allocator(dataLimit).validate(TreeKind.KeyValueObjects))
+      kvDefault <- limitError(allocator(dataLimit).validate())
+    yield
+      assert(kv == NodeSizeExceedsAllocatorLimit(0, dataLimit, sliceLimit))
+      assert(kvDefault == kv)
+
+  atest("for each kind a tier above the pool limit fails validate and getAllocatorForTier"):
+    for
+      data <- limitError(allocator(dataLimit, dataLimit + 1).validate(TreeKind.DataObjects))
+      dataTier <- limitError(allocator(dataLimit, dataLimit + 1).getAllocatorForTier(1, TreeKind.DataObjects))
+      kv <- limitError(allocator(sliceLimit, sliceLimit + 1).validate(TreeKind.KeyValueObjects))
+      kvTier <- limitError(allocator(sliceLimit, sliceLimit + 1).getAllocatorForTier(1, TreeKind.KeyValueObjects))
+    yield
+      assert(data == NodeSizeExceedsAllocatorLimit(1, dataLimit + 1, dataLimit))
+      assert(dataTier == data)
+      assert(kv == NodeSizeExceedsAllocatorLimit(1, sliceLimit + 1, sliceLimit))
+      assert(kvTier == kv)
+
+  atest("a DataObject node allocated in a pool below the tier's node size fails where the node lands"):
+    given tx: Transaction = client.newTransaction()
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      stub = new StubAllocator(pool.allocator, None)
+      na = new StubNodeAllocator(client, stub, dataLimit + 1)
+      _ <- na.validate(TreeKind.DataObjects)
+      alloc <- na.getAllocatorForTier(0, TreeKind.DataObjects)
+      err <- limitError(alloc.allocateDataObject())
+    yield
+      assert(err == NodeSizeExceedsAllocatorLimit(0, dataLimit + 1, dataLimit))
+
+  atest("a DataObject node at the pool limit allocates"):
+    given tx: Transaction = client.newTransaction()
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      stub = new StubAllocator(pool.allocator, None)
+      na = new StubNodeAllocator(client, stub, dataLimit)
+      alloc <- na.getAllocatorForTier(0, TreeKind.DataObjects)
+      ptr <- alloc.allocateDataObject()
+    yield
+      assert(ptr.poolId == Radicle.poolId)
+
+
+/** `KeyValueNodeEncoding` delegates to the `KeyValueListNode` statics */
+class KeyValueNodeEncodingSuite extends IntegrationTestSuite:
+
+  private def key(i: Int): Key = Key(Array[Byte](i.toByte))
+  private def value(i: Int): Value = Value(Array[Byte](i.toByte, i.toByte))
+
+  /** Entries as (key, value) numbers: Key and Value compare by reference */
+  private def bytes(node: ListNode): List[(Int, Int)] =
+    node.entries.map((k, v) => (k.bytes.head.toInt, v.bytes.head.toInt))
+
+  test("NodeEncoding selects the KeyValue encoding and it uses the KeyValue node size limit"):
+    val enc = NodeEncoding(TreeKind.KeyValueObjects)
+    assert(enc eq KeyValueNodeEncoding)
+    assert(enc.kind == TreeKind.KeyValueObjects)
+    assert(enc.nodeSizeLimit(ReedSolomon(5, 3, 4), Some(4096)) ==
+      NodeAllocator.nodeSizeLimit(ReedSolomon(5, 3, 4), Some(4096), TreeKind.KeyValueObjects))
+
+  atest("allocate, insert, read and delete through the encoding"):
+    val enc = KeyValueNodeEncoding
+    val noSplit: (Key, ObjectPointer) => Future[Unit] = (_, _) => Future.failed(new Exception("no split expected"))
+    val noJoin: (Key, ObjectPointer) => Future[Unit] = (_, _) => Future.failed(new Exception("no join expected"))
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      alloc = pool.allocator
+      tx0 = client.newTransaction()
+      kvos0 <- client.read(radicle)
+      _ = tx0.bumpVersion(radicle, kvos0.revision)
+      ptr <- enc.allocate(alloc, Map(key(1) -> value(1)))(using tx0)
+      _ <- tx0.commit()
+      n0 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
+      tx1 = client.newTransaction()
+      _ <- enc.insert(n0, key(2), value(2), 4096, alloc, noSplit, None)(using tx1)
+      _ <- tx1.commit()
+      n1 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
+      tx2 = client.newTransaction()
+      _ <- enc.delete(n1, key(1), noJoin)(using tx2)
+      _ <- tx2.commit()
+      n2 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
+    yield
+      assert(n0.pointer == ptr)
+      assert(bytes(n0) == List(1 -> 1))
+      assert(bytes(n1) == List(1 -> 1, 2 -> 2))
+      assert(bytes(n2) == List(2 -> 2))
+
+  atest("a node that is not a KeyValueListNode is rejected"):
+    val other = new ListNode:
+      def pointer: ObjectPointer = radicle
+      def minimum: Key = Key.AbsoluteMinimum
+      def maximum: Option[Key] = None
+      def link: Option[NodeLink] = None
+      def ordering: KeyOrdering = ByteArrayKeyOrdering
+      def revision: ObjectRevision = ObjectRevision.Null
+      def refcount: ObjectRefcount = ObjectRefcount(0, 1)
+      def entries: List[(Key, Value)] = Nil
+      def get(key: Key): Option[Value] = None
+      def size: Int = 0
+      def keyInRange(key: Key): Boolean = true
+    given tx: Transaction = client.newTransaction()
+    val err = intercept[IllegalArgumentException]:
+      KeyValueNodeEncoding.delete(other, key(1), (_, _) => Future.unit)
+    Future.successful(assert(err.getMessage.contains("KeyValueListNode")))
 
 
 /** RandomAccessReedSolomon slices hold whole cells, so a short right pointer occupies a full cell of every slice */

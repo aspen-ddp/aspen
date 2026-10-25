@@ -222,10 +222,10 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     * node's revision and drops its refcount.
     *
     * The joined node takes this node's minimum, which may be longer than the right node's, so it can be larger than
-    * the right node. No size limit is available here, so the join happens only when the joined node is no larger
-    * than the right node is now. Otherwise this node is left empty, keeping its link, and no join is made.
+    * the right node. The join happens only when the joined node fits within `maxNodeSize`. Otherwise this node is
+    * left empty, keeping its link, and no join is made, so the delete always succeeds.
     */
-  def delete(node: ListNode, key: Key, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
+  def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
             (using tx: Transaction): Future[Unit] =
     val n = dataNode(node)
     given ExecutionContext = n.reader.client.clientContext
@@ -239,7 +239,7 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
           n.reader.read(dataPointer(right.pointer),
             s"Joining DataObject TKVL node ${right.pointer.id}. Minimum: ${right.minimum}. target: $key").flatMap: rs =>
             val r = new DataObjectListNode(n.reader, n.ordering, rs)
-            if encodedSize(r.entries, n.minimum, r.link) > rs.size then
+            if encodedSize(r.entries, n.minimum, r.link) > maxNodeSize then
               writeNode(n, encode(Nil, n.minimum, n.link))
               Future.unit
             else

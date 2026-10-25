@@ -157,7 +157,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     def onJoin(delMinimum: Key, delNode: ObjectPointer): Future[Unit] =
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
-    deleteFromContainingNode(key, node => encodingFor(node).delete(node, key, onJoin))
+    rootManager.getMaxNodeSize(0).flatMap: maxNodeSize =>
+      deleteFromContainingNode(key, node => encodingFor(node).delete(node, key, maxNodeSize, onJoin))
 
   /** Descends to the tier-0 node containing `key` and hands it to `del`.
    *

@@ -328,11 +328,11 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
     for
       n0 <- makeNode(List(key(1) -> vbytes(1), key(2) -> vbytes(2), key(3) -> vbytes(3)), key(1), link)
       tx = client.newTransaction()
-      _ <- enc.delete(n0, key(2), noJoin)(using tx)
+      _ <- enc.delete(n0, key(2), 4096, noJoin)(using tx)
       _ <- tx.commit()
       n1 <- readNode(n0.pointer, key(1))
       tx2 = client.newTransaction()
-      _ <- enc.delete(n1, key(99), noJoin)(using tx2)
+      _ <- enc.delete(n1, key(99), 4096, noJoin)(using tx2)
     yield
       assert(asBytes(n1.entries) == asBytes(List(key(1) -> vbytes(1), key(3) -> vbytes(3))))
       assert(sameLink(n1.link, link))
@@ -351,7 +351,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       right <- makeNode(rightEntries, key(50), rightLink)
       left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
       tx = client.newTransaction()
-      _ <- enc.delete(left, key(1), onJoin)(using tx)
+      _ <- enc.delete(left, key(1), 4096, onJoin)(using tx)
       _ <- tx.commit()
       l1 <- readNode(left.pointer)
       oright <- client.readOptional(right.pointer.asInstanceOf[DataObjectPointer])
@@ -364,22 +364,47 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       assert(sameLink(l1.link, rightLink))
       assert(oright.isEmpty)
 
-  atest("a join that would be larger than the right node leaves the left node empty and linked instead"):
-    // The left minimum is much longer than the right one, so the joined node would outgrow the right node
-    val leftMinimum = Key(Array.fill[Byte](60)(1))
-    val rightLink = Some(NodeLink(key(90), fakePointer(1)))
-    val rightEntries = List(key(50) -> vbytes(50), key(60) -> vbytes(60))
+  // The left minimum is much longer than the right one, so the joined node is larger than the right node
+  private val longLeftMinimum = Key(Array.fill[Byte](60)(1))
+  private val joinRightLink = Some(NodeLink(key(90), fakePointer(1)))
+  private val joinRightEntries = List(key(50) -> vbytes(50), key(60) -> vbytes(60))
+  private val joinedSize = enc.encodedSize(joinRightEntries, longLeftMinimum, joinRightLink)
+
+  atest("a join larger than the right node but within maxNodeSize happens"):
+    var joined: List[(Key, ObjectPointer)] = Nil
+    val onJoin: (Key, ObjectPointer) => Future[Unit] = (k, p) =>
+      joined = (k, p) :: joined
+      Future.unit
+    for
+      right <- makeNode(joinRightEntries, key(50), joinRightLink)
+      left <- makeNode(List(longLeftMinimum -> vbytes(1)), longLeftMinimum, Some(NodeLink(key(50), right.pointer)))
+      tx = client.newTransaction()
+      _ <- enc.delete(left, longLeftMinimum, joinedSize, onJoin)(using tx)
+      _ <- tx.commit()
+      l1 <- readNode(left.pointer)
+      oright <- client.readOptional(right.pointer.asInstanceOf[DataObjectPointer])
+    yield
+      assert(joinedSize > enc.encodedSize(joinRightEntries, key(50), joinRightLink))
+      assert(joined.map(_._2) == List(right.pointer))
+      assert(asBytes(l1.entries) == asBytes(joinRightEntries))
+      assert(l1.minimum == longLeftMinimum)
+      assert(sameLink(l1.link, joinRightLink))
+      assert(oright.isEmpty)
+
+  atest("a join larger than maxNodeSize leaves the left node empty and linked instead"):
+    val leftMinimum = longLeftMinimum
+    val rightLink = joinRightLink
+    val rightEntries = joinRightEntries
     for
       right <- makeNode(rightEntries, key(50), rightLink)
       rightLinkFromLeft = Some(NodeLink(key(50), right.pointer))
       left <- makeNode(List(leftMinimum -> vbytes(1)), leftMinimum, rightLinkFromLeft)
       tx = client.newTransaction()
-      _ <- enc.delete(left, leftMinimum, noJoin)(using tx)
+      _ <- enc.delete(left, leftMinimum, joinedSize - 1, noJoin)(using tx)
       _ <- tx.commit()
       l1 <- readNode(left.pointer)
       r1 <- readNode(right.pointer)
     yield
-      assert(enc.encodedSize(rightEntries, leftMinimum, rightLink) > enc.encodedSize(rightEntries, key(50), rightLink))
       assert(l1.entries.isEmpty)
       assert(l1.minimum == leftMinimum)
       assert(sameLink(l1.link, rightLinkFromLeft))
@@ -395,7 +420,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       // Modify the right node after the join has read and staged it
-      _ <- enc.delete(left, key(1), (_, _) =>
+      _ <- enc.delete(left, key(1), 4096, (_, _) =>
         for
           r <- readNode(right.pointer, key(50))
           tx2 = client.newTransaction()
@@ -416,7 +441,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
     for
       n0 <- makeNode(List(key(1) -> vbytes(1)))
       tx = client.newTransaction()
-      _ <- enc.delete(n0, key(1), noJoin)(using tx)
+      _ <- enc.delete(n0, key(1), 4096, noJoin)(using tx)
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)
     yield
@@ -548,7 +573,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       _ <- enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, None)(using tx)
-      err <- Future.delegate(enc.delete(n0, key(1), noJoin)(using tx)).failed
+      err <- Future.delegate(enc.delete(n0, key(1), 4096, noJoin)(using tx)).failed
     yield
       assert(alreadyModified(err, n0))
 
@@ -561,7 +586,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(original)
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.delete(n0, key(2), noJoin)(using tx)
+      _ <- enc.delete(n0, key(2), 4096, noJoin)(using tx)
       err <- Future.delegate(enc.insert(n0, key(3), vbytes(3, 100), maxNodeSize, alloc, noSplit, None)(using tx))
         .failed
       txErr <- tx.result.failed
@@ -578,7 +603,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       _ <- enc.insert(left, key(2), vbytes(2), 4096, alloc, noSplit, None)(using tx)
-      err <- Future.delegate(enc.delete(left, key(1), noJoin)(using tx)).failed
+      err <- Future.delegate(enc.delete(left, key(1), 4096, noJoin)(using tx)).failed
     yield
       assert(alreadyModified(err, left))
 
@@ -589,7 +614,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       alloc <- allocator()
       tx = client.newTransaction()
       _ <- enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, None)(using tx)
-      err <- Future.delegate(enc.delete(left, key(1), noJoin)(using tx)).failed
+      err <- Future.delegate(enc.delete(left, key(1), 4096, noJoin)(using tx)).failed
       txErr <- tx.result.failed
       l1 <- readNode(left.pointer)
     yield
@@ -607,7 +632,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.delete(left, key(1), onJoin)(using tx)
+      _ <- enc.delete(left, key(1), 4096, onJoin)(using tx)
       err <- Future.delegate(enc.insert(right, key(60), vbytes(60), 4096, alloc, noSplit, None)(using tx)).failed
     yield
       assert(joined)
@@ -619,7 +644,7 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       n0 <- makeNode(original)
       alloc <- allocator()
       tx = client.newTransaction()
-      _ <- enc.delete(n0, key(1), noJoin)(using tx)
+      _ <- enc.delete(n0, key(1), 4096, noJoin)(using tx)
       err <- Future.delegate(enc.splitAt(n0, key(4), false, None, alloc)(using tx)).failed
       _ <- tx.commit()
       n1 <- readNode(n0.pointer)

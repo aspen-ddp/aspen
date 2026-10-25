@@ -38,7 +38,8 @@ object KeyValueNodeEncoding extends NodeEncoding:
     given ExecutionContext = n.reader.client.clientContext
     KeyValueListNode.insert(n, n.ordering, key, value, maxNodeSize, allocator, prepareForSplit, requirement)
 
-  def delete(node: ListNode, key: Key, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
+  /** `maxNodeSize` is not needed: a KeyValue join is never larger than the two nodes it joins */
+  def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
             (using Transaction): Future[Unit] =
     val n = kvNode(node)
     given ExecutionContext = n.reader.client.clientContext

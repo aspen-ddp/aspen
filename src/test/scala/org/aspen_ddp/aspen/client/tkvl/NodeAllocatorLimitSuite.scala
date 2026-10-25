@@ -337,7 +337,7 @@ class KeyValueNodeEncodingSuite extends IntegrationTestSuite:
       _ <- tx1.commit()
       n1 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
       tx2 = client.newTransaction()
-      _ <- enc.delete(n1, key(1), noJoin)(using tx2)
+      _ <- enc.delete(n1, key(1), 4096, noJoin)(using tx2)
       _ <- tx2.commit()
       n2 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
     yield
@@ -361,7 +361,7 @@ class KeyValueNodeEncodingSuite extends IntegrationTestSuite:
       def keyInRange(key: Key): Boolean = true
     given tx: Transaction = client.newTransaction()
     val err = intercept[IllegalArgumentException]:
-      KeyValueNodeEncoding.delete(other, key(1), (_, _) => Future.unit)
+      KeyValueNodeEncoding.delete(other, key(1), 4096, (_, _) => Future.unit)
     Future.successful(assert(err.getMessage.contains("KeyValueListNode")))
 
 

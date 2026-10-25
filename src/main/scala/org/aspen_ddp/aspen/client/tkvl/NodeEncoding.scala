@@ -31,9 +31,10 @@ trait NodeEncoding:
              requirement: Option[Either[Boolean, ObjectRevision]])(using Transaction): Future[Unit]
 
   /** Deletes `key` from `node`. Deleting the last key of a node with a right link joins the right node into it
-    * and calls `prepareForJoin` with the right node's minimum and pointer.
+    * and calls `prepareForJoin` with the right node's minimum and pointer. `maxNodeSize` is the node's tier's; an
+    * encoding whose joined node can outgrow the right node uses it to decide whether the join fits.
     */
-  def delete(node: ListNode, key: Key, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
+  def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
             (using Transaction): Future[Unit]
 
   /** Splits the list at `splitAtKey`, keeping keys below it (and it too when `inclusive`) in `node`. Returns the

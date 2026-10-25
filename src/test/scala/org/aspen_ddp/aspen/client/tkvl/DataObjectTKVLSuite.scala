@@ -3,10 +3,10 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{InvalidObject, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, IntegerKeyOrdering, Key, KeyValueObjectPointer, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, IntegerKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, ObjectPointer, Value}
 
 import scala.concurrent.Future
-import scala.util.Success
+import scala.util.{Random, Success}
 
 class DataObjectTKVLSuite extends IntegrationTestSuite:
 
@@ -38,12 +38,13 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
 
   /** An empty tree of `kind` whose root is hosted under `treeKey` */
   private def newRootManager(maxNodeSize: Int = smallNodeSize,
-                             kind: TreeKind = TreeKind.DataObjects): Future[KVObjectRootManager] =
+                             kind: TreeKind = TreeKind.DataObjects,
+                             treeOrdering: KeyOrdering = ordering): Future[KVObjectRootManager] =
     for
       host <- rootHost()
       nodeAllocator = new SinglePoolNodeAllocator(client, Radicle.poolId, maxNodeSize)
       tx = client.newTransaction()
-      froot <- KVObjectRootManager.createNewTree(client, host, treeKey, ordering, nodeAllocator, Map(), kind)(using tx)
+      froot <- KVObjectRootManager.createNewTree(client, host, treeKey, treeOrdering, nodeAllocator, Map(), kind)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
       rm <- froot
@@ -279,6 +280,24 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
 
   // ---------------------------------------------------------------------------------------------------------------
   // Walks
+
+  atest("deleting every key of a lexical-key tree with varied key lengths leaves no empty tier-0 node behind"):
+    // Left minimums often encode longer than their right neighbour's, which must not stop the joins
+    val rnd = new Random(20261025L)
+    val ks = List.fill(80)(Key(Array.fill(1 + rnd.nextInt(40))(('a' + rnd.nextInt(26)).toByte))).distinct
+    for
+      rm <- newRootManager(300, TreeKind.DataObjects, LexicalKeyOrdering)
+      tree <- rm.getDataObjectTree()
+      _ <- setAll(tree, ks)
+      before <- tier0Nodes(rm)
+      _ <- deleteAll(tree, rnd.shuffle(ks))
+      after <- tier0Nodes(rm)
+      remaining <- Future.sequence(ks.map(tree.get))
+    yield
+      assert(before.size > 5)
+      assert(remaining.forall(_.isEmpty))
+      assert(after.tail.forall(_.entries.nonEmpty))
+      assert(after.size == 1)
 
   atest("foreachFrom and foreachInRange honor inclusive and exclusive bounds on node edges"):
     val all = keys(1 to 24)

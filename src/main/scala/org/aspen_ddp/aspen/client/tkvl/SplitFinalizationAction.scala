@@ -37,7 +37,7 @@ class SplitFinalizationAction(val client: AspenClient,
 
         for {
           alloc <- rootManager.getAllocatorForTier(tier)
-          nroot <- TierEngine.encodingFor(rootNode).allocate(alloc, rootContent)
+          nroot <- TierEngine.encodingFor(rootNode).allocate(alloc, ordering, rootContent)
           _ <- rootManager.prepareRootUpdate(tier, Some(nroot))
           _ <- tx.commit()
         } yield ()

@@ -45,8 +45,9 @@ trait NodeEncoding:
               optionalDownPointer: Option[ObjectPointer],
               allocator: ObjectAllocator)(using Transaction): Future[NodeLink]
 
-  /** Allocates the first node of a tree holding `entries` */
-  def allocate(allocator: ObjectAllocator, entries: Map[Key, Value])(using Transaction): Future[ObjectPointer]
+  /** Allocates the first node of a tree, or of a new tier, holding `entries`, whose order is given by `ordering` */
+  def allocate(allocator: ObjectAllocator, ordering: KeyOrdering, entries: Map[Key, Value])
+              (using Transaction): Future[ObjectPointer]
 
   /** Deletes every node of the list starting at `head`, calling `odeleteEntry` for each entry first if given */
   def deleteList(client: AspenClient,
@@ -62,8 +63,7 @@ trait NodeEncoding:
 object NodeEncoding:
   def apply(kind: TreeKind): NodeEncoding = kind match
     case TreeKind.KeyValueObjects => KeyValueNodeEncoding
-    case TreeKind.DataObjects =>
-      throw new UnsupportedOperationException("The DataObject node encoding is not implemented yet")
+    case TreeKind.DataObjects => DataObjectNodeEncoding
 
 object SplitPlan:
 

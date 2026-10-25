@@ -239,7 +239,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
           for
             _ <- rootManager.createInitialNode(Map())
             alloc <- rootManager.getAllocatorForTier(0)
-            ptr <- encoding.allocate(alloc, Map[Key, Value]())
+            ptr <- encoding.allocate(alloc, ordering, Map[Key, Value]())
           yield
             (tier, ptr)
     yield

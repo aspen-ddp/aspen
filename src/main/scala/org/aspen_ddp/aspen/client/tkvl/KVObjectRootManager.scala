@@ -106,7 +106,7 @@ class KVObjectRootManager(val client: AspenClient,
             tx.abortAndThrow(new Exception("Initial TKVL node already exists."))
 
       alloc <- root.nodeAllocator.getAllocatorForTier(0, root.kind)
-      rptr <- NodeEncoding(root.kind).allocate(alloc, contents)
+      rptr <- NodeEncoding(root.kind).allocate(alloc, root.ordering, contents)
     } yield {
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator, root.kind)
       // Pin the revision at which the tree was observed to be empty. Callers

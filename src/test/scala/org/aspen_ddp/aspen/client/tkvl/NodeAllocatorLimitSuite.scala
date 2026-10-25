@@ -308,7 +308,7 @@ class KeyValueNodeEncodingSuite extends IntegrationTestSuite:
       tx0 = client.newTransaction()
       kvos0 <- client.read(radicle)
       _ = tx0.bumpVersion(radicle, kvos0.revision)
-      ptr <- enc.allocate(alloc, Map(key(1) -> value(1)))(using tx0)
+      ptr <- enc.allocate(alloc, ByteArrayKeyOrdering, Map(key(1) -> value(1)))(using tx0)
       _ <- tx0.commit()
       n0 <- enc.read(client, ptr, Key.AbsoluteMinimum, ByteArrayKeyOrdering, "test read")
       tx1 = client.newTransaction()

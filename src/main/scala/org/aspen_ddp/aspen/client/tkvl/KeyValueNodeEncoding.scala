@@ -54,7 +54,8 @@ object KeyValueNodeEncoding extends NodeEncoding:
     KeyValueListNode.splitAt(n, n.ordering, splitAtKey, inclusive, optionalDownPointer.map(kvPointer), allocator)
       .map(p => NodeLink(p.minimum, p.pointer))
 
-  def allocate(allocator: ObjectAllocator, entries: Map[Key, Value])(using Transaction): Future[ObjectPointer] =
+  def allocate(allocator: ObjectAllocator, ordering: KeyOrdering, entries: Map[Key, Value])
+              (using Transaction): Future[ObjectPointer] =
     allocator.allocateKeyValueObject(entries)
 
   def deleteList(client: AspenClient,

@@ -52,11 +52,16 @@ class TierEngineSuite extends IntegrationTestSuite:
     new TierEngine(client, new StubRootManager(stub)).get(theKey).map: v =>
       assert(v.map(_.bytes.toList) == Some(theValue.bytes.toList))
 
-  atest("TierEngine picks the encoding from a DataObjects root's kind"):
-    // NodeEncoding(DataObjects) is not implemented yet, so choosing it is observable as this failure
+  test("TierEngine picks the encoding from a node's tree kind"):
+    val kvStub = new StubNode(KeyValueObjectPointer(ObjectId(new UUID(1, 2)), poolId))
+    val doStub = new StubNode(DataObjectPointer(ObjectId(new UUID(1, 2)), poolId))
+    assert(TierEngine.encodingFor(kvStub) eq KeyValueNodeEncoding)
+    assert(TierEngine.encodingFor(doStub) eq DataObjectNodeEncoding)
+
+  atest("TierEngine reads a DataObjects root"):
     val stub = new StubNode(DataObjectPointer(ObjectId(new UUID(1, 2)), poolId))
-    recoverToSucceededIf[UnsupportedOperationException]:
-      new TierEngine(client, new StubRootManager(stub)).get(theKey)
+    new TierEngine(client, new StubRootManager(stub)).get(theKey).map: v =>
+      assert(v.map(_.bytes.toList) == Some(theValue.bytes.toList))
 
   /** A KeyValueObjects tree holding keys 1 to 30 in nodes small enough to need more than one tier */
   private def multiTierTree(): Future[KVObjectRootManager] =

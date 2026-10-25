@@ -1,0 +1,360 @@
+package org.aspen_ddp.aspen.client.tkvl
+
+import java.util.UUID
+
+import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
+import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.common.ida.ReedSolomon
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.pool.PoolId
+
+import scala.concurrent.Future
+import scala.util.Random
+
+class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
+
+  private val enc = DataObjectNodeEncoding
+  private val ordering = ByteArrayKeyOrdering
+
+  private def key(i: Int): Key = Key(Array[Byte](i.toByte))
+  private def vbytes(i: Int, size: Int = 1): Value = Value(Array.fill[Byte](size)(i.toByte))
+
+  private def fakePointer(n: Int): DataObjectPointer =
+    DataObjectPointer(ObjectId(new UUID(7, n)), PoolId(new UUID(8, n)), Array[Byte](1, 2, 3))
+
+  /** Entries as comparable byte lists: Key compares by content but Value does not */
+  private def asBytes(entries: List[(Key, Value)]): List[(List[Byte], List[Byte])] =
+    entries.map((k, v) => (k.bytes.toList, v.bytes.toList))
+
+  private def sameLink(a: Option[NodeLink], b: Option[NodeLink]): Boolean = (a, b) match
+    case (None, None) => true
+    case (Some(x), Some(y)) => x.minimum == y.minimum && x.pointer == y.pointer &&
+      x.pointer.toArray.toList == y.pointer.toArray.toList
+    case _ => false
+
+  private val noSplit: (Key, ObjectPointer) => Future[Unit] =
+    (_, _) => Future.failed(new Exception("no split expected"))
+  private val noJoin: (Key, ObjectPointer) => Future[Unit] =
+    (_, _) => Future.failed(new Exception("no join expected"))
+
+  private def allocator(): Future[ObjectAllocator] = client.getStoragePool(Radicle.poolId).map(_.allocator)
+
+  /** Allocates and commits a node holding `entries`, then reads it back */
+  private def makeNode(entries: List[(Key, Value)],
+                       minimum: Key = Key.AbsoluteMinimum,
+                       link: Option[NodeLink] = None): Future[DataObjectListNode] =
+    for
+      alloc <- allocator()
+      tx = client.newTransaction()
+      ptr <- alloc.allocateDataObject(DataBuffer(enc.encode(entries, minimum, link)))(using tx)
+      _ <- tx.commit()
+      node <- readNode(ptr, minimum)
+    yield
+      node
+
+  private def readNode(ptr: ObjectPointer, minimum: Key = Key.AbsoluteMinimum): Future[DataObjectListNode] =
+    enc.read(client, ptr, minimum, ordering, "test read").map(_.asInstanceOf[DataObjectListNode])
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Pure encoding
+
+  test("encode/decode round trips entries, minimum and link"):
+    val bigKey = Key(Array.tabulate[Byte](5000)(i => (i % 251).toByte))
+    val cases: List[(List[(Key, Value)], Key, Option[NodeLink])] = List(
+      (Nil, Key.AbsoluteMinimum, None),
+      (Nil, Key("min"), Some(NodeLink(Key("next"), fakePointer(1)))),
+      (List(key(1) -> Value(Array[Byte]())), Key.AbsoluteMinimum, None),
+      (List(key(1) -> vbytes(1), key(2) -> Value(Array[Byte]()), key(3) -> vbytes(3, 300)), key(1),
+        Some(NodeLink(key(9), fakePointer(2)))),
+      (List(bigKey -> vbytes(4, 200)), Key.AbsoluteMinimum, Some(NodeLink(bigKey, fakePointer(3)))),
+      (List(Key.AbsoluteMinimum -> vbytes(5)), Key.AbsoluteMinimum, None))
+
+    cases.foreach: (entries, minimum, link) =>
+      val bytes = enc.encode(entries, minimum, link)
+      val d = enc.decode(bytes)
+      assert(asBytes(d.entries) == asBytes(entries))
+      assert(d.minimum == minimum)
+      assert(sameLink(d.link, link))
+      assert(enc.encodedSize(entries, minimum, link) == bytes.length)
+    succeed
+
+  test("an empty node with the absolute minimum and no link is one byte"):
+    assert(enc.encode(Nil, Key.AbsoluteMinimum, None).length == 1)
+
+  test("encodedSize equals the encoded length and splits into overhead plus entry sizes"):
+    val rnd = new Random(20261025L)
+    def bytes(max: Int): Array[Byte] =
+      val a = new Array[Byte](rnd.nextInt(max + 1))
+      rnd.nextBytes(a)
+      a
+
+    (1 to 300).foreach: _ =>
+      val entries = List.fill(rnd.nextInt(20))(Key(bytes(300)) -> Value(bytes(300)))
+        .sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+      val minimum = Key(bytes(200))
+      val link = if rnd.nextBoolean() then Some(NodeLink(Key(bytes(200)), fakePointer(rnd.nextInt()))) else None
+      val size = enc.encodedSize(entries, minimum, link)
+      assert(size == enc.encode(entries, minimum, link).length)
+      assert(size == enc.nodeOverhead(minimum, link) + entries.map((k, v) => enc.entrySize(k, v)).sum)
+    succeed
+
+  test("NodeEncoding selects the DataObject encoding and it uses the DataObject node size limit"):
+    val e = NodeEncoding(TreeKind.DataObjects)
+    assert(e eq DataObjectNodeEncoding)
+    assert(e.kind == TreeKind.DataObjects)
+    assert(e.nodeSizeLimit(ReedSolomon(5, 3, 4), Some(4096)) ==
+      NodeAllocator.nodeSizeLimit(ReedSolomon(5, 3, 4), Some(4096), TreeKind.DataObjects))
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Insert
+
+  atest("allocate sorts entries and creates a node with the absolute minimum and no link"):
+    for
+      alloc <- allocator()
+      tx = client.newTransaction()
+      ptr <- enc.allocate(alloc, ordering, Map(key(3) -> vbytes(3), key(1) -> vbytes(1), key(2) -> vbytes(2)))(using tx)
+      _ <- tx.commit()
+      node <- readNode(ptr)
+    yield
+      assert(asBytes(node.entries) == asBytes(List(key(1) -> vbytes(1), key(2) -> vbytes(2), key(3) -> vbytes(3))))
+      assert(node.minimum == Key.AbsoluteMinimum)
+      assert(node.link.isEmpty)
+
+  atest("insert under maxNodeSize rewrites the node"):
+    val link = Some(NodeLink(key(50), fakePointer(1)))
+    for
+      n0 <- makeNode(List(key(1) -> vbytes(1), key(5) -> vbytes(5)), key(1), link)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.insert(n0, key(3), vbytes(3), 4096, alloc, noSplit, None)(using tx)
+      _ <- tx.commit()
+      tx2 = client.newTransaction()
+      n1 <- readNode(n0.pointer, key(1))
+      _ <- enc.insert(n1, key(5), vbytes(9), 4096, alloc, noSplit, None)(using tx2)
+      _ <- tx2.commit()
+      n2 <- readNode(n0.pointer, key(1))
+    yield
+      assert(asBytes(n1.entries) == asBytes(List(key(1) -> vbytes(1), key(3) -> vbytes(3), key(5) -> vbytes(5))))
+      assert(n1.revision == tx.revision)
+      assert(sameLink(n1.link, link))
+      assert(n1.minimum == key(1))
+      assert(asBytes(n2.entries) == asBytes(List(key(1) -> vbytes(1), key(3) -> vbytes(3), key(5) -> vbytes(9))))
+
+  atest("insert that overflows splits per SplitPlan and calls prepareForSplit with the new node"):
+    val originalLink = Some(NodeLink(key(100), fakePointer(1)))
+    val original = (1 to 6).toList.map(i => key(i * 10) -> vbytes(i, 100))
+    val newKey = key(35)
+    val newValue = vbytes(35, 100)
+    val maxNodeSize = enc.encodedSize(original, Key.AbsoluteMinimum, originalLink) + 50
+    val all = (newKey -> newValue :: original).sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+    val expectedMoved = SplitPlan.keysToMove(all.map((k, v) => k -> enc.entrySize(k, v)))
+
+    var split: List[(Key, ObjectPointer)] = Nil
+    val onSplit: (Key, ObjectPointer) => Future[Unit] = (k, p) =>
+      split = (k, p) :: split
+      Future.unit
+
+    for
+      n0 <- makeNode(original, Key.AbsoluteMinimum, originalLink)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      _ <- enc.insert(n0, newKey, newValue, maxNodeSize, alloc, onSplit, None)(using tx)
+      _ <- tx.commit()
+      left <- readNode(n0.pointer)
+      (newMin, newPtr) = split.head
+      right <- readNode(newPtr, newMin)
+      leftBytes <- client.read(n0.pointer.asInstanceOf[DataObjectPointer])
+      rightBytes <- client.read(newPtr.asInstanceOf[DataObjectPointer])
+    yield
+      assert(split.size == 1)
+      assert(newMin == expectedMoved.head)
+      assert(right.entries.map(_._1) == expectedMoved)
+      assert(right.minimum == newMin)
+      assert(sameLink(right.link, originalLink))
+      assert(sameLink(left.link, Some(NodeLink(newMin, newPtr))))
+      assert(asBytes(left.entries ++ right.entries) == asBytes(all))
+      assert(leftBytes.size <= maxNodeSize)
+      assert(rightBytes.size <= maxNodeSize)
+
+  atest("a split whose left node would not fit with its new link aborts with NodeSizeExceeded"):
+    // Only key(3) moves right, leaving the big entry in a left node that now needs a link
+    val original = List(key(1) -> vbytes(1, 10), key(2) -> vbytes(2, 900))
+    val maxNodeSize = enc.encodedSize(original, Key.AbsoluteMinimum, None) + 5
+    for
+      n0 <- makeNode(original)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      err <- Future.delegate(enc.insert(n0, key(3), vbytes(3, 10), maxNodeSize, alloc, noSplit, None)(using tx))
+        .failed
+      txErr <- tx.result.failed
+      n1 <- readNode(n0.pointer)
+    yield
+      assert(err.isInstanceOf[NodeSizeExceeded])
+      assert(txErr.isInstanceOf[NodeSizeExceeded])
+      assert(n1.revision == n0.revision)
+
+  atest("insert with a defined requirement throws UnsupportedRequirement"):
+    for
+      n0 <- makeNode(List(key(1) -> vbytes(1)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      r1 <- Future.delegate(enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, Some(Left(true)))(using tx))
+        .failed
+      r2 <- Future.delegate(enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit,
+        Some(Right(n0.revision)))(using tx)).failed
+    yield
+      assert(r1.isInstanceOf[UnsupportedRequirement])
+      assert(r2.isInstanceOf[UnsupportedRequirement])
+      assert(tx.isEmpty)
+
+  atest("an entry too large for the node limit throws NodeSizeExceeded with nothing staged"):
+    val maxNodeSize = 200
+    for
+      n0 <- makeNode(List(key(1) -> vbytes(1)))
+      alloc <- allocator()
+      tx = client.newTransaction()
+      err <- Future.delegate(enc.insert(n0, key(2), vbytes(2, maxNodeSize), maxNodeSize, alloc, noSplit,
+        None)(using tx)).failed
+      n1 <- readNode(n0.pointer)
+    yield
+      assert(err.isInstanceOf[NodeSizeExceeded])
+      assert(tx.isEmpty)
+      assert(n1.revision == n0.revision)
+      assert(asBytes(n1.entries) == asBytes(n0.entries))
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // Delete
+
+  atest("deleting a non-last key rewrites the node"):
+    val link = Some(NodeLink(key(50), fakePointer(1)))
+    for
+      n0 <- makeNode(List(key(1) -> vbytes(1), key(2) -> vbytes(2), key(3) -> vbytes(3)), key(1), link)
+      tx = client.newTransaction()
+      _ <- enc.delete(n0, key(2), noJoin)(using tx)
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer, key(1))
+      tx2 = client.newTransaction()
+      _ <- enc.delete(n1, key(99), noJoin)(using tx2)
+    yield
+      assert(asBytes(n1.entries) == asBytes(List(key(1) -> vbytes(1), key(3) -> vbytes(3))))
+      assert(sameLink(n1.link, link))
+      assert(tx2.isEmpty)
+
+  atest("deleting the last key of a node with a right link joins the right node into it"):
+    val rightLink = Some(NodeLink(key(90), fakePointer(1)))
+    val rightEntries = List(key(50) -> vbytes(50), key(60) -> vbytes(60))
+
+    var joined: List[(Key, ObjectPointer)] = Nil
+    val onJoin: (Key, ObjectPointer) => Future[Unit] = (k, p) =>
+      joined = (k, p) :: joined
+      Future.unit
+
+    for
+      right <- makeNode(rightEntries, key(50), rightLink)
+      left <- makeNode(List(key(1) -> vbytes(1)), Key.AbsoluteMinimum, Some(NodeLink(key(50), right.pointer)))
+      tx = client.newTransaction()
+      _ <- enc.delete(left, key(1), onJoin)(using tx)
+      _ <- tx.commit()
+      l1 <- readNode(left.pointer)
+      oright <- client.readOptional(right.pointer.asInstanceOf[DataObjectPointer])
+    yield
+      assert(joined.size == 1)
+      assert(joined.head._1 == key(50))
+      assert(joined.head._2 == right.pointer)
+      assert(asBytes(l1.entries) == asBytes(rightEntries))
+      assert(l1.minimum == Key.AbsoluteMinimum)
+      assert(sameLink(l1.link, rightLink))
+      assert(oright.isEmpty)
+
+  atest("deleting the last key of the last node leaves an empty node"):
+    for
+      n0 <- makeNode(List(key(1) -> vbytes(1)))
+      tx = client.newTransaction()
+      _ <- enc.delete(n0, key(1), noJoin)(using tx)
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer)
+    yield
+      assert(n1.entries.isEmpty)
+      assert(n1.link.isEmpty)
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // splitAt
+
+  atest("splitAt keeps lower keys in place and returns a two-node list holding the rest"):
+    val originalLink = Some(NodeLink(key(100), fakePointer(1)))
+    val down = fakePointer(2)
+    val original = (1 to 6).toList.map(i => key(i) -> vbytes(i))
+    for
+      n0 <- makeNode(original, Key.AbsoluteMinimum, originalLink)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      head <- enc.splitAt(n0, key(4), false, Some(down), alloc)(using tx)
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer)
+      newLeft <- readNode(head.pointer)
+      newRight <- readNode(newLeft.link.get.pointer, key(4))
+    yield
+      assert(head.minimum == Key.AbsoluteMinimum)
+      assert(asBytes(n1.entries) == asBytes(original.take(3)))
+      assert(n1.link.isEmpty)
+      assert(asBytes(newLeft.entries) == asBytes(List(Key.AbsoluteMinimum -> Value(down.toArray))))
+      assert(newLeft.minimum == Key.AbsoluteMinimum)
+      assert(newLeft.link.get.minimum == key(4))
+      assert(asBytes(newRight.entries) == asBytes(original.drop(3)))
+      assert(newRight.minimum == key(4))
+      assert(sameLink(newRight.link, originalLink))
+
+  atest("inclusive splitAt without a down pointer keeps the split key and leaves the new head empty"):
+    val original = (1 to 6).toList.map(i => key(i) -> vbytes(i))
+    for
+      n0 <- makeNode(original)
+      alloc <- allocator()
+      tx = client.newTransaction()
+      head <- enc.splitAt(n0, key(4), true, None, alloc)(using tx)
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer)
+      newLeft <- readNode(head.pointer)
+      newRight <- readNode(newLeft.link.get.pointer, key(4))
+    yield
+      assert(asBytes(n1.entries) == asBytes(original.take(4)))
+      assert(newLeft.entries.isEmpty)
+      assert(asBytes(newRight.entries) == asBytes(original.drop(4)))
+      assert(newRight.link.isEmpty)
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // deleteList
+
+  /** A three-node list: head (absolute minimum) -> key(10) -> key(20) */
+  private def threeNodeList(): Future[List[DataObjectListNode]] =
+    for
+      c <- makeNode(List(key(20) -> vbytes(20), key(21) -> vbytes(21)), key(20))
+      b <- makeNode(List(key(10) -> vbytes(10)), key(10), Some(NodeLink(key(20), c.pointer)))
+      a <- makeNode(List(key(1) -> vbytes(1), key(2) -> vbytes(2)), Key.AbsoluteMinimum,
+        Some(NodeLink(key(10), b.pointer)))
+    yield
+      List(a, b, c)
+
+  atest("deleteList visits every entry and deletes every node"):
+    var visited: List[(Key, Value)] = Nil
+    val onEntry: (Key, Value) => Future[Unit] = (k, v) =>
+      synchronized { visited = (k, v) :: visited }
+      Future.unit
+    for
+      nodes <- threeNodeList()
+      _ <- enc.deleteList(client, NodeLink(Key.AbsoluteMinimum, nodes.head.pointer), ordering, Some(onEntry))
+      remaining <- Future.sequence(nodes.map(n => client.readOptional(n.pointer.asInstanceOf[DataObjectPointer])))
+    yield
+      assert(asBytes(visited).toSet == asBytes(nodes.flatMap(_.entries)).toSet)
+      assert(visited.size == 5)
+      assert(remaining.forall(_.isEmpty))
+
+  atest("deleteList without a callback deletes every node and tolerates an already deleted list"):
+    for
+      nodes <- threeNodeList()
+      head = NodeLink(Key.AbsoluteMinimum, nodes.head.pointer)
+      _ <- enc.deleteList(client, head, ordering, None)
+      remaining <- Future.sequence(nodes.map(n => client.readOptional(n.pointer.asInstanceOf[DataObjectPointer])))
+      _ <- enc.deleteList(client, head, ordering, None)
+    yield
+      assert(remaining.forall(_.isEmpty))

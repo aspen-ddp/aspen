@@ -322,6 +322,40 @@ class KeyValueNodePlanSuite extends AnyFunSuite:
     assert(tier.nodes.size < before)
     assert(tier.entries.size == tier.nodes.map(_.content.size).sum)
 
+  test("overwriting the only key of a node with a value that fits alone stays in place"):
+    val tier = new Tier(Replication(3, 2), 400)
+    tier.insert(key(1), value(150))
+    // 250 bytes fit in a 400 byte node by themselves but not alongside the 150 bytes being replaced
+    tier.insert(key(1), value(250))
+    tier.checkInvariants("overwrite")
+    assert(tier.nodes.size == 1)
+    assert(tier.entries.map((k, v) => k -> v.bytes.length) == List(key(1) -> 250))
+
+  test("renaming the only key of a node to a longer key that fits alone stays in place"):
+    val tier = new Tier(Replication(3, 2), 400)
+    tier.insert(key(1), value(250))
+    tier.rename(key(1), padded(20, 2))
+    tier.checkInvariants("rename")
+    assert(tier.nodes.size == 1)
+    assert(tier.entries.map(_._1) == List(padded(20, 2)))
+
+  test("overwriting a key never splits a node when the value does not grow"):
+    for seed <- 1 to 20 do
+      val rnd = new Random(seed)
+      val tier = new Tier(Replication(3, 2), 1024)
+      var model = Map.empty[List[Byte], Value]
+      // Fill the nodes as full as inserts allow
+      while tier.nodes.size < 4 do
+        val k = randomKey(rnd)
+        val v = randomValue(rnd)
+        tier.insert(k, v)
+        model += k.bytes.toList -> v
+      val nodeCount = tier.nodes.size
+      model.foreach: (k, v) =>
+        tier.insert(Key(k.toArray), v)
+        tier.checkInvariants(s"seed $seed")
+      assert(tier.nodes.size == nodeCount, s"seed $seed: overwriting with identical values split a node")
+
   test("insert requirements"):
     val ida = Replication(3, 2)
     val tier = new Tier(ida, 1024)

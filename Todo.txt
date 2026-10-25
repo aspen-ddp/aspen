@@ -1,10 +1,6 @@
 TODO
 ====
 
-Need to audit the KeyValueListNode, TKVL, and root manager tests. Several bugs in these areas have
-been uncovered recently which leads me to suspect that the current coverage is far from complete. I
-suspect many edge cases are currently unaccounted for.
-
 Need KeyValueListNode & TKVL prepareUpdates(inserts: List[(Key,Value)], deletes: List[Key]): Future[Unit]
   - Applies all changes in a single transaction
   - May want to consider reimplement individual prepareInsert/prepareDelete operations in terms of this

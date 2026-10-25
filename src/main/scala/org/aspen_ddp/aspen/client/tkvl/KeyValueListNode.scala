@@ -474,7 +474,10 @@ object KeyValueListNode extends Logging {
       case Some(Right(revision)) => KeyRevision(key, revision) :: Nil
     }
 
-    if (newPairSize + currentSize < maxSize)
+    // An overwrite replaces the existing pair rather than adding to it
+    val replacedSize = shape.contents.get(key).map(vs => KVObjectState.idaEncodedPairSize(shape.ida, key, vs.value)).getOrElse(0)
+
+    if (newPairSize + currentSize - replacedSize < maxSize)
       InPlace(WithinRange(key, shape.ordering) :: reqs, List(Insert(key, value.bytes)))
     else {
       val fullContent = shape.contents + (key -> pendingEntry(value))
@@ -497,12 +500,16 @@ object KeyValueListNode extends Logging {
     val newPairSize = KVObjectState.idaEncodedPairSize(shape.ida, newKey, value)
     val maxSize = maxNodeSize - nodeOverhead(shape.ida, shape.minimum, shape.maximum, shape.tail, shape.contents.size)
 
-    if (newPairSize - oldPairSize > maxSize)
+    if (newPairSize > maxSize)
       throw new NodeSizeExceeded
 
     val reqs: List[KeyRequirement] = KeyRevision(oldKey, shape.contents(oldKey).revision) :: Nil
 
-    if (newPairSize + currentSize < maxSize)
+    // The old pair is removed, and a pair already stored under newKey is replaced
+    val replacedSize = shape.contents.get(newKey).filter(_ => newKey != oldKey)
+      .map(vs => KVObjectState.idaEncodedPairSize(shape.ida, newKey, vs.value)).getOrElse(0)
+
+    if (newPairSize + currentSize - oldPairSize - replacedSize < maxSize)
       InPlace(WithinRange(newKey, shape.ordering) :: reqs, List(Delete(oldKey), Insert(newKey, value.bytes)))
     else {
       val fullContent = shape.contents - oldKey + (newKey -> pendingEntry(value))

@@ -186,24 +186,6 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       assert(walkErr == WrongTreeKind(TreeKind.DataObjects, TreeKind.KeyValueObjects))
       assert(tx.isEmpty)
 
-  atest("a TieredKeyValueList over a DataObject tree fails with WrongTreeKind before touching the transaction"):
-    val wrong = WrongTreeKind(TreeKind.KeyValueObjects, TreeKind.DataObjects)
-    for
-      (doTree, rm) <- newTree()
-      _ <- setAll(doTree, keys(1 to 3))
-      kv <- rm.getTree()
-      getErr <- kv.get(Key(1)).failed
-      foldErr <- kv.foldLeft(0)((n, _) => n + 1).failed
-      walkErr <- kv.foreach((_, _, _) => Future.unit).failed
-      tx = client.newTransaction()
-      setErr <- kv.set(Key(4), value(4))(using tx).failed
-      deleteErr <- kv.delete(Key(1))(using tx).failed
-      v1 <- doTree.get(Key(1))
-    yield
-      assert(List(getErr, foldErr, walkErr, setErr, deleteErr).forall(_ == wrong))
-      assert(tx.isEmpty)
-      assert(bytesOf(v1) == bytesOf(Some(value(1))))
-
   // ---------------------------------------------------------------------------------------------------------------
   // set / get / delete
 

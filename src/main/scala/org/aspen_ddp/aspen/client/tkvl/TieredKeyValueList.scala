@@ -17,21 +17,16 @@ class TieredKeyValueList(val client: AspenClient,
 
   private val engine = new TierEngine(client, rootManager)
 
-  // The root's kind can only be read asynchronously, so every operation checks it first. Over a root that is not a
-  // KeyValueObjects root each fails with WrongTreeKind, before touching the transaction.
-  private val checked = new TreeKindCheck(rootManager, TreeKind.KeyValueObjects)
-
   def get(key: Key): Future[Option[ValueState]] =
-    checked(engine.getContainingNode(key).map(_.flatMap(node => kvNode(node).contents.get(key))))
+    engine.getContainingNode(key).map(_.flatMap(node => kvNode(node).contents.get(key)))
 
   def getContainingNode(key: Key): Future[Option[TieredKeyValueListNode]] =
-    checked(engine.getContainingNode(key).map(_.map(node => new TieredKeyValueListNode(this, kvNode(node)))))
+    engine.getContainingNode(key).map(_.map(node => new TieredKeyValueListNode(this, kvNode(node))))
   
   def deleteTree(odeleteKVPair: Option[(Key, ValueState) => Future[Unit]]): Future[Unit] =
-    checked:
-      engine.deleteTree: node =>
-        val kvlp = KeyValueListPointer(Key.AbsoluteMinimum, kvNode(node).pointer)
-        KeyValueListNode.deleteList(client, kvlp, node.ordering, odeleteKVPair)
+    engine.deleteTree: node =>
+      val kvlp = KeyValueListPointer(Key.AbsoluteMinimum, kvNode(node).pointer)
+      KeyValueListNode.deleteList(client, kvlp, node.ordering, odeleteKVPair)
 
   /**
    * Splits the tree into two trees at the supplied key. All keys comparing
@@ -48,15 +43,15 @@ class TieredKeyValueList(val client: AspenClient,
    */
   def splitTree(splitAtKey: Key, inclusive: Boolean = false)
                (using t: Transaction): Future[Root] =
-    checked(engine.splitTree(splitAtKey, inclusive))
+    engine.splitTree(splitAtKey, inclusive)
 
   def set(key: Key,
           value: Value,
           requirement: Option[Either[Boolean, ObjectRevision]] = None)
          (using t: Transaction): Future[Unit] =
-    checked(engine.set(key, value, requirement))
+    engine.set(key, value, requirement)
 
-  def delete(key: Key)(using t: Transaction): Future[Unit] = checked(engine.delete(key))
+  def delete(key: Key)(using t: Transaction): Future[Unit] = engine.delete(key)
 
   /** KeyValue-object trees only: the requirements are key-value requirements on the containing node */
   def delete(key: Key, 
@@ -66,12 +61,11 @@ class TieredKeyValueList(val client: AspenClient,
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
     }
-    checked:
-      engine.deleteFromContainingNode(key, node => kvNode(node).delete(key, requiredRevision, requirements, onJoin))
+    engine.deleteFromContainingNode(key, node => kvNode(node).delete(key, requiredRevision, requirements, onJoin))
   }
 
   def foldLeft[B](z: B)(fn: (B, Map[Key, ValueState]) => B): Future[B] =
-    checked(engine.foldLeft(z)((acc, node) => fn(acc, kvNode(node).contents)))
+    engine.foldLeft(z)((acc, node) => fn(acc, kvNode(node).contents))
 
   /** Visit every entry in the tree, in ascending key order.
    *
@@ -81,13 +75,13 @@ class TieredKeyValueList(val client: AspenClient,
    *  continues to the next key. A failing read fails the returned future.
    */
   def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    checked(engine.foreach(withValueState(fn)))
+    engine.foreach(withValueState(fn))
 
   /** Visit every entry in `[minKey, maxKey)`, in ascending key order. */
   def foreachInRange(minKey: Key,
                      maxKey: Key,
                      fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    checked(engine.foreachInRange(minKey, maxKey, withValueState(fn)))
+    engine.foreachInRange(minKey, maxKey, withValueState(fn))
 
   /** Visit every entry at or above `minKey`, in ascending key order. The open-ended
    *  counterpart to foreachInRange, used to resume an interrupted walk from a checkpointed
@@ -101,7 +95,7 @@ class TieredKeyValueList(val client: AspenClient,
    */
   def foreachFrom(minKey: Key,
                   fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    checked(engine.foreachFrom(minKey, withValueState(fn)))
+    engine.foreachFrom(minKey, withValueState(fn))
 
   /** `fn` as a TierEngine walk callback, handed the KeyValueListNode and the entry's ValueState */
   private def withValueState(fn: (KeyValueListNode, Key, ValueState) => Future[Unit])

@@ -25,7 +25,17 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
 
   private val engine = new TierEngine(client, rootManager)
 
-  private val checked = new TreeKindCheck(rootManager, TreeKind.DataObjects)
+  // The kind of a tree never changes, so one successful check covers every later operation
+  @volatile private var kindChecked = false
+
+  /** Runs `f` once the root is known to be a DataObjects root */
+  private def checked[A](f: => Future[A]): Future[A] =
+    if kindChecked then
+      f
+    else
+      DataObjectTKVL.checkKind(rootManager).flatMap: _ =>
+        kindChecked = true
+        f
 
   def get(key: Key): Future[Option[Value]] = checked(engine.get(key))
 
@@ -77,4 +87,9 @@ object DataObjectTKVL:
   /** The tree managed by `rootManager`. Fails with `WrongTreeKind` if its root is not a `DataObjects` root. */
   def open(client: AspenClient, rootManager: RootManager): Future[DataObjectTKVL] =
     given ExecutionContext = client.clientContext
-    TreeKindCheck.check(rootManager, TreeKind.DataObjects).map(_ => new DataObjectTKVL(client, rootManager))
+    checkKind(rootManager).map(_ => new DataObjectTKVL(client, rootManager))
+
+  private def checkKind(rootManager: RootManager)(using ExecutionContext): Future[Unit] =
+    rootManager.getRoot().map: root =>
+      if root.kind != TreeKind.DataObjects then
+        throw WrongTreeKind(TreeKind.DataObjects, root.kind)

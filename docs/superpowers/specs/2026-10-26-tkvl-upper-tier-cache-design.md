@@ -29,15 +29,16 @@ long-lived tree skip them. The motivation is general performance, not any one ap
   no benefit. Making them reuse instances is a separate piece of work.
 - No cross-instance or client-wide sharing of cached nodes.
 - Anti-goal: any path where a stale cache leads to a wrong result, a spurious `BrokenTree`, or a write
-  that is retried forever against the same stale state.
+  that is retried forever against the same stale state. The single accepted exception is `splitTree`
+  performed through another instance (see below).
 
 ## Where the cache lives
 
 The cache belongs to the tree instance, owned by its `RootManager` (the root manager is the object that
 already reads the root, and both facades and `TierEngine` reach the tree through it). Each `RootManager`
 implementation (`KVObjectRootManager`, `SimpleDirectoryRootManager`, `SimpleFileRootManager`) accepts a
-cache, defaulting to the default implementation. Root managers decoded by `RootManagerFactory`, as in the
-finalization actions, get a fresh default cache. That is harmless: those instances are short-lived.
+cache, defaulting to the default implementation. Root managers decoded by `RootManagerFactory` (only the
+finalization actions do this) get `NoCache`, since finalization actions read fresh.
 *(My call: user agreed the cache belongs to the long-lived tree instance; owning it in the root manager
 is my choice of where.)*
 
@@ -88,12 +89,32 @@ refinement of it.)*
   upper-tier nodes it finds), `prepareRootUpdate` and `createInitialNode` (see below), and the Split, Join
   and TailRemoval finalization actions. The finalization actions run with `NoCache`.
 
+## `splitTree` and other instances (user's decision)
+
+`splitTree` cuts the boundary nodes, and the existing nodes to the right of the cut become part of the new
+tree. Another instance of the original tree whose cache still holds upper-tier nodes from before the split
+can follow them into the new tree's nodes. Their ranges still hold the moved keys, so that instance
+returns the **new** tree's values for them, and nothing marks the result as stale. This is a wrong answer
+and the one exception to "stale only costs reads".
+
+The user decided against a per-operation root revision check to catch this: `splitTree` is rare and
+niche, and the cache exists for the common case. Instead:
+
+- `splitTree` clears the calling instance's whole cache, both when it is called and again once its
+  transaction resolves, so the instance that splits is never wrong.
+- Other instances are not protected. `splitTree` on both facades (`TieredKeyValueList`, `DataObjectTKVL`)
+  carries a prominent warning in its doc comment: other long-lived instances of the tree (other clients,
+  other processes, other instances in this process) may return entries that moved to the new tree until
+  their caches are cleared. Handling that is left to the caller, e.g. by clearing those instances' caches
+  or by opening trees that get split with `NoCache`.
+
 ## Correctness rules
 
 - **Safety net** *(scope is my call)*. It wraps only the descent and routing phase of an operation, before
   anything is staged in a transaction. It never wraps code after a transaction has been staged. It
-  triggers when a descent that used any cached node ends in `BrokenTree` or `InvalidObject` (including
-  running out of candidates). It then drops the whole cache and retries once with the cache bypassed for
+  triggers when the descent ends in `BrokenTree` or `InvalidObject` (including running out of
+  candidates). Whether a cached node was used is not tracked: retrying an already-fresh descent only
+  costs reads on a path that is failing anyway. It then drops the whole cache and retries once with the cache bypassed for
   every tier. A failure on that fresh attempt is reported as today. Other read failures (timeouts and so
   on) are handled as `fetchNode` already handles them: the node is blacklisted and its cached parent
   evicted. They do not trigger the retry. `deleteTree` followed by reuse of the same instance therefore

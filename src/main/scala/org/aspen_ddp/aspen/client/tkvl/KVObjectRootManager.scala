@@ -23,7 +23,6 @@ class KVObjectRootManager(val client: AspenClient,
 
   def getRoot(): Future[Root] = getRData().map(_.root)
   
-  /** Returns (numTiers, keyOrdering, rootNode) */
   private def getRData(fresh: Boolean = false): Future[RootState] =
     RootManager.cachedRead(cache, fresh)(readRData())
 

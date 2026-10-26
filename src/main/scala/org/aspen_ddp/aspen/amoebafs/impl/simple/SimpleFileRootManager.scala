@@ -24,7 +24,7 @@ class SimpleFileRootManager(client: AspenClient,
   def getRoot(): Future[Root] = getRData().map(_.root)
 
   private def getRData(fresh: Boolean = false, oInodeDos: Option[DataObjectState] = None): Future[RootState] =
-    RootManager.cachedRead(cache, fresh)(readRData(oInodeDos))
+    RootManager.cachedRead(cache, fresh || oInodeDos.isDefined)(readRData(oInodeDos))
 
   private def readRData(oInodeDos: Option[DataObjectState]): Future[RootState] = 
     val p = Promise[RootState]()

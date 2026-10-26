@@ -91,19 +91,19 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
 
   atest("getFreshRootNode bypasses and refreshes the cache"):
     for
-      rm <- multiTierTree()
-      _ <- rm.getRootNode()
-      _ <- waitForTransactionsToComplete()
-      _ = rm.cache.dropRoot()
-      _ <- rm.getRootNode()
-      before = rm.cache.root
-      _ <- waitForTransactionsToComplete()
-      (_, reads) <- net.countReads(rm.getFreshRootNode())
+      a <- multiTierTree()
+      b = new KVObjectRootManager(client, a.treeKey, a.pointer)
+      (tier, _, _) <- a.getRootNode()
+      root <- a.getRoot()
+      before = a.cache.root
+      // Changes the revision of the root entry behind a's back
+      _ <- inTx(tx => b.prepareRootUpdate(tier, root.orootObject)(using tx))
+      (_, reads) <- net.countReads(a.getFreshRootNode())
     yield
       assert(before.isDefined)
-      assert(reads.contains(rm.pointer.id))
-      assert(rm.cache.root.isDefined)
-      assert(rm.cache.root.get.root.tier >= 1)
+      assert(reads.contains(a.pointer.id))
+      assert(a.cache.root.get.revision != before.get.revision)
+      assert(a.cache.root.get.root.tier >= 1)
 
   atest("root writes read fresh"):
     for

@@ -12,7 +12,8 @@ import scala.util.{Failure, Success}
 
 class KVObjectRootManager(val client: AspenClient,
                           val treeKey: Key,
-                          val pointer: KeyValueObjectPointer) extends RootManager {
+                          val pointer: KeyValueObjectPointer,
+                          val cache: TierCache = TierCache.default()) extends RootManager {
 
   import KVObjectRootManager._
 
@@ -23,8 +24,11 @@ class KVObjectRootManager(val client: AspenClient,
   def getRoot(): Future[Root] = getRData().map(_.root)
   
   /** Returns (numTiers, keyOrdering, rootNode) */
-  private def getRData(): Future[RData] = {
-    val p = Promise[RData]()
+  private def getRData(fresh: Boolean = false): Future[RootState] =
+    RootManager.cachedRead(cache, fresh)(readRData())
+
+  private def readRData(): Future[RootState] = {
+    val p = Promise[RootState]()
 
     client.read(pointer, s"Object hosting TKVL Root for tree $treeKey").onComplete {
       case Failure(err) => p.failure(err)
@@ -36,17 +40,17 @@ class KVObjectRootManager(val client: AspenClient,
             val root = Root(client, v.value.bytes)
 
             root.orootObject match {
-              case None => p.success(RData(root, v.revision, None))
+              case None => p.success(RootState(root, v.revision, None))
               case Some(rootObject) =>
                 NodeEncoding(root.kind).read(client, rootObject, Key.AbsoluteMinimum, root.ordering,
                   s"Root node for TKVL tree $treeKey").onComplete {
                   case Failure(err) =>
                     // Tree has been deleted but the root has not yet been updated
                     // Return an empty tree root
-                    p.success(RData(root.copy(tier=0, orootObject=None), v.revision, None))
+                    p.success(RootState(root.copy(tier=0, orootObject=None), v.revision, None))
                     
                   case Success(node) =>
-                    p.success(RData(root, v.revision, Some(node)))
+                    p.success(RootState(root, v.revision, Some(node)))
                 }
             }
           } catch {
@@ -71,7 +75,11 @@ class KVObjectRootManager(val client: AspenClient,
   }
 
   def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = getRData().map { rd =>
-    (rd.root.tier, rd.root.ordering, rd.onode)
+    (rd.root.tier, rd.root.ordering, rd.node)
+  }
+
+  def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = getRData(fresh = true).map { rd =>
+    (rd.root.tier, rd.root.ordering, rd.node)
   }
 
   def getMaxNodeSize(tier: Int): Future[Int] = getRData().map { rd =>
@@ -89,9 +97,9 @@ class KVObjectRootManager(val client: AspenClient,
   }
 
   def prepareRootUpdate(newTier: Int, onewRoot: Option[ObjectPointer])(using tx: Transaction): Future[Unit] = {
-    getRData().map { rd =>
+    getRData(fresh = true).map { rd =>
       val data = rd.root.copy(tier=newTier, orootObject=onewRoot).encode()
-      val reqs = KeyValueUpdate.KeyRevision(treeKey, rd.rootRevision) :: Nil
+      val reqs = KeyValueUpdate.KeyRevision(treeKey, rd.revision) :: Nil
       val ops = Insert(treeKey, data) :: Nil
       
       tx.update(pointer, None, None, reqs, ops)
@@ -105,7 +113,7 @@ class KVObjectRootManager(val client: AspenClient,
     }
 
     for {
-      RData(root, rootRevision, onode) <- getRData()
+      RootState(root, rootRevision, onode) <- getRData(fresh = true)
 
       // Check for a race condition where multiple concurrent attempts to
       // create the initial node might clash with each other. Done before the
@@ -132,8 +140,6 @@ class KVObjectRootManager(val client: AspenClient,
 }
 
 object KVObjectRootManager extends RootManagerFactory {
-
-  private case class RData(root: Root, rootRevision: ObjectRevision, onode: Option[ListNode])
 
   val typeUUID: UUID = UUID.fromString("CE36789D-42F1-43F9-9464-E9B44419D8C4")
 
@@ -165,7 +171,7 @@ object KVObjectRootManager extends RootManagerFactory {
     val karr = new Array[Byte](klen)
     bb.get(karr)
     val ptr = KeyValueObjectPointer(bb)
-    new KVObjectRootManager(client, Key(karr), ptr)
+    new KVObjectRootManager(client, Key(karr), ptr, NoCache)
   }
 
   /** Outter future is for ready to commit transaction. Inner future is to the root manager after successful

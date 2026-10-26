@@ -12,7 +12,8 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
 
 class SimpleFileRootManager(client: AspenClient,
-                            inodePointer: DataObjectPointer) extends RootManager:
+                            inodePointer: DataObjectPointer,
+                            val cache: TierCache = TierCache.default()) extends RootManager:
 
   import SimpleFileRootManager._
 
@@ -22,8 +23,11 @@ class SimpleFileRootManager(client: AspenClient,
 
   def getRoot(): Future[Root] = getRData().map(_.root)
 
-  private def getRData(oInodeDos: Option[DataObjectState] = None): Future[RData] = 
-    val p = Promise[RData]()
+  private def getRData(fresh: Boolean = false, oInodeDos: Option[DataObjectState] = None): Future[RootState] =
+    RootManager.cachedRead(cache, fresh)(readRData(oInodeDos))
+
+  private def readRData(oInodeDos: Option[DataObjectState]): Future[RootState] = 
+    val p = Promise[RootState]()
     
     val fInodeDos = oInodeDos match 
       case None => client.read(inodePointer)
@@ -39,18 +43,18 @@ class SimpleFileRootManager(client: AspenClient,
           val root = inode.contents
 
           root.rootKeyValuePointer match
-            case None => p.success(RData(root, inodeDos.revision, None))
+            case None => p.success(RootState(root, inodeDos.revision, None))
             case Some(rootObject) =>
               client.read(rootObject).onComplete:
                 case Failure(err) =>
                   // Tree has been deleted but the root has not yet been updated
                   // Return an empty tree root
-                  p.success(RData(root.copy(tier=0, orootObject=None), inodeDos.revision, None))
+                  p.success(RootState(root.copy(tier=0, orootObject=None), inodeDos.revision, None))
 
                 case Success(rootKvos) =>
                   val rootLp = KeyValueListPointer(Key.AbsoluteMinimum, rootObject)
                   val node = KeyValueListNode(client, rootLp, root.ordering, rootKvos)
-                  p.success(RData(root, inodeDos.revision, Some(node)))
+                  p.success(RootState(root, inodeDos.revision, Some(node)))
         catch
           case cause: Throwable => p.failure(new InvalidRoot(cause))
     
@@ -63,9 +67,13 @@ class SimpleFileRootManager(client: AspenClient,
     getRData().flatMap: rd =>
       rd.root.nodeAllocator.getAllocatorForTier(tier)
   
-  def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] = 
+  def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = 
     getRData().map: rd =>
-      (rd.root.tier, rd.root.ordering, rd.onode)
+      (rd.root.tier, rd.root.ordering, rd.node)
+
+  def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] =
+    getRData(fresh = true).map: rd =>
+      (rd.root.tier, rd.root.ordering, rd.node)
 
   def getMaxNodeSize(tier: Int): Future[Int] = 
     getRData().map: rd =>
@@ -100,7 +108,7 @@ class SimpleFileRootManager(client: AspenClient,
   override def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit] =
     for
       dos <- client.read(inodePointer)
-      RData(root, _, onode) <- getRData(Some(dos))
+      RootState(root, _, onode) <- getRData(fresh = true, Some(dos))
 
       // Check for a race condition where multiple concurrent attempts to
       // create the initial node might clash with each other. Done before the
@@ -121,10 +129,8 @@ class SimpleFileRootManager(client: AspenClient,
 object SimpleFileRootManager extends RootManagerFactory:
   val typeUUID: UUID = UUID.fromString("51936423-bbd1-4500-b60d-b4c557b69f24")
 
-  private case class RData(root: Root, rootRevision: ObjectRevision, onode: Option[KeyValueListNode])
-
   def apply(client: AspenClient, bb: ByteBuffer): SimpleFileRootManager =
-    new SimpleFileRootManager(client, DataObjectPointer(bb))
+    new SimpleFileRootManager(client, DataObjectPointer(bb), NoCache)
 
   override def createRootManager(client: AspenClient, data: Array[Byte]): SimpleFileRootManager =
     val bb = ByteBuffer.wrap(data)

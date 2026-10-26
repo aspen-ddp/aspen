@@ -173,7 +173,7 @@ abstract class TreeKindParitySuiteBase extends TreeKindSuiteBase:
         nodes <- allTiers(kind, rm).map(_.flatten)
         _ <- tree.deleteTree(Some(onEntry))
         remaining <- Future.sequence(nodes.map(n => exists(n.pointer)))
-        (tier, _, oroot) <- rm.getRootNode()
+        (tier, _, oroot) <- rm.getFreshRootNode()
         v <- tree.get(Key(1))
       yield
         assert(nodes.size > 5)

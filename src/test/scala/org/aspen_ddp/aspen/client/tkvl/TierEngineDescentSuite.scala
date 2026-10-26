@@ -41,8 +41,10 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
       froot <- KVObjectRootManager.createNewTree(client, host, Key(Array[Byte](0)), ordering, nodeAllocator, Map(),
         kind)(using tx)
       _ <- tx.commit()
-      rm <- froot
+      cached <- froot
     yield
+      // Uncached: these suites reshape the tree (tier changes, joins, splitTree) and expect every read to be live
+      val rm = new KVObjectRootManager(client, cached.treeKey, cached.pointer, NoCache)
       val tree = kind match
         case TreeKind.KeyValueObjects =>
           val t = new TieredKeyValueList(client, rm)
@@ -90,7 +92,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
         else
           read(ObjectPointer(head.get(Key.AbsoluteMinimum).get.bytes), Key.AbsoluteMinimum)
             .flatMap(down(tier - 1, _)).map(nodes :: _)
-    rm.getRootNode().flatMap: (tier, _, oroot) =>
+    rm.getFreshRootNode().flatMap: (tier, _, oroot) =>
       down(tier, oroot.get)
 
   /** The second node of tier 1 */
@@ -174,7 +176,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
       _ <- sequentially(all)((k, tx) => tree.set(k, value(k.bytes.last))(using tx))
       tiersBefore <- allTiers(kind, rm)
       _ <- sequentially(all.init)((k, tx) => tree.delete(k)(using tx))
-      (rootTier, _, _) <- rm.getRootNode()
+      (rootTier, _, _) <- rm.getFreshRootNode()
       tiersAfter <- allTiers(kind, rm)
       last <- tree.get(all.last)
       // The shrunken tree still takes inserts above and below what is left
@@ -200,7 +202,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
   private def checkPredecessors(kind: TreeKind, rm: RootManager): Future[org.scalatest.Assertion] =
     for
       tiers <- allTiers(kind, rm)
-      (rootTier, _, oroot) <- rm.getRootNode()
+      (rootTier, _, oroot) <- rm.getFreshRootNode()
       found <- Future.sequence(
         for
           (nodes, i) <- tiers.zipWithIndex

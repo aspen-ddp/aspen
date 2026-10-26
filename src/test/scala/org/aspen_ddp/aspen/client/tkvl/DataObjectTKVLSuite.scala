@@ -50,9 +50,10 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, treeOrdering, nodeAllocator, Map(), kind)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
-      rm <- froot
+      cached <- froot
     yield
-      rm
+      // Uncached: these suites reshape the tree (tier changes, joins, splitTree) and expect every read to be live
+      new KVObjectRootManager(client, cached.treeKey, cached.pointer, NoCache)
 
   private def newTree(maxNodeSize: Int = smallNodeSize): Future[(DataObjectTKVL, KVObjectRootManager)] =
     for
@@ -101,14 +102,14 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
         else
           readNode(ObjectPointer(head.get(Key.AbsoluteMinimum).get.bytes)).flatMap(down(tier - 1, _)).map(nodes :: _)
 
-    rm.getRootNode().flatMap: (tier, _, oroot) =>
+    rm.getFreshRootNode().flatMap: (tier, _, oroot) =>
       oroot match
         case None => Future.successful(Nil)
         case Some(root) => down(tier, root)
 
   private def tier0Nodes(rm: RootManager): Future[List[ListNode]] = allTiers(rm).map(_.lastOption.getOrElse(Nil))
 
-  private def numTiers(rm: RootManager): Future[Int] = rm.getRootNode().map(_._1)
+  private def numTiers(rm: RootManager): Future[Int] = rm.getFreshRootNode().map(_._1)
 
   private def dataPointer(p: ObjectPointer): DataObjectPointer = p.asInstanceOf[DataObjectPointer]
 
@@ -415,7 +416,7 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       nodes <- allTiers(rm).map(_.flatten)
       _ <- tree.deleteTree(if withCallback then Some(onEntry) else None)
       remaining <- Future.sequence(nodes.map(n => client.readOptional(dataPointer(n.pointer))))
-      (tier, _, oroot) <- rm.getRootNode()
+      (tier, _, oroot) <- rm.getFreshRootNode()
       v <- tree.get(Key(1))
     yield
       assert(nodes.size > 5)

@@ -12,8 +12,8 @@ import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Gossip, HostMessage, ReadResponse, TxMessage}
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Gossip, HostMessage, Read, ReadResponse, TxMessage}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -155,9 +155,32 @@ class TestNetwork(executionContext: ExecutionContext,
   /** Hosts the client messenger reports offline. Everything is online unless a test says otherwise. */
   @volatile var offlineHostIds: Set[HostId] = Set.empty
 
+  private var readCounting = false
+  private var countedReads: Set[(UUID, ObjectId)] = Set()
+
+  private def recordRead(r: Read): Unit = synchronized:
+    if readCounting then
+      countedReads += ((r.readUUID, r.objectPointer.id))
+
+  /** Runs `f`, counting `client`'s object reads: one per read operation (distinct readUUID), per object */
+  def countReads[T](f: => Future[T]): Future[(T, Map[ObjectId, Int])] =
+    given ExecutionContext = executionContext
+    synchronized:
+      countedReads = Set()
+      readCounting = true
+    def stop(): Map[ObjectId, Int] = synchronized:
+      readCounting = false
+      countedReads.groupMapReduce(_._2)(_ => 1)(_ + _)
+    f.transform: result =>
+      val counts = stop()
+      result.map(t => (t, counts))
+
   private val cliMessenger = new ClientMessenger {
 
     def sendClientRequest(msg: ClientRequest): Unit = {
+      msg match
+        case r: Read if r.fromClient == client.clientId => recordRead(r)
+        case _ => ()
       handleEvents()
       smgr.receiveClientRequest(msg)
       handleEvents()

@@ -49,6 +49,75 @@ class KVObjectRootManagerSuite extends IntegrationTestSuite:
     val tx = client.newTransaction()
     update(tx).flatMap(_ => tx.commit()).flatMap(_ => waitForTransactionsToComplete())
 
+  /** A tree of tier >= 1: small nodes and enough keys to split the root */
+  private def multiTierTree(): Future[KVObjectRootManager] =
+    for
+      host <- rootHost()
+      rm <- newTree(host, 256)
+      tree <- rm.getTree()
+      _ <- (0 until 40).foldLeft(Future.unit): (f, i) =>
+        f.flatMap(_ => inTx(tx => tree.set(Key(i), value(i))(using tx)))
+      (tier, _, _) <- rm.getFreshRootNode()
+      _ = assert(tier >= 1)
+    yield
+      rm
+
+  atest("a warm multi-tier root is served without reads"):
+    for
+      rm <- multiTierTree()
+      _ <- rm.getRootNode()
+      _ <- waitForTransactionsToComplete()
+      (_, rootNodeReads) <- net.countReads(rm.getRootNode())
+      (_, rootReads) <- net.countReads(rm.getRoot())
+      (_, sizeReads) <- net.countReads(rm.getMaxNodeSize(0))
+      (_, allocReads) <- net.countReads(rm.getAllocatorForTier(0))
+    yield
+      assert(rootNodeReads.isEmpty)
+      assert(rootReads.isEmpty)
+      assert(sizeReads.isEmpty)
+      assert(allocReads.isEmpty)
+
+  atest("a tier-0 root is always read"):
+    for
+      rm <- newTree()
+      tree <- rm.getTree()
+      _ <- inTx(tx => tree.set(Key(1), value(1))(using tx))
+      (_, _, onode) <- rm.getRootNode()
+      _ <- waitForTransactionsToComplete()
+      (_, reads) <- net.countReads(rm.getRootNode())
+    yield
+      assert(reads.contains(rm.pointer.id))
+      assert(reads.contains(onode.get.pointer.id))
+
+  atest("getFreshRootNode bypasses and refreshes the cache"):
+    for
+      rm <- multiTierTree()
+      _ <- rm.getRootNode()
+      _ <- waitForTransactionsToComplete()
+      _ = rm.cache.dropRoot()
+      _ <- rm.getRootNode()
+      before = rm.cache.root
+      _ <- waitForTransactionsToComplete()
+      (_, reads) <- net.countReads(rm.getFreshRootNode())
+    yield
+      assert(before.isDefined)
+      assert(reads.contains(rm.pointer.id))
+      assert(rm.cache.root.isDefined)
+      assert(rm.cache.root.get.root.tier >= 1)
+
+  atest("root writes read fresh"):
+    for
+      a <- multiTierTree()
+      b = new KVObjectRootManager(client, a.treeKey, a.pointer)
+      (tier, _, _) <- a.getRootNode()
+      root <- a.getRoot()
+      _ = assert(a.cache.root.isDefined)
+      _ <- inTx(tx => b.prepareRootUpdate(tier, root.orootObject)(using tx))
+      // a's cached revision of the root entry is now stale
+      _ <- inTx(tx => a.prepareRootUpdate(tier, root.orootObject)(using tx))
+    yield
+      succeed
+
   atest("encode and createRootManager round-trip to a manager for the same tree"):
     for
       rm <- newTree()

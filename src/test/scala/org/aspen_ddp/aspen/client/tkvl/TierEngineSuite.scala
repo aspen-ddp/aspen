@@ -31,9 +31,11 @@ class TierEngineSuite extends IntegrationTestSuite:
 
   /** Serves `node` as a tier-0 root. Nothing else is used by the reads below. */
   private class StubRootManager(node: ListNode) extends RootManager:
+    def cache: TierCache = NoCache
     def getRoot(): Future[Root] = Future.failed(new NotImplementedError)
     def getRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] =
       Future.successful((0, node.ordering, Some(node)))
+    def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = getRootNode()
     def createInitialNode(contents: Map[Key, Value])(using tx: Transaction): Future[Unit] =
       Future.failed(new NotImplementedError)
     def getAllocatorForTier(tier: Int): Future[ObjectAllocator] = Future.failed(new NotImplementedError)
@@ -88,7 +90,7 @@ class TierEngineSuite extends IntegrationTestSuite:
       tree <- root.getTree()
       _ <- (1 to 30).foldLeft(Future.unit)((f, i) => f.flatMap(_ => insert(tree, i)))
       _ <- waitForTransactionsToComplete()
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
     yield
       assert(numTiers > 0)
       root
@@ -113,7 +115,7 @@ class TierEngineSuite extends IntegrationTestSuite:
         handed = node :: handed
         NodeEncoding(TreeKind.KeyValueObjects).deleteList(client, NodeLink(Key.AbsoluteMinimum, node.pointer),
           node.ordering, None)
-      (numTiers, _, oroot) <- root.getRootNode()
+      (numTiers, _, oroot) <- root.getFreshRootNode()
       upperRoot <- root.getRoot()
     yield
       assert(handed.map(_.pointer.id) == leftmost.map(_.pointer.id).toList)

@@ -181,7 +181,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tree <- root.getTree()
       v <- tree.get(key3)
-      (numTiers, _, _) <- tree.rootManager.getRootNode()
+      (numTiers, _, _) <- tree.rootManager.getFreshRootNode()
 
     } yield {
       v.isEmpty should be (false)
@@ -244,11 +244,11 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tree <- root.getTree()
       v <- tree.get(key3)
-      (numTiers, _, _) <- tree.rootManager.getRootNode()
+      (numTiers, _, _) <- tree.rootManager.getFreshRootNode()
       
       _ <- tree.deleteTree(Some(deleteKV))
       
-      (numTiersAfterDelete, _, rootAfterDelete) <- tree.rootManager.getRootNode()
+      (numTiersAfterDelete, _, rootAfterDelete) <- tree.rootManager.getFreshRootNode()
 
     } yield {
       v.isEmpty should be(false)
@@ -289,7 +289,7 @@ class TKVLSuite extends IntegrationTestSuite {
       root <- froot
       tree <- root.getTree()
       _ <- tree.deleteTree(None)
-      (_, _, emptyRoot) <- tree.rootManager.getRootNode()
+      (_, _, emptyRoot) <- tree.rootManager.getFreshRootNode()
 
       // Recreate the initial node through the empty-tree path of set
       tx2 = client.newTransaction()
@@ -373,7 +373,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
       tree <- root.getTree()
       v <- tree.get(key3)
-      (numTiers, _, _) <- tree.rootManager.getRootNode()
+      (numTiers, _, _) <- tree.rootManager.getFreshRootNode()
 
     } yield {
       v.isEmpty should be (false)
@@ -486,7 +486,9 @@ class TKVLSuite extends IntegrationTestSuite {
                                      stale: KeyValueListNode,
                                      staleTier: Int = 0) extends RootManager:
     private var served = false
+    def cache: TierCache = real.cache
     def getRoot(): Future[Root] = real.getRoot()
+    def getFreshRootNode(): Future[(Int, KeyOrdering, Option[ListNode])] = real.getFreshRootNode()
     def getRootNode(): Future[(Int, KeyOrdering, Option[KeyValueListNode])] =
       if served then
         real.getKeyValueRootNode()
@@ -586,7 +588,7 @@ class TKVLSuite extends IntegrationTestSuite {
   atest("A scan into a permanently deleted node fails rather than hanging") {
     for
       (tree, root, keys) <- buildSplitTree(3)
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
       nodes <- tier0Nodes(tree)
       last = nodes.last
       // Delete the last node without unlinking it, so the descent falls back to its left
@@ -606,7 +608,7 @@ class TKVLSuite extends IntegrationTestSuite {
     val splitAtKey = Key(3)
     for
       (tree, root, keys) <- buildSplitTree(4)
-      (numTiers, ordering, _) <- root.getRootNode()
+      (numTiers, ordering, _) <- root.getFreshRootNode()
 
       splitTx = client.newTransaction()
       newRoot <- tree.splitTree(splitAtKey)(using splitTx)
@@ -616,6 +618,8 @@ class TKVLSuite extends IntegrationTestSuite {
 
       newTreeRoot <- fnewTreeRoot
       newTree <- newTreeRoot.getTree()
+      // splitTree moved entries out from under the cached upper tiers
+      _ = root.cache.clear()
       (_, _, ooldRoot) <- root.getKeyValueRootNode()
       oldValues <- Future.sequence(keys.map(tree.get))
       newValues <- Future.sequence(keys.map(newTree.get))
@@ -639,7 +643,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
     for
       (tree, root, keys) <- buildSplitTree(8)
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
       _ <- tree.foreach(record)
     yield
       // Guard the guard: if the tree never split, this test proves nothing.
@@ -672,7 +676,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
     for
       (tree, root, keys) <- buildSplitTree(8)
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
       // Keys are 1..8 across several nodes; [3, 7) must yield exactly 3, 4, 5, 6 regardless
       // of where the node boundaries happen to fall.
       _ <- tree.foreachInRange(Key(3), Key(7), record)
@@ -697,7 +701,7 @@ class TKVLSuite extends IntegrationTestSuite {
       // Smaller values so nodes hold several keys each; at the default size every node holds
       // exactly one key and there is no "inside" for a key to be.
       (tree, root, keys) <- buildSplitTree(12, 128 * 1024)
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
       mins <- tier0NodeMinimums(tree)
 
       // Derived from the tree rather than hardcoded: the first key that lives in a node other
@@ -732,7 +736,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
     for
       (tree, root, keys) <- buildSplitTree(8)
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
       mins <- tier0NodeMinimums(tree)
 
       // The awkward descent: minKey is exactly a node's minimum, so the node to its left
@@ -761,7 +765,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
     for
       (tree, root, keys) <- buildSplitTree(8)
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
       _ <- tree.foreachFrom(Key(0), record)
     yield
       numTiers should be >= 1
@@ -778,7 +782,7 @@ class TKVLSuite extends IntegrationTestSuite {
 
     for
       (tree, root, keys) <- buildSplitTree(8)
-      (numTiers, _, _) <- root.getRootNode()
+      (numTiers, _, _) <- root.getFreshRootNode()
       // Reachable in production when the checkpointed key is deleted between the crash and the
       // resume. The filter empties the last node, its tail is None, and the walk completes
       // successfully having visited nothing.

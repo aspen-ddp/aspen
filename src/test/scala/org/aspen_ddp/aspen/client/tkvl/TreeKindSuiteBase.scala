@@ -106,8 +106,10 @@ abstract class TreeKindSuiteBase extends IntegrationTestSuite:
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, ordering, nodeAllocator, Map(), kind)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
-      rm <- froot
+      cached <- froot
     yield
+      // Uncached: these suites reshape the tree (tier changes, joins, splitTree) and expect every read to be live
+      val rm = new KVObjectRootManager(client, cached.treeKey, cached.pointer, NoCache)
       (open(kind, rm), rm)
 
   protected def newTree(kind: TreeKind): Future[(Tree, KVObjectRootManager)] = newTree(kind, nodeSize(kind))
@@ -153,7 +155,7 @@ abstract class TreeKindSuiteBase extends IntegrationTestSuite:
         else
           read(ObjectPointer(head.get(Key.AbsoluteMinimum).get.bytes), Key.AbsoluteMinimum)
             .flatMap(down(tier - 1, _)).map(nodes :: _)
-    rm.getRootNode().flatMap: (tier, _, oroot) =>
+    rm.getFreshRootNode().flatMap: (tier, _, oroot) =>
       oroot match
         case None => Future.successful(Nil)
         case Some(root) => down(tier, root)
@@ -161,7 +163,7 @@ abstract class TreeKindSuiteBase extends IntegrationTestSuite:
   protected def tier0Nodes(kind: TreeKind, rm: RootManager): Future[List[ListNode]] =
     allTiers(kind, rm).map(_.lastOption.getOrElse(Nil))
 
-  protected def numTiers(rm: RootManager): Future[Int] = rm.getRootNode().map(_._1)
+  protected def numTiers(rm: RootManager): Future[Int] = rm.getFreshRootNode().map(_._1)
 
   protected def exists(p: ObjectPointer): Future[Boolean] = p match
     case dp: DataObjectPointer => client.readOptional(dp).map(_.isDefined)

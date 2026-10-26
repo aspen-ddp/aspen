@@ -29,6 +29,9 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     * nodes another instance deleted with `deleteTree`. Whether the failed run used the cache is not tracked: a
     * retry of a run that read everything fresh only costs reads on a path that is failing anyway. A failure of the
     * retry is reported as is.
+    *
+    * The single retry composes with the MaxJoinRaceRestarts loops in `prepareUpdates` and `deleteFromContainingNode`,
+    * so the worst case is bounded but multiplied, and only on paths that are already failing.
     */
   private def navigate[A](nav: (TierCache, () => Future[(Int, KeyOrdering, Option[ListNode])]) => Future[A]): Future[A] =
     Future.delegate(nav(rootManager.cache, () => rootManager.getRootNode())).recoverWith:

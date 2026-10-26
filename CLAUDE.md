@@ -83,6 +83,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
   - `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
     each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe.
+  - Each `RootManager` owns a `TierCache` (default `LruTierCache`: 5 nodes per tier >= 1, plus the root when on
+    tier >= 1; `NoCache` for tests and finalization actions). Stale entries cost only reads, except that `splitTree`
+    through another instance can make warm instances return moved entries.
 - Aspen is designed and implemented largely as a logical system
   - Messages are addressed to logical entities like DataStores rather than physical hosts
   - The last step prior to sending a message is to look up the address of the network endpoint currently

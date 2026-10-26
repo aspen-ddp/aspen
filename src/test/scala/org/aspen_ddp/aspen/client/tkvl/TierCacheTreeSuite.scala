@@ -6,7 +6,7 @@ import scala.collection.immutable.TreeMap
 import scala.concurrent.Future
 
 /** A tree instance reused across operations caches its upper tiers. These tests run a warm instance against changes
-  * made through another, uncached, instance of the same tree (as another client would make them) and check that the
+  * made through another instance of the same tree (as another client would make them) and check that the
   * stale cache entries are evicted without changing any result.
   *
   * Every tree starts with keys 1 to 30, which gives three tiers for both kinds with room in the rightmost tier-1 node

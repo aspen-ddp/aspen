@@ -23,7 +23,8 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
   * `tier` is the tier of that entry, one above the node's own, matching `JoinFinalizationAction`.
   *
   * Nothing is done if the node is gone, is no longer empty or has no predecessor. Because the node's revision is
-  * locked, a racing insert into it fails this transaction and the retry re-checks.
+  * required and bumped, a racing insert into it fails this transaction and the retry re-checks, and a racing
+  * removal that would rewrite it after this one fails instead.
   */
 class TailRemovalFinalizationAction(val client: AspenClient,
                                     val txd: TransactionDescription,
@@ -97,7 +98,10 @@ class TailRemovalFinalizationAction(val client: AspenClient,
             maxNodeSize <- rootManager.getMaxNodeSize(nodeTier)
             alloc <- rootManager.getAllocatorForTier(nodeTier)
             _ <- encoding.relink(pred, tail.link, maxNodeSize, alloc, onSplit)
-            _ = tx.lockRevision(tail.pointer, tail.revision)
+            // A version bump rather than a revision lock: deleting the node must change its revision, so that a
+            // racing removal of its right neighbor, which read it as that neighbor's predecessor, cannot still
+            // rewrite it and leave its own predecessor linked to the deleted neighbor
+            _ = tx.bumpVersion(tail.pointer, tail.revision)
             _ = tx.setRefcount(tail.pointer, tail.refcount, tail.refcount.decrement())
             _ = JoinFinalizationAction.addToTransaction(rootManager, tier, tailMinimum, tailNode, tx)
 

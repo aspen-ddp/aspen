@@ -5,7 +5,7 @@ import java.nio.ByteBuffer
 import org.aspen_ddp.aspen.client.{AspenClient, ConflictingRequirements, InvalidObject, MultipleDataUpdatesToObject, MultipleRefcountUpdatesToObject, ObjectAllocator, ObjectReader, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.IDA
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyOrdering, ObjectPointer, ObjectRevision, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyAlreadyExists, KeyOrdering, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.util.Varint
 import scribe.Logging
 
@@ -15,7 +15,8 @@ import scala.util.Failure
 
 /** Nodes stored as DataObjects. A DataObject has no side fields, so the node's minimum and right link live in its
   * bytes. Every update is a whole-node rewrite guarded by the node's revision; there are no per-entry revisions, so
-  * insert requirements are not supported.
+  * revision requirements are not supported. "Key must not exist" is: the node's range changes only through an update
+  * of the node, so a key absent from the node as read is absent at commit if the node's revision still matches.
   *
   * A transaction can modify a node only once, so an update to a node the transaction already modifies fails with
   * `NodeAlreadyModified` (see `writeNode`). It stages nothing unless an earlier part of the same update is already
@@ -199,6 +200,92 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     else
       NeedsSplit(all)
 
+  /** Throws `KeyAlreadyExists` if `requirement` demands `key` be new and `content` holds it, and
+    * `UnsupportedRequirement` for a revision requirement
+    */
+  private def checkRequirement(content: NodeContent,
+                               key: Key,
+                               requirement: Option[Either[Boolean, ObjectRevision]]): Unit =
+    requirement match
+      case None | Some(Left(false)) =>
+      case Some(Left(true)) =>
+        if content.entries.exists(_._1 == key) then
+          throw new KeyAlreadyExists(key)
+      case Some(Right(_)) => throw new UnsupportedRequirement(kind)
+
+  /** Plans a batch of `ops`, ascending and at most one per key, all within the node's range, or None if the batch
+    * changes nothing (it only deletes keys the node does not hold). Generalizes `planInsert` and `planDelete`: each
+    * put is accepted as `planInsert` accepts an entry, and the result is the node's new entries, which are empty when
+    * the batch deletes every entry (the caller then considers a join as for `ConsiderJoin`). Throws
+    * `NodeSizeExceeded` for an entry that is not accepted, and `KeyAlreadyExists` or `UnsupportedRequirement` for a
+    * put's requirement.
+    */
+  def planBatch(pointer: DataObjectPointer,
+                content: NodeContent,
+                ordering: KeyOrdering,
+                ops: List[BatchOp],
+                maxNodeSize: Int): Option[RewritePlan] =
+    val puts = ops.collect { case p: BatchOp.Put => p }
+    val removes = ops.collect { case BatchOp.Remove(k) => k }.toSet
+
+    puts.foreach: p =>
+      checkRequirement(content, p.key, p.requirement)
+      val reserved = math.max(nodeOverhead(content.minimum, content.link),
+        nodeOverhead(content.minimum, Some(NodeLink(p.key, pointer))))
+      if entrySize(p.key, p.value) > maxNodeSize - reserved then
+        throw new NodeSizeExceeded
+
+    val putKeys = puts.iterator.map(_.key).toSet
+
+    if puts.isEmpty && !content.entries.exists(e => removes.contains(e._1)) then
+      None
+    else
+      val all = (content.entries.filterNot(e => removes.contains(e._1) || putKeys.contains(e._1)) ++
+        puts.map(p => p.key -> p.value)).sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+
+      if encodedSize(all, content.minimum, content.link) <= maxNodeSize then
+        Some(Rewrite(all))
+      else
+        Some(NeedsSplit(all))
+
+  /** Divides `all`, too many entries for one split, into runs that each fit a node: the first stays in the node,
+    * with `minimum`, and each other moves to a new node, the last taking `link`. Uses as few nodes as possible.
+    * `standIn` is the size the new nodes' pointers are assumed to have. Throws `NodeSizeExceeded` if no division fits.
+    */
+  def planMultiSplit(minimum: Key,
+                     link: Option[NodeLink],
+                     all: List[(Key, Value)],
+                     standIn: DataObjectPointer,
+                     maxNodeSize: Int): List[List[(Key, Value)]] =
+    val entries = all.toIndexedSeq
+    val sizes = entries.map((k, v) => entrySize(k, v))
+    val prefix = sizes.scanLeft(0)(_ + _)
+
+    def fits(i: Int, j: Int): Boolean =
+      val nodeLink = if j == entries.size then link else Some(NodeLink(entries(j)._1, standIn))
+      nodeOverhead(if i == 0 then minimum else entries(i)._1, nodeLink) + prefix(j) - prefix(i) <= maxNodeSize
+
+    val starts = SplitPlan.runs(sizes, maxNodeSize, fits).getOrElse(throw new NodeSizeExceeded)
+
+    (starts :+ entries.size).sliding(2).map(b => entries.slice(b(0), b(1)).toList).toList
+
+  /** Whether `runs`, from `planMultiSplit`, fit with `pointers` as the new nodes' pointers */
+  private[tkvl] def multiSplitFits(minimum: Key,
+                                   link: Option[NodeLink],
+                                   runs: List[List[(Key, Value)]],
+                                   pointers: List[DataObjectPointer],
+                                   maxNodeSize: Int): Boolean =
+    multiSplitNodes(minimum, link, runs, pointers).forall((min, l, entries) => encodedSize(entries, min, l) <= maxNodeSize)
+
+  /** The minimum, link and entries of each node of a multi-split, the original node first */
+  private def multiSplitNodes(minimum: Key,
+                              link: Option[NodeLink],
+                              runs: List[List[(Key, Value)]],
+                              pointers: List[DataObjectPointer]): List[(Key, Option[NodeLink], List[(Key, Value)])] =
+    val links = runs.tail.zip(pointers).map((run, p) => Some(NodeLink(run.head._1, p))) :+ link
+    val minimums = minimum :: runs.tail.map(_.head._1)
+    minimums.lazyZip(links).lazyZip(runs).toList
+
   /** Plans pointing a node, the predecessor of an empty node being removed from its list, at `newLink` */
   def planRelink(content: NodeContent, newLink: Option[NodeLink], maxNodeSize: Int): RewritePlan =
     if encodedSize(content.entries, content.minimum, newLink) <= maxNodeSize then
@@ -294,8 +381,8 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
     val n = dataNode(node)
     given ExecutionContext = n.reader.client.clientContext
 
-    if requirement.isDefined then
-      throw new UnsupportedRequirement(kind)
+    try checkRequirement(n.content, key, requirement)
+    catch case e: KeyAlreadyExists => tx.abortAndThrow(e)
 
     planInsert(n.pointer, n.content, n.ordering, key, value, maxNodeSize) match
       case Rewrite(entries) =>
@@ -375,18 +462,139 @@ object DataObjectNodeEncoding extends NodeEncoding with Logging:
               writeNode(n, encode(Nil, n.minimum, n.link))
               Future.successful(true)
 
-            case Some(joined) =>
-              writeNode(n, encode(joined.entries, joined.minimum, joined.link))
-              // This node's rewrite is already staged. The transaction rejects the lock if it already updates the
-              // right node, and the refcount update if it already changes the right node's refcount.
-              abortIfAlreadyModified(tx):
-                try
-                  tx.lockRevision(r.pointer, r.revision)
-                  tx.setRefcount(r.pointer, r.refcount, r.refcount.decrement())
-                catch
-                  case _: ConflictingRequirements | _: MultipleRefcountUpdatesToObject =>
-                    throw NodeAlreadyModified(r.pointer)
-              prepareForJoin(right.minimum, right.pointer).map(_ => r.entries.isEmpty)
+            case Some(joined) => stageJoin(n, joined, r, prepareForJoin)
+
+  /** Stages `n` absorbing its right neighbor `r` as `joined`, planned by `planJoin`. True if the joined node is empty */
+  private def stageJoin(n: DataObjectListNode,
+                        joined: NodeContent,
+                        r: DataObjectListNode,
+                        prepareForJoin: (Key, ObjectPointer) => Future[Unit])(using tx: Transaction): Future[Boolean] =
+    given ExecutionContext = n.reader.client.clientContext
+    writeNode(n, encode(joined.entries, joined.minimum, joined.link))
+    // This node's rewrite is already staged. The transaction rejects the bump if it already updates or locks the
+    // right node, and the refcount update if it already changes the right node's refcount. The right node's version
+    // is bumped rather than its revision locked, so that a racing writer that read it before the join, such as the
+    // removal of an empty node it precedes, fails rather than rewriting a deleted node.
+    abortIfAlreadyModified(tx):
+      try
+        tx.bumpVersion(r.pointer, r.revision)
+        tx.setRefcount(r.pointer, r.refcount, r.refcount.decrement())
+      catch
+        case _: ConflictingRequirements | _: MultipleDataUpdatesToObject | _: MultipleRefcountUpdatesToObject =>
+          throw NodeAlreadyModified(r.pointer)
+    prepareForJoin(r.minimum, r.pointer).map(_ => r.entries.isEmpty)
+
+  /** As `KeyValueListNode.applyBatch`, rewriting the whole node once. A put demanding its key be new relies on the
+    * node's revision, which every rewrite requires, so no further requirement is added.
+    */
+  def applyBatch(node: ListNode,
+                 ops: List[BatchOp],
+                 maxNodeSize: Int,
+                 allocator: ObjectAllocator,
+                 joinSource: Option[ListNode],
+                 prepareForSplit: (Key, ObjectPointer) => Future[Unit],
+                 prepareForJoin: (Key, ObjectPointer) => Future[Unit])(using tx: Transaction): Future[Boolean] =
+    val n = dataNode(node)
+    given ExecutionContext = n.reader.client.clientContext
+
+    val plan =
+      try planBatch(n.pointer, n.content, n.ordering, ops, maxNodeSize)
+      catch case e: KeyAlreadyExists => tx.abortAndThrow(e)
+
+    plan match
+      case None => Future.successful(false)
+
+      case Some(Rewrite(Nil)) if n.link.isDefined && joinSource.isDefined =>
+        val r = dataNode(joinSource.get)
+        planJoin(n.content, r.content, maxNodeSize) match
+          case None =>
+            writeNode(n, encode(Nil, n.minimum, n.link))
+            Future.successful(true)
+          case Some(joined) => stageJoin(n, joined, r, prepareForJoin)
+
+      case Some(Rewrite(entries)) =>
+        writeNode(n, encode(entries, n.minimum, n.link))
+        Future.successful(entries.isEmpty)
+
+      case Some(NeedsSplit(all)) =>
+        allocator.createDataObjectPointer().flatMap: rightPointer =>
+          splitIndex(n.minimum, all, n.link, rightPointer, maxNodeSize) match
+            case Some(_) =>
+              stageSplit(n, planSplit(n.minimum, n.link, all, rightPointer, maxNodeSize), n.link, rightPointer,
+                allocator, prepareForSplit).map(_ => false)
+            case None =>
+              multiSplit(n.minimum, n.link, all, rightPointer, maxNodeSize, allocator).flatMap: (runs, pointers) =>
+                val first = stageNewNodes(n.link, runs, pointers, allocator)
+                // The new nodes are already staged
+                abortIfAlreadyModified(tx)(writeNode(n, encode(runs.head, n.minimum, first)))
+                prepareNewNodes(runs, pointers, prepareForSplit).map(_ => false)
+
+  /** How many times a multi-split plans again with larger pointers before giving up */
+  private val MultiSplitAttempts = 3
+
+  /** The runs `all` divides into (see `planMultiSplit`) and a pointer for each new node. Plans with `standIn`, a
+    * pointer already created for the split, creates the rest, and plans again with the largest of them while a real
+    * pointer is too large for the plan. Creating pointers stages nothing.
+    */
+  private def multiSplit(minimum: Key,
+                         link: Option[NodeLink],
+                         all: List[(Key, Value)],
+                         standIn: DataObjectPointer,
+                         maxNodeSize: Int,
+                         allocator: ObjectAllocator)
+                        (using Transaction, ExecutionContext): Future[(List[List[(Key, Value)]], List[DataObjectPointer])] =
+    def attempt(sizing: DataObjectPointer,
+                created: List[DataObjectPointer],
+                remaining: Int): Future[(List[List[(Key, Value)]], List[DataObjectPointer])] =
+      val runs = planMultiSplit(minimum, link, all, sizing, maxNodeSize)
+      val needed = runs.size - 1
+      val fmore = Future.sequence(List.fill(math.max(0, needed - created.size))(allocator.createDataObjectPointer()))
+      fmore.flatMap: more =>
+        val pointers = (created ++ more).take(needed)
+        if multiSplitFits(minimum, link, runs, pointers, maxNodeSize) then
+          Future.successful((runs, pointers))
+        else if remaining == 0 then
+          Future.failed(new NodeSizeExceeded)
+        else
+          attempt(pointers.maxBy(_.encodedSize), created ++ more, remaining - 1)
+
+    attempt(standIn, List(standIn), MultiSplitAttempts)
+
+  /** Stages the allocation of every new node of a multi-split, the last taking `link`. Returns the link to the first */
+  private def stageNewNodes(link: Option[NodeLink],
+                            runs: List[List[(Key, Value)]],
+                            pointers: List[DataObjectPointer],
+                            allocator: ObjectAllocator)(using Transaction): Option[NodeLink] =
+    multiSplitNodes(Key.AbsoluteMinimum, link, runs, pointers).tail.zip(pointers).foreach: (node, ptr) =>
+      val (min, l, entries) = node
+      allocator.stageDataObjectAllocation(ptr, DataBuffer(encode(entries, min, l)))
+    Some(NodeLink(runs(1).head._1, pointers.head))
+
+  private def prepareNewNodes(runs: List[List[(Key, Value)]],
+                              pointers: List[DataObjectPointer],
+                              prepareForSplit: (Key, ObjectPointer) => Future[Unit])
+                             (using ExecutionContext): Future[Unit] =
+    runs.tail.zip(pointers).foldLeft(Future.unit): (prev, t) =>
+      prev.flatMap(_ => prepareForSplit(t._1.head._1, t._2))
+
+  def allocateChain(allocator: ObjectAllocator,
+                    ordering: KeyOrdering,
+                    entries: Map[Key, Value],
+                    maxNodeSize: Int,
+                    prepareForSplit: (Key, ObjectPointer) => Future[Unit])(using Transaction): Future[ObjectPointer] =
+    given ExecutionContext = allocator.client.clientContext
+    val sorted = entries.toList.sortWith((a, b) => ordering.compare(a._1, b._1) < 0)
+
+    allocator.createDataObjectPointer().flatMap: head =>
+      if encodedSize(sorted, Key.AbsoluteMinimum, None) <= maxNodeSize then
+        allocator.stageDataObjectAllocation(head, DataBuffer(encode(sorted, Key.AbsoluteMinimum, None)))
+        Future.successful(head)
+      else
+        allocator.createDataObjectPointer().flatMap: standIn =>
+          multiSplit(Key.AbsoluteMinimum, None, sorted, standIn, maxNodeSize, allocator).flatMap: (runs, pointers) =>
+            val first = stageNewNodes(None, runs, pointers, allocator)
+            allocator.stageDataObjectAllocation(head, DataBuffer(encode(runs.head, Key.AbsoluteMinimum, first)))
+            prepareNewNodes(runs, pointers, prepareForSplit).map(_ => head)
 
   /** As `KeyValueListNode.relink`: this node's entries are rewritten with `newLink`, or split in two if that does not
     * fit within `maxNodeSize`.

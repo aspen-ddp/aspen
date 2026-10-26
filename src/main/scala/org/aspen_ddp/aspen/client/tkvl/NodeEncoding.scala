@@ -20,7 +20,8 @@ trait NodeEncoding:
   /** Inserts or replaces `key` in `node`, which must be the node whose range holds `key`. A node that would grow
     * past `maxNodeSize` is split: the new right node is allocated from `allocator` and `prepareForSplit` is called
     * with its minimum and pointer. `requirement` is `Left(true)` for "key must not exist" or `Right(revision)` for
-    * "key must be at this revision"; encodings that cannot enforce it throw `UnsupportedRequirement`.
+    * "key must be at this revision"; encodings that cannot enforce it throw `UnsupportedRequirement`. A key that
+    * must not exist but does aborts the transaction with `KeyAlreadyExists`.
     */
   def insert(node: ListNode,
              key: Key,
@@ -40,6 +41,23 @@ trait NodeEncoding:
     */
   def delete(node: ListNode, key: Key, maxNodeSize: Int, prepareForJoin: (Key, ObjectPointer) => Future[Unit])
             (using Transaction): Future[Boolean]
+
+  /** Applies a batch of `ops` to `node`: ascending, at most one per key and all within the node's range. The node is
+    * updated once, so it can take any number of changes in one transaction. A node that no longer fits splits, into
+    * more than two nodes if one split is not enough, calling `prepareForSplit` for each new node. `joinSource` is the
+    * node's right neighbor, as read, when the caller found that the batch removes every entry of the node and leaves
+    * the neighbor alone: the node absorbs it if the join fits, calling `prepareForJoin`. Reads nothing.
+    *
+    * A put demanding its key be new (`Left(true)`) aborts the transaction with `KeyAlreadyExists` if the node holds
+    * the key. The result is true if the node is left empty.
+    */
+  def applyBatch(node: ListNode,
+                 ops: List[BatchOp],
+                 maxNodeSize: Int,
+                 allocator: ObjectAllocator,
+                 joinSource: Option[ListNode],
+                 prepareForSplit: (Key, ObjectPointer) => Future[Unit],
+                 prepareForJoin: (Key, ObjectPointer) => Future[Unit])(using Transaction): Future[Boolean]
 
   /** Stages pointing `node`, the predecessor of an empty node being removed from the list, at `newLink`, the removed
     * node's link. `newLink` can be longer than the old link, in which case `node` splits if it no longer fits
@@ -68,6 +86,15 @@ trait NodeEncoding:
   /** Allocates the first node of a tree, or of a new tier, holding `entries`, whose order is given by `ordering` */
   def allocate(allocator: ObjectAllocator, ordering: KeyOrdering, entries: Map[Key, Value])
               (using Transaction): Future[ObjectPointer]
+
+  /** As `allocate`, for the first node of a tree. Entries too many for one node of `maxNodeSize` are divided among a
+    * list of nodes, calling `prepareForSplit` for each node after the first. Returns the first node.
+    */
+  def allocateChain(allocator: ObjectAllocator,
+                    ordering: KeyOrdering,
+                    entries: Map[Key, Value],
+                    maxNodeSize: Int,
+                    prepareForSplit: (Key, ObjectPointer) => Future[Unit])(using Transaction): Future[ObjectPointer]
 
   /** Deletes every node of the list starting at `head`, calling `odeleteEntry` for each entry first if given */
   def deleteList(client: AspenClient,
@@ -108,3 +135,47 @@ object SplitPlan:
 
     val rsizes = sizes.reverse
     rmove(rsizes.tail, rsizes.head._1 :: Nil, rsizes.head._2) // Ensure at least 1 move
+
+  /** Splits the entries of a node that is too large for one split into consecutive runs, each fitting a node. Used
+   *  when a batch adds more to a node than two nodes can hold.
+   *
+   *  `sizes` holds the encoded size of each entry, ascending by key ordering. `fits(i, j)` says whether entries
+   *  `i until j` fit in one node: the run starting at 0 is the original node, every other run a new node whose
+   *  minimum is entry `i`, and every run but the last links to a node whose minimum is entry `j`. A run's entries
+   *  alone exceeding `maxNodeSize` is taken as not fitting without asking `fits`.
+   *
+   *  Returns the start index of each run, the first being 0, using as few nodes as possible and, among those, runs as
+   *  close to equal size as the greedy choice allows. There are always at least two runs. None if no division fits.
+   */
+  def runs(sizes: IndexedSeq[Int], maxNodeSize: Int, fits: (Int, Int) => Boolean): Option[List[Int]] =
+    val n = sizes.size
+    val prefix = sizes.scanLeft(0)(_ + _)
+
+    def pairs(i: Int, j: Int): Int = prefix(j) - prefix(i)
+
+    // The ends a run starting at i can have. The original node may not hold every entry.
+    def ends(i: Int): Iterator[Int] =
+      Iterator.range(i + 1, n + 1).takeWhile(j => pairs(i, j) <= maxNodeSize).filter(j => !(i == 0 && j == n))
+        .filter(j => fits(i, j))
+
+    // nodes(i): fewest nodes holding entries i until n, if any division fits
+    val nodes = new Array[Int](n + 1)
+    java.util.Arrays.fill(nodes, -1)
+    nodes(n) = 0
+    val fitting = Array.fill(n)(List.empty[Int])
+    for i <- (n - 1) to 0 by -1 do
+      fitting(i) = ends(i).filter(j => nodes(j) >= 0).toList
+      if fitting(i).nonEmpty then
+        nodes(i) = fitting(i).map(nodes(_)).min + 1
+
+    if nodes(0) < 0 then
+      None
+    else
+      def choose(i: Int): List[Int] =
+        if i == n then
+          Nil
+        else
+          val target = pairs(i, n) / nodes(i)
+          val j = fitting(i).filter(j => nodes(j) == nodes(i) - 1).minBy(j => math.abs(pairs(i, j) - target))
+          i :: choose(j)
+      Some(choose(0))

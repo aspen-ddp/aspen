@@ -10,10 +10,11 @@ import scala.concurrent.{ExecutionContext, Future}
   *
   * Differs from `TieredKeyValueList` where the node kind shows through:
   *  - Entries are plain values. There are no per-key revisions or timestamps and no key-level requirements.
+  *  - Inserts can require that the key not exist, but there are no revision requirements.
   *  - A transaction can modify each node only once. A `set` or `delete` reaching a node the same transaction already
-  *    modifies fails with `NodeAlreadyModified`, so two keys that share a node cannot be changed in one transaction.
-  *    Two `set`s on an empty tree in one transaction would both create the initial node; the second fails with
-  *    `RootAlreadyModified` and aborts the transaction.
+  *    modifies fails with `NodeAlreadyModified`, so to change two keys that may share a node in one transaction, use
+  *    `prepareUpdates`. Two `set`s on an empty tree in one transaction would both create the initial node; the
+  *    second fails with `RootAlreadyModified` and aborts the transaction.
   *
   * The root's kind can only be read asynchronously, so the constructor cannot check it. Every operation checks it
   * first and fails with `WrongTreeKind` for a root that is not a `DataObjects` root, before touching the
@@ -39,9 +40,15 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
 
   def get(key: Key): Future[Option[Value]] = checked(engine.get(key))
 
-  def set(key: Key, value: Value)(using Transaction): Future[Unit] = checked(engine.set(key, value))
+  /** With `requireDoesNotExist`, the transaction fails with `KeyAlreadyExists` if the tree holds `key` */
+  def set(key: Key, value: Value, requireDoesNotExist: Boolean = false)(using Transaction): Future[Unit] =
+    checked(engine.set(key, value, if requireDoesNotExist then Some(Left(true)) else None))
 
   def delete(key: Key)(using Transaction): Future[Unit] = checked(engine.delete(key))
+
+  /** As `TieredKeyValueList.prepareUpdates` */
+  def prepareUpdates(inserts: List[TKVLInsert], deletes: List[Key])(using Transaction): Future[Unit] =
+    checked(Future.delegate(engine.prepareUpdates(BatchOp.from(inserts, deletes))))
 
   /** Folds `fn` over the entries of every tier-0 node, left to right */
   def foldLeft[B](z: B)(fn: (B, Map[Key, Value]) => B): Future[B] =

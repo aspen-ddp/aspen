@@ -65,21 +65,33 @@ trait ObjectAllocator:
                              right: Option[Value] = None,
                              initialRefcount: ObjectRefcount = ObjectRefcount(0,1))(using t: Transaction): Future[KeyValueObjectPointer] =
     given ExecutionContext = client.clientContext
-    allocateKeyValueObject().map: ptr =>
-
-      var ops: List[KeyValueOperation] = initialContent.map((k, v) => Insert(k, v.bytes)).toList
-
-      minimum.foreach: min =>
-        ops = SetMin(min) :: ops
-      maximum.foreach: max =>
-        ops = SetMax(max) :: ops
-      left.foreach: left =>
-        ops = SetLeft(left.bytes) :: ops
-      right.foreach: right =>
-        ops = SetRight(right.bytes) :: ops
-
-      t.update(ptr, None, None, Nil, ops)
-      t.setRefcount(ptr, ObjectRefcount.Allocating, initialRefcount)
-
+    createKeyValueObjectPointer().map: ptr =>
+      stageKeyValueObjectAllocation(ptr, initialContent, minimum, maximum, left, right, initialRefcount)
       ptr
+
+  /** As `stageDataObjectAllocation`, for a pointer from `createKeyValueObjectPointer` */
+  protected[client] def stageKeyValueObjectAllocation(ptr: KeyValueObjectPointer,
+                                                      initialContent: Map[Key,Value],
+                                                      minimum: Option[Key] = None,
+                                                      maximum: Option[Key] = None,
+                                                      left: Option[Value] = None,
+                                                      right: Option[Value] = None,
+                                                      initialRefcount: ObjectRefcount = ObjectRefcount(0,1))
+                                                     (using t: Transaction): Unit =
+    t.addAllocatingObject(ptr)
+    AllocationFinalizationAction.addToTransaction(ptr, t)
+
+    var ops: List[KeyValueOperation] = initialContent.map((k, v) => Insert(k, v.bytes)).toList
+
+    minimum.foreach: min =>
+      ops = SetMin(min) :: ops
+    maximum.foreach: max =>
+      ops = SetMax(max) :: ops
+    left.foreach: left =>
+      ops = SetLeft(left.bytes) :: ops
+    right.foreach: right =>
+      ops = SetRight(right.bytes) :: ops
+
+    t.update(ptr, None, None, Nil, ops)
+    t.setRefcount(ptr, ObjectRefcount.Allocating, initialRefcount)
 

@@ -21,7 +21,9 @@ trait RootManager {
         case other => throw new IllegalStateException(s"Expected a KeyValueListNode but found ${other.getClass.getName}")
       (tier, ordering, kvNode)
 
-  /** Implementations must only commit if the tree is still empty at commit time.
+  /** Implementations must only commit if the tree is still empty at commit time. Contents too large for one tier-0
+   *  node are divided among a list of nodes (see `NodeEncoding.allocateChain`), each after the first added to tier 1
+   *  by a `SplitFinalizationAction`.
    *  TieredKeyValueList.set relies on this in place of key requirements. Fails with RootAlreadyModified, aborting
    *  the transaction, if the transaction already updates the root.
    */

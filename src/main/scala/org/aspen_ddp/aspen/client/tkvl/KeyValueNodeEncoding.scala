@@ -45,6 +45,17 @@ object KeyValueNodeEncoding extends NodeEncoding:
     given ExecutionContext = n.reader.client.clientContext
     KeyValueListNode.delete(n, key, n.reader, prepareForJoin)
 
+  def applyBatch(node: ListNode,
+                 ops: List[BatchOp],
+                 maxNodeSize: Int,
+                 allocator: ObjectAllocator,
+                 joinSource: Option[ListNode],
+                 prepareForSplit: (Key, ObjectPointer) => Future[Unit],
+                 prepareForJoin: (Key, ObjectPointer) => Future[Unit])(using Transaction): Future[Boolean] =
+    val n = kvNode(node)
+    given ExecutionContext = n.reader.client.clientContext
+    KeyValueListNode.applyBatch(n, ops, maxNodeSize, allocator, joinSource.map(kvNode), prepareForSplit, prepareForJoin)
+
   def relink(node: ListNode,
              newLink: Option[NodeLink],
              maxNodeSize: Int,
@@ -69,6 +80,14 @@ object KeyValueNodeEncoding extends NodeEncoding:
   def allocate(allocator: ObjectAllocator, ordering: KeyOrdering, entries: Map[Key, Value])
               (using Transaction): Future[ObjectPointer] =
     allocator.allocateKeyValueObject(entries)
+
+  def allocateChain(allocator: ObjectAllocator,
+                    ordering: KeyOrdering,
+                    entries: Map[Key, Value],
+                    maxNodeSize: Int,
+                    prepareForSplit: (Key, ObjectPointer) => Future[Unit])(using Transaction): Future[ObjectPointer] =
+    given ExecutionContext = allocator.client.clientContext
+    KeyValueListNode.allocateChain(allocator, ordering, entries, maxNodeSize, prepareForSplit)
 
   def deleteList(client: AspenClient,
                  head: NodeLink,

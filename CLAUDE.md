@@ -81,6 +81,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     pluggable `NodeEncoding`. `DataObjectTKVL` is more compact, stores values only (no per-key revisions/requirements)
     and uses whole-node revision checks: intended for single-writer / low-contention use. A second update to one of its
     nodes in a transaction fails with `NodeAlreadyModified`; `getContainingNode`/`TieredKeyValueListNode` are KV-only.
+  - `prepareUpdates(inserts: List[TKVLInsert], deletes)` changes many keys in one transaction on either kind, updating
+    each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe.
 - Aspen is designed and implemented largely as a logical system
   - Messages are addressed to logical entities like DataStores rather than physical hosts
   - The last step prior to sending a message is to look up the address of the network endpoint currently

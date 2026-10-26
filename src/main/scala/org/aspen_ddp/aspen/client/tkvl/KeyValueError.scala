@@ -35,9 +35,11 @@ class EmptyTree extends KeyValueError
 
 class BrokenTree extends KeyValueError
 
-/** The tree's node encoding cannot enforce the requested insert requirement (see `NodeEncoding.insert`) */
+/** The tree's node encoding cannot enforce the requested insert requirement (see `NodeEncoding.insert`). DataObject
+  * trees support only "key must not exist".
+  */
 class UnsupportedRequirement(val kind: TreeKind) extends KeyValueError:
-  override def getMessage: String = s"Insert requirements are not supported by $kind trees"
+  override def getMessage: String = s"Revision requirements are not supported by $kind trees"
 
 /** A DataObject-tree update would modify `pointer`, a node the same transaction already modifies. DataObject nodes
   * are rewritten whole, so one transaction can change a node only once.

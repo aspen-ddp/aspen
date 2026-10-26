@@ -26,6 +26,7 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
     def get(k: Key): Future[Option[List[Byte]]]
     def set(k: Key, v: Value)(using Transaction): Future[Unit]
     def delete(k: Key)(using Transaction): Future[Unit]
+    def prepareUpdates(inserts: List[TKVLInsert], deletes: List[Key])(using Transaction): Future[Unit]
 
   private def newTree(kind: TreeKind, maxNodeSize: Int): Future[(Tree, KVObjectRootManager)] =
     for
@@ -49,12 +50,16 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
             def get(k: Key) = t.get(k).map(_.map(_.value.bytes.toList))
             def set(k: Key, v: Value)(using Transaction) = t.set(k, v)
             def delete(k: Key)(using Transaction) = t.delete(k)
+            def prepareUpdates(inserts: List[TKVLInsert], deletes: List[Key])(using Transaction) =
+              t.prepareUpdates(inserts, deletes)
         case TreeKind.DataObjects =>
           val t = new DataObjectTKVL(client, rm)
           new Tree:
             def get(k: Key) = t.get(k).map(_.map(_.bytes.toList))
             def set(k: Key, v: Value)(using Transaction) = t.set(k, v)
             def delete(k: Key)(using Transaction) = t.delete(k)
+            def prepareUpdates(inserts: List[TKVLInsert], deletes: List[Key])(using Transaction) =
+              t.prepareUpdates(inserts, deletes)
       (tree, rm)
 
   /** One transaction per update, in order, without waiting for finalization in between. Everything is finalized
@@ -129,6 +134,35 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
 
   atest("a DataObject tree finds, deletes and inserts keys below an upper-tier node's first entry"):
     lookupsInTheGap(TreeKind.DataObjects, 200, 24)
+
+  /** As `lookupsInTheGap`, but one batch changes the key in the gap and every key above it. The batch's descent
+    * splits its ops among many tier-1 entries; the group for the gap finds nothing to descend into below the second
+    * tier-1 node and falls back to the node to its left, from which its scan reaches nodes other groups also reach.
+    */
+  private def batchThroughTheGap(kind: TreeKind, maxNodeSize: Int, numKeys: Int): Future[org.scalatest.Assertion] =
+    val all = (1 to numKeys).toList.map(i => Key(i))
+    for
+      (tree, rm) <- newTree(kind, maxNodeSize)
+      _ <- sequentially(all)((k, tx) => tree.set(k, value(k.bytes.last))(using tx))
+      b <- secondTier1Node(kind, rm)
+      m = b.minimum
+      _ <- sequentially(all.filter(k => ordering.compare(k, m) < 0))((k, tx) => tree.delete(k)(using tx))
+      above = all.filter(k => ordering.compare(k, m) > 0)
+      tx = client.newTransaction()
+      _ <- tree.prepareUpdates(above.map(k => TKVLInsert(k, value(99))), List(m))(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      vm <- tree.get(m)
+      values <- Future.sequence(above.map(tree.get))
+    yield
+      assert(vm.isEmpty)
+      assert(values.forall(_ == Some(value(99).bytes.toList)))
+
+  atest("a KeyValue-object tree applies a batch reaching below an upper-tier node's first entry"):
+    batchThroughTheGap(TreeKind.KeyValueObjects, 500, 60)
+
+  atest("a DataObject tree applies a batch reaching below an upper-tier node's first entry"):
+    batchThroughTheGap(TreeKind.DataObjects, 200, 24)
 
   /** Deleting all but the last key joins every node away except an emptied rightmost node at each tier. Removing
     * those empty tail nodes lets the tree give up all of its upper tiers.

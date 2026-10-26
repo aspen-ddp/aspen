@@ -1,18 +1,6 @@
 TODO
 ====
 
-Need KeyValueListNode & TKVL prepareUpdates(inserts: List[(Key,Value)], deletes: List[Key]): Future[Unit]
-  - Applies all changes in a single transaction
-  - May want to consider reimplement individual prepareInsert/prepareDelete operations in terms of this
-    more general-purpose method
-  - First step is to create a list of insert/delete operations sorted by key
-  - At KeyValueListNode level, just scan right and update/split/join nodes along the way
-  - At TKVL level, we can branch off and parallelize operations as we descend the tree
-    - can split off a subset of operations that will apply to a down pointer, and split off another set that
-      applies to another down-pointer. Both descent operations will result in a pointer so upper tiers return
-      sequences of futures to lower-level operations completing.
-    - Should result in good performance
-
 Need to add an upper-tier node caching capability to speed up future tree navigations
   - Upper tiers change very slowly so caching can be very beneficial
   - Cache misses don't affect correctness because we can always scan right on a tier

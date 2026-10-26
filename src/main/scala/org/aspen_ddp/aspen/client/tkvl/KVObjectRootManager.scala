@@ -99,6 +99,11 @@ class KVObjectRootManager(val client: AspenClient,
   }
 
   def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit] = {
+    def onSplit(newMinimum: Key, newNode: ObjectPointer): Future[Unit] = {
+      SplitFinalizationAction.addToTransaction(this, 1, newMinimum, newNode, tx)
+      Future.unit
+    }
+
     for {
       RData(root, rootRevision, onode) <- getRData()
 
@@ -109,7 +114,8 @@ class KVObjectRootManager(val client: AspenClient,
             tx.abortAndThrow(new Exception("Initial TKVL node already exists."))
 
       alloc <- root.nodeAllocator.getAllocatorForTier(0, root.kind)
-      rptr <- NodeEncoding(root.kind).allocate(alloc, root.ordering, contents)
+      rptr <- NodeEncoding(root.kind).allocateChain(alloc, root.ordering, contents,
+        root.nodeAllocator.getMaxNodeSize(0), onSplit)
     } yield {
       val newRoot = Root(0, root.ordering, Some(rptr), root.nodeAllocator, root.kind)
       // Pin the revision at which the tree was observed to be empty. Callers

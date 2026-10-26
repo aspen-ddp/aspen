@@ -53,6 +53,14 @@ class TieredKeyValueList(val client: AspenClient,
 
   def delete(key: Key)(using t: Transaction): Future[Unit] = engine.delete(key)
 
+  /** Inserts and deletes many keys in one transaction. Each node is updated once, so keys sharing a node can change
+    * together, which `set` and `delete` on the same node in one transaction cannot. Deleting a key the tree does not
+    * hold does nothing. Fails with `IllegalArgumentException`, before touching the transaction, if a key is inserted
+    * twice or both inserted and deleted. A failure once part of the batch is staged aborts the transaction.
+    */
+  def prepareUpdates(inserts: List[TKVLInsert], deletes: List[Key])(using t: Transaction): Future[Unit] =
+    Future.delegate(engine.prepareUpdates(BatchOp.from(inserts, deletes)))
+
   /** KeyValue-object trees only: the requirements are key-value requirements on the containing node */
   def delete(key: Key, 
              requiredRevision: Option[ObjectRevision],

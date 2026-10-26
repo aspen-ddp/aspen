@@ -121,47 +121,105 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
           value: Value,
           requirement: Option[Either[Boolean, ObjectRevision]] = None)
          (using t: Transaction): Future[Unit] =
+    prepareUpdates(List(BatchOp.Put(key, value, requirement)))
+
+  def delete(key: Key)(using t: Transaction): Future[Unit] =
+    prepareUpdates(List(BatchOp.Remove(key)))
+
+  /** Applies `ops`, at most one per key, to the tree in `t`. Each tier-0 node is updated once, so any number of keys
+    * sharing a node can change together. The ops are split among the down pointers of each node on the way down and
+    * the subtrees are descended in parallel, then each tier-0 node's ops are applied by `ListBatch`. A failure once an
+    * earlier node is staged aborts `t`.
+    *
+    * An empty tree gets its initial node holding the puts. Their requirements are dropped and deletes have nothing to
+    * delete: createInitialNode only commits if the tree is still empty, in which case no key can exist.
+    */
+  private[tkvl] def prepareUpdates(ops: List[BatchOp])(using t: Transaction): Future[Unit] =
 
     def onSplit(newMinimum: Key, newNode: ObjectPointer): Future[Unit] =
       SplitFinalizationAction.addToTransaction(rootManager, 1, newMinimum, newNode, t)
       Future.unit
 
-    def empty(): Future[Unit] =
-      // `requirement` is intentionally dropped. createInitialNode only commits
-      // if the tree is still empty, in which case the key cannot exist and a
-      // DoesNotExist requirement is already satisfied.
-      rootManager.createInitialNode(Map(key -> value)).map(_=>())
-
-    def nonEmpty(tier: Int, ordering: KeyOrdering, root: ListNode): Future[Unit] =
-      val encoding = encodingFor(root)
-      for
-        alloc <- rootManager.getAllocatorForTier(0)
-        maxNodeSize <- rootManager.getMaxNodeSize(0)
-
-        e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
-
-        node = e match
-          case Left(_) => throw new BrokenTree()
-          case Right(n) => n
-
-        _ <- encoding.insert(node, key, value, maxNodeSize, alloc, onSplit, requirement)
-      yield
-        ()
-
-    rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
-      oroot match
-        case None => empty()
-        case Some(root) => nonEmpty(tier, ordering, root)
-
-  def delete(key: Key)(using t: Transaction): Future[Unit] =
     def onJoin(delMinimum: Key, delNode: ObjectPointer): Future[Unit] =
       JoinFinalizationAction.addToTransaction(rootManager, 1, delMinimum, delNode, t)
       Future.unit
-    rootManager.getMaxNodeSize(0).flatMap: maxNodeSize =>
-      deleteFromContainingNode(key, node =>
-        encodingFor(node).delete(node, key, maxNodeSize, onJoin).map: empty =>
-          if empty then
-            prepareEmptyNodeRemoval(rootManager, 0, node))
+
+    def empty(): Future[Unit] =
+      val puts = ops.collect { case p: BatchOp.Put => p.key -> p.value }
+      if puts.isEmpty then
+        Future.unit
+      else
+        rootManager.createInitialNode(puts.toMap)
+
+    // Every read of the batch. A racing join can delete a node read along the way, which fails the read with
+    // InvalidObject. Nothing is staged yet, so the batch restarts from a fresh root.
+    def locateTargets(restarts: Int): Future[Option[List[ListBatch.Target]]] =
+      rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
+        oroot match
+          case None => Future.successful(None)
+          case Some(root) =>
+            val fetched = for
+              located <- locate(tier, root, BatchOp.sorted(ops, ordering))
+              _ = if located.unplaced.nonEmpty then throw new BrokenTree()
+              targets <- ListBatch.withJoinSources(client, located.assigned(ordering), located.read)
+            yield
+              Some(targets)
+            fetched.recoverWith:
+              case _: InvalidObject if restarts < MaxJoinRaceRestarts => locateTargets(restarts + 1)
+
+    if ops.isEmpty then
+      Future.unit
+    else
+      locateTargets(0).flatMap:
+        case None => empty()
+        case Some(targets) =>
+          for
+            alloc <- rootManager.getAllocatorForTier(0)
+            maxNodeSize <- rootManager.getMaxNodeSize(0)
+            emptied <- ListBatch.stage(targets, maxNodeSize, alloc, onSplit, onJoin)
+          yield
+            emptied.foreach(node => prepareEmptyNodeRemoval(rootManager, 0, node))
+
+  /** Finds the tier-0 node holding each of `ops`, ascending and all at or above `node`'s minimum, descending from
+    * `node` on `tier`. On an upper tier, each op goes to the greatest entry at or below its key and each entry's ops
+    * descend in parallel. A child that cannot be read, or below which some ops cannot be placed, hands those ops to
+    * the entry to its left, as `descend` falls back to the next candidate; ops with no entry left to try are returned
+    * unplaced. On tier 0, `ListBatch.assign` scans right from the node.
+    */
+  private def locate(tier: Int, node: ListNode, ops: List[BatchOp]): Future[Located] =
+    if tier == 0 then
+      ListBatch.assign(client, node, ops).map: (assigned, read) =>
+        Located(assigned, read.iterator.map(n => n.pointer.id -> n).toMap, Nil)
+    else
+      val encoding = encodingFor(node)
+      val ordering = node.ordering
+      val entries = node.entries.map((k, v) => k -> ObjectPointer(v.bytes)).toIndexedSeq
+
+      // Candidates for one entry's ops: the entry, then every entry to its left, as `descend` tries them
+      def viaCandidates(candidates: List[(Key, ObjectPointer)],
+                        ops: List[BatchOp],
+                        blacklist: Set[ObjectId]): Future[Located] = candidates match
+        case Nil => Future.successful(Located(Nil, Map(), ops))
+        case (minimum, pointer) :: rest =>
+          fetchNode(client, encoding, ordering, tier - 1, minimum, pointer, blacklist).flatMap:
+            case Left(bl) => viaCandidates(rest, ops, bl)
+            case Right(child) =>
+              locate(tier - 1, child, ops).flatMap: located =>
+                if located.unplaced.isEmpty then
+                  Future.successful(located)
+                else
+                  viaCandidates(rest, located.unplaced, blacklist + child.pointer.id)
+                    .map(located.copy(unplaced = Nil).merge)
+
+      // The index of the greatest entry at or below each op's key, or -1 for none
+      def entryIndex(key: Key): Int = entries.lastIndexWhere(e => ordering.compare(e._1, key) <= 0)
+
+      val groups = ops.groupBy(op => entryIndex(op.key)).toList
+      val unplaced = groups.collect { case (-1, gops) => gops }.flatten
+
+      Future.traverse(groups.filter(_._1 >= 0)): (index, gops) =>
+        viaCandidates(entries.take(index + 1).reverse.toList, BatchOp.sorted(gops, ordering), Set())
+      .map(_.foldLeft(Located(Nil, Map(), unplaced))((a, b) => a.merge(b)))
 
   /** Descends to the tier-0 node containing `key` and hands it to `del`.
    *
@@ -320,6 +378,22 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       Root(newTier, ordering, Some(ptr), oldRoot.nodeAllocator, oldRoot.kind)
 
 object TierEngine:
+
+  /** Where a batch's ops landed: the tier-0 nodes holding them, every tier-0 node read and the ops that could not be
+    * placed. Stale upper tiers can lead two groups of ops to the same tier-0 node, so `assigned` merges them.
+    */
+  private final case class Located(found: List[ListBatch.Assigned],
+                                   read: Map[ObjectId, ListNode],
+                                   unplaced: List[BatchOp]):
+
+    def merge(other: Located): Located =
+      Located(found ++ other.found, read ++ other.read, unplaced ++ other.unplaced)
+
+    /** One entry per node, left to right, the first read of a node kept */
+    def assigned(ordering: KeyOrdering): List[ListBatch.Assigned] =
+      found.groupBy(_.node.pointer.id).values.toList
+        .map(as => ListBatch.Assigned(as.head.node, BatchOp.sorted(as.flatMap(_.ops), ordering)))
+        .sortWith((a, b) => ordering.compare(a.node.minimum, b.node.minimum) < 0)
 
   /** Registers a `TailRemovalFinalizationAction` for an empty `node` that is not the head of its tier (a tier's head
     * has the absolute minimum and is never removed), to remove it from its list. `tier` is `node`'s own. Call after

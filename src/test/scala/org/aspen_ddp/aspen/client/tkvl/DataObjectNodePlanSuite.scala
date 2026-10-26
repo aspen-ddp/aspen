@@ -29,6 +29,8 @@ class DataObjectNodePlanSuite extends AnyFunSuite:
   private case class Node(pointer: DataObjectPointer, content: NodeContent)
 
   private var declinedJoins = 0
+  private var multiSplits = 0
+  private var batchJoins = 0
   private var splitRemovals = 0
 
   private class Tier(val maxNodeSize: Int, pointerLengths: Seq[Int] = Seq(3)):
@@ -80,6 +82,60 @@ class DataObjectNodePlanSuite extends AnyFunSuite:
               declinedJoins += 1
               nodes = nodes.updated(index, n.copy(content = n.content.copy(entries = Nil)))
       removeEmptyNodes()
+
+    /** As the executor's split of `all` in node `index`: one split if one fits, else a multi-split, planned again
+      * with larger pointers while the created ones do not fit
+      */
+    private def splitNode(index: Int, all: List[(Key, Value)]): Unit =
+      val n = nodes(index)
+      val c = n.content
+      val rightPointer = newPointer()
+      splitIndex(c.minimum, all, c.link, rightPointer, maxNodeSize) match
+        case Some(_) =>
+          val split = planSplit(c.minimum, c.link, all, rightPointer, maxNodeSize)
+          val left = Node(n.pointer, NodeContent(c.minimum, Some(NodeLink(split.newMinimum, rightPointer)), split.left))
+          nodes = nodes.patch(index, Vector(left, Node(rightPointer, NodeContent(split.newMinimum, c.link, split.right))), 1)
+        case None =>
+          def attempt(sizing: DataObjectPointer, created: List[DataObjectPointer], remaining: Int)
+              : (List[List[(Key, Value)]], List[DataObjectPointer]) =
+            val runs = planMultiSplit(c.minimum, c.link, all, sizing, maxNodeSize)
+            val all2 = created ++ List.fill(math.max(0, runs.size - 1 - created.size))(newPointer())
+            val ptrs = all2.take(runs.size - 1)
+            if multiSplitFits(c.minimum, c.link, runs, ptrs, maxNodeSize) then (runs, ptrs)
+            else if remaining == 0 then throw new NodeSizeExceeded
+            else attempt(ptrs.maxBy(_.encodedSize), all2, remaining - 1)
+          val (runs, ptrs) = attempt(rightPointer, List(rightPointer), 3)
+          multiSplits += 1
+          val links = runs.tail.zip(ptrs).map((r, p) => Some(NodeLink(r.head._1, p))) :+ c.link
+          val left = Node(n.pointer, NodeContent(c.minimum, links.head, runs.head))
+          val created = runs.tail.indices.map(j => Node(ptrs(j), NodeContent(runs(j + 1).head._1, links(j + 1), runs(j + 1))))
+          nodes = nodes.patch(index, left +: created, 1)
+
+    /** Applies a batch as `ListBatch` does, see the KeyValue suite's `batch` */
+    def batch(ops: List[BatchOp]): Unit =
+      val saved = nodes
+      try
+        val groups = BatchOp.sorted(ops, ordering).groupBy(op => indexFor(op.key))
+        val plans = groups.toList.map: (i, gops) =>
+          val n = nodes(i)
+          i -> planBatch(n.pointer, n.content, ordering, BatchOp.sorted(gops, ordering), maxNodeSize)
+        plans.sortBy(-_._1).foreach: (i, plan) =>
+          val n = nodes(i)
+          plan match
+            case None =>
+            case Some(Rewrite(Nil)) if n.content.link.isDefined && !groups.contains(i + 1) =>
+              planJoin(n.content, nodes(i + 1).content, maxNodeSize) match
+                case Some(joined) =>
+                  batchJoins += 1
+                  nodes = nodes.patch(i, Vector(n.copy(content = joined)), 2)
+                case None => nodes = nodes.updated(i, n.copy(content = n.content.copy(entries = Nil)))
+            case Some(Rewrite(entries)) => nodes = nodes.updated(i, n.copy(content = n.content.copy(entries = entries)))
+            case Some(NeedsSplit(all)) => splitNode(i, all)
+        removeEmptyNodes()
+      catch
+        case e: Throwable =>
+          nodes = saved
+          throw e
 
     /** What `TailRemovalFinalizationAction` does for every emptied node */
     def removeEmptyNodes(): Unit =
@@ -153,9 +209,96 @@ class DataObjectNodePlanSuite extends AnyFunSuite:
       assert(asBytes(tier.entries).toMap == model)
       assert(applied > 30)
 
+  private def put(k: Key, v: Value, mustNotExist: Boolean = false): BatchOp =
+    BatchOp.Put(k, v, if mustNotExist then Some(Left(true)) else None)
+
+  for limit <- List(200, 400, 1024); pointerLengths <- List(Seq(3), Seq(3, 30, 60)); seed <- 1 to 3 do
+    test(s"random batches keep every node within the limit and match the model (limit $limit, pointers ${pointerLengths.mkString("/")}, seed $seed)"):
+      val rnd = new Random(seed)
+      val tier = new Tier(limit, pointerLengths)
+      var model = Map.empty[List[Byte], List[Byte]]
+      var applied = 0
+
+      for step <- 0 until 60 do
+        val size = if rnd.nextInt(5) == 0 then 50 + rnd.nextInt(150) else 1 + rnd.nextInt(12)
+        val held = model.keys.toVector
+        // Values small enough for the limit that a large batch is rarely rejected for one entry
+        def randomValue(rnd: Random): Value = value(if rnd.nextBoolean() then rnd.nextInt(8) else rnd.nextInt(limit / 6))
+        val ops = (0 until size).map: _ =>
+          rnd.nextInt(10) match
+            case r if r < 3 && held.nonEmpty => BatchOp.Remove(Key(held(rnd.nextInt(held.size)).toArray))
+            case r if r < 4 => BatchOp.Remove(randomKey(rnd))
+            case r if r < 6 && held.nonEmpty => put(Key(held(rnd.nextInt(held.size)).toArray), randomValue(rnd))
+            case _ => put(randomKey(rnd), randomValue(rnd))
+        .groupBy(_.key).values.map(_.head).toList
+
+        val before = asBytes(tier.entries)
+        try
+          tier.batch(ops)
+          model = ops.foldLeft(model):
+            case (m, p: BatchOp.Put) => m + (p.key.bytes.toList -> p.value.bytes.toList)
+            case (m, BatchOp.Remove(k)) => m - k.bytes.toList
+          applied += 1
+        catch
+          case _: NodeSizeExceeded => assert(asBytes(tier.entries) == before, s"step $step")
+
+        tier.checkInvariants(s"step $step")
+        assert(asBytes(tier.entries).toMap == model, s"step $step")
+
+      assert(applied > 20)
+
+  test("a must-not-exist put of a held key is rejected and a revision requirement is unsupported"):
+    val ptr = pointer(1)
+    val content = NodeContent(Key.AbsoluteMinimum, None, List(key(1) -> value(1)))
+    intercept[org.aspen_ddp.aspen.common.objects.KeyAlreadyExists](
+      planBatch(ptr, content, ordering, List(put(key(1), value(2), mustNotExist = true)), 1024))
+    intercept[UnsupportedRequirement](
+      planBatch(ptr, content, ordering, List(BatchOp.Put(key(2), value(2), Some(Right(org.aspen_ddp.aspen.common.objects.ObjectRevision.Null)))), 1024))
+    assert(planBatch(ptr, content, ordering, List(put(key(2), value(2), mustNotExist = true)), 1024).isDefined)
+
+  for seed <- 1 to 5 do
+    test(s"a batch of one op plans what the single-key plan functions do (seed $seed)"):
+      val rnd = new Random(seed)
+      val tier = new Tier(400, Seq(3, 30))
+      var compared = 0
+
+      def same(a: RewritePlan, b: RewritePlan): Boolean = (a, b) match
+        case (Rewrite(x), Rewrite(y)) => asBytes(x) == asBytes(y)
+        case (NeedsSplit(x), NeedsSplit(y)) => asBytes(x) == asBytes(y)
+        case _ => false
+
+      for step <- 0 until 200 do
+        val k = randomKey(rnd)
+        val n = tier.nodes(tier.indexFor(k))
+
+        locally:
+          val v = randomValue(rnd)
+          val single = scala.util.Try(planInsert(n.pointer, n.content, ordering, k, v, 400))
+          val batched = scala.util.Try(planBatch(n.pointer, n.content, ordering, List(put(k, v)), 400))
+          (single, batched) match
+            case (scala.util.Success(p), scala.util.Success(Some(b))) => assert(same(p, b), s"step $step")
+            case (scala.util.Failure(e1), scala.util.Failure(e2)) => assert(e1.getClass == e2.getClass, s"step $step")
+            case other => fail(s"step $step: $other")
+          compared += 1
+
+        if n.content.entries.nonEmpty then
+          val held = n.content.entries(rnd.nextInt(n.content.entries.size))._1
+          (planDelete(n.content, held), planBatch(n.pointer, n.content, ordering, List(BatchOp.Remove(held)), 400)) match
+            case (RemoveEntry(rem), Some(Rewrite(b))) => assert(asBytes(rem) == asBytes(b))
+            case (ConsiderJoin(_), Some(Rewrite(Nil))) => assert(n.content.link.isDefined)
+            case other => fail(s"step $step: $other")
+        assert(planBatch(n.pointer, n.content, ordering, List(BatchOp.Remove(padded(130, 3))), 400).isEmpty)
+
+        try tier.insert(k, randomValue(rnd))
+        catch case _: NodeSizeExceeded => ()
+
+      assert(compared == 200)
+
   test("the random runs decline joins and split to remove empty nodes"):
     assert(declinedJoins > 0, "no join was declined")
     assert(splitRemovals > 0, "no removal needed a split")
+    assert(multiSplits > 0, "no batch split a node into more than two")
+    assert(batchJoins > 0, "no batch joined an emptied node")
 
   test("an entry is rejected unless it fits with a link as long as one to its own key"):
     val ptr = pointer(1)

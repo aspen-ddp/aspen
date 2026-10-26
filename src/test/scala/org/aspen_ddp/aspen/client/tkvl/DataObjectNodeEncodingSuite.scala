@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{ObjectAllocator, Transaction}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.ReedSolomon
-import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyAlreadyExists, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 
 import scala.concurrent.Future
@@ -177,19 +177,26 @@ class DataObjectNodeEncodingSuite extends IntegrationTestSuite:
       assert(tx.isEmpty)
       assert(n1.revision == n0.revision)
 
-  atest("insert with a defined requirement throws UnsupportedRequirement"):
+  atest("insert supports must-not-exist but throws UnsupportedRequirement for a revision requirement"):
     for
       n0 <- makeNode(List(key(1) -> vbytes(1)))
       alloc <- allocator()
       tx = client.newTransaction()
-      r1 <- Future.delegate(enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, Some(Left(true)))(using tx))
-        .failed
-      r2 <- Future.delegate(enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit,
+      r <- Future.delegate(enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit,
         Some(Right(n0.revision)))(using tx)).failed
+      _ = assert(r.isInstanceOf[UnsupportedRequirement])
+      _ = assert(tx.isEmpty)
+      _ <- enc.insert(n0, key(2), vbytes(2), 4096, alloc, noSplit, Some(Left(true)))(using tx)
+      _ <- tx.commit()
+      n1 <- readNode(n0.pointer)
+      tx2 = client.newTransaction()
+      exists <- Future.delegate(enc.insert(n1, key(1), vbytes(3), 4096, alloc, noSplit,
+        Some(Left(true)))(using tx2)).failed
+      aborted <- tx2.result.failed
     yield
-      assert(r1.isInstanceOf[UnsupportedRequirement])
-      assert(r2.isInstanceOf[UnsupportedRequirement])
-      assert(tx.isEmpty)
+      assert(n1.entries.map(_._1) == List(key(1), key(2)))
+      assert(exists.isInstanceOf[KeyAlreadyExists])
+      assert(aborted.isInstanceOf[KeyAlreadyExists])
 
   atest("an entry too large for the node limit throws NodeSizeExceeded with nothing staged"):
     val maxNodeSize = 200

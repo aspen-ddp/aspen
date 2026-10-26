@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.client.tkvl
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer}
 
 import scala.collection.immutable.TreeMap
-import scala.concurrent.Future
+import scala.concurrent.{ExecutionContext, Future}
 
 /** A tree instance reused across operations caches its upper tiers. These tests run a warm instance against changes
   * made through another instance of the same tree (as another client would make them) and check that the
@@ -220,6 +220,31 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
           freshRoot.map(n => (n.pointer.id, n.revision))))
         assert(left.isEmpty)
         assert(right == bytesOf(moved))
+
+    atest(s"$kind: a lookup chained on the split's commit misses the moved key"):
+      val moved = Key(25)
+      for
+        f <- fixture(kind)
+        _ <- f.warm.get(moved)
+        tx = client.newTransaction()
+        newRoot <- f.warm.splitTree(Key(15), false)(using tx)
+        _ = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), true, newRoot)(using tx)
+        left <- tx.commit().flatMap(_ => f.warm.get(moved))
+      yield
+        assert(left.isEmpty)
+
+    // The suite's serial executor runs the lookup above only after every callback splitTree registered, so it cannot
+    // catch a cache restored before those run. A parasitic continuation runs inline, and before older callbacks.
+    atest(s"$kind: a continuation of the split's commit sees nothing cached"):
+      for
+        f <- fixture(kind)
+        _ <- f.warm.get(Key(25))
+        tx = client.newTransaction()
+        newRoot <- f.warm.splitTree(Key(15), false)(using tx)
+        _ = KVObjectRootManager.setNewRoot(client, f.rm.pointer, Key(Array[Byte](1)), true, newRoot)(using tx)
+        seen <- tx.commit().map(_ => f.rm.cache.root)(using ExecutionContext.parasitic)
+      yield
+        assert(seen.isEmpty)
 
     atest(s"$kind: deleteTree then reuse of the same instance"):
       val k = Key(15)

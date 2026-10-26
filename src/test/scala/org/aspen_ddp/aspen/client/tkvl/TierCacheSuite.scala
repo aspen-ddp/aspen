@@ -2,11 +2,13 @@ package org.aspen_ddp.aspen.client.tkvl
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyOrdering, KeyValueObjectPointer, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.scalatest.funsuite.AnyFunSuite
 
-class TierCacheSuite extends IntegrationTestSuite:
+import scala.concurrent.Promise
+
+class TierCacheSuite extends AnyFunSuite:
 
   private val poolId = PoolId(new UUID(0, 5))
 
@@ -25,8 +27,11 @@ class TierCacheSuite extends IntegrationTestSuite:
   private def stub(i: Int): StubNode =
     new StubNode(KeyValueObjectPointer(ObjectId(new UUID(1, i)), poolId))
 
+  // No client: the cache never uses the allocator
+  private val allocator = new NodeAllocator(null, Nil)
+
   private def rootState(tier: Int, node: Option[ListNode]): RootState =
-    RootState(Root(tier, ByteArrayKeyOrdering, None, new NodeAllocator(client, Nil)), ObjectRevision.Null, node)
+    RootState(Root(tier, ByteArrayKeyOrdering, None, allocator), ObjectRevision.Null, node)
 
   test("NoCache stores nothing"):
     val n = stub(1)
@@ -63,7 +68,8 @@ class TierCacheSuite extends IntegrationTestSuite:
     val c = new LruTierCache(5)
     val nodes = (1 to 6).map(stub)
     nodes.foreach(c.put(1, _, c.generation))
-    assert(nodes.count(n => c.node(1, n.pointer.id).isDefined) <= 5)
+    // The synchronous eviction executor has evicted one by now
+    assert(nodes.count(n => c.node(1, n.pointer.id).isDefined) == 5)
     val other = stub(10)
     c.put(2, other, c.generation)
     assert(c.node(2, other.pointer.id).contains(other))
@@ -107,4 +113,31 @@ class TierCacheSuite extends IntegrationTestSuite:
     val rs = rootState(1, Some(n))
     c.putRoot(rs, c.generation)
     assert(c.node(1, n.pointer.id).contains(n))
+    assert(c.root.contains(rs))
+
+  test("a suspended cache misses and ignores fills until its future completes"):
+    val c = new LruTierCache(5)
+    val a = stub(1)
+    val b = stub(2)
+    c.put(1, a, c.generation)
+    c.putRoot(rootState(1, Some(a)), c.generation)
+    val p = Promise[Unit]()
+    c.suspendUntil(p.future)
+    assert(c.node(1, a.pointer.id).isEmpty)
+    assert(c.root.isEmpty)
+    val during = c.generation
+    c.put(1, b, during)
+    c.putRoot(rootState(1, Some(b)), during)
+    assert(c.node(1, b.pointer.id).isEmpty)
+    assert(c.root.isEmpty)
+    p.success(())
+    assert(c.node(1, a.pointer.id).isEmpty)
+    assert(c.root.isEmpty)
+    // A fill whose read started while suspended stays ignored
+    c.put(1, b, during)
+    assert(c.node(1, b.pointer.id).isEmpty)
+    c.put(1, b, c.generation)
+    val rs = rootState(1, Some(b))
+    c.putRoot(rs, c.generation)
+    assert(c.node(1, b.pointer.id).contains(b))
     assert(c.root.contains(rs))

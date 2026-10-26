@@ -1,11 +1,12 @@
 package org.aspen_ddp.aspen.client.tkvl
 
-import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong, AtomicReference}
 
 import com.github.blemale.scaffeine.{Cache, Scaffeine}
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRevision}
 
 import scala.collection.concurrent.TrieMap
+import scala.concurrent.{ExecutionContext, Future}
 
 /** The root as a root manager reads it: the Root, its hosting object's revision and the root node */
 final case class RootState(root: Root, revision: ObjectRevision, node: Option[ListNode])
@@ -38,6 +39,11 @@ trait TierCache:
 
   def clear(): Unit
 
+  /** Until `f` completes every lookup misses and every fill is ignored. Once it does, the cache is cleared before
+    * lookups and fills resume, so a fill whose read started before that is ignored too.
+    */
+  def suspendUntil(f: Future[?]): Unit
+
 object TierCache:
   val DefaultNodesPerTier: Int = 5
 
@@ -53,26 +59,29 @@ object NoCache extends TierCache:
   def put(tier: Int, node: ListNode, generation: Long): Unit = ()
   def stale(tier: Int, node: ListNode): Unit = ()
   def clear(): Unit = ()
+  def suspendUntil(f: Future[?]): Unit = ()
 
 /** Keeps the most recently used `nodesPerTier` nodes of each tier >= 1, plus the root */
 final class LruTierCache(nodesPerTier: Int) extends TierCache:
   private val tiers = TrieMap.empty[Int, Cache[ObjectId, ListNode]]
   private val rootRef = new AtomicReference[Option[RootState]](None)
   private val clears = new AtomicLong(0)
+  private val suspensions = new AtomicInteger(0)
 
-  // Fills and clear() hold this lock, so a fill cannot pass the generation check and then land after a clear
+  // Fills, clear() and the end of a suspension hold this lock, so a fill cannot pass the generation and suspension
+  // checks and then land after a clear
   private val fillLock = new Object
 
   // The synchronous executor makes eviction deterministic
   private def tierCache(tier: Int): Cache[ObjectId, ListNode] =
     tiers.getOrElseUpdate(tier, Scaffeine().maximumSize(nodesPerTier).executor(_.run()).build[ObjectId, ListNode]())
 
-  def root: Option[RootState] = rootRef.get()
+  def root: Option[RootState] = if suspensions.get() > 0 then None else rootRef.get()
 
   def generation: Long = clears.get()
 
   def putRoot(r: RootState, generation: Long): Unit = fillLock.synchronized:
-    if generation == clears.get() then
+    if suspensions.get() == 0 && generation == clears.get() then
       if r.node.isDefined && r.root.tier >= 1 then
         rootRef.set(Some(r))
       else
@@ -81,10 +90,10 @@ final class LruTierCache(nodesPerTier: Int) extends TierCache:
   def dropRoot(): Unit = rootRef.set(None)
 
   def node(tier: Int, id: ObjectId): Option[ListNode] =
-    if tier < 1 then None else tiers.get(tier).flatMap(_.getIfPresent(id))
+    if tier < 1 || suspensions.get() > 0 then None else tiers.get(tier).flatMap(_.getIfPresent(id))
 
   def put(tier: Int, node: ListNode, generation: Long): Unit = fillLock.synchronized:
-    if tier >= 1 && generation == clears.get() then
+    if tier >= 1 && suspensions.get() == 0 && generation == clears.get() then
       tierCache(tier).put(node.pointer.id, node)
 
   def stale(tier: Int, node: ListNode): Unit =
@@ -96,3 +105,12 @@ final class LruTierCache(nodesPerTier: Int) extends TierCache:
     clears.incrementAndGet()
     tiers.values.foreach(_.invalidateAll())
     dropRoot()
+
+  def suspendUntil(f: Future[?]): Unit =
+    suspensions.incrementAndGet()
+    // Clearing before resuming advances the generation, so a fill whose read started while suspended stays ignored
+    f.onComplete { _ =>
+      fillLock.synchronized:
+        clear()
+        suspensions.decrementAndGet()
+    }(using ExecutionContext.parasitic)

@@ -62,7 +62,8 @@ refinement of it.)*
 
   then evict P only. The rest of tier t+1 stays cached. If P is the cached root, drop the cached root so
   the next operation re-reads it.
-- Scans right that start from a freshly read (non-cached) parent evict nothing.
+- The stale signal evicts P whether or not P came from the cache. Evicting a freshly read P only costs a
+  re-read, e.g. while a split finalization is pending, which is already accepted.
 - A split whose finalization action has not yet updated the parent produces the same scan-right signal
   repeatedly until it runs. Each time P is evicted and re-read. That is accepted.
 
@@ -100,8 +101,13 @@ and the one exception to "stale only costs reads".
 The user decided against a per-operation root revision check to catch this: `splitTree` is rare and
 niche, and the cache exists for the common case. Instead:
 
-- `splitTree` clears the calling instance's whole cache, both when it is called and again once its
-  transaction resolves, so the instance that splits is never wrong.
+- `splitTree` suspends the calling instance's cache until its transaction resolves, whatever the outcome:
+  while suspended every lookup misses and every fill is ignored, and on resolution the cache is cleared
+  before lookups and fills resume. A plain clear in a callback on the transaction's result is not enough:
+  a promise runs its newest callbacks first, so continuations of `commit()` registered after `splitTree`
+  returns could run before it, and `splitTree`'s own reads cache the pre-split root. Suspension hides what
+  was cached before the call, so no separate clear on entry is needed. The instance that splits is
+  therefore never wrong.
 - Other instances are not protected. `splitTree` on both facades (`TieredKeyValueList`, `DataObjectTKVL`)
   carries a prominent warning in its doc comment: other long-lived instances of the tree (other clients,
   other processes, other instances in this process) may return entries that moved to the new tree until
@@ -125,8 +131,9 @@ niche, and the cache exists for the common case. Instead:
 - **Races between filling and clearing** *(controller ruling)*. A refill across a `clear()` is not
   allowed. The cache keeps a generation that `clear()` advances, and every fill (`put`, `putRoot`) passes
   the generation its caller captured before starting the read. A fill whose read started before a clear is
-  ignored, so a read in flight when `splitTree` clears the cache cannot restore a pre-split root or node,
-  and the splitting instance is never wrong.
+  ignored, so a read in flight when a `splitTree` suspension ends (with a clear) cannot restore a
+  pre-split root or node, and the splitting instance is never wrong. The clear and the end of the
+  suspension happen together under the fill lock.
 - **Root writes read fresh.** `prepareRootUpdate` and `createInitialNode` use the root container's revision
   as a transaction requirement and `createInitialNode` relies on observing the tree as empty. They must
   always read the root fresh, never from the cache, so an aborted write is never retried against the same

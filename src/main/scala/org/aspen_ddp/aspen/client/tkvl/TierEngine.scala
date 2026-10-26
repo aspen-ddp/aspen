@@ -346,14 +346,15 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   /** See `TieredKeyValueList.splitTree`. It writes the upper-tier nodes on its path, so it reads them fresh. Once the
     * split commits, this instance's cached upper tiers would route lookups of the moved keys into the new tree, so
-    * the whole cache is cleared on entry and again when `t` resolves, whatever its outcome.
+    * the cache is suspended until `t` resolves, whatever its outcome, and is then cleared. A callback on `t.result`
+    * cannot simply clear it: callbacks registered later, such as those of `t.commit()`, may run first, and this
+    * method's own reads cache the pre-split root. Suspension also hides what was cached before the call, so no
+    * separate clear on entry is needed.
     */
   def splitTree(splitAtKey: Key, inclusive: Boolean = false)
                (using t: Transaction): Future[Root] =
 
-    rootManager.cache.clear()
-    // Parasitic, so the cache is clear before anything waiting on the transaction runs
-    t.result.onComplete(_ => rootManager.cache.clear())(using ExecutionContext.parasitic)
+    rootManager.cache.suspendUntil(t.result)
 
     // Nodes above tier 0 on the descent path need not hold splitAtKey, since navigation between
     // tiers is not consistent, so each split first scans right to the node that does.

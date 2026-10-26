@@ -22,13 +22,15 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   import TierEngine.*
 
-  /** Descends to the tier-0 node containing `key` and hands it to `f`. An empty tree yields `empty`. */
+  /** Descends to the tier-0 node containing `key` and hands it to `f`. An empty tree yields `empty`. The descent
+    * goes through the cached upper tiers.
+    */
   private def withContainingNode[A](key: Key, empty: => A)(f: ListNode => Future[A]): Future[A] =
     rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
       oroot match
         case None => Future.successful(empty)
         case Some(root) =>
-          fetchContainingNode(client, tier, 0, ordering, key, root, Set()).flatMap:
+          fetchContainingNode(client, tier, 0, ordering, key, root, Set(), cache = rootManager.cache).flatMap:
             case Left(_) => throw new BrokenTree()
             case Right(node) => f(node)
 
@@ -185,6 +187,9 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     * descend in parallel. A child that cannot be read, or below which some ops cannot be placed, hands those ops to
     * the entry to its left, as `descend` falls back to the next candidate; ops with no entry left to try are returned
     * unplaced. On tier 0, `ListBatch.assign` scans right from the node.
+    *
+    * Upper-tier nodes come from the tree's cache when present. `node` is evicted from it as `descend` evicts a stale
+    * parent: when the child an entry names does not hold the greatest of the entry's ops, or cannot be read.
     */
   private def locate(tier: Int, node: ListNode, ops: List[BatchOp]): Future[Located] =
     if tier == 0 then
@@ -194,21 +199,29 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       val encoding = encodingFor(node)
       val ordering = node.ordering
       val entries = node.entries.map((k, v) => k -> ObjectPointer(v.bytes)).toIndexedSeq
+      val cache = rootManager.cache
 
-      // Candidates for one entry's ops: the entry, then every entry to its left, as `descend` tries them
+      // Candidates for one entry's ops: the entry, then every entry to its left, as `descend` tries them. Only the
+      // first, the entry the ops belong to, is expected to hold them.
       def viaCandidates(candidates: List[(Key, ObjectPointer)],
                         ops: List[BatchOp],
-                        blacklist: Set[ObjectId]): Future[Located] = candidates match
+                        blacklist: Set[ObjectId],
+                        first: Boolean): Future[Located] = candidates match
         case Nil => Future.successful(Located(Nil, Map(), ops))
         case (minimum, pointer) :: rest =>
-          fetchNode(client, encoding, ordering, tier - 1, minimum, pointer, blacklist).flatMap:
-            case Left(bl) => viaCandidates(rest, ops, bl)
+          fetchNode(client, encoding, ordering, tier - 1, minimum, pointer, blacklist, cache).flatMap:
+            case Left(bl) =>
+              if !blacklist.contains(pointer.id) then
+                cache.stale(tier, node)
+              viaCandidates(rest, ops, bl, false)
             case Right(child) =>
+              if first && !child.keyInRange(ops.last.key) then
+                cache.stale(tier, node)
               locate(tier - 1, child, ops).flatMap: located =>
                 if located.unplaced.isEmpty then
                   Future.successful(located)
                 else
-                  viaCandidates(rest, located.unplaced, blacklist + child.pointer.id)
+                  viaCandidates(rest, located.unplaced, blacklist + child.pointer.id, false)
                     .map(located.copy(unplaced = Nil).merge)
 
       // The index of the greatest entry at or below each op's key, or -1 for none
@@ -218,10 +231,12 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       val unplaced = groups.collect { case (-1, gops) => gops }.flatten
 
       Future.traverse(groups.filter(_._1 >= 0)): (index, gops) =>
-        viaCandidates(entries.take(index + 1).reverse.toList, BatchOp.sorted(gops, ordering), Set())
+        viaCandidates(entries.take(index + 1).reverse.toList, BatchOp.sorted(gops, ordering), Set(), true)
       .map(_.foldLeft(Located(Nil, Map(), unplaced))((a, b) => a.merge(b)))
 
   /** Descends to the tier-0 node containing `key` and hands it to `del`.
+   *
+   *  The descent goes through the cached upper tiers.
    *
    *  Deleting a node's last key joins it with its right neighbour, which `del` reads. If a racing
    *  join already absorbed that neighbour, the containing node was read before the join and the
@@ -236,7 +251,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
           case None => Future.unit
           case Some(root) =>
             for
-              e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set())
+              e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set(), cache = rootManager.cache)
               node = e match
                 case Left(_) => throw new BrokenTree()
                 case Right(n) => n
@@ -249,7 +264,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   /** Deletes every node of the tree, then updates the root to an empty tree. `deleteDataList` deletes the tier-0
     * list starting at the leftmost tier-0 node it is handed, which lets a facade visit each entry in its own
-    * terms. Upper tiers are deleted through the tree's encoding.
+    * terms. Upper tiers are deleted through the tree's encoding. Every node is read fresh, never from the cache.
     */
   def deleteTree(deleteDataList: ListNode => Future[Unit]): Future[Unit] =
 
@@ -290,7 +305,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
           ()
 
     for
-      (tier, ordering, onode) <- rootManager.getRootNode()
+      (tier, ordering, onode) <- rootManager.getFreshRootNode()
 
       _ <- onode match
         case None => Future.unit
@@ -307,9 +322,16 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     yield
       ()
 
-  /** See `TieredKeyValueList.splitTree` */
+  /** See `TieredKeyValueList.splitTree`. It writes the upper-tier nodes on its path, so it reads them fresh. Once the
+    * split commits, this instance's cached upper tiers would route lookups of the moved keys into the new tree, so
+    * the whole cache is cleared on entry and again when `t` resolves, whatever its outcome.
+    */
   def splitTree(splitAtKey: Key, inclusive: Boolean = false)
                (using t: Transaction): Future[Root] =
+
+    rootManager.cache.clear()
+    // Parasitic, so the cache is clear before anything waiting on the transaction runs
+    t.result.onComplete(_ => rootManager.cache.clear())(using ExecutionContext.parasitic)
 
     // Nodes above tier 0 on the descent path need not hold splitAtKey, since navigation between
     // tiers is not consistent, so each split first scans right to the node that does.
@@ -364,7 +386,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     for
       oldRoot <- rootManager.getRoot()
       encoding = NodeEncoding(oldRoot.kind)
-      (tier, ordering, oroot) <- rootManager.getRootNode()
+      (tier, ordering, oroot) <- rootManager.getFreshRootNode()
       (newTier, ptr) <- oroot match
         case Some(root) => nonEmpty(encoding, tier, ordering, root)
         case None =>
@@ -417,6 +439,9 @@ object TierEngine:
   /*
    Returns Left if the tree is broken or Right with the node on targetTier whose range holds target.
 
+   Upper-tier nodes below currentNode come from `cache` when present, and stale ones are evicted from it (see
+   descend). The finalization actions pass no cache, and so read every node fresh.
+
    With linksTo, which names a node on targetTier whose minimum is target, this instead finds the node on
    targetTier immediately to its left. See fetchPredecessor.
    */
@@ -428,11 +453,12 @@ object TierEngine:
                                         currentNode: ListNode,
                                         initialBlacklist: Set[ObjectId],
                                         reversePath: List[ListNode] = Nil,
-                                        linksTo: Option[ObjectId] = None): Future[Either[Set[ObjectId], ListNode]] =
+                                        linksTo: Option[ObjectId] = None,
+                                        cache: TierCache = NoCache): Future[Either[Set[ObjectId], ListNode]] =
     given ExecutionContext = client.clientContext
 
     fetchContainingNodePath(client, currentTier, targetTier, ordering, target,
-      currentNode, initialBlacklist, reversePath, linksTo).map:
+      currentNode, initialBlacklist, reversePath, linksTo, cache).map:
       case Left(l) => Left(l)
       case Right(rpath) => Right(rpath.head)
 
@@ -446,7 +472,7 @@ object TierEngine:
    node and fails with InvalidObject. Upper-tier reads are already tolerant of this (fetchNode
    blacklists them), so any InvalidObject here comes from the target-tier scan. currentNode is
    the leftmost node of its tier, which a join never deletes, so refreshing it and descending
-   again sees the list as the join left it.
+   again sees the list as the join left it. See fetchContainingNode for `cache`.
 
    Tier reduction does delete the root, though, so the refresh fails if one ran after the caller
    read it. The deleted root held only its AbsoluteMinimum child, which became the new root, so
@@ -460,7 +486,8 @@ object TierEngine:
                                             currentNode: ListNode,
                                             initialBlacklist: Set[ObjectId],
                                             reversePath: List[ListNode] = Nil,
-                                            linksTo: Option[ObjectId] = None): Future[Either[Set[ObjectId], List[ListNode]]] =
+                                            linksTo: Option[ObjectId] = None,
+                                            cache: TierCache = NoCache): Future[Either[Set[ObjectId], List[ListNode]]] =
 
     given ExecutionContext = client.clientContext
 
@@ -479,8 +506,8 @@ object TierEngine:
                 tier: Int,
                 start: ListNode,
                 restarts: Int): Future[Either[Set[ObjectId], List[ListNode]]] =
-      descend(client, encoding, tier, targetTier, ordering, target, start, initialBlacklist, reversePath, linksTo)
-        .recoverWith:
+      descend(client, encoding, tier, targetTier, ordering, target, start, initialBlacklist, reversePath, linksTo,
+        cache).recoverWith:
         case _: InvalidObject if restarts < MaxJoinRaceRestarts =>
           refresh(encoding, start).map(n => (tier, n)).recoverWith:
             case _: InvalidObject if tier > targetTier => leftmostChild(encoding, start).map(n => (tier - 1, n))
@@ -553,6 +580,17 @@ object TierEngine:
       case Left(l) => Left(l)
       case Right(n) => Right(n.link.filter(_.pointer.id == linkedNode).map(_ => n))
 
+  /** Descends from `currentNode` on `currentTier` to targetTier, trying the entries at or below `target` from the
+    * greatest down (see fetchContainingNode). Each child on tier >= 1 comes from `cache` when present and is put in it
+    * when read.
+    *
+    * Stepping from a parent P to the child its greatest such entry names, a child whose range does not hold `target`
+    * means P is behind a split, and a child that cannot be read means P points at a node a join deleted. Either way P
+    * is evicted from `cache` (dropping the cached root, if P is the root node) and the descent carries on as without
+    * a cache: a scan right on targetTier, or the next candidate. A child of a later candidate is not expected to hold
+    * `target`, so only a failed read of it evicts P. A predecessor search (linksTo) skips the range check, since it
+    * deliberately descends to the left of `target`.
+    */
   private def descend(client: AspenClient,
                       encoding: NodeEncoding,
                       currentTier: Int,
@@ -562,7 +600,8 @@ object TierEngine:
                       currentNode: ListNode,
                       initialBlacklist: Set[ObjectId],
                       reversePath: List[ListNode],
-                      linksTo: Option[ObjectId]): Future[Either[Set[ObjectId], List[ListNode]]] = {
+                      linksTo: Option[ObjectId],
+                      cache: TierCache): Future[Either[Set[ObjectId], List[ListNode]]] = {
 
     given ExecutionContext = client.clientContext
 
@@ -577,21 +616,28 @@ object TierEngine:
 
       val p = Promise[Either[Set[ObjectId], List[ListNode]]]()
 
-      def rtry(candidates: List[(Key, ObjectPointer)], blacklist: Set[ObjectId]): Unit = {
+      def rtry(candidates: List[(Key, ObjectPointer)], blacklist: Set[ObjectId], first: Boolean): Unit = {
         if (candidates.isEmpty) {
           p.success(Left(blacklist + currentNode.pointer.id))
         } else {
-          fetchNode(client, encoding, ordering, targetTier, candidates.head._1, candidates.head._2, blacklist) foreach {
-            case Left(blklst) => rtry(candidates.tail, blklst)
-            case Right(next) => descend(client, encoding, currentTier-1, targetTier, ordering, target,
-              next, blacklist, currentNode :: reversePath, linksTo).onComplete {
-              case Failure(err) => p.failure(err)
-              // `next` holds nothing to descend into, as when joins removed its first entries but left its
-              // minimum. Fall back to the next candidate to the left: the scan right from below it reaches the
-              // target, since navigation within a tier is consistent.
-              case Success(Left(blklst)) => rtry(candidates.tail, blklst + next.pointer.id)
-              case Success(Right(rpath)) => p.success(Right(rpath))
-            }
+          val (minimum, pointer) = candidates.head
+          fetchNode(client, encoding, ordering, currentTier - 1, minimum, pointer, blacklist, cache) foreach {
+            case Left(blklst) =>
+              if !blacklist.contains(pointer.id) then
+                cache.stale(currentTier, currentNode)
+              rtry(candidates.tail, blklst, false)
+            case Right(next) =>
+              if first && linksTo.isEmpty && !next.keyInRange(target) then
+                cache.stale(currentTier, currentNode)
+              descend(client, encoding, currentTier-1, targetTier, ordering, target,
+                next, blacklist, currentNode :: reversePath, linksTo, cache).onComplete {
+                case Failure(err) => p.failure(err)
+                // `next` holds nothing to descend into, as when joins removed its first entries but left its
+                // minimum. Fall back to the next candidate to the left: the scan right from below it reaches the
+                // target, since navigation within a tier is consistent.
+                case Success(Left(blklst)) => rtry(candidates.tail, blklst + next.pointer.id, false)
+                case Success(Right(rpath)) => p.success(Right(rpath))
+              }
           }
         }
       }
@@ -605,34 +651,44 @@ object TierEngine:
         sortWith((l, r) => ordering.compare(l._1, r._1) < 0).
         reverse
 
-      rtry(initialCandidates, initialBlacklist)
+      rtry(initialCandidates, initialBlacklist, true)
 
       p.future
     }
 
   }
 
+  /** The node `pointer` names, on `tier`, or Left with it added to `blacklist` if it is blacklisted or cannot be read.
+    * On tier >= 1 a node in `cache` is returned without a read, and a node read is put in it.
+    */
   private def fetchNode(client: AspenClient,
                         encoding: NodeEncoding,
                         ordering: KeyOrdering,
-                        targetTier: Int,
+                        tier: Int,
                         minimum: Key,
                         pointer: ObjectPointer,
-                        blacklist: Set[ObjectId]): Future[Either[Set[ObjectId], ListNode]] = {
+                        blacklist: Set[ObjectId],
+                        cache: TierCache): Future[Either[Set[ObjectId], ListNode]] = {
 
     given ExecutionContext = client.clientContext
 
     if (blacklist.contains(pointer.id)) {
       Future.successful(Left(blacklist))
     } else {
-      val p = Promise[Either[Set[ObjectId], ListNode]]()
+      val cached = if tier >= 1 then cache.node(tier, pointer.id) else None
+      cached match
+        case Some(node) => Future.successful(Right(node))
+        case None =>
+          val p = Promise[Either[Set[ObjectId], ListNode]]()
 
-      Future.delegate(encoding.read(client, pointer, minimum, ordering,
-        s"TKVL read of tier $targetTier, key: $minimum")) onComplete {
-        case Failure(_) => p.success(Left(blacklist + pointer.id))
-        case Success(node) => p.success(Right(node))
-      }
+          Future.delegate(encoding.read(client, pointer, minimum, ordering,
+            s"TKVL read of tier $tier, key: $minimum")) onComplete {
+            case Failure(_) => p.success(Left(blacklist + pointer.id))
+            case Success(node) =>
+              cache.put(tier, node)
+              p.success(Right(node))
+          }
 
-      p.future
+          p.future
     }
   }

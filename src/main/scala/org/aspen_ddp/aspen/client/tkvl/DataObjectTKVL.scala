@@ -78,6 +78,11 @@ class DataObjectTKVL(val client: AspenClient, val rootManager: RootManager):
     * The same-node guard applies per tier: each tier's split fails with `NodeAlreadyModified` if its node is already
     * modified in the transaction, but splits of the tiers below it are already staged by then. Upper-tier nodes are
     * normally written only by finalization actions, in transactions of their own.
+    *
+    * WARNING: this instance's cache is cleared, but other long-lived instances of this tree (in other clients, other
+    * processes, or other instances in this process) may keep returning entries that moved to the new tree until their
+    * caches are cleared (`rootManager.cache.clear()`). Alternatively, trees that get split can be opened with
+    * `NoCache`. Handling this is the caller's responsibility.
     */
   def splitTree(splitAtKey: Key, inclusive: Boolean = false)(using Transaction): Future[Root] =
     checked(engine.splitTree(splitAtKey, inclusive))

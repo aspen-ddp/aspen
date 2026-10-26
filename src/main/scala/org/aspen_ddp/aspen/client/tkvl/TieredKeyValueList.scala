@@ -40,6 +40,13 @@ class TieredKeyValueList(val client: AspenClient,
    * that race conditions with outstanding split/join finalization actions
    * could cause errant content to appear in the original (left) tree.
    * Use with caution.
+   *
+   * WARNING: this instance's cache is cleared, but other long-lived
+   * instances of this tree (in other clients, other processes, or other
+   * instances in this process) may keep returning entries that moved to the
+   * new tree until their caches are cleared (`rootManager.cache.clear()`).
+   * Alternatively, trees that get split can be opened with `NoCache`.
+   * Handling this is the caller's responsibility.
    */
   def splitTree(splitAtKey: Key, inclusive: Boolean = false)
                (using t: Transaction): Future[Root] =

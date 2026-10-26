@@ -50,10 +50,9 @@ class DataObjectTKVLSuite extends IntegrationTestSuite:
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, treeOrdering, nodeAllocator, Map(), kind)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
-      cached <- froot
+      rm <- froot
     yield
-      // Uncached: these suites reshape the tree (tier changes, joins, splitTree) and expect every read to be live
-      new KVObjectRootManager(client, cached.treeKey, cached.pointer, NoCache)
+      rm
 
   private def newTree(maxNodeSize: Int = smallNodeSize): Future[(DataObjectTKVL, KVObjectRootManager)] =
     for

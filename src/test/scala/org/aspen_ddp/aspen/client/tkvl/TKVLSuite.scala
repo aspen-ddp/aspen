@@ -618,8 +618,6 @@ class TKVLSuite extends IntegrationTestSuite {
 
       newTreeRoot <- fnewTreeRoot
       newTree <- newTreeRoot.getTree()
-      // splitTree moved entries out from under the cached upper tiers
-      _ = root.cache.clear()
       (_, _, ooldRoot) <- root.getKeyValueRootNode()
       oldValues <- Future.sequence(keys.map(tree.get))
       newValues <- Future.sequence(keys.map(newTree.get))

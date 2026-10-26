@@ -41,10 +41,8 @@ class TierEngineDescentSuite extends IntegrationTestSuite:
       froot <- KVObjectRootManager.createNewTree(client, host, Key(Array[Byte](0)), ordering, nodeAllocator, Map(),
         kind)(using tx)
       _ <- tx.commit()
-      cached <- froot
+      rm <- froot
     yield
-      // Uncached: these suites reshape the tree (tier changes, joins, splitTree) and expect every read to be live
-      val rm = new KVObjectRootManager(client, cached.treeKey, cached.pointer, NoCache)
       val tree = kind match
         case TreeKind.KeyValueObjects =>
           val t = new TieredKeyValueList(client, rm)

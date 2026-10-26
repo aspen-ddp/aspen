@@ -106,10 +106,8 @@ abstract class TreeKindSuiteBase extends IntegrationTestSuite:
       froot <- KVObjectRootManager.createNewTree(client, host, treeKey, ordering, nodeAllocator, Map(), kind)(using tx)
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
-      cached <- froot
+      rm <- froot
     yield
-      // Uncached: these suites reshape the tree (tier changes, joins, splitTree) and expect every read to be live
-      val rm = new KVObjectRootManager(client, cached.treeKey, cached.pointer, NoCache)
       (open(kind, rm), rm)
 
   protected def newTree(kind: TreeKind): Future[(Tree, KVObjectRootManager)] = newTree(kind, nodeSize(kind))

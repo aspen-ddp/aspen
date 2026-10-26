@@ -22,21 +22,43 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   import TierEngine.*
 
-  /** Descends to the tier-0 node containing `key` and hands it to `f`. An empty tree yields `empty`. The descent
-    * goes through the cached upper tiers.
+  /** Runs `nav` with the instance's cache and root. A BrokenTree or InvalidObject clears the cache and runs `nav`
+    * once more with NoCache and a fresh root. Only wrap code that stages nothing in a transaction.
+    *
+    * This is the safety net for cached state the targeted evictions cannot catch, such as a cached root naming
+    * nodes another instance deleted with `deleteTree`. Whether the failed run used the cache is not tracked: a
+    * retry of a run that read everything fresh only costs reads on a path that is failing anyway. A failure of the
+    * retry is reported as is.
+    */
+  private def navigate[A](nav: (TierCache, () => Future[(Int, KeyOrdering, Option[ListNode])]) => Future[A]): Future[A] =
+    Future.delegate(nav(rootManager.cache, () => rootManager.getRootNode())).recoverWith:
+      case _: BrokenTree | _: InvalidObject =>
+        rootManager.cache.clear()
+        nav(NoCache, () => rootManager.getFreshRootNode())
+
+  /** The tier-0 node containing `key`, or None for an empty tree. The descent goes through the cached upper tiers,
+    * within the safety net (see `navigate`).
+    */
+  private def containingNode(key: Key): Future[Option[ListNode]] =
+    navigate: (cache, getRoot) =>
+      getRoot().flatMap: (tier, ordering, oroot) =>
+        oroot match
+          case None => Future.successful(None)
+          case Some(root) =>
+            fetchContainingNode(client, tier, 0, ordering, key, root, Set(), cache = cache).map:
+              case Left(_) => throw new BrokenTree()
+              case Right(node) => Some(node)
+
+  /** Descends to the tier-0 node containing `key` and hands it to `f`. An empty tree yields `empty`. Only the
+    * descent is retried by the safety net, not `f`.
     */
   private def withContainingNode[A](key: Key, empty: => A)(f: ListNode => Future[A]): Future[A] =
-    rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
-      oroot match
-        case None => Future.successful(empty)
-        case Some(root) =>
-          fetchContainingNode(client, tier, 0, ordering, key, root, Set(), cache = rootManager.cache).flatMap:
-            case Left(_) => throw new BrokenTree()
-            case Right(node) => f(node)
+    containingNode(key).flatMap:
+      case None => Future.successful(empty)
+      case Some(node) => f(node)
 
   /** The tier-0 node whose range holds `key`, or None for an empty tree */
-  def getContainingNode(key: Key): Future[Option[ListNode]] =
-    withContainingNode(key, None)(node => Future.successful(Some(node)))
+  def getContainingNode(key: Key): Future[Option[ListNode]] = containingNode(key)
 
   def get(key: Key): Future[Option[Value]] =
     getContainingNode(key).map(_.flatMap(_.get(key)))
@@ -154,25 +176,28 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
         rootManager.createInitialNode(puts.toMap)
 
     // Every read of the batch. A racing join can delete a node read along the way, which fails the read with
-    // InvalidObject. Nothing is staged yet, so the batch restarts from a fresh root.
-    def locateTargets(restarts: Int): Future[Option[List[ListBatch.Target]]] =
-      rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
+    // InvalidObject. Nothing is staged yet, so the batch restarts from the root. Nothing is staged by any attempt,
+    // so all of them run within the safety net (see `navigate`).
+    def locateTargets(cache: TierCache,
+                      getRoot: () => Future[(Int, KeyOrdering, Option[ListNode])],
+                      restarts: Int): Future[Option[List[ListBatch.Target]]] =
+      getRoot().flatMap: (tier, ordering, oroot) =>
         oroot match
           case None => Future.successful(None)
           case Some(root) =>
             val fetched = for
-              located <- locate(tier, root, BatchOp.sorted(ops, ordering))
+              located <- locate(tier, root, BatchOp.sorted(ops, ordering), cache)
               _ = if located.unplaced.nonEmpty then throw new BrokenTree()
               targets <- ListBatch.withJoinSources(client, located.assigned(ordering), located.read)
             yield
               Some(targets)
             fetched.recoverWith:
-              case _: InvalidObject if restarts < MaxJoinRaceRestarts => locateTargets(restarts + 1)
+              case _: InvalidObject if restarts < MaxJoinRaceRestarts => locateTargets(cache, getRoot, restarts + 1)
 
     if ops.isEmpty then
       Future.unit
     else
-      locateTargets(0).flatMap:
+      navigate((cache, getRoot) => locateTargets(cache, getRoot, 0)).flatMap:
         case None => empty()
         case Some(targets) =>
           for
@@ -188,10 +213,10 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     * the entry to its left, as `descend` falls back to the next candidate; ops with no entry left to try are returned
     * unplaced. On tier 0, `ListBatch.assign` scans right from the node.
     *
-    * Upper-tier nodes come from the tree's cache when present. `node` is evicted from it as `descend` evicts a stale
-    * parent: when the child an entry names does not hold the greatest of the entry's ops, or cannot be read.
+    * Upper-tier nodes come from `cache` when present. `node` is evicted from it as `descend` evicts a stale parent:
+    * when the child an entry names does not hold the greatest of the entry's ops, or cannot be read.
     */
-  private def locate(tier: Int, node: ListNode, ops: List[BatchOp]): Future[Located] =
+  private def locate(tier: Int, node: ListNode, ops: List[BatchOp], cache: TierCache): Future[Located] =
     if tier == 0 then
       ListBatch.assign(client, node, ops).map: (assigned, read) =>
         Located(assigned, read.iterator.map(n => n.pointer.id -> n).toMap, Nil)
@@ -199,7 +224,6 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
       val encoding = encodingFor(node)
       val ordering = node.ordering
       val entries = node.entries.map((k, v) => k -> ObjectPointer(v.bytes)).toIndexedSeq
-      val cache = rootManager.cache
 
       // Candidates for one entry's ops: the entry, then every entry to its left, as `descend` tries them. Only the
       // first, the entry the ops belong to, is expected to hold them.
@@ -217,7 +241,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
             case Right(child) =>
               if first && !child.keyInRange(ops.last.key) then
                 cache.stale(tier, node)
-              locate(tier - 1, child, ops).flatMap: located =>
+              locate(tier - 1, child, ops, cache).flatMap: located =>
                 if located.unplaced.isEmpty then
                   Future.successful(located)
                 else
@@ -236,7 +260,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
 
   /** Descends to the tier-0 node containing `key` and hands it to `del`.
    *
-   *  The descent goes through the cached upper tiers.
+   *  The descent goes through the cached upper tiers, within the safety net (see `navigate`). `del` is not retried
+   *  by the safety net, since it stages the delete.
    *
    *  Deleting a node's last key joins it with its right neighbour, which `del` reads. If a racing
    *  join already absorbed that neighbour, the containing node was read before the join and the
@@ -246,19 +271,11 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
   def deleteFromContainingNode(key: Key, del: ListNode => Future[Unit]): Future[Unit] =
 
     def attempt(restarts: Int): Future[Unit] =
-      rootManager.getRootNode().flatMap: (tier, ordering, oroot) =>
-        oroot match
-          case None => Future.unit
-          case Some(root) =>
-            for
-              e <- fetchContainingNode(client, tier, 0, ordering, key, root, Set(), cache = rootManager.cache)
-              node = e match
-                case Left(_) => throw new BrokenTree()
-                case Right(n) => n
-              _ <- del(node).recoverWith:
-                case _: InvalidObject if restarts < MaxJoinRaceRestarts => attempt(restarts + 1)
-            yield
-              ()
+      containingNode(key).flatMap:
+        case None => Future.unit
+        case Some(node) =>
+          del(node).recoverWith:
+            case _: InvalidObject if restarts < MaxJoinRaceRestarts => attempt(restarts + 1)
 
     attempt(0)
 

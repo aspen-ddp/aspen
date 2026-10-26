@@ -30,7 +30,9 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
 
   private def fixture(kind: TreeKind): Future[Fixture] =
     for
-      (other, otherRm) <- newTree(kind)
+      (_, created) <- newTree(kind)
+      otherRm = new KVObjectRootManager(client, created.treeKey, created.pointer, NoCache)
+      other = open(kind, otherRm)
       _ <- setAll(other, initial)
       tiers <- allTiers(kind, otherRm)
     yield
@@ -75,6 +77,20 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
       // The split only added an entry to the parent, which still has room
       assert(after(1).map(_.pointer.id) == before(1).map(_.pointer.id))
       (parent, inserted)
+
+  /** A fixture whose warm instance is warmed, then the tree deleted through `b`, a second default-cached instance
+    * of the same tree, as another client would hold. Returns the fixture and `b`.
+    */
+  private def deletedElsewhere(kind: TreeKind): Future[(Fixture, Tree)] =
+    for
+      f <- fixture(kind)
+      _ <- f.warm.get(Key(15))
+      _ = assert(f.rm.cache.root.isDefined)
+      b = open(kind, new KVObjectRootManager(client, f.rm.treeKey, f.rm.pointer, TierCache.default()))
+      _ <- b.deleteTree(None)
+      _ <- waitForTransactionsToComplete()
+    yield
+      (f, b)
 
   for kind <- TreeKind.values do
 
@@ -204,3 +220,87 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
           freshRoot.map(n => (n.pointer.id, n.revision))))
         assert(left.isEmpty)
         assert(right == bytesOf(moved))
+
+    atest(s"$kind: deleteTree then reuse of the same instance"):
+      val k = Key(15)
+      for
+        f <- fixture(kind)
+        _ <- f.warm.get(k)
+        _ <- f.warm.deleteTree(None)
+        _ <- waitForTransactionsToComplete()
+        gone <- f.warm.get(k)
+        _ <- setAll(f.warm, List(k))
+        v <- f.warm.get(k)
+        entries <- f.warm.entries()
+      yield
+        assert(gone.isEmpty)
+        assert(v == bytesOf(k))
+        assert(entries == expectedEntries(List(k)))
+
+    atest(s"$kind: a tree deleted through another instance"):
+      for
+        (f, _) <- deletedElsewhere(kind)
+        gone <- f.warm.get(Key(15))
+        emptied <- f.warm.entries()
+      yield
+        assert(gone.isEmpty)
+        assert(emptied.isEmpty)
+
+    atest(s"$kind: a tree recreated through another instance"):
+      val recreated = keys(1 to 3)
+      for
+        (f, b) <- deletedElsewhere(kind)
+        gone <- f.warm.get(Key(15))
+        _ <- setAll(b, recreated)
+        values <- Future.sequence(recreated.map(f.warm.get))
+        entries <- f.warm.entries()
+      yield
+        assert(gone.isEmpty)
+        assert(values == recreated.map(bytesOf))
+        assert(entries == expectedEntries(recreated))
+
+    atest(s"$kind: tier reduction with a warm cache"):
+      // Deletes from the left through the warm instance, one transaction each, until the tree loses a tier
+      def deleteUntilReduced(f: Fixture, remaining: List[Key]): Future[List[Key]] =
+        assert(remaining.size > 1)
+        deleteAll(f.warm, List(remaining.head)).flatMap(_ => numTiers(f.otherRm)).flatMap: tiers =>
+          if tiers < 2 then
+            Future.successful(remaining.tail)
+          else
+            deleteUntilReduced(f, remaining.tail)
+      for
+        f <- fixture(kind)
+        _ <- Future.sequence(initial.map(f.warm.get))
+        remaining <- deleteUntilReduced(f, initial)
+        _ <- waitForTransactionsToComplete()
+        values <- Future.sequence(initial.map(f.warm.get))
+        entries <- f.warm.entries()
+      yield
+        assert(values == initial.map(k => if remaining.contains(k) then bytesOf(k) else None))
+        assert(entries == expectedEntries(remaining))
+
+    atest(s"$kind: tier growth with a warm cache"):
+      // Inserts ascending keys from `from` through `tree`, one transaction each, until the root is on `tier`
+      def insertUntilTier(tree: Tree, rm: RootManager, from: Int, tier: Int): Future[Int] =
+        assert(from < 100)
+        setAll(tree, List(Key(from))).flatMap(_ => numTiers(rm)).flatMap: tiers =>
+          if tiers >= tier then
+            Future.successful(from)
+          else
+            insertUntilTier(tree, rm, from + 1, tier)
+      for
+        (_, created) <- newTree(kind)
+        rm = new KVObjectRootManager(client, created.treeKey, created.pointer, TierCache.default())
+        tree = open(kind, rm)
+        // Counts tiers without refreshing the warm instance's cached root
+        counter = new KVObjectRootManager(client, created.treeKey, created.pointer, NoCache)
+        last1 <- insertUntilTier(tree, counter, 1, 1)
+        _ <- Future.sequence(keys(1 to last1).map(tree.get))
+        _ = assert(rm.cache.root.isDefined)
+        last <- insertUntilTier(tree, counter, last1 + 1, 2)
+        _ <- waitForTransactionsToComplete()
+        values <- Future.sequence(keys(1 to last).map(tree.get))
+        entries <- tree.entries()
+      yield
+        assert(values == keys(1 to last).map(bytesOf))
+        assert(entries == expectedEntries(keys(1 to last)))

@@ -5,11 +5,15 @@ Need to add an upper-tier node caching capability to speed up future tree naviga
   - Upper tiers change very slowly so caching can be very beneficial
   - Cache misses don't affect correctness because we can always scan right on a tier
   - No one solution will be best in all cases so this should be an interface with pluggable implementations
+    - We also need a NoCache option for unit tests
   - Start super simple with a fixed LRU cache of 5 nodes for each tier-1+
     - TKVLs default to this implementation
     - No caching of tier-0 nodes
     - Whenever a scan-right operation is done in a tier, drop the cache on the tier above it.
       - reread the root if the scan-right is done on the top tier
+    - This approach is just a suggestion, recommendations for a better default solution are welcome
+  - The default caching operation should be the simple solution described above this comes
+    at the cost of having to update all unit tests that depend on upper tier behavior. 
 
 Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
 encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs

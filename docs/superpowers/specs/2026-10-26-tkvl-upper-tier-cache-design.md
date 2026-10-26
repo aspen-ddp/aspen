@@ -120,8 +120,13 @@ niche, and the cache exists for the common case. Instead:
   evicted. They do not trigger the retry. `deleteTree` followed by reuse of the same instance therefore
   sees an empty tree (or the recreated tree), not `BrokenTree`.
 - **Races between filling and evicting** *(my call)*. A read that completes after an eviction may put a
-  stale node back in the cache. No generation counter is used: the entry only costs extra reads and is
-  evicted again on its next use.
+  stale node back in the cache. That is allowed: the entry only costs extra reads and is evicted again on
+  its next use.
+- **Races between filling and clearing** *(controller ruling)*. A refill across a `clear()` is not
+  allowed. The cache keeps a generation that `clear()` advances, and every fill (`put`, `putRoot`) passes
+  the generation its caller captured before starting the read. A fill whose read started before a clear is
+  ignored, so a read in flight when `splitTree` clears the cache cannot restore a pre-split root or node,
+  and the splitting instance is never wrong.
 - **Root writes read fresh.** `prepareRootUpdate` and `createInitialNode` use the root container's revision
   as a transaction requirement and `createInitialNode` relies on observing the tree as empty. They must
   always read the root fresh, never from the cache, so an aborted write is never retried against the same

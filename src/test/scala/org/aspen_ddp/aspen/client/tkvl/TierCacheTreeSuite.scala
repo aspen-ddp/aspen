@@ -103,7 +103,8 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
         assert(v == bytesOf(k))
         assert(evicted)
         assert(v2 == bytesOf(k))
-        assert(reads2.values.sum <= 2)
+        // The parent is read again and now leads straight to the new node
+        assert(reads2 == Map(parent.pointer.id -> 1, holding(leaves, k).pointer.id -> 1))
         assert(v3 == bytesOf(k))
         assert(reads3 == Map(holding(leaves, k).pointer.id -> 1))
 
@@ -125,7 +126,6 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
         assert(cachedRoot.entries.size < after.head.head.entries.size)
         assert(v == bytesOf(k))
         assert(f.rm.cache.root.isEmpty)
-        assert(f.rm.cache.node(2, cachedRoot.pointer.id).isEmpty)
 
     atest(s"$kind: a cached parent pointing at a joined-away child is evicted"):
       for

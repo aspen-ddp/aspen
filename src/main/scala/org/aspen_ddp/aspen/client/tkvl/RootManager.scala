@@ -50,15 +50,18 @@ trait RootManager {
 
 object RootManager:
 
-  /** The cached root unless `fresh` or nothing is cached. Otherwise runs `read` and caches its result. */
+  /** The cached root unless `fresh` or nothing is cached. Otherwise runs `read` and caches its result, unless the
+    * cache was cleared while it ran.
+    */
   def cachedRead(cache: TierCache, fresh: Boolean)(read: => Future[RootState])
                 (using ExecutionContext): Future[RootState] =
     val cached = if fresh then None else cache.root
     cached match
       case Some(rs) => Future.successful(rs)
       case None =>
+        val generation = cache.generation
         read.map: rs =>
-          cache.putRoot(rs)
+          cache.putRoot(rs, generation)
           rs
 
   /** Runs `update`, a `createInitialNode` write of `host`, the object holding the tree's root. The transaction

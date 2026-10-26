@@ -317,6 +317,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
             tx = client.newTransaction()
             _ <- rootManager.prepareRootUpdate(0, None)(using tx)
             _ <- tx.commit()
+            // The cached root, and any upper-tier nodes cached during the deletion, name deleted nodes
+            _ = rootManager.cache.clear()
           yield
             ()
     yield
@@ -659,7 +661,8 @@ object TierEngine:
   }
 
   /** The node `pointer` names, on `tier`, or Left with it added to `blacklist` if it is blacklisted or cannot be read.
-    * On tier >= 1 a node in `cache` is returned without a read, and a node read is put in it.
+    * On tier >= 1 a node in `cache` is returned without a read, and a node read is put in it unless the cache was
+    * cleared during the read.
     */
   private def fetchNode(client: AspenClient,
                         encoding: NodeEncoding,
@@ -680,12 +683,14 @@ object TierEngine:
         case Some(node) => Future.successful(Right(node))
         case None =>
           val p = Promise[Either[Set[ObjectId], ListNode]]()
+          // Captured before the read, so a node read across a clear() is not put back
+          val generation = cache.generation
 
           Future.delegate(encoding.read(client, pointer, minimum, ordering,
             s"TKVL read of tier $tier, key: $minimum")) onComplete {
             case Failure(_) => p.success(Left(blacklist + pointer.id))
             case Success(node) =>
-              cache.put(tier, node)
+              cache.put(tier, node, generation)
               p.success(Right(node))
           }
 

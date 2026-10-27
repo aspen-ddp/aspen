@@ -103,15 +103,17 @@ class DurableServiceSuite extends IntegrationTestSuite:
       exec = executors.poll()
 
   def makeExecutor(hostCount: () => Int = () => 0,
-                   hostCountRecheckInterval: Duration = Duration(1, HOURS)): SimpleDurableServiceExecutor =
+                   hostCountRecheckInterval: Duration = Duration(1, HOURS),
+                   scanInterval: (Duration, Duration) = (Duration(50, MILLISECONDS), Duration(100, MILLISECONDS))
+                  ): SimpleDurableServiceExecutor =
     val exec = new SimpleDurableServiceExecutor(
       client, testHostId, client.backgroundTaskManager,
       // No test here depends on a lease expiring, so keep it far longer than any scheduling
       // stall: a lease lost to a starved process shuts the service down mid-test.
       leaseDuration        = Duration(30000, MILLISECONDS),
       renewalInterval      = Duration(50, MILLISECONDS),
-      minScanInterval      = Duration(50, MILLISECONDS),
-      maxScanInterval      = Duration(100, MILLISECONDS),
+      minScanInterval      = scanInterval._1,
+      maxScanInterval      = scanInterval._2,
       claimDelayPerService = Duration(0, MILLISECONDS),
       hostCount            = hostCount,
       hostCountRecheckInterval = hostCountRecheckInterval
@@ -183,15 +185,14 @@ class DurableServiceSuite extends IntegrationTestSuite:
     val svcUUID = UUID.randomUUID()
     // Every recheck sees a larger cluster. Re-arming on each change would keep moving the scan into a window
     // seconds out, so the claim would never be made; the scan already pending must fire as drawn.
-    // The count starts growing only once the service is registered: a scan that ran before then re-arms under
-    // whatever count it sees, and a large one would leave nothing pending to claim the service promptly.
+    // The service is registered through an executor that never scans, and the growing one is made afterwards: its
+    // first scan is the pending one, drawn under a count of 1, and finds the service. A scan already running while
+    // the count grew would re-arm under the larger count when it finished, and nothing would claim the service.
+    val registrar = makeExecutor(scanInterval = (Duration(1, HOURS), Duration(2, HOURS)))
     val reads = new java.util.concurrent.atomic.AtomicInteger(0)
-    @volatile var growing = false
-    val exec = makeExecutor(hostCount = () => if growing then reads.incrementAndGet() else 0,
-      hostCountRecheckInterval = Duration(10, MILLISECONDS))
     for
-      _  <- exec.registerService(fixedTypeUUID, svcUUID, Map.empty)
-      _   = growing = true
+      _  <- registrar.registerService(fixedTypeUUID, svcUUID, Map.empty)
+      exec = makeExecutor(hostCount = () => reads.incrementAndGet(), hostCountRecheckInterval = Duration(10, MILLISECONDS))
       _  <- claimedPromise.future
       vs <- exec.servicesTkvl.get(Key(svcUUID))
     yield

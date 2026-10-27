@@ -16,7 +16,7 @@ import java.net.{DatagramSocket, ServerSocket}
 import java.util.UUID
 import java.util.concurrent.ExecutorService
 import scala.concurrent.duration.{Duration, SECONDS}
-import scala.concurrent.{Await, ExecutionContext}
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.util.Random
 
 /** A bootstrapped single-host system, started the way the `host` command starts one, with a client built the way
@@ -128,11 +128,22 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
                     List(Insert(key, dp.toArray)))
       _ <- tx.commit()
       _ = committed = System.nanoTime()
-      kvos <- client.read(Radicle.pointer)
-      dos <- client.read(dp)
-    yield (dp, kvos, dos)
+    yield dp
 
-    val (dp, kvos, dos) = Await.result(f, Timeout)
+    val dp = Await.result(f, Timeout)
+    // Commit returns once the outcome is decided, so a read right after it can reach stores that have yet to apply it:
+    // the new object is then not found, and the Radicle lacks the key. Read again until both are seen.
+    val deadline = System.nanoTime() + Timeout.toNanos
+    def readUntil[T](what: String)(read: => Future[T])(done: T => Boolean): T =
+      def attempt(): Either[Throwable, T] =
+        try Right(Await.result(read, Timeout)) catch case e: Exception => Left(e)
+      var last = attempt()
+      while !last.exists(done) && System.nanoTime() < deadline do
+        Thread.sleep(10)
+        last = attempt()
+      last.fold(e => throw e, identity)
+    val kvos = readUntil("the Radicle")(client.read(Radicle.pointer))(_.contents.contains(key))
+    val dos = readUntil("the data object")(client.read(dp))(_ => true)
     val end = System.nanoTime()
     info(s"commit ${(committed - start) / 1000000} ms, reads ${(end - committed) / 1000000} ms")
 

@@ -85,7 +85,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       val store = if i % 2 == 0 then fx.storesA(i % 2) else fx.storesB(i % 2)
       c.net.clientMessenger.sendClientRequest(read(store, c.net.clientId))
       c.net.clientMessenger.sendClientRequest(rebuildData(if i % 2 == 0 then fx.storesB.head else fx.storesA.head))
-    c.net.awaitPendingMessagesSent(Duration(5, SECONDS)) shouldBe true
+    c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(5, SECONDS))) shouldBe true
     // Host A receives 13 reads and 12 transfers; host B receives 12 reads and 13 transfers
     val gotA = await(fx.a.handler.clientRequests, 25).map(_.message)
     val gotB = await(fx.b.handler.clientRequests, 25).map(_.message)
@@ -98,7 +98,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val c = fx.client()
     val req = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)
-    c.net.awaitPendingMessagesSent(Duration(5, SECONDS)) shouldBe true
+    c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(5, SECONDS))) shouldBe true
     await(fx.a.handler.clientRequests, 1).map(_.message) shouldBe List(req)
 
   test("flush covers messages parked on a metadata lookup"):
@@ -174,7 +174,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     conn.drops shouldBe 3
     encs.foreach(_.prefix.refCnt() shouldBe 0)
     entry.connection.get() shouldBe null
-    c.net.awaitPendingMessagesSent(Duration(1, SECONDS)) shouldBe true
+    c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(1, SECONDS))) shouldBe true
 
   test("a second host on a port in use fails clearly and leaves nothing behind"):
     // Built on a thread of its own ThreadGroup: every thread the failed net starts inherits it, so the group's
@@ -215,7 +215,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       eventually("the sender is running"):
         sent.get() > 100
       val start = System.nanoTime()
-      c.net.awaitPendingMessagesSent(Duration(5, SECONDS)) shouldBe true
+      c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(5, SECONDS))) shouldBe true
       elapsedMillis(start) should be < 5000L
       sender.isAlive shouldBe true
     finally
@@ -228,10 +228,10 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       val m = checkDevice(fx.hostIdA, c.net.clientId)
       c.net.clientMessenger.sendHostMessage(m)
       withClue(s"iteration $i: "):
-        c.net.awaitPendingMessagesSent(Duration(5, SECONDS)) shouldBe true
+        c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(5, SECONDS))) shouldBe true
         // Short linger: on loopback quiche transmits flushed bytes in well under a millisecond
-        c.net.shutdown(Duration(50, MILLISECONDS))
-        await(fx.a.handler.hostMessages, 1, 5000).map(_.message) shouldBe List(m)
+        c.net.shutdown(LoadProbe.scale(Duration(50, MILLISECONDS)))
+        await(fx.a.handler.hostMessages, 1).map(_.message) shouldBe List(m)
 
   test("sends after shutdown are dropped without throwing"):
     val c = fx.client()
@@ -250,7 +250,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     Thread.sleep(300)
     fx.a.handler.total shouldBe 0
     fx.b.handler.total shouldBe 0
-    c.net.awaitPendingMessagesSent(Duration(1, SECONDS)) shouldBe true
+    c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(1, SECONDS))) shouldBe true
 
   test("event loop threads are gone after shutdown"):
     val c = fx.client()

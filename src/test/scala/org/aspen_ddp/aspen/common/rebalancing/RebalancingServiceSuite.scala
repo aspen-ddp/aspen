@@ -200,7 +200,6 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
   atest("the sweep skips a level-1 set instead of failing on it"):
     given ExecutionContext = executionContext
     val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
-    val exec = makeExecutor()
     for
       _ <- net.createSecondDevice()
       // A level-1 set holds sets, not devices. getStateForRebalancePlanning throws on it, so
@@ -216,6 +215,9 @@ class RebalancingServiceSuite extends IntegrationTestSuite:
       upper <- client.createStorageDeviceSet("upper", 1, None)
       _ <- RebalancingDurableService.setAutoRebalancePeriod(client, Duration(1, HOURS))
       _ <- writeLastAutoRebalance(HLCTimestamp.Zero)
+      // The service starts with the executor and sweeps at once because the initial lastSweep is Zero, so the executor
+      // must not exist until the period is an hour and the forced sweep is the only one that can happen
+      exec = makeExecutor()
       _ <- awaitUntil("the sweep to enroll the level-0 set")(
              readActiveTasks().map(_.exists(_._1 == setId)))
       active <- readActiveTasks()

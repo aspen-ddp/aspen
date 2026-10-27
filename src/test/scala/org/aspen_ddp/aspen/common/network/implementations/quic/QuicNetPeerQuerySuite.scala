@@ -234,6 +234,8 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
       d.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(ts(1))
 
       // A query outstanding: still ignored over an inbound connection
+      // The query goes to peers membership reports online, so D must have heard from one first
+      eventually("D sees a peer online", WaitMillis)(d.net.membership.exists(m => m.isOnline(fx.hostIdA) || m.isOnline(fx.hostIdB)))
       d.net.requestPeerQuery(hostIdC)
       eventually("D queries about C", WaitMillis)(d.net.peerQueriesSentForTests > 0)
       sendAnswerThenMarker(inboundCh, answer(11), hostIdD, d)

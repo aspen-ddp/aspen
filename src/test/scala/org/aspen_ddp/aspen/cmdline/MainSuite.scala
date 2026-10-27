@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
-import org.aspen_ddp.aspen.server.{BootstrapHttpServer, HostConfig}
+import org.aspen_ddp.aspen.server.{BootstrapHttpServer, HostConfig, UserJarLoader}
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.yaml.snakeyaml.parser.ParserException
 
@@ -623,6 +623,23 @@ class MainSuite extends AnyFunSuite with Matchers:
       parsed.writeThreshold shouldBe 2
       parsed.deviceSetName shouldBe "myset"
       parsed.maximumStoreSize shouldBe 4096L
+
+  test("host --load-jars names a version directory under <host-directory>/jars"):
+    withTempDir("parse-load-jars"): dir =>
+      def parse(args: String*) = Console.withErr(OutputStream.nullOutputStream()):
+        Main.buildParser.parse(Seq("host", dir.toString) ++ args, Main.Args())
+      parse().map(_.loadJars) shouldBe Some(None)
+      parse("--load-jars=latest").map(_.loadJars) shouldBe Some(Some("latest"))
+      parse("--load-jars", "1.2.0").map(_.loadJars) shouldBe Some(Some("1.2.0"))
+      parse("--load-jars=../elsewhere") shouldBe None
+      parse("--load-jars=..") shouldBe None
+      parse("--load-jars=") shouldBe None
+
+  test("startHost loads user jars before starting anything and reports a failure clearly"):
+    withTempDir("start-host-jars"): dir =>
+      // No host config exists, so reaching the LoadError shows the jars are loaded first
+      val e = intercept[UserJarLoader.LoadError](Main.startHost(dir, Some("v1")))
+      Main.commandErrorMessage(e) shouldBe s"Error: Jar directory does not exist: ${dir / "jars" / "v1"}"
 
   test("createIDA builds RandomAccessReedSolomon with the requested cell size"):
     val parsed = Main.buildParser.parse(

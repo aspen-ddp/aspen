@@ -124,7 +124,8 @@ object Main {
                   fsName:String="",
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
-                  networkCacheDir:Option[os.Path]=None)
+                  networkCacheDir:Option[os.Path]=None,
+                  loadJars:Option[String]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
 
@@ -218,6 +219,7 @@ object Main {
     case e: YamlFormat.FormatError   => s"Error loading config file: $e"
     case e: YAMLException            => s"Error parsing config file: $e"
     case e: ConfigError              => s"Error: $e"
+    case e: UserJarLoader.LoadError  => s"Error: ${e.getMessage}"
     case _: TimeoutException         => "Error: operation timed out waiting for the storage system to respond"
     case e: IllegalArgumentException => s"Error: ${e.getMessage}"
     case e: BootstrapFetcher.NoReachableHosts => "Error: " + e.getMessage
@@ -386,7 +388,17 @@ object Main {
       // MetadataManager can keep the file up to date as the bootstrap pool moves.
       arg[os.Path]("<host-directory>").text("Host Directory").
         action( (x, c) => c.copy(hostDirectory=x)).
-        validate( x => if (os.exists(x)) success else failure(s"Host directory does not exist: $x"))
+        validate( x => if (os.exists(x)) success else failure(s"Host directory does not exist: $x")),
+
+      opt[String]("load-jars").valueName("<version>").
+        text(s"Load user type factories from the jars in <host-directory>/${UserJarLoader.JarsDirName}/<version>. " +
+             "<version> may be a symlink, such as 'latest'").
+        action((x, c) => c.copy(loadJars = Some(x))).
+        validate(x =>
+          if x.isEmpty || x.contains('/') || x == "." || x == ".." then
+            failure(s"--load-jars must name a directory directly under <host-directory>/${UserJarLoader.JarsDirName}")
+          else
+            success)
     )
 
   private def amoebafsArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -862,7 +874,7 @@ object Main {
           cfg.mode match
             case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory, cfg.address,
                                           cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
-            case "host" => run_host(cfg.hostDirectory)
+            case "host" => run_host(cfg.hostDirectory, cfg.loadJars)
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
@@ -1040,13 +1052,14 @@ object Main {
                                      session.clientConfig.credentials.certificate,
                                      session.clientConfig.credentials.privateKey)
 
-    createAspenClient(session.bootstrapConfig, onRefresh, tls, None, onetworkCacheDir)
+    createAspenClient(session.bootstrapConfig, onRefresh, tls, None, onetworkCacheDir, Nil)
 
   def createAspenClient(bootstrapConfig: BootstrapConfig.Config,
                         onRefresh: (String, BootstrapConfig.Config) => Unit,
                         tls: TlsCredentials,
                         onnet: Option[(NetworkBridge, NetworkPlugin)],
-                        onetworkCacheDir: Option[os.Path]): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
+                        onetworkCacheDir: Option[os.Path],
+                        userTypeFactories: List[RegisteredTypeFactory]): (AspenClient, NetworkPlugin, KeyValueObjectPointer) = {
 
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls, None, onetworkCacheDir))
 
@@ -1069,7 +1082,8 @@ object Main {
       initialReadDelay,
       maxReadDelay,
       txRetransmitDelay,
-      allocationRetransmitDelay),  nnet, Radicle.pointer)
+      allocationRetransmitDelay,
+      userTypeFactories),  nnet, Radicle.pointer)
 
     networkBridge.oclient = Some(ret._1)
 
@@ -1250,10 +1264,10 @@ object Main {
     def stop(): Unit = stopAction()
 
   /** Starts the `host` command: blocks forever once the host is running. */
-  def run_host(hostDir: os.Path): Int = {
+  def run_host(hostDir: os.Path, loadJars: Option[String]): Int = {
     configureLogging()
 
-    val h = startHost(hostDir)
+    val h = startHost(hostDir, loadJars)
 
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO
     // thread is what keeps the process alive; the IO thread itself is a daemon thread.
@@ -1267,8 +1281,13 @@ object Main {
    *
    *  Logging is left alone so an in-process caller (a test) keeps its own configuration;
    *  run_host configures it first.
+   *
+   *  `loadJars` names the version directory under `<host-dir>/jars` whose user type factories the
+   *  host's client is given. They are loaded before anything else is started so a bad jar fails fast.
    */
-  def startHost(hostDir: os.Path): RunningHost = {
+  def startHost(hostDir: os.Path, loadJars: Option[String] = None): RunningHost = {
+
+    val userTypeFactories = loadJars.map(UserJarLoader.load(hostDir, _)).getOrElse(Nil)
 
     val sched = Executors.newScheduledThreadPool(3)
     val ec = ExecutionContext.fromExecutorService(sched)
@@ -1321,7 +1340,7 @@ object Main {
                                               Some(hostDir))
 
     val (client, network, _) = createAspenClient(bootstrapCfg, onBootstrapConfigRefreshed, tls,
-                                                 Some((networkBridge, nnet)), None)
+                                                 Some((networkBridge, nnet)), None, userTypeFactories)
 
     networkBridge.oclient = Some(client)
 

@@ -478,9 +478,9 @@ subtypes to be used.
 
 One big caveat to note with this approach is that those types must be passed to every host and client 
 attached to the Aspen system. FinalizationActions are executed by the machines hosting the DataStores 
-so they must have access to the code that implements the actions. Given the flexibility of the JVM, 
-there’s probably a good dynamic way to do this with jars and classloaders but, for the moment, it's 
-all hardcoded.
+so they must have access to the code that implements the actions. Hosts started from the command line 
+load these types from user-supplied jar files (`aspen host --load-jars=<version>`) using a classloader 
+and Java's ServiceLoader. See "Loading Your Types into Hosts" in UsageGuide.md.
 
 Another point to note is that Aspen’s networking subsystem is pluggable. The initial implementation 
 was built on top of ZeroMQ for simplicity and has since been replaced by one based on Netty & QUIC.

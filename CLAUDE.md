@@ -129,6 +129,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - QUIC envelopes carry the intended HostId. A host receiving one meant for another HostId drops it and replies
   `WrongHost` (rate-limited per connection). A handshake certificate UUID mismatch is treated the same way.
   Either marks the entry known-wrong, drops sends to it, and starts the peer query immediately.
+- `aspen host --load-jars=<version>` loads user RegisteredTypeFactory lists from every jar in `<host-dir>/jars/<version>/`
+  (may be a symlink, e.g. `latest`) via `UserJarLoader`: one URLClassLoader, parent-first, `AspenTypeProvider` classes
+  found with ServiceLoader. Duplicate UUIDs (including against built-ins) fail startup naming both classes and jars
 - DataStores are pluggable. Currently only a RocksDB and in-memory Map are supported.
 
 ## Subsystem Details

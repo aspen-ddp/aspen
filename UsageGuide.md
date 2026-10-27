@@ -121,9 +121,9 @@ class, you can pass in a list of your custom RegisteredTypeFactory instances to 
 the system.
 
 **Note:** All Hosts and other processes attached to the same Aspen system must have access to these
-types in order for them to work properly. A jar + class loader solution hasn't been implemented quite
-yet so using them is currently a bit inconvenient as everything is hard coded. This should be an easy
-problem to solve, it just hasn't made it to the top of the queue yet.
+types in order for them to work properly. FinalizationActions and DurableTasks run on the Hosts, so a
+Host started from the command line loads your types from jar files. See
+[Loading Your Types into Hosts](#loading-your-types-into-hosts).
 
 ### Tiered Key Value List (TKVL)
 This is a distributed B+ Tree provided by Aspen and is the workhorse underlying most of Aspen's internal
@@ -687,6 +687,125 @@ class UnlinkFileTask(
           state
       case _ => Future.successful(state)
 ```
+
+## Loading Your Types into Hosts
+Your application passes its RegisteredTypeFactory instances to the AspenClient it creates. A Host
+started with `aspen host` has no knowledge of your code, though, and it is the Host that runs your
+FinalizationActions and DurableTasks. So you package your types into one or more jar files, copy
+them to each Host, and start the Host with `--load-jars`. Three things are needed:
+
+1. A class in your code that lists your factories
+2. A one-line file in your jar that names that class
+3. The jar(s) placed in the Host's directory
+
+### 1. List your factories in an AspenTypeProvider
+Write a class (not an `object`) with a no-arg constructor that extends `AspenTypeProvider`. The
+factories it returns can be objects, as they usually are:
+
+```scala
+package com.example.myapp
+
+import org.aspen_ddp.aspen.client.{AspenTypeProvider, RegisteredTypeFactory}
+
+class MyAppTypes extends AspenTypeProvider:
+  def factories: List[RegisteredTypeFactory] = List(UnlinkFileTask, MyFinalizationAction)
+```
+
+Your application can use the same class to build the list it passes to its own client,
+`userTypeFactories = new MyAppTypes().factories`, so the Hosts and the application can never
+disagree about what is registered.
+
+### 2. Name the class in a service file
+Aspen finds providers with Java's standard
+[ServiceLoader](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/ServiceLoader.html)
+mechanism, the same one JDBC drivers and logging backends use. Create this file in your project:
+
+```
+src/main/resources/META-INF/services/org.aspen_ddp.aspen.client.AspenTypeProvider
+```
+
+containing the fully qualified name of your provider class, one per line:
+
+```
+com.example.myapp.MyAppTypes
+```
+
+The file name must be exactly the name of the `AspenTypeProvider` trait. Lines starting with `#` are
+comments. sbt, Maven, and Gradle all copy `src/main/resources` into the jar unchanged, so no other build
+configuration is needed for this step. A jar may list several providers and several jars may each
+supply their own; Aspen combines them all.
+
+### 3. Configure the build
+Depend on Aspen as `Provided`. The Host already has Aspen and all of its libraries (Scala included),
+and those are the copies your code will see, so they should not be packaged into your jar. Build with
+the same Scala 3 version as Aspen (see Aspen's `build.sbt`) or an older 3.x one. Aspen is not
+published to a public repository, so run `sbt publishLocal` in the Aspen checkout first.
+
+```scala
+// build.sbt
+libraryDependencies += "org.aspen_ddp" %% "aspen" % "0.1" % Provided
+```
+
+Then choose how to ship your own third-party dependencies:
+
+- **One "fat" jar (recommended).** Use the [sbt-assembly](https://github.com/sbt/sbt-assembly)
+  plugin. `Provided` dependencies are already left out and its default merge strategy correctly
+  combines `META-INF/services` files from several libraries.
+
+  ```scala
+  // project/plugins.sbt
+  addSbtPlugin("com.eed3si9n" % "sbt-assembly" % "2.3.1")
+
+  // build.sbt: the Host supplies the Scala library too
+  assemblyPackageScala / assembleArtifact := false
+  ```
+
+  `sbt assembly` writes a single jar to `target/scala-<version>/`.
+
+- **Loose jars.** Build your jar with `sbt package` and copy it to the Host together with the jars of
+  every library it needs that Aspen does not already include. Every jar in the version directory is
+  loaded, so nothing else needs to be configured.
+
+Using Maven or Gradle instead? Mark Aspen as `provided` / `compileOnly`, and if you build a fat jar make
+sure service files are merged: the Maven Shade plugin's `ServicesResourceTransformer`, or the Gradle
+Shadow plugin's `mergeServiceFiles()`.
+
+To check the result, print the service file from the finished jar:
+
+```
+unzip -p target/scala-3.7.3/myapp-assembly-1.2.0.jar META-INF/services/org.aspen_ddp.aspen.client.AspenTypeProvider
+```
+
+One caveat: because Aspen's own copy of a shared library always wins, your code cannot use a
+different version of a library Aspen already depends on.
+
+### 4. Install the jars on each Host
+Jars live in a directory per version under the Host's directory. A `latest` symlink lets the Host's
+startup command stay the same across upgrades:
+
+```
+<host-dir>/jars/
+    1.1.0/myapp-assembly-1.1.0.jar
+    1.2.0/myapp-assembly-1.2.0.jar
+    latest -> 1.2.0
+```
+
+```
+mkdir -p <host-dir>/jars/1.2.0
+cp target/scala-3.7.3/myapp-assembly-1.2.0.jar <host-dir>/jars/1.2.0/
+ln -sfn 1.2.0 <host-dir>/jars/latest
+
+aspen host <host-dir> --load-jars=latest
+```
+
+Jars are read once, at startup. To switch versions, repoint the symlink and restart the Host. Copying
+the jars to every Host is currently a manual step and must be done before restarting them.
+
+The Host refuses to start, with a message saying what is wrong, if the version directory is missing or
+has no jars, if no jar registers a provider, if a provider or one of its dependencies cannot be loaded,
+or if two different types share a UUID. A UUID collision names both classes and the jars they came
+from, including when one of them is a built-in Aspen type. Every type's UUID must be unique and must
+never change once it has been used, since it is stored in Aspen objects.
 
 ## Where To Go From Here
 The AmoebaFS implementation is a good source for examples of how to use Aspen as are portions of the

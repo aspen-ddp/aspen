@@ -20,18 +20,24 @@ arguments are the IDA configuration to use for the `aspen-bootstrap` pool which 
 the metadata needed to bring up an Aspen system. 
 
 ```shell
-aspen bootstrap [options] <target-directory> <address> <ida-type> <read-threshold> <write-threshold> <width>
+aspen bootstrap [options] <host-directory> <hostname> <address> <ida-type> <read-threshold> <write-threshold> <width>
 ```
 
 Aspen deployments always start with three things:
-1. A single host named `bootstrap-host`
+1. A single host, named by the `<hostname>` argument
 2. A single storage device identified by a random UUID
 3. A single storage device set named `bootstrap`
 
-The `target-directory` provided to the command is where the host instance and storage
-device will be created. All the DataStore instances backing the `aspen-bootstrap` pool
-are initially stored on the single storage device. This is the basis from which the
-deployment will grow. To expand the system, add new hosts and new storage devices.
+`<host-directory>` and `<hostname>` work exactly as they do for `add-host`. The host directory is
+the new host's root directory. It is created if it does not exist, and an existing one must not
+already hold an `aspen-host-config.yaml`. The host name can be anything and does not have to match
+the directory name. The examples in this guide use `bootstrap-host`. Once `bootstrap` finishes,
+this host is no different from any other, so on a machine that will stay in the system
+long-term, choose the name you would give it with `add-host`.
+
+The storage device is created inside the host directory. All the DataStore instances backing the
+`aspen-bootstrap` pool are initially stored on the single storage device. This is the basis from
+which the deployment will grow. To expand the system, add new hosts and new storage devices.
 
 The `<address>` argument is needed to facilitate the expansion of the system. It is combined with
 the host's `http-port` (default 4751, `--http-port`) to form the first entry in the client config's
@@ -65,8 +71,10 @@ both fail. This endpoint is unauthenticated, which is an accepted risk for now.
 
 Clients never need a hand-maintained copy of the bootstrap config. Instead, every client command
 (everything except `bootstrap` and `host`, including `amoebafs`) takes an
-`aspen-client-config.yaml` file. `bootstrap` writes it to `<target-directory>/aspen-client-config.yaml`
-with owner-only (0600) permissions. It contains:
+`aspen-client-config.yaml` file. `bootstrap` writes it with owner-only (0600) permissions to the
+current working directory, or to the file named by `--output-client-config <file>`. Before creating
+anything, it checks that the file's directory exists and is writable and that the file does not
+already exist. It contains:
 
 - `aspen-system-id`: the system the client belongs to
 - `certificate` and `private-key`: the client's TLS identity. The QUIC network plugin (see

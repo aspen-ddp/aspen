@@ -78,7 +78,8 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     try
       val (dataPort, httpPort, storeTransferPort) = freePorts()
       Console.withOut(new java.io.ByteArrayOutputStream):
-        Main.bootstrap(Replication(3, 2), tmp, "127.0.0.1", dataPort, httpPort, storeTransferPort) shouldBe 0
+        Main.bootstrap(Replication(3, 2), tmp / "bootstrap-host", "bootstrap-host", "127.0.0.1",
+                       dataPort, httpPort, storeTransferPort, tmp / "aspen-client-config.yaml") shouldBe 0
 
       val host = Main.startHost(tmp / "bootstrap-host")
       try

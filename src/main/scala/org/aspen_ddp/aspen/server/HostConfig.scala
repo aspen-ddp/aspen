@@ -11,7 +11,7 @@ import java.util.UUID
 /*
 host-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000
-name: bootstrap-host
+name: "bootstrap-host"
 address: 127.0.0.1
 data-port: 4750
 http-port: 4751
@@ -55,7 +55,7 @@ case class HostConfig(hostId: HostId,
   def yamlConfig: String =
     val base = s"""host-id: ${hostId.uuid}
        |aspen-system-id: $aspenSystemId
-       |name: $name
+       |name: ${yamlQuote(name)}
        |address: $address
        |data-port: $dataPort
        |http-port: $httpPort

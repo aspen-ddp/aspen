@@ -245,13 +245,15 @@ See the [AmoebaFS](Amoebafs.md) document for more information.
 4. Run `sbt compile`
 
 ### Execution
-Run the following command to create a new Aspen system under `/tmp/aspen-test`. The first
-argument after the target directory is the address other hosts use to reach this one; the
-remaining four are the bootstrap pool's IDA: type, read threshold, write threshold, and
-width. This creates `/tmp/aspen-test/bootstrap-host`, containing the host's configuration,
-its storage devices, and the three bootstrap data stores.
+Run the following command to create a new Aspen system under `/tmp/aspen-test`. The arguments
+are the bootstrap host's directory, its name, the address other hosts use to reach it, and then
+the bootstrap pool's IDA: type, read threshold, write threshold, and width. This creates `/tmp/aspen-test/bootstrap-host`, containing the host's configuration,
+its storage devices, and the three bootstrap data stores. The host name can be anything;
+`bootstrap-host` is just a descriptive choice for this walkthrough.
 ```
-./aspen bootstrap /tmp/aspen-test 127.0.0.1 replication 2 3 3
+mkdir -p /tmp/aspen-test
+./aspen bootstrap /tmp/aspen-test/bootstrap-host bootstrap-host 127.0.0.1 replication 2 3 3 \
+    --output-client-config /tmp/aspen-test/aspen-client-config.yaml
 ```
 
 This walkthrough runs everything on one machine, so `127.0.0.1` is the right address here
@@ -259,7 +261,8 @@ and the "not reachable from other machines" warning it prints is expected. A sys
 will have hosts added to it later needs an address those hosts can route to — an external
 IP or a DNS name — since the value given here is what they will dial.
 
-Bootstrap also writes `aspen-client-config.yaml` into the target directory (`/tmp/aspen-test`).
+Bootstrap also writes the client config. It goes to `aspen-client-config.yaml` in the current
+directory unless `--output-client-config` names another file, as it does here.
 Every client command starts from this file. It holds the system id, the client credentials, and the
 address of the bootstrap host, so it is created owner-only and should be treated as a secret.
 Clients use it to fetch the current `aspen-bootstrap-config.yaml` over HTTP from a running host.

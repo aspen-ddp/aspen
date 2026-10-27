@@ -43,6 +43,18 @@ class HostConfigSuite extends AnyFunSuite with Matchers:
     finally
       os.remove(f)
 
+  // Host names are arbitrary user input, so they must survive YAML's special characters
+  test("loadHostConfig round-trips a name that needs YAML quoting"):
+    val f = os.temp(prefix = "aspen-host-config-name", suffix = ".yaml")
+    try
+      for name <- List("web: 1", "#a", "\"quoted\"", "back\\slash", "[x]", "true", "42") do
+        val cfg = sample.copy(name = name)
+        os.write.over(f, cfg.yamlConfig)
+        withClue(s"name '$name': "):
+          HostConfig.loadHostConfig(f) should be(cfg)
+    finally
+      os.remove(f)
+
   test("round trip preserves the TLS certificate and private key exactly"):
     val f = os.temp(prefix = "aspen-host-config-tls", suffix = ".yaml")
     try
@@ -68,7 +80,7 @@ class HostConfigSuite extends AnyFunSuite with Matchers:
   test("doc-comment example config parses correctly"):
     val docExampleYaml = """host-id: 00000000-0000-0000-0000-000000000000
 aspen-system-id: 00000000-0000-0000-0000-000000000000
-name: bootstrap-host
+name: "bootstrap-host"
 address: 127.0.0.1
 data-port: 4750
 http-port: 4751

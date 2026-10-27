@@ -238,13 +238,14 @@ class MainSuite extends AnyFunSuite with Matchers:
   // bootstrap config on the command line, so bootstrap must leave both of them behind.
   test("bootstrap writes host and bootstrap config files into the host directory"):
     withTempDir("aspen-bootstrap"): tmp =>
+      // The directory and the name are independent, as they are for add-host
+      val hostDir = tmp / "srv" / "aspen-host"
       val stdout = java.io.ByteArrayOutputStream()
       val result = Console.withOut(stdout):
-        Main.bootstrap(Replication(3, 2), tmp, "10.0.0.5", 4750, 4751, 4752)
+        Main.bootstrap(Replication(3, 2), hostDir, "node a: #1", "10.0.0.5", 4750, 4751, 4752,
+                       tmp / "aspen-client-config.yaml")
       result shouldBe 0
       stdout.toString should include ("# Aspen Radicle Pointer Definition")
-
-      val hostDir = tmp / "bootstrap-host"
 
       // Both files hold private keys, so neither may be readable by anyone but the owner.
       val ownerOnly = os.PermSet.fromString("rw-------")
@@ -262,7 +263,8 @@ class MainSuite extends AnyFunSuite with Matchers:
       bsCfg.hosts.map(_.hostId) shouldBe List(hostCfg.hostId)
 
       val bsHost = bsCfg.hosts.head
-      bsHost.name shouldBe hostCfg.name
+      hostCfg.name shouldBe "node a: #1"
+      bsHost.name shouldBe "node a: #1"
       bsHost.dataPort shouldBe hostCfg.dataPort
       bsHost.httpPort shouldBe hostCfg.httpPort
       bsHost.storeTransferPort shouldBe hostCfg.storeTransferPort
@@ -281,7 +283,8 @@ class MainSuite extends AnyFunSuite with Matchers:
     withTempDir("aspen-bootstrap"): tmp =>
       val stdout = java.io.ByteArrayOutputStream()
       Console.withOut(stdout):
-        Main.bootstrap(Replication(3, 2), tmp, "10.0.0.5", 4750, 4751, 4752) shouldBe 0
+        Main.bootstrap(Replication(3, 2), tmp / "bootstrap-host", "bootstrap-host", "10.0.0.5",
+                       4750, 4751, 4752, tmp / "aspen-client-config.yaml") shouldBe 0
 
       val clientCfgFile = tmp / "aspen-client-config.yaml"
       os.exists(clientCfgFile) shouldBe true
@@ -300,6 +303,58 @@ class MainSuite extends AnyFunSuite with Matchers:
       val ca = Pem.decodeCertificate(bsCfg.caCertificate)
       noException should be thrownBy
         CertificateVerifier.verify(Pem.decodeCertificate(clientCfg.credentials.certificate), ca)
+
+  private def bootstrapInto(hostDir: os.Path, clientCfgDir: os.Path): Int =
+    Main.bootstrap(Replication(3, 2), hostDir, "bootstrap-host", "10.0.0.5", 4750, 4751, 4752,
+                   clientCfgDir / "aspen-client-config.yaml")
+
+  test("bootstrap refuses an unwritable client config directory before creating the host"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      val dir = tmp / "ro"
+      os.makeDir(dir, os.PermSet.fromString("r-xr-xr-x"))
+      try
+        val e = intercept[Main.ConfigError](bootstrapInto(tmp / "host", dir))
+        Main.commandErrorMessage(e) shouldBe
+          s"Error: bootstrap must create ${dir / "aspen-client-config.yaml"} but the directory " +
+          s"$dir cannot be written to"
+        os.exists(tmp / "host") shouldBe false
+      finally
+        os.perms.set(dir, os.PermSet.fromString("rwxr-xr-x"))
+
+  test("bootstrap refuses a client config whose directory does not exist"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      val e = intercept[Main.ConfigError](bootstrapInto(tmp / "host", tmp / "missing"))
+      e.getMessage should include (s"the directory ${tmp / "missing"} does not exist")
+      os.exists(tmp / "host") shouldBe false
+
+  test("bootstrap writes the client config to any named file"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      val cfgFile = tmp / "my-system.yaml"
+      Console.withOut(java.io.ByteArrayOutputStream()):
+        Main.bootstrap(Replication(3, 2), tmp / "host", "bootstrap-host", "10.0.0.5", 4750, 4751, 4752,
+                       cfgFile) shouldBe 0
+      ClientConfig.load(cfgFile).bootstrapHosts shouldBe List(BootstrapEndpoint("10.0.0.5", 4751))
+      os.exists(tmp / "aspen-client-config.yaml") shouldBe false
+
+  test("bootstrap refuses to overwrite an existing client config"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      os.write(tmp / "aspen-client-config.yaml", "existing")
+      val e = intercept[Main.ConfigError](bootstrapInto(tmp / "host", tmp))
+      e.getMessage should include (s"${tmp / "aspen-client-config.yaml"} already exists")
+      os.read(tmp / "aspen-client-config.yaml") shouldBe "existing"
+      os.exists(tmp / "host") shouldBe false
+
+  test("bootstrap accepts an existing empty host directory but not an initialized one"):
+    withTempDir("aspen-bootstrap"): tmp =>
+      val hostDir = tmp / "host"
+      os.makeDir(hostDir)
+      Console.withOut(java.io.ByteArrayOutputStream()):
+        bootstrapInto(hostDir, tmp) shouldBe 0
+      os.remove(tmp / "aspen-client-config.yaml")
+
+      val e = intercept[Main.ConfigError](bootstrapInto(hostDir, tmp))
+      e.getMessage should include (s"$hostDir already contains ${HostConfig.configFilename}")
+      os.exists(tmp / "aspen-client-config.yaml") shouldBe false
 
   test("validateHostAddress accepts IPv4, DNS names, and bracketed IPv6"):
     Main.validateHostAddress("10.0.0.5") shouldBe None
@@ -548,7 +603,8 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   test("a command's help lists that command's own arguments and options"):
     val help = Main.helpRequest(Seq("bootstrap", "--help")).get
-    help should include("<target-directory>")
+    help should include("<host-directory>")
+    help should include("<hostname>")
     help should include("<write-threshold>")
     help should include("--data-port")
     help should include("Port for client/store data traffic (default: 4750)")
@@ -643,7 +699,7 @@ class MainSuite extends AnyFunSuite with Matchers:
 
   test("createIDA builds RandomAccessReedSolomon with the requested cell size"):
     val parsed = Main.buildParser.parse(
-      Seq("bootstrap", "/tmp/target", "10.0.0.1", "random-access-reed-solomon", "3", "4", "5",
+      Seq("bootstrap", "/tmp/target", "bootstrap-host", "10.0.0.1", "random-access-reed-solomon", "3", "4", "5",
           "--cell-size", "4096"),
       Main.Args()).getOrElse(fail("bootstrap did not parse"))
     Main.createIDA(parsed) shouldBe RandomAccessReedSolomon(5, 3, 4, 4096)
@@ -664,17 +720,33 @@ class MainSuite extends AnyFunSuite with Matchers:
   test("--cell-size below 8 is rejected"):
     def parse(size: String) = Console.withErr(OutputStream.nullOutputStream()):
       Main.buildParser.parse(
-        Seq("bootstrap", "/tmp/target", "10.0.0.1", "random-access-reed-solomon", "3", "4", "5", "--cell-size", size),
+        Seq("bootstrap", "/tmp/target", "bootstrap-host", "10.0.0.1", "random-access-reed-solomon", "3", "4", "5", "--cell-size", size),
         Main.Args())
     parse("7") shouldBe None
     parse("0") shouldBe None
     parse("-1") shouldBe None
     parse("8").map(_.cellSize) shouldBe Some(8)
 
+  test("bootstrap takes a host directory and a required hostname"):
+    def parse(args: String*) = Console.withErr(OutputStream.nullOutputStream()):
+      Main.buildParser.parse(Seq("bootstrap") ++ args, Main.Args())
+    val parsed = parse("/srv/h", "node-a", "10.0.0.1", "replication", "2", "2", "3").
+      getOrElse(fail("bootstrap did not parse"))
+    parsed.hostDirectory shouldBe os.Path("/srv/h")
+    parsed.hostName shouldBe "node-a"
+    parsed.outputClientConfig shouldBe None
+    parse("/srv/h", "node-a", "10.0.0.1", "replication", "2", "2", "3",
+          "--output-client-config", "/srv/cfg.yaml").flatMap(_.outputClientConfig) shouldBe
+      Some(os.Path("/srv/cfg.yaml"))
+    parse("/srv/h", "node-a", "10.0.0.1", "replication", "2", "2", "3",
+          "--output-client-config", "/tmp") shouldBe None
+    parse("/srv/h", " ", "10.0.0.1", "replication", "2", "2", "3") shouldBe None
+    parse("/srv/h", "10.0.0.1", "replication", "2", "2", "3") shouldBe None
+
   test("the shared port options reach a command that takes them"):
     withTempDir("parse-ports"): dir =>
       val parsed = Main.buildParser.parse(
-        Seq("bootstrap", (dir / "target").toString, "10.0.0.1", "Replication", "2", "2", "3",
+        Seq("bootstrap", (dir / "target").toString, "bootstrap-host", "10.0.0.1", "Replication", "2", "2", "3",
             "--data-port", "5000", "--http-port", "5001", "--store-transfer-port", "5002"),
         Main.Args()).getOrElse(fail("bootstrap did not parse"))
 

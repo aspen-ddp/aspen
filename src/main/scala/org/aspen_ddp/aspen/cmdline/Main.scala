@@ -88,7 +88,6 @@ object Main {
 
   case class Args(mode:String="",
                   hostDirectory:os.Path=null,
-                  targetDirectory:os.Path=null,
                   clientConfigFile:os.Path=null,
                   bootstrapHost:Option[ClientConfig.BootstrapEndpoint]=None,
                   hostName:String="",
@@ -125,7 +124,8 @@ object Main {
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
                   networkCacheDir:Option[os.Path]=None,
-                  loadJars:Option[String]=None)
+                  loadJars:Option[String]=None,
+                  outputClientConfig:Option[os.Path]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
 
@@ -218,7 +218,7 @@ object Main {
   private[cmdline] def commandErrorMessage: PartialFunction[Throwable, String] =
     case e: YamlFormat.FormatError   => s"Error loading config file: $e"
     case e: YAMLException            => s"Error parsing config file: $e"
-    case e: ConfigError              => s"Error: $e"
+    case e: ConfigError              => s"Error: ${e.getMessage}"
     case e: UserJarLoader.LoadError  => s"Error: ${e.getMessage}"
     case _: TimeoutException         => "Error: operation timed out waiting for the storage system to respond"
     case e: IllegalArgumentException => s"Error: ${e.getMessage}"
@@ -345,20 +345,35 @@ object Main {
   // so the stored name cannot drift from the one that was validated.
   private val stripTrailingSlash = (s: String) => s.stripSuffix("/")
 
+  /** The <host-directory> of bootstrap and add-host, both of which create it if it is missing. */
+  private def hostDirectoryToCreateArg(p: ArgParser): OptionDef[os.Path, Args] =
+    p.arg[os.Path]("<host-directory>").text("Directory to initialize as the new host's root").
+      action((x, c) => c.copy(hostDirectory = x)).
+      validate { x =>
+        if !os.exists(x) || os.isDir(x) then
+          p.success
+        else
+          p.failure(s"Not a directory: $x")
+      }
+
+  private def hostNameArg(p: ArgParser, text: String): OptionDef[String, Args] =
+    p.arg[String]("<hostname>").text(text).
+      action((x, c) => c.copy(hostName = x)).
+      validate(x => if x.trim.nonEmpty then p.success else p.failure("Host name must not be empty"))
+
   private def bootstrapArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
-      // Unlike every other directory argument in this parser, the target is not required
-      // to exist: bootstrap creates it. Bootstrapping over an existing system is caught
-      // later by the bootstrap-host check in bootstrap() itself.
-      arg[os.Path]("<target-directory>").text("Directory the bootstrap host, its stores, and aspen-client-config.yaml are created under").
-        action((x, c) => c.copy(targetDirectory = x)).
-        validate { x =>
-          if !os.exists(x) || os.isDir(x) then
-            success
-          else
-            failure(s"Not a directory: $x")
-        },
+      // Like add-host's <host-directory>, it need not exist: bootstrap creates it. One that
+      // already holds a host is caught in bootstrap() itself.
+      hostDirectoryToCreateArg(p),
+
+      hostNameArg(p, "Name for the bootstrap host"),
+
+      opt[os.Path]("output-client-config").valueName("<file>").
+        text(s"File to write the client config to (default: ${ClientConfig.configFilename} in the current directory)").
+        action((x, c) => c.copy(outputClientConfig = Some(x))).
+        validate(x => if os.isDir(x) then failure(s"Is a directory: $x") else success),
 
       arg[String]("<address>").
         text("IP address or DNS name other hosts use to reach this bootstrap host").
@@ -577,18 +592,9 @@ object Main {
       // Unlike the <host-directory> of host and create-storage-device, this one is not
       // required to exist: add-host creates it. An already-initialized directory is
       // caught by the host-config check in HostManager.createHost.
-      arg[os.Path]("<host-directory>").text("Directory to initialize as the new host's root").
-        action((x, c) => c.copy(hostDirectory = x)).
-        validate { x =>
-          if !os.exists(x) || os.isDir(x) then
-            success
-          else
-            failure(s"Not a directory: $x")
-        },
+      hostDirectoryToCreateArg(p),
 
-      arg[String]("<hostname>").text("Name for the new host. Must not already be in use").
-        action((x, c) => c.copy(hostName = x)).
-        validate(x => if x.trim.nonEmpty then success else failure("Host name must not be empty")),
+      hostNameArg(p, "Name for the new host. Must not already be in use"),
 
       arg[String]("<address>").
         text("IP address or DNS name other hosts use to reach this host").
@@ -872,8 +878,9 @@ object Main {
         try
           //println(s"Config file: $config")
           cfg.mode match
-            case "bootstrap" => bootstrap(createIDA(cfg), cfg.targetDirectory, cfg.address,
-                                          cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
+            case "bootstrap" => bootstrap(createIDA(cfg), cfg.hostDirectory, cfg.hostName, cfg.address,
+                                          cfg.dataPort, cfg.httpPort, cfg.storeTransferPort,
+                                          cfg.outputClientConfig.getOrElse(os.pwd / ClientConfig.configFilename))
             case "host" => run_host(cfg.hostDirectory, cfg.loadJars)
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
@@ -1410,27 +1417,47 @@ object Main {
   }
 
   def bootstrap(bootstrapIda: IDA,
-                baseDirectory: os.Path, // created if it does not already exist
+                hostDirectory: os.Path, // created if it does not already exist
+                hostName: String,
                 address: String, // advertised to other hosts; never bound to
                 dataPort: Int,
                 httpPort: Int,
-                storeTransferPort: Int): Int = {
+                storeTransferPort: Int,
+                clientConfigFile: os.Path): Int = {
 
     if isUnreachableAddress(address) then
       println(s"Warning: '$address' is not reachable from other machines. Hosts added to this " +
               "system later will not be able to connect to the bootstrap host.")
 
-    val hostDirectory = baseDirectory / "bootstrap-host"
+    val clientConfigDir = clientConfigFile / os.up
+    val clientConfigDirDesc =
+      if clientConfigDir == os.pwd then s"the current working directory $clientConfigDir"
+      else s"the directory $clientConfigDir"
 
-    if os.exists(hostDirectory) then
-      throw new Exception(s"Bootstrap host directory exists: $hostDirectory")
+    // Every check runs before anything is created, so a refused bootstrap leaves nothing behind.
+    if !os.isDir(clientConfigDir) then
+      throw ConfigError(s"bootstrap must create $clientConfigFile but $clientConfigDirDesc does not exist")
+
+    if !java.nio.file.Files.isWritable(clientConfigDir.toNIO) then
+      throw ConfigError(s"bootstrap must create $clientConfigFile but $clientConfigDirDesc cannot be written to")
+
+    // Another system's client config, whose credentials would be lost if overwritten
+    if os.exists(clientConfigFile) then
+      throw ConfigError(s"$clientConfigFile already exists")
+
+    if os.exists(hostDirectory / HostConfig.configFilename) then
+      throw ConfigError(s"$hostDirectory already contains ${HostConfig.configFilename}. " +
+                        "It has already been initialized as a host root directory.")
+
+    val storageDevicesDir = hostDirectory / StorageDeviceManager.StorageDevicesDirName
+    val bootstrapDevDir = storageDevicesDir / "bootstrap-device"
+
+    if os.exists(bootstrapDevDir) then
+      throw ConfigError(s"$bootstrapDevDir already exists")
 
     val sched = Executors.newScheduledThreadPool(1)
     val ec = ExecutionContext.fromExecutorService(sched)
     given ExecutionContext = ec
-
-    val storageDevicesDir = hostDirectory / StorageDeviceManager.StorageDevicesDirName
-    val bootstrapDevDir = storageDevicesDir / "bootstrap-device"
 
     os.makeDir.all(bootstrapDevDir)
 
@@ -1446,7 +1473,7 @@ object Main {
     val hostConfig = HostConfig(
       bootstrapHostId,
       aspenSystemId,
-      "bootstrap-host",
+      hostName,
       address,
       dataPort,
       httpPort,
@@ -1492,7 +1519,7 @@ object Main {
 
     val bootstrapHost = HostState(
       hostConfig.hostId,
-      "bootstrap-host",
+      hostName,
       address,
       hostConfig.dataPort,
       hostConfig.httpPort,
@@ -1524,7 +1551,6 @@ object Main {
 
     // Every other command starts from this file, fetching the bootstrap config from the hosts
     // it caches. It holds the client's private key and is written owner-only.
-    val clientConfigFile = baseDirectory / ClientConfig.configFilename
     ClientConfig.write(clientConfigFile, ClientConfig.Config(
       aspenSystemId,
       ClientConfig.ClientCredentials.generate(ca),

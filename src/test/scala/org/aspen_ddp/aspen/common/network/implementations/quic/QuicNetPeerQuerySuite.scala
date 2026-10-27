@@ -194,7 +194,8 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
       relays.contains(hostIdC)
 
     sendUntilDelivered(cl, hostIdC, c)
-    cl.net.metadataManager.hostTimestamp(hostIdC) shouldBe Some(ts(2))
+    // The message can reach C through a relay before the answer to the client's own query is applied
+    eventually("the client's entry for C is repaired", WaitMillis)(cl.net.metadataManager.hostTimestamp(hostIdC) == Some(ts(2)))
 
   test("queries go out as datagrams"):
     val alloc = PooledByteBufAllocator.DEFAULT

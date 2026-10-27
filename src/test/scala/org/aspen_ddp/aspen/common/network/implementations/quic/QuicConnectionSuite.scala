@@ -384,7 +384,8 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("a channel that closes after attach closes the connection"):
     val fx = fixture()
     val ch = fx.dialAndWait()
-    val (ok, enc) = fx.submit(sized(1, 200))
+    // Stream-sized: a datagram can be lost, and this test only needs the connection to be working
+    val (ok, enc) = fx.submit(sized(1, QuicMessageCodec.DatagramThreshold + 1))
     ok shouldBe true
     fx.srv.awaitReceived()
     ch.close().await(AwaitMillis) shouldBe true

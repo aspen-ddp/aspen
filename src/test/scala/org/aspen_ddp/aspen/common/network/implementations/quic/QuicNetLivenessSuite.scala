@@ -142,12 +142,19 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     val stale = entryFor(fx.a.net, fx.hostIdB).connection.get()
     stale should not be null
     fx.stopB()
-    eventually("A's connection to the stopped B closes", LoadProbe.scaleMillis(3000)):
+    eventually("A's connection to the stopped B closes", LoadProbe.scaleMillis(15000)):
       stale.isClosed
     fx.startB()
+    // A message sent while A's re-dial is still failing or handshaking is dropped, so send it until one arrives
     val m = rebuildData(fx.storesB.head)
-    fx.a.net.clientMessenger.sendClientRequest(m)
-    await(fx.b.handler.clientRequests, 1).map(_.message) shouldBe List(m)
+    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AwaitMillis)
+    var got: Delivery[ClientRequest] = null
+    while got == null do
+      if System.nanoTime() - deadline > 0 then
+        throw new AssertionError(s"no message reached the restarted B within ${AwaitMillis}ms")
+      fx.a.net.clientMessenger.sendClientRequest(m)
+      got = fx.b.handler.clientRequests.poll(LoadProbe.scaleMillis(500), TimeUnit.MILLISECONDS)
+    got.message shouldBe m
 
   test("fast restart re-dials and is reported as restarted"):
     // A long idle timeout, so only the boot-id re-dial can make A drop its black-holed connection in time

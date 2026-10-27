@@ -116,19 +116,22 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     new Random(size).nextBytes(data)
     val key = Key(UUID.randomUUID())
 
-    given tx: Transaction = client.newTransaction()
-
     val start = System.nanoTime()
     @volatile var committed = 0L
-    val f = for
-      pool <- client.getStoragePool(Radicle.poolId)
-      dp <- pool.allocator.allocateDataObject(DataBuffer(data))
-      _ = tx.update(Radicle.pointer, None, None,
-                    List(KeyValueUpdate.DoesNotExist(key)),
-                    List(Insert(key, dp.toArray)))
-      _ <- tx.commit()
-      _ = committed = System.nanoTime()
-    yield dp
+    // The host updates the Radicle too, so the commit can collide with it and abort; that is retried
+    val f = client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+      for
+        pool <- client.getStoragePool(Radicle.poolId)
+        dp <- pool.allocator.allocateDataObject(DataBuffer(data))
+      yield
+        tx.update(Radicle.pointer, None, None,
+                  List(KeyValueUpdate.DoesNotExist(key)),
+                  List(Insert(key, dp.toArray)))
+        dp
+    .map: dp =>
+      committed = System.nanoTime()
+      dp
 
     val dp = Await.result(f, Timeout)
     // Commit returns once the outcome is decided, so a read right after it can reach stores that have yet to apply it:

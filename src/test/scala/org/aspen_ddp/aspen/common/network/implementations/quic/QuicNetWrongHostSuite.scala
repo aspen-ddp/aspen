@@ -87,7 +87,8 @@ class QuicNetWrongHostSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     val port = freeUdpPort()
     fx.directory.put(HostState(hostIdD, "host_d", "127.0.0.1", port, 0, 0, Set()))
     val d = fx.host(hostIdD, port, cfg, networkCache = cache)
-    hosts.foreach(h => d.net.metadataManager.hostTimestamp(h.hostId) shouldBe Some(h.timestamp))
+    // Seeded from the cache. A starved test thread can get here after gossip from B has already brought a newer entry.
+    hosts.foreach(h => d.net.metadataManager.hostTimestamp(h.hostId).exists(_ >= h.timestamp) shouldBe true)
     d
 
   /** A raw QUIC client connected to `port` */

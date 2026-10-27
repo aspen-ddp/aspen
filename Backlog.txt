@@ -1,36 +1,21 @@
 Backlog
 =======
 
-Users of Aspen systems can define their own implementations for FinalizationActions and DurableTasks. Aspen
-maintains a registry of UUIDs that map to factory classes that can create instances of the needed type. The
-SimpleAspenClient constructor takes a userTypeFactories: List[RegisteredTypeFactory] that allows users of
-the library to pass in their own type factories when initializing a client instance. This is simple for
-clients but those types must also be available to Host instances which are brought up via the CLI. We need
-some way to load user-supplied classes and inject them into the SimpleAspenClient constructor when launching
-a host. Java has a classloader ability for programmatically loading classes from jar files. Lets take advantage
-of this to obtain the list of RegisteredTypeFactory. A few thoughts to steer the design:
-  - Lets start simple and require manual delivery of the jar files to each host
-  - Consider placing them in <host-dir>/jars/<version>/
-  - The CLI host command gains a --load-jars=<version>
-  - A symlink in the <host-dir>/jars/ folder should be supported
-    - This allows startup scripts to always use --load-jars=latest
-    - Symlink is updated to switch the version that will be used on the next startup
-  - Ideally we should be able to load multiple RegisteredTypeFactory lists from multiple jars and
-    combine them into a single list before handing them to the SimpleAspenClient constructor
-  - The client constructor checks the supplied list of type factories for duplicate UUIDs and throws an
-    exception if a collision is found. The CLI should be prepared for this and error out with a clear
-    error message describing the problem and, if possible, exactly which two types collided to aid the
-    user in debugging the issue.
-Open questions for which there may well be industry-standard solutions that I'm not aware of:
-  - Jars usually have 3rd party dependencies, how should those be handled?
-  - Given a directory full of jar files, how do we know which ones to look in for the type registries?
-  - What is the name of the class(es) to look for?
-    - We want this to be easy for the user to configure
-    - Perhaps a manifest/config yaml file in the version directory?
+Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
+encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs
+and tombstones until the object is full. If compaction frees up enough space, the object can be
+overwritten and append operations can resume until a split is eventually required. The encoding is a
+pluggable NodeEncoding so it plugs in without touching the tree logic in TierEngine.
+  - Note that appending to the object saves write bandwidth but comes at the cost of increasing read
+    bandwidth.
+    - The implementation should balance the two. Rather than blindly appending, calculate the cost
+      of doing a subsequent read when choosing to append or a compacted overwrite. There probably
+      isn't a single solution that is ideal in all cases. If possible, design the code such that
+      a plugin (or just a callback) can be provided that optimize to specific use cases but default to
+      a good, general-purpose implementation.
 
-Add ability to physically move storage devices between Hosts
-  - Add StorageDeviceState.StoreState.Offline enum value
-  - Add AspenClient.takeStorageDeviceOffline(StoreId)
+Need a way to connect AllocationGroups to App-defined Allocators
+  - Application can just create them during initialization
 
 AmoebaFS is limited to a single SinglePoolNodeAllocator
   - Need plan for using ObjectAllocators tied to AllocationGroups
@@ -39,9 +24,6 @@ Generate IDA document to discuss pros and cons of each IDA algorithm and what th
 "appendix" should discuss high-level of how they're implemented. Might feed into a larger "Design Guide"
 that talks about things like IDA + Backend combinations. RandomAccessReedSolomon + RocksDB is a poor
 combination.
-
-Need a way to connect AllocationGroups to App-defined Allocators
-  - Application can just create them during initialization
 
 Need a mechanism to handle "out of space" errors
   - Will present when we attempt to commit an object update to the store

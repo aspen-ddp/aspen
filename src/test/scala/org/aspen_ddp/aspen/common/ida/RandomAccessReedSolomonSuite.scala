@@ -19,6 +19,7 @@ class RandomAccessReedSolomonSuite extends AnyFunSuite with Matchers:
     RandomAccessReedSolomon(4, 4, 4, 16),
     RandomAccessReedSolomon(5, 3, 4, 64),
     RandomAccessReedSolomon(6, 4, 5, 8),
+    RandomAccessReedSolomon(5, 3, 4, 12),
     RandomAccessReedSolomon(8, 5, 6, 64),
     RandomAccessReedSolomon(10, 7, 9, 8))
 
@@ -44,6 +45,16 @@ class RandomAccessReedSolomonSuite extends AnyFunSuite with Matchers:
     ida.calculateEncodedSegmentLength(17) should be (16)
     ida.calculateEncodedSegmentLength(40) should be (16)
     ida.calculateEncodedSegmentLength(41) should be (24)
+  }
+
+  test("copyCell matches System.arraycopy for unaligned offsets and every short length") {
+    val src = Array.tabulate[Byte](160)(i => (i * 31 + 7).toByte)
+    for n <- 0 to 72; srcPos <- 0 to 9; dstPos <- 0 to 9 do
+      val expected = new Array[Byte](96)
+      val actual = new Array[Byte](96)
+      System.arraycopy(src, srcPos, expected, dstPos, n)
+      RandomAccessReedSolomon.copyCell(src, srcPos, actual, dstPos, n)
+      withClue(s"n=$n srcPos=$srcPos dstPos=$dstPos") { actual should be (expected) }
   }
 
   test("encode then restore round trips") {

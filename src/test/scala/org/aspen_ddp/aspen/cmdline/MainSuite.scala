@@ -630,7 +630,7 @@ class MainSuite extends AnyFunSuite with Matchers:
           "--cell-size", "4096"),
       Main.Args()).getOrElse(fail("bootstrap did not parse"))
     Main.createIDA(parsed) shouldBe RandomAccessReedSolomon(5, 3, 4, 4096)
-    Main.createIDA(parsed.copy(cellSize = 64)) shouldBe RandomAccessReedSolomon(5, 3, 4)
+    Main.createIDA(parsed.copy(cellSize = 16)) shouldBe RandomAccessReedSolomon(5, 3, 4)
 
   test("validateIdaType accepts random-access-reed-solomon"):
     withTempDir("parse-ida"): dir =>

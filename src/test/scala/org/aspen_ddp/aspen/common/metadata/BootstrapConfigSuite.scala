@@ -72,11 +72,11 @@ class BootstrapConfigSuite extends AnyFunSuite with Matchers:
     yaml should include("cell-size: 4096")
     BootstrapConfig.parseBootstrapConfig(yaml).bootstrapIDA should be(ida)
 
-  test("cell-size defaults to 64"):
+  test("cell-size defaults to 16"):
     val yaml = generatedWith(RandomAccessReedSolomon(1, 1, 1))
       .linesIterator.filterNot(_.contains("cell-size")).mkString("\n")
     yaml should not include "cell-size"
-    BootstrapConfig.parseBootstrapConfig(yaml).bootstrapIDA should be(RandomAccessReedSolomon(1, 1, 1, 64))
+    BootstrapConfig.parseBootstrapConfig(yaml).bootstrapIDA should be(RandomAccessReedSolomon(1, 1, 1, 16))
 
   test("loadBootstrapConfig round-trips generateBootstrapConfig"):
     val f = os.temp(prefix = "aspen-bootstrap-config", suffix = ".yaml")

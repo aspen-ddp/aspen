@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.common.ida
 
-import java.nio.ByteBuffer
+import java.lang.invoke.{MethodHandles, VarHandle}
+import java.nio.{ByteBuffer, ByteOrder}
 
 import com.backblaze.erasure.ReedSolomon as RSCodec
 import com.github.blemale.scaffeine.{LoadingCache, Scaffeine}
@@ -515,13 +516,39 @@ case class ReedSolomon(width: Int, restoreThreshold: Int, writeThreshold: Int) e
 
 object RandomAccessReedSolomon:
 
-  val DefaultCellSize: Int = 64
+  /** Small cells keep the per-slice padding of small objects and the deltas of small edits low. Benchmarked
+    * against 64 at k = 10 (IDABenchmark): a quarter of the storage for sub-256 byte objects, roughly half the
+    * bytes sent for small appends and edits, and within a few percent everywhere else.
+    */
+  val DefaultCellSize: Int = 16
 
   /** The cell size is serialized as an unsigned 16-bit value */
   val MaxCellSize: Int = 0xFFFF
 
   /** Big-endian logical length stored in the last 8 bytes of the final row */
   val TrailerSize: Int = 8
+
+  /** Cells at most this long are moved 8 bytes at a time. System.arraycopy's per-call overhead dominates
+    * for short copies, and scatter/gather make one copy per cell. Through 32; at 64 arraycopy wins in practice.
+    */
+  private val WordCopyMaxCellSize: Int = 32
+
+  /** Copies n bytes. Short copies use unaligned native-order long moves, which the JIT intrinsifies */
+  private[ida] def copyCell(src: Array[Byte], srcPos: Int, dst: Array[Byte], dstPos: Int, n: Int): Unit =
+    if n > WordCopyMaxCellSize then
+      System.arraycopy(src, srcPos, dst, dstPos, n)
+    else
+      var j = 0
+      while j + 8 <= n do
+        val word: Long = LongView.get(src, srcPos + j)
+        LongView.set(dst, dstPos + j, word)
+        j += 8
+      while j < n do
+        dst(dstPos + j) = src(srcPos + j)
+        j += 1
+
+  private val LongView: VarHandle =
+    MethodHandles.byteArrayViewVarHandle(classOf[Array[Long]], ByteOrder.nativeOrder())
 
 
 /** Systematic Reed-Solomon code with a row-interleaved layout that supports appending without
@@ -633,14 +660,26 @@ case class RandomAccessReedSolomon(
   private def scatter(src: Array[Byte], offset: Int, length: Int, rows: Int): Array[Array[Byte]] =
     val shards = Array.ofDim[Byte](width, rows * cellSize)
 
+    // Rows lying entirely within the source copy whole cells without per-cell bounds arithmetic
+    val fullRows = math.min(rows, length / rowBytes)
     var row = 0
+    var srcPos = offset
+    while row < fullRows do
+      val slicePos = row * cellSize
+      var i = 0
+      while i < k do
+        RandomAccessReedSolomon.copyCell(src, srcPos, shards(i), slicePos, cellSize)
+        srcPos += cellSize
+        i += 1
+      row += 1
+
     while row < rows do
       var i = 0
       while i < k do
         val streamPos = row * rowBytes + i * cellSize
         val nReal = math.min(cellSize, length - streamPos)
         if nReal > 0 then
-          System.arraycopy(src, offset + streamPos, shards(i), row * cellSize, nReal)
+          RandomAccessReedSolomon.copyCell(src, offset + streamPos, shards(i), row * cellSize, nReal)
         i += 1
       row += 1
 
@@ -789,14 +828,26 @@ case class RandomAccessReedSolomon(
     * beyond dest.length are not copied.
     */
   private def gather(shards: Array[Array[Byte]], firstRow: Int, rows: Int, dest: Array[Byte], destBase: Int): Unit =
+    // Rows lying entirely within dest copy whole cells without per-cell bounds arithmetic
+    val fullRows = math.max(0L, math.min(rows.toLong, (dest.length.toLong + destBase) / rowBytes - firstRow)).toInt
     var row = 0
+    var destPos = firstRow * rowBytes - destBase
+    while row < fullRows do
+      val slicePos = row * cellSize
+      var i = 0
+      while i < k do
+        RandomAccessReedSolomon.copyCell(shards(i), slicePos, dest, destPos, cellSize)
+        destPos += cellSize
+        i += 1
+      row += 1
+
     while row < rows do
       var i = 0
       while i < k do
         val streamPos = (firstRow + row) * rowBytes + i * cellSize
         val nCopy = math.min(cellSize, dest.length + destBase - streamPos)
         if nCopy > 0 then
-          System.arraycopy(shards(i), row * cellSize, dest, streamPos - destBase, nCopy)
+          RandomAccessReedSolomon.copyCell(shards(i), row * cellSize, dest, streamPos - destBase, nCopy)
         i += 1
       row += 1
 

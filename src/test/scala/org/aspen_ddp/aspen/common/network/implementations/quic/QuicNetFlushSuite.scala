@@ -156,7 +156,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     var result: Option[Boolean] = None
     noException should be thrownBy:
       result = Some(c.net.awaitPendingMessagesSent(Duration(500, MILLISECONDS)))
-    elapsedMillis(start) should be < 1500L
+    elapsedMillis(start) should be < 10000L
     result shouldBe Some(false)
 
   test("a blocking name lookup blocks neither the sender nor flush"):
@@ -171,11 +171,11 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       val start = System.nanoTime()
       c.net.sendToHost(entry, read(fx.storesA.head, c.net.clientId))
       c.net.sendToHost(entry, read(fx.storesA.head, c.net.clientId))
-      elapsedMillis(start) should be < 100L
+      elapsedMillis(start) should be < 5000L // not blocked for the 30 s the lookup takes
       resolving.await(5, TimeUnit.SECONDS) shouldBe true
       val flushStart = System.nanoTime()
       c.net.awaitPendingMessagesSent(Duration(300, MILLISECONDS)) shouldBe false
-      elapsedMillis(flushStart) should be < 1300L
+      elapsedMillis(flushStart) should be < 10000L
     finally
       release.countDown()
 

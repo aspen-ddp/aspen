@@ -109,10 +109,21 @@ trait FailedStorageDeviceTestHarness:
       drain = new FailedStorageDeviceDurableTask(
                 DurableTaskPointer(added.head._2), client, deviceId, fastPoll)
       _ <- withTimeout(drain.completed.map(_ => ()), Duration(60000, MILLISECONDS),
-                       s"the drain of ${deviceId.uuid}").transform: result =>
+                       s"the drain of ${deviceId.uuid}").recoverWith:
+             case e: AssertionError =>
+               // Say where the drain stopped: the failed device's remaining stores and the tasks still enrolled
+               describeStuckDrain(deviceId).map(d => throw new AssertionError(s"${e.getMessage}; $d", e))
+           .transform: result =>
              drain.stop()
              result
     yield ()
+
+  private def describeStuckDrain(deviceId: StorageDeviceId): Future[String] =
+    given ExecutionContext = executionContext
+    val device = client.getStorageDevicePointer(deviceId).flatMap(client.read).map: kvos =>
+      s"device stores ${StorageDeviceState(kvos).stores}"
+    val tasks = enrolledTasks().map(t => s"${t.size} tasks enrolled")
+    Future.sequence(List(device, tasks).map(_.recover { case e => s"unreadable: $e" })).map(_.mkString(", "))
 
   /** Flip `sid`'s Rebuilding entry on `deviceId` to Active, as Host.markRebuiltStoreActive does
    *  once the destination host has reconstructed the store. */

@@ -114,36 +114,41 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
 
     val data = new Array[Byte](size)
     new Random(size).nextBytes(data)
-    val key = Key(UUID.randomUUID())
 
     val start = System.nanoTime()
     @volatile var committed = 0L
-    // The host updates the Radicle too, so the commit can collide with it and abort; that is retried
-    val f = client.transactUntilSuccessful: tx =>
-      given Transaction = tx
-      for
-        pool <- client.getStoragePool(Radicle.poolId)
-        dp <- pool.allocator.allocateDataObject(DataBuffer(data))
-      yield
-        tx.update(Radicle.pointer, None, None,
-                  List(KeyValueUpdate.DoesNotExist(key)),
-                  List(Insert(key, dp.toArray)))
-        dp
-    .map: dp =>
-      committed = System.nanoTime()
-      dp
+    // The host updates the Radicle too, so a commit can collide with it and abort. Each attempt allocates the whole
+    // object again, so the retries are few, and each uses a key of its own in case an earlier one did commit.
+    def attempt(n: Int): Future[(Key, org.aspen_ddp.aspen.common.objects.DataObjectPointer)] =
+      val key = Key(UUID.randomUUID())
+      client.transact: tx =>
+        given Transaction = tx
+        for
+          pool <- client.getStoragePool(Radicle.poolId)
+          dp <- pool.allocator.allocateDataObject(DataBuffer(data))
+        yield
+          tx.update(Radicle.pointer, None, None,
+                    List(KeyValueUpdate.DoesNotExist(key)),
+                    List(Insert(key, dp.toArray)))
+          (key, dp)
+      .map: r =>
+        committed = System.nanoTime()
+        r
+      .recoverWith:
+        case _: org.aspen_ddp.aspen.client.TransactionAborted if n < 5 => attempt(n + 1)
+    val f = attempt(1)
 
-    val dp = Await.result(f, Timeout)
+    val (key, dp) = Await.result(f, Timeout)
     // Commit returns once the outcome is decided, so a read right after it can reach stores that have yet to apply it:
     // the new object is then not found, and the Radicle lacks the key. Read again until both are seen.
     val deadline = System.nanoTime() + Timeout.toNanos
     def readUntil[T](what: String)(read: => Future[T])(done: T => Boolean): T =
-      def attempt(): Either[Throwable, T] =
+      def tryRead(): Either[Throwable, T] =
         try Right(Await.result(read, Timeout)) catch case e: Exception => Left(e)
-      var last = attempt()
+      var last = tryRead()
       while !last.exists(done) && System.nanoTime() < deadline do
         Thread.sleep(10)
-        last = attempt()
+        last = tryRead()
       last.fold(e => throw e, identity)
     val kvos = readUntil("the Radicle")(client.read(Radicle.pointer))(_.contents.contains(key))
     val dos = readUntil("the data object")(client.read(dp))(_ => true)

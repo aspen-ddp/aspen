@@ -179,6 +179,10 @@ class StoreTransferManager(port: Int,
   private def send(storeId: StoreId, out: Outbound, sourceDirectory: os.Path, host: String, port: Int): Unit =
     val raw = new Socket()
     var succeeded = false
+    // jar buffers its archive in a temporary file it deletes itself only when it exits normally, so an archiver
+    // destroyed by an aborted transfer would leave the whole store's worth of data behind. Give it a directory of
+    // its own to remove.
+    var archiverTmp: Option[os.Path] = None
     try
       out.lastProgress = System.nanoTime()
       if !attach(out, raw) then
@@ -197,7 +201,10 @@ class StoreTransferManager(port: Int,
       // os.spawn leaks a throwing shutdown hook if the process cannot start, so check the cwd first
       if !os.isDir(sourceDirectory) then
         throw new Exception(s"source directory $sourceDirectory does not exist")
-      val p = os.spawn(cmd = ("jar", "--create", "--no-manifest", "."), cwd = sourceDirectory, stderr = os.Pipe)
+      val tmp = os.temp.dir(prefix = "store-transfer-out")
+      archiverTmp = Some(tmp)
+      val p = os.spawn(cmd = ("jar", s"-J-Djava.io.tmpdir=$tmp", "--create", "--no-manifest", "."),
+                       cwd = sourceDirectory, stderr = os.Pipe)
       if !attach(out, p) then
         throw new Exception("aborted before archiving")
       logger.info(s"Sending store $storeId, transfer ${out.transferUUID}, to $host:$port")
@@ -245,6 +252,8 @@ class StoreTransferManager(port: Int,
         if !succeeded && lastTimestamp.get(storeId).contains(out.timestamp) then
           lastTimestamp -= storeId
       try raw.close() catch case _: Throwable => ()
+      archiverTmp.foreach: tmp =>
+        try os.remove.all(tmp) catch case _: Throwable => ()
 
   /** Records the attempt's socket so it can be aborted. False if the attempt was already aborted. */
   private def attach(out: Outbound, sock: Socket): Boolean = synchronized:

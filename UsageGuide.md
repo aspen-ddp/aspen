@@ -168,9 +168,9 @@ How to set limits:
   smaller of the two and never consults network state or the transaction for it.
 
 Pool and group limits are fixed at creation and cannot be changed. A group's limit is either explicit or
-absent. A pool or group may join a group only if its own limit is no larger than the group's, and a member
-with no limit cannot join a limited group; otherwise joining fails with `MemberLimitExceedsGroup` before
-any state changes.
+absent. A group's limit is a floor that every member meets: a limited group accepts members with no limit
+or with a limit at least as large as its own, and an unlimited group accepts only unlimited members.
+Otherwise joining fails with `MemberLimitIncompatible` before any state changes.
 
 ### Allocation Group IDA Policy
 

@@ -37,9 +37,9 @@ The `<address>` argument is needed to facilitate the expansion of the system. It
 the host's `http-port` (default 4751, `--http-port`) to form the first entry in the client config's
 list of bootstrap hosts. To add a new host, copy `aspen-client-config.yaml` (see below) to the
 machine to be added and invoke the `aspen add-host` command. The CLI fetches the current bootstrap
-config from the bootstrap host and connects to the Aspen host process on that machine. It'll then
-create the metadata for the new host inside
-the Aspen system and set up the local directories and files to support the new host.
+config from one of the hosts listed in the client config and connects to the running Aspen system.
+Nothing needs to be running on the new machine yet. It'll then create the metadata for the new host
+inside the Aspen system and set up the local directories and files to support the new host.
 
 Once a new host is added, `aspen create-storage-device` can be used to add storage devices.
 When a device is created, the storage device set it belongs to must be specified. Adding

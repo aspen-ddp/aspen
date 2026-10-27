@@ -389,8 +389,9 @@ AllocationGroups exist to spread object allocations across a group of StoragePoo
 AllocationGroups. Similar to StorageDeviceSets, AllocationGroups use the same Leveling strategy to 
 form groups of groups for allocation purposes.
 
-An AllocationGroup may carry a maximum slice size, fixed at creation. A pool or group may only join a group
-whose limit is at least as large as its own, so every allocation from the group fits whichever member is chosen.
+An AllocationGroup may carry a maximum slice size, fixed at creation. The group's limit is a floor: a pool or
+group may only join if it has no limit or one at least as large as the group's, so every allocation from the
+group fits whichever member is chosen. An unlimited group accepts only unlimited members.
 
 An AllocationGroup also has an IDA policy, fixed at creation. Under the default `ExactMatch` policy the group is
 created with an IDA and every member pool or group must have an IDA equal to it (same type and every parameter);

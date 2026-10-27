@@ -110,9 +110,10 @@ trait FailedStorageDeviceTestHarness:
                 DurableTaskPointer(added.head._2), client, deviceId, fastPoll)
       _ <- withTimeout(drain.completed.map(_ => ()), Duration(60000, MILLISECONDS),
                        s"the drain of ${deviceId.uuid}").recoverWith:
-             case e: AssertionError =>
-               // Say where the drain stopped: the failed device's remaining stores and the tasks still enrolled
-               describeStuckDrain(deviceId).map(d => throw new AssertionError(s"${e.getMessage}; $d", e))
+             case e: Throwable =>
+               // Say where the drain stopped: the failed device's remaining stores and the tasks still enrolled.
+               // A Future boxes an Error such as the timeout's AssertionError, so it is not matched by type.
+               describeStuckDrain(deviceId).map(d => throw new AssertionError(s"$e; $d", e))
            .transform: result =>
              drain.stop()
              result

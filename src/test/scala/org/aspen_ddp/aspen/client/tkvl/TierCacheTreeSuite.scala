@@ -49,17 +49,24 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
   private def holding(nodes: List[ListNode], k: Key): ListNode = nodes.find(_.keyInRange(k)).get
 
   /** Inserts keys after `from`, one transaction each through the uncached instance, until `split` reports the tree's
-    * shape changed. Returns the keys inserted.
+    * shape changed. Returns the keys inserted. Upper tiers change only through the finalization of a tier-0 split, so
+    * finalization is awaited only after an insert that split a tier-0 node.
     */
   private def insertUntil(f: Fixture, from: Int)(split: List[List[ListNode]] => Boolean): Future[List[Key]] =
-    def loop(i: Int, inserted: List[Key]): Future[List[Key]] =
+    def loop(i: Int, inserted: List[Key], leaves: Int): Future[List[Key]] =
       assert(i < from + 40)
-      setAll(f.other, List(Key(i))).flatMap(_ => f.tiers).flatMap: tiers =>
-        if split(tiers) then
-          Future.successful((Key(i) :: inserted).reverse)
+      val k = Key(i)
+      inTransaction(tx => f.other.set(k, value(i))(using tx)).flatMap(_ => f.tiers).flatMap: tiers =>
+        if tiers.last.size == leaves then
+          Future.successful(tiers)
         else
-          loop(i + 1, Key(i) :: inserted)
-    loop(from, Nil)
+          waitForTransactionsToComplete().flatMap(_ => f.tiers)
+      .flatMap: tiers =>
+        if split(tiers) then
+          Future.successful((k :: inserted).reverse)
+        else
+          loop(i + 1, k :: inserted, tiers.last.size)
+    f.tiers.flatMap(tiers => loop(from, Nil, tiers.last.size))
 
   /** Warms the cache through a lookup of the last key, then splits the rightmost tier-0 node through the uncached
     * instance. Returns the rightmost tier-1 node from before the split, which is cached and now stale, and the keys
@@ -285,47 +292,42 @@ class TierCacheTreeSuite extends TreeKindSuiteBase:
         assert(entries == expectedEntries(recreated))
 
     atest(s"$kind: tier reduction with a warm cache"):
-      // Deletes from the left through the warm instance, one transaction each, until the tree loses a tier
-      def deleteUntilReduced(f: Fixture, remaining: List[Key]): Future[List[Key]] =
-        assert(remaining.size > 1)
-        deleteAll(f.warm, List(remaining.head)).flatMap(_ => numTiers(f.otherRm)).flatMap: tiers =>
-          if tiers < 2 then
-            Future.successful(remaining.tail)
-          else
-            deleteUntilReduced(f, remaining.tail)
+      // Two keys fit in one node, so deleting the rest from the left through the warm instance loses a tier
+      val remaining = initial.takeRight(2)
       for
         f <- fixture(kind)
         _ <- Future.sequence(initial.map(f.warm.get))
-        remaining <- deleteUntilReduced(f, initial)
-        _ <- waitForTransactionsToComplete()
+        _ <- deleteAll(f.warm, initial.dropRight(2))
+        tiers <- numTiers(f.otherRm)
         values <- Future.sequence(initial.map(f.warm.get))
         entries <- f.warm.entries()
       yield
+        assert(tiers < 2)
         assert(values == initial.map(k => if remaining.contains(k) then bytesOf(k) else None))
         assert(entries == expectedEntries(remaining))
 
     atest(s"$kind: tier growth with a warm cache"):
-      // Inserts ascending keys from `from` through `tree`, one transaction each, until the root is on `tier`
-      def insertUntilTier(tree: Tree, rm: RootManager, from: Int, tier: Int): Future[Int] =
-        assert(from < 100)
-        setAll(tree, List(Key(from))).flatMap(_ => numTiers(rm)).flatMap: tiers =>
-          if tiers >= tier then
-            Future.successful(from)
-          else
-            insertUntilTier(tree, rm, from + 1, tier)
+      // 10 keys put the root on tier 1 for both kinds and `initial` puts it on tier 2
+      val first = keys(1 to 10)
       for
         (_, created) <- newTree(kind)
         rm = new KVObjectRootManager(client, created.treeKey, created.pointer, TierCache.default())
         tree = open(kind, rm)
         // Counts tiers without refreshing the warm instance's cached root
         counter = new KVObjectRootManager(client, created.treeKey, created.pointer, NoCache)
-        last1 <- insertUntilTier(tree, counter, 1, 1)
-        _ <- Future.sequence(keys(1 to last1).map(tree.get))
+        _ <- setAll(tree, first)
+        tiers1 <- numTiers(counter)
+        _ = assert(tiers1 == 1)
+        // The root cached while the keys went in can be behind the last split. A lookup of the last key evicts it
+        // and the next one caches the current root.
+        _ <- tree.get(first.last)
+        _ <- tree.get(first.last)
         _ = assert(rm.cache.root.isDefined)
-        last <- insertUntilTier(tree, counter, last1 + 1, 2)
-        _ <- waitForTransactionsToComplete()
-        values <- Future.sequence(keys(1 to last).map(tree.get))
+        _ <- setAll(tree, initial.drop(first.size))
+        tiers2 <- numTiers(counter)
+        values <- Future.sequence(initial.map(tree.get))
         entries <- tree.entries()
       yield
-        assert(values == keys(1 to last).map(bytesOf))
-        assert(entries == expectedEntries(keys(1 to last)))
+        assert(tiers2 == 2)
+        assert(values == initial.map(bytesOf))
+        assert(entries == expectedEntries(initial))

@@ -35,7 +35,12 @@ deployment will grow. To expand the system, add new hosts and new storage device
 
 The `<address>` argument is needed to facilitate the expansion of the system. It is combined with
 the host's `http-port` (default 4751, `--http-port`) to form the first entry in the client config's
-list of bootstrap hosts. To add a new host, copy `aspen-client-config.yaml` (see below) to the
+list of bootstrap hosts. The `<ida-type> <read-threshold> <write-threshold> <width>` arguments define
+the IDA of the bootstrap storage pool. More information on this can be found below in the section
+that describes creating new storage pools. A good general-purpose choice would be a read-threshold of
+10, a write-threshold of 12, and a width of 16.
+
+To add a new host, copy `aspen-client-config.yaml` (see below) to the
 machine to be added and invoke the `aspen add-host` command. The CLI fetches the current bootstrap
 config from one of the hosts listed in the client config and connects to the running Aspen system.
 Nothing needs to be running on the new machine yet. It'll then create the metadata for the new host
@@ -198,7 +203,7 @@ aspen add-host ~/aspen/aspen-client-config.yaml /srv/aspen/host-c host-c 10.0.0.
     --data-port 5750 --http-port 5751 --store-transfer-port 5752
 ```
 
-A new host owns no storage yet, so add at least one storage device to it (below). Then start it:
+Then start it:
 
 ```shell
 aspen host /srv/aspen/host-b --load-jars=latest
@@ -206,6 +211,9 @@ aspen host /srv/aspen/host-b --load-jars=latest
 
 The host directory holds the host's TLS private key in `aspen-host-config.yaml`, so keep it readable
 only by the account that runs the host.
+
+Note that a new host will have no storage devices when it first starts. Instructions on how to add
+them may be found below.
 
 ### Storage Device Sets
 
@@ -300,20 +308,32 @@ A storage pool is where objects are actually stored. Each pool has:
   threshold and the width is how many DataStores can be unavailable while writes keep working.
 * **A storage device set**: where the pool's DataStores live.
 
+Choosing the right IDA requires a good understanding of the IDAs TODO(Add IDA document) and the
+application's design. The chosen IDA doesn't have to be ideally matched to the initial runtime
+environment. Everything will work just fine on the bootstrap host with a single storage device.
+If in doubt, a good general-purpose IDA is ReedSolomon with a read-threshold of 10, a write-threshold 
+of 12, and a width of 16.
+
 The command is `create-pool <pool-name> <ida-type> <width> <read-threshold> <write-threshold>
 <device-set-name> [maximum-store-size]`:
 
 ```shell
 # Erasure coded across 5 SSDs: any 3 pieces rebuild an object, writes need 4
-aspen create-pool ~/aspen/aspen-client-config.yaml app-index reed-solomon 5 3 4 ssd
+aspen create-pool ~/aspen/aspen-client-config.yaml app-index reed-solomon 16 10 12 ssd
 
 # Three full copies on the HDD set
 aspen create-pool ~/aspen/aspen-client-config.yaml app-meta replication 3 2 2 hdd
 
 # Appendable, range-readable bulk data, with a soft 100 GiB per-store size limit
-aspen create-pool ~/aspen/aspen-client-config.yaml app-bulk random-access-reed-solomon 6 4 5 hdd \
-    107374182400
+aspen create-pool ~/aspen/aspen-client-config.yaml app-bulk random-access-reed-solomon 16 10 12 hdd
 ```
+
+Note that the IDA choice needs to be guided by a blend of application design choices and operational
+environment considerations. Just because the chosen IDA provides random-access-reed-solomon, an
+application won't automatically be able to take advantage of the random-access capabilities of the
+pool unless it is designed to do so. And, conversely, using a random-access-reed-solomon IDA for
+pools that will host large numbers of small objects, and KeyValue objects in particular, will almost
+always be a mistake. Make sure to read the TODO(IDA guide) to understand the tradeoffs involved.
 
 Options:
 

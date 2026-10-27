@@ -14,6 +14,11 @@ Add ability to physically move storage devices between Hosts
     - When host sees that a storage device it owns is in the ShuttingDown state:
       - Shuts stores down as if they're going to transfer out and sends gossip message
       - When all of this is complete, update the StorageDeviceState status to Shutdown
+      - Any in progress transfer-in/out attempts should be killed as the device will likely be physically removed soon
+        - messages to begin the transfer process should be ignored while the device is in the Shutdown state
+        - Double-check that attempts to start a transfer in always begin by looking up the owning hostId from
+          the StorageDeviceState as the device may be physically relocated so the hostId can change between
+          initiation attempts.
     - The host should scan it's storage devices folder every 10 seconds to look for new additions
       - If one is found, enqueue it to be loaded
       - As part of load, lookup the device's owning host. If there is a mismatch, the device has

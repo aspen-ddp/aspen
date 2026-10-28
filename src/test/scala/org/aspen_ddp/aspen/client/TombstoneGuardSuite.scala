@@ -138,7 +138,9 @@ class TombstoneGuardSuite extends IntegrationTestSuite:
     yield
       pool.stores.map(_.storageDeviceId).toSet should be(Set(net.secondDeviceId, fourth))
 
-  atest("createNewStoragePool fails with DeviceNotOperational when too few devices are operational"):
+  // A set narrower than the IDA already places several of a pool's stores on one device. With one
+  // member shut down, the operational member takes the repeats rather than the shut-down one.
+  atest("createNewStoragePool repeats an operational device rather than use a Shutdown one"):
     given ExecutionContext = executionContext
     for
       setId <- client.createStorageDeviceSet("tight-set", level = 0, parent = None)
@@ -149,8 +151,26 @@ class TombstoneGuardSuite extends IntegrationTestSuite:
       _ <- client.moveDeviceToSet(net.thirdDeviceId, setId)
       _ <- waitForTransactionsToComplete()
       _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.Shutdown))
+      poolId <- client.createNewStoragePool("tight-pool", Replication(2, 2), None, RocksDBConfig(),
+                  setId, 1_000_000L)
+      pool <- client.getStoragePoolState(poolId)
+    yield
+      pool.stores.map(_.storageDeviceId).toList should be(List(net.secondDeviceId, net.secondDeviceId))
+
+  atest("createNewStoragePool fails with DeviceNotOperational when no member device is operational"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("dark-set", level = 0, parent = None)
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.secondDeviceId, setId)
+      _ <- client.moveDeviceToSet(net.thirdDeviceId, setId)
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.secondDeviceId)(_.copy(status = DeviceStatus.ShuttingDown))
+      _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.Shutdown))
       result <- recoverToSucceededIf[AspenClient.DeviceNotOperational](
-                  client.createNewStoragePool("tight-pool", Replication(2, 2), None, RocksDBConfig(),
+                  client.createNewStoragePool("dark-pool", Replication(2, 2), None, RocksDBConfig(),
                     setId, 1_000_000L))
     yield result
 

@@ -565,3 +565,48 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
       st.stores(movingStore).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
+
+  atest("a transfer out whose store closes as its device starts shutting down does not begin"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+    val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
+    val sends = new StagedSendService
+    val host = newHost(hostRoot, transferService = sends)
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    os.makeDir.all(deviceDir / movingStore.directoryName)
+    val local = host.loadedDevices(sourceId)
+    local.loadedStores = local.loadedStores + movingStore
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      // The request passes every check and starts closing the store, which is held open.
+      transferGate = host.holdTransferOutCloses()
+      _ <- host.testingOnlyStartStoreTransferOut(StartStoreTransfer(host.hostId, client.clientId,
+             sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
+      closesRequested = host.transferOutCloses.toList
+      // The device's shutdown begins meanwhile and is held in its own close of the store. The
+      // bootstrap device holds the whole bootstrap pool, so the real request would refuse.
+      shutdownGate = host.holdShutdownCloses()
+      _ <- forceShuttingDown(sourceId)
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(host.shutdownCloses.nonEmpty)
+      // The transfer's close finishes while the shutdown runs. Its continuation is queued on the
+      // serial ExecutionContext ahead of these yields.
+      _ = transferGate.success(())
+      _ <- yieldUntil(false, 10)
+      sendsWhileShuttingDown = sends.transfersOut
+      _ = shutdownGate.success(())
+      _ <- pumpUntil(!host.loadedDevices.contains(sourceId))
+      st <- state(sourceId)
+    yield
+      closesRequested should be(List(movingStore))
+      sendsWhileShuttingDown should be(Vector())
+      sends.transfersOut should be(Vector())
+      // The shutdown marked it, as it does every store it closes.
+      os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      st.stores(movingStore).status should be(StoreStatus.TransferringOut)
+      st.status should be(DeviceStatus.Shutdown)

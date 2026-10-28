@@ -87,6 +87,17 @@ class StorageDeviceSetSelectionSuite extends AnyFunSuite with Matchers:
     val result = Await.result(set.selectDevices(1, excluded, noLookup, new Random(4)), timeout)
     result should be(List(devices(3)))
 
+  // createPool soft-excludes a shutting-down device. On a set narrower than the IDA, the other
+  // devices must take the repeats rather than the excluded one.
+  test("level 0: repeats non-excluded devices before any excluded one"):
+    val devices = List.fill(3)(dev())
+    val set = leaf(devices)
+    val excluded = devices.take(1).toSet
+    val result = Await.result(set.selectDevices(5, excluded, noLookup, new Random(8)), timeout)
+    result.length should be(5)
+    result.toSet should be(devices.drop(1).toSet)
+    result.groupBy(identity).view.mapValues(_.size).values.toList.sorted should be(List(2, 3))
+
   test("level 0: falls back to a duplicate when all devices are excluded"):
     val devices = List.fill(3)(dev())
     val set = leaf(devices)

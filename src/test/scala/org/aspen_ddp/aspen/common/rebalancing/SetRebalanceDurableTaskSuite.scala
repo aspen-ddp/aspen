@@ -232,6 +232,22 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase:
     yield
       phase should be(SetRebalanceDurableTask.Phase.InFlight)
 
+  atest("classify treats a store that landed Offline on a shutting-down destination as Completed"):
+    given ExecutionContext = executionContext
+    val s0 = storeId(0)
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      // What updateStateForTransferredStore leaves when the destination was asked to shut down
+      // while the bytes were in flight: the source no longer lists the store, and the
+      // destination's entry is Offline rather than Active.
+      _ <- updateDevice(net.thirdDeviceId)(st =>
+             st.setStoreEntry(s0, StorageDeviceState.StoreStatus.Offline, None)
+               .copy(status = StorageDeviceState.DeviceStatus.ShuttingDown))
+      phase <- SetRebalanceDurableTask.classify(client, (s0, net.secondDeviceId, net.thirdDeviceId))
+    yield
+      phase should be(SetRebalanceDurableTask.Phase.Completed)
+
   // ---- Device death mid-transfer, through the real FailedStorageDeviceDurableTask ------
 
   /** The TransferringIn and TransferringOut entries on `deviceId`: the halves of transfers. */

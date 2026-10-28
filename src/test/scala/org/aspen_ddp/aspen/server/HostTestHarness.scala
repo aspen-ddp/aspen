@@ -482,6 +482,22 @@ private class RecordingHost(mgrClient: AspenClient,
       shutdownCloses += storeId
     shutdownCloseGate.get.map(_.future).getOrElse(Future.unit)
 
+  /** Every store closeStoreForTransferOut was called for, in call order. Lazy, as above. */
+  lazy val transferOutCloses: mutable.ListBuffer[StoreId] = mutable.ListBuffer[StoreId]()
+
+  private lazy val transferOutCloseGate = new AtomicReference[Option[Promise[Unit]]](None)
+
+  /** Holds every later transfer-out close open until the returned promise is completed. */
+  def holdTransferOutCloses(): Promise[Unit] =
+    val p = Promise[Unit]()
+    transferOutCloseGate.set(Some(p))
+    p
+
+  override protected def closeStoreForTransferOut(storeId: StoreId): Future[Unit] =
+    synchronized:
+      transferOutCloses += storeId
+    transferOutCloseGate.get.map(_.future).getOrElse(super.closeStoreForTransferOut(storeId))
+
   /** Every outcome completeDeviceShutdown returned, in order. Lazy, as above. */
   lazy val shutdownOutcomes: mutable.ListBuffer[ShutdownOutcome] = mutable.ListBuffer[ShutdownOutcome]()
 
@@ -516,10 +532,12 @@ private class RecordingHost(mgrClient: AspenClient,
   /** (deviceId, previousHostId) for every adoptDevice call, in order. Lazy, as above. */
   lazy val adoptCalls: mutable.ListBuffer[(StorageDeviceId, HostId)] = mutable.ListBuffer[(StorageDeviceId, HostId)]()
 
-  override protected def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId): Future[Boolean] =
+  override protected def adoptDevice(storageDeviceId: StorageDeviceId,
+                                     previousHostId: HostId,
+                                     devicePath: os.Path): Future[Host.AdoptOutcome] =
     synchronized:
       adoptCalls += ((storageDeviceId, previousHostId))
-    super.adoptDevice(storageDeviceId, previousHostId)
+    super.adoptDevice(storageDeviceId, previousHostId, devicePath)
 
   /** Installs `sds` in the protected device map without it ever having been on disk.
    *

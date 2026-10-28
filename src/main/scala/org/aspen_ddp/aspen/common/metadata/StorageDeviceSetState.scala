@@ -119,8 +119,8 @@ final case class StorageDeviceSetState(
    *
    *  Level-0 sets draw from their member devices. Level-1+ sets distribute the
    *  request evenly across their member sets and recurse. `rng` is injectable so
-   *  tests can be deterministic. `exclude` devices are soft-excluded: chosen only once every
-   *  other device has been.
+   *  tests can be deterministic. `exclude` devices are soft-excluded: at level 0 one is chosen
+   *  only when every member device is excluded; the others are repeated first.
    */
   def selectDevicesForPool(
       numStores: Int,
@@ -263,9 +263,12 @@ final case class StorageDeviceSetState(
     else
       val shuffled = rng.shuffle(memberDevices)
       val preferred = shuffled.filterNot(exclude.contains)
-      // Once the preferred devices run out, excluded ones are used before any is repeated.
-      val excluded = shuffled.filter(exclude.contains)
-      val ordered = preferred.iterator ++ Iterator.continually(if excluded.nonEmpty then excluded else shuffled).flatten
+      // Once the preferred devices run out they are repeated, in the same order; an excluded
+      // device is named only when every member is excluded. Exclusion is soft so that a set
+      // narrower than the request still fills it, and repeating the preferred ones is what keeps
+      // a soft-excluded device -- one shutting down, at createPool -- out of a set that has
+      // other devices to repeat.
+      val ordered = preferred.iterator ++ Iterator.continually(if preferred.nonEmpty then preferred else shuffled).flatten
       Future.successful(ordered.take(numStores).toList)
 
   private def selectFromSets(

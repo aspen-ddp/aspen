@@ -41,7 +41,12 @@ object SetRebalanceDurableTask:
     yield
       val dstEntry = dst.stores.get(storeId)
       val srcEntry = src.stores.get(storeId)
-      if dstEntry.exists(_.status == StorageDeviceState.StoreStatus.Active) && srcEntry.isEmpty then
+      // Offline counts as arrived: a transfer that finishes onto a destination asked to shut down
+      // writes its entry Offline, not Active (Host.updateStateForTransferredStore). The store has
+      // moved, and planning it again would move it a second time.
+      if srcEntry.isEmpty && dstEntry.exists(e =>
+           e.status == StorageDeviceState.StoreStatus.Active ||
+           e.status == StorageDeviceState.StoreStatus.Offline) then
         Phase.Completed
       else if dstEntry.exists(_.status == StorageDeviceState.StoreStatus.TransferringIn) ||
               srcEntry.exists(_.status == StorageDeviceState.StoreStatus.TransferringOut) then

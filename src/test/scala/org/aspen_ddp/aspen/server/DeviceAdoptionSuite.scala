@@ -1,6 +1,8 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.Transaction
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StartStoreTransfer, StoreMoved}
@@ -525,3 +527,104 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       firstAsk.toHost should be(oldHostId)
       retried.map(_.toHost) should be(List(HostId.BootstrapHostId))
       sends.transfersOut.map(_._1) should be(Vector(s0))
+
+  /** A carried deviceA with Offline entries for `stores`, found by a scan whose lookup returns
+   *  the state as it was before the last of them was added: the adoption must act on the state
+   *  it re-reads, not on that one. `closeLast` decides whether the last store's directory was
+   *  closed cleanly. */
+  private def adoptWithStaleLookup(closeLast: Boolean): Future[(RecordingHost, os.Path, List[StoreId])] =
+    given ExecutionContext = executionContext
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
+                  Map(ss(0) -> offline, ss(1) -> offline)
+      List(s0, s1) = stores: @unchecked
+      current <- state(deviceA)
+      hostRoot = newHostDir()
+      host = newHost(hostRoot)
+      deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = Some(oldHostId))
+      _ = DeviceMarkers.writeShutdownState(deviceDir, oldHostId)
+      _ = writeClosedStore(deviceDir, s0)
+      _ = if closeLast then writeClosedStore(deviceDir, s1)
+      lookup = host.armLookup(deviceA)
+      _ = net.takeCapturedGossip()
+      _ = host.testingOnlyScanDevices()
+      _ = lookup.success(current.copy(stores = current.stores - s1))
+      _ <- resolve(host)
+    yield (host, deviceDir, stores)
+
+  atest("adoption re-validates the Offline stores of the state it re-reads"):
+    given ExecutionContext = executionContext
+    for
+      (host, deviceDir, stores) <- adoptWithStaleLookup(closeLast = false)
+      st <- state(deviceA)
+    yield
+      host.adoptCalls.toList should be(List((deviceA, oldHostId)))
+      st.status should be(DeviceStatus.Shutdown)
+      st.hostId should be(oldHostId)
+      st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Offline))
+      host.loadedDevices.contains(deviceA) should be(false)
+      host.deviceDirWarnings.count(_._1 == deviceDir) should be(1)
+      DeviceMarkers.readShutdownState(deviceDir) should be(Some(oldHostId))
+
+  atest("adoption brings into service the stores of the state it committed"):
+    given ExecutionContext = executionContext
+    for
+      (host, deviceDir, stores) <- adoptWithStaleLookup(closeLast = true)
+      st <- state(deviceA)
+    yield
+      st.status should be(DeviceStatus.Operational)
+      st.stores.values.map(_.status).toSet should be(Set(StoreStatus.Active))
+      host.loadedDevices.contains(deviceA) should be(true)
+      stores.map(s => os.exists(marker(deviceDir / s.directoryName))) should be(List(false, false))
+      storeMoves().map(_.storeId).toSet should be(stores.toSet)
+
+  atest("adopting a device holding bootstrap-pool stores rewrites the bootstrap config for them only"):
+    given ExecutionContext = executionContext
+    val kept = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+    val moved = List(StoreId(PoolId.BootstrapPoolId, 1.toByte), StoreId(PoolId.BootstrapPoolId, 2.toByte))
+    def parse(yaml: String) = BootstrapConfig.parseBootstrapConfig(yaml)
+    def storesOn(cfg: BootstrapConfig.Config, h: HostId) = cfg.hosts.find(_.hostId == h).map(_.stores.toSet)
+    for
+      _ <- client.createHost("old-host", "10.0.0.9", 5750, 5751, 5752, oldHostId)
+      _ <- net.createDevice(deviceA)
+      // Two of the bootstrap pool's three stores live on deviceA under the old host, and the
+      // radicle's bootstrap config says so, as the transfers that put them there would have left it.
+      _ <- client.transactUntilSuccessful: tx =>
+             given Transaction = tx
+             for
+               ptr <- client.getStoragePoolPointer(PoolId.BootstrapPoolId)
+               kvos <- client.read(ptr)
+               cfg = StoragePoolState(kvos)
+               _ = moved.foreach(s => cfg.stores(s.poolIndex) = StoragePoolState.StoreEntry(oldHostId, deviceA))
+               _ <- BootstrapConfig.prepRadicleUpdate(client, moved.head, cfg, oldHostId)
+             yield
+               tx.update(ptr, None, None,
+                 List(KeyRevision(StoragePoolState.ConfigKey, kvos.contents(StoragePoolState.ConfigKey).revision)),
+                 List(Insert(StoragePoolState.ConfigKey, cfg.encode())))
+      _ <- setDeviceState(deviceA)(_.copy(hostId = oldHostId, status = DeviceStatus.Shutdown,
+                                          stores = moved.map(_ -> offline).toMap))
+      _ <- addToHost(oldHostId, deviceA)
+      _ <- waitForTransactionsToComplete()
+      before <- client.getBootstrapConfig().map(parse)
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      _ = moved.foreach(writeClosedStore(deviceDir, _))
+      host = newHost(hostRoot)
+      _ <- resolve(host)
+      st <- state(deviceA)
+      after <- client.getBootstrapConfig().map(parse)
+      pool <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield
+      st.status should be(DeviceStatus.Operational)
+      storesOn(before, oldHostId) should be(Some(moved.toSet))
+      storesOn(before, HostId.BootstrapHostId) should be(Some(Set(kept)))
+      // Both moved stores now name the adopting host; the old host, left with none, is gone.
+      storesOn(after, HostId.BootstrapHostId) should be(Some(Set(kept) ++ moved))
+      after.hosts.map(_.hostId) should be(List(HostId.BootstrapHostId))
+      // Nothing else changed: the adopting host's own entry, the IDA, the system id, the CA.
+      after.hosts.head.copy(stores = Nil) should be(
+        before.hosts.find(_.hostId == HostId.BootstrapHostId).get.copy(stores = Nil))
+      after.bootstrapIDA should be(before.bootstrapIDA)
+      after.aspenSystemId should be(before.aspenSystemId)
+      after.caCertificate should be(before.caCertificate)
+      pool.stores.toList.map(_.hostId) should be(List.fill(3)(HostId.BootstrapHostId))
+      pool.stores(kept.poolIndex).storageDeviceId should be(StorageDeviceId.BootstrapStorageDeviceId)

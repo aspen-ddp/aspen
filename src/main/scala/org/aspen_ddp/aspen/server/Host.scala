@@ -157,6 +157,19 @@ object Host:
     case Cancelled
 
 
+  /** What adoptDevice decided, from the device state it re-read inside its transaction. */
+  private[aspen] enum AdoptOutcome:
+    /** Committed. `state` is exactly what was written, for the post-commit steps to act on. */
+    case Adopted(state: StorageDeviceState)
+
+    /** The device is no longer Shutdown and owned by the previous host. Nothing was written. */
+    case Changed
+
+    /** These Offline stores were not closed cleanly on disk (closedForAdoption). Nothing was
+     *  written. */
+    case Unclean(stores: List[StoreId])
+
+
   class IOHandler(host: Host) extends CompletionHandler:
     override def complete(op: Completion): Unit =
       host.events.add(IOCompletion(op))
@@ -668,42 +681,53 @@ class Host(val client: AspenClient,
                              state: StorageDeviceState,
                              previousHostId: HostId): Unit =
     val deviceId = sdCfg.storageDeviceId
-    val unclean = state.stores.collect {
-      case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Offline &&
-                               !closedForAdoption(storeId, path / storeId.directoryName) => storeId
-    }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+    // Checked here as well as inside adoptDevice, against the looked-up state, so a device that
+    // is plainly not ready costs no transaction. The check that counts is adoptDevice's own.
+    val unclean = uncleanStores(path, state)
 
     if unclean.nonEmpty then
-      warnOnce(path, s"Storage device $deviceId at $path was shut down by host $previousHostId, but " +
-                     s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory, " +
-                     s"transfer-out marker, or intact CRL save file). Not adopting it. It may have been " +
-                     s"removed too early: return it to that host to finish the shutdown")
+      warnUnclean(path, deviceId, previousHostId, unclean)
     else
       logger.info(s"Adopting storage device $deviceId at $path, shut down by host $previousHostId")
       pendingMarkerResolutions += path
       val fadopt =
-        try adoptDevice(deviceId, previousHostId)
+        try adoptDevice(deviceId, previousHostId, path)
         catch case t: Throwable => Future.failed(t)
       fadopt.onComplete: result =>
         synchronized:
           pendingMarkerResolutions -= path
           result match
-            case Success(true) =>
-              // What adoptDevice wrote, without a re-read: the rows it changed are exactly these.
-              val adopted = state.withOfflineStoresActive.copy(
-                hostId = hostId, status = StorageDeviceState.DeviceStatus.Operational)
-              try bringIntoService(path, sdCfg, adopted, rewriteOwner = true)
+            case Success(AdoptOutcome.Adopted(committed)) =>
+              try bringIntoService(path, sdCfg, committed, rewriteOwner = true)
               catch case t: Throwable =>
                 // The adoption is committed, so the next scan reaching this directory takes the
                 // "Operational, owned here" row and runs these steps again.
                 logger.error(s"Adopted storage device $deviceId but failed to load it from $path. " +
                              s"Will retry on the next scan. Error: $t")
-            case Success(false) =>
+            case Success(AdoptOutcome.Changed) =>
               logger.info(s"Storage device $deviceId changed state before it could be adopted. " +
                           s"The next scan will look at it again")
+            case Success(AdoptOutcome.Unclean(stores)) =>
+              warnUnclean(path, deviceId, previousHostId, stores)
             case Failure(t) =>
               warnOnce(path, s"Failed to adopt storage device $deviceId at $path. Will retry on the " +
                              s"next scan. Error: $t")
+
+  /** The Offline entries of `state` whose directories under `path` were not closed cleanly. */
+  private def uncleanStores(path: os.Path, state: StorageDeviceState): List[StoreId] =
+    state.stores.collect {
+      case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Offline &&
+                               !closedForAdoption(storeId, path / storeId.directoryName) => storeId
+    }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+
+  private def warnUnclean(path: os.Path,
+                          deviceId: StorageDeviceId,
+                          previousHostId: HostId,
+                          unclean: List[StoreId]): Unit =
+    warnOnce(path, s"Storage device $deviceId at $path was shut down by host $previousHostId, but " +
+                   s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory, " +
+                   s"transfer-out marker, or intact CRL save file). Not adopting it. It may have been " +
+                   s"removed too early: return it to that host to finish the shutdown")
 
   /** The local half of a restart or adoption, once `state` -- Operational and owned by this host
    *  -- has committed. Each step is idempotent, so a crash between any two of them is finished by
@@ -1616,14 +1640,21 @@ class Host(val client: AspenClient,
         if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
           // A retransmitted request finds the store already closed, and its going offline already gossiped
           val wasLoaded = stores.contains(m.storeId)
-          val fclosed = stores.get(m.storeId) match
-            case None => Future.unit
-            case Some(_) => closeStore(m.storeId)
+          val fclosed = closeStoreForTransferOut(m.storeId)
 
           fclosed.foreach: _ =>
             synchronized {
               val storePath = sourceDs.devicePath / m.storeId.directoryName
-              try
+              // Checked again now the close is done: a shutdown that began during it has already
+              // run stopDeviceWork, which found no send to cancel, so a send begun here would run
+              // on a device being shelved. The store is left closed and unmarked, which the
+              // shutdown's closeStoresForShutdown picks up and marks like its own. A device
+              // unloaded meanwhile -- its shutdown already finished -- is not ours to send from.
+              if shuttingDownDevices.contains(sourceDs.storageDeviceId) ||
+                 !storageDevices.get(sourceDs.storageDeviceId).contains(sourceDs) then
+                logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
+                            s"${sourceDs.storageDeviceId} began shutting down while the store closed")
+              else try
                 // Written before archiving, so it travels with the store and keeps this copy
                 // offline across restarts until the transfer is resolved one way or the other.
                 DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile,
@@ -2007,8 +2038,12 @@ class Host(val client: AspenClient,
    *  - for a bootstrap-pool store, the bootstrap config in the radicle, as a transfer does.
    *
    *  Every object written carries a KeyRevision, so a restart on the old host or a second
-   *  adopter racing this one makes one of them lose and re-read. Returns false, writing nothing,
-   *  when the re-read finds the device no longer Shutdown and owned by `previousHostId`. The
+   *  adopter racing this one makes one of them lose and re-read. Returns Changed, writing nothing,
+   *  when the re-read finds the device no longer Shutdown and owned by `previousHostId`, and
+   *  Unclean, writing nothing, when an Offline entry of the re-read state has a directory under
+   *  `devicePath` that was not closed cleanly: the state validated is the state committed, so an
+   *  entry gone Offline since the caller's lookup is checked too. Adopted carries the state
+   *  written, which the post-commit steps act on. The
    *  previous host's HostState is skipped if that host has no entry in the hosts tree: it was
    *  removed, and there is nothing left to take the device out of.
    *
@@ -2017,7 +2052,9 @@ class Host(val client: AspenClient,
    *
    *  protected so a test subclass can record the calls.
    */
-  protected def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId): Future[Boolean] =
+  protected def adoptDevice(storageDeviceId: StorageDeviceId,
+                            previousHostId: HostId,
+                            devicePath: os.Path): Future[AdoptOutcome] =
     import StorageDeviceState.DeviceStatus
 
     case class PoolUpdate(pointer: KeyValueObjectPointer, kvos: KeyValueObjectState, config: StoragePoolState)
@@ -2045,9 +2082,12 @@ class Host(val client: AspenClient,
         devPtr <- client.getStorageDevicePointer(storageDeviceId)
         devKvos <- client.read(devPtr)
         state = StorageDeviceState(devKvos)
+        unclean = uncleanStores(devicePath, state)
         adopted <-
           if state.status != DeviceStatus.Shutdown || state.hostId != previousHostId then
-            Future.successful(false)
+            Future.successful(AdoptOutcome.Changed)
+          else if unclean.nonEmpty then
+            Future.successful(AdoptOutcome.Unclean(unclean))
           else
             // Pool entries are rewritten before prepRadicleUpdate reads them, so its store map
             // names this host for every moved bootstrap store, not only the one it is given.
@@ -2092,7 +2132,7 @@ class Host(val client: AspenClient,
 
               tx.result.foreach: _ =>
                 logger.info(s"Adopted storage device $storageDeviceId from host $previousHostId")
-              true
+              AdoptOutcome.Adopted(newState)
       yield adopted
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
@@ -2117,6 +2157,11 @@ class Host(val client: AspenClient,
    *  not to start anything. */
   protected def readTransferSourceState(fromDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     client.getStorageDeviceState(fromDeviceId)
+
+  /** Takes a store out of service for a transfer out: closeStore if it is open, else nothing. A
+   *  seam so a test can hold the close open. Caller holds the instance lock. */
+  protected def closeStoreForTransferOut(storeId: StoreId): Future[Unit] =
+    if stores.contains(storeId) then closeStore(storeId) else Future.unit
 
   /** Takes one store out of service for a device shutdown. The default is closeStore, which saves
    *  the store's CRL state beside it. A seam so a test can hold a close open, and count closes,

@@ -512,6 +512,23 @@ class StoreTransferManagerSuite extends AnyFunSuite with Matchers with BeforeAnd
     drain(r.connections.head._1) should be < (32L * 1024 * 1024)
     a.isTransferringOut(sid) should be(true)
 
+  test("cancelTransferOut aborts an active send"):
+    val a = newManager(ioTimeout = 30.seconds)
+    val b = newManager()
+    val sid = newStoreId()
+    val u = UUID.randomUUID()
+    val f = b.beginTransferIn(sid, u, tempDir())
+    a.beginTransferOut(sid, u, bigTree(), "127.0.0.1", b.boundPort, HLCTimestamp.now)
+    eventually { a.isTransferringOut(sid) should be(true) }
+    a.cancelTransferOut(sid)
+    a.isTransferringOut(sid) should be(false)
+    await(f).isFailure should be(true)
+
+  test("cancelTransferOut with no active send does nothing"):
+    val a = newManager()
+    a.cancelTransferOut(newStoreId())
+    a.transferringOutStores should be(Set.empty)
+
   test("same or older timestamp is ignored after completion"):
     val a = newManager()
     val b = newManager()

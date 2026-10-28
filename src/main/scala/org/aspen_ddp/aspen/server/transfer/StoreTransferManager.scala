@@ -172,6 +172,13 @@ class StoreTransferManager(port: Int,
       t.setDaemon(true)
       t.start()
 
+  def cancelTransferOut(storeId: StoreId): Unit =
+    val out = synchronized:
+      val o = active.get(storeId)
+      active -= storeId
+      o
+    out.foreach(abortOutbound(_, "cancelled"))
+
   def isTransferringOut(storeId: StoreId): Boolean = synchronized(active.contains(storeId))
 
   def transferringOutStores: Set[StoreId] = synchronized(active.keySet)

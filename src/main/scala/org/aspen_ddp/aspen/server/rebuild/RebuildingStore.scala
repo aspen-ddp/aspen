@@ -29,6 +29,9 @@ object RebuildingStore:
   /** Length of an allocation-tree key that names an object: the raw bytes of an ObjectId. */
   val ObjectIdKeyLength: Int = 16
 
+  /** The failure of a rebuild stopped by `cancel()`. */
+  case class RebuildCancelled(storeId: StoreId) extends Exception(s"Rebuild of $storeId was cancelled")
+
 
 /** Reconstructs one store by walking its pool's allocation tree, reading each object through
  *  the client, and writing this store's slice of it into a fresh backend.
@@ -48,7 +51,8 @@ class RebuildingStore(client: AspenClient,
                       testingOnlyFailKeys: Set[Key] = Set(),
                       testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
                       testingOnlyTrackRestoredKeys: Boolean = false,
-                      maxFailedObjects: Int = RebuildState.MaxFailedObjects) extends StoreRebuild with Logging:
+                      maxFailedObjects: Int = RebuildState.MaxFailedObjects,
+                      testingOnlyOnRestored: () => Unit = () => ()) extends StoreRebuild with Logging:
 
   import RebuildingStore.*
 
@@ -85,6 +89,13 @@ class RebuildingStore(client: AspenClient,
    *  retryFailures() and finish() run, leaving the checkpoint in staging so the next device
    *  check resumes. */
   private var abortCause: Option[Throwable] = None
+
+  /** Latches `RebuildCancelled` as the abort cause, so the rest of the walk is a no-op and the
+   *  pass fails with the checkpoint left in staging, exactly as for any other fatal condition. */
+  def cancel(): Unit =
+    synchronized:
+      if abortCause.isEmpty then
+        abortCause = Some(RebuildCancelled(storeId))
 
   // Key's equality is not something to bet a test seam on; compare the bytes directly.
   // Declared here, before start(), so it is initialized before the walk begins.
@@ -306,6 +317,7 @@ class RebuildingStore(client: AspenClient,
         false
 
     if checkpointNow then checkpointBestEffort("during the walk")
+    testingOnlyOnRestored()
     Future.unit
 
   private def recordFailure(objectId: ObjectId, err: Throwable): Future[Unit] =

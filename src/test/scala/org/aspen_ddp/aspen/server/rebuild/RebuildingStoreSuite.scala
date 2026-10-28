@@ -294,6 +294,35 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // Recorded as one more failed object, subject to the existing cap and retry machinery.
       RebuildState.load(staging).get.failedObjects should be(List(bogusId))
 
+  atest("cancel stops a rebuild and leaves its checkpoint for resumption"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    var rebuildRef: RebuildingStore = null
+    var restored = 0
+    for
+      _ <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      // Cancelled from inside the walk, after a checkpoint has been written, so the cancel
+      // cannot race the walk finishing.
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+                                    checkpointInterval = 2,
+                                    testingOnlyOnRestored = () =>
+                                      restored += 1
+                                      if restored == 5 then rebuildRef.cancel())
+      _ = rebuildRef = rebuild
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+      // What the cancelled pass left behind, before a new one resumes from it
+      checkpointed = RebuildState.load(staging).isDefined
+      placed = os.exists(dev / storeId.directoryName)
+      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev)
+      _ <- resumed.complete
+    yield
+      outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
+      checkpointed should be(true)
+      placed should be(false)
+      os.exists(dev / storeId.directoryName) should be(true)
+
   atest("out of space fails the pass with empty failedObjects proving the latch alone stopped it"):
     given ExecutionContext = executionContext
     val dev = deviceDir()

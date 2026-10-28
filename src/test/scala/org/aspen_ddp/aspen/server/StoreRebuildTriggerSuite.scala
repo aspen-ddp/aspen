@@ -19,6 +19,8 @@ private class RecordedRebuild(val storeId: StoreId,
                               val storageDeviceId: StorageDeviceId) extends StoreRebuild:
   val promise: Promise[Unit] = Promise()
   def complete: Future[Unit] = promise.future
+  @volatile var cancelled: Boolean = false
+  def cancel(): Unit = cancelled = true
 
 private class RecordingRebuildFactory extends StoreRebuildFactory:
   val created: mutable.ListBuffer[RecordedRebuild] = mutable.ListBuffer()

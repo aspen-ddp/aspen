@@ -74,6 +74,8 @@ private class StagedTransferService extends StoreTransferService:
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
     throw new UnsupportedOperationException("StagedTransferService does not send stores")
 
+  def cancelTransferOut(storeId: StoreId): Unit = ()
+
   def isTransferringOut(storeId: StoreId): Boolean = false
 
   def transferringOutStores: Set[StoreId] = Set.empty
@@ -103,6 +105,8 @@ private class StagedSendService extends StoreTransferService:
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit = synchronized:
     begun :+= (storeId, transferUUID)
     sending += storeId
+
+  def cancelTransferOut(storeId: StoreId): Unit = endTransferOut(storeId)
 
   def isTransferringOut(storeId: StoreId): Boolean = synchronized(sending.contains(storeId))
 

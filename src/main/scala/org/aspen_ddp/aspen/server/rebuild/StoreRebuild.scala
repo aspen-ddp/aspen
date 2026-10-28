@@ -16,6 +16,11 @@ trait StoreRebuild:
   val storeId: StoreId
   def complete: Future[Unit]
 
+  /** Stops the rebuild, leaving its staging directory and checkpoint in place as a crash would
+   *  so a later rebuild resumes. `complete` then fails with `RebuildingStore.RebuildCancelled`
+   *  (unless it had already finished). */
+  def cancel(): Unit
+
 /** Constructs a store rebuild. The default `Filesystem` factory produces the real
  *  implementation. Tests inject a factory that records the request and resolves on command. */
 trait StoreRebuildFactory:

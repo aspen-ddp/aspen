@@ -38,6 +38,9 @@ trait StoreTransferService:
   def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit
 
+  /** Aborts the active send of `storeId`, if any. It is no longer transferring out afterwards. */
+  def cancelTransferOut(storeId: StoreId): Unit
+
   def isTransferringOut(storeId: StoreId): Boolean
 
   def transferringOutStores: Set[StoreId]
@@ -54,6 +57,8 @@ object StoreTransferService:
     def beginTransferOut(storeId: StoreId, transferUUID: UUID, sourceDirectory: os.Path,
                          destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
       logger.warn(s"Store transfer is disabled on this host. Ignoring transfer out of store $storeId")
+
+    def cancelTransferOut(storeId: StoreId): Unit = ()
 
     def isTransferringOut(storeId: StoreId): Boolean = false
 

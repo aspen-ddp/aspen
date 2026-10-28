@@ -248,6 +248,15 @@ class MainSuite extends AnyFunSuite with Matchers:
     parseGroup("g", "0", "bogus", "3", "2", "2") shouldBe None
     parseGroup("g", "0", "reed-solomon", "5", "2", "4") shouldBe None  // read threshold not a majority
 
+  for cmd <- List("shutdown-device", "restart-device") do
+    test(s"$cmd parses a device UUID"):
+      withTempDir("parse-device"): dir =>
+        val cfgs = emptyFile(dir / "bootstrap.yaml")
+        val id = UUID.randomUUID().toString
+        val parsed = Main.buildParser.parse(Seq(cmd, cfgs, id), Main.Args())
+          .getOrElse(fail(s"$cmd did not parse"))
+        parsed.deviceId shouldBe id
+
   // The host command reads both files out of the host directory rather than taking the
   // bootstrap config on the command line, so bootstrap must leave both of them behind.
   test("bootstrap writes host and bootstrap config files into the host directory"):

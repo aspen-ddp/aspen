@@ -756,6 +756,8 @@ object Main {
     Command("add-group-to-group", "Nests one allocation group inside another", addGroupToGroupArgs),
     Command("move-device-to-set", "Moves a storage device into a different level-0 device set", moveDeviceToSetArgs),
     Command("fail-storage-device", "Declares a storage device dead and rebuilds its stores elsewhere", failStorageDeviceArgs),
+    Command("shutdown-device", "Shuts down a storage device so that its disk may be moved to another host", failStorageDeviceArgs),
+    Command("restart-device", "Returns a shut down storage device to service", failStorageDeviceArgs),
     Command("add-host", "Registers a new host and initializes its root directory", addHostArgs),
     Command("create-storage-device", "Registers a new storage device on a host", createStorageDeviceArgs),
     Command("transfer-store", "Transfers a store to a different storage device", transferStoreArgs),
@@ -900,6 +902,8 @@ object Main {
             case "add-group-to-group" => add_group_to_group(session, cfg.srcGroupName, cfg.newGroupName)
             case "move-device-to-set" => move_device_to_set(session, cfg.deviceId, cfg.deviceSetName)
             case "fail-storage-device" => fail_storage_device(session, cfg.deviceId)
+            case "shutdown-device" => shutdown_device(session, cfg.deviceId)
+            case "restart-device" => restart_device(session, cfg.deviceId)
             case "add-host" => add_host(session,
                                         cfg.hostDirectory, cfg.hostName, cfg.address,
                                         cfg.dataPort, cfg.httpPort, cfg.storeTransferPort)
@@ -1825,6 +1829,54 @@ object Main {
         println(s"  show-device <client-config-file> $deviceIdStr")
       case Failure(err) => reportError(err)
   }
+
+  private def changeDeviceStatus(session: ClientSession,
+                                 deviceIdStr: String,
+                                 verb: String,
+                                 change: (AspenClient, StorageDeviceId) => Future[Unit])
+                                (onSuccess: StorageDeviceState => Unit): Int = {
+
+    configureLogging()
+
+    val (client, network, _) = createAspenClient(session)
+
+    network.startIoThread(client)
+
+    given ExecutionContext = client.clientContext
+
+    val deviceId = StorageDeviceId(UUID.fromString(deviceIdStr))
+
+    val f = change(client, deviceId).flatMap(_ => client.getStorageDeviceState(deviceId))
+
+    // getStorageDevicePointer throws NoSuchElementException for an unknown id
+    def reportError(cause: Throwable): Unit = cause match
+      case _: NoSuchElementException =>
+        println(s"Error: storage device '$deviceIdStr' not found")
+      case _: AspenClient.DeviceFailed =>
+        println(s"Error: storage device '$deviceIdStr' has been declared failed")
+      case e =>
+        println(s"Error trying to $verb storage device: ${e.getMessage}")
+
+    awaitAndReport(f):
+      case Success(state) =>
+        println(s"Storage device '$deviceIdStr' status: ${state.status}")
+        onSuccess(state)
+        println("Watch progress with:")
+        println(s"  show-device <client-config-file> $deviceIdStr")
+        println("The command is idempotent. If the status does not progress, run it again.")
+      case Failure(err) => reportError(err)
+  }
+
+  def shutdown_device(session: ClientSession,
+                      deviceIdStr: String): Int =
+    changeDeviceStatus(session, deviceIdStr, "shut down", _.shutdownStorageDevice(_)): _ =>
+      println("The host closes the device's stores, then the status becomes Shutdown.")
+      println("The disk may be removed once the status reads Shutdown.")
+
+  def restart_device(session: ClientSession,
+                     deviceIdStr: String): Int =
+    changeDeviceStatus(session, deviceIdStr, "restart", _.restartStorageDevice(_)): _ =>
+      println("The host reopens the device's stores and the status becomes Operational.")
 
   def migrate_pool(session: ClientSession,
                    poolRef: String,

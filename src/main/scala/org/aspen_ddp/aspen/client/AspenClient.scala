@@ -538,6 +538,56 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       nudges.foreach(sendBestEffortHostMessage)
       nudges.nonEmpty
 
+  /** Requests a planned shutdown of the device: every Active store becomes Offline and the device
+   *  ShuttingDown. The owning host does the rest and moves the device to Shutdown once its stores
+   *  are closed. Idempotent: on a device already ShuttingDown or Shutdown nothing is written, but
+   *  the nudge is still sent so that a host that missed it can catch up. Fails with `DeviceFailed`
+   *  for a tombstoned device.
+   */
+  def shutdownStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
+    changeDeviceStatus(deviceId): state =>
+      state.status match
+        case StorageDeviceState.DeviceStatus.Operational =>
+          Some(state.withActiveStoresOffline.copy(status = StorageDeviceState.DeviceStatus.ShuttingDown))
+        case _ => None
+
+  /** Reverses `shutdownStorageDevice`: Offline stores become Active and the device Operational.
+   *  Idempotent in the same way: on an Operational device nothing is written but the nudge is
+   *  still sent. Fails with `DeviceFailed` for a tombstoned device.
+   */
+  def restartStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
+    changeDeviceStatus(deviceId): state =>
+      state.status match
+        case StorageDeviceState.DeviceStatus.Operational => None
+        case _ =>
+          Some(state.withOfflineStoresActive.copy(status = StorageDeviceState.DeviceStatus.Operational))
+
+  private def changeDeviceStatus(deviceId: StorageDeviceId)
+                                (change: StorageDeviceState => Option[StorageDeviceState]): Future[Unit] =
+    given ExecutionContext = this.clientContext
+
+    // As in abortStoreTransfer: only a collision is retried, and the nudge is built inside the
+    // transaction but sent after commit so a retried attempt cannot double-send.
+    val fNudge: Future[CheckStorageDevice] = transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+      given Transaction = tx
+
+      for
+        devPtr <- getStorageDevicePointer(deviceId)
+        kvos <- read(devPtr)
+      yield
+        val state = StorageDeviceState(kvos)
+        if state.isFailed then
+          throw StopRetrying(AspenClient.DeviceFailed(deviceId))
+
+        change(state).foreach: newState =>
+          tx.update(devPtr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey, newState.encode())))
+
+        CheckStorageDevice(state.hostId, clientId, deviceId)
+
+    fNudge.map(sendBestEffortHostMessage)
+
   def getBootstrapConfig(): Future[String] =
     given ExecutionContext = this.clientContext
 

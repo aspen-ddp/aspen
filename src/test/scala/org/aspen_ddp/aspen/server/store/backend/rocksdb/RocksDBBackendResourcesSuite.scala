@@ -1,6 +1,6 @@
-package org.aspen_ddp.aspen.server.store.backend
+package org.aspen_ddp.aspen.server.store.backend.rocksdb
 
-import org.aspen_ddp.aspen.server.store.backend.RocksDBBackend.ResourceConfig
+import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend.ResourceConfig
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 

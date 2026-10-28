@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
 import org.aspen_ddp.aspen.common.util.physicalMemory
 import org.aspen_ddp.aspen.server.HostConfig
-import org.aspen_ddp.aspen.server.store.backend.RocksDBBackend
+import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
 import java.util.UUID
 

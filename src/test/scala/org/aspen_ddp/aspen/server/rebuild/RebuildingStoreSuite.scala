@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId, 
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
-import org.aspen_ddp.aspen.server.store.backend.BufferedConsistentRocksDB
+import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksDB
 
 import java.nio.ByteBuffer
 import java.util.UUID

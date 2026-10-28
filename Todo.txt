@@ -1,9 +1,6 @@
 TODO
 ====
 
-move store.backend.BufferredConsistentRocksDB and store.backend.RocksDBBackend to dedicated store.backend.rocksdb
-package
-
 Add ability to physically move storage devices between Hosts
   - Add StorageDeviceState.StoreState.Offline enum value
   - Add AspenClient.takeStorageDeviceOffline(StoreId)

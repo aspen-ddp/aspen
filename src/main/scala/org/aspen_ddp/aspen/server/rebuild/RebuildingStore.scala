@@ -8,7 +8,8 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import scribe.Logging
 
 import scala.collection.mutable

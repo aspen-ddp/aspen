@@ -1,4 +1,4 @@
-package org.aspen_ddp.aspen.server.store.backend
+package org.aspen_ddp.aspen.server.store.backend.rocksdb
 
 import org.aspen_ddp.aspen.FileBasedTests
 import org.rocksdb.{WriteBatch, WriteOptions}

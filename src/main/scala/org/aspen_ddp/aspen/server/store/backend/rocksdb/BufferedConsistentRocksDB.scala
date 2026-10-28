@@ -1,5 +1,6 @@
-package org.aspen_ddp.aspen.server.store.backend
+package org.aspen_ddp.aspen.server.store.backend.rocksdb
 
+import org.aspen_ddp.aspen.server.store.backend.*
 import org.rocksdb.{FlushOptions, RocksDB, WriteBatch, WriteOptions}
 import scribe.Logging
 

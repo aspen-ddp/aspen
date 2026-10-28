@@ -28,7 +28,8 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBBackend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
 import org.aspen_ddp.aspen.server.transfer.StoreTransferManager

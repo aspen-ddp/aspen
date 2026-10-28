@@ -11,7 +11,8 @@ import org.aspen_ddp.aspen.common.transaction.TransactionStatus
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runSequentially}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler, RocksDBBackend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}

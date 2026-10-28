@@ -63,7 +63,8 @@ object StorageDeviceManager:
    *  Precondition: `hostConfig` must be the config loaded from `hostDirectory`. This is not
    *  checked. Passing a mismatched pair registers the device to `hostConfig.hostId` while
    *  the config file lands under a different host's `storage-devices/`, and that host will
-   *  load it -- Host validates only `aspenSystemId`, never `hostId`.
+   *  load it. The `owning-host` file written beside the config names `hostConfig.hostId`,
+   *  and that is what decides which host owns the device.
    *
    *  Ordering: the transaction commits before the file is written, and the two cannot be
    *  made atomic. A crash in between leaves registered metadata with no on-disk device --
@@ -106,6 +107,7 @@ object StorageDeviceManager:
           // os.exists guard above from this write, so a config appearing in that window
           // must not be silently clobbered.
           os.write(configFile, cfg.yamlConfig)
+          DeviceMarkers.writeOwningHost(devDir, hostConfig.hostId)
         catch
           case t: FileAlreadyExistsException =>
             // Raced with another creation; the existing file is not ours to remove.

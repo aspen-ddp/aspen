@@ -28,6 +28,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
+import org.aspen_ddp.aspen.server.DeviceMarkers
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
@@ -1497,6 +1498,7 @@ object Main {
     val storageDevConfig = StorageDeviceConfig(StorageDeviceId(UUID.randomUUID()), aspenSystemId)
 
     os.write(bootstrapDevDir / StorageDeviceConfig.configFilename, storageDevConfig.yamlConfig)
+    DeviceMarkers.writeOwningHost(bootstrapDevDir, bootstrapHostId)
 
     val bootstrapStores =
       for

@@ -115,17 +115,21 @@ trait HostTestHarness:
   protected def writeDevice(hostRoot: os.Path,
                             name: String,
                             deviceId: StorageDeviceId,
-                            sysId: UUID = systemId): os.Path =
+                            sysId: UUID = systemId,
+                            owner: Option[HostId] = Some(HostId.BootstrapHostId)): os.Path =
     val dir = StorageDeviceManager.deviceDirectory(hostRoot, name)
     os.makeDir.all(dir)
-    writeDeviceConfig(dir, deviceId, sysId)
+    writeDeviceConfig(dir, deviceId, sysId, owner)
     dir
 
-  /** Writes only the config file into an existing device directory. */
+  /** Writes the config file, and the `owning-host` file when `owner` is given, into an
+   *  existing device directory. */
   protected def writeDeviceConfig(deviceDir: os.Path,
                                   deviceId: StorageDeviceId,
-                                  sysId: UUID = systemId): Unit =
+                                  sysId: UUID = systemId,
+                                  owner: Option[HostId] = Some(HostId.BootstrapHostId)): Unit =
     os.write.over(deviceDir / StorageDeviceConfig.configFilename, StorageDeviceConfig(deviceId, sysId).yamlConfig)
+    owner.foreach(DeviceMarkers.writeOwningHost(deviceDir, _))
 
   protected def newHost(hostRoot: os.Path,
                            failFirstStoreLoad: Boolean = false,

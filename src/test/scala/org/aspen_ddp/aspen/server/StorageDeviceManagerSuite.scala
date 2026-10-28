@@ -148,6 +148,7 @@ class StorageDeviceManagerSuite extends IntegrationTestSuite:
       os.isFile(written) should be(true)
       val cfg = StorageDeviceConfig.loadStorageDeviceConfig(written)
       cfg.storageDeviceId should be(deviceId)
+      DeviceMarkers.readOwningHost(dir) should be(Some(hostConfig().hostId))
       cfg.aspenSystemId should be(systemId)
       ds.hostId should be(HostId.BootstrapHostId)
       ds.storageDeviceSet should be(bootstrapSet)

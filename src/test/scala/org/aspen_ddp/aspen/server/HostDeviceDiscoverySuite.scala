@@ -162,7 +162,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
   atest("constructor loads a device that already exists on disk"):
     val hostRoot = newHostDir()
-    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = None)
 
     val host = newHost(hostRoot)
 
@@ -195,7 +195,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
   atest("an already-loaded device is not reloaded"):
     val hostRoot = newHostDir()
-    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = None)
     os.makeDir.all(deviceDir / "some-store-dir")
 
     val host = newHost(hostRoot)

@@ -2,13 +2,15 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.MetadataTree
-import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.client.{AllocationError, AspenClient}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyAlreadyExists}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceState.DeviceStatus
+import org.aspen_ddp.aspen.common.store.StoreId
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -299,3 +301,43 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       device.storageDeviceSet should be(destId)
       dest.memberDevices should contain(deviceId)
       old.memberDevices should not contain deviceId
+
+  private val bootSetId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+
+  atest("selectDeviceForStore skips a Shutdown device"):
+    given ExecutionContext = executionContext
+    def pickMany(n: Int, size: Long): Future[List[StorageDeviceId]] =
+      client.getStorageDeviceSetState(bootSetId).flatMap: set =>
+        Future.sequence(List.fill(n)(set.selectDeviceForStore(size, Set.empty, client)))
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.secondDeviceId)(_.copy(status = DeviceStatus.Shutdown))
+      picks <- pickMany(20, 0L)
+      // Only the shut-down device is big enough.
+      _ <- setDeviceState(StorageDeviceId.BootstrapStorageDeviceId)(_.copy(totalSize = 100L))
+      _ <- setDeviceState(net.secondDeviceId)(_.copy(totalSize = 1000L))
+      set <- client.getStorageDeviceSetState(bootSetId)
+      failed <- recoverToSucceededIf[AllocationError](set.selectDeviceForStore(500L, Set.empty, client))
+    yield
+      picks.toSet should be(Set(StorageDeviceId.BootstrapStorageDeviceId))
+      failed
+
+  atest("selectDeviceForRebuild skips a ShuttingDown device"):
+    given ExecutionContext = executionContext
+    def pickMany(n: Int): Future[List[StorageDeviceId]] =
+      client.getStorageDeviceSetState(bootSetId).flatMap: set =>
+        Future.sequence(List.fill(n)(set.selectDeviceForRebuild(PoolId.BootstrapPoolId, 0.toByte, client)))
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.secondDeviceId)(_.copy(status = DeviceStatus.ShuttingDown))
+      picks <- pickMany(20)
+      _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.ShuttingDown))
+      set <- client.getStorageDeviceSetState(bootSetId)
+      failed <- recoverToSucceededIf[AllocationError](
+                  set.selectDeviceForRebuild(PoolId.BootstrapPoolId, 0.toByte, client))
+    yield
+      picks.toSet should be(Set(net.thirdDeviceId))
+      failed

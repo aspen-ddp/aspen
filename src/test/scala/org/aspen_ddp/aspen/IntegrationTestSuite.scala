@@ -2,7 +2,9 @@ package org.aspen_ddp.aspen
 
 import org.aspen_ddp.aspen.client.{AspenClient, RegisteredTypeFactory}
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
-import org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.scalatest.{FutureOutcome, Tag, compatible}
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -72,5 +74,19 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   def waitForTransactionsToComplete(): Future[Unit] = net.waitForTransactionsToComplete()
 
   def handleEvents(): Unit = net.handleEvents()
+
+  /** Rewrite one device's state object in a single revision-guarded transaction. Metadata only:
+    * no Host reacts to it. */
+  def setDeviceState(id: StorageDeviceId)(f: StorageDeviceState => StorageDeviceState): Future[Unit] =
+    given scala.concurrent.ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStorageDevicePointer(id)
+        kvos <- client.read(ptr)
+      yield
+        val updated = f(StorageDeviceState(kvos))
+        tx.update(ptr, None, None,
+          List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+          List(Insert(StorageDeviceState.StateKey, updated.encode())))
 
 }

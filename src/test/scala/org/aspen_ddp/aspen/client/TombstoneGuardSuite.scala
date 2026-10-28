@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceState.DeviceStatus
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState, fixed_ids}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -98,3 +99,59 @@ class TombstoneGuardSuite extends IntegrationTestSuite:
                     setId,
                     1_000_000L))
     yield result
+
+  atest("transferStore onto a ShuttingDown or Shutdown device fails with DeviceNotOperational"):
+    given ExecutionContext = executionContext
+    val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+    def attempt(status: DeviceStatus) =
+      for
+        _ <- setDeviceState(net.secondDeviceId)(_.copy(status = status))
+        _ <- recoverToSucceededIf[AspenClient.DeviceNotOperational](
+               client.transferStore(storeId, net.secondDeviceId))
+      yield ()
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- attempt(DeviceStatus.ShuttingDown)
+      _ <- attempt(DeviceStatus.Shutdown)
+      src <- client.getStorageDeviceState(StorageDeviceId.BootstrapStorageDeviceId)
+      dst <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      src.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)
+      dst.stores.contains(storeId) should be(false)
+
+  atest("createNewStoragePool avoids a Shutdown member device"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("spare-set", level = 0, parent = None)
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- net.createDevice(fourth)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.secondDeviceId, setId)
+      _ <- client.moveDeviceToSet(net.thirdDeviceId, setId)
+      _ <- client.moveDeviceToSet(fourth, setId)
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.Shutdown))
+      poolId <- client.createNewStoragePool("avoid-pool", Replication(2, 2), None, RocksDBConfig(), setId, 1_000_000L)
+      pool <- client.getStoragePoolState(poolId)
+    yield
+      pool.stores.map(_.storageDeviceId).toSet should be(Set(net.secondDeviceId, fourth))
+
+  atest("createNewStoragePool fails with DeviceNotOperational when too few devices are operational"):
+    given ExecutionContext = executionContext
+    for
+      setId <- client.createStorageDeviceSet("tight-set", level = 0, parent = None)
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.moveDeviceToSet(net.secondDeviceId, setId)
+      _ <- client.moveDeviceToSet(net.thirdDeviceId, setId)
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.Shutdown))
+      result <- recoverToSucceededIf[AspenClient.DeviceNotOperational](
+                  client.createNewStoragePool("tight-pool", Replication(2, 2), None, RocksDBConfig(),
+                    setId, 1_000_000L))
+    yield result
+
+  private val fourth = StorageDeviceId(new java.util.UUID(0, 102))

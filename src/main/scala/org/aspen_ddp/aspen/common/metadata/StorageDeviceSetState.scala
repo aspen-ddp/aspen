@@ -119,15 +119,17 @@ final case class StorageDeviceSetState(
    *
    *  Level-0 sets draw from their member devices. Level-1+ sets distribute the
    *  request evenly across their member sets and recurse. `rng` is injectable so
-   *  tests can be deterministic.
+   *  tests can be deterministic. `exclude` devices are soft-excluded: chosen only once every
+   *  other device has been.
    */
   def selectDevicesForPool(
       numStores: Int,
       client: AspenClient,
-      rng: Random = new Random()
+      rng: Random = new Random(),
+      exclude: Set[StorageDeviceId] = Set.empty
   ): Future[List[StorageDeviceId]] =
     given ExecutionContext = client.clientContext
-    selectDevices(numStores, Set.empty, client.getStorageDeviceSetState, rng)
+    selectDevices(numStores, exclude, client.getStorageDeviceSetState, rng)
 
   /** Select a device to host a store that must be rebuilt from scratch because its
    *  data was lost. The store currently at `failedIndex` in pool `poolId` is the one
@@ -175,7 +177,7 @@ final case class StorageDeviceSetState(
               failedDevice,
               poolDevices,
               client.getStorageDeviceSetState,
-              id => client.getStorageDeviceState(id).map(s => s.totalSize - s.currentUsage),
+              id => freeSpaceOfOperational(client, id),
               rng)
       yield device
 
@@ -198,8 +200,15 @@ final case class StorageDeviceSetState(
       hardExclude = Set.empty,
       softExclude = exclude,
       lookup = client.getStorageDeviceSetState,
-      freeSpaceLookup = id => client.getStorageDeviceState(id).map(s => s.totalSize - s.currentUsage),
+      freeSpaceLookup = id => freeSpaceOfOperational(client, id),
       rng = rng)
+
+  /** Free space of `id`, failing for a device that is not operational so selection skips it. */
+  private def freeSpaceOfOperational(client: AspenClient, id: StorageDeviceId)
+                                    (using ExecutionContext): Future[Long] =
+    client.getStorageDeviceState(id).flatMap: s =>
+      if s.isOperational then Future.successful(s.totalSize - s.currentUsage)
+      else Future.failed(AspenClient.DeviceNotOperational(id))
 
   /** Every device reachable from this set: `memberDevices` at level 0, the union of the
    *  members' walks above. This is the "is this store already in the target set?" predicate
@@ -254,7 +263,9 @@ final case class StorageDeviceSetState(
     else
       val shuffled = rng.shuffle(memberDevices)
       val preferred = shuffled.filterNot(exclude.contains)
-      val ordered = preferred.iterator ++ Iterator.continually(shuffled).flatten
+      // Once the preferred devices run out, excluded ones are used before any is repeated.
+      val excluded = shuffled.filter(exclude.contains)
+      val ordered = preferred.iterator ++ Iterator.continually(if excluded.nonEmpty then excluded else shuffled).flatten
       Future.successful(ordered.take(numStores).toList)
 
   private def selectFromSets(

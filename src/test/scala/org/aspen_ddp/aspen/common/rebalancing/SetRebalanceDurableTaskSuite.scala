@@ -136,6 +136,43 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase:
       remaining shouldBe empty
       dst should be(Some(StorageDeviceState.StoreStatus.Active))
 
+  atest("rebalance does not treat a Shutdown device as usable"):
+    given ExecutionContext = executionContext
+    val s0 = storeId(0)
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.secondDeviceId)(_.copy(status = StorageDeviceState.DeviceStatus.Shutdown))
+      _ <- writePending(List((s0, boot, net.secondDeviceId)))
+      task = startTask()
+      // Re-targeted to the only operational non-pool device, never started onto the shut-down one.
+      _ <- awaitUntil("the destination to be replaced")(
+             pendingTransfers().map(_ == List((s0, boot, net.thirdDeviceId))))
+      _ <- driveToCompletion(task)
+      onSecond <- statusOf(net.secondDeviceId, s0)
+      onThird <- statusOf(net.thirdDeviceId, s0)
+    yield
+      onSecond should be(None)
+      onThird should be(Some(StorageDeviceState.StoreStatus.Active))
+
+  atest("a pending transfer to a Shutdown device is left pending when nothing else is selectable"):
+    given ExecutionContext = executionContext
+    val s0 = storeId(0)
+    val planned = (s0, boot, net.secondDeviceId)
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(net.secondDeviceId)(_.copy(status = StorageDeviceState.DeviceStatus.Shutdown))
+      _ <- writePending(List(planned))
+      task = startTask()
+      _ <- awaitPasses(task.testingOnlyCompletedPasses, 5)
+      remaining <- pendingTransfers()
+      src <- statusOf(boot, s0)
+    yield
+      remaining should be(List(planned))
+      src should be(Some(StorageDeviceState.StoreStatus.Active))
+
   atest("a replacement destination avoids another pending destination of the same pool"):
     given ExecutionContext = executionContext
     val s0 = storeId(0)

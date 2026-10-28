@@ -529,6 +529,9 @@ abstract class BaseAspenClient(
         if du.state.isFailed then
           throw AspenClient.DeviceFailed(du.storageDeviceId)
 
+        if !du.state.isOperational then
+          throw AspenClient.DeviceNotOperational(du.storageDeviceId)
+
         val updates = du.stores.map { storeId =>
           storeId -> StorageDeviceState.StoreEntry(
             StorageDeviceState.StoreStatus.Initializing,

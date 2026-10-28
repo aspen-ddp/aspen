@@ -31,6 +31,10 @@ object AspenClient:
    *  retrying cannot help, since a tombstone is one-way. */
   class DeviceFailed(deviceId: StorageDeviceId)
     extends Exception(s"Storage device ${deviceId.uuid} has been declared failed")
+  /** A store was about to be placed on a device that is shutting down or shut down. Selection
+   *  skips such devices; this reports the race where one was chosen anyway. */
+  class DeviceNotOperational(deviceId: StorageDeviceId)
+    extends Exception(s"Storage device ${deviceId.uuid} is not operational")
   /** fail-storage-device was invoked against a device that already carries a tombstone.
    *  Terminal: the tombstone is one-way, and a recovered device is re-introduced under a new id. */
   class DeviceAlreadyFailed(deviceId: StorageDeviceId)
@@ -348,12 +352,22 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     val poolId = PoolId(UUID.randomUUID())
     for
       set <- getStorageDeviceSetState(storageDeviceSet)
-      deviceIds <- set.selectDevicesForPool(ida.width, this)
-      devices <- Future.sequence(deviceIds.map(sid => getStorageDeviceState(sid)))
+      firstIds <- set.selectDevicesForPool(ida.width, this)
+      firstDevices <- Future.sequence(firstIds.map(sid => getStorageDeviceState(sid)))
+      // A device that is shutting down or shut down is never a legal member. Re-select once with
+      // those devices soft-excluded; if selection still has to name one, there is no alternative.
+      skipped = firstIds.zip(firstDevices).collect { case (sid, dev) if !dev.isOperational => sid }.toSet
+      deviceIds <-
+        if skipped.isEmpty then Future.successful(firstIds)
+        else set.selectDevicesForPool(ida.width, this, exclude = skipped)
+      devices <-
+        if skipped.isEmpty then Future.successful(firstDevices)
+        else Future.sequence(deviceIds.map(sid => getStorageDeviceState(sid)))
       // A tombstoned device's zeroed storageDeviceId would otherwise flow into
       // StoragePoolState.StoreEntry on the next line and blow up collectDevices' tree lookup
       // before any downstream guard can run. Report the real id, not the zeroed one.
       _ = deviceIds.zip(devices).find((_, dev) => dev.isFailed).foreach((sid, _) => throw DeviceFailed(sid))
+      _ = deviceIds.zip(devices).find((_, dev) => !dev.isOperational).foreach((sid, _) => throw DeviceNotOperational(sid))
       stores = devices.map(dev => StoragePoolState.StoreEntry(dev.hostId, dev.storageDeviceId)).toArray
       config = StoragePoolState(
         poolId,
@@ -401,6 +415,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         // reconcileDeviceState ignores failed devices outright.
         if dstState.isFailed then
           throw DeviceFailed(destinationId)
+
+        if !dstState.isOperational then
+          throw DeviceNotOperational(destinationId)
 
         // Fresh per attempt: only the committed attempt's id is ever recorded.
         val transferId = UUID.randomUUID()

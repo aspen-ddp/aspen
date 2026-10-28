@@ -449,6 +449,8 @@ class FailedStorageDeviceDurableTask(
               // Structurally unreachable once step 1 has removed the tombstone from its set, but
               // the pool state driving selection can be stale.
               throw AspenClient.DeviceFailed(dst.id)
+            if !dst.state.isOperational then
+              throw AspenClient.DeviceNotOperational(dst.id)
 
         _ <-
           odst match

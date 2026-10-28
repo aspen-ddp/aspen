@@ -239,9 +239,9 @@ class SetRebalanceDurableTask(
         logger.warn(s"Rebalance set $setId: could not advance transfer of $storeId " +
           s"(will retry via poll): $err")
 
-  /** A destination is usable when it is not failed and its host is not offline. */
+  /** A destination is usable when it is operational and its host is not offline. */
   private def usable(device: StorageDeviceState): Boolean =
-    !device.isFailed && !client.offlineHosts().contains(device.hostId)
+    !device.isFailed && device.isOperational && !client.offlineHosts().contains(device.hostId)
 
   /** Pick a new destination for a not-started transfer whose planned one is unusable and write
    *  it back into pendingTransfers. The entry is never dropped: when nothing usable can be

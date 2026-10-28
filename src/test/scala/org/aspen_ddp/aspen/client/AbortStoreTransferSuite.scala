@@ -149,7 +149,7 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
                ptr <- client.getStorageDevicePointer(net.secondDeviceId)
                kvos <- client.read(ptr)
              yield
-               val st = StorageDeviceState(kvos).copy(hostId = fixed_ids.FailedHostId)
+               val st = StorageDeviceState(kvos).copy(hostId = fixed_ids.FailedHostId, status = StorageDeviceState.DeviceStatus.Failed)
                tx.update(ptr, None, None,
                  List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
                  List(Insert(StorageDeviceState.StateKey, st.encode())))

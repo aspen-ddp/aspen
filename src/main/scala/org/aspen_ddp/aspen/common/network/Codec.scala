@@ -1378,12 +1378,26 @@ object Codec extends Logging:
     StorageDeviceId(decodeUUID(m.deviceUuid.get))
 
 
+  def encodeStorageDeviceStatus(o: StorageDeviceState.DeviceStatus): codec.StorageDeviceStatus = o match
+    case StorageDeviceState.DeviceStatus.Operational => codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_OPERATIONAL
+    case StorageDeviceState.DeviceStatus.ShuttingDown => codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_SHUTTING_DOWN
+    case StorageDeviceState.DeviceStatus.Shutdown => codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_SHUTDOWN
+    case StorageDeviceState.DeviceStatus.Failed => codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_FAILED
+
+  def decodeStorageDeviceStatus(m: codec.StorageDeviceStatus): StorageDeviceState.DeviceStatus = m match
+    case codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_OPERATIONAL => StorageDeviceState.DeviceStatus.Operational
+    case codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_SHUTTING_DOWN => StorageDeviceState.DeviceStatus.ShuttingDown
+    case codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_SHUTDOWN => StorageDeviceState.DeviceStatus.Shutdown
+    case codec.StorageDeviceStatus.STORAGE_DEVICE_STATUS_FAILED => StorageDeviceState.DeviceStatus.Failed
+    case codec.StorageDeviceStatus.Unrecognized(v) => throw new EncodingError(f"Invalid StorageDeviceStatus: $v")
+
   def encodeStorageDeviceStoreStatus(o: StorageDeviceState.StoreStatus): codec.StorageDeviceStoreStatus = o match
     case StorageDeviceState.StoreStatus.Initializing => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING
     case StorageDeviceState.StoreStatus.Active => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_ACTIVE
     case StorageDeviceState.StoreStatus.TransferringIn => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN
     case StorageDeviceState.StoreStatus.TransferringOut => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT
     case StorageDeviceState.StoreStatus.Rebuilding => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING
+    case StorageDeviceState.StoreStatus.Offline => codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_OFFLINE
 
   def decodeStorageDeviceStoreStatus(m: codec.StorageDeviceStoreStatus): StorageDeviceState.StoreStatus = m match
     case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_INITIALIZING => StorageDeviceState.StoreStatus.Initializing
@@ -1391,6 +1405,7 @@ object Codec extends Logging:
     case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN => StorageDeviceState.StoreStatus.TransferringIn
     case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT => StorageDeviceState.StoreStatus.TransferringOut
     case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_REBUILDING => StorageDeviceState.StoreStatus.Rebuilding
+    case codec.StorageDeviceStoreStatus.STORAGE_DEVICE_STORE_STATUS_OFFLINE => StorageDeviceState.StoreStatus.Offline
     case codec.StorageDeviceStoreStatus.Unrecognized(v) => throw new EncodingError(f"Invalid StorageDeviceStoreStatus: $v")
 
 
@@ -1420,7 +1435,8 @@ object Codec extends Logging:
       }.toSeq,
       currentUsage = o.currentUsage,
       totalSize = o.totalSize,
-      storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid))
+      storageDeviceSet = Some(encodeUUID(o.storageDeviceSet.uuid)),
+      status = encodeStorageDeviceStatus(o.status)
     )
 
   def decode(m: codec.StorageDeviceState): StorageDeviceState =
@@ -1434,7 +1450,8 @@ object Codec extends Logging:
 
     val storageDeviceSet = StorageDeviceSetId(decodeUUID(m.storageDeviceSet.get))
 
-    new StorageDeviceState(storageDeviceId, hostId, m.currentUsage, m.totalSize, stores, storageDeviceSet)
+    new StorageDeviceState(storageDeviceId, hostId, m.currentUsage, m.totalSize, stores, storageDeviceSet,
+      decodeStorageDeviceStatus(m.status))
 
   def encodeSteppedDurableTaskState(step: Int, state: Map[String, Array[Byte]]): Array[Byte] =
     codec.SteppedDurableTaskState(

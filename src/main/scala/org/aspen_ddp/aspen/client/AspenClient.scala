@@ -283,7 +283,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   /** Declare `deviceId` dead and begin reconstructing every store that lived on it.
    *
    *  One transaction enrolls a FailedStorageDeviceDurableTask, which then tombstones the device
-   *  -- removing it from its set and its owning host and zeroing both ids -- and moves its stores
+   *  -- removing it from its set and its owning host, setting its status to Failed and zeroing both ids -- and moves its stores
    *  one at a time onto live devices of each store's pool's set, marked Rebuilding. Returns as
    *  soon as the enrollment commits; progress is observable via `show-device`.
    *

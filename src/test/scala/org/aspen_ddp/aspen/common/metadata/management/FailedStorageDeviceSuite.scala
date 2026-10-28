@@ -95,6 +95,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
     yield
       state.hostId should be(fixed_ids.FailedHostId)
       state.storageDeviceId should be(fixed_ids.FailedStorageDeviceId)
+      state.status should be(StorageDeviceState.DeviceStatus.Failed)
       state.isFailed should be(true)
       set.memberDevices should not contain net.secondDeviceId
       host.storageDevices should not contain net.secondDeviceId
@@ -490,7 +491,8 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       yield
         val tombstoned = StorageDeviceState(kvos).copy(
           hostId = fixed_ids.FailedHostId,
-          storageDeviceId = fixed_ids.FailedStorageDeviceId)
+          storageDeviceId = fixed_ids.FailedStorageDeviceId,
+          status = StorageDeviceState.DeviceStatus.Failed)
         tx.update(ptr, None, None,
           List(KeyRevision(StorageDeviceState.StateKey,
             kvos.contents(StorageDeviceState.StateKey).revision)),

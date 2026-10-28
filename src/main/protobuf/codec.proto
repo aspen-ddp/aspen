@@ -703,6 +703,14 @@ enum StorageDeviceStoreStatus {
   STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_IN = 2;
   STORAGE_DEVICE_STORE_STATUS_TRANSFERRING_OUT = 3;
   STORAGE_DEVICE_STORE_STATUS_REBUILDING = 4;
+  STORAGE_DEVICE_STORE_STATUS_OFFLINE = 5;
+}
+
+enum StorageDeviceStatus {
+  STORAGE_DEVICE_STATUS_OPERATIONAL = 0;
+  STORAGE_DEVICE_STATUS_SHUTTING_DOWN = 1;
+  STORAGE_DEVICE_STATUS_SHUTDOWN = 2;
+  STORAGE_DEVICE_STATUS_FAILED = 3;
 }
 
 message StorageDeviceStoreEntry {
@@ -723,6 +731,7 @@ message StorageDeviceState {
   int64 current_usage = 4;
   int64 total_size = 5;
   UUID storage_device_set = 6;
+  StorageDeviceStatus status = 7;
 }
 
 //---------------------------------------------------------------------------

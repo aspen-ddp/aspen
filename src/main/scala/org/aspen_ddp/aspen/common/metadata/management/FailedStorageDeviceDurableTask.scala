@@ -158,7 +158,7 @@ class FailedStorageDeviceDurableTask(
       else
         tombstone()
 
-  /** Step 1. One transaction: the device leaves its set, leaves its owning host, and has both
+  /** Step 1. One transaction: the device leaves its set, leaves its owning host, and has its status set to Failed and both
    *  ids zeroed.
    *
    *  Everything is re-read inside the transaction and every removal is self-healing, so a
@@ -201,10 +201,11 @@ class FailedStorageDeviceDurableTask(
           List(KeyRevision(HostState.StateKey, hostKvos.contents(HostState.StateKey).revision)),
           List(Insert(HostState.StateKey, newHost.encode())))
 
-        // Device: zero both ids. Everything else -- the store map above all -- is preserved:
+        // Device: mark Failed and zero both ids. Everything else -- the store map above all -- is preserved:
         // it is the drain's work list.
         val tombstoned = state.copy(hostId = fixed_ids.FailedHostId,
-                                    storageDeviceId = fixed_ids.FailedStorageDeviceId)
+                                    storageDeviceId = fixed_ids.FailedStorageDeviceId,
+                                    status = StorageDeviceState.DeviceStatus.Failed)
         tx.update(devPtr, None, None,
           List(KeyRevision(StorageDeviceState.StateKey,
             devKvos.contents(StorageDeviceState.StateKey).revision)),

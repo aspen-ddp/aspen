@@ -188,7 +188,7 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase:
       // The state FailedStorageDeviceDurableTask leaves after rebuilding a store whose transfer
       // source died: the source is a tombstone that no longer lists the store, and the planned
       // destination holds a Rebuilding entry for it.
-      _ <- updateDevice(net.secondDeviceId)(_.copy(hostId = fixed_ids.FailedHostId))
+      _ <- updateDevice(net.secondDeviceId)(_.copy(hostId = fixed_ids.FailedHostId, status = StorageDeviceState.DeviceStatus.Failed))
       _ <- updateDevice(net.thirdDeviceId)(
              _.setStoreEntry(s0, StorageDeviceState.StoreStatus.Rebuilding, None))
       phase <- SetRebalanceDurableTask.classify(client, (s0, net.secondDeviceId, net.thirdDeviceId))

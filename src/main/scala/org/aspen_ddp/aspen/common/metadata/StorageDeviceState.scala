@@ -35,7 +35,12 @@ object StorageDeviceState:
     StorageDeviceState(kvos.contents(StateKey).value.bytes)
   
   enum StoreStatus:
-    case Initializing, Active, TransferringIn, TransferringOut, Rebuilding
+    case Initializing, Active, TransferringIn, TransferringOut, Rebuilding, Offline
+
+  /** Operational is the normal state. ShuttingDown and Shutdown bracket a planned physical move
+   *  of the device. Failed is the one-way tombstone written by failStorageDevice. */
+  enum DeviceStatus:
+    case Operational, ShuttingDown, Shutdown, Failed
 
   /** `transferId` identifies one logical transfer and is shared by the source's TransferringOut
    *  and the destination's TransferringIn entries. It is carried in the on-disk transfer markers
@@ -50,7 +55,8 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
                               currentUsage: Long,
                               totalSize: Long,
                               stores: Map[StoreId, StorageDeviceState.StoreEntry],
-                              storageDeviceSet: StorageDeviceSetId):
+                              storageDeviceSet: StorageDeviceSetId,
+                              status: StorageDeviceState.DeviceStatus = StorageDeviceState.DeviceStatus.Operational):
   
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
 
@@ -58,9 +64,24 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
    *  is still readable -- it holds the list of stores awaiting reconstruction -- but it is no
    *  longer a member of any set or host, and is never a legal destination for a store.
    *
-   *  `||` rather than `&&`: a half-written tombstone must read as failed, not as healthy. */
-  def isFailed: Boolean =
-    hostId == fixed_ids.FailedHostId || storageDeviceId == fixed_ids.FailedStorageDeviceId
+   *  The status is authoritative. The tombstone also zeroes both ids, but a zeroed id on an
+   *  otherwise Operational device does not make it failed. */
+  def isFailed: Boolean = status == StorageDeviceState.DeviceStatus.Failed
+
+  def isOperational: Boolean = status == StorageDeviceState.DeviceStatus.Operational
+
+  /** Every Active store becomes Offline; all other entries are untouched. */
+  def withActiveStoresOffline: StorageDeviceState =
+    remapStores(StorageDeviceState.StoreStatus.Active, StorageDeviceState.StoreStatus.Offline)
+
+  /** Every Offline store becomes Active; all other entries are untouched. */
+  def withOfflineStoresActive: StorageDeviceState =
+    remapStores(StorageDeviceState.StoreStatus.Offline, StorageDeviceState.StoreStatus.Active)
+
+  private def remapStores(from: StorageDeviceState.StoreStatus,
+                          to: StorageDeviceState.StoreStatus): StorageDeviceState =
+    this.copy(stores = stores.map: (storeId, entry) =>
+      if entry.status == from then storeId -> entry.copy(status = to) else storeId -> entry)
 
   def setHost(hostId: HostId): StorageDeviceState =
     this.copy(hostId=hostId)

@@ -32,7 +32,8 @@ class TombstoneGuardSuite extends IntegrationTestSuite:
       yield
         val state = StorageDeviceState(kvos)
         val tombstoned = state.copy(hostId = fixed_ids.FailedHostId,
-                                    storageDeviceId = fixed_ids.FailedStorageDeviceId)
+                                    storageDeviceId = fixed_ids.FailedStorageDeviceId,
+                                    status = StorageDeviceState.DeviceStatus.Failed)
         val reqs = List(KeyRevision(StorageDeviceState.StateKey,
           kvos.contents(StorageDeviceState.StateKey).revision))
         val ops = List(Insert(StorageDeviceState.StateKey, tombstoned.encode()))

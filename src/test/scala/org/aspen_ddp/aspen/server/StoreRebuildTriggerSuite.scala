@@ -263,7 +263,8 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
         Future.successful:
           val tombstoned = state2.copy(
             storageDeviceId = fixed_ids.FailedStorageDeviceId,
-            hostId = fixed_ids.FailedHostId)
+            hostId = fixed_ids.FailedHostId,
+            status = StorageDeviceState.DeviceStatus.Failed)
           val reqs = List(KeyRevision(StorageDeviceState.StateKey,
             kvos2.contents(StorageDeviceState.StateKey).revision))
           val ops = List(Insert(StorageDeviceState.StateKey, tombstoned.encode()))

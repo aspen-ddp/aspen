@@ -157,7 +157,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
   private def tombstonedState(stores: Map[StoreId, StorageDeviceState.StoreEntry] = Map()):
       StorageDeviceState =
     StorageDeviceState(fixed_ids.FailedStorageDeviceId, fixed_ids.FailedHostId,
-                       0L, 1024L, stores, deviceSetId)
+                       0L, 1024L, stores, deviceSetId,
+                       status = StorageDeviceState.DeviceStatus.Failed)
 
   atest("constructor loads a device that already exists on disk"):
     val hostRoot = newHostDir()
@@ -769,7 +770,8 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       yield
         val tombstoned = StorageDeviceState(kvos).copy(
           hostId = fixed_ids.FailedHostId,
-          storageDeviceId = fixed_ids.FailedStorageDeviceId)
+          storageDeviceId = fixed_ids.FailedStorageDeviceId,
+          status = StorageDeviceState.DeviceStatus.Failed)
         tx.update(ptr, None, None,
           List(KeyRevision(StorageDeviceState.StateKey,
             kvos.contents(StorageDeviceState.StateKey).revision)),

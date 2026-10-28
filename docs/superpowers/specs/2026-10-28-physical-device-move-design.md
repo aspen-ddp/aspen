@@ -112,7 +112,16 @@ entries are never touched by this feature.
 - Completes successfully once the status is `ShuttingDown`. If it is already `ShuttingDown` or `Shutdown`, it
   succeeds without writing, but **still resends the nudge**: that is how an operator recovers from a lost one.
 - Fails if the device is `Failed`.
-- `shutdown-device` CLI command calls it.
+- **Pool write-threshold refusal.** On an `Operational` device the same transaction reads every pool with a store on
+  the device and the state of every other device those pools use. If, for any such pool, fewer than the pool IDA's
+  write threshold of its stores are on `Operational` devices other than this one, the request fails with
+  `AspenClient.ShutdownWouldBreakPool(poolId)` (terminal; no `--force`) and writes nothing. A `ShuttingDown`,
+  `Shutdown` or `Failed` device counts as unavailable. Without this, shutting down a device holding enough
+  bootstrap-pool stores would make the metadata unreadable once its stores close, and the shutdown, a restart and any
+  adoption could then never commit. The other `Operational` devices counted have their revisions locked by the
+  transaction, so two concurrent shutdowns of devices sharing a pool cannot both pass. The check does not apply to a
+  device already `ShuttingDown` or `Shutdown` (the idempotent no-write-but-nudge case).
+- `shutdown-device` CLI command calls it, and prints a clear error for `ShutdownWouldBreakPool`.
 
 ### `AspenClient.restartStorageDevice(deviceId): Future[Unit]` and `restart-device`
 
@@ -126,7 +135,11 @@ entries are never touched by this feature.
 Driven from the existing device reconcile (`checkStorageDevice`), so a nudge or the hourly check triggers it:
 
 1. Stop running work on the device. Cancel any active transfer-in/out sessions and stop any running
-   `RebuildingStore`. Their device entries stay as they are.
+   `RebuildingStore`. Their device entries stay as they are. **Bounded wait:** before closing any store, the host
+   waits for the rebuilds it cancelled to finish acting on their outcome (a cancelled walk stops reading at once and
+   closes its staging backend), and for any transfer-in pool update already in flight for the device. The wait is
+   bounded by the `Host` constructor parameter `shutdownWorkTimeout` (default 60 s). On timeout the shutdown proceeds
+   and logs a warning naming the stores still running; they are left as a crash leaves them.
 2. Close every loaded store using the transfer-out shutdown path: `closeStore` (saves CRL state), write the
    per-store "do not load" marker, and gossip `StoreOffline`. Stores that are not loaded (`Rebuilding`,
    `TransferringIn`, or `TransferringOut` already closed by its transfer) get no new handling. They are left
@@ -142,9 +155,17 @@ Driven from the existing device reconcile (`checkStorageDevice`), so a nudge or 
 
 The whole procedure must be safe to repeat. A crash at any point, followed by the next check, finishes the job.
 
+Everything the "safe to remove" decision depends on is forced to disk before `Shutdown` is committed: each closed
+store's marker and CRL save file, and `shutdown.state` (and `owning-host` whenever it is written). Each is written to a
+temp file, forced, renamed into place, and its directory forced.
+
+A rebuild or transfer in that finishes after its device has been adopted by another host writes nothing: only the
+device's owner writes its entries and its pool entries, which always name the device's `hostId`.
+
 While a device is `ShuttingDown` or `Shutdown`, its host ignores requests to start a transfer in or out of it,
 and a host starting a transfer re-reads the owning `hostId` from `StorageDeviceState` on every attempt
-(audit `startStoreTransferOut` and the transfer-in initiator). Transfers whose peer is shut down simply keep
+(audit `startStoreTransferOut` and the transfer-in initiator). A pending transfer in re-reads its source device on
+every retransmit, retry and device check, and re-addresses its `StartStoreTransfer` to the source's current host. Transfers whose peer is shut down simply keep
 retrying until the device reappears.
 
 ### Owning host: `restart-device` before the disk moves
@@ -187,7 +208,8 @@ exhaustive `match` on `StoreStatus` or the new device status is audited for the 
 
 | `shutdown.state` names | Device status | Action |
 |---|---|---|
-| this host | `Shutdown` / `ShuttingDown` | Ignore (do not load). |
+| this host | `Shutdown` | Ignore (do not load). |
+| this host | `ShuttingDown` | Load, and the normal reconcile finishes the shutdown (a crash between writing `shutdown.state` and committing `Shutdown`). |
 | this host | `Operational` | Restart path above. |
 | another host | `Shutdown` | **Adopt** (below). |
 | another host | anything else | Log once, ignore. |
@@ -196,8 +218,10 @@ exhaustive `match` on `StoreStatus` or the new device status is audited for the 
 
 ### Adoption
 
-1. Validate on disk that every store the device lists as `Offline` has its "do not load" marker and its CRL save
-   file. If any fails, log once and ignore the device. (It may go back into its original host, finish its shutdown,
+1. Validate on disk that every store the device lists as `Offline` has its "do not load" marker and a CRL save
+   file that parses and names that store (a store that transferred in during the shutdown has its transferred-in
+   marker instead). If any fails, log once and ignore the device. The check is repeated inside the adoption
+   transaction against the state it re-reads, and the post-commit steps act on the state committed. (It may go back into its original host, finish its shutdown,
    and return.) Entries in other states are not validated: they are whatever a crash would have left, and their
    existing recovery paths handle them.
 2. One transaction, built from `updateHostId`, guarded on the device state revision, both `HostState` revisions

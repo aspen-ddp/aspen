@@ -3,13 +3,18 @@ TODO
 
 Add ability to physically move storage devices between Hosts
   - Add StorageDeviceState.StoreState.Offline enum value
-  - Add AspenClient.takeStorageDeviceOffline(StoreId)
+  - Add method AspenClient.shutdownStorageDevice(StoreId): Future[Unit]
+    - Add a shutdown-device cli command to call this method
+    - Future returns when the StorageDeviceState is updated to be in the ShuttingDown state
+      - Also success if the device is already in the Shutdown state
+    - Return Failure if device is in the Failed state
     - In single Tx
        - Updates the state of all stores to say they're Offline
        - Update StorageDeviceState status (new field) to ShuttingDown
          - Other states are Operational, Shutdown, Failed
            - Can use explicit Failed state rather than deriving it from the storageDeviceId and hostId.
              - Should be more obvious to readers of the code
+         - Ensure CLI show-device command displays this field
        - Send nudge on Tx success
     - When host sees that a storage device it owns is in the ShuttingDown state:
       - Shuts stores down as if they're going to transfer out and sends gossip message

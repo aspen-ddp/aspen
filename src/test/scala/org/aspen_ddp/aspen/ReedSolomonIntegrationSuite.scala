@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{IDA, ReedSolomon}
-import org.aspen_ddp.aspen.common.metadata.BootstrapConfig
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.objects.{Delete, Insert, Key, ObjectId, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate

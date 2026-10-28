@@ -14,7 +14,8 @@ import io.netty.util.{AttributeKey, NetUtil}
 import io.netty.util.concurrent.Future as NFuture
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
+import org.aspen_ddp.aspen.common.metadata.{HostId}
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.{HostMembership, MembershipListener}
 import org.aspen_ddp.aspen.common.network.snapshot.{HostSnapshot, NetworkSnapshotReader, StoreSnapshot}

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen
 
-import org.aspen_ddp.aspen.common.metadata.ClientConfig
+import org.aspen_ddp.aspen.common.config.ClientConfig
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 
 import java.util.UUID

@@ -3,7 +3,8 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
 import org.aspen_ddp.aspen.common.objects.KeyAlreadyExists
 import org.aspen_ddp.aspen.common.pool.PoolId

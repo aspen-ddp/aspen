@@ -2,7 +2,8 @@ package org.aspen_ddp.aspen.common.network
 
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
+import org.aspen_ddp.aspen.common.metadata.{HostId}
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.network.snapshot.{HostSnapshot, StoreSnapshot}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId

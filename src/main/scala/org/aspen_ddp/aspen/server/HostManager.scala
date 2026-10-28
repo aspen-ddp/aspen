@@ -1,7 +1,8 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId}
+import org.aspen_ddp.aspen.common.metadata.{HostId}
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem, SecretFile}
 
 import java.nio.charset.StandardCharsets

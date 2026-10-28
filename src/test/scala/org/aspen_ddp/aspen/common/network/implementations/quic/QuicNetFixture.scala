@@ -5,7 +5,8 @@ import org.aspen_ddp.aspen.client.{DataObjectState, KeyValueObjectState}
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, HostId, HostState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StoragePoolState}
+import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}

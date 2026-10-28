@@ -1,4 +1,4 @@
-package org.aspen_ddp.aspen.common.metadata
+package org.aspen_ddp.aspen.common.config
 
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.util.YamlFormat.*

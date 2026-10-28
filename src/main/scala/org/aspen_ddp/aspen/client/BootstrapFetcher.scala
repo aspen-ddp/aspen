@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.client
 
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, ClientConfig}
+import org.aspen_ddp.aspen.common.config.{BootstrapConfig, ClientConfig}
 
 import java.net.URI
 import java.net.http.{HttpClient, HttpRequest, HttpResponse}

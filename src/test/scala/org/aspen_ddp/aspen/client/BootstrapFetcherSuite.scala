@@ -2,8 +2,9 @@ package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.metadata.ClientConfig.BootstrapEndpoint
-import org.aspen_ddp.aspen.common.metadata.{BootstrapConfig, ClientConfig, HostId, HostState}
+import org.aspen_ddp.aspen.common.config.ClientConfig.BootstrapEndpoint
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
+import org.aspen_ddp.aspen.common.config.{BootstrapConfig, ClientConfig}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.BootstrapHttpServer

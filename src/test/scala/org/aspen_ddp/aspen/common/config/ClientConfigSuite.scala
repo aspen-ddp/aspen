@@ -1,8 +1,9 @@
-package org.aspen_ddp.aspen.common.metadata
+package org.aspen_ddp.aspen.common.config
 
+import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.common.metadata.ClientConfig.{BootstrapEndpoint, CacheUpdate}
+import org.aspen_ddp.aspen.common.config.ClientConfig.{BootstrapEndpoint, CacheUpdate}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.FormatError

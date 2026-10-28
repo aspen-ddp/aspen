@@ -1,5 +1,6 @@
-package org.aspen_ddp.aspen.common.metadata
+package org.aspen_ddp.aspen.common.config
 
+import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestTLS}
 import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.pool.PoolId

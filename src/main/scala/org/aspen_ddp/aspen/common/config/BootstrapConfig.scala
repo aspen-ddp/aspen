@@ -1,9 +1,9 @@
-package org.aspen_ddp.aspen.common.metadata
+package org.aspen_ddp.aspen.common.config
 
 import org.aspen_ddp.aspen.client.{AspenClient, Transaction}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, IDA, ReedSolomon, Replication}
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
 import org.aspen_ddp.aspen.common.pool.PoolId

@@ -1,5 +1,6 @@
-package org.aspen_ddp.aspen.common.metadata
+package org.aspen_ddp.aspen.common.config
 
+import org.aspen_ddp.aspen.common.metadata.*
 import org.aspen_ddp.aspen.TestTLS
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, Replication}
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}

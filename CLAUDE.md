@@ -167,6 +167,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   same host a Shutdown device waits for `restartStorageDevice`. Another host adopts it only when Shutdown and every
   Offline store dir has `transferring-out` + `crl_save.log` (or `transferred-in`), in one transaction rewriting the
   device, its pool entries and both HostStates, then rewrites `owning-host`, removes the markers and loads it
+- A `crl_save.log` in a store's final directory is the only copy of its CRL state: if it fails to load (missing,
+  truncated, or naming another store) the store is never served. It gets a `rebuild-required` marker, its entry is
+  flipped to Rebuilding by the reconcile, and the directory is discarded before the rebuild. Adoption of a Shutdown
+  device does the same for such stores instead of refusing the device. A network transfer validates the staged copy's
+  save file before promotion and retries on failure, since the source still holds the state
 
 ### Hybrid Logical Clock (HLC) Timestamps
 - Provides timestamps that are guaranteed to be later than some previously observed event(s)

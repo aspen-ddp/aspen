@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.server.rebuild.{StoreRebuild, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
 
 import java.util.UUID
 import scala.collection.mutable
@@ -234,6 +234,55 @@ class StoreRebuildTriggerSuite extends IntegrationTestSuite with HostTestHarness
       moved.map(m => (m.hostId, m.timestamp)) should be(
         List((poolState.stores(rebuilt.poolIndex).hostId, poolTimestamp)))
       moved.head.onlineTimestamp should be > offline.head.timestamp
+
+  atest("an Active store marked rebuild-required is flipped to Rebuilding, discarded and rebuilt"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val factory = new RecordingRebuildFactory
+    val host = newHost(hostRoot, storeRebuildFactory = factory)
+    val lost = storeN(0)
+    val storeDir = deviceDir / lost.directoryName
+
+    for
+      deviceSetId <- client.createStorageDeviceSet("test-set", 0, None)
+      realDeviceId <- client.createStorageDevice(HostId.BootstrapHostId, deviceSetId)
+      ptr <- client.getStorageDevicePointer(realDeviceId)
+      kvos <- client.read(ptr)
+      _ <- client.transactUntilSuccessful: tx =>
+        Future.successful:
+          val newState = StorageDeviceState(kvos).setStoreEntry(lost,
+            StorageDeviceState.StoreStatus.Active, None)
+          tx.update(ptr, None, None,
+            List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
+            List(Insert(StorageDeviceState.StateKey, newState.encode())))
+      _ <- waitForTransactionsToComplete()
+      // As crlSaveFileLost leaves it: marked, and offline. The recording tryLoadStore keeps
+      // neither set, so the offline entry is made by hand.
+      _ = os.makeDir.all(storeDir)
+      _ = os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+      local = new Host.LocalStorageDeviceState(
+        realDeviceId, deviceDir, deviceDir / StorageDeviceConfig.configFilename)
+      _ = local.offlineStores = Set(lost)
+      _ = host.injectLoadedDevice(local)
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- completeRebuildsStarted(factory)
+      finalState <- client.getStorageDeviceState(realDeviceId)
+    yield
+      finalState.stores.get(lost).map(_.status) should be(Some(StorageDeviceState.StoreStatus.Rebuilding))
+      factory.created.map(_.storeId).toList should be(List(lost))
+      os.exists(storeDir) should be(false)
+
+  /** Pumps transactions until `factory` has created a rebuild. Silent on exhaustion: callers
+   *  assert on it. */
+  private def completeRebuildsStarted(factory: RecordingRebuildFactory, rounds: Int = 50): Future[Unit] =
+    if factory.created.nonEmpty || rounds == 0 then
+      Future.unit
+    else
+      for
+        _ <- waitForTransactionsToComplete()
+        _ <- yieldUntil(factory.created.nonEmpty, 20)
+        _ <- completeRebuildsStarted(factory, rounds - 1)
+      yield ()
 
   atest("a rebuild on a tombstoned device is discarded, not loaded"):
     val hostRoot = newHostDir()

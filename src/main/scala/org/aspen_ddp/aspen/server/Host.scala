@@ -59,6 +59,7 @@ object Host:
   private case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend,
                                   maxSliceSize: Option[Long], completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
+  private case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
   private case class Exit() extends Event
   private case class RecoveryEvent() extends Event
   private case class HeartbeatEvent() extends Event
@@ -165,9 +166,19 @@ object Host:
     /** The device is no longer Shutdown and owned by the previous host. Nothing was written. */
     case Changed
 
-    /** These Offline stores were not closed cleanly on disk (closedForAdoption). Nothing was
+    /** These Offline stores were not closed cleanly on disk (adoptionClass). Nothing was
      *  written. */
     case Unclean(stores: List[StoreId])
+
+  /** adoptionClass's verdict on one Offline store of a Shutdown device. */
+  private[aspen] enum AdoptionClass:
+    /** Everything it needs is in its directory: adopted Active. */
+    case Clean
+    /** Closed, but its CRL save file is missing or unusable, so its transaction state is gone:
+     *  adopted Rebuilding. */
+    case CrlLost
+    /** Its close did not finish: the device is refused. */
+    case Unclean
 
 
   class IOHandler(host: Host) extends CompletionHandler:
@@ -285,6 +296,10 @@ class Host(val client: AspenClient,
   // Completed when the rebuild of each store in rebuildingStores has released its slot, its
   // outcome acted on. What a shutdown waits on for the rebuilds it cancels.
   private var rebuildsSettled: Map[StoreId, Promise[Unit]] = Map()
+
+  /** Stores whose requestStoreRebuild transaction is in flight, so a reconcile meanwhile does
+   *  not start a second one. */
+  private var pendingRebuildRequests: Set[StoreId] = Set()
   // The pool updates of transfers in now running (recordTransferIn), with the device receiving
   // each, completed once its outcome has been acted on. A shutdown of that device waits on them.
   private var recordingTransfersIn: Map[StoreId, (StorageDeviceId, Promise[Unit])] = Map()
@@ -637,7 +652,7 @@ class Host(val client: AspenClient,
         warnOnce(path, s"Failed to resolve the shutdown of storage device $deviceId at $path. " +
                        s"Will retry on the next scan. Error: $t")
 
-  /** Whether the store at `storePath`, whose entry is Offline, can be put back into service by an
+  /** How the store at `storePath`, whose entry is Offline, can be put back into service by an
    *  adoption: every piece of its state must be in its own directory, since the host that took
    *  it offline is not here.
    *
@@ -649,24 +664,30 @@ class Host(val client: AspenClient,
    *    CRL file empty since a fresh rebuild has no transaction state;
    *  - a transfer in that landed during the shutdown (PoolRepointedOffline): its transferred-in
    *    marker. It was never opened on this device, so it has no CRL state to carry.
-   *  Anything else -- a missing directory, a marker with no CRL file -- is a store whose close did
-   *  not finish, and adopting it would drop the transactions its CRL state was holding.
+   *  A missing directory, or one with neither marker, is a store whose close did not finish, and
+   *  adopting it would drop the transactions its CRL state was holding: Unclean.
    *
-   *  The CRL file is parsed, not just found: a disk pulled before its save reached the platter
-   *  can come back with the file present but cut short, and loadStoreState rejects that. Its
-   *  header must also name this store, so a file copied from another store's directory does not
+   *  A transfer-out marker with a missing or unusable CRL file is CrlLost. The device reads
+   *  Shutdown, which the shutdown commits only once every close has finished and been forced to
+   *  disk, so the save file was lost afterwards -- a disk pulled before it reached the platter, or
+   *  later damage -- and the host that wrote it no longer holds the state either. Refusing the
+   *  device would not bring the state back, so the store is adopted as Rebuilding instead.
+   *
+   *  The CRL file is parsed, not just found: loadValidStoreState rejects a file cut short, and one
+   *  whose header names another store, so a file copied from another store's directory does not
    *  pass for this one's state.
    */
-  private def closedForAdoption(storeId: StoreId, storePath: os.Path): Boolean =
-    def crlIntact: Boolean =
-      val file = Backend.crlSaveFile(storePath)
-      os.exists(file) &&
-        (try CrashRecoveryLog.loadStoreState(file)._1 == storeId
-         catch case _: Throwable => false)
-
-    os.isDir(storePath) &&
-      ((os.exists(storePath / StoreTransfer.TransferOutMarkerFile) && crlIntact) ||
-        os.exists(storePath / StoreTransfer.TransferredInMarkerFile))
+  private def adoptionClass(storeId: StoreId, storePath: os.Path): AdoptionClass =
+    if !os.isDir(storePath) then
+      AdoptionClass.Unclean
+    else if os.exists(storePath / StoreTransfer.TransferredInMarkerFile) then
+      AdoptionClass.Clean
+    else if os.exists(storePath / StoreTransfer.TransferOutMarkerFile) then
+      CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(storePath), storeId) match
+        case Right(_) => AdoptionClass.Clean
+        case Left(_) => AdoptionClass.CrlLost
+    else
+      AdoptionClass.Unclean
 
   /** Validates a device shut down by `previousHostId` and, if every Offline store was closed
    *  cleanly, adopts it. On success the post-commit steps run from the transaction's callback.
@@ -713,20 +734,26 @@ class Host(val client: AspenClient,
               warnOnce(path, s"Failed to adopt storage device $deviceId at $path. Will retry on the " +
                              s"next scan. Error: $t")
 
-  /** The Offline entries of `state` whose directories under `path` were not closed cleanly. */
-  private def uncleanStores(path: os.Path, state: StorageDeviceState): List[StoreId] =
+  /** The Offline entries of `state` in adoption class `cls`, by their directories under `path`. */
+  private def offlineStoresIn(path: os.Path,
+                              state: StorageDeviceState,
+                              cls: AdoptionClass): List[StoreId] =
     state.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Offline &&
-                               !closedForAdoption(storeId, path / storeId.directoryName) => storeId
+                               adoptionClass(storeId, path / storeId.directoryName) == cls => storeId
     }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+
+  /** The Offline entries of `state` whose directories under `path` were not closed cleanly. */
+  private def uncleanStores(path: os.Path, state: StorageDeviceState): List[StoreId] =
+    offlineStoresIn(path, state, AdoptionClass.Unclean)
 
   private def warnUnclean(path: os.Path,
                           deviceId: StorageDeviceId,
                           previousHostId: HostId,
                           unclean: List[StoreId]): Unit =
     warnOnce(path, s"Storage device $deviceId at $path was shut down by host $previousHostId, but " +
-                   s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory, " +
-                   s"transfer-out marker, or intact CRL save file). Not adopting it. It may have been " +
+                   s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory or " +
+                   s"transfer-out marker). Not adopting it. It may have been " +
                    s"removed too early: return it to that host to finish the shutdown")
 
   /** The local half of a restart or adoption, once `state` -- Operational and owned by this host
@@ -849,6 +876,11 @@ class Host(val client: AspenClient,
         try os.remove.all(staging)
         catch case t: Throwable =>
           logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
+        // Likewise a store copy discardLostStore had moved aside but not yet deleted.
+        val discarded = storageDevicePath / RebuildingStore.DiscardDirectory
+        try os.remove.all(discarded)
+        catch case t: Throwable =>
+          logger.warn(s"Failed to remove discarded store directory $discarded: $t")
         Try(os.list(storageDevicePath)) match
           case Failure(t) =>
             // Same hazard as the scan in checkForNewDevices: listing can fail with an IO
@@ -881,7 +913,14 @@ class Host(val client: AspenClient,
     if os.exists(storeCfgPath) then
       try
         val storeCfg = StoreConfig.loadStoreConfig(storeCfgPath)
-        if os.exists(potentialStoreFile / StoreTransfer.TransferOutMarkerFile) then
+        if os.exists(potentialStoreFile / RebuildingStore.RebuildRequiredMarkerFile) then
+          // Its CRL state is gone. The reconcile flips its entry to Rebuilding, and the rebuild
+          // discards this directory before writing a fresh copy.
+          logger.warn(s"Not loading store ${storeCfg.storeId}: its CRL save file was lost and it " +
+                      s"awaits a rebuild. $potentialStoreFile")
+          offlineStores += storeCfg.storeId
+          sds.offlineStores += storeCfg.storeId
+        else if os.exists(potentialStoreFile / StoreTransfer.TransferOutMarkerFile) then
           logger.info(s"Skipping load of offline store marked for transfer out. StoreId ${storeCfg.storeId}. $potentialStoreFile")
           offlineStores += storeCfg.storeId
           sds.offlineStores += storeCfg.storeId
@@ -1524,23 +1563,42 @@ class Host(val client: AspenClient,
               // would have the restart load a copy the pool does not name, and the device check
               // would then refuse the existing directory instead of resuming that step.
               val stagedPath = devicePath / StoreTransfer.StagingDirectory / storeId.directoryName
-              val promoted =
-                try
-                  val marker = stagedPath / StoreTransfer.TransferOutMarkerFile
-                  if os.exists(marker) then
-                    os.remove(marker)
-                  // Durable, marker and move both: a copy that lands during a shutdown is
-                  // accepted by an adopter on the strength of this marker alone.
-                  DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
-                                     transferId.map(_.toString).getOrElse(""))
-                  os.move(stagedPath, finalPath)
-                  DurableFiles.syncDirectory(devicePath)
-                  true
-                catch
-                  case t: Throwable =>
-                    logger.error(s"Failed to move the transferred store $storeId from " +
-                                 s"$stagedPath to $finalPath. Restarting the transfer. Error: $t")
+
+              // The copy's CRL save file is checked while the source still holds the state: once
+              // the pool update commits, the source deletes its copy and the file is the only one
+              // left. The source always writes it when closing the store, so a missing file is as
+              // bad as a damaged one.
+              val crlValid =
+                CrashRecoveryLog.loadValidStoreState(Backend.crlSaveFile(stagedPath), storeId) match
+                  case Right(_) => true
+                  case Left(err) =>
+                    logger.error(s"The transferred copy of store $storeId has an unusable CRL save " +
+                                 s"file. Restarting the transfer. Error: $err")
+                    try os.remove.all(stagedPath)
+                    catch case t: Throwable =>
+                      logger.error(s"Failed to remove the staged copy of store $storeId at $stagedPath: $t")
                     false
+
+              val promoted =
+                if !crlValid then
+                  false
+                else
+                  try
+                    val marker = stagedPath / StoreTransfer.TransferOutMarkerFile
+                    if os.exists(marker) then
+                      os.remove(marker)
+                    // Durable, marker and move both: a copy that lands during a shutdown is
+                    // accepted by an adopter on the strength of this marker alone.
+                    DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
+                                       transferId.map(_.toString).getOrElse(""))
+                    os.move(stagedPath, finalPath)
+                    DurableFiles.syncDirectory(devicePath)
+                    true
+                  catch
+                    case t: Throwable =>
+                      logger.error(s"Failed to move the transferred store $storeId from " +
+                                   s"$stagedPath to $finalPath. Restarting the transfer. Error: $t")
+                      false
 
               if ! promoted then
                 // Nothing has been recorded yet, so the pool still names the source and this is
@@ -1778,7 +1836,7 @@ class Host(val client: AspenClient,
   private def startStoreRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     synchronized {
       if !rebuildingStores.contains(storeId) && rebuildingStores.size < maxConcurrentRebuilds &&
-         !shuttingDownDevices.contains(local.storageDeviceId) then
+         !shuttingDownDevices.contains(local.storageDeviceId) && discardLostStore(local, storeId) then
         val sr = storeRebuildFactory.createRebuild(
           client, storeId, local.storageDeviceId, local.devicePath)
 
@@ -2012,6 +2070,112 @@ class Host(val client: AspenClient,
         logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
   }
 
+  /** Writes the marker that keeps the store at `storePath` from ever being loaded again: its CRL
+   *  save file is unusable and was the only copy of its transaction state. */
+  private def markRebuildRequired(storePath: os.Path): Unit =
+    DurableFiles.write(storePath / RebuildingStore.RebuildRequiredMarkerFile, "")
+
+  /** The LoadStore handler found `backend`'s CRL save file unusable. The file sits in the store's
+   *  own directory, so it is the only copy of that state: the store is permanently failed. It
+   *  is closed unserved, marked, and left offline; the reconcile then flips its entry to
+   *  Rebuilding, and the rebuild discards the directory.
+   *
+   *  A store arriving over the network never reaches here with a bad file: its staged copy is
+   *  checked before promotion, while the source still holds the state.
+   *
+   *  Caller holds the instance lock.
+   */
+  private def crlSaveFileLost(storageDeviceId: StorageDeviceId,
+                              backend: Backend,
+                              err: Throwable): Unit =
+    val storeId = backend.storeId
+    logger.error(s"Store $storeId cannot be loaded: its CRL save file is unusable and its transaction " +
+                 s"state is lost. Rebuilding it. Error: $err")
+    offlineStores += storeId
+    storageDevices.get(storageDeviceId).foreach: sds =>
+      sds.loadedStores -= storeId
+      sds.offlineStores += storeId
+    backend.close()
+    try
+      markRebuildRequired(backend.path)
+    catch
+      case t: Throwable =>
+        // Offline for the life of this process either way. The next start re-reads the same
+        // unusable file and lands here again.
+        logger.error(s"Failed to mark store $storeId for rebuild at ${backend.path}: $t")
+    checkStorageDevice(storageDeviceId)
+
+  /** Flips the entry of a store whose CRL state was lost from Active to Rebuilding, on its own
+   *  device. Nothing else changes: the pool already names this device and host. Writes nothing
+   *  if the device is failed or owned elsewhere, or the entry is no longer Active. Re-checks the
+   *  device afterwards, so the Rebuilding pass starts the rebuild now.
+   *
+   *  Only a collision is retried, as everywhere else in Host. A permanent failure is logged and
+   *  left for a later reconcile, which finds the marker again.
+   */
+  private def requestStoreRebuild(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
+    synchronized:
+      if !pendingRebuildRequests.contains(storeId) then
+        pendingRebuildRequests += storeId
+        val f =
+          try
+            client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+              for
+                ptr <- client.getStorageDevicePointer(storageDeviceId)
+                kvos <- client.read(ptr)
+                state = StorageDeviceState(kvos)
+              yield
+                val active = state.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
+                if !state.isFailed && state.hostId == hostId && active then
+                  val newState = state.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
+                  tx.update(ptr, None, None,
+                    List(KeyRevision(StorageDeviceState.StateKey,
+                      kvos.contents(StorageDeviceState.StateKey).revision)),
+                    List(Insert(StorageDeviceState.StateKey, newState.encode())))
+                  true
+                else
+                  // No update staged, as in markRebuiltStoreActive.
+                  false
+          catch case t: Throwable => Future.failed(t)
+
+        f.onComplete: result =>
+          synchronized(pendingRebuildRequests -= storeId)
+          result match
+            case Success(true) =>
+              logger.info(s"Store $storeId on device $storageDeviceId is now Rebuilding")
+              checkStorageDevice(storageDeviceId)
+            case Success(false) => ()
+            case Failure(t) =>
+              logger.warn(s"Failed to mark store $storeId on device $storageDeviceId for rebuild. " +
+                          s"Will retry on a later check. Error: $t")
+
+  /** Removes a store directory whose CRL state was lost, before its rebuild starts: a rebuild that
+   *  finds a directory at the store's path takes it for a store already in place. Renamed out of
+   *  the way first, which is atomic and forced to disk, so a crash during the delete never leaves
+   *  a partial directory at the store's path. Returns whether the path is now clear.
+   *
+   *  Caller holds the instance lock.
+   */
+  private def discardLostStore(local: LocalStorageDeviceState, storeId: StoreId): Boolean =
+    val storePath = local.devicePath / storeId.directoryName
+    if !os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+      true
+    else
+      try
+        val discardDir = local.devicePath / RebuildingStore.DiscardDirectory
+        os.makeDir.all(discardDir)
+        val target = discardDir / s"${storeId.directoryName}-${UUID.randomUUID()}"
+        logger.warn(s"Discarding store $storeId at $storePath, whose CRL state was lost, before rebuilding it")
+        os.move(storePath, target)
+        DurableFiles.syncDirectory(local.devicePath)
+        try os.remove.all(target)
+        catch case t: Throwable => logger.warn(s"Failed to delete discarded store copy $target: $t")
+        true
+      catch
+        case t: Throwable =>
+          logger.error(s"Failed to discard store $storeId at $storePath. Not rebuilding it yet. Error: $t")
+          false
+
   /** Gossips StoreMoved for a store this host has brought back online without repointing the
    *  pool: one whose rebuild has completed, or whose abandoned transfer out has been reinstated.
    *
@@ -2117,7 +2281,17 @@ class Host(val client: AspenClient,
                   List(KeyRevision(StoragePoolState.ConfigKey, pu.kvos.contents(StoragePoolState.ConfigKey).revision)),
                   List(Insert(StoragePoolState.ConfigKey, pu.config.encode())))
 
-              val newState = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
+              // Stores whose CRL state is gone are rebuilt rather than refused. The marker is
+              // written before the commit and is correct whatever its outcome: the state is lost
+              // either way, and the marker is what keeps the directory from ever being loaded.
+              val crlLost = offlineStoresIn(devicePath, state, AdoptionClass.CrlLost)
+              crlLost.foreach: storeId =>
+                logger.warn(s"Store $storeId on storage device $storageDeviceId has a missing or " +
+                            s"unusable CRL save file. Adopting it as Rebuilding")
+                markRebuildRequired(devicePath / storeId.directoryName)
+              val reactivated = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
+              val newState = crlLost.foldLeft(reactivated): (st, storeId) =>
+                st.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Rebuilding, None)
               tx.update(devPtr, None, None,
                 List(KeyRevision(StorageDeviceState.StateKey, devKvos.contents(StorageDeviceState.StateKey).revision)),
                 List(Insert(StorageDeviceState.StateKey, newState.encode())))
@@ -2458,8 +2632,9 @@ class Host(val client: AspenClient,
   }
 
   /** Reconciles a loaded device's on-disk state against the state recorded for it in the
-   *  storage-devices tree: deletes stores transferred away, reinstates stores left offline by an
-   *  abandoned transfer out, creates Initializing stores, and starts transfers in.
+   *  storage-devices tree: deletes stores transferred away, flips stores whose CRL state was lost
+   *  to Rebuilding, reinstates stores left offline by an abandoned transfer out, creates
+   *  Initializing stores, and starts transfers in.
    *
    *  If the tree records a different host, none of that happens and the device is not claimed.
    *  tryLoadDevice only loads a device whose `owning-host` file names this host, so a mismatch
@@ -2519,6 +2694,19 @@ class Host(val client: AspenClient,
             case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
 
       //----------------------
+      // Lost CRL State
+      //
+      // A store marked rebuild-required (crlSaveFileLost, or an adoption) whose entry still
+      // reads Active is flipped to Rebuilding; the Rebuilding pass below then discards its
+      // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
+      // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
+      val lostCrl = local.offlineStores.filter(storeId =>
+        os.exists(local.devicePath / storeId.directoryName / RebuildingStore.RebuildRequiredMarkerFile))
+      lostCrl.foreach: storeId =>
+        if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
+          requestStoreRebuild(local.storageDeviceId, storeId)
+
+      //----------------------
       // Abandoned Transfers Out
       //
       // Nothing else ever clears a transfer-out marker from the source. startStoreTransferIn
@@ -2548,7 +2736,7 @@ class Host(val client: AspenClient,
       // A store still sending is left alone but re-checked shortly. An abort's nudge usually
       // arrives while the send is still running, and the send ends (the destination cancels its
       // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
-      val (stillSending, abandonedOut) = local.offlineStores.filter(storeId =>
+      val (stillSending, abandonedOut) = (local.offlineStores -- lostCrl).filter(storeId =>
         remote.stores.get(storeId).exists(entry =>
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
@@ -3242,19 +3430,52 @@ class Host(val client: AspenClient,
         handleRecoveryEvent()
 
       case LoadStore(storageDeviceId, backend, maxSliceSize, p) =>
-        val store = new Store(storageDeviceId, ec, backend, objectCacheFactory(backend.storeId), net, backgroundTasks, crl,
-          txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8, maxSliceSize)
-        backend.setCompletionHandler(ioHandler)
-        stores += (backend.storeId -> store)
-        offlineStores -= backend.storeId
+        // The save file is read before the Store exists: a store whose CRL state cannot be
+        // recovered must never serve, not even briefly.
+        val savedState =
+          if os.exists(backend.crlSaveFile) then
+            CrashRecoveryLog.loadValidStoreState(backend.crlSaveFile, backend.storeId).map(Some(_))
+          else
+            Right(None)
 
-        if os.exists(backend.crlSaveFile) then
-          val (storeId, trs) = CrashRecoveryLog.loadStoreState(backend.crlSaveFile)
-          crl.loadStore(storeId, trs).foreach: _ =>
-            os.remove(backend.crlSaveFile)
-            p.success(())
-        else
-          p.success(())
+        savedState match
+          case Left(err) =>
+            crlSaveFileLost(storageDeviceId, backend, err)
+            p.failure(err)
+
+          case Right(trs) =>
+            val store = new Store(storageDeviceId, ec, backend, objectCacheFactory(backend.storeId), net, backgroundTasks, crl,
+              txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8, maxSliceSize)
+            backend.setCompletionHandler(ioHandler)
+            stores += (backend.storeId -> store)
+            offlineStores -= backend.storeId
+
+            trs match
+              case None => p.success(())
+              case Some(trs) =>
+                crl.loadStore(backend.storeId, trs).onComplete:
+                  case Success(_) =>
+                    os.remove(backend.crlSaveFile)
+                    p.success(())
+                  case Failure(err) =>
+                    // The save file stays, so a restart tries again. Until then the store must
+                    // not serve without the state the file holds.
+                    logger.error(s"Failed to load the CRL state of store ${backend.storeId}. Taking it " +
+                                 s"offline. Error: $err")
+                    events.put(UnloadFailedStore(backend.storeId, store))
+                    p.failure(err)
+
+      case UnloadFailedStore(storeId, store) =>
+        if stores.get(storeId).exists(_ eq store) then
+          stores -= storeId
+          offlineStores += storeId
+          store.objectCache.clear()
+          storageDevices.get(store.storageDeviceId).foreach: sds =>
+            sds.offlineStores += storeId
+          // Drops whatever part of the saved state did reach the CRL. The save file is not
+          // rewritten from it: the file on disk is still the whole state.
+          crl.closeStore(storeId).onComplete: _ =>
+            store.close()
 
       case LoadStoreById(storageDeviceId, storeId) =>
         storageDevices.get(storageDeviceId).foreach: sds =>

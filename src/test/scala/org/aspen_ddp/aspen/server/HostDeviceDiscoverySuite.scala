@@ -9,7 +9,10 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.store.backend.Backend
+import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.transaction.TransactionDriver
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 
@@ -46,12 +49,17 @@ private class StagedTransferService extends StoreTransferService:
 
   /** Resolves `storeId`'s latest transfer as if every byte had arrived. Leaves behind what
    *  extraction would have: `<dir>/<storeId.directoryName>`, still carrying the source's
-   *  transfer-out marker, for Host's promotion step to move into place. */
-  def finishTransferIn(storeId: StoreId): Unit =
+   *  transfer-out marker and the CRL save file its close wrote, for Host's promotion step to
+   *  move into place. `crlValid = false` leaves a truncated save file instead. */
+  def finishTransferIn(storeId: StoreId, crlValid: Boolean = true): Unit =
     latest(storeId).foreach: (sid, _, dir, p) =>
       val staged = dir / sid.directoryName
       os.makeDir.all(staged)
       os.write.over(staged / StoreTransfer.TransferOutMarkerFile, "")
+      if crlValid then
+        CrashRecoveryLog.saveStoreState(sid, Nil, Backend.crlSaveFile(staged))
+      else
+        os.write.over(Backend.crlSaveFile(staged), "")
       p.success(())
 
   /** Fails `storeId`'s latest transfer, as a timed-out or truncated stream would. */
@@ -1244,6 +1252,21 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       os.exists(promoted / "transferred-in") should be(false)
       os.exists(t.deviceDir / "transferring-in" / dirName) should be(false)
 
+  atest("a transferred copy with an unusable CRL save file is not promoted and the transfer restarts"):
+    given ExecutionContext = executionContext
+
+    for
+      t <- startTransferIn()
+      _ = t.transfers.finishTransferIn(t.movingStore, crlValid = false)
+      _ <- pumpUntil(t.host.testingOnlyScheduledTransferInRetries.contains(t.movingStore))
+    yield
+      val dirName = t.movingStore.directoryName
+      // The source still holds the state, so the attempt is retried rather than installed.
+      t.host.testingOnlyScheduledTransferInRetries should contain(t.movingStore)
+      t.host.transferOutcomes.get(t.movingStore) should be(None)
+      os.exists(t.deviceDir / dirName) should be(false)
+      os.exists(t.deviceDir / "transferring-in" / dirName) should be(false)
+
   atest("StartStoreTransfer carries the UUID registered with the service"):
     given ExecutionContext = executionContext
 
@@ -1871,3 +1894,64 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       os.exists(activeDir / StoreTransfer.TransferredInMarkerFile) should be(false)
       os.exists(pendingDir / StoreTransfer.TransferredInMarkerFile) should be(true)
       host.storeLoadAttempts.toList.drop(before) should be(List((deviceA, activeDir)))
+
+  /** A real Host, which opens RocksDB backends and honours the markers, over `hostRoot`. */
+  private def newRealHost(hostRoot: os.Path): Host =
+    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+      net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
+      net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+      Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
+
+  private def writeStoreDir(deviceDir: os.Path): os.Path =
+    val storeDir = deviceDir / storeId.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    storeDir
+
+  atest("a store whose CRL save file is truncated is not served and its load fails"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newRealHost(hostRoot)
+    val storeDir = writeStoreDir(deviceDir)
+    os.write.over(Backend.crlSaveFile(storeDir), "")
+
+    val backend = new RocksDBBackend(storeDir, storeId, executionContext)
+    val loaded = host.loadStore(deviceA, backend, None)
+    host.testingOnlyHandleEvents()
+
+    loaded.failed.map: err =>
+      err shouldBe a[CrashRecoveryLog.InvalidSaveFile]
+      host.getStoreIds should not contain storeId
+      host.testingOnlyOfflineStores should contain(storeId)
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      // Left in place: it is not this host's to delete, only to stop trusting.
+      os.exists(Backend.crlSaveFile(storeDir)) should be(true)
+
+  atest("a host restarting over a store with a truncated CRL save file does not serve it"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    os.write.over(Backend.crlSaveFile(storeDir), Array[Byte](1, 2, 3))
+
+    val host = newRealHost(hostRoot)
+    host.testingOnlyHandleEvents()
+
+    Future.successful:
+      host.getStoreIds should not contain storeId
+      host.testingOnlyOfflineStores should contain(storeId)
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+
+  atest("a store marked rebuild-required is not loaded at startup"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeStoreDir(deviceDir)
+    os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+
+    val host = newRealHost(hostRoot)
+    host.testingOnlyHandleEvents()
+
+    Future.successful:
+      host.getStoreIds should not contain storeId
+      host.testingOnlyOfflineStores should contain(storeId)
+      // Nothing was opened in its directory.
+      os.list(storeDir).length should be(2)

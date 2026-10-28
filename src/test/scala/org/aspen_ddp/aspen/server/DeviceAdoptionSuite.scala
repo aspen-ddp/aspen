@@ -201,59 +201,44 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       rebuilds.created.map(_.storeId).toList should be(List(s1))
       rebuilds.created.head.storageDeviceId should be(deviceA)
 
-  atest("a device missing a store's CRL file is not adopted"):
-    given ExecutionContext = executionContext
-    for
-      stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true): ss =>
-                  Map(ss(0) -> offline)
-      s0 = stores.head
-      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
-      d0 = writeClosedStore(deviceDir, s0, withCrl = false)
-      host = newHost(hostRoot)
-      _ <- resolve(host)
-      _ <- scanAndResolve(host)
-      stBefore <- state(deviceA)
-      warningsBefore = host.deviceDirWarnings.count(_._1 == deviceDir)
-      adoptsBefore = host.adoptCalls.size
-      loadedBefore = host.loadedDevices.contains(deviceA)
-      _ = CrashRecoveryLog.saveStoreState(s0, Nil, Backend.crlSaveFile(d0))
-      _ <- scanAndResolve(host)
-      stAfter <- state(deviceA)
-    yield
-      adoptsBefore should be(0)
-      warningsBefore should be(1)
-      loadedBefore should be(false)
-      stBefore.status should be(DeviceStatus.Shutdown)
-      stBefore.hostId should be(oldHostId)
-      host.adoptCalls.toList should be(List((deviceA, oldHostId)))
-      stAfter.status should be(DeviceStatus.Operational)
-      stAfter.hostId should be(HostId.BootstrapHostId)
-      host.loadedDevices.contains(deviceA) should be(true)
-
-  // A disk pulled before the save reached it, or one whose save file was copied from another
-  // store, must not be adopted: the CRL state the store needs is not in the file.
+  // The device reads Shutdown, so every close finished and was forced to disk: a save file
+  // missing or unusable now was lost afterwards (a disk pulled before it reached the platter, or
+  // a file copied from another store), and no host holds the state any more. Refusing the device
+  // would not bring it back, so the store is adopted as Rebuilding and its directory discarded
+  // before the rebuild; the device's other stores are adopted as usual.
   for (what, corrupt) <- List[(String, (os.Path, StoreId) => Unit)](
+        ("no", (file, _) => os.remove(file)),
         ("a truncated", (file, _) => os.write.over(file, "")),
         ("another store's", (file, s) =>
           CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file))) do
-    atest(s"a device with $what CRL save file is not adopted"):
+    atest(s"a store with $what CRL save file is adopted as Rebuilding and rebuilt"):
       given ExecutionContext = executionContext
+      val rebuilds = new RecordingRebuildFactory
       for
-        stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true): ss =>
-                    Map(ss(0) -> offline)
-        s0 = stores.head
+        stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 2, registerOldHost = true): ss =>
+                    Map(ss(0) -> offline, ss(1) -> offline)
+        List(s0, s1) = stores: @unchecked
         (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
         d0 = writeClosedStore(deviceDir, s0)
+        d1 = writeClosedStore(deviceDir, s1)
         _ = corrupt(Backend.crlSaveFile(d0), s0)
-        host = newHost(hostRoot)
+        host = newHost(hostRoot, storeRebuildFactory = rebuilds)
         _ <- resolve(host)
+        _ <- pumpUntil(rebuilds.created.nonEmpty)
         st <- state(deviceA)
+        e0 <- poolEntry(s0)
       yield
-        host.adoptCalls.toList should be(Nil)
-        host.loadedDevices.contains(deviceA) should be(false)
-        host.deviceDirWarnings.count(_._1 == deviceDir) should be(1)
-        st.status should be(DeviceStatus.Shutdown)
-        st.hostId should be(oldHostId)
+        host.adoptCalls.toList should be(List((deviceA, oldHostId)))
+        st.status should be(DeviceStatus.Operational)
+        st.hostId should be(HostId.BootstrapHostId)
+        st.stores(s0) should be(rebuilding)
+        st.stores(s1).status should be(StoreStatus.Active)
+        e0.hostId should be(HostId.BootstrapHostId)
+        host.loadedDevices.contains(deviceA) should be(true)
+        rebuilds.created.map(_.storeId).toList should be(List(s0))
+        // Discarded before the rebuild began, so the rebuild cannot take it for a store in place.
+        os.exists(d0) should be(false)
+        host.storeLoadAttempts.map(_._2) should contain(d1)
 
   atest("a device whose shutdown did not finish is refused by another host"):
     given ExecutionContext = executionContext

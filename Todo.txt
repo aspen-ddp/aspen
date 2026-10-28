@@ -1,6 +1,53 @@
 TODO
 ====
 
+Follow-ups from the physical device move work (docs/superpowers/specs/2026-10-28-physical-device-move-design.md)
+
+Pool write-threshold check counts unavailable stores as writable
+  - Context: AspenClient.checkPoolsStayWritable refuses shutdownStorageDevice with ShutdownWouldBreakPool
+    when a pool would be left with fewer than ida.writeThreshold writable stores. It counts every pool entry
+    whose device is Operational. Stores on an Operational device that are Rebuilding, Offline or TransferringIn
+    cannot take writes, but they are still counted, so a shutdown can be allowed even
+    though it leaves the pool below threshold.
+  - Recommended fix: count an entry only if its device is Operational and that device's
+    StorageDeviceState.stores lists the store as Active. The other device's state is already being read and
+    revision-locked, so this needs no extra reads. Add a test with a pool at exactly writeThreshold where one
+    of the other stores is Rebuilding; the shutdown must be refused.
+
+shutdown-device / restart-device report "not found" for the wrong device
+  - Context: cmdline Main.changeDeviceStatus turns any NoSuchElementException into
+    "storage device '<id>' not found". checkPoolsStayWritable reads the pointer of every other device named
+    by the affected pools (getStorageDevicePointer). If one of those devices is missing, it throws the same
+    exception, so the operator is told that the device they named does not exist.
+  - Recommended fix: in checkPoolsStayWritable, recover a missing pointer for another device and treat that
+    device as unavailable. This is the conservative direction and matches how a missing pool is skipped. Then
+    only the target device's own lookup can produce "not found".
+
+DurableFiles leaves its temp file behind on failure
+  - Context: DurableFiles.writeWith writes `.<name>.tmp` next to the target, forces it, renames it into place,
+    and syncs the directory. If fill, force or the move throws, the temp file stays in the device or store
+    directory. Nothing reads these files, so it is clutter rather than a correctness problem.
+  - Recommended fix: wrap everything up to the move in try/catch, remove the temp file with os.remove, and
+    rethrow.
+
+Rebuild's final rename is not directory-synced
+  - Context: RebuildingStore.finish moves the staging directory to its final store path with os.move but does
+    not fsync the device directory. The transfer-in promotion in Host.scala does sync it
+    (DurableFiles.syncDirectory(devicePath)). If power is lost or the disk is pulled after a shutdown, the
+    rename can be lost. This fails safe: the device comes back with the staging dir, the adoption check finds
+    the Offline store missing its files, and the new host refuses the device. It still forces an operator to
+    restart the device on its original host instead of finishing the move.
+  - Recommended fix: call DurableFiles.syncDirectory(finalPath / os.up) right after the move in finish().
+
+Directory fsync assumes Linux
+  - Context: DurableFiles.syncDirectory opens the directory with FileChannel READ and calls force(true). That
+    works on Linux. It throws on Windows. On macOS it does not issue F_FULLFSYNC, so the data may not be
+    durable.
+  - Recommended fix: low priority. Document Linux as the supported host platform for the durability claim, or
+    make syncDirectory a no-op with a warning logged once on platforms where it is unsupported. Also, add an
+    item to the end of Backlog.txt that describes the problem and how it can be resolved on Windows with a
+    JNA-based MoveFileEx solution.
+
 Modify StoragePoolAllocationStrategy
   - Currently the StoragePoolAllocationStrategy is created inside the PoolObjectAllocator, lets move this
     to the StoragePool interface instead.

@@ -86,6 +86,24 @@ object CrashRecoveryLog:
     finally
       fc.close()
 
+  /** Thrown, or carried by a failed load, when a store's CRL save file cannot be used. */
+  class InvalidSaveFile(path: os.Path, reason: String)
+    extends Exception(s"CRL save file $path is unusable: $reason")
+
+  /** Loads the save file at `saveFilePath` as `storeId`'s state. Left for any file that is
+   *  missing, unreadable, truncated, or whose header names a different store: in every such case
+   *  the transactions it held are not recoverable from it. */
+  def loadValidStoreState(saveFilePath: os.Path,
+                          storeId: StoreId): Either[InvalidSaveFile, List[TransactionRecoveryState]] =
+    try
+      val (fileStoreId, trs) = loadStoreState(saveFilePath)
+      if fileStoreId == storeId then
+        Right(trs)
+      else
+        Left(InvalidSaveFile(saveFilePath, s"it belongs to store $fileStoreId, not $storeId"))
+    catch
+      case t: Throwable => Left(InvalidSaveFile(saveFilePath, t.toString))
+
 
 trait CrashRecoveryLog {
   def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState]

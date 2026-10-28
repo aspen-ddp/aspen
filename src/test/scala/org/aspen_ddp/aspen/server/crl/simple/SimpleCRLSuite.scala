@@ -180,6 +180,20 @@ class SimpleCRLSuite extends FileBasedTests {
       assertThrows[CrashRecoveryLog.TruncatedSaveFile](CrashRecoveryLog.loadStoreState(savePath))
   }
 
+  test("loadValidStoreState accepts only an intact file naming the store") {
+    val savePath = tdir / "crl_save_file.log"
+    val other = StoreId(storeId.poolId, (storeId.poolIndex + 1).toByte)
+
+    assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId).isLeft)
+
+    CrashRecoveryLog.saveStoreState(storeId, List(trsValidTxd), savePath)
+    assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId) == Right(List(trsValidTxd)))
+    assert(CrashRecoveryLog.loadValidStoreState(savePath, other).isLeft)
+
+    os.write.over(savePath, os.read.bytes(savePath).dropRight(1))
+    assert(CrashRecoveryLog.loadValidStoreState(savePath, storeId).isLeft)
+  }
+
   test("SimpleCRL Drop Transaction Data") {
     val queue = new LinkedBlockingQueue[String]()
 

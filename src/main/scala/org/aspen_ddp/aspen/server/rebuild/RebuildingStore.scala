@@ -22,6 +22,17 @@ object RebuildingStore:
    *  down. That is what keeps a half-rebuilt store from being loaded and answering reads. */
   val RebuildDirectory = "rebuilding"
 
+  /** Present in a store directory whose CRL save file was found unusable. Its transaction state
+   *  is lost for good, so the directory is never loaded again: the store's entry is flipped to
+   *  Rebuilding and the directory is discarded before the rebuild starts. */
+  val RebuildRequiredMarkerFile = "rebuild-required"
+
+  /** Device-root directory a marked store directory is renamed into before it is deleted, so
+   *  a crash part-way through the delete never leaves a partial directory at the store's path
+   *  (which a rebuild would take for a store already in place). Invisible to Host.tryLoadStore
+   *  for the same reason as RebuildDirectory. */
+  val DiscardDirectory = "discarded"
+
   /** Objects between checkpoints. Small enough that a crash costs little, large enough that
    *  the flush is not the dominant cost. */
   val CheckpointInterval: Int = 1000

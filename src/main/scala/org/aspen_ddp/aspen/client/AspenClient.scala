@@ -39,6 +39,14 @@ object AspenClient:
    *  Terminal: the tombstone is one-way, and a recovered device is re-introduced under a new id. */
   class DeviceAlreadyFailed(deviceId: StorageDeviceId)
     extends Exception(s"Storage device ${deviceId.uuid} has already been declared failed")
+  /** shutdown-device was refused: with the device's stores offline, pool `poolId` would have
+   *  fewer stores on Operational devices than its IDA's write threshold, so nothing could write
+   *  it -- and, for the bootstrap pool, nothing could read or write the metadata a shutdown and
+   *  any later restart depend on. Terminal: the operator must first move stores off the device
+   *  or bring other devices back into service. */
+  class ShutdownWouldBreakPool(val poolId: PoolId)
+    extends Exception(s"Shutting down the device would leave pool ${poolId.uuid} with fewer stores " +
+                      s"on operational devices than its write threshold")
 
 /** The primary interface for applications using Aspen object storage: object allocation,
  *  transaction building, and object retrieval.
@@ -544,28 +552,69 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *  ShuttingDown. The owning host does the rest and moves the device to Shutdown once its stores
    *  are closed. Idempotent: on a device already ShuttingDown or Shutdown nothing is written, but
    *  the nudge is still sent so that a host that missed it can catch up. Fails with `DeviceFailed`
-   *  for a tombstoned device.
+   *  for a tombstoned device, and with `ShutdownWouldBreakPool` when taking an Operational
+   *  device's stores offline would leave one of its pools unwritable (see checkPoolsStayWritable).
    */
   def shutdownStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
-    changeDeviceStatus(deviceId): state =>
+    given ExecutionContext = this.clientContext
+    changeDeviceStatus(deviceId): (state, tx) =>
       state.status match
         case StorageDeviceState.DeviceStatus.Operational =>
-          Some(state.withActiveStoresOffline.copy(status = StorageDeviceState.DeviceStatus.ShuttingDown))
-        case _ => None
+          checkPoolsStayWritable(state)(using tx).map: _ =>
+            Some(state.withActiveStoresOffline.copy(status = StorageDeviceState.DeviceStatus.ShuttingDown))
+        case _ => Future.successful(None)
+
+  /** Fails the shutdown of `device` with `ShutdownWouldBreakPool` if any pool holding a store on
+   *  it would be left with fewer stores on other Operational devices than its write threshold.
+   *  A ShuttingDown, Shutdown or Failed device counts as unavailable: its stores are offline or
+   *  about to be. A pool named by an entry but no longer registered is skipped, as there is
+   *  nothing left to keep writable.
+   *
+   *  Run inside the shutdown's transaction, so a collision retry re-reads everything. Each other
+   *  device counted as Operational has its revision locked by the transaction: two devices of
+   *  one pool shut down at once would otherwise each count the other as available, and both
+   *  commit. With the locks, whichever commits second sees the first one's revision change,
+   *  retries, and is refused.
+   */
+  private def checkPoolsStayWritable(device: StorageDeviceState)(using tx: Transaction): Future[Unit] =
+    given ExecutionContext = this.clientContext
+    val deviceId = device.storageDeviceId
+    val poolIds = device.stores.keysIterator.map(_.poolId).toList.distinct
+    for
+      pools <- Future.sequence(poolIds.map: poolId =>
+                 getStoragePoolState(poolId).map(Some(_)).recover:
+                   case _: NoSuchElementException => None)
+      others = pools.flatten.flatMap(_.stores.map(_.storageDeviceId)).distinct.filter(_ != deviceId)
+      otherStates <- Future.sequence(others.map: id =>
+                       for
+                         ptr <- getStorageDevicePointer(id)
+                         kvos <- read(ptr)
+                       yield (id, ptr, kvos))
+    yield
+      val operational = otherStates.collect:
+        case (id, ptr, kvos) if StorageDeviceState(kvos).isOperational => id -> (ptr, kvos)
+      .toMap
+      pools.flatten.find: pool =>
+        pool.stores.count(e => e.storageDeviceId != deviceId && operational.contains(e.storageDeviceId)) <
+          pool.ida.writeThreshold
+      .foreach: pool =>
+        throw StopRetrying(ShutdownWouldBreakPool(pool.poolId))
+      operational.valuesIterator.foreach: (ptr, kvos) =>
+        tx.lockRevision(ptr, kvos.revision)
 
   /** Reverses `shutdownStorageDevice`: Offline stores become Active and the device Operational.
    *  Idempotent in the same way: on an Operational device nothing is written but the nudge is
    *  still sent. Fails with `DeviceFailed` for a tombstoned device.
    */
   def restartStorageDevice(deviceId: StorageDeviceId): Future[Unit] =
-    changeDeviceStatus(deviceId): state =>
+    changeDeviceStatus(deviceId): (state, _) =>
       state.status match
-        case StorageDeviceState.DeviceStatus.Operational => None
+        case StorageDeviceState.DeviceStatus.Operational => Future.successful(None)
         case _ =>
-          Some(state.withOfflineStoresActive.copy(status = StorageDeviceState.DeviceStatus.Operational))
+          Future.successful(Some(state.withOfflineStoresActive.copy(status = StorageDeviceState.DeviceStatus.Operational)))
 
   private def changeDeviceStatus(deviceId: StorageDeviceId)
-                                (change: StorageDeviceState => Option[StorageDeviceState]): Future[Unit] =
+                                (change: (StorageDeviceState, Transaction) => Future[Option[StorageDeviceState]]): Future[Unit] =
     given ExecutionContext = this.clientContext
 
     // As in abortStoreTransfer: only a collision is retried, and the nudge is built inside the
@@ -576,12 +625,11 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
       for
         devPtr <- getStorageDevicePointer(deviceId)
         kvos <- read(devPtr)
+        state = StorageDeviceState(kvos)
+        _ = if state.isFailed then throw StopRetrying(AspenClient.DeviceFailed(deviceId))
+        changed <- change(state, tx)
       yield
-        val state = StorageDeviceState(kvos)
-        if state.isFailed then
-          throw StopRetrying(AspenClient.DeviceFailed(deviceId))
-
-        change(state).foreach: newState =>
+        changed.foreach: newState =>
           tx.update(devPtr, None, None,
             List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
             List(Insert(StorageDeviceState.StateKey, newState.encode())))

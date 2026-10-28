@@ -170,7 +170,8 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(storeId, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ <- client.shutdownStorageDevice(sourceId)
+      // The bootstrap device holds the whole bootstrap pool, so the real request refuses.
+      _ <- forceShuttingDown(sourceId)
       _ <- waitForTransactionsToComplete()
       _ <- client.abortStoreTransfer(storeId)
       _ <- waitForTransactionsToComplete()

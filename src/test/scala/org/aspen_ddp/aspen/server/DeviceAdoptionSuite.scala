@@ -409,7 +409,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       oldHost = newHost(oldRoot, storeRebuildFactory = rebuilds, hostId = oldHostId)
       _ = oldHost.testingOnlyCheckAllDevices()
       _ <- pumpUntil(rebuilds.created.nonEmpty && oldHost.testingOnlyActiveDeviceChecks.isEmpty)
-      _ <- client.shutdownStorageDevice(deviceA)
+      // The pool lives on deviceA alone, so the real request would refuse this shutdown.
+      _ <- forceShuttingDown(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = oldHost.testingOnlyCheckAllDevices()
       _ <- pumpUntil(!oldHost.loadedDevices.contains(deviceA))

@@ -1856,6 +1856,10 @@ object Main {
         println(s"Error: storage device '$deviceIdStr' not found")
       case _: AspenClient.DeviceFailed =>
         println(s"Error: storage device '$deviceIdStr' has been declared failed")
+      case e: AspenClient.ShutdownWouldBreakPool =>
+        println(s"Error: refusing to shut down storage device '$deviceIdStr': pool ${e.poolId.uuid} would be left")
+        println("with fewer stores on operational devices than its write threshold, and could no longer be written.")
+        println("Transfer some of its stores off this device, or restart other shut-down devices, first.")
       case e =>
         println(s"Error trying to $verb storage device: ${e.getMessage}")
 

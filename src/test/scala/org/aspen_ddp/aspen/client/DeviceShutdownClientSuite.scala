@@ -1,11 +1,13 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceState
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceState.{DeviceStatus, StoreEntry, StoreStatus}
 import org.aspen_ddp.aspen.common.network.CheckStorageDevice
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -68,6 +70,72 @@ class DeviceShutdownClientSuite extends IntegrationTestSuite:
       yield
         after should be(before)
         expectOneNudge(nudges, after)
+
+  /** Points the bootstrap pool's store `i` at `device`. Metadata only: the store's data stays
+   *  where it is, which is all the threshold check reads. */
+  private def placeBootstrapStore(i: Int, device: StorageDeviceId): Future[Unit] =
+    given ExecutionContext = executionContext
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStoragePoolPointer(PoolId.BootstrapPoolId)
+        kvos <- client.read(ptr)
+      yield
+        val cfg = StoragePoolState(kvos)
+        cfg.stores(i) = StoragePoolState.StoreEntry(HostId.BootstrapHostId, device)
+        tx.update(ptr, None, None,
+          List(KeyRevision(StoragePoolState.ConfigKey, kvos.contents(StoragePoolState.ConfigKey).revision)),
+          List(Insert(StoragePoolState.ConfigKey, cfg.encode())))
+
+  // The bootstrap pool is Replication(3, 2) with all three stores on the bootstrap device.
+  atest("shutdownStorageDevice refuses to take a pool below its write threshold"):
+    given ExecutionContext = executionContext
+    val device = net.storageDeviceId
+    for
+      before <- client.getStorageDeviceState(device)
+      _ = takeNudges()
+      r <- client.shutdownStorageDevice(device).failed
+      after <- client.getStorageDeviceState(device)
+    yield
+      r shouldBe a[AspenClient.ShutdownWouldBreakPool]
+      r.asInstanceOf[AspenClient.ShutdownWouldBreakPool].poolId should be(PoolId.BootstrapPoolId)
+      after should be(before)
+      after.status should be(DeviceStatus.Operational)
+      takeNudges() should be(Nil)
+
+  atest("shutdownStorageDevice counts only the pool's stores on other Operational devices"):
+    given ExecutionContext = executionContext
+    val other = net.secondDeviceId
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      // Store 0 on the bootstrap device, 1 on the shutting-down third device, 2 on the device
+      // being shut down: one Operational store would remain, below the threshold of two.
+      _ <- placeBootstrapStore(1, net.thirdDeviceId)
+      _ <- placeBootstrapStore(2, other)
+      _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.ShuttingDown,
+                                                    stores = Map(sid(1) -> StoreEntry(StoreStatus.Offline, None))))
+      _ <- seed(Map(sid(2) -> StoreEntry(StoreStatus.Active, None)), DeviceStatus.Operational)
+      r <- client.shutdownStorageDevice(other).failed
+      after <- secondState()
+    yield
+      r shouldBe a[AspenClient.ShutdownWouldBreakPool]
+      after.status should be(DeviceStatus.Operational)
+      after.stores(sid(2)).status should be(StoreStatus.Active)
+
+  atest("shutdownStorageDevice proceeds when enough of each pool stays on Operational devices"):
+    given ExecutionContext = executionContext
+    val other = net.secondDeviceId
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- placeBootstrapStore(2, other)
+      _ <- seed(Map(sid(2) -> StoreEntry(StoreStatus.Active, None)), DeviceStatus.Operational)
+      _ <- client.shutdownStorageDevice(other)
+      after <- secondState()
+    yield
+      after.status should be(DeviceStatus.ShuttingDown)
+      after.stores(sid(2)).status should be(StoreStatus.Offline)
 
   atest("shutdownStorageDevice on a Failed device fails with DeviceFailed"):
     given ExecutionContext = executionContext

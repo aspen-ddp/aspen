@@ -89,4 +89,10 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
           List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
           List(Insert(StorageDeviceState.StateKey, updated.encode())))
 
+  /** Writes what shutdownStorageDevice writes -- Active stores Offline, the device ShuttingDown --
+    * without its pool write-threshold check. For tests whose device holds a pool's only stores,
+    * such as the bootstrap device, which the real request refuses to shut down. No nudge. */
+  def forceShuttingDown(id: StorageDeviceId): Future[Unit] =
+    setDeviceState(id)(_.withActiveStoresOffline.copy(status = StorageDeviceState.DeviceStatus.ShuttingDown))
+
 }

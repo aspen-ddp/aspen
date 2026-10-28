@@ -509,7 +509,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         // Built here and sent after commit, as in transferStore, so a retried attempt cannot
         // double-send. Empty when nothing was changed.
         dstRead.toList.flatMap: (dstPtr, dstKvos) =>
-          val newSrcState = srcState.setStoreEntry(storeId, StorageDeviceState.StoreStatus.Active, None)
+          // Offline rather than Active on a source being shut down: see serviceStatus. Its copy
+          // is closed behind the transfer-out marker, as the shutdown's other Offline stores are.
+          val newSrcState = srcState.setStoreEntry(storeId, srcState.serviceStatus, None)
           tx.update(srcPtr, None, None,
             List(KeyRevision(StorageDeviceState.StateKey, srcKvos.contents(StorageDeviceState.StateKey).revision)),
             List(Insert(StorageDeviceState.StateKey, newSrcState.encode())))

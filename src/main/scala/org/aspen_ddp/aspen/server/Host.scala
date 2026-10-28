@@ -78,6 +78,12 @@ object Host:
     /** The pool now names the destination, which therefore owns the arrived copy. */
     case PoolRepointed
 
+    /** As PoolRepointed, but the destination is shutting down or shut down, so its entry was
+     *  written Offline rather than Active. The arrived copy is ours but must not be served: it
+     *  stays unloaded behind its transferred-in marker until a restart or adoption makes the
+     *  entry Active, when the reconcile's completed-transfers-in pass loads it. */
+    case PoolRepointedOffline
+
     /** The destination was declared failed mid-flight, so the source was put back to Active and
      *  the pool left naming it. The arrived copy belongs to nobody. */
     case SourceRestored
@@ -102,6 +108,12 @@ object Host:
      *  loaded. */
     case Adopt
 
+    /** The device is shutting down or shut down, so the entry was written Offline rather than
+     *  Active (or was found Offline already). The rebuilt store is the device's, but must not be
+     *  served: it is kept offline behind a transfer-out marker, like every other store the
+     *  shutdown closed, until a restart or adoption brings it back. */
+    case AdoptOffline
+
     /** The tree does not say this device owns a rebuilt store: the device was tombstoned,
      *  the entry vanished, or the entry has a status other than Rebuilding/Active. The rebuilt
      *  store belongs to nobody and must be discarded. */
@@ -117,9 +129,10 @@ object Host:
     /** The device is Shutdown and has no Active entry. It may be unloaded. */
     case Completed
 
-    /** Some entry had become Active since the shutdown request -- a rebuild, transfer in or
-     *  store creation finishing late -- and has been flipped to Offline instead of committing
-     *  Shutdown. Its store may be open, so the shutdown goes round again to close it. */
+    /** Some entry was Active although the shutdown request had committed -- defence in depth,
+     *  as every writer of an Active entry writes Offline on a shutting-down device -- and has
+     *  been flipped to Offline instead of committing Shutdown. Its store may be open, so the
+     *  shutdown goes round again to close it. */
     case StoresReactivated
 
     /** The device is no longer ShuttingDown: a restart arrived (or the device was declared
@@ -244,14 +257,6 @@ class Host(val client: AspenClient,
   // so without this a nudge or the hourly check arriving mid-shutdown would close stores, write
   // markers and transact the device state a second time in parallel with the first.
   private var shuttingDownDevices: Set[StorageDeviceId] = Set()
-
-  // Metadata steps in flight that may yet flip an entry of their device to Active: a rebuild
-  // (from start until its slot is released), a store creation, and a transfer in's pool update.
-  // Keyed by a token per step so two steps for the same store cannot remove each other's entry.
-  // A shutdown waits for its device's entries before going on, because a flip that commits after
-  // the Shutdown transaction would leave a Shutdown device with an Active entry that nothing
-  // takes offline again. One that commits before it is caught by completeDeviceShutdown instead.
-  private var pendingActivations: Map[UUID, (StorageDeviceId, Future[Unit])] = Map()
 
   private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
   // Runs the DurableServices this host claims. Every host scans the services TKVL for unclaimed or expired
@@ -724,7 +729,9 @@ class Host(val client: AspenClient,
           val fromDevOps = List(Insert(StorageDeviceState.StateKey, newFromDev.encode()))
           tx.update(fromDevPtr, None, None, fromDevReqs, fromDevOps)
 
-          val newEntry = StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
+          // Offline on a destination asked to shut down since the transfer began; see
+          // serviceStatus. The pool is repointed all the same: the bytes are here.
+          val newEntry = StorageDeviceState.StoreEntry(toDev.serviceStatus, None)
           val newToStores = toDev.stores + (storeId -> newEntry)
           val newtoDev = toDev.copy(stores = newToStores)
           val toDevReqs = List(KeyRevision(StorageDeviceState.StateKey, toDevKvos.contents(StorageDeviceState.StateKey).revision))
@@ -751,10 +758,15 @@ class Host(val client: AspenClient,
 
             // Tell every other host (and client) where the store now lives. Sent only on this
             // branch: the other outcomes did not repoint the pool. This transaction wrote the pool
-            // config, so its timestamp is the config value's.
+            // config, so its timestamp is the config value's. An Offline entry is announced
+            // too, followed by its StoreOffline: the store does live here now, it just does not
+            // answer until its device is back in service.
             gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp, HLCTimestamp.now))
+            if newEntry.status == StorageDeviceState.StoreStatus.Offline then
+              gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
 
-          TransferOutcome.PoolRepointed
+          if newEntry.status == StorageDeviceState.StoreStatus.Offline then TransferOutcome.PoolRepointedOffline
+          else TransferOutcome.PoolRepointed
 
         // The source has already dropped the store. Either a concurrent call to this method
         // repointed the pool at the destination, which owns the arrived copy either way, so this
@@ -762,7 +774,12 @@ class Host(val client: AspenClient,
         // drain rebuilt the store elsewhere, in which case the pool names some other device and
         // loading the arrived copy would serve a store nobody routes to.
         else if poolCfg.stores(storeId.poolIndex).storageDeviceId == toDeviceid then
-          TransferOutcome.PoolRepointed
+          // Offline when that call wrote it Offline, or the shutdown request has taken it Offline
+          // since: either way the copy is ours but must not be served.
+          if toDev.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Offline) then
+            TransferOutcome.PoolRepointedOffline
+          else
+            TransferOutcome.PoolRepointed
 
         else
           logger.info(s"Transfer of store $storeId from device $fromDeviceId onto device " +
@@ -997,14 +1014,10 @@ class Host(val client: AspenClient,
                                transferUUID: UUID,
                                fromDeviceId: StorageDeviceId,
                                toDeviceid: StorageDeviceId): Unit =
-    // The pool update below makes this device's entry Active; see pendingActivations.
-    val settle = trackActivation(toDeviceid)
-
-    def finished(): Unit =
-      synchronized:
-        if transferringIn.get(storeId).contains(transferUUID) then
-          transferringIn -= storeId
-      settle()
+    def finished(): Unit = synchronized {
+      if transferringIn.get(storeId).contains(transferUUID) then
+        transferringIn -= storeId
+    }
 
     // Loading is downstream of the metadata decision, not ahead of it. An unconditional load
     // hands a live copy of the store to a device that updateStateForTransferredStore may be about
@@ -1029,6 +1042,20 @@ class Host(val client: AspenClient,
                   offlineStores += storeId
                   sds.offlineStores += storeId
             }
+
+          case Success(TransferOutcome.PoolRepointedOffline) =>
+            // Left exactly as it arrived, behind its transferred-in marker, and recorded offline
+            // as a restart's scan would record it. Once a restart or adoption makes the entry
+            // Active, the reconcile's completed-transfers-in pass clears the marker and loads it.
+            // Unlike the shutdown's own markers this needs no disk write, so it is the same
+            // whether or not the device is still loaded.
+            synchronized {
+              offlineStores += storeId
+              storageDevices.get(toDeviceid).foreach: sds =>
+                sds.offlineStores += storeId
+            }
+            logger.info(s"Store $storeId has transferred onto device $toDeviceid, which is being " +
+                        s"shut down. It stays offline")
 
           case Success(TransferOutcome.SourceRestored) | Success(TransferOutcome.Aborted) =>
             discardArrivedTransferIn(storeId, toDeviceid)
@@ -1284,59 +1311,83 @@ class Host(val client: AspenClient,
       }
   }
 
+  /** Creates and loads an Initializing store, then flips its entry out of Initializing.
+   *
+   *  The flip writes serviceStatus: Active normally, Offline when the device has been asked to
+   *  shut down since the create began. The store is loaded either way, and recorded in
+   *  loadedStores, so the shutdown closes and marks it like the device's other open stores.
+   *
+   *  A create that has not started its local work by the time this device's shutdown begins (or
+   *  its unload) does none: nothing is created or loaded, and the entry stays Initializing for a
+   *  later check once the device is back in service. Writing Offline over a store that does not
+   *  exist would have a restart bring an empty slot into service. The decision and the
+   *  loadedStores record share one hold of the lock, so a shutdown either sees the store or the
+   *  create sees the shutdown.
+   *
+   *  Only a collision is retried. Any other failure -- the pool cannot be read, the directory
+   *  cannot be written -- is logged and releases creatingStores, so the next check tries again
+   *  rather than a silent retry loop running for the life of the process.
+   */
   private def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
     val storePath = local.devicePath / storeId.directoryName
+    val deviceId = local.storageDeviceId
 
-    if ! creatingStores.contains(storeId) && ! shuttingDownDevices.contains(local.storageDeviceId) then
+    if ! creatingStores.contains(storeId) && ! shuttingDownDevices.contains(deviceId) then
       creatingStores += storeId
 
-      val fcreate = if os.exists(storePath) then
-        Future.unit
+      // True when the store exists on disk (created here, or by an attempt that crashed before
+      // its flip), false when the create was skipped for a shutdown.
+      val fcreate: Future[Boolean] = if os.exists(storePath) then
+        Future.successful(true)
       else
         client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
-          val storeConfig = pstate.backendConfig match
-            case cfg: RocksDBConfig => StoreConfig(storeId, StoreConfig.RocksDB(cfg.maxSliceSize), pstate.maxSliceSize)
+          synchronized {
+            if shuttingDownDevices.contains(deviceId) || ! storageDevices.get(deviceId).contains(local) then
+              logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
+              Future.successful(false)
+            else
+              val storeConfig = pstate.backendConfig match
+                case cfg: RocksDBConfig => StoreConfig(storeId, StoreConfig.RocksDB(cfg.maxSliceSize), pstate.maxSliceSize)
 
-          os.makeDir.all(storePath)
-          os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)
+              os.makeDir.all(storePath)
+              os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)
 
-          val backend = storeConfig.backend match
-            case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
+              val backend = storeConfig.backend match
+                case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
 
-          // Recorded as tryLoadStore records a load, so a shutdown of this device finds the
-          // store and closes it.
-          synchronized:
-            local.loadedStores += storeId
-          loadStore(local.storageDeviceId, backend, storeConfig.effectiveMaxSliceSize.map(_.toLong))
+              // Recorded as tryLoadStore records a load, so a shutdown of this device finds the
+              // store and closes it.
+              local.loadedStores += storeId
+              loadStore(deviceId, backend, storeConfig.effectiveMaxSliceSize.map(_.toLong)).map(_ => true)
+          }
 
-      val fflip = client.transactUntilSuccessful: tx =>
+      val fflip = client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
         for
-          _ <- fcreate
-          ptr <- client.getStorageDevicePointer(local.storageDeviceId)
+          created <- fcreate
+          ptr <- client.getStorageDevicePointer(deviceId)
           kvos <- client.read(ptr)
           state = StorageDeviceState(kvos)
         yield
           state.stores.get(storeId).foreach: entry =>
-            if entry.status == StorageDeviceState.StoreStatus.Initializing then
-              val newStores = state.stores + (storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))
-              val newState = state.copy(stores = newStores)
+            if created && entry.status == StorageDeviceState.StoreStatus.Initializing then
+              val status = state.serviceStatus
+              val newState = state.setStoreEntry(storeId, status, None)
 
               val reqs = List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision))
               val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
 
-              logger.info(s"Updating device state to mark store $storeId as Active")
+              logger.info(s"Updating device state to mark store $storeId as $status")
               tx.update(ptr, None, None, reqs, ops)
 
               tx.result.foreach: _ =>
-                logger.info(s"Successfully updated device state to mark store $storeId as Active")
-                synchronized:
-                  creatingStores -= storeId
+                logger.info(s"Successfully updated device state to mark store $storeId as $status")
 
-      // The flip can land after a shutdown request; see pendingActivations. Registered only now
-      // that both futures exist, so a synchronous throw above cannot leave an entry that never
-      // settles. Nothing can interleave: this method holds the lock throughout.
-      val settle = trackActivation(local.storageDeviceId)
-      fflip.onComplete(_ => settle())
+      fflip.onComplete: result =>
+        result.failed.foreach: t =>
+          logger.error(s"Failed to create store $storeId on device $deviceId. The next check of the " +
+                       s"device will try again. Error: $t")
+        synchronized:
+          creatingStores -= storeId
   }
 
   /** Begins reconstruction of one store from the rest of its pool.
@@ -1366,14 +1417,8 @@ class Host(val client: AspenClient,
         val sr = storeRebuildFactory.createRebuild(
           client, storeId, local.storageDeviceId, local.devicePath)
 
-        // Settled with the slot's release, which every outcome reaches only after its metadata
-        // decision: a shutdown waiting on this rebuild then sees the entry as it will stay.
-        val settle = trackActivation(local.storageDeviceId)
-
-        def release(): Unit =
-          synchronized:
-            rebuildingStores -= storeId
-          settle()
+        def release(): Unit = synchronized:
+          rebuildingStores -= storeId
 
         def recheckAll(): Unit =
           synchronized(storageDevices.keys).foreach(checkStorageDevice)
@@ -1430,6 +1475,13 @@ class Host(val client: AspenClient,
                   release()
                   recheckAll()
 
+              case Success(RebuildOutcome.AdoptOffline) =>
+                try
+                  keepRebuiltStoreOffline(local, storeId)
+                finally
+                  release()
+                  recheckAll()
+
               case Success(RebuildOutcome.Discard) =>
                 try
                   discardStoreDirectory(storeId, local.storageDeviceId,
@@ -1454,9 +1506,9 @@ class Host(val client: AspenClient,
                   recheckAll()
 
           case Failure(RebuildingStore.RebuildCancelled(_)) =>
-            // Cancelled by a shutdown of this device, which is waiting on this release. Not an
-            // error, and this device is not re-checked: it is shutting down. The checkpoint stays
-            // in staging, so the rebuild resumes once the device is back in service.
+            // Cancelled by a shutdown of this device. Not an error, and this device is not
+            // re-checked: it is shutting down. The checkpoint stays in staging, so the rebuild
+            // resumes once the device is back in service.
             try
               logger.info(s"Rebuild of store $storeId cancelled")
             finally
@@ -1506,25 +1558,37 @@ class Host(val client: AspenClient,
         else
           state.stores.get(storeId) match
             case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Rebuilding =>
-              val newState = state.setStoreEntry(
-                storeId, StorageDeviceState.StoreStatus.Active, None)
+              // Offline on a device asked to shut down since the rebuild began; see serviceStatus.
+              val status = state.serviceStatus
+              val newState = state.setStoreEntry(storeId, status, None)
 
               val reqs = List(KeyRevision(StorageDeviceState.StateKey,
                 kvos.contents(StorageDeviceState.StateKey).revision))
               val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
 
-              logger.info(s"Updating device state to mark rebuilt store $storeId as Active")
+              logger.info(s"Updating device state to mark rebuilt store $storeId as $status")
               tx.update(ptr, None, None, reqs, ops)
 
-              tx.result.foreach: _ =>
-                logger.info(s"Rebuild of store $storeId complete")
-                gossipStoreOnline(storeId)
-
-              RebuildOutcome.Adopt
+              if status == StorageDeviceState.StoreStatus.Active then
+                tx.result.foreach: _ =>
+                  logger.info(s"Rebuild of store $storeId complete")
+                  gossipStoreOnline(storeId)
+                RebuildOutcome.Adopt
+              else
+                tx.result.foreach: _ =>
+                  logger.info(s"Rebuild of store $storeId complete. Its device is shutting down, " +
+                              s"so it stays offline")
+                RebuildOutcome.AdoptOffline
 
             case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Active =>
               // Already flipped by a concurrent rebuild completion. No update staged.
               RebuildOutcome.Adopt
+
+            case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Offline =>
+              // Already flipped by a concurrent completion, onto a device shutting down -- or
+              // flipped Active and then taken Offline by the shutdown request. Either way the
+              // copy is this device's and must stay out of service. No update staged.
+              RebuildOutcome.AdoptOffline
 
             case _ =>
               // Entry missing entirely, or has a status other than Rebuilding/Active (Initializing,
@@ -1532,6 +1596,31 @@ class Host(val client: AspenClient,
               // device owns a rebuilt store. Latent rather than live: no current in-tree writer
               // produces "healthy device, entry vanished", but it's the wrong default.
               RebuildOutcome.Discard
+
+  /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
+   *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker.
+   *  That is exactly how the shutdown leaves the stores it closed, so a restart's
+   *  abandoned-transfer-out pass, or an adoption, brings it back the same way.
+   *
+   *  With the device unloaded already (its shutdown finished first), the disk is not touched: it
+   *  may be on its way out of the machine. Nothing is lost by that. Unmarked, the store simply
+   *  loads with the rest once its device is next loaded, after the restart or adoption has made
+   *  the entry Active; and a crash-resumed shutdown that loads it first closes and marks it.
+   */
+  private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
+    offlineStores += storeId
+    if storageDevices.get(local.storageDeviceId).contains(local) then
+      local.offlineStores += storeId
+      val storePath = local.devicePath / storeId.directoryName
+      try
+        os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
+      catch
+        case t: Throwable =>
+          // Offline for the life of this process either way. Only a restart cancelling the
+          // shutdown is affected: without the marker that pass does not reinstate the store,
+          // which then waits for this host's next start to load.
+          logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
+  }
 
   /** Gossips StoreMoved for a store this host has brought back online without repointing the
    *  pool: one whose rebuild has completed, or whose abandoned transfer out has been reinstated.
@@ -1579,25 +1668,13 @@ class Host(val client: AspenClient,
    *  without real backends. */
   protected def closeStoreForShutdown(storeId: StoreId): Future[Unit] = closeStore(storeId)
 
-  /** Records a metadata step that may flip an entry of `deviceId` to Active, returning the
-   *  function that marks it settled. The function is idempotent, so a caller with several exit
-   *  paths may call it on each. See pendingActivations. */
-  private def trackActivation(deviceId: StorageDeviceId): () => Unit = synchronized {
-    val token = UUID.randomUUID()
-    val settled = Promise[Unit]()
-    pendingActivations += token -> (deviceId, settled.future)
-    () =>
-      synchronized:
-        pendingActivations -= token
-      settled.trySuccess(())
-  }
-
   /** The last step of a shutdown: one transaction on the device state that either commits
    *  Shutdown or explains why it did not.
    *
-   *  The Active check is the race guard. A rebuild, transfer in or store creation that finishes
-   *  after the shutdown request still flips its entry to Active, and the store may be loaded by
-   *  the time this runs. Committing Shutdown then would shelve a disk whose metadata says one of
+   *  The Active check is defence in depth. Every transaction that brings a store into service
+   *  writes StorageDeviceState.serviceStatus, which is Offline once the shutdown request has
+   *  committed, so no Active entry should be found here. Should one appear anyway (a writer
+   *  that misses that rule), committing Shutdown would shelve a disk whose metadata says one of
    *  its stores is serving. Instead those entries are flipped to Offline, as the request itself
    *  did for the entries Active at the time, and the caller goes round again to close them.
    *
@@ -1641,8 +1718,7 @@ class Host(val client: AspenClient,
    *  Called from reconcileDeviceState in place of its normal passes, so while a device is shutting
    *  down nothing new starts on it: no store is created, no transfer in begins, no rebuild starts.
    *  The sequence, each step after the previous one completes:
-   *  1. stopDeviceWork: cancel the rebuilds and transfers running on the device, and wait out any
-   *     metadata step that could still flip an entry to Active.
+   *  1. stopDeviceWork: cancel the rebuilds and transfers running on the device.
    *  2. closeStoresForShutdown: close every open store, mark it and announce it offline.
    *  3. Write shutdown.state naming this host, so the device is not loaded again on its own.
    *  4. completeDeviceShutdown, then act on its outcome.
@@ -1671,8 +1747,8 @@ class Host(val client: AspenClient,
       // with it the guard's release: every later check of this device would then do nothing.
       val fshutdown =
         try
+          stopDeviceWork(local, remote)
           for
-            _ <- stopDeviceWork(local, remote)
             _ <- closeStoresForShutdown(local)
             _ = DeviceMarkers.writeShutdownState(local.devicePath, hostId)
             outcome <- completeDeviceShutdown(deviceId)
@@ -1718,30 +1794,31 @@ class Host(val client: AspenClient,
           logger.warn(s"Shutdown of storage device $deviceId failed. The next check of the device " +
                       s"will try again. Error: $t")
 
-  /** Step 1 of shutDownDevice: stops everything running on the device and completes once nothing
-   *  can flip one of its entries to Active any more.
+  /** Step 1 of shutDownDevice: stops everything running on the device. Nothing is waited for.
+   *  Work that finishes regardless -- a rebuild already past its last read, a transfer in already
+   *  in its pool update, a store creation already loading -- writes its entry Offline rather than
+   *  Active, because each of those transactions reads the device state and writes serviceStatus.
    *
    *  The device entries are left exactly as they are. The interrupted work is resumed after a
    *  restart or adoption by the same crash-recovery paths that resume it after a crash: a
    *  rebuild from its checkpoint in staging, a transfer in by the reconcile's TransferringIn
    *  pass, a transfer out by the receiver's retransmitted StartStoreTransfer.
    */
-  private def stopDeviceWork(local: LocalStorageDeviceState, remote: StorageDeviceState): Future[Unit] =
-    val (cancelledIns, settling) = synchronized {
+  private def stopDeviceWork(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
+    val cancelledIns = synchronized {
       val deviceId = local.storageDeviceId
       def entriesIn(status: StorageDeviceState.StoreStatus): Set[StoreId] =
         remote.stores.collect { case (storeId, entry) if entry.status == status => storeId }.toSet
 
-      // Cancelled rebuilds fail their complete with RebuildCancelled. Their slot is released, and
-      // their pendingActivations entry settled, only after that.
+      // Cancelled rebuilds fail their complete with RebuildCancelled, which releases their slot.
       entriesIn(StorageDeviceState.StoreStatus.Rebuilding).foreach: storeId =>
         rebuildingStores.get(storeId).foreach: sr =>
           logger.info(s"Cancelling the rebuild of store $storeId for the shutdown of device $deviceId")
           sr.cancel()
 
       // Forgotten before the service is told, so each attempt's completion handler finds itself
-      // no longer current and neither retries nor promotes. An attempt already past promotion is
-      // in its pool update, which pendingActivations covers.
+      // no longer current and neither retries nor promotes. An attempt already past that check
+      // runs its pool update, which writes the entry Offline.
       val ins = entriesIn(StorageDeviceState.StoreStatus.TransferringIn).toList.flatMap: storeId =>
         if pendingStartTransfers.get(storeId).exists(_.toDeviceId == deviceId) then
           pendingStartTransfers -= storeId
@@ -1758,14 +1835,12 @@ class Host(val client: AspenClient,
           logger.info(s"Cancelling the transfer out of store $storeId for the shutdown of device $deviceId")
           storeTransferService.cancelTransferOut(storeId)
 
-      (ins, pendingActivations.valuesIterator.collect { case (`deviceId`, settled) => settled }.toList)
+      ins
     }
 
     cancelledIns.foreach: (storeId, transferUUID) =>
       logger.info(s"Cancelling the transfer in of store $storeId for the shutdown of device ${local.storageDeviceId}")
       storeTransferService.cancelTransferIn(storeId, transferUUID)
-
-    Future.sequence(settling).map(_ => ())
 
   /** Step 2 of shutDownDevice, also run once more after Shutdown commits: closes each store open
    *  on the device, then writes its transfer-out marker (empty, as no transfer owns it) and

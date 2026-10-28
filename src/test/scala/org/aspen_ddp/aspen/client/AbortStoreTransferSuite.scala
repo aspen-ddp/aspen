@@ -162,3 +162,22 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
     yield
       nudges.map(_.deviceId) should be(List(sourceId))
       src.stores(storeId).status should be(StorageDeviceState.StoreStatus.Active)
+
+  atest("abortStoreTransfer restores the source Offline when it is shutting down"):
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(storeId, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.shutdownStorageDevice(sourceId)
+      _ <- waitForTransactionsToComplete()
+      _ <- client.abortStoreTransfer(storeId)
+      _ <- waitForTransactionsToComplete()
+      src <- client.getStorageDeviceState(sourceId)
+      dst <- client.getStorageDeviceState(net.secondDeviceId)
+    yield
+      // Only a restart may bring a store into service on a device being shelved.
+      src.status should be(StorageDeviceState.DeviceStatus.ShuttingDown)
+      src.stores(storeId) should be(StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Offline, None))
+      dst.stores.contains(storeId) should be(false)

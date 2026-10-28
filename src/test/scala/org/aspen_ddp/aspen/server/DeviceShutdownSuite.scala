@@ -63,6 +63,17 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
 
   private def state(id: StorageDeviceId): Future[StorageDeviceState] = client.getStorageDeviceState(id)
 
+  /** Pumps until `id`'s entry for `storeId` satisfies `p`, re-reading it each round. Silent on
+   *  exhaustion, like pumpUntil. */
+  private def pumpUntilEntry(id: StorageDeviceId, storeId: StoreId, rounds: Int = 50)
+                            (p: Option[StoreEntry] => Boolean): Future[Unit] =
+    given ExecutionContext = executionContext
+    state(id).flatMap: st =>
+      if p(st.stores.get(storeId)) || rounds == 0 then
+        Future.unit
+      else
+        pumpUntil(false, rounds = 1).flatMap(_ => pumpUntilEntry(id, storeId, rounds - 1)(p))
+
   /** Lists `id` in the bootstrap host's HostState, as device creation does. net.createDevice
    *  registers the device and its set membership only. */
   private def addToBootstrapHost(id: StorageDeviceId): Future[Unit] =
@@ -299,3 +310,112 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       host.transferSourceReads.toList should be(List(deviceB, deviceB))
       startedWhileShutdown should be(Set())
       transfers.startedTransfersIn should be(Set(s0))
+
+  atest("a transfer in whose pool update commits after the shutdown request leaves its entry Offline"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val destId = net.secondDeviceId
+    val deviceDir = writeDevice(hostRoot, "dev0", destId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    val arrived = deviceDir / movingStore.directoryName
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, destId)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
+      // Hold the pool update between promotion and its transaction, then request the shutdown.
+      gate = host.holdTransferOutcomes()
+      _ = transfers.finishTransferIn(movingStore)
+      _ <- pumpUntil(os.exists(arrived / StoreTransfer.TransferredInMarkerFile))
+      _ <- client.shutdownStorageDevice(destId)
+      _ <- waitForTransactionsToComplete()
+      _ = gate.success(())
+      _ <- pumpUntil(host.transferOutcomes.contains(movingStore))
+      entryAfterUpdate <- state(destId).map(_.stores.get(movingStore))
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!host.loadedDevices.contains(destId))
+      st <- state(destId)
+      pool <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+    yield
+      host.transferOutcomes(movingStore) should be(Host.TransferOutcome.PoolRepointedOffline)
+      entryAfterUpdate.map(_.status) should be(Some(StoreStatus.Offline))
+      pool.stores(movingStore.poolIndex).storageDeviceId should be(destId)
+      host.loadStoreByIdRequests.toList should be(Nil)
+      // Kept as it arrived, behind its transferred-in marker, and not served.
+      os.exists(arrived / StoreTransfer.TransferredInMarkerFile) should be(true)
+      host.testingOnlyOfflineStores should contain(movingStore)
+      st.stores(movingStore).status should be(StoreStatus.Offline)
+      st.status should be(DeviceStatus.Shutdown)
+
+  atest("a rebuild completing after the shutdown request leaves its entry Offline"):
+    given ExecutionContext = executionContext
+    // RecordedRebuild ignores cancel(), as a rebuild whose finish had already begun does.
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> StoreEntry(StoreStatus.Rebuilding, None)), rebuilds = rebuilds)
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(rebuilds.created.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      // The rebuilt store lands at its final path, as the walk leaves it.
+      _ = os.makeDir.all(deviceDir / s0.directoryName)
+      _ = rebuilds.created.head.promise.success(())
+      _ <- pumpUntil(host.rebuildFlipSeq.contains((deviceA, s0)))
+      entryAfterFlip <- state(deviceA).map(_.stores.get(s0))
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      st <- state(deviceA)
+    yield
+      entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
+      host.loadStoreByIdRequests.toList should be(Nil)
+      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      host.testingOnlyOfflineStores should contain(s0)
+      st.stores(s0).status should be(StoreStatus.Offline)
+      st.status should be(DeviceStatus.Shutdown)
+
+  atest("a store created as its device is shut down is flipped Offline, then closed"):
+    given ExecutionContext = executionContext
+    // A real pool, so createNewStore gets as far as loading the store.
+    val creating = StoreId(PoolId.BootstrapPoolId, 0)
+    for
+      (host, deviceDir) <- setUp(Map(creating -> StoreEntry(StoreStatus.Initializing, None)))
+      gate = host.holdStoreLoads()
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(host.loadStoreRequests.nonEmpty)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      // The load completes and the flip runs against the ShuttingDown device.
+      _ = gate.success(())
+      _ <- pumpUntilEntry(deviceA, creating)(!_.exists(_.status == StoreStatus.Initializing))
+      entryAfterFlip <- state(deviceA).map(_.stores.get(creating))
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      st <- state(deviceA)
+    yield
+      host.loadStoreRequests.toList should be(List((deviceA, creating)))
+      entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
+      host.shutdownCloses.toList should be(List(creating))
+      os.exists(deviceDir / creating.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      st.stores(creating).status should be(StoreStatus.Offline)
+      st.status should be(DeviceStatus.Shutdown)
+
+  atest("a create that keeps failing does not block the shutdown"):
+    given ExecutionContext = executionContext
+    // No such pool: the create fails on every attempt.
+    val creating = storeN(7)
+    val initializing = StoreEntry(StoreStatus.Initializing, None)
+    for
+      (host, _) <- setUp(Map(creating -> initializing))
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ <- shutDown(host)
+      st <- state(deviceA)
+    yield
+      host.loadedDevices.contains(deviceA) should be(false)
+      st.stores(creating) should be(initializing)
+      st.status should be(DeviceStatus.Shutdown)

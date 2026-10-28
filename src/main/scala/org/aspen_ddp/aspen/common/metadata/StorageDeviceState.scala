@@ -70,6 +70,25 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
 
   def isOperational: Boolean = status == StorageDeviceState.DeviceStatus.Operational
 
+  /** True while the device is being, or has been, shelved for a planned physical move. */
+  def isShutDownOrShuttingDown: Boolean =
+    status == StorageDeviceState.DeviceStatus.ShuttingDown ||
+    status == StorageDeviceState.DeviceStatus.Shutdown
+
+  /** The status to write for a store that is coming into service on this device: Active, or
+   *  Offline while the device is ShuttingDown or Shutdown.
+   *
+   *  Every transaction that would make an entry Active -- a store creation, a rebuild or transfer
+   *  in finishing, a transfer out rolled back -- reads this state under a KeyRevision and writes
+   *  what this returns. That is what keeps a shut-down device from ever holding an Active entry:
+   *  a write ordered after the shutdown request sees ShuttingDown and writes Offline, and one
+   *  ordered before it is flipped to Offline by the request itself. Only a restart or adoption
+   *  turns those Offline entries Active again.
+   */
+  def serviceStatus: StorageDeviceState.StoreStatus =
+    if isShutDownOrShuttingDown then StorageDeviceState.StoreStatus.Offline
+    else StorageDeviceState.StoreStatus.Active
+
   /** Every Active store becomes Offline; all other entries are untouched. */
   def withActiveStoresOffline: StorageDeviceState =
     remapStores(StorageDeviceState.StoreStatus.Active, StorageDeviceState.StoreStatus.Offline)
@@ -104,6 +123,10 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
    *  MigratePoolToSetDurableTask's inFlight, SetRebalanceDurableTask's Phase.InFlight, and
    *  rebalancing's ownedStores. Nothing else about the transfer needs undoing at this level.
    *
+   *  On a device that is shutting down or shut down the entry goes back to Offline instead; see
+   *  serviceStatus. The source's copy is already closed behind its transfer-out marker, which is
+   *  exactly how the shutdown leaves its other Offline stores.
+   *
    *  None when this device is not, or is no longer, the source of that particular transfer. Both
    *  callers read this state inside a transaction that carries a KeyRevision on StateKey, so a
    *  None is the loser of a race re-reading after the winner already restored the entry --
@@ -117,4 +140,4 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
         entry.status == StorageDeviceState.StoreStatus.TransferringOut &&
         entry.transferDevice.contains(failedDestination)
       .map: _ =>
-        setStoreEntry(storeId, StorageDeviceState.StoreStatus.Active, None)
+        setStoreEntry(storeId, serviceStatus, None)

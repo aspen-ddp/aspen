@@ -417,6 +417,29 @@ private class RecordingHost(mgrClient: AspenClient,
       case Some(Left(error)) => throw error
       case None              => super.lookupStorageDeviceState(storageDeviceId)
 
+  /** (deviceId, storeId) for every loadStore call, in order. Only createNewStore calls it here:
+   *  tryLoadStore is overridden. Lazy, as above. */
+  lazy val loadStoreRequests: mutable.ListBuffer[(StorageDeviceId, StoreId)] =
+    mutable.ListBuffer[(StorageDeviceId, StoreId)]()
+
+  private lazy val storeLoadGate = new AtomicReference[Option[Promise[Unit]]](None)
+
+  /** Makes every later loadStore return a Future completed by the returned promise, so a test can
+   *  run work between createNewStore loading a store and its Initializing -> Active flip. The
+   *  LoadStore event itself is still queued, as it is without the hold. */
+  def holdStoreLoads(): Promise[Unit] =
+    val p = Promise[Unit]()
+    storeLoadGate.set(Some(p))
+    p
+
+  override def loadStore(storageDeviceId: StorageDeviceId,
+                         backend: org.aspen_ddp.aspen.server.store.backend.Backend,
+                         maxSliceSize: Option[Long]): Future[Unit] =
+    synchronized:
+      loadStoreRequests += ((storageDeviceId, backend.storeId))
+    val queued = super.loadStore(storageDeviceId, backend, maxSliceSize)
+    storeLoadGate.get.map(_.future).getOrElse(queued)
+
   /** Every store closeStoreForShutdown was called for, in call order. Lazy for the same
    *  initialization-order reason as storeLoadAttempts. */
   lazy val shutdownCloses: mutable.ListBuffer[StoreId] = mutable.ListBuffer[StoreId]()

@@ -74,11 +74,24 @@ private class StagedTransferService extends StoreTransferService:
                        destHost: String, destPort: Int, timestamp: HLCTimestamp): Unit =
     throw new UnsupportedOperationException("StagedTransferService does not send stores")
 
-  def cancelTransferOut(storeId: StoreId): Unit = ()
+  // Sends exist only when a test declares one with markSending: this service never ships bytes.
+  private var sending = Set[StoreId]()
+  private val outCancels = mutable.ArrayBuffer[StoreId]()
 
-  def isTransferringOut(storeId: StoreId): Boolean = false
+  /** Makes `storeId` read as transferring out until cancelTransferOut is called for it. */
+  def markSending(storeId: StoreId): Unit = synchronized:
+    sending += storeId
 
-  def transferringOutStores: Set[StoreId] = Set.empty
+  /** Every cancelTransferOut call, in order. */
+  def cancelledTransfersOut: Vector[StoreId] = synchronized(outCancels.toVector)
+
+  def cancelTransferOut(storeId: StoreId): Unit = synchronized:
+    outCancels += storeId
+    sending -= storeId
+
+  def isTransferringOut(storeId: StoreId): Boolean = synchronized(sending.contains(storeId))
+
+  def transferringOutStores: Set[StoreId] = synchronized(sending)
 
 
 /** A StoreTransferService whose sends move no bytes and end only when the test says so, for

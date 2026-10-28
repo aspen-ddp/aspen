@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
-import org.aspen_ddp.aspen.server.Host.RebuildOutcome
+import org.aspen_ddp.aspen.server.Host.{RebuildOutcome, ShutdownOutcome}
 
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
@@ -416,6 +416,58 @@ private class RecordingHost(mgrClient: AspenClient,
       case Some(Right(p))    => p.future
       case Some(Left(error)) => throw error
       case None              => super.lookupStorageDeviceState(storageDeviceId)
+
+  /** Every store closeStoreForShutdown was called for, in call order. Lazy for the same
+   *  initialization-order reason as storeLoadAttempts. */
+  lazy val shutdownCloses: mutable.ListBuffer[StoreId] = mutable.ListBuffer[StoreId]()
+
+  private lazy val shutdownCloseGate = new AtomicReference[Option[Promise[Unit]]](None)
+
+  /** Holds every later shutdown close open until the returned promise is completed. */
+  def holdShutdownCloses(): Promise[Unit] =
+    val p = Promise[Unit]()
+    shutdownCloseGate.set(Some(p))
+    p
+
+  /** Records the close and completes it (or holds it, see holdShutdownCloses) without touching
+   *  the event queue. The real closeStore queues a ShutdownStore event, which nothing in these
+   *  suites runs, and the stores the tests name were never opened anyway. Host does its own
+   *  offline bookkeeping once the close completes, so nothing is lost by skipping it. */
+  override protected def closeStoreForShutdown(storeId: StoreId): Future[Unit] =
+    synchronized:
+      shutdownCloses += storeId
+    shutdownCloseGate.get.map(_.future).getOrElse(Future.unit)
+
+  /** Every outcome completeDeviceShutdown returned, in order. Lazy, as above. */
+  lazy val shutdownOutcomes: mutable.ListBuffer[ShutdownOutcome] = mutable.ListBuffer[ShutdownOutcome]()
+
+  private lazy val beforeShutdownCommit = new AtomicReference[Option[() => Future[Unit]]](None)
+
+  /** Runs `hook` once, before the next completeDeviceShutdown reads the device state: a window in
+   *  which a rebuild or transfer in could flip an entry to Active. */
+  def beforeNextShutdownCommit(hook: () => Future[Unit]): Unit = beforeShutdownCommit.set(Some(hook))
+
+  override protected def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome] =
+    given ExecutionContext = ec
+    val f = beforeShutdownCommit.getAndSet(None) match
+      case None => super.completeDeviceShutdown(storageDeviceId)
+      case Some(hook) => hook().flatMap(_ => super.completeDeviceShutdown(storageDeviceId))
+    f.map: outcome =>
+      synchronized:
+        shutdownOutcomes += outcome
+      outcome
+
+  /** Every transfer-in source read that has completed, in order. Recorded before Host's own
+   *  continuation runs, so on the suite's serial ExecutionContext a test that has seen the record
+   *  and then yields has also seen whatever Host did with the read. Lazy, as above. */
+  lazy val transferSourceReads: mutable.ListBuffer[StorageDeviceId] = mutable.ListBuffer[StorageDeviceId]()
+
+  override protected def readTransferSourceState(fromDeviceId: StorageDeviceId): Future[StorageDeviceState] =
+    given ExecutionContext = ec
+    super.readTransferSourceState(fromDeviceId).map: state =>
+      synchronized:
+        transferSourceReads += fromDeviceId
+      state
 
   /** Installs `sds` in the protected device map without it ever having been on disk.
    *

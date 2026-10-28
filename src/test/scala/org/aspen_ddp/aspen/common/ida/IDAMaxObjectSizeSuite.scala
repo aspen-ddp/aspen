@@ -67,6 +67,33 @@ class IDAMaxObjectSizeSuite extends AnyFunSuite with Matchers:
     Replication(3, 2).maxObjectSize(Long.MaxValue) should be (Int.MaxValue)
     ReedSolomon(5, 3, 4).maxObjectSize(Long.MaxValue) should be (Int.MaxValue)
 
+  for ida <- idas do
+    test(s"$ida minSliceSizeFor is the smallest slice limit admitting the desired object size"):
+      val desired = List(0, 1, 2, 7, 8, 9, 10, 11, 23, 24, 25, 1000, 4095, 4096, 4097, 65536,
+        10 * (1 << 20), 10 * (1 << 20) - 1, 10 * (1 << 20) + 1)
+
+      desired.foreach { n =>
+        val s = ida.minSliceSizeFor(n)
+        withClue(s"desired=$n, minSliceSizeFor=$s: ") {
+          s should be >= ida.minSliceSize.toLong
+          ida.maxObjectSize(s) should be >= n
+          // One byte less must not admit the object (or fall below the minimum slice size)
+          if s - 1 >= ida.minSliceSize then
+            ida.maxObjectSize(s - 1) should be < n
+        }
+      }
+
+  test("minSliceSizeFor sizes a pool so objects of exactly 10MiB fit"):
+    val tenMiB = 10 * (1 << 20)
+    ReedSolomon(14, 10, 12).minSliceSizeFor(tenMiB) should be ((1L << 20) + 1)
+    Replication(3, 2).minSliceSizeFor(tenMiB) should be (tenMiB.toLong)
+    val rars = RandomAccessReedSolomon(14, 10, 12, 4096)
+    rars.maxObjectSize(rars.minSliceSizeFor(tenMiB)) should be >= tenMiB
+
+  test("minSliceSizeFor rejects invalid sizes"):
+    an [IllegalArgumentException] should be thrownBy ReedSolomon(5, 3, 4).minSliceSizeFor(-1)
+    an [IllegalArgumentException] should be thrownBy RandomAccessReedSolomon(5, 3, 4, 8).minSliceSizeFor(Int.MaxValue)
+
   test("minSliceSize values"):
     Replication(3, 2).minSliceSize should be (1)
     ReedSolomon(5, 3, 4).minSliceSize should be (1)

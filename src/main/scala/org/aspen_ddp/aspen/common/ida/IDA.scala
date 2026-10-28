@@ -172,6 +172,20 @@ sealed abstract class IDA extends Ordered[IDA] {
     */
   def minSliceSize: Int
 
+  /** Smallest `maxSliceSize` that admits objects of `desiredMaxObjectSize` bytes. This is the inverse of
+    * `maxObjectSize` and lets applications work with round object sizes (e.g. exactly 10MiB) by sizing
+    * the slice limit to account for padding, trailers and row rounding:
+    * `maxObjectSize(minSliceSizeFor(n)) >= n`, and no smaller slice limit satisfies this.
+    *
+    * @throws IllegalArgumentException if `desiredMaxObjectSize` is negative or beyond what the IDA supports
+    */
+  def minSliceSizeFor(desiredMaxObjectSize: Int): Long =
+    require(desiredMaxObjectSize >= 0, s"desiredMaxObjectSize must not be negative: $desiredMaxObjectSize")
+    val needed = math.max(calculateEncodedSegmentLength(desiredMaxObjectSize), minSliceSize).toLong
+    require(needed > 0 && maxObjectSize(needed) >= desiredMaxObjectSize,
+      s"$desiredMaxObjectSize bytes exceeds the maximum object size supported by $this")
+    needed
+
   /** Returns the number of bytes needed to serialize the IDA type. */
   def getSerializedIDATypeLength: Int
 

@@ -29,7 +29,7 @@ object DeviceMarkers:
     writeHostId(devicePath, ShutdownStateFile, hostId)
 
   def removeShutdownState(devicePath: os.Path): Unit =
-    os.remove(devicePath / ShutdownStateFile)
+    DurableFiles.remove(devicePath / ShutdownStateFile)
 
   private def readHostId(file: os.Path): Option[HostId] =
     if os.exists(file) then
@@ -37,9 +37,8 @@ object DeviceMarkers:
     else
       None
 
-  // The temp file lives in the same directory so the rename is atomic. A crash can leave
-  // the temp file behind but never a partially written marker.
+  // Atomic and forced to disk before returning (DurableFiles.write): the shutdown reports a
+  // device safe to remove only after shutdown.state is written, and a lost owning-host would
+  // leave the device refusing to load on its own host.
   private def writeHostId(devicePath: os.Path, name: String, hostId: HostId): Unit =
-    val tmp = devicePath / s".$name.tmp"
-    os.write.over(tmp, hostId.uuid.toString)
-    os.move(tmp, devicePath / name, replaceExisting = true, atomicMove = true)
+    DurableFiles.write(devicePath / name, hostId.uuid.toString)

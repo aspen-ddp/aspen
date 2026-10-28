@@ -582,10 +582,21 @@ class Host(val client: AspenClient,
    *    marker. It was never opened on this device, so it has no CRL state to carry.
    *  Anything else -- a missing directory, a marker with no CRL file -- is a store whose close did
    *  not finish, and adopting it would drop the transactions its CRL state was holding.
+   *
+   *  The CRL file is parsed, not just found: a disk pulled before its save reached the platter
+   *  can come back with the file present but cut short, and loadStoreState rejects that. Its
+   *  header must also name this store, so a file copied from another store's directory does not
+   *  pass for this one's state.
    */
-  private def closedForAdoption(storePath: os.Path): Boolean =
+  private def closedForAdoption(storeId: StoreId, storePath: os.Path): Boolean =
+    def crlIntact: Boolean =
+      val file = Backend.crlSaveFile(storePath)
+      os.exists(file) &&
+        (try CrashRecoveryLog.loadStoreState(file)._1 == storeId
+         catch case _: Throwable => false)
+
     os.isDir(storePath) &&
-      ((os.exists(storePath / StoreTransfer.TransferOutMarkerFile) && os.exists(Backend.crlSaveFile(storePath))) ||
+      ((os.exists(storePath / StoreTransfer.TransferOutMarkerFile) && crlIntact) ||
         os.exists(storePath / StoreTransfer.TransferredInMarkerFile))
 
   /** Validates a device shut down by `previousHostId` and, if every Offline store was closed
@@ -603,13 +614,13 @@ class Host(val client: AspenClient,
     val deviceId = sdCfg.storageDeviceId
     val unclean = state.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Offline &&
-                               !closedForAdoption(path / storeId.directoryName) => storeId
+                               !closedForAdoption(storeId, path / storeId.directoryName) => storeId
     }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
 
     if unclean.nonEmpty then
       warnOnce(path, s"Storage device $deviceId at $path was shut down by host $previousHostId, but " +
                      s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory, " +
-                     s"transfer-out marker or CRL save file). Not adopting it. It may have been " +
+                     s"transfer-out marker, or intact CRL save file). Not adopting it. It may have been " +
                      s"removed too early: return it to that host to finish the shutdown")
     else
       logger.info(s"Adopting storage device $deviceId at $path, shut down by host $previousHostId")
@@ -1403,9 +1414,12 @@ class Host(val client: AspenClient,
                   val marker = stagedPath / StoreTransfer.TransferOutMarkerFile
                   if os.exists(marker) then
                     os.remove(marker)
-                  os.write.over(stagedPath / StoreTransfer.TransferredInMarkerFile,
-                                transferId.map(_.toString).getOrElse(""))
+                  // Durable, marker and move both: a copy that lands during a shutdown is
+                  // accepted by an adopter on the strength of this marker alone.
+                  DurableFiles.write(stagedPath / StoreTransfer.TransferredInMarkerFile,
+                                     transferId.map(_.toString).getOrElse(""))
                   os.move(stagedPath, finalPath)
+                  DurableFiles.syncDirectory(devicePath)
                   true
                 catch
                   case t: Throwable =>
@@ -1521,8 +1535,8 @@ class Host(val client: AspenClient,
               try
                 // Written before archiving, so it travels with the store and keeps this copy
                 // offline across restarts until the transfer is resolved one way or the other.
-                os.write.over(storePath / StoreTransfer.TransferOutMarkerFile,
-                              devEntry.transferId.map(_.toString).getOrElse(""))
+                DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile,
+                                   devEntry.transferId.map(_.toString).getOrElse(""))
                 storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
                   toHostState.address, toHostState.storeTransferPort, m.timestamp)
                 // The transfer may have been aborted after the reads above, and the abort's
@@ -1844,7 +1858,7 @@ class Host(val client: AspenClient,
       local.offlineStores += storeId
     val storePath = local.devicePath / storeId.directoryName
     try
-      os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
+      DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile, "")
       if ! os.exists(Backend.crlSaveFile(storePath)) then
         CrashRecoveryLog.saveStoreState(storeId, Nil, Backend.crlSaveFile(storePath))
     catch
@@ -2195,7 +2209,10 @@ class Host(val client: AspenClient,
           // steps read does not depend on how the store was closed.
           offlineStores += storeId
           local.offlineStores += storeId
-          os.write.over(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
+          // Forced to disk, as the CRL file ShutdownStore saved beside it was: once Shutdown
+          // commits the disk may be pulled at any moment, and an adopter refuses a store whose
+          // marker or CRL file did not survive.
+          DurableFiles.write(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
           gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
     .map(_ => ())
 

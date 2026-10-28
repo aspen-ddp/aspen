@@ -4,72 +4,87 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.codec
 import org.aspen_ddp.aspen.common.network.Codec
+import org.aspen_ddp.aspen.server.DurableFiles
 
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import scala.concurrent.{Future, Promise}
 
 object CrashRecoveryLog:
+  /** Writes `trsList` to `saveFilePath`, replacing it atomically and forcing it to disk before
+   *  returning (DurableFiles): the file is what lets a closed store, possibly on a disk pulled
+   *  right after its shutdown, resume its transactions wherever it is next loaded. */
   def saveStoreState(storeId: StoreId,
                      trsList: List[TransactionRecoveryState],
                      saveFilePath: os.Path): Unit =
+    DurableFiles.writeWith(saveFilePath): fos =>
+      val header = new Array[Byte](17)
 
-    val fos = os.write.over.outputStream(saveFilePath)
+      val storeIdHeader = ByteBuffer.wrap(header)
+      storeIdHeader.order(ByteOrder.BIG_ENDIAN)
+      storeIdHeader.putLong(storeId.poolId.uuid.getMostSignificantBits)
+      storeIdHeader.putLong(storeId.poolId.uuid.getLeastSignificantBits)
+      storeIdHeader.put(storeId.poolIndex)
 
-    val header = new Array[Byte](17)
+      fos.write(header)
 
-    val storeIdHeader = ByteBuffer.wrap(header)
-    storeIdHeader.order(ByteOrder.BIG_ENDIAN)
-    storeIdHeader.putLong(storeId.poolId.uuid.getMostSignificantBits)
-    storeIdHeader.putLong(storeId.poolId.uuid.getLeastSignificantBits)
-    storeIdHeader.put(storeId.poolIndex)
+      def write(trs: TransactionRecoveryState): Unit =
+        val entry = codec.StoreCRLEntry(trs = Some(Codec.encode(trs)))
 
-    fos.write(header)
+        val length = new Array[Byte](8)
+        val msg = entry.toByteArray
 
-    def write(trs: TransactionRecoveryState): Unit =
-      val entry = codec.StoreCRLEntry(trs = Some(Codec.encode(trs)))
+        ByteBuffer.wrap(length).order(ByteOrder.BIG_ENDIAN).putLong(msg.size)
 
-      val length = new Array[Byte](8)
-      val msg = entry.toByteArray
+        fos.write(length)
+        fos.write(msg)
 
-      ByteBuffer.wrap(length).order(ByteOrder.BIG_ENDIAN).putLong(msg.size)
+      trsList.foreach(trs => write(trs))
 
-      fos.write(length)
-      fos.write(msg)
+  /** Thrown by loadStoreState for a file that is shorter than its own framing says: a write
+   *  that never finished, or a file truncated by a crash. */
+  class TruncatedSaveFile(path: os.Path, what: String)
+    extends Exception(s"CRL save file $path is truncated: $what")
 
-    trsList.foreach(trs => write(trs))
-
-    fos.close()
-
+  /** Reads a file written by saveStoreState. Strict: a file cut short anywhere -- including a
+   *  zero-length one -- throws TruncatedSaveFile rather than loading as fewer transactions, so a
+   *  caller deciding whether a store's state is intact can rely on it. */
   def loadStoreState(saveFilePath: os.Path): (StoreId, List[TransactionRecoveryState]) =
     var trsList: List[TransactionRecoveryState] = Nil
     val fc = os.read.channel(saveFilePath)
+    try
+      def readFully(buf: ByteBuffer, what: String): Unit =
+        while buf.hasRemaining do
+          if fc.read(buf) < 0 then
+            throw TruncatedSaveFile(saveFilePath, what)
+        buf.position(0)
 
-    val header = ByteBuffer.allocate(17)
-    header.order(ByteOrder.BIG_ENDIAN)
-    fc.read(header)
-    header.position(0)
-    val msb = header.getLong()
-    val lsb = header.getLong()
-    val idx = header.get()
+      val header = ByteBuffer.allocate(17)
+      header.order(ByteOrder.BIG_ENDIAN)
+      readFully(header, "header")
+      val msb = header.getLong()
+      val lsb = header.getLong()
+      val idx = header.get()
 
-    val storeId = StoreId(org.aspen_ddp.aspen.common.pool.PoolId(new UUID(msb, lsb)), idx)
+      val storeId = StoreId(org.aspen_ddp.aspen.common.pool.PoolId(new UUID(msb, lsb)), idx)
 
-    while fc.position() < fc.size() do
-      val lbb = ByteBuffer.allocate(8)
-      lbb.order(ByteOrder.BIG_ENDIAN)
-      fc.read(lbb)
-      lbb.position(0)
-      val entryLength = lbb.getLong
+      while fc.position() < fc.size() do
+        val lbb = ByteBuffer.allocate(8)
+        lbb.order(ByteOrder.BIG_ENDIAN)
+        readFully(lbb, "entry length")
+        val entryLength = lbb.getLong
+        if entryLength < 0 || entryLength > fc.size() - fc.position() then
+          throw TruncatedSaveFile(saveFilePath, s"entry of $entryLength bytes")
 
-      val entryBytes = new Array[Byte](entryLength.toInt)
-      val entryBuf = ByteBuffer.wrap(entryBytes)
-      fc.read(entryBuf)
+        val entryBytes = new Array[Byte](entryLength.toInt)
+        readFully(ByteBuffer.wrap(entryBytes), "entry")
 
-      val m = codec.StoreCRLEntry.parseFrom(entryBytes)
-      trsList = Codec.decode(m.trs.get) :: trsList
+        val m = codec.StoreCRLEntry.parseFrom(entryBytes)
+        trsList = Codec.decode(m.trs.get) :: trsList
 
-    (storeId, trsList)
+      (storeId, trsList)
+    finally
+      fc.close()
 
 
 trait CrashRecoveryLog {

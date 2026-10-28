@@ -165,6 +165,21 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
   }
 
+  // An adopting host decides from this file whether a store's CRL state survived the move. A
+  // file cut short by a crash or a pulled disk must fail to load, never load as fewer entries.
+  test("A truncated CRL saved state file fails to load") {
+    val savePath = tdir / "crl_save_file.log"
+    CrashRecoveryLog.saveStoreState(storeId, List(trsValidTxd), savePath)
+    val full = os.read.bytes(savePath)
+    assert(CrashRecoveryLog.loadStoreState(savePath)._2.length == 1)
+    assert(os.list(tdir).map(_.last).toSet == Set("crl_save_file.log"))
+
+    // Zero length, mid-header, mid-length-prefix and mid-entry
+    for cut <- List(0, 9, 17 + 3, full.length - 1) do
+      os.write.over(savePath, full.take(cut))
+      assertThrows[CrashRecoveryLog.TruncatedSaveFile](CrashRecoveryLog.loadStoreState(savePath))
+  }
+
   test("SimpleCRL Drop Transaction Data") {
     val queue = new LinkedBlockingQueue[String]()
 

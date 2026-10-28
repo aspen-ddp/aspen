@@ -228,6 +228,31 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       stAfter.hostId should be(HostId.BootstrapHostId)
       host.loadedDevices.contains(deviceA) should be(true)
 
+  // A disk pulled before the save reached it, or one whose save file was copied from another
+  // store, must not be adopted: the CRL state the store needs is not in the file.
+  for (what, corrupt) <- List[(String, (os.Path, StoreId) => Unit)](
+        ("a truncated", (file, _) => os.write.over(file, "")),
+        ("another store's", (file, s) =>
+          CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file))) do
+    atest(s"a device with $what CRL save file is not adopted"):
+      given ExecutionContext = executionContext
+      for
+        stores <- setUpMetadata(oldHostId, DeviceStatus.Shutdown, 1, registerOldHost = true): ss =>
+                    Map(ss(0) -> offline)
+        s0 = stores.head
+        (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+        d0 = writeClosedStore(deviceDir, s0)
+        _ = corrupt(Backend.crlSaveFile(d0), s0)
+        host = newHost(hostRoot)
+        _ <- resolve(host)
+        st <- state(deviceA)
+      yield
+        host.adoptCalls.toList should be(Nil)
+        host.loadedDevices.contains(deviceA) should be(false)
+        host.deviceDirWarnings.count(_._1 == deviceDir) should be(1)
+        st.status should be(DeviceStatus.Shutdown)
+        st.hostId should be(oldHostId)
+
   atest("a device whose shutdown did not finish is refused by another host"):
     given ExecutionContext = executionContext
     for

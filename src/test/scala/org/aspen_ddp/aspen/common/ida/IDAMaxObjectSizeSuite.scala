@@ -29,6 +29,30 @@ class IDAMaxObjectSizeSuite extends AnyFunSuite with Matchers:
           withClue(s"slice size $s, n=$n: ") { (next > s || atCap) should be (true) }
       }
 
+  for ida <- idas do
+    test(s"$ida encoding a maxObjectSize object produces slices within the slice limit"):
+      List(ida.minSliceSize.toLong + 50, 1000L, 4096L, 1L << 20).foreach { s =>
+        val n = ida.maxObjectSize(s)
+        val content = Array.tabulate[Byte](n)(i => (i * 31 + 7).toByte)
+
+        val slices = ida.encode(content)
+        slices.foreach(slice => withClue(s"slice limit $s, n=$n: ") { slice.length.toLong should be <= s })
+
+        val restored = ida.restoreArray(slices.zipWithIndex.take(ida.restoreThreshold).map((a, i) => (i.toByte, a)).toList)
+        restored.toSeq should be (content.toSeq)
+
+        // One byte more must not fit, unless the Int.MaxValue cap applies
+        val over = ida.encode(new Array[Byte](n + 1))
+        withClue(s"slice limit $s, n+1=${n + 1}: ") { over.map(_.length.toLong).max should be > s }
+      }
+
+  test("ReedSolomon(14,10,12) with a 1MiB slice limit rejects exactly 10MiB because of padding"):
+    val ida = ReedSolomon(14, 10, 12)
+    val limit = 1L << 20
+    ida.maxObjectSize(limit) should be (10 * (1 << 20) - 1)
+    ida.encode(new Array[Byte](10 * (1 << 20) - 1)).foreach(_.length.toLong should be (limit))
+    ida.encode(new Array[Byte](10 * (1 << 20))).foreach(_.length.toLong should be (limit + 1))
+
   test("ReedSolomon(14,10,12).maxObjectSize(1000) == 9999"):
     ReedSolomon(14, 10, 12).maxObjectSize(1000) should be (9999)
 

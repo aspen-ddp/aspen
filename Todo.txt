@@ -1,16 +1,6 @@
 TODO
 ====
 
-Test that size restrictions are enforced when using erasure-coding that adds padding bytes
-  - Potential problem: ReedSolmon with read threshold of 10 and a backend that restricts to 1Mib
-    slices. maxObjectSize is calculated to be 10Mib. If a client actually tries to write exactly 10Mib,
-    would the padding added by the IDA cause the encoded slice to exceed 1Mib in size?
-  - If so we need to account for this
-    - maxObjectSize could be reduced by the size of the padding
-    - backends could account for this and use maximum slice sizes a few bytes beyond a round number
-      like 1Mib to allow users to work with round-numbered object sizes like 1Mib.
-    - Alternative suggestions are welcome
-
 move common.metadata.BootstrapConfig & ClientConfig to common.config package
 
 move store.backend.BufferredConsistentRocksDB and store.backend.RocksDBBackend to dedicated store.backend.rocksdb

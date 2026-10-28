@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StoreMoved}
+import org.aspen_ddp.aspen.common.network.{CheckStorageDevice, StartStoreTransfer, StoreMoved}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -413,6 +413,9 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       _ <- forceShuttingDown(deviceA)
       _ <- waitForTransactionsToComplete()
       _ = oldHost.testingOnlyCheckAllDevices()
+      // The rebuild ignores its cancel, so the shutdown proceeds only once its wait times out.
+      _ <- pumpUntil(oldHost.shutdownWorkTimeouts.nonEmpty)
+      _ = oldHost.fireShutdownWorkTimeouts()
       _ <- pumpUntil(!oldHost.loadedDevices.contains(deviceA))
       // The rebuild, past its last read, lands its store and finishes on the unloaded device.
       d0Old = oldDir / s0.directoryName
@@ -439,3 +442,86 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
       st.stores(s0).status should be(StoreStatus.Active)
       os.exists(marker(newDir / s0.directoryName)) should be(false)
       host.storeLoadAttempts.map(_._2) should contain(newDir / s0.directoryName)
+
+  private val destHostId = HostId(UUID.fromString("0a0a0a0a-0000-0000-0000-000000000002"))
+
+  private def startTransfers(): List[StartStoreTransfer] =
+    net.takeCapturedHostMessages().collect { case m: StartStoreTransfer => m }
+
+  /** deviceA, owned by the old host, sending its one store to deviceB on a third host whose
+   *  RecordingHost (`dest`) has already asked the old host for it. deviceA is then shut down and
+   *  carried to the adopting RecordingHost (`host`), which adopts it. Returns the store, the
+   *  first request, and both hosts. */
+  private def adoptTransferSource(transfers: StagedTransferService,
+                                  sends: StagedSendService)
+      : Future[(StoreId, StartStoreTransfer, RecordingHost, RecordingHost)] =
+    given ExecutionContext = executionContext
+    val transferId = UUID.randomUUID()
+    for
+      stores <- setUpMetadata(oldHostId, DeviceStatus.Operational, 1, registerOldHost = true): ss =>
+                  Map(ss(0) -> StoreEntry(StoreStatus.TransferringOut, Some(deviceB), Some(transferId)))
+      s0 = stores.head
+      _ <- client.createHost("dest-host", "10.0.0.10", 5760, 5761, 5762, destHostId)
+      _ <- net.createDevice(deviceB)
+      _ <- setDeviceState(deviceB)(_.copy(hostId = destHostId,
+             stores = Map(s0 -> StoreEntry(StoreStatus.TransferringIn, Some(deviceA), Some(transferId)))))
+      _ <- waitForTransactionsToComplete()
+      destRoot = newHostDir()
+      _ = writeDevice(destRoot, "dev0", deviceB, owner = Some(destHostId))
+      dest = newHost(destRoot, transferService = transfers, hostId = destHostId)
+      _ = net.takeCapturedHostMessages()
+      _ = dest.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(s0))
+      firstAsk = startTransfers()
+      _ <- setDeviceState(deviceA)(_.copy(status = DeviceStatus.Shutdown))
+      (hostRoot, deviceDir) = writeCarriedDevice(oldHostId, oldHostId)
+      // The transfer's own marker, as the old host's transfer out left it.
+      _ = writeClosedStore(deviceDir, s0)
+      host = newHost(hostRoot, transferService = sends)
+      _ <- resolve(host)
+      _ = net.takeCapturedHostMessages()
+    yield (s0, firstAsk.head, dest, host)
+
+  /** Hands `ask` to `host` as its event loop would and waits for the send to begin. */
+  private def deliver(host: RecordingHost, sends: StagedSendService, ask: StartStoreTransfer): Future[Unit] =
+    given ExecutionContext = executionContext
+    for
+      _ <- host.testingOnlyStartStoreTransferOut(ask)
+      _ <- pumpUntil(sends.transfersOut.nonEmpty)
+    yield ()
+
+  atest("a retransmitted transfer request follows its source device to the adopting host"):
+    given ExecutionContext = executionContext
+    val transfers = new StagedTransferService
+    val sends = new StagedSendService
+    for
+      (s0, firstAsk, dest, host) <- adoptTransferSource(transfers, sends)
+      // The re-send goes out to the address held, then again once the source is re-read.
+      _ = dest.retransmitPendingStartTransfers(force = true)
+      _ <- pumpUntil(net.capturedHostMessages.exists:
+             case m: StartStoreTransfer => m.toHost == HostId.BootstrapHostId
+             case _ => false)
+      resent = startTransfers()
+      _ <- deliver(host, sends, resent.last)
+    yield
+      firstAsk.toHost should be(oldHostId)
+      resent.map(_.toHost) should be(List(oldHostId, HostId.BootstrapHostId))
+      resent.last.transferUUID should be(firstAsk.transferUUID)
+      sends.transfersOut.map(_._1) should be(Vector(s0))
+
+  atest("a retried transfer in asks the host that has since adopted its source"):
+    given ExecutionContext = executionContext
+    val transfers = new StagedTransferService
+    val sends = new StagedSendService
+    for
+      (s0, firstAsk, dest, host) <- adoptTransferSource(transfers, sends)
+      _ = transfers.failTransferIn(s0)
+      _ <- pumpUntil(dest.testingOnlyScheduledTransferInRetries.contains(s0))
+      _ = dest.testingOnlyRetryTransferIns()
+      _ <- pumpUntil(net.capturedHostMessages.exists(_.isInstanceOf[StartStoreTransfer]))
+      retried = startTransfers()
+      _ <- deliver(host, sends, retried.head)
+    yield
+      firstAsk.toHost should be(oldHostId)
+      retried.map(_.toHost) should be(List(HostId.BootstrapHostId))
+      sends.transfersOut.map(_._1) should be(Vector(s0))

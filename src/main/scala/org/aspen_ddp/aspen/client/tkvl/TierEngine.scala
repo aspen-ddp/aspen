@@ -83,13 +83,19 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     *
     * A failing `fn`, whether it returns a failed future or throws, is logged and the walk continues to the next
     * key. A failing read fails the returned future. `fn` is handed the node holding the key.
+    *
+    * `stopWhen` is checked before each entry is handed to `fn` and before each node to the right is read. Once it
+    * holds, the walk ends successfully without reading anything more, so a consumer that has given up (a cancelled
+    * store rebuild) stops issuing reads at once rather than walking the rest of the tree as no-ops.
     */
-  def foreach(fn: (ListNode, Key, Value) => Future[Unit]): Future[Unit] =
-    walk(Key.AbsoluteMinimum, "foreach", (_, _) => true, (_, _) => false, fn)
+  def foreach(fn: (ListNode, Key, Value) => Future[Unit], stopWhen: () => Boolean = () => false): Future[Unit] =
+    walk(Key.AbsoluteMinimum, "foreach", (_, _) => true, (_, _) => false, fn, stopWhen)
 
   /** Visits every entry at or above `minKey`, in ascending key order. The bound is inclusive. See `foreach`. */
-  def foreachFrom(minKey: Key, fn: (ListNode, Key, Value) => Future[Unit]): Future[Unit] =
-    walk(minKey, "foreachFrom", (_, _) => true, (_, _) => false, fn)
+  def foreachFrom(minKey: Key,
+                  fn: (ListNode, Key, Value) => Future[Unit],
+                  stopWhen: () => Boolean = () => false): Future[Unit] =
+    walk(minKey, "foreachFrom", (_, _) => true, (_, _) => false, fn, stopWhen)
 
   /** Visits every entry in `[minKey, maxKey)`, in ascending key order. A node whose minimum is at or above `maxKey`
     * holds nothing in range and neither does anything to its right, so the walk ends without reading it.
@@ -110,7 +116,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
                    label: String,
                    below: (Key, KeyOrdering) => Boolean,
                    past: (Key, KeyOrdering) => Boolean,
-                   fn: (ListNode, Key, Value) => Future[Unit]): Future[Unit] =
+                   fn: (ListNode, Key, Value) => Future[Unit],
+                   stopWhen: () => Boolean = () => false): Future[Unit] =
 
     def inRange(node: ListNode): List[(Key, Value)] =
       node.entries.filter((k, _) => node.ordering.compare(k, minKey) >= 0 && below(k, node.ordering))
@@ -120,6 +127,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     def advance(node: ListNode): Future[Unit] = visit(node, inRange(node))
 
     def visit(node: ListNode, entries: List[(Key, Value)]): Future[Unit] = entries match
+      case _ if stopWhen() => Future.unit
+
       case (key, value) :: rest =>
         Future.delegate(fn(node, key, value)).transformWith:
           case Failure(err) =>

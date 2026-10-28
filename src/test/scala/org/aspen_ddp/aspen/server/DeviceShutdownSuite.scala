@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.common.network.{StartStoreTransfer, StoreOffline}
+import org.aspen_ddp.aspen.common.network.{StartStoreTransfer, StoreMoved, StoreOffline}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host.ShutdownOutcome
@@ -421,4 +421,147 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
     yield
       host.loadedDevices.contains(deviceA) should be(false)
       st.stores(creating) should be(initializing)
+      st.status should be(DeviceStatus.Shutdown)
+
+  private val rebuilding = StoreEntry(StoreStatus.Rebuilding, None)
+
+  private val otherHostId = HostId(UUID.fromString("0b0b0b0b-0000-0000-0000-000000000001"))
+
+  atest("a transfer finishing onto a device another host now owns writes nothing"):
+    given ExecutionContext = executionContext
+    val host = newHost(newHostDir())
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    val destId = net.secondDeviceId
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, destId)
+      _ <- waitForTransactionsToComplete()
+      // The destination was shut down and adopted elsewhere while the bytes were in flight.
+      _ <- setDeviceState(destId)(_.copy(hostId = otherHostId))
+      poolBefore <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      srcBefore <- state(net.storageDeviceId)
+      dstBefore <- state(destId)
+      _ = net.takeCapturedGossip()
+      outcome <- host.testingOnlyUpdateStateForTransferredStore(movingStore, net.storageDeviceId, destId)
+      _ <- waitForTransactionsToComplete()
+      poolAfter <- client.getStoragePoolState(PoolId.BootstrapPoolId)
+      srcAfter <- state(net.storageDeviceId)
+      dstAfter <- state(destId)
+    yield
+      outcome should be(Host.TransferOutcome.NotOwned)
+      poolAfter.stores.toList should be(poolBefore.stores.toList)
+      srcAfter should be(srcBefore)
+      dstAfter should be(dstBefore)
+      net.takeCapturedGossip().collect { case g: StoreMoved => g } should be(Nil)
+
+  atest("a rebuild finishing on a device another host now owns writes nothing and keeps the copy"):
+    given ExecutionContext = executionContext
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> rebuilding), rebuilds = rebuilds)
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(rebuilds.created.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ <- setDeviceState(deviceA)(_.copy(hostId = otherHostId))
+      _ = os.makeDir.all(deviceDir / s0.directoryName)
+      _ = rebuilds.created.head.promise.success(())
+      _ <- pumpUntil(host.rebuildOutcomes.contains((deviceA, s0)))
+      st <- state(deviceA)
+    yield
+      host.rebuildOutcomes((deviceA, s0)) should be(Host.RebuildOutcome.NotOwned)
+      st.stores(s0) should be(rebuilding)
+      st.hostId should be(otherHostId)
+      host.loadStoreByIdRequests.toList should be(Nil)
+      // Left for the owner, whose rebuild finds the store in place and only flips it.
+      os.exists(deviceDir / s0.directoryName) should be(true)
+      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
+
+  /** setUp with s0 Rebuilding under a RecordedRebuild, which ignores cancel() as a rebuild whose
+   *  walk is still reading does, and s1 Active and open. The shutdown is requested and checked,
+   *  and has reached its wait for the rebuild. */
+  private def shutDownDuringRebuild(): Future[(RecordingHost, os.Path, RecordingRebuildFactory)] =
+    given ExecutionContext = executionContext
+    val rebuilds = new RecordingRebuildFactory
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> rebuilding, s1 -> active), loaded = Set(s1), rebuilds = rebuilds)
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(rebuilds.created.nonEmpty && host.testingOnlyActiveDeviceChecks.isEmpty)
+      _ <- client.shutdownStorageDevice(deviceA)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(host.shutdownWorkTimeouts.nonEmpty)
+    yield (host, deviceDir, rebuilds)
+
+  atest("shutdown waits for a cancelled rebuild to stop before closing the device's stores"):
+    given ExecutionContext = executionContext
+    for
+      (host, deviceDir, rebuilds) <- shutDownDuringRebuild()
+      closesWhileWaiting = host.shutdownCloses.toList
+      outcomesWhileWaiting = host.shutdownOutcomes.toList
+      // The walk ends and the rebuilt store lands, after the shutdown request.
+      _ = os.makeDir.all(deviceDir / s0.directoryName)
+      _ = rebuilds.created.head.promise.success(())
+      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      st <- state(deviceA)
+    yield
+      host.shutdownWorkTimeouts.map(_._1).toList should be(List(deviceA))
+      rebuilds.created.head.cancelled should be(true)
+      closesWhileWaiting should be(Nil)
+      outcomesWhileWaiting should be(Nil)
+      host.shutdownCloses.toList should be(List(s1))
+      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      // Kept offline as the shutdown's own closes are, before Shutdown committed.
+      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      st.stores(s0).status should be(StoreStatus.Offline)
+      st.status should be(DeviceStatus.Shutdown)
+
+  atest("a shutdown whose cancelled rebuild does not stop proceeds once its timeout passes"):
+    given ExecutionContext = executionContext
+    for
+      (host, _, rebuilds) <- shutDownDuringRebuild()
+      closesWhileWaiting = host.shutdownCloses.toList
+      _ = host.fireShutdownWorkTimeouts()
+      _ <- pumpUntil(!host.loadedDevices.contains(deviceA))
+      st <- state(deviceA)
+    yield
+      closesWhileWaiting should be(Nil)
+      rebuilds.created.head.promise.isCompleted should be(false)
+      host.shutdownCloses.toList should be(List(s1))
+      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      // Left as a crash leaves it, for the rebuild to resume after a restart or adoption.
+      st.stores(s0) should be(rebuilding)
+      st.status should be(DeviceStatus.Shutdown)
+
+  atest("shutdown waits for a transfer in's pool update already in flight"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val destId = net.secondDeviceId
+    val deviceDir = writeDevice(hostRoot, "dev0", destId)
+    val transfers = new StagedTransferService
+    val host = newHost(hostRoot, transferService = transfers)
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, destId)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(transfers.startedTransfersIn.contains(movingStore))
+      gate = host.holdTransferOutcomes()
+      _ = transfers.finishTransferIn(movingStore)
+      _ <- pumpUntil(os.exists(deviceDir / movingStore.directoryName / StoreTransfer.TransferredInMarkerFile))
+      _ <- client.shutdownStorageDevice(destId)
+      _ <- waitForTransactionsToComplete()
+      _ = host.testingOnlyCheckAllDevices()
+      _ <- pumpUntil(host.shutdownWorkTimeouts.nonEmpty)
+      outcomesWhileWaiting = host.shutdownOutcomes.toList
+      _ = gate.success(())
+      _ <- pumpUntil(!host.loadedDevices.contains(destId))
+      st <- state(destId)
+    yield
+      outcomesWhileWaiting should be(Nil)
+      host.transferOutcomes(movingStore) should be(Host.TransferOutcome.PoolRepointedOffline)
+      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+      st.stores(movingStore).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)

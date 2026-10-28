@@ -364,7 +364,26 @@ private class RecordingHost(mgrClient: AspenClient,
     super.markRebuiltStoreActive(storageDeviceId, storeId).map: outcome =>
       synchronized:
         rebuildFlipSeq += ((storageDeviceId, storeId) -> rebuildEventSeq.incrementAndGet())
+        rebuildOutcomes += ((storageDeviceId, storeId) -> outcome)
       outcome
+
+  /** The outcome of every completed markRebuiltStoreActive, by (deviceId, storeId). Lazy, as above. */
+  lazy val rebuildOutcomes: mutable.Map[(StorageDeviceId, StoreId), RebuildOutcome] =
+    mutable.Map[(StorageDeviceId, StoreId), RebuildOutcome]()
+
+  /** Every shutdown-work timeout a shutdown has scheduled, by device, in order. Recorded rather
+   *  than timed: NoBackgroundTaskManager never fires anything, so a test fires these itself
+   *  with fireShutdownWorkTimeouts. Lazy, as above. */
+  lazy val shutdownWorkTimeouts: mutable.ListBuffer[(StorageDeviceId, () => Unit)] =
+    mutable.ListBuffer[(StorageDeviceId, () => Unit)]()
+
+  override protected def scheduleShutdownWorkTimeout(storageDeviceId: StorageDeviceId)(fn: => Unit): Unit =
+    synchronized:
+      shutdownWorkTimeouts += ((storageDeviceId, () => fn))
+
+  /** Runs every recorded shutdown-work timeout, as if shutdownWorkTimeout had elapsed. */
+  def fireShutdownWorkTimeouts(): Unit =
+    synchronized(shutdownWorkTimeouts.toList).foreach(_._2())
 
   override def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     synchronized:

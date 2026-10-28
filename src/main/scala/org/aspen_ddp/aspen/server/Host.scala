@@ -101,6 +101,12 @@ object Host:
      *  another device, the pool names that one, and the destination's stale entry is removed. */
     case Aborted
 
+    /** The destination device now names another host: it was shut down and adopted while this
+     *  host's pool update was still in flight. Nothing was written. The arrived copy is left as
+     *  it is, behind its transferred-in marker, for the owner's reconcile to finish: its
+     *  TransferringIn pass finds the promoted copy and runs this update itself. */
+    case NotOwned
+
   /** What markRebuiltStoreActive decided about a rebuilt store, so its caller knows whether the
    *  device is allowed to adopt the copy the rebuild placed.
    *
@@ -123,6 +129,12 @@ object Host:
      *  the entry vanished, or the entry has a status other than Rebuilding/Active. The rebuilt
      *  store belongs to nobody and must be discarded. */
     case Discard
+
+    /** The device now names another host: it was shut down and adopted while the rebuild was
+     *  finishing. Nothing was written and the rebuilt copy is left in place. The owner's
+     *  reconcile restarts the rebuild, which finds the store already at its final path and only
+     *  flips the entry. */
+    case NotOwned
 
   /** What completeDeviceShutdown decided, so shutDownDevice knows whether to unload the device,
    *  go round again, or undo its own on-disk work.
@@ -159,8 +171,9 @@ object Host:
     def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace
 
   /** `toDeviceId` is the local device receiving the store, so a check of that device can tell
-   *  which of its transfers in the tree no longer records. */
-  class PendingTransfer(val msg: StartStoreTransfer,
+   *  which of its transfers in the tree no longer records. `msg` is re-addressed (see
+   *  Host.readdressPendingTransfer) when its source device turns out to have moved host. */
+  class PendingTransfer(var msg: StartStoreTransfer,
                         val toDeviceId: StorageDeviceId,
                         var lastSend: HLCTimestamp)
 
@@ -201,7 +214,11 @@ class Host(val client: AspenClient,
                    /** How often storage-devices/ is listed for newly present device directories.
                     *  Only the local directory scan runs this often. The network-reading
                     *  reconcile of every loaded device stays on checkStorageDevicePeriod. */
-                   val deviceScanPeriod: Duration = Duration(10, SECONDS)) extends Logging with RepairTarget {
+                   val deviceScanPeriod: Duration = Duration(10, SECONDS),
+                   /** How long a device shutdown waits for the work it cancelled -- rebuilds,
+                    *  transfer-in pool updates already in flight -- to stop before it closes the
+                    *  device's stores anyway. See awaitShutdownWork. */
+                   val shutdownWorkTimeout: Duration = Duration(60, SECONDS)) extends Logging with RepairTarget {
   import Host._
   
   given ExecutionContext = ec
@@ -252,6 +269,12 @@ class Host(val client: AspenClient,
   private var offlineStores: Set[StoreId] = Set()
   private var creatingStores: Set[StoreId] = Set()
   private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
+  // Completed when the rebuild of each store in rebuildingStores has released its slot, its
+  // outcome acted on. What a shutdown waits on for the rebuilds it cancels.
+  private var rebuildsSettled: Map[StoreId, Promise[Unit]] = Map()
+  // The pool updates of transfers in now running (recordTransferIn), with the device receiving
+  // each, completed once its outcome has been acted on. A shutdown of that device waits on them.
+  private var recordingTransfersIn: Map[StoreId, (StorageDeviceId, Promise[Unit])] = Map()
   // The transfer UUID of each store this host is currently receiving. Stores being shipped out
   // are tracked by storeTransferService, which is what knows when a send has ended.
   private var transferringIn: Map[StoreId, UUID] = Map()
@@ -293,14 +316,47 @@ class Host(val client: AspenClient,
     retransmitPendingStartTransfers()
 
   /** Re-sends the StartStoreTransfer of every transfer in that has not yet completed and was last
-   *  sent more than 30 s ago. `force` skips the age check so tests need not wait it out. */
+   *  sent more than 30 s ago. `force` skips the age check so tests need not wait it out.
+   *
+   *  Each re-send also re-reads the source device, and if the device now names another host the
+   *  request is re-addressed and sent again there: a source shut down and adopted elsewhere
+   *  would otherwise be asked for at its old host for as long as the attempt lives, since the
+   *  reconcile's TransferringIn pass never starts a second attempt while this one holds the store
+   *  in transferringIn. The re-send itself stays synchronous and goes to the address already
+   *  held, so a failed or slow read costs nothing over not reading at all.
+   */
   private[aspen] def retransmitPendingStartTransfers(force: Boolean = false): Unit = synchronized {
     val now = HLCTimestamp.now
     pendingStartTransfers.valuesIterator.foreach: pt =>
       if force || now - pt.lastSend > Duration(30, SECONDS) then
         pt.lastSend = now
         client.sendHostMessage(pt.msg)
+        val fsource =
+          try readTransferSourceState(pt.msg.fromDevice)
+          catch case t: Throwable => Future.failed(t)
+        fsource.onComplete:
+          case Success(source) =>
+            synchronized:
+              // Not re-sent if the attempt ended while the read was out.
+              if pendingStartTransfers.get(pt.msg.storeId).contains(pt) && readdressPendingTransfer(pt, source) then
+                client.sendHostMessage(pt.msg)
+          case Failure(t) =>
+            logger.warn(s"Failed to re-read source device ${pt.msg.fromDevice} of the transfer in of " +
+                        s"store ${pt.msg.storeId}. Its request stays addressed to host ${pt.msg.toHost}. Error: $t")
   }
+
+  /** Points a pending transfer's request at `source`'s current host when that has changed, so
+   *  the next send reaches a source that has been adopted by another host. A failed source keeps
+   *  its address: its zeroed host id names nobody, and the reconcile abandons the transfer.
+   *  Returns whether the address changed. Caller holds the instance lock. */
+  private def readdressPendingTransfer(pt: PendingTransfer, source: StorageDeviceState): Boolean =
+    if !source.isFailed && source.hostId != pt.msg.toHost then
+      logger.info(s"Source device ${pt.msg.fromDevice} of the transfer in of store ${pt.msg.storeId} " +
+                  s"is now on host ${source.hostId}, not ${pt.msg.toHost}. Asking there")
+      pt.msg = pt.msg.copy(toHost = source.hostId)
+      true
+    else
+      false
 
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
     events.put(HeartbeatEvent())
@@ -915,7 +971,7 @@ class Host(val client: AspenClient,
         // without that, the moved store's old host reaches generateBootstrapConfig with no stores
         // and trips its require(storesOnHost.nonEmpty).
         _ <-
-          if toDev.isFailed then
+          if toDev.isFailed || toDev.hostId != hostId then
             Future.unit
           else
             BootstrapConfig.prepRadicleUpdate(client, storeId, poolCfg, toDev.hostId)(using tx)
@@ -945,6 +1001,15 @@ class Host(val client: AspenClient,
 
           TransferOutcome.SourceRestored
 
+        // The destination was shut down and adopted by another host while this update was
+        // pending. Only its owner may write its entries or announce where the store lives, so
+        // nothing is written here; that host's reconcile resumes this update from the arrived
+        // copy, which stays behind its transferred-in marker.
+        else if toDev.hostId != hostId then
+          logger.info(s"Transfer of store $storeId onto device $toDeviceid finished after the " +
+                      s"device moved to host ${toDev.hostId}. Leaving the pool update to that host")
+          TransferOutcome.NotOwned
+
         // Aborted (AspenClient.abortStoreTransfer) while the bytes were in flight, which puts the
         // source back to Active and leaves the pool naming it. Repointing the pool now would
         // complete a transfer its initiator has been told never happened.
@@ -958,7 +1023,9 @@ class Host(val client: AspenClient,
         // If the from device doesn't contain the storeId, we're already done.
         // A concurrent call to this method must have succeeded
         else if fromDev.stores.contains(storeId) then
-          poolCfg.stores(storeId.poolIndex) = StoragePoolState.StoreEntry(hostId, toDeviceid)
+          // toDev.hostId, which the guard above has established is this host: the pool names the
+          // device's owner, never merely whoever ran the update.
+          poolCfg.stores(storeId.poolIndex) = StoragePoolState.StoreEntry(toDev.hostId, toDeviceid)
           val poolReqs = List(KeyRevision(StoragePoolState.ConfigKey, poolKvos.contents(StoragePoolState.ConfigKey).revision))
           val poolOps = List(Insert(StoragePoolState.ConfigKey, poolCfg.encode()))
           tx.update(poolPtr, None, None, poolReqs, poolOps)
@@ -1001,7 +1068,7 @@ class Host(val client: AspenClient,
             // config, so its timestamp is the config value's. An Offline entry is announced
             // too, followed by its StoreOffline: the store does live here now, it just does not
             // answer until its device is back in service.
-            gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp, HLCTimestamp.now))
+            gossipRetransmitter.broadcast(StoreMoved(storeId, toDev.hostId, timestamp, HLCTimestamp.now))
             if newEntry.status == StorageDeviceState.StoreStatus.Offline then
               gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
 
@@ -1159,7 +1226,7 @@ class Host(val client: AspenClient,
     def current: Boolean =
       transferInRetries.contains(storeId) && transferringIn.get(storeId).contains(transferUUID)
 
-    def restart(entryState: scala.util.Try[StorageDeviceState]): Unit = synchronized {
+    def restart(entryState: scala.util.Try[StorageDeviceState], sourceHostId: HostId): Unit = synchronized {
       if current then
         transferInRetries -= storeId
         transferringIn -= storeId
@@ -1176,7 +1243,7 @@ class Host(val client: AspenClient,
                         s"store $storeId. Retrying anyway. Error: $t")
             true
         if stillWanted then
-          startStoreTransferIn(storeId, fromHostId, fromDeviceId, toDeviceid, transferId)
+          startStoreTransferIn(storeId, sourceHostId, fromDeviceId, toDeviceid, transferId)
         else
           logger.info(s"Not retrying the transfer in of store $storeId: device $toDeviceid no " +
                       s"longer records it as transferring in from device $fromDeviceId")
@@ -1187,7 +1254,17 @@ class Host(val client: AspenClient,
         val fstate =
           try client.getStorageDeviceState(toDeviceid)
           catch case t: Throwable => Future.failed(t)
-        fstate.onComplete(restart)
+        // The source's owner is re-read too: the device may have been shut down and adopted by
+        // another host since the failed attempt asked for it. A failed read keeps the old one.
+        val fsourceHost =
+          (try readTransferSourceState(fromDeviceId) catch case t: Throwable => Future.failed(t))
+            .map(source => if source.isFailed then fromHostId else source.hostId)
+            .recover:
+              case t =>
+                logger.warn(s"Failed to re-read source device $fromDeviceId before retrying the " +
+                            s"transfer in of store $storeId. Asking host $fromHostId. Error: $t")
+                fromHostId
+        fstate.transformWith(st => fsourceHost.map(h => (st, h))).foreach((st, h) => restart(st, h))
     }
 
     logger.info(s"Retrying the transfer in of store $storeId in $TransferInRetryDelay")
@@ -1254,9 +1331,18 @@ class Host(val client: AspenClient,
                                transferUUID: UUID,
                                fromDeviceId: StorageDeviceId,
                                toDeviceid: StorageDeviceId): Unit =
+    // Registered before the update starts, so a shutdown of toDeviceid that begins at any point
+    // from here on finds it and waits for it.
+    val settled = Promise[Unit]()
+    synchronized:
+      recordingTransfersIn += storeId -> (toDeviceid, settled)
+
     def finished(): Unit = synchronized {
       if transferringIn.get(storeId).contains(transferUUID) then
         transferringIn -= storeId
+      if recordingTransfersIn.get(storeId).exists(_._2 eq settled) then
+        recordingTransfersIn -= storeId
+      settled.trySuccess(())
     }
 
     // Loading is downstream of the metadata decision, not ahead of it. An unconditional load
@@ -1299,6 +1385,11 @@ class Host(val client: AspenClient,
 
           case Success(TransferOutcome.SourceRestored) | Success(TransferOutcome.Aborted) =>
             discardArrivedTransferIn(storeId, toDeviceid)
+
+          case Success(TransferOutcome.NotOwned) =>
+            // Not ours to load or discard. Its device is not loaded here either, or will not be
+            // for long: a shutdown unloaded it before the move.
+            ()
 
           case Failure(t) =>
             // The only observer this Future has. Its onFail routes the permanent errors to
@@ -1660,8 +1751,13 @@ class Host(val client: AspenClient,
         val sr = storeRebuildFactory.createRebuild(
           client, storeId, local.storageDeviceId, local.devicePath)
 
+        val settled = Promise[Unit]()
+
         def release(): Unit = synchronized:
           rebuildingStores -= storeId
+          if rebuildsSettled.get(storeId).exists(_ eq settled) then
+            rebuildsSettled -= storeId
+          settled.trySuccess(())
 
         def recheckAll(): Unit =
           synchronized(storageDevices.keys).foreach(checkStorageDevice)
@@ -1699,6 +1795,7 @@ class Host(val client: AspenClient,
 
         synchronized:
           rebuildingStores += storeId -> sr
+          rebuildsSettled += storeId -> settled
 
         // The pool already names this device, so peers would otherwise pick a store that cannot
         // answer until the rebuild completes
@@ -1732,6 +1829,16 @@ class Host(val client: AspenClient,
                 finally
                   release()
                   recheckAll()
+
+              case Success(RebuildOutcome.NotOwned) =>
+                // The device is another host's now; the copy is left for it. Only the other
+                // devices are worth re-checking: this one is not ours to reconcile.
+                try
+                  logger.info(s"Rebuild of store $storeId finished after device " +
+                              s"${local.storageDeviceId} moved to another host. Leaving it to that host")
+                finally
+                  release()
+                  recheckOtherDevices()
 
               case Failure(t) =>
                 // The only observer this Future has. Its onFail routes the permanent errors to
@@ -1778,7 +1885,8 @@ class Host(val client: AspenClient,
    *
    *  The device may have been tombstoned or removed from the tree between a rebuild starting and
    *  finishing. Reading the state inside the transaction and checking isFailed before the status
-   *  check ensures the decision is made from current metadata, not stale assumptions.
+   *  check ensures the decision is made from current metadata, not stale assumptions. A device
+   *  that has since been adopted by another host reads NotOwned, and nothing is written.
    *
    *  Only a collision is retried. Retrying a permanent error -- getStorageDevicePointer's
    *  NoSuchElementException, an unreadable device object -- would never complete the future, and
@@ -1798,6 +1906,10 @@ class Host(val client: AspenClient,
         // drain is moving the store elsewhere, so two hosts serve a live copy of the same StoreId.
         if state.isFailed then
           RebuildOutcome.Discard
+        // Shut down and adopted by another host while the rebuild was finishing. Only the owner
+        // may write the device's entries, and the copy is the owner's to adopt, not ours to drop.
+        else if state.hostId != hostId then
+          RebuildOutcome.NotOwned
         else
           state.stores.get(storeId) match
             case Some(entry) if entry.status == StorageDeviceState.StoreStatus.Rebuilding =>
@@ -2061,7 +2173,9 @@ class Host(val client: AspenClient,
    *  Called from reconcileDeviceState in place of its normal passes, so while a device is shutting
    *  down nothing new starts on it: no store is created, no transfer in begins, no rebuild starts.
    *  The sequence, each step after the previous one completes:
-   *  1. stopDeviceWork: cancel the rebuilds and transfers running on the device.
+   *  1. stopDeviceWork: cancel the rebuilds and transfers running on the device, then
+   *     awaitShutdownWork: wait, at most shutdownWorkTimeout, for the cancelled rebuilds and any
+   *     transfer-in pool update already running to finish acting on their outcome.
    *  2. closeStoresForShutdown: close every open store, mark it and announce it offline.
    *  3. Write shutdown.state naming this host, so the device is not loaded again on its own.
    *  4. completeDeviceShutdown, then act on its outcome.
@@ -2090,8 +2204,9 @@ class Host(val client: AspenClient,
       // with it the guard's release: every later check of this device would then do nothing.
       val fshutdown =
         try
-          stopDeviceWork(local, remote)
+          val stopping = stopDeviceWork(local, remote)
           for
+            _ <- awaitShutdownWork(deviceId, stopping)
             _ <- closeStoresForShutdown(local)
             _ = DeviceMarkers.writeShutdownState(local.devicePath, hostId)
             outcome <- completeDeviceShutdown(deviceId)
@@ -2137,27 +2252,38 @@ class Host(val client: AspenClient,
           logger.warn(s"Shutdown of storage device $deviceId failed. The next check of the device " +
                       s"will try again. Error: $t")
 
-  /** Step 1 of shutDownDevice: stops everything running on the device. Nothing is waited for.
-   *  Work that finishes regardless -- a rebuild already past its last read, a transfer in already
-   *  in its pool update, a store creation already loading -- writes its entry Offline rather than
-   *  Active, because each of those transactions reads the device state and writes serviceStatus.
+  /** Step 1 of shutDownDevice: stops everything running on the device, returning, by store, what
+   *  awaitShutdownWork must wait for: each cancelled rebuild's slot release, and each transfer in
+   *  whose pool update is already running. Work that finishes regardless -- a rebuild already past
+   *  its last read, a transfer in already in its pool update, a store creation already loading --
+   *  writes its entry Offline rather than Active, because each of those transactions reads the
+   *  device state and writes serviceStatus.
    *
    *  The device entries are left exactly as they are. The interrupted work is resumed after a
    *  restart or adoption by the same crash-recovery paths that resume it after a crash: a
    *  rebuild from its checkpoint in staging, a transfer in by the reconcile's TransferringIn
    *  pass, a transfer out by the receiver's retransmitted StartStoreTransfer.
    */
-  private def stopDeviceWork(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
-    val cancelledIns = synchronized {
+  private def stopDeviceWork(local: LocalStorageDeviceState,
+                             remote: StorageDeviceState): Map[StoreId, Future[Unit]] =
+    val (cancelledIns, stopping) = synchronized {
       val deviceId = local.storageDeviceId
       def entriesIn(status: StorageDeviceState.StoreStatus): Set[StoreId] =
         remote.stores.collect { case (storeId, entry) if entry.status == status => storeId }.toSet
 
       // Cancelled rebuilds fail their complete with RebuildCancelled, which releases their slot.
-      entriesIn(StorageDeviceState.StoreStatus.Rebuilding).foreach: storeId =>
-        rebuildingStores.get(storeId).foreach: sr =>
+      // One already past its walk finishes instead, and writes its entry Offline.
+      val rebuilds = entriesIn(StorageDeviceState.StoreStatus.Rebuilding).toList.flatMap: storeId =>
+        rebuildingStores.get(storeId).map: sr =>
           logger.info(s"Cancelling the rebuild of store $storeId for the shutdown of device $deviceId")
           sr.cancel()
+          storeId -> rebuildsSettled.get(storeId).map(_.future).getOrElse(Future.unit)
+
+      // Past promotion, a transfer in cannot be cancelled: its pool update is a transaction
+      // already under way. Waited for, so the shutdown neither closes the device under it nor
+      // commits Shutdown before its outcome -- an Offline entry -- has been acted on.
+      val recording = recordingTransfersIn.collect:
+        case (storeId, (toDeviceId, settled)) if toDeviceId == deviceId => storeId -> settled.future
 
       // Forgotten before the service is told, so each attempt's completion handler finds itself
       // no longer current and neither retries nor promotes. An attempt already past that check
@@ -2178,12 +2304,44 @@ class Host(val client: AspenClient,
           logger.info(s"Cancelling the transfer out of store $storeId for the shutdown of device $deviceId")
           storeTransferService.cancelTransferOut(storeId)
 
-      ins
+      (ins, rebuilds.toMap ++ recording)
     }
 
     cancelledIns.foreach: (storeId, transferUUID) =>
       logger.info(s"Cancelling the transfer in of store $storeId for the shutdown of device ${local.storageDeviceId}")
       storeTransferService.cancelTransferIn(storeId, transferUUID)
+
+    stopping
+
+  /** The wait at the end of step 1 of shutDownDevice: completes once every future in `work` has
+   *  (success or failure alike), or once shutdownWorkTimeout has passed, whichever is first.
+   *
+   *  Without it the shutdown could close the device's stores and commit Shutdown -- telling the
+   *  operator the disk may be pulled -- while a cancelled rebuild still had its staging RocksDB
+   *  open on it, or a transfer in was about to load the store it had just recorded. The timeout
+   *  bounds what a stuck walk (a read that never returns) can cost: the shutdown then proceeds
+   *  as it did before this wait existed, and the warning names the stores left running. They
+   *  are left as a crash leaves them; their entries keep the device's state honest either way.
+   */
+  private def awaitShutdownWork(deviceId: StorageDeviceId, work: Map[StoreId, Future[Unit]]): Future[Unit] =
+    if work.isEmpty then
+      Future.unit
+    else
+      val done = Promise[Unit]()
+      Future.sequence(work.valuesIterator.map(_.transform(_ => Success(()))).toList)
+        .foreach(_ => done.trySuccess(()))
+      scheduleShutdownWorkTimeout(deviceId):
+        if done.trySuccess(()) then
+          val running = work.collect { case (storeId, f) if !f.isCompleted => storeId }
+            .toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+          logger.warn(s"Work on storage device $deviceId did not stop within $shutdownWorkTimeout of " +
+                      s"its shutdown starting: stores ${running.mkString(", ")}. Shutting it down anyway")
+      done.future
+
+  /** Runs `fn` after shutdownWorkTimeout. A seam so a test can fire the timeout itself, since the
+   *  test hosts' BackgroundTaskManager never fires anything. */
+  protected def scheduleShutdownWorkTimeout(storageDeviceId: StorageDeviceId)(fn: => Unit): Unit =
+    backgroundTasks.schedule(shutdownWorkTimeout)(fn)
 
   /** Step 2 of shutDownDevice, also run once more after Shutdown commits: closes each store open
    *  on the device, then writes its transfer-out marker (empty, as no transfer owns it) and
@@ -2451,6 +2609,14 @@ class Host(val client: AspenClient,
                           s"${local.storageDeviceId}: source device $fromDeviceId is " +
                           s"${fromDevice.status}. Retrying on a later check")
             else
+              // An attempt already asking the source's old host -- the source was shut down and
+              // adopted since -- is pointed at the new one and asked again now, rather than at
+              // the next retransmit.
+              synchronized:
+                pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId).foreach: pt =>
+                  if readdressPendingTransfer(pt, fromDevice) then
+                    pt.lastSend = HLCTimestamp.now
+                    client.sendHostMessage(pt.msg)
               startStoreTransferIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId, transferId)
 
       //----------------------

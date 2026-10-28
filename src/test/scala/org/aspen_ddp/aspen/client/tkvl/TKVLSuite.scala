@@ -656,6 +656,31 @@ class TKVLSuite extends IntegrationTestSuite {
       visits.filterNot(_._2) should be (Nil)
   }
 
+  // A cancelled store rebuild relies on this to stop reading the allocation tree at once.
+  atest("foreach stops visiting and reading nodes once its stop condition holds") {
+    var visits = List[Key]()
+
+    def record(node: KeyValueListNode, key: Key, vs: ValueState): Future[Unit] =
+      visits = key :: visits
+      Future.unit
+
+    for
+      (tree, root, keys) <- buildSplitTree(8)
+      (numTiers, _, _) <- root.getFreshRootNode()
+      (_, fullReads) <- net.countReads(tree.foreach((_, _, _) => Future.unit))
+      (_, stoppedReads) <- net.countReads(tree.foreach(record, stopWhen = () => visits.size >= 3))
+      _ = visits = Nil
+      _ <- tree.foreachFrom(Key(5), record, stopWhen = () => visits.size >= 2)
+      fromVisits = visits.reverse
+    yield
+      numTiers should be >= 1
+      fromVisits should be (List(Key(5), Key(6)))
+      // Each node holds one key at the default value size: the stopped walk reads its three
+      // nodes (and the upper tiers above them) and none of the five beyond.
+      stoppedReads.values.sum should be < fullReads.values.sum
+      fullReads.values.sum - stoppedReads.values.sum should be >= 5
+  }
+
   // Covers key visitation and pairing across node boundaries. It cannot observe the old
   // termination defect. That guard compared maxKey against a bare `minimum`, which bound to the
   // class field - the minimum of the node the walk started on, constant for the whole recursion.

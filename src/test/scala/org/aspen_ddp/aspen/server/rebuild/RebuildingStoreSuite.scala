@@ -323,6 +323,35 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       placed should be(false)
       os.exists(dev / storeId.directoryName) should be(true)
 
+  // A shutdown waits for its cancelled rebuilds, so a cancelled walk must stop reading at once
+  // rather than read the rest of the allocation tree as no-ops.
+  atest("a cancelled walk issues no further reads and closes promptly"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    var rebuildRef: RebuildingStore = null
+    var restored = 0
+    var afterCancel: Future[(Unit, Map[ObjectId, Int])] = null
+    for
+      _ <- populate(60)
+      _ <- net.waitForTransactionsToComplete()
+      // Read counting starts the moment cancel() returns, inside the walk's own callback, and
+      // covers everything up to the rebuild's completion.
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+                                    checkpointInterval = 2,
+                                    testingOnlyOnRestored = () =>
+                                      restored += 1
+                                      if restored == 5 then
+                                        rebuildRef.cancel()
+                                        afterCancel = net.countReads(
+                                          rebuildRef.complete.recover { case _ => () }))
+      _ = rebuildRef = rebuild
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+      (_, readsAfterCancel) <- afterCancel
+    yield
+      outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
+      restored should be(5)
+      readsAfterCancel should be(Map())
+
   atest("out of space fails the pass with empty failedObjects proving the latch alone stopped it"):
     given ExecutionContext = executionContext
     val dev = deviceDir()

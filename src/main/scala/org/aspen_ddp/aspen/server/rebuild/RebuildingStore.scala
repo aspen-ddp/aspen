@@ -83,15 +83,25 @@ class RebuildingStore(client: AspenClient,
 
   /** Abort latch: when a fatal condition fires (out of space or too many failures), we record
    *  the cause here. The TKVL walks swallow a failing fn by design -- they log and
-   *  continues -- so a fatal condition has to be carried out of band. Once set, restoreObject
-   *  returns Future.unit immediately, making the remainder of the walk a cheap no-op. The
-   *  latched cause is checked after the walk returns, and if set, the pass fails before
-   *  retryFailures() and finish() run, leaving the checkpoint in staging so the next device
-   *  check resumes. */
+   *  continues -- so a fatal condition has to be carried out of band. Once set, the walk stops
+   *  (its stopWhen is `aborted`), and restoreObject returns Future.unit for anything already
+   *  handed to it. The latched cause is checked after the walk returns, and if set, the pass
+   *  fails before retryFailures() and finish() run, leaving the checkpoint in staging so the
+   *  next device check resumes. */
   private var abortCause: Option[Throwable] = None
 
-  /** Latches `RebuildCancelled` as the abort cause, so the rest of the walk is a no-op and the
-   *  pass fails with the checkpoint left in staging, exactly as for any other fatal condition. */
+  private val aborted: () => Boolean = () => synchronized(abortCause).isDefined
+
+  /** Latches `RebuildCancelled` as the abort cause, so the walk stops and the pass fails with the
+   *  checkpoint left in staging, exactly as for any other fatal condition.
+   *
+   *  The walk checks the latch before every entry and before reading each node (`aborted`), so it
+   *  stops reading once the object in flight, if any, has been read; the backend is then closed
+   *  and `complete` fails. Prompt matters: a device shutdown waits for its cancelled rebuilds
+   *  before closing the device's stores, and a walk that ran on through the rest of the
+   *  allocation tree would hold the staging RocksDB open on a disk about to be pulled. The
+   *  backend is never closed under a write still in progress: the walk hands out one object at
+   *  a time, and the close waits for the pass to end. */
   def cancel(): Unit =
     synchronized:
       if abortCause.isEmpty then
@@ -174,8 +184,8 @@ class RebuildingStore(client: AspenClient,
              // The resume range is inclusive of the checkpointed key. rebuildWrite is an
              // overwrite, so re-restoring that one object is free, and inclusive is the only
              // bound that cannot skip.
-             case Some(k) => tree.foreachFrom(k, restoreObject)
-             case None => tree.foreach(restoreObject)
+             case Some(k) => tree.foreachFrom(k, restoreObject, stopWhen = aborted)
+             case None => tree.foreach(restoreObject, stopWhen = aborted)
       // Check the abort latch after the walk completes. If it's set, fail the pass before
       // retryFailures() and finish() run, leaving the checkpoint in staging.
       _ <- synchronized(abortCause) match

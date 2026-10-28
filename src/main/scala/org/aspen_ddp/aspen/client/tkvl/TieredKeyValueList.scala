@@ -92,9 +92,12 @@ class TieredKeyValueList(val client: AspenClient,
    *
    *  A failing `fn`, whether it returns a failed future or throws, is logged and the walk
    *  continues to the next key. A failing read fails the returned future.
+   *
+   *  The walk ends early, reading nothing more, once `stopWhen` holds; see TierEngine.foreach.
    */
-  def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    engine.foreach(withValueState(fn))
+  def foreach(fn: (KeyValueListNode, Key, ValueState) => Future[Unit],
+              stopWhen: () => Boolean = () => false): Future[Unit] =
+    engine.foreach(withValueState(fn), stopWhen)
 
   /** Visit every entry in `[minKey, maxKey)`, in ascending key order. */
   def foreachInRange(minKey: Key,
@@ -113,8 +116,9 @@ class TieredKeyValueList(val client: AspenClient,
    *  checkpoint into work that is permanently skipped.
    */
   def foreachFrom(minKey: Key,
-                  fn: (KeyValueListNode, Key, ValueState) => Future[Unit]): Future[Unit] =
-    engine.foreachFrom(minKey, withValueState(fn))
+                  fn: (KeyValueListNode, Key, ValueState) => Future[Unit],
+                  stopWhen: () => Boolean = () => false): Future[Unit] =
+    engine.foreachFrom(minKey, withValueState(fn), stopWhen)
 
   /** `fn` as a TierEngine walk callback, handed the KeyValueListNode and the entry's ValueState */
   private def withValueState(fn: (KeyValueListNode, Key, ValueState) => Future[Unit])

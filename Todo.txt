@@ -61,6 +61,10 @@ FixedSizeIndexedFile Store Backend
   - Two creation-time options:
     - Segment size
     - Number of segments
+  - At time of creation, the user will supply the desired IDA and maximum object size. The backend needs to
+    be configured with a segment size. This must be obtained by calling the IDA's minSliceSizeFor method as
+    IDAs often require padding bytes that will extend the required slice size slightly to accommodate those
+    extra bytes. 
   - Files:
     - data
     - index map

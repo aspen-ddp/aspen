@@ -161,6 +161,12 @@ FixedSizedIndexFileAllocationStrategy
     zeroed bitmaps to the StoragePoolState object of new pools being created with the FixedSizeIndexedFile
     backend.
 
+Add an iscsi server application similar to amoebafs. The goal is to implement block devices on top of Aspen that
+are exported via the iscsi protocol with "good" performance. TCMU seems to be a good balance between performance and
+implementation simplicity. A high-level design description of how this might be achieved is
+captured in features/iscsi-target.txt this should serve as the starting point for how to implement this feature but
+it should not be considered set-in-stone. Alternative solutions may be considered
+
 Think through some options for new DataStore backends
   - Need some options that play well with RandomAccessReedSolomon
   - Single-Allocator solutions are valid

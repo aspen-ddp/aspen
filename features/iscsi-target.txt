@@ -1,0 +1,101 @@
+Architectural Blueprint: TCMU-Based iSCSI Target Integration for Java
+
+High-Level Architecture
+To expose a custom distributed erasure-coded object store as an enterprise iSCSI target without heavy C-based JVM extensions or high-overhead gRPC layers, we will implement an IPC Bridge Pattern using:
+
+Linux LIO Kernel Subsystem + tcmu-runner: Handles network-layer iSCSI, TCP connections, authentication, and kernel-space ring buffers (UIO).
+
+Lightweight C Shim Plugin (tcmu-runner plugin): A thin shared library (.so) that registers with tcmu-runner, intercepts SCSI block commands, and forwards them over a local Unix Domain Socket.
+
+Java Application (Netty-backed): Receives high-performance binary-framed IPC messages over the Unix socket and maps them directly to the distributed erasure-coded object store.
+
+Component Design & Responsibilities
+
+A. The C-Based Shim Plugin
+
+Role: Acts as the translation bridge between tcmu-runner's handler callbacks (open, read, write, flush, unmap, resize, close) and the Unix domain socket.
+
+Responsibilities:
+
+Parse the cfgstring passed via targetcli (e.g., socket=/var/run/my-store.sock,lun=disk1).
+
+Maintain a persistent Unix domain socket connection to the Java process.
+
+Serialize incoming TCMU SCSI commands into compact binary frames, forward them to Java, wait synchronously (or via asynchronous correlation IDs) for the response, and return status codes back to the kernel.
+
+B. The Netty / Unix-Domain-Socket Protocol (Java Side)
+
+Design Constraint: Avoid Protocol Buffers for large data payloads to prevent memory allocation churn and extra copying. Use a hybrid binary framing strategy via Netty ByteBuf.
+
+Frame Structure:
+
+Magic Byte / Version: 1 byte
+
+Command Type: 1 byte (0x01 = READ, 0x02 = WRITE, 0x03 = FLUSH, 0x04 = UNMAP, 0x05 = OPEN, 0x06 = RESIZE)
+
+Request ID: 8 bytes (long, for async correlation if needed)
+
+LBA (Logical Block Address): 8 bytes (long)
+
+Payload Length: 4 bytes (int)
+
+Payload Data: [Length bytes] (Raw block bytes for WRITE; empty for READ requests, populated by Java in the reply stream for READ completions).
+
+Key Operations Lifecycle
+
+Initialization & Target Creation
+
+Configuration (targetcli):
+/> cd /backstores/user:my_store
+/backstores/user:my_store> create name=disk1 size=100G cfgstring=socket=/var/run/my-store.sock
+/backstores/user:my_store> cd /iscsi
+/iscsi> create iqn.2026-10.com.example:storage.target1
+/iscsi/iqn.20.../tpg1/luns> create /backstores/user:my_store/disk1
+
+Handshake Flow:
+
+tcmu-runner loads the C plugin and invokes the device open handler.
+
+The C shim connects to the Unix socket and sends an OPEN frame containing the target name, block size (e.g., 4096 bytes), and initial total capacity blocks.
+
+Java initializes the LUN mapping context.
+
+Read / Write Data Path
+
+READ Operation:
+
+Initiator sends a SCSI Read command -> Kernel LIO -> tcmu-runner -> C Shim.
+
+C Shim sends a READ frame (LBA + length) over the Unix socket to Netty.
+
+Java queries the distributed erasure-coded object store, retrieves/reconstructs the block byte array, and writes the binary header + raw data back down the Unix socket.
+
+C Shim copies data into the TCMU ring buffer and completes the request.
+
+WRITE Operation:
+
+Initiator sends data -> C Shim receives command and raw bytes.
+
+C Shim packages header + payload into a Netty binary frame and sends it over the Unix socket.
+
+Java receives the frame, extracts the raw bytes directly from the Netty ByteBuf, and persists them to the erasure-coded object store backend.
+
+Java replies with an ACK status frame.
+
+Auxiliary SCSI Operations (FLUSH & UNMAP)
+
+FLUSH (Synchronize Cache): Java ensures all pending write-ahead logs or modified EC stripes are durably flushed/committed.
+
+UNMAP (TRIM/Discard): Java marks the specified LBA range as invalid/released, allowing the distributed object store to reclaim space and garbage-collect underlying chunks.
+
+Dynamic Resizing
+
+Trigger: Storage size is expanded via administrative tooling / targetcli.
+
+Notification: TCMU propagates the size change down to the C plugin handler.
+
+IPC Propagation: C shim sends a RESIZE frame with the new total block count over the Unix socket to Java.
+
+Java Backend Update: Java updates its internal max LBA boundaries.
+
+Client Rescan: Administrator executes an initiator-side rescan (iscsiadm) to resize the host kernel block node and expand the local file system (resize2fs/xfs_growfs).

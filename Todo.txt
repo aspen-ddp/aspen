@@ -1,6 +1,21 @@
 TODO
 ====
 
+Test that size restrictions are enforced when using erasure-coding that adds padding bytes
+  - Potential problem: ReedSolmon with read threshold of 10 and a backend that restricts to 1Mib
+    slices. maxObjectSize is calculated to be 10Mib. If a client actually tries to write exactly 10Mib,
+    would the padding added by the IDA cause the encoded slice to exceed 1Mib in size?
+  - If so we need to account for this
+    - maxObjectSize could be reduced by the size of the padding
+    - backends could account for this and use maximum slice sizes a few bytes beyond a round number
+      like 1Mib to allow users to work with round-numbered object sizes like 1Mib.
+    - Alternative suggestions are welcome
+
+move common.metadata.BootstrapConfig & ClientConfig to common.config package
+
+move store.backend.BufferredConsistentRocksDB and store.backend.RocksDBBackend to dedicated store.backend.rocksdb
+package
+
 Add ability to physically move storage devices between Hosts
   - Add StorageDeviceState.StoreState.Offline enum value
   - Add AspenClient.takeStorageDeviceOffline(StoreId)
@@ -19,14 +34,132 @@ Add ability to physically move storage devices between Hosts
         - Double-check that attempts to start a transfer in always begin by looking up the owning hostId from
           the StorageDeviceState as the device may be physically relocated so the hostId can change between
           initiation attempts.
-    - The host should scan it's storage devices folder every 10 seconds to look for new additions
+    - The host should scan its storage devices folder every 10 seconds to look for new additions.
       - If one is found, enqueue it to be loaded
+        - Check must look for a valid storage device configuration file belonging to the aspen system
+        - This also covers the case where a nudge message is missed after creating a new store. Old docs
+          say the new device won't be found until the host is restarted. Update those.
       - As part of load, lookup the device's owning host. If there is a mismatch, the device has
         been physically transferred to the new host.
+        - Validate that all the stores were properly shut down and have their CRL files. If not log an error and
+          ignore this device.
+          - Continue to check it but only log once per process lifetime (no need to persist anything)
+          - It is possible that someone removed the device too early. It could be plugged back into the original host,
+            shut down properly, then plugged back into this host
         - In a single Tx:
           - Update the state of all the stores to Active
           - Change the StorageDeviceState status to Operational & update the hostId to the new Host
         - Load the stores and send the moved gossip for each
+
+Modify StoragePoolAllocationStrategy
+  - Currently the StoragePoolAllocationStrategy is created inside the PoolObjectAllocator, lets move this
+    to the StoragePool interface instead.
+    - change def allocationStrategy: Option[UUID] to def allocationStrategy[StoragePoolAllocationStrategy]
+      - Create the strategy on first use and cache the result rather than constructing it up-front
+  - Add the following method to StoragePoolAllocationStrategy
+    - def deleteObject(pointer: ObjectPointer)(using t: Transaction): Unit
+    - the Default object's deleteObject method should do nothing
+  - Whenever a transaction attempts to set the refcount for an object to zero, the deleteObject method
+    must be called. The expectation is that this method may add some finalization actions to the transaction
+  - Create a test to verify that a custom StoragePoolAllocationStrategy is created for a pool and that its
+    methods are called correctly during the allocation/deallocation process
+
+FixedSizeIndexedFile Store Backend
+  A store backend that stores data in a flat file broken up into fixed-sized chunks that store the slice data
+  along with its associated metadata.
+  - place in store.backend.fsif package
+  - Two creation-time options:
+    - Segment size
+    - Number of segments
+  - Files:
+    - data
+    - index map
+    - journal
+  - Data
+    - Segmented into chunks of: <fixed-size-header><slice-data>
+    - Header
+      - 1-byte object type. KeyValue vs Data object
+      - 4-byte external index for validating that we read the right slice (compaction moves these around)
+      - 4-byte slice length
+      - 4-byte CRC32 to detect data corruption
+      - Serialized Metadata (revision,timestamp,refcount)
+    - Always read the full segment size then use 4-byte length in the header to drop the excess data
+      - For smaller objects, it may make sense to allocate a new, smaller array and copy the data over to
+        save RAM
+      - At some point the cost of the allocation + copy exceeds the benefit though and we should just keep
+        the array that has some wasted space.
+  - Journal
+    - Begins with an 8-byte sequence number
+    - Contains log of all external-index=internal-index made since index-map was written
+    - Updated in write batches. While a flush is pending, buffer changes
+    - When write finishes, complete batch promise
+    - Uses an a/b mechanism to close an old journal and start a new one
+      - start with journal.a file when it is closed switch to journal.b
+      - Instead of deleting journal.a, instead truncate it but retain the initial 8 byte sequence number
+      - At startup, the sequence number can be used to determine which journal file is active
+  - index map
+    - binary array: index into the array is the external index. value is the internal index. -1 means unassigned
+    - Uses the same a/b file handling mechanism as the journal
+      - file content is: <sequence-number><4-byte-CRC32><index-map-array>
+      - On load of the index map file
+        - If the file size isn't exactly the calculated size it should be, ignore it. It means we crashed while
+          in the process of creating the new index map file.
+          - Truncate the failed index map file
+          - Truncate the associated journal file
+          - Use the old index map and journal. They still contain perfectly valid content
+        - If the CRC validation check fails, the store is permanently lost. Throw an exception so the host can
+          initiate the rebuild process for this store
+    - Updated periodically
+      - When compactions and commits complete, check the length of the journal. If it exceeds 50% of the size of
+        the index map file, create a new index map
+        - Increment the serial number shared by the index map file and the journal file
+        - Copy the in-memory index map array and tell the journal to write all future journal entries to *both*
+          journal files (new journal file uses the updated serial number)
+        - In a background thread, write the new index map file with the new serial number and flush it.
+        - When the index map write completes:
+          - Tell the journal to truncate the old journal file. All subsequent writes to to just the new file
+          - Truncate the old index map file
+  - Compaction
+    - When segments earlier in the file are deallocated, we can reduce the size of the file by moving the segment
+      at the end of the file into that deallocated segment and then truncating the file. However, we must be
+      very careful to avoid race conditions while this is done.
+      - If the segment to be moved is currently being written, we must wait for that write to complete before
+        beginning the move operation
+      - If a segment is being moved, we must wait for that move to complete before writing an update to the
+        segment (which will go to the new location)
+      - Starting a compaction operation must be atomic with respect to allocating a segment. That is to say that
+        a write to an external index who's internal index is -1 (meaning that segment isn't being used) must not
+        choose the internal index that is being compacted.
+  - Backend Operation
+    - The Backend's interface methods run in the same thread that calls them. These methods plan I/O operations
+      but the actual reads and writes to files should occur on a pool of background I/O threads with Futures to
+      their completion. Multiple Backends should be able to share the same pool of threads.
+    - When operations complete, such as commits, reads, & compactions, they may take the opportunity to trigger
+      the next compaction operation if one isn't currently outstanding. This allows compaction to be driven
+      passively without the need for a dedicated thread. One compaction completion triggers the next and when
+      no more compactions are possible, the process ends. The first commit or read to a freshly booted backend
+      may trigger a compaction operation if any are possible and resumes the compaction process that failed to
+      complete before the backend shut down.
+
+FixedSizedIndexFileAllocationStrategy
+  - Use a KeyValue object to hold segments of an allocated indicies bitmap
+    - 100Gib of 1Mib segments is 102400 indicies - 12k allocation bitmap
+  - Can use a bitmap KeyValue object to hold 100 1k segments of the bitmap
+  - Allocator chooses one at random for allocating. Therefore low chance of collision
+  - *** Note that this choice must be cached in the Transaction instance
+    - When attempting to allocate multiple objects from the same pool in the transaction, we need to re-use
+      this same bitmap. Only choose another if it is full.
+    - We'll also need to be able to register a callback to be called at the beginning of the transaction build
+      process.
+      - This will aggregate all the allocations into a list of Insert operations with key revision guards
+        and adds an update to the KeyValue object to the transaction
+  - deleteObject method will need to register a DurableTask to clear the bitmap entry exactly once
+    - Can't use a finalization action for this since they can run multiple times. A possible scenario is
+      it runs on one store and clears the bit, the index is re-allocated, then the finalization action runs
+      again on another store and clears the bit again while the new allocation is still valid.
+  - Add this allocation strategy and a pointer to a KeyValue object with the KeyValue content holding the
+    zeroed bitmaps to the StoragePoolState object of new pools being created with the FixedSizeIndexedFile
+    backend.
 
 Think through some options for new DataStore backends
   - Need some options that play well with RandomAccessReedSolomon

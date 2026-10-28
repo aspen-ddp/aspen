@@ -25,6 +25,19 @@ Generate IDA document to discuss pros and cons of each IDA algorithm and what th
 that talks about things like IDA + Backend combinations. RandomAccessReedSolomon + RocksDB is a poor
 combination.
 
+On start, if the CRL is found to be corrupted. We would need to initiate a recovery process that checks
+the metadata for every object in every store on the host to find objects that may have voted to commit,
+crashed, and then come up with a missing CRL. Those mid-transaction objects wouldn't be recorded in the
+error tree. The only way to recover would be to check every slice which reads reading the metadata for
+all data objects and the metadata+KeyMetadata for all KeyValueObjects. Which would be hugely expensive.
+Maybe a lightweight alternative would work. We could still send all Paxos state and data to the main CRL
+but create much smaller logs on each device. Those logs just record the poolId+ObjectId of the objects
+being modified by transactions plus tombstones for when the data is discarded. These would be small
+enough that we could use a/b files for the logs. When one log is full, write the full compliment of
+active transactions to the new log, flush it, then truncate the old log. Then if the main CRL fails,
+we would know exactly which objects to repair without putting a large I/O load on the disk by double-writing
+the data. Ultimately, we probably need a more robust solution than SimpleCRL.
+
 Need a mechanism to handle "out of space" errors
   - Will present when we attempt to commit an object update to the store
     - Read-Only or out of space underlying media will cause it to fail

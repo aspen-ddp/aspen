@@ -279,8 +279,10 @@ aspen create-storage-device ~/aspen/aspen-client-config.yaml /srv/aspen/host-b n
 ```
 
 The directory must already exist and must not already belong to a device. The set must be a level-0 set.
-If the host is running it picks up the new device within moments. Otherwise it loads the device the next
-time it starts. Each device is identified by a UUID, which the command prints and `list-devices` shows.
+A running host picks up the new device right away, and in any case within about 10 seconds, without a
+restart. A host loads only the devices it owns: a device directory recording another host as its owner
+is logged once and left alone, never claimed. Each device is identified by a UUID, which the command
+prints and `list-devices` shows.
 
 A new device starts out empty. Rebalancing fills it over time: it runs automatically every 8 hours by
 default, and new pools created on the set will also place stores on it. To spread existing data onto

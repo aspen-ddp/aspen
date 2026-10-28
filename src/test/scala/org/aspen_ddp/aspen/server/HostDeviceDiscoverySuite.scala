@@ -136,6 +136,29 @@ private class RecordingExecutionContext(underlying: ExecutionContext) extends Ex
   def failures: List[Throwable] = synchronized(recorded.toList)
 
 
+/** Records the period of every schedulePeriodic call and schedules nothing, like
+ *  NoBackgroundTaskManager. */
+private class PeriodRecordingTasks extends BackgroundTaskManager(ExecutionContext.parasitic):
+  private val recorded = mutable.ListBuffer[Duration]()
+
+  def periods: List[Duration] = synchronized(recorded.toList)
+
+  override def schedule(delay: Duration)(fn: => Unit): BackgroundTaskManager.ScheduledTask =
+    BackgroundTaskManager.ShutdownTask
+
+  override def scheduleRandomlyWithinWindow(window: Duration)(fn: => Unit): BackgroundTaskManager.ScheduledTask =
+    BackgroundTaskManager.ShutdownTask
+
+  override def schedulePeriodic(period: Duration, callNow: Boolean)(fn: => Unit): BackgroundTaskManager.ScheduledTask =
+    synchronized:
+      recorded += period
+    BackgroundTaskManager.ShutdownTask
+
+  override def retryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)
+                                          (fn: => Boolean): BackgroundTaskManager.ScheduledTask =
+    BackgroundTaskManager.ShutdownTask
+
+
 class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness:
 
   /** `foreignSystemId` is the rejection case: a device config carrying it must be ignored by
@@ -166,7 +189,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
   atest("constructor loads a device that already exists on disk"):
     val hostRoot = newHostDir()
-    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = None)
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
 
     val host = newHost(hostRoot)
 
@@ -175,9 +198,11 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       host.loadedDevices(deviceA).devicePath should be(deviceDir)
 
       // Also pins the recording seam itself: tryLoadStore is offered every child of the
-      // device directory, and dev0's only child is the device config file.
-      host.storeLoadAttempts.toList should be(
-        List((deviceA, deviceDir / StorageDeviceConfig.configFilename)))
+      // device directory, and dev0's only children are the device config file and the
+      // owning-host marker. Compared as a set so the assertion does not depend on listing order.
+      host.storeLoadAttempts.toList.toSet should be(Set(
+        (deviceA, deviceDir / StorageDeviceConfig.configFilename),
+        (deviceA, deviceDir / DeviceMarkers.OwningHostFile)))
 
   atest("a device created after construction is discovered on the next CheckAllDevices"):
     val hostRoot = newHostDir()
@@ -199,7 +224,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
   atest("an already-loaded device is not reloaded"):
     val hostRoot = newHostDir()
-    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = None)
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     os.makeDir.all(deviceDir / "some-store-dir")
 
     val host = newHost(hostRoot)
@@ -207,12 +232,13 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     val attemptsAfterConstruction = host.storeLoadAttempts.toList
 
     // tryLoadDevice offers every child of the device directory to tryLoadStore: here the
-    // device config file and some-store-dir. The real tryLoadStore would load neither -- it
-    // requires a store config file inside the candidate, and the config file is not a
-    // directory while some-store-dir is empty -- but the recording override takes both.
-    // Compared as a set so the assertion does not depend on listing order.
+    // device config file, the owning-host marker and some-store-dir. The real tryLoadStore
+    // would load none of them -- it requires a store config file inside the candidate, and the
+    // two files are not directories while some-store-dir is empty -- but the recording override
+    // takes all three. Compared as a set so the assertion does not depend on listing order.
     attemptsAfterConstruction.map(_._2).toSet should be(Set(
       deviceDir / StorageDeviceConfig.configFilename,
+      deviceDir / DeviceMarkers.OwningHostFile,
       deviceDir / "some-store-dir"))
 
     host.testingOnlyCheckAllDevices()
@@ -644,18 +670,154 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       host.testingOnlyActiveDeviceChecks should be(empty)
       host.testingOnlyDeferredDeviceChecks should be(empty)
 
-  atest("a device owned by another host is claimed with updateHostId"):
+  atest("a device owned by another host is not loaded or claimed"):
     val hostRoot = newHostDir()
-    writeDevice(hostRoot, "dev0", deviceA)
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = Some(HostId(UUID.randomUUID())))
+    os.makeDir.all(deviceDir / storeId.directoryName)
     val host = newHost(hostRoot)
+
+    host.testingOnlyScanDevices()
+    host.testingOnlyCheckAllDevices()
+
+    Future.successful:
+      host.loadedDevices.keySet should be(empty)
+      host.storeLoadAttempts should be(empty)
+      // Never loaded, so never checked: nothing reads the device's state, let alone writes it.
+      host.lookupAttempts should be(empty)
+      host.testingOnlyReportedDeviceDirs should be(Set(deviceDir))
+
+  atest("a loaded device the tree records as owned by another host is left alone"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newHost(hostRoot)
+    val before = host.storeLoadAttempts.size
 
     val armed = host.armLookup(deviceA)
     host.testingOnlyCheckAllDevices()
-    armed.success(StorageDeviceState(deviceA, HostId(UUID.randomUUID()),
-                                     0L, 1024L, Map(), deviceSetId))
+    // An Initializing store would normally drive createNewStore. Nothing runs here.
+    armed.success(StorageDeviceState(deviceA, HostId(UUID.randomUUID()), 0L, 1024L,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Initializing, None)),
+      deviceSetId))
 
-    yieldUntil(host.hostIdClaims.nonEmpty).map: _ =>
-      host.hostIdClaims.toList should be(List(deviceA))
+    yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+      os.exists(deviceDir / storeId.directoryName) should be(false)
+      host.storeLoadAttempts.size should be(before)
+      host.loadedDevices.keySet should be(Set(deviceA))
+
+  atest("the device scan skips directories that are already loaded"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newHost(hostRoot)
+    val firstState = host.loadedDevices(deviceA)
+    val attempts = host.storeLoadAttempts.toList
+
+    // Were the scan to read it again, this would be a warned-about parse failure.
+    writeUnparseableDeviceConfig(deviceDir)
+    host.testingOnlyScanDevices()
+    host.testingOnlyScanDevices()
+
+    Future.successful:
+      host.loadedDevices(deviceA) should be theSameInstanceAs firstState
+      host.storeLoadAttempts.toList should be(attempts)
+      host.deviceDirWarnings should be(empty)
+      host.testingOnlyLoadedDeviceDirs should be(Map(deviceDir -> deviceA))
+
+  atest("a device whose directory disappears is checked again when it reappears"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newHost(hostRoot)
+    val firstState = host.loadedDevices(deviceA)
+    val attempts = host.storeLoadAttempts.toList
+    host.testingOnlyLoadedDeviceDirs should be(Map(deviceDir -> deviceA))
+
+    val parked = hostRoot / "parked-dev0"
+    os.move(deviceDir, parked)
+    host.testingOnlyScanDevices()
+    host.testingOnlyLoadedDeviceDirs should be(empty)
+
+    os.move(parked, deviceDir)
+    host.testingOnlyScanDevices()
+
+    Future.successful:
+      host.testingOnlyLoadedDeviceDirs should be(Map(deviceDir -> deviceA))
+      // The existing duplicate guard: the device is already in storageDevices, so its stores
+      // are not offered again.
+      host.loadedDevices(deviceA) should be theSameInstanceAs firstState
+      host.storeLoadAttempts.toList should be(attempts)
+
+  atest("a device without an owning-host file is not loaded"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = None)
+    val host = newHost(hostRoot)
+
+    host.loadedDevices.keySet should be(empty)
+    host.testingOnlyScanDevices()
+    host.loadedDevices.keySet should be(empty)
+    host.storeLoadAttempts should be(empty)
+    host.testingOnlyReportedDeviceDirs should be(Set(deviceDir))
+    // Construction scanned once, the explicit scan a second time. One warning.
+    host.deviceDirWarnings.toList.map(_._1) should be(List(deviceDir))
+
+    // Recovery: once the device is marked as ours it loads, and its warning state is cleared.
+    DeviceMarkers.writeOwningHost(deviceDir, HostId.BootstrapHostId)
+    host.testingOnlyScanDevices()
+
+    Future.successful:
+      host.loadedDevices.keySet should be(Set(deviceA))
+      host.testingOnlyReportedDeviceDirs should be(empty)
+
+  atest("a device with a malformed owning-host file is not loaded"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA, owner = None)
+    os.write.over(deviceDir / DeviceMarkers.OwningHostFile, "not a uuid")
+    val host = newHost(hostRoot)
+
+    host.testingOnlyScanDevices()
+
+    Future.successful:
+      host.loadedDevices.keySet should be(empty)
+      host.storeLoadAttempts should be(empty)
+      host.deviceDirWarnings.toList.map(_._1) should be(List(deviceDir))
+
+  atest("a device carrying shutdown.state is not loaded by the scan"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    DeviceMarkers.writeShutdownState(deviceDir, HostId.BootstrapHostId)
+    os.makeDir.all(deviceDir / storeId.directoryName)
+    val host = newHost(hostRoot)
+
+    host.testingOnlyScanDevices()
+
+    Future.successful:
+      host.loadedDevices.keySet should be(empty)
+      host.storeLoadAttempts should be(empty)
+      host.testingOnlyLoadedDeviceDirs should be(empty)
+
+  atest("the scan runs on the configured period"):
+    def periodsOf(scanPeriod: Option[Duration]): List[Duration] =
+      val tasks = new PeriodRecordingTasks
+      val hostRoot = newHostDir()
+      scanPeriod match
+        case None =>
+          new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+            net.objectCacheFactory, net, tasks, TestNetwork.TestCRL,
+            net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+            Duration(60, SECONDS))
+        case Some(p) =>
+          new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+            net.objectCacheFactory, net, tasks, TestNetwork.TestCRL,
+            net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
+            Duration(60, SECONDS), deviceScanPeriod = p)
+      tasks.periods
+
+    // 7 s is used by nothing else Host schedules, so its presence pins the new parameter.
+    val custom = periodsOf(Some(Duration(7, SECONDS)))
+    val default = periodsOf(None)
+
+    Future.successful:
+      custom should contain(Duration(7, SECONDS))
+      default should contain(Duration(10, SECONDS))
+      default should not contain Duration(7, SECONDS)
 
   atest("a tombstoned device is not claimed and nothing is reconciled"):
     val hostRoot = newHostDir()
@@ -672,7 +834,6 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
         StorageDeviceState.StoreStatus.Initializing, None))))
 
     yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
-      host.hostIdClaims.toList should be(Nil)
       host.storeLoadAttempts.size should be(before)
       // The guard entry is released, so later checks of this device still run. That release
       // is the actual regression: the old code held it for the life of the process.

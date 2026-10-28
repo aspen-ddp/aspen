@@ -1,11 +1,10 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, StoragePool, ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget, StoreNotHosted}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
-import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runSequentially}
@@ -63,6 +62,7 @@ object Host:
   private case class RecoveryEvent() extends Event
   private case class HeartbeatEvent() extends Event
   private case class CheckAllDevices() extends Event
+  private case class ScanDevices() extends Event
   private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
   private case class InitializeTaskExecutor() extends Event
 
@@ -160,7 +160,11 @@ class Host(val client: AspenClient,
                     *  eight-store device must not start eight at once. Entries beyond this bound
                     *  wait; every completion re-checks all loaded devices and starts whatever is
                     *  queued. */
-                   val maxConcurrentRebuilds: Int = 2) extends Logging with RepairTarget {
+                   val maxConcurrentRebuilds: Int = 2,
+                   /** How often storage-devices/ is listed for newly present device directories.
+                    *  Only the local directory scan runs this often. The network-reading
+                    *  reconcile of every loaded device stays on checkStorageDevicePeriod. */
+                   val deviceScanPeriod: Duration = Duration(10, SECONDS)) extends Logging with RepairTarget {
   import Host._
   
   given ExecutionContext = ec
@@ -180,11 +184,24 @@ class Host(val client: AspenClient,
 
   val storageDevicesDir: os.Path = rootDir / StorageDeviceManager.StorageDevicesDirName
 
-  // Append-only for the life of the process: tryLoadDevice is the only writer in production and
-  // nothing anywhere removes an entry. So a device present here stays present, and a lookup miss
-  // means a device this process has never loaded rather than one that has gone away. Tests inject
-  // entries directly via RecordingHost.injectLoadedDevice.
+  // tryLoadDevice is the only writer that adds entries in production. Entries are removed when a
+  // device is shut down and unloaded, so a lookup miss means a device that is not loaded right
+  // now: one never seen, one rejected by the load decision, or one unloaded by a shutdown. Tests
+  // inject entries directly via RecordingHost.injectLoadedDevice.
   protected var storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
+
+  // Directories under storage-devices/ that hold a loaded device. checkForNewDevices skips these
+  // without reading anything in them, which keeps the frequent scan down to one directory
+  // listing. An entry is dropped when its path stops being listed, so a disk pulled and
+  // re-inserted on this host is checked again in full (and the duplicate guard in tryLoadDevice
+  // finds it already loaded). Unloading a device must also remove its entry.
+  private var loadedDeviceDirs: Map[os.Path, StorageDeviceId] = Map()
+
+  // Directories whose problem has already been logged. The scan rechecks an unloaded directory
+  // every deviceScanPeriod, so without this every unowned or broken device would produce a
+  // warning every few seconds forever. In memory only: a restart logs each problem once more. A
+  // path leaves the set when its device loads, so a later problem with it is reported again.
+  private var reportedDeviceDirs: Set[os.Path] = Set()
   protected var stores: Map[StoreId, Store] = Map()
 
   private var offlineStores: Set[StoreId] = Set()
@@ -240,6 +257,10 @@ class Host(val client: AspenClient,
   
   private val checkStorageDeviceTask = backgroundTasks.schedulePeriodic(checkStorageDevicePeriod) {
     events.put(CheckAllDevices())
+  }
+
+  private val deviceScanTask = backgroundTasks.schedulePeriodic(deviceScanPeriod) {
+    events.put(ScanDevices())
   }
 
   /** Continual repair of this host's stores. Constructed here rather than after task-executor
@@ -339,21 +360,28 @@ class Host(val client: AspenClient,
 
   def getServiceExecutor(): Future[DurableServiceExecutor] = serviceExecutorPromise.future
 
-  /** Scans storage-devices/ and loads any device found there.
+  /** Scans storage-devices/ and loads any device found there that this host owns.
    *
-   *  Called at construction and from the event loop, both on every CheckAllDevices and on a
-   *  CheckStorageDevice naming a device we have not loaded. Repeated scans are safe:
-   *  tryLoadDevice skips any device already present in storageDevices, so a device's
-   *  LocalStorageDeviceState -- and with it the offlineStores set that reconcileDeviceState
-   *  reads -- survives, and its children are not re-offered to tryLoadStore over
-   *  already-open backends.
+   *  Called at construction and from the event loop: every ScanDevices (each deviceScanPeriod),
+   *  every CheckAllDevices, and every CheckStorageDevice naming a device we have not loaded.
+   *  Directories in loadedDeviceDirs are skipped without being read, so the common-case scan is
+   *  a single listing. Every other directory gets tryLoadDevice's full check each time; its
+   *  problems are logged once (warnOnce) and then rechecked silently.
+   *
+   *  Repeated scans are safe: tryLoadDevice also skips any device already present in
+   *  storageDevices, so a device's LocalStorageDeviceState -- and with it the offlineStores set
+   *  that reconcileDeviceState reads -- survives, and its children are not re-offered to
+   *  tryLoadStore over already-open backends.
+   *
+   *  Returns the devices this call loaded, so ScanDevices can check them at once.
    *
    *  Mutual exclusion: the handleEvent calls hold the instance lock; the constructor call
    *  precedes start(), so no event-loop thread exists yet.
    */
-  private def checkForNewDevices(): Unit =
+  private def checkForNewDevices(): List[StorageDeviceId] =
     if ! os.isDir(storageDevicesDir) then
-      logger.warn(s"Invalid storage devices directory: $storageDevicesDir")
+      warnOnce(storageDevicesDir, s"Invalid storage devices directory: $storageDevicesDir")
+      Nil
     else
       // Listing can fail with an IO error even when isDir just succeeded. Uncaught, the
       // constructor and the event loop fare differently: from the constructor it would abort
@@ -361,58 +389,132 @@ class Host(val client: AspenClient,
       // loop running but report only the event class and the exception. Warn here so both name
       // the directory that could not be listed.
       Try(os.list(storageDevicesDir)) match
-        case Failure(t)     => logger.warn(s"Failed to list storage devices directory: $storageDevicesDir. Error: $t")
-        case Success(paths) => paths.foreach(tryLoadDevice)
+        case Failure(t) =>
+          warnOnce(storageDevicesDir, s"Failed to list storage devices directory: $storageDevicesDir. Error: $t")
+          Nil
+        case Success(paths) =>
+          reportedDeviceDirs -= storageDevicesDir
+          // A loaded device whose directory is gone is forgotten here, so it is read in full
+          // again if it comes back. Its storageDevices entry is untouched: its stores are open.
+          val listed = paths.toSet
+          loadedDeviceDirs = loadedDeviceDirs.filter((path, _) => listed.contains(path))
+          paths.filterNot(loadedDeviceDirs.contains).flatMap(tryLoadDevice).toList
 
-  private def tryLoadDevice(storageDevicePath: os.Path): Unit =
+  /** Logs `msg` unless a problem with `path` has already been logged by this process. */
+  private def warnOnce(path: os.Path, msg: => String): Unit =
+    if ! reportedDeviceDirs.contains(path) then
+      reportedDeviceDirs += path
+      logDeviceDirWarning(path, msg)
+
+  // protected so a test subclass can count what warnOnce lets through.
+  protected def logDeviceDirWarning(path: os.Path, msg: String): Unit = logger.warn(msg)
+
+  /** Called instead of loading a device that carries `shutdown.state`, naming `markerHost`.
+   *
+   *  A placeholder for now: the device is left unloaded, and since it is not added to
+   *  loadedDeviceDirs it is looked at again on every scan. Deciding between restart, adoption
+   *  and staying shut down needs the device's StorageDeviceState, which is a network read.
+   */
+  private def resolveShutdownMarker(storageDevicePath: os.Path,
+                                    sdCfg: StorageDeviceConfig,
+                                    markerHost: HostId): Unit =
+    warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
+                                s"was shut down by host $markerHost. Not loading it")
+
+  /** Loads the device at `storageDevicePath` if this host owns it, returning its id when this
+   *  call is what loaded it.
+   *
+   *  The load decision is made from device-local files before anything on the device is
+   *  touched -- not even its stale staging directory is removed -- because a device that is
+   *  not ours may still be needed exactly as it is by the host that does own it:
+   *  - `shutdown.state` present: handed to resolveShutdownMarker, which decides.
+   *  - otherwise `owning-host` names this host: loaded.
+   *  - otherwise (another host, no file, malformed file): not loaded and never claimed. A disk
+   *    pulled before its shutdown finished, or moved without one, must go back to its owner or
+   *    be adopted through a shutdown. Claiming it here would steal stores from a host that may
+   *    still be serving them from a copy or that crashed mid-transaction.
+   *  The decision needs no network, which matters at startup: a host may need its own devices
+   *  loaded before it can read any metadata.
+   */
+  private def tryLoadDevice(storageDevicePath: os.Path): Option[StorageDeviceId] =
     val sdCfgPath = storageDevicePath / StorageDeviceConfig.configFilename
 
     if os.isDir(storageDevicePath) && os.exists(sdCfgPath) then
       try
         val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
         if sdCfg.aspenSystemId != aspenSystemId then
-          logger.warn(s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+          warnOnce(storageDevicePath, s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+          None
         else
-          storageDevices.get(sdCfg.storageDeviceId) match
-            case Some(existing) =>
-              // Already loaded. Usually this is just a rescan finding the same directory
-              // again, which must be a no-op so the device's state and open backends
-              // survive. A different directory claiming the same id -- a duplicate mount or
-              // a copied config file -- would otherwise replace the map entry and orphan the
-              // original's already-open stores, so report it and keep the original.
-              if existing.devicePath != storageDevicePath then
-                logger.warn(s"Storage device ${sdCfg.storageDeviceId} is already loaded from " +
-                            s"${existing.devicePath}; ignoring duplicate at $storageDevicePath")
+          DeviceMarkers.readShutdownState(storageDevicePath) match
+            case Some(markerHost) =>
+              resolveShutdownMarker(storageDevicePath, sdCfg, markerHost)
+              None
             case None =>
-              // Nothing can be receiving onto a device that is not loaded yet, so whatever is in
-              // its staging directory was left by an attempt that crashed or was abandoned. A copy
-              // that had finished arriving was already moved to its final path.
-              val staging = storageDevicePath / StoreTransfer.StagingDirectory
-              try os.remove.all(staging)
-              catch case t: Throwable =>
-                logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
-              Try(os.list(storageDevicePath)) match
-                case Failure(t) =>
-                  // Same hazard as the scan in checkForNewDevices: listing can fail with an IO
-                  // error even when isDir just succeeded. The catch below would absorb the
-                  // exception and leave the device unregistered and retryable just the same;
-                  // this guard exists to name the directory instead.
-                  logger.warn(s"Failed to list storage device directory $storageDevicePath. " +
-                              s"Will retry on the next scan. Error: $t")
-                case Success(storeFiles) =>
-                  val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath)
-                  logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
-                  storeFiles.foreach: potentialStoreFile =>
-                    tryLoadStore(sds, potentialStoreFile)
-                  // Registered only after every child has been offered to tryLoadStore. If
-                  // anything above throws, the catch below logs it and the device stays
-                  // unregistered, so the next scan retries the whole device rather than
-                  // skipping it as already loaded. That retry re-offers children whose
-                  // LoadStore events are already queued; tryLoadStore's own catch absorbs the
-                  // resulting duplicate-backend failures.
-                  storageDevices += sdCfg.storageDeviceId -> sds
+              DeviceMarkers.readOwningHost(storageDevicePath) match
+                case Some(owner) if owner == hostId => loadOwnedDevice(storageDevicePath, sdCfgPath, sdCfg)
+                case owner =>
+                  val who = owner.map(h => s"host $h").getOrElse(s"no host (${DeviceMarkers.OwningHostFile} is missing)")
+                  warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
+                                              s"is owned by $who, not this host. Not loading or claiming it")
+                  None
       catch
-        case t: Throwable => logger.warn(s"Failed to load storage device found at path $storageDevicePath. Error: $t")
+        case t: Throwable =>
+          warnOnce(storageDevicePath, s"Failed to load storage device found at path $storageDevicePath. Error: $t")
+          None
+    else
+      None
+
+  /** The load half of tryLoadDevice, run only once the device is known to be ours. */
+  private def loadOwnedDevice(storageDevicePath: os.Path,
+                              sdCfgPath: os.Path,
+                              sdCfg: StorageDeviceConfig): Option[StorageDeviceId] =
+    storageDevices.get(sdCfg.storageDeviceId) match
+      case Some(existing) =>
+        // Already loaded. Usually this is just a rescan finding the same directory
+        // again -- a directory that briefly disappeared, since loaded ones are not otherwise
+        // read -- which must be a no-op so the device's state and open backends survive. A
+        // different directory claiming the same id -- a duplicate mount or a copied config
+        // file -- would otherwise replace the map entry and orphan the original's
+        // already-open stores, so report it and keep the original.
+        if existing.devicePath != storageDevicePath then
+          warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} is already loaded from " +
+                                      s"${existing.devicePath}; ignoring duplicate at $storageDevicePath")
+        else
+          loadedDeviceDirs += storageDevicePath -> sdCfg.storageDeviceId
+        None
+      case None =>
+        // Nothing can be receiving onto a device that is not loaded yet, so whatever is in
+        // its staging directory was left by an attempt that crashed or was abandoned. A copy
+        // that had finished arriving was already moved to its final path.
+        val staging = storageDevicePath / StoreTransfer.StagingDirectory
+        try os.remove.all(staging)
+        catch case t: Throwable =>
+          logger.warn(s"Failed to remove stale transfer staging directory $staging: $t")
+        Try(os.list(storageDevicePath)) match
+          case Failure(t) =>
+            // Same hazard as the scan in checkForNewDevices: listing can fail with an IO
+            // error even when isDir just succeeded. The catch in tryLoadDevice would absorb
+            // the exception and leave the device unregistered and retryable just the same;
+            // this guard exists to name the directory instead.
+            warnOnce(storageDevicePath, s"Failed to list storage device directory $storageDevicePath. " +
+                                        s"Will retry on the next scan. Error: $t")
+            None
+          case Success(storeFiles) =>
+            val sds = new LocalStorageDeviceState(sdCfg.storageDeviceId, storageDevicePath, sdCfgPath)
+            logger.info(s"Loading storage device $storageDevicePath. StorageDeviceId ${sds.storageDeviceId}")
+            storeFiles.foreach: potentialStoreFile =>
+              tryLoadStore(sds, potentialStoreFile)
+            // Registered only after every child has been offered to tryLoadStore. If
+            // anything above throws, the catch in tryLoadDevice logs it and the device stays
+            // unregistered, so the next scan retries the whole device rather than
+            // skipping it as already loaded. That retry re-offers children whose
+            // LoadStore events are already queued; tryLoadStore's own catch absorbs the
+            // resulting duplicate-backend failures.
+            storageDevices += sdCfg.storageDeviceId -> sds
+            loadedDeviceDirs += storageDevicePath -> sdCfg.storageDeviceId
+            reportedDeviceDirs -= storageDevicePath
+            Some(sdCfg.storageDeviceId)
 
   // protected so tests can subclass with a recording implementation instead of opening a
   // real RocksDB backend. `stores` and `storageDevices` are already protected.
@@ -1125,93 +1227,6 @@ class Host(val client: AspenClient,
       }
   }
 
-  // protected so a test subclass can record the claim instead of transacting against a host
-  // object. Nothing outside Host calls it.
-  protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
-    client.transactUntilSuccessful: tx =>
-      given Transaction = tx
-
-      case class PoolState(poolId: PoolId,
-                           pointer: KeyValueObjectPointer,
-                           kvos: KeyValueObjectState,
-                           stores: List[StoreId],
-                           config: StoragePoolState)
-
-      def collectPools(stores: List[StoreId]): List[Future[PoolState]] =
-        val poolMap = stores.foldLeft(Map[PoolId, List[StoreId]]()): (m, storeId) =>
-          val l = m.get(storeId.poolId) match
-            case None => storeId :: Nil
-            case Some(lst) => storeId :: lst
-          m + (storeId.poolId -> l)
-
-        poolMap.map { (poolId, stores) =>
-          for
-            poolPtr <- client.getStoragePoolPointer(poolId)
-            poolKvos <- client.read(poolPtr)
-          yield
-            PoolState(poolId, poolPtr, poolKvos, stores, StoragePoolState(poolKvos))
-        }.toList
-
-      def updatePool(ps: PoolState): Unit =
-        ps.stores.foreach: storeId =>
-          val newEntry = ps.config.stores(storeId.poolIndex).copy(hostId = hostId)
-          ps.config.stores(storeId.poolIndex) = newEntry
-
-        val reqs = List(KeyRevision(StoragePoolState.ConfigKey, ps.kvos.contents(StoragePoolState.ConfigKey).revision))
-        val ops = List(Insert(StoragePoolState.ConfigKey, ps.config.encode()))
-
-        tx.update(ps.pointer, None, None, reqs, ops)
-
-      for
-        devPtr <- client.getStorageDevicePointer(storageDeviceId)
-        devKvos <- client.read(devPtr)
-        state = StorageDeviceState(devKvos)
-        pools <- Future.sequence(collectPools(state.stores.keysIterator.toList))
-        newHostPtr <- client.getHostPointer(hostId)
-        newHostKvos <- client.read(newHostPtr)
-        oldHostPtr <- client.getHostPointer(state.hostId)
-        oldHostKvos <- client.read(oldHostPtr)
-      yield
-        // Check to ensure another concurrent call to this method didn't already
-        // succeed
-        if state.hostId != hostId then
-          logger.info(s"Updating host for storage device ${storageDeviceId}")
-
-          pools.foreach: ps =>
-            updatePool(ps)
-
-          //----------------------
-          // Update Device State
-          //
-          val newDevState = state.copy(hostId = hostId)
-          val reqs = List(KeyRevision(StorageDeviceState.StateKey, devKvos.contents(StorageDeviceState.StateKey).revision))
-          val ops = List(Insert(StorageDeviceState.StateKey, newDevState.encode()))
-
-          tx.update(devPtr, None, None, reqs, ops)
-
-          //----------------------
-          // Update Old HostState State
-          //
-          val oldHostState = HostState(oldHostKvos)
-          val updatedOldHostState = oldHostState.copy(storageDevices = oldHostState.storageDevices - storageDeviceId)
-
-          tx.update(oldHostPtr, None, None,
-            List(KeyRevision(HostState.StateKey, oldHostKvos.contents(HostState.StateKey).revision)),
-            List(Insert(HostState.StateKey, updatedOldHostState.encode())))
-
-          //----------------------
-          // Update New HostState State
-          //
-          val newHostState = HostState(newHostKvos)
-          val updatedNewHostState = newHostState.copy(storageDevices = newHostState.storageDevices + storageDeviceId)
-
-          tx.update(newHostPtr, None, None,
-            List(KeyRevision(HostState.StateKey, newHostKvos.contents(HostState.StateKey).revision)),
-            List(Insert(HostState.StateKey, updatedNewHostState.encode())))
-
-          tx.result.foreach: _ =>
-            logger.info(s"Successfully updated host for storage device ${storageDeviceId}")
-
   private def createNewStore(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
     val storePath = local.devicePath / storeId.directoryName
 
@@ -1472,8 +1487,11 @@ class Host(val client: AspenClient,
    *  storage-devices tree: deletes stores transferred away, reinstates stores left offline by an
    *  abandoned transfer out, creates Initializing stores, and starts transfers in.
    *
-   *  If the tree records a different host, none of that happens: the device has migrated here,
-   *  so this claims it with updateHostId and re-requests the check once the claim commits.
+   *  If the tree records a different host, none of that happens and the device is not claimed.
+   *  tryLoadDevice only loads a device whose `owning-host` file names this host, so a mismatch
+   *  means the file and the tree disagree -- a hand-edited file, or a crash inside a future
+   *  ownership change -- and reconciling against another host's records could delete or create
+   *  stores that are not ours. It is logged once per device and left for an operator.
    *  A device the tree records as failed is ignored outright: it is neither claimed nor
    *  reconciled, and its stores are being rebuilt elsewhere.
    *
@@ -1483,14 +1501,12 @@ class Host(val client: AspenClient,
                                    remote: StorageDeviceState): Unit =
     if remote.isFailed then
       // An operator has declared this device dead. Its directory can still mount -- a dead
-      // controller rather than a dead platter -- and without this the zeroed host id reads as a
-      // migration: updateHostId would call getHostPointer on a host that does not exist, fail
-      // inside transactUntilSuccessful, and retry forever while holding this device's entry in
-      // activeDeviceChecks. Every later check of the device would then be dropped silently.
+      // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
+      // another owner by the branch below. Its stores are being rebuilt elsewhere.
       logger.info(s"Ignoring failed storage device ${local.storageDeviceId}")
     else if remote.hostId != hostId then
-      updateHostId(local.storageDeviceId).foreach: _ =>
-        checkStorageDevice(local.storageDeviceId)
+      warnOnce(local.devicePath, s"Storage device ${local.storageDeviceId} owned by host ${remote.hostId} " +
+                                 s"is loaded here. Not claiming it")
     else
       //----------------------
       // Deleted Stores
@@ -1911,9 +1927,8 @@ class Host(val client: AspenClient,
                 // routinely reachable case.
                 //
                 // A copied or moved config is NOT one of these: its device is registered, so the
-                // lookup succeeds. A config carried to another host then takes
-                // reconcileDeviceState's hostId mismatch branch, which is the designed
-                // host-migration path, not a warn.
+                // lookup succeeds. A device carried to another host is not loaded there at all
+                // (its owning-host file names its old host), so it never reaches this check.
                 case Failure(err) =>
                   val what =
                     if storageDevices.contains(storageDeviceId) then "storage device"
@@ -2051,6 +2066,13 @@ class Host(val client: AspenClient,
    *  task-executor bootstrap transaction.
    */
   private[aspen] def testingOnlyCheckAllDevices(): Unit = handleEvent(CheckAllDevices())
+
+  /** Testing hook: runs a ScanDevices event synchronously. See testingOnlyCheckAllDevices. */
+  private[aspen] def testingOnlyScanDevices(): Unit = handleEvent(ScanDevices())
+
+  private[aspen] def testingOnlyLoadedDeviceDirs: Map[os.Path, StorageDeviceId] = synchronized(loadedDeviceDirs)
+
+  private[aspen] def testingOnlyReportedDeviceDirs: Set[os.Path] = synchronized(reportedDeviceDirs)
 
   /** Testing hook: runs receiveHostMessage's handler synchronously. See
    *  testingOnlyCheckAllDevices for why this bypasses the event queue. */
@@ -2215,6 +2237,12 @@ class Host(val client: AspenClient,
         checkForNewDevices()
         storageDevices.valuesIterator.foreach: sds =>
           checkStorageDevice(sds.storageDeviceId)
+
+      case ScanDevices() =>
+        // Local only: listing the directory reads nothing over the network. A device this scan
+        // loads is checked at once, as CheckAllDevices would, so its Initializing stores are
+        // created now rather than up to checkStorageDevicePeriod from now.
+        checkForNewDevices().foreach(checkStorageDevice)
 
       case InitializeTaskExecutor() =>
         initializeTaskExecutor()

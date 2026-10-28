@@ -309,14 +309,19 @@ private class RecordingHost(mgrClient: AspenClient,
   def loadedDevices: Map[StorageDeviceId, Host.LocalStorageDeviceState] =
     synchronized { storageDevices }
 
-  /** Storage device ids passed to updateHostId, in call order.
+  /** (path, message) for every device-directory warning Host actually logged, in order.
    *
-   *  Recorded rather than executed: the real updateHostId transacts against the host object,
-   *  and the case under test is precisely the one where that host does not exist. Lazy for the
-   *  same initialization-order reason as storeLoadAttempts.
+   *  warnOnce suppresses repeats before calling the hook, so this holds one entry per
+   *  directory per problem episode. Lazy because Host's constructor scan can warn before this
+   *  subclass's fields would otherwise be initialized.
    */
-  lazy val hostIdClaims: mutable.ListBuffer[StorageDeviceId] =
-    mutable.ListBuffer[StorageDeviceId]()
+  lazy val deviceDirWarnings: mutable.ListBuffer[(os.Path, String)] =
+    mutable.ListBuffer[(os.Path, String)]()
+
+  override protected def logDeviceDirWarning(path: os.Path, msg: String): Unit =
+    synchronized:
+      deviceDirWarnings += ((path, msg))
+    super.logDeviceDirWarning(path, msg)
 
   /** Monotonic counter for stamping rebuild event sequences. Incremented each time an event
    *  (metadata flip or load decision) occurs. Lazy for the same initialization-order reason as
@@ -411,11 +416,6 @@ private class RecordingHost(mgrClient: AspenClient,
       case Some(Right(p))    => p.future
       case Some(Left(error)) => throw error
       case None              => super.lookupStorageDeviceState(storageDeviceId)
-
-  override protected def updateHostId(storageDeviceId: StorageDeviceId): Future[Unit] =
-    synchronized:
-      hostIdClaims += storageDeviceId
-    Future.unit
 
   /** Installs `sds` in the protected device map without it ever having been on disk.
    *

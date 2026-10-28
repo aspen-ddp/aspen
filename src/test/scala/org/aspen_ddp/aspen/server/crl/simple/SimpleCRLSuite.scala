@@ -149,6 +149,22 @@ class SimpleCRLSuite extends FileBasedTests {
     i.crl.shutdown()
   }
 
+  // A store rebuilt while its device is shut down is given an empty save file so an adopting
+  // host accepts it. Loading that file must restore nothing and succeed.
+  test("An empty CRL saved state file loads with no transactions") {
+    val savePath = tdir / "crl_save_file.log"
+    CrashRecoveryLog.saveStoreState(storeId, Nil, savePath)
+
+    val (sid, trl) = CrashRecoveryLog.loadStoreState(savePath)
+    assert(sid == storeId)
+    assert(trl.isEmpty)
+
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+    Await.result(i.crl.loadStore(sid, trl), Duration(5000, MILLISECONDS))
+    assert(i.crl.getFullRecoveryState(storeId).isEmpty)
+    i.crl.shutdown()
+  }
+
   test("SimpleCRL Drop Transaction Data") {
     val queue = new LinkedBlockingQueue[String]()
 

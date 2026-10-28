@@ -521,14 +521,15 @@ Given the high-volume of data being sent to the CRL, most deployments will proba
 CRL files with NVMe or SSD media. Importantly, the data in the CRL is centralized and the state for 
 transactions affecting all the DataStores on the host are commingled. Consequently, the in-flight 
 transaction data is NOT stored on the StorageDevice hosting the DataStore. So, you can’t just pull a 
-drive out of one host and plug it into another and expect everything to work just yet. Physically 
-moving drives between hosts is definitely possible but it will require implementing a command that 
-first shuts down all the DataStores on a drive and writes their active transaction state to their 
-folder on the underlying StorageDevice. Shutting down DataStores in this manner is already 
-implemented and is required for transferring DataStores between Hosts/StorageDevices. What remains is 
-just the command to shut down all stores on a device and note that it is ready for transfer. Followed 
-by a little bit of code in the Host to detect a transferred drive and properly load all the stores.
-A good portion of this is already implemented but not quite all of it just yet.
+drive out of one host and plug it into another. A drive must first be shut down with the 
+`shutdown-device` command: its host closes every DataStore on it, writing each one's active transaction 
+state into the DataStore's folder on the drive (the same mechanism used when transferring a DataStore 
+between hosts), records on the drive which host shut it down, and marks the device Shutdown. The drive 
+can then be pulled and plugged into any other host. That host notices the new drive within ten seconds, 
+checks that every DataStore was closed properly, and adopts it in a single transaction that moves the 
+device and its DataStores to the new host before loading them. A drive pulled before its shutdown 
+finished is refused; plugging it back into its original host lets the shutdown complete. A shut-down 
+drive left in, or returned to, its original host stays offline until `restart-device` is used.
 
 Aspen is currently being co-developed with the distributed file system [AmoebaFS](Amoebafs.md) which is 
 Aspen's first real-world use case. AmoebaFS and designed both validate and demonstrate most of 

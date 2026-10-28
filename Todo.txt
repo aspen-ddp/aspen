@@ -1,46 +1,6 @@
 TODO
 ====
 
-Add ability to physically move storage devices between Hosts
-  - Add StorageDeviceState.StoreState.Offline enum value
-  - Add method AspenClient.shutdownStorageDevice(StoreId): Future[Unit]
-    - Add a shutdown-device cli command to call this method
-    - Future returns when the StorageDeviceState is updated to be in the ShuttingDown state
-      - Also success if the device is already in the Shutdown state
-    - Return Failure if device is in the Failed state
-    - In single Tx
-       - Updates the state of all stores to say they're Offline
-       - Update StorageDeviceState status (new field) to ShuttingDown
-         - Other states are Operational, Shutdown, Failed
-           - Can use explicit Failed state rather than deriving it from the storageDeviceId and hostId.
-             - Should be more obvious to readers of the code
-         - Ensure CLI show-device command displays this field
-       - Send nudge on Tx success
-    - When host sees that a storage device it owns is in the ShuttingDown state:
-      - Shuts stores down as if they're going to transfer out and sends gossip message
-      - When all of this is complete, update the StorageDeviceState status to Shutdown
-      - Any in progress transfer-in/out attempts should be killed as the device will likely be physically removed soon
-        - messages to begin the transfer process should be ignored while the device is in the Shutdown state
-        - Double-check that attempts to start a transfer in always begin by looking up the owning hostId from
-          the StorageDeviceState as the device may be physically relocated so the hostId can change between
-          initiation attempts.
-    - The host should scan its storage devices folder every 10 seconds to look for new additions.
-      - If one is found, enqueue it to be loaded
-        - Check must look for a valid storage device configuration file belonging to the aspen system
-        - This also covers the case where a nudge message is missed after creating a new store. Old docs
-          say the new device won't be found until the host is restarted. Update those.
-      - As part of load, lookup the device's owning host. If there is a mismatch, the device has
-        been physically transferred to the new host.
-        - Validate that all the stores were properly shut down and have their CRL files. If not log an error and
-          ignore this device.
-          - Continue to check it but only log once per process lifetime (no need to persist anything)
-          - It is possible that someone removed the device too early. It could be plugged back into the original host,
-            shut down properly, then plugged back into this host
-        - In a single Tx:
-          - Update the state of all the stores to Active
-          - Change the StorageDeviceState status to Operational & update the hostId to the new Host
-        - Load the stores and send the moved gossip for each
-
 Modify StoragePoolAllocationStrategy
   - Currently the StoragePoolAllocationStrategy is created inside the PoolObjectAllocator, lets move this
     to the StoragePool interface instead.

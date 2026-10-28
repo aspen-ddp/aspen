@@ -136,12 +136,13 @@ trait HostTestHarness:
                            ec: ExecutionContext = executionContext,
                            transferService: StoreTransferService = StoreTransferService.Disabled,
                            storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
-                           maxConcurrentRebuilds: Int = 2
+                           maxConcurrentRebuilds: Int = 2,
+                           hostId: HostId = HostId.BootstrapHostId
                           ): RecordingHost =
     new RecordingHost(client, systemId, hostRoot, ec,
                               net.objectCacheFactory, net, net.FinalizerFactory,
                               failFirstStoreLoad, transferService, storeRebuildFactory,
-                              maxConcurrentRebuilds)
+                              maxConcurrentRebuilds, hostId)
 
   protected val deviceA = StorageDeviceId(UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001"))
   protected val deviceB = StorageDeviceId(UUID.fromString("bbbbbbbb-0000-0000-0000-000000000002"))
@@ -188,10 +189,11 @@ private class RecordingHost(mgrClient: AspenClient,
                             failFirstStoreLoad: Boolean = false,
                             transferService: StoreTransferService = StoreTransferService.Disabled,
                             rebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
-                            maxRebuilds: Int = 2)
+                            maxRebuilds: Int = 2,
+                            hid: HostId = HostId.BootstrapHostId)
   extends Host(
     mgrClient,
-    HostId.BootstrapHostId,
+    hid,
     systemId,
     hostRootDir,
     execCtx,
@@ -491,6 +493,14 @@ private class RecordingHost(mgrClient: AspenClient,
       synchronized:
         transferSourceReads += fromDeviceId
       state
+
+  /** (deviceId, previousHostId) for every adoptDevice call, in order. Lazy, as above. */
+  lazy val adoptCalls: mutable.ListBuffer[(StorageDeviceId, HostId)] = mutable.ListBuffer[(StorageDeviceId, HostId)]()
+
+  override protected def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId): Future[Boolean] =
+    synchronized:
+      adoptCalls += ((storageDeviceId, previousHostId))
+    super.adoptDevice(storageDeviceId, previousHostId)
 
   /** Installs `sds` in the protected device map without it ever having been on disk.
    *

@@ -160,6 +160,13 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - Hosts will poll these instances and act on changes
   - This approach is preferred over sending messages directly to the host, since those messages could be lost
   - An example is seeing that a DataStore is marked for transfer in or out. When seen, the hoste will start the process
+- Planned physical moves: `shutdownStorageDevice` makes Active stores Offline and the device ShuttingDown; its host
+  closes the stores (each gets an empty `transferring-out` marker and its `crl_save.log`), writes `shutdown.state`
+  (its HostId) in the device dir, and commits Shutdown. Each device dir also has `owning-host` (`server.DeviceMarkers`),
+  so the 10 s scan decides without the network; only a dir with `shutdown.state` needs a device-state lookup. On the
+  same host a Shutdown device waits for `restartStorageDevice`. Another host adopts it only when Shutdown and every
+  Offline store dir has `transferring-out` + `crl_save.log` (or `transferred-in`), in one transaction rewriting the
+  device, its pool entries and both HostStates, then rewrites `owning-host`, removes the markers and loads it
 
 ### Hybrid Logical Clock (HLC) Timestamps
 - Provides timestamps that are guaranteed to be later than some previously observed event(s)

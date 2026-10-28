@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.Host.ShutdownOutcome
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild, StoreRebuildFactory}
+import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
 import java.util.UUID
@@ -374,6 +375,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       entryAfterFlip.map(_.status) should be(Some(StoreStatus.Offline))
       host.loadStoreByIdRequests.toList should be(Nil)
       os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      // Empty, as a fresh rebuild has no transaction state, but present so an adopter accepts it.
+      os.exists(Backend.crlSaveFile(deviceDir / s0.directoryName)) should be(true)
       host.testingOnlyOfflineStores should contain(s0)
       st.stores(s0).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)

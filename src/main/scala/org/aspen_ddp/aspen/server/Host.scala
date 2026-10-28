@@ -1,10 +1,11 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{AspenClient, StopRetrying, StoragePool, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget, StoreNotHosted}
 
 import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import org.aspen_ddp.aspen.common.network.*
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runSequentially}
@@ -63,6 +64,10 @@ object Host:
   private case class HeartbeatEvent() extends Event
   private case class CheckAllDevices() extends Event
   private case class ScanDevices() extends Event
+  private case class ShutdownMarkerResolved(path: os.Path,
+                                            cfg: StorageDeviceConfig,
+                                            markerHost: HostId,
+                                            state: Try[StorageDeviceState]) extends Event
   private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
   private case class InitializeTaskExecutor() extends Event
 
@@ -234,6 +239,14 @@ class Host(val client: AspenClient,
   // warning every few seconds forever. In memory only: a restart logs each problem once more. A
   // path leaves the set when its device loads, so a later problem with it is reported again.
   private var reportedDeviceDirs: Set[os.Path] = Set()
+
+  // Device directories carrying shutdown.state whose StorageDeviceState lookup, or the adoption
+  // that lookup led to, is still in flight. One at a time per path: the scan reaches such a
+  // directory every deviceScanPeriod, and without this a slow read would pile up a lookup per
+  // scan, and a slow adoption a second transaction racing the first. A path leaves the set once
+  // its outcome has been acted on, so the next scan decides afresh.
+  private var pendingMarkerResolutions: Set[os.Path] = Set()
+
   protected var stores: Map[StoreId, Store] = Map()
 
   private var offlineStores: Set[StoreId] = Set()
@@ -449,15 +462,231 @@ class Host(val client: AspenClient,
 
   /** Called instead of loading a device that carries `shutdown.state`, naming `markerHost`.
    *
-   *  A placeholder for now: the device is left unloaded, and since it is not added to
-   *  loadedDeviceDirs it is looked at again on every scan. Deciding between restart, adoption
-   *  and staying shut down needs the device's StorageDeviceState, which is a network read.
+   *  Whether such a device stays shut down, is restarted in place, or is adopted by this host
+   *  depends on its StorageDeviceState, which is a network read, so the load decision cannot be
+   *  made here. The lookup is issued and its result queued as a ShutdownMarkerResolved event,
+   *  which shutdownMarkerResolved acts on from the event loop. Until then the directory is not
+   *  in loadedDeviceDirs, so later scans reach it again; pendingMarkerResolutions keeps them from
+   *  issuing a second lookup while this one is in flight.
+   *
+   *  Caller holds the instance lock.
    */
   private def resolveShutdownMarker(storageDevicePath: os.Path,
                                     sdCfg: StorageDeviceConfig,
                                     markerHost: HostId): Unit =
-    warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
-                                s"was shut down by host $markerHost. Not loading it")
+    if ! pendingMarkerResolutions.contains(storageDevicePath) then
+      pendingMarkerResolutions += storageDevicePath
+      // A throw before the Future exists would register no callback, and the path would stay
+      // pending -- and the device unresolved -- for the life of the process.
+      val lookup =
+        try lookupStorageDeviceState(sdCfg.storageDeviceId)
+        catch case t: Throwable => Future.failed(t)
+      lookup.onComplete: result =>
+        events.put(ShutdownMarkerResolved(storageDevicePath, sdCfg, markerHost, result))
+
+  /** Acts on the StorageDeviceState looked up for a device carrying `shutdown.state`:
+   *
+   *  | marker names | device state                      | action                                  |
+   *  |--------------|-----------------------------------|-----------------------------------------|
+   *  | this host    | Shutdown                          | not loaded, quietly: it awaits a restart or a move |
+   *  | this host    | ShuttingDown                      | loaded: a crash before Shutdown committed. The reconcile finishes the shutdown |
+   *  | this host    | Operational, owned here           | restarted while unloaded: brought back into service |
+   *  | another host | Shutdown, owned by the marker host| adopted, if every store was closed cleanly |
+   *  | another host | Operational, owned here           | adopted earlier, crashed before the load: brought into service |
+   *  | any          | Failed, or anything else          | warned about once, not loaded            |
+   *  | lookup failed|                                   | warned about once, retried on the next scan |
+   *
+   *  The ShuttingDown row for another host is the important refusal: a disk pulled before its
+   *  shutdown finished may still have stores whose CRL state is only on the old host, and its
+   *  metadata still names that host. It must go back there to finish shutting down.
+   *
+   *  Every row that does nothing leaves the directory out of loadedDeviceDirs, so the next scan
+   *  decides again from a fresh read: a restart or a finished shutdown is picked up that way.
+   *
+   *  Called from handleEvent, which holds the instance lock.
+   */
+  private def shutdownMarkerResolved(path: os.Path,
+                                     sdCfg: StorageDeviceConfig,
+                                     markerHost: HostId,
+                                     result: Try[StorageDeviceState]): Unit =
+    import StorageDeviceState.DeviceStatus
+    pendingMarkerResolutions -= path
+    val deviceId = sdCfg.storageDeviceId
+    try
+      // The disk was read before the lookup went out. If it has been pulled, or its marker has
+      // changed, since then, this result describes a directory that is no longer there to act
+      // on; the next scan starts over from what the disk says now.
+      val stillMarked = os.isDir(path) && DeviceMarkers.readShutdownState(path).contains(markerHost)
+      if ! stillMarked || loadedDeviceDirs.contains(path) then
+        ()
+      else if storageDevices.get(deviceId).exists(_.devicePath != path) then
+        warnOnce(path, s"Storage device $deviceId is already loaded from " +
+                       s"${storageDevices(deviceId).devicePath}; ignoring duplicate at $path")
+      else
+        result match
+          case Failure(err) =>
+            warnOnce(path, s"Failed to read the state of shut-down storage device $deviceId at $path. " +
+                           s"Not loading it. Will retry on the next scan. Error: $err")
+
+          case Success(state) =>
+            val ownedHere = state.hostId == hostId
+            def refuse(why: String): Unit =
+              warnOnce(path, s"Storage device $deviceId at $path was shut down by host $markerHost, " +
+                             s"and the storage-devices tree records it as ${state.status} owned by " +
+                             s"host ${state.hostId}. $why")
+
+            if state.isFailed then
+              refuse("It has been declared failed. Not loading it")
+            else if markerHost == hostId then
+              state.status match
+                case DeviceStatus.Shutdown if ownedHere => ()
+                case DeviceStatus.ShuttingDown if ownedHere =>
+                  logger.info(s"Storage device $deviceId at $path was being shut down when this host " +
+                              s"stopped. Loading it to finish the shutdown")
+                  loadOwnedDevice(path, path / StorageDeviceConfig.configFilename, sdCfg)
+                    .foreach(checkStorageDevice)
+                case DeviceStatus.Operational if ownedHere =>
+                  logger.info(s"Storage device $deviceId at $path has been restarted. Loading it")
+                  bringIntoService(path, sdCfg, state, rewriteOwner = false)
+                case _ =>
+                  refuse("Not loading it")
+            else
+              state.status match
+                case DeviceStatus.Shutdown if state.hostId == markerHost =>
+                  tryAdoptDevice(path, sdCfg, state, markerHost)
+                case DeviceStatus.Operational if ownedHere =>
+                  logger.info(s"Storage device $deviceId at $path was adopted by this host but not " +
+                              s"yet loaded. Finishing the adoption")
+                  bringIntoService(path, sdCfg, state, rewriteOwner = true)
+                case DeviceStatus.ShuttingDown if state.hostId == markerHost =>
+                  refuse("Its shutdown did not finish, so some of its stores may not have been " +
+                         "closed. Not adopting it. Return it to that host to finish the shutdown")
+                case _ =>
+                  refuse("Not loading or adopting it")
+    catch
+      case t: Throwable =>
+        warnOnce(path, s"Failed to resolve the shutdown of storage device $deviceId at $path. " +
+                       s"Will retry on the next scan. Error: $t")
+
+  /** Whether the store at `storePath`, whose entry is Offline, can be put back into service by an
+   *  adoption: every piece of its state must be in its own directory, since the host that took
+   *  it offline is not here.
+   *
+   *  An Offline entry on a shut-down device comes from one of three places, and each leaves a
+   *  recognisable directory:
+   *  - a store the shutdown closed: its transfer-out marker and the CRL save file ShutdownStore
+   *    wrote beside it (a transfer out rolled back to Offline is closed the same way);
+   *  - a store rebuilt during or after the shutdown (keepRebuiltStoreOffline): the same pair, the
+   *    CRL file empty since a fresh rebuild has no transaction state;
+   *  - a transfer in that landed during the shutdown (PoolRepointedOffline): its transferred-in
+   *    marker. It was never opened on this device, so it has no CRL state to carry.
+   *  Anything else -- a missing directory, a marker with no CRL file -- is a store whose close did
+   *  not finish, and adopting it would drop the transactions its CRL state was holding.
+   */
+  private def closedForAdoption(storePath: os.Path): Boolean =
+    os.isDir(storePath) &&
+      ((os.exists(storePath / StoreTransfer.TransferOutMarkerFile) && os.exists(Backend.crlSaveFile(storePath))) ||
+        os.exists(storePath / StoreTransfer.TransferredInMarkerFile))
+
+  /** Validates a device shut down by `previousHostId` and, if every Offline store was closed
+   *  cleanly, adopts it. On success the post-commit steps run from the transaction's callback.
+   *
+   *  The directory stays in pendingMarkerResolutions until the adoption has been acted on, so a
+   *  scan arriving meanwhile does not start a second one.
+   *
+   *  Caller holds the instance lock.
+   */
+  private def tryAdoptDevice(path: os.Path,
+                             sdCfg: StorageDeviceConfig,
+                             state: StorageDeviceState,
+                             previousHostId: HostId): Unit =
+    val deviceId = sdCfg.storageDeviceId
+    val unclean = state.stores.collect {
+      case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Offline &&
+                               !closedForAdoption(path / storeId.directoryName) => storeId
+    }.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+
+    if unclean.nonEmpty then
+      warnOnce(path, s"Storage device $deviceId at $path was shut down by host $previousHostId, but " +
+                     s"stores ${unclean.mkString(", ")} were not closed cleanly (missing directory, " +
+                     s"transfer-out marker or CRL save file). Not adopting it. It may have been " +
+                     s"removed too early: return it to that host to finish the shutdown")
+    else
+      logger.info(s"Adopting storage device $deviceId at $path, shut down by host $previousHostId")
+      pendingMarkerResolutions += path
+      val fadopt =
+        try adoptDevice(deviceId, previousHostId)
+        catch case t: Throwable => Future.failed(t)
+      fadopt.onComplete: result =>
+        synchronized:
+          pendingMarkerResolutions -= path
+          result match
+            case Success(true) =>
+              // What adoptDevice wrote, without a re-read: the rows it changed are exactly these.
+              val adopted = state.withOfflineStoresActive.copy(
+                hostId = hostId, status = StorageDeviceState.DeviceStatus.Operational)
+              try bringIntoService(path, sdCfg, adopted, rewriteOwner = true)
+              catch case t: Throwable =>
+                // The adoption is committed, so the next scan reaching this directory takes the
+                // "Operational, owned here" row and runs these steps again.
+                logger.error(s"Adopted storage device $deviceId but failed to load it from $path. " +
+                             s"Will retry on the next scan. Error: $t")
+            case Success(false) =>
+              logger.info(s"Storage device $deviceId changed state before it could be adopted. " +
+                          s"The next scan will look at it again")
+            case Failure(t) =>
+              warnOnce(path, s"Failed to adopt storage device $deviceId at $path. Will retry on the " +
+                             s"next scan. Error: $t")
+
+  /** The local half of a restart or adoption, once `state` -- Operational and owned by this host
+   *  -- has committed. Each step is idempotent, so a crash between any two of them is finished by
+   *  the next scan, which finds shutdown.state still present and lands here again:
+   *  1. `owning-host` is rewritten to name this host (adoption only), so once shutdown.state is
+   *     gone the device loads here on its own.
+   *  2. The transfer-out marker the shutdown left is removed from every store now Active, except
+   *     one whose entry still names a transfer or that this process is sending: there the marker
+   *     belongs to a transfer. Offline entries -- none are expected -- keep theirs and stay
+   *     unloaded. A transferred-in marker is left alone: the reconcile's completed-transfers-in
+   *     pass clears it and loads the store, as it would after any crash.
+   *  3. shutdown.state is removed.
+   *  4. The device is loaded through tryLoadDevice and checked at once, so its Rebuilding and
+   *     TransferringIn work resumes now rather than at the next periodic check.
+   *  5. StoreMoved is gossiped for every Active store, read from the pool as for a completed
+   *     transfer in: the shutdown announced them all offline, and after an adoption peers must
+   *     also learn the new host. The stores' LoadStore events are already queued ahead of any
+   *     message a peer sends in response.
+   *
+   *  A failed marker removal in step 2 only leaves that store offline: the reconcile's
+   *  abandoned-transfer-out pass picks it up on a later check. A failed step 3 leaves the whole
+   *  device to the next scan.
+   *
+   *  Caller holds the instance lock.
+   */
+  private def bringIntoService(path: os.Path,
+                               sdCfg: StorageDeviceConfig,
+                               state: StorageDeviceState,
+                               rewriteOwner: Boolean): Unit =
+    if rewriteOwner then
+      DeviceMarkers.writeOwningHost(path, hostId)
+
+    val active = state.stores.collect {
+      case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Active => storeId -> entry
+    }
+    active.foreach: (storeId, entry) =>
+      val markerFile = path / storeId.directoryName / StoreTransfer.TransferOutMarkerFile
+      if entry.transferDevice.isEmpty && !storeTransferService.isTransferringOut(storeId) &&
+         os.exists(markerFile) then
+        try os.remove(markerFile)
+        catch case t: Throwable =>
+          logger.error(s"Failed to remove the transfer-out marker for store $storeId at $markerFile. " +
+                       s"The store stays offline until a later check of its device. Error: $t")
+
+    if os.exists(path / DeviceMarkers.ShutdownStateFile) then
+      DeviceMarkers.removeShutdownState(path)
+
+    tryLoadDevice(path).foreach: deviceId =>
+      checkStorageDevice(deviceId)
+      active.keysIterator.foreach(gossipStoreOnline)
 
   /** Loads the device at `storageDevicePath` if this host owns it, returning its id when this
    *  call is what loaded it.
@@ -1598,28 +1827,32 @@ class Host(val client: AspenClient,
               RebuildOutcome.Discard
 
   /** Keeps a rebuilt store whose entry was written Offline (RebuildOutcome.AdoptOffline) out of
-   *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker.
-   *  That is exactly how the shutdown leaves the stores it closed, so a restart's
-   *  abandoned-transfer-out pass, or an adoption, brings it back the same way.
+   *  service: it is not loaded, and it is recorded offline behind an empty transfer-out marker
+   *  plus an empty CRL save file. That is exactly how the shutdown leaves the stores it closed, so
+   *  a restart, or an adoption's check that every Offline store was closed cleanly, treats it
+   *  the same way. Empty because a store fresh from a rebuild has no transaction state.
    *
-   *  With the device unloaded already (its shutdown finished first), the disk is not touched: it
-   *  may be on its way out of the machine. Nothing is lost by that. Unmarked, the store simply
-   *  loads with the rest once its device is next loaded, after the restart or adoption has made
-   *  the entry Active; and a crash-resumed shutdown that loads it first closes and marks it.
+   *  Written even when the device has already been unloaded (its shutdown finished first): the
+   *  device path is still known, and without the pair an adopting host would refuse the whole
+   *  device for a store that is in fact complete. A disk already pulled makes the writes fail,
+   *  which is logged; an adopter then refuses the device until it is returned and shut down
+   *  again, the same as any other store whose close did not finish.
    */
   private def keepRebuiltStoreOffline(local: LocalStorageDeviceState, storeId: StoreId): Unit = synchronized {
     offlineStores += storeId
     if storageDevices.get(local.storageDeviceId).contains(local) then
       local.offlineStores += storeId
-      val storePath = local.devicePath / storeId.directoryName
-      try
-        os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
-      catch
-        case t: Throwable =>
-          // Offline for the life of this process either way. Only a restart cancelling the
-          // shutdown is affected: without the marker that pass does not reinstate the store,
-          // which then waits for this host's next start to load.
-          logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
+    val storePath = local.devicePath / storeId.directoryName
+    try
+      os.write.over(storePath / StoreTransfer.TransferOutMarkerFile, "")
+      if ! os.exists(Backend.crlSaveFile(storePath)) then
+        CrashRecoveryLog.saveStoreState(storeId, Nil, Backend.crlSaveFile(storePath))
+    catch
+      case t: Throwable =>
+        // Offline for the life of this process either way. A restart cancelling the shutdown
+        // loses the abandoned-transfer-out pass's reinstatement without the marker, so the store
+        // waits for this host's next start to load; an adopter refuses the device.
+        logger.error(s"Failed to mark rebuilt store $storeId offline at $storePath: $t")
   }
 
   /** Gossips StoreMoved for a store this host has brought back online without repointing the
@@ -1639,6 +1872,102 @@ class Host(val client: AspenClient,
         gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp, onlineTimestamp))
       case Failure(err) =>
         logger.warn(s"Failed to read pool ${storeId.poolId} to gossip that store $storeId is online: $err")
+
+  /** Moves a device shut down by `previousHostId` onto this host, in one transaction:
+   *  - the device: Offline stores Active, status Operational, hostId this host;
+   *  - every pool entry naming this device: hostId this host. Entries naming another device are
+   *    left alone -- a TransferringIn entry's pool still names its source;
+   *  - the previous host's HostState loses the device, this host's gains it;
+   *  - for a bootstrap-pool store, the bootstrap config in the radicle, as a transfer does.
+   *
+   *  Every object written carries a KeyRevision, so a restart on the old host or a second
+   *  adopter racing this one makes one of them lose and re-read. Returns false, writing nothing,
+   *  when the re-read finds the device no longer Shutdown and owned by `previousHostId`. The
+   *  previous host's HostState is skipped if that host has no entry in the hosts tree: it was
+   *  removed, and there is nothing left to take the device out of.
+   *
+   *  Only a collision is retried, as everywhere else in Host: a permanent error would otherwise
+   *  hold the device's pendingMarkerResolutions entry for the life of the process.
+   *
+   *  protected so a test subclass can record the calls.
+   */
+  protected def adoptDevice(storageDeviceId: StorageDeviceId, previousHostId: HostId): Future[Boolean] =
+    import StorageDeviceState.DeviceStatus
+
+    case class PoolUpdate(pointer: KeyValueObjectPointer, kvos: KeyValueObjectState, config: StoragePoolState)
+
+    def readPool(poolId: PoolId): Future[PoolUpdate] =
+      for
+        ptr <- client.getStoragePoolPointer(poolId)
+        kvos <- client.read(ptr)
+      yield PoolUpdate(ptr, kvos, StoragePoolState(kvos))
+
+    def readHost(id: HostId): Future[(KeyValueObjectPointer, KeyValueObjectState)] =
+      for
+        ptr <- client.getHostPointer(id)
+        kvos <- client.read(ptr)
+      yield (ptr, kvos)
+
+    def writeHost(ptr: KeyValueObjectPointer, kvos: KeyValueObjectState, hs: HostState)(using tx: Transaction): Unit =
+      tx.update(ptr, None, None,
+        List(KeyRevision(HostState.StateKey, kvos.contents(HostState.StateKey).revision)),
+        List(Insert(HostState.StateKey, hs.encode())))
+
+    client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>
+      given Transaction = tx
+      for
+        devPtr <- client.getStorageDevicePointer(storageDeviceId)
+        devKvos <- client.read(devPtr)
+        state = StorageDeviceState(devKvos)
+        adopted <-
+          if state.status != DeviceStatus.Shutdown || state.hostId != previousHostId then
+            Future.successful(false)
+          else
+            // Pool entries are rewritten before prepRadicleUpdate reads them, so its store map
+            // names this host for every moved bootstrap store, not only the one it is given.
+            val moved = state.stores.keysIterator.toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
+            for
+              pools <- Future.sequence(moved.map(_.poolId).distinct.map(readPool))
+              newHost <- readHost(hostId)
+              oldHost <- readHost(previousHostId).map(Some(_)).recover:
+                           case _: NoSuchElementException => None
+              repointed = moved.filter: storeId =>
+                pools.find(_.config.poolId == storeId.poolId).exists: pu =>
+                  val entry = pu.config.stores(storeId.poolIndex)
+                  if entry.storageDeviceId == storageDeviceId && entry.hostId != hostId then
+                    pu.config.stores(storeId.poolIndex) = entry.copy(hostId = hostId)
+                    true
+                  else
+                    false
+              _ <- repointed.find(_.poolId == PoolId.BootstrapPoolId) match
+                     case Some(storeId) =>
+                       val cfg = pools.find(_.config.poolId == storeId.poolId).get.config
+                       BootstrapConfig.prepRadicleUpdate(client, storeId, cfg, hostId)
+                     case None => Future.unit
+            yield
+              val changedPools = repointed.map(_.poolId).toSet
+              pools.filter(pu => changedPools.contains(pu.config.poolId)).foreach: pu =>
+                tx.update(pu.pointer, None, None,
+                  List(KeyRevision(StoragePoolState.ConfigKey, pu.kvos.contents(StoragePoolState.ConfigKey).revision)),
+                  List(Insert(StoragePoolState.ConfigKey, pu.config.encode())))
+
+              val newState = state.withOfflineStoresActive.copy(hostId = hostId, status = DeviceStatus.Operational)
+              tx.update(devPtr, None, None,
+                List(KeyRevision(StorageDeviceState.StateKey, devKvos.contents(StorageDeviceState.StateKey).revision)),
+                List(Insert(StorageDeviceState.StateKey, newState.encode())))
+
+              oldHost match
+                case Some((ptr, kvos)) => writeHost(ptr, kvos, HostState(kvos).removeStorageDevice(storageDeviceId))
+                case None =>
+                  logger.info(s"Previous host $previousHostId of storage device $storageDeviceId is not " +
+                              s"registered. Adopting the device without updating its host state")
+              val (newPtr, newKvos) = newHost
+              writeHost(newPtr, newKvos, HostState(newKvos).addStorageDevice(storageDeviceId))
+
+              tx.result.foreach: _ =>
+                logger.info(s"Adopted storage device $storageDeviceId from host $previousHostId")
+              true
+      yield adopted
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
    *
@@ -1914,8 +2243,10 @@ class Host(val client: AspenClient,
    *
    *  If the tree records a different host, none of that happens and the device is not claimed.
    *  tryLoadDevice only loads a device whose `owning-host` file names this host, so a mismatch
-   *  means the file and the tree disagree -- a hand-edited file, or a crash inside a future
-   *  ownership change -- and reconciling against another host's records could delete or create
+   *  means the file and the tree disagree -- a hand-edited or copied file, or a device adopted
+   *  by another host and then carried back here without a shutdown (an adoption itself rewrites
+   *  the file only after its commit, while shutdown.state still keeps the device unloaded) --
+   *  and reconciling against another host's records could delete or create
    *  stores that are not ours. It is logged once per device and left for an operator.
    *  A device the tree records as failed is ignored outright: it is neither claimed nor
    *  reconciled, and its stores are being rebuilt elsewhere.
@@ -2526,6 +2857,25 @@ class Host(val client: AspenClient,
 
   private[aspen] def testingOnlyReportedDeviceDirs: Set[os.Path] = synchronized(reportedDeviceDirs)
 
+  /** Testing hook: device directories with a shutdown-marker lookup or adoption in flight. */
+  private[aspen] def testingOnlyPendingMarkerResolutions: Set[os.Path] = synchronized(pendingMarkerResolutions)
+
+  /** Testing hook: how many ShutdownMarkerResolved events are queued. */
+  private[aspen] def testingOnlyQueuedMarkerResolutions: Int =
+    events.toArray.count(_.isInstanceOf[ShutdownMarkerResolved])
+
+  /** Testing hook: removes the queued ShutdownMarkerResolved events and handles them
+   *  synchronously, leaving every other event queued. See testingOnlyCheckAllDevices. */
+  private[aspen] def testingOnlyHandleMarkerResolutions(): Unit =
+    val it = events.iterator()
+    var resolved = List[Event]()
+    while it.hasNext do
+      val e = it.next()
+      if e.isInstanceOf[ShutdownMarkerResolved] then
+        it.remove()
+        resolved = e :: resolved
+    resolved.reverse.foreach(handleEvent)
+
   /** Testing hook: runs receiveHostMessage's handler synchronously. See
    *  testingOnlyCheckAllDevices for why this bypasses the event queue. */
   private[aspen] def testingOnlyHandleHostMessage(msg: HostMessage): Unit =
@@ -2694,6 +3044,9 @@ class Host(val client: AspenClient,
         checkForNewDevices()
         storageDevices.valuesIterator.foreach: sds =>
           checkStorageDevice(sds.storageDeviceId)
+
+      case ShutdownMarkerResolved(path, cfg, markerHost, state) =>
+        shutdownMarkerResolved(path, cfg, markerHost, state)
 
       case ScanDevices() =>
         // Local only: listing the directory reads nothing over the network. A device this scan

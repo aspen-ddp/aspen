@@ -9,12 +9,17 @@ import scribe.Logging
 
 import scala.concurrent.{Future, Promise}
 
+object Backend:
+  /** Where ShutdownStore saves a closed store's CRL state, and LoadStore looks for it. Computed
+   *  from the store directory alone so a host can check for it without opening the backend. */
+  def crlSaveFile(storePath: os.Path): os.Path = storePath / "crl_save.log"
+
 trait Backend extends Logging {
   val storeId: StoreId
 
   def path: os.Path
 
-  def crlSaveFile: os.Path = path / "crl_save.log"
+  def crlSaveFile: os.Path = Backend.crlSaveFile(path)
 
   def close(): Future[Unit]
 

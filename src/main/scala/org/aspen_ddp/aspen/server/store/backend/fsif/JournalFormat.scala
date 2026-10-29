@@ -152,15 +152,19 @@ object JournalFormat:
         JournalRecord.Delta(ext, slot, header, ranges.result())
       case t => throw BadRecord(s"unknown record type $t")
 
-  def scan(bytes: Array[Byte]): Scan =
-    val headerOk = bytes.length >= HeaderSize &&
+  /** (seq, salt) if the file starts with a valid header, whatever follows it */
+  def decodeHeader(bytes: Array[Byte]): Option[(Long, Long)] =
+    val ok = bytes.length >= HeaderSize &&
       java.util.Arrays.equals(bytes, 0, 8, Magic, 0, 8) &&
       ByteBuffer.wrap(bytes).getInt(24) == crc(bytes, 0, 24)
-    if !headerOk then
+    if ok then Some((ByteBuffer.wrap(bytes).getLong(8), ByteBuffer.wrap(bytes).getLong(16))) else None
+
+  def scan(bytes: Array[Byte]): Scan =
+    val header = decodeHeader(bytes)
+    if header.isEmpty then
       if bytes.length <= HeaderSize then Scan.Empty else Scan.Corrupt("invalid journal header")
     else
-      val seq = ByteBuffer.wrap(bytes).getLong(8)
-      val salt = ByteBuffer.wrap(bytes).getLong(16)
+      val (seq, salt) = header.get
       val records = Vector.newBuilder[JournalRecord]
       var o = HeaderSize.toLong
       var n = 0L

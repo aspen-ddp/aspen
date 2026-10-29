@@ -2,7 +2,9 @@ package org.aspen_ddp.aspen.common.rebalancing
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState,
+                                            StorageDeviceState}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 
@@ -134,6 +136,45 @@ abstract class TransferStarterSuiteBase extends IntegrationTestSuite:
                   .map(Right(_)).recover { case e => Left(e) }
     yield
       result.isLeft should be(true)
+
+  /** A store of the bootstrap pool at an index no host serves, so neither a host's reconcile nor
+   *  its usage tracker acts on the metadata written for it. */
+  private val phantom = StoreId(poolId, 9.toByte)
+
+  atest("start returns NoRoom, and starts nothing, when the destination is already receiving too much"):
+    given ExecutionContext = executionContext
+    for
+      _ <- setup()
+      // More than the second device's 1,000,000 bytes are already on their way to it.
+      _ <- setStoreSize(phantom, 2_000_000L)
+      _ <- setDeviceState(net.secondDeviceId)(_.setStoreEntry(phantom,
+             StorageDeviceState.StoreStatus.TransferringIn, Some(sourceId)))
+      result <- TransferStarter.start(client, store0, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      src <- statusOf(sourceId, store0)
+      dst <- statusOf(net.secondDeviceId, store0)
+    yield
+      result should be(StartResult.NoRoom)
+      src should be(Some(StorageDeviceState.StoreStatus.Active))
+      dst should be(None)
+
+  atest("start does not count a planned transfer against its own destination"):
+    given ExecutionContext = executionContext
+    for
+      _ <- setup()
+      // 600,000 bytes fit the second device's 1,000,000 once, not twice. A host's usage tracker
+      // may lower the recorded size mid-test, which still fits.
+      _ <- setStoreSize(store0, 600_000L)
+      setPtr <- client.getStorageDeviceSetPointer(StorageDeviceSetId.BootstrapStorageDeviceSetId)
+      setDos <- client.read(setPtr)
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.overwrite(setPtr, setDos.revision, DataBuffer(StorageDeviceSetState(setDos).copy(
+               pendingTransfers = List((store0, sourceId, net.secondDeviceId))).toBytes))
+             Future.unit
+      _ <- waitForTransactionsToComplete()
+      result <- TransferStarter.start(client, store0, net.secondDeviceId)
+    yield
+      result should be(StartResult.Started)
 
 class TransferStarterSuite extends TransferStarterSuiteBase:
 

@@ -28,6 +28,35 @@ object StorageDeviceSetState:
   /** Cap on concurrent member-set reads while walking a hierarchy. Bounds load on large trees. */
   private[metadata] val MaxConcurrentSetReads: Int = 20
 
+  /** Free space on `device` once the stores it is committed to receive
+   *  (`StorageDeviceState.incomingStores`) arrive. `excluding` leaves stores out of that
+   *  reservation: a caller about to start a transfer that its set's plan already lists must not
+   *  count the store against its own destination. */
+  private[aspen] def availableSpace(client: AspenClient,
+                                    device: StorageDeviceState,
+                                    excluding: Set[StoreId] = Set.empty)
+                                   (using ExecutionContext): Future[Long] =
+    for
+      set <- client.getStorageDeviceSetState(device.storageDeviceSet)
+      incoming <- storeSizes(client, device.incomingStores(set.pendingTransfers) -- excluding)
+    yield device.totalSize - device.currentUsage - incoming.values.sum
+
+  /** Each store's size from its pool's per-store usage accounting, 0 where none is recorded.
+   *  Reads each distinct pool once. */
+  private[metadata] def storeSizes(client: AspenClient, storeIds: Set[StoreId])
+                                  (using ExecutionContext): Future[Map[StoreId, Long]] =
+    val byPool = storeIds.groupBy(_.poolId).toSeq
+    runBoundedParallel(byPool, MaxConcurrentSetReads): (poolId, ids) =>
+      for
+        ptr <- client.getStoragePoolPointer(poolId)
+        kvos <- client.read(ptr)
+      yield
+        ids.toSeq.map: sid =>
+          sid -> kvos.contents.get(StoragePoolState.getStoreUsageKey(sid.poolIndex))
+                   .map(vs => byte2long(vs.value.bytes))
+                   .getOrElse(0L)
+    .map(_.flatten.toMap)
+
   /** Thrown when attempting to move a device into a set whose level is not 0.
    *  Only level-0 sets hold devices. */
   class NotLevelZero(val setId: StorageDeviceSetId)
@@ -203,12 +232,16 @@ final case class StorageDeviceSetState(
       freeSpaceLookup = id => freeSpaceOfOperational(client, id),
       rng = rng)
 
-  /** Free space of `id`, failing for a device that is not operational so selection skips it. */
+  /** Free space of `id`, failing for a device that is not operational so selection skips it.
+   *  The stores the device is already committed to receive (`StorageDeviceState.incomingStores`)
+   *  are subtracted, so concurrent placements cannot all pick one empty device and overfill it. */
   private def freeSpaceOfOperational(client: AspenClient, id: StorageDeviceId)
                                     (using ExecutionContext): Future[Long] =
     client.getStorageDeviceState(id).flatMap: s =>
-      if s.isOperational then Future.successful(s.totalSize - s.currentUsage)
-      else Future.failed(AspenClient.DeviceNotOperational(id))
+      if !s.isOperational then
+        Future.failed(AspenClient.DeviceNotOperational(id))
+      else
+        StorageDeviceSetState.availableSpace(client, s)
 
   /** Every device reachable from this set: `memberDevices` at level 0, the union of the
    *  members' walks above. This is the "is this store already in the target set?" predicate

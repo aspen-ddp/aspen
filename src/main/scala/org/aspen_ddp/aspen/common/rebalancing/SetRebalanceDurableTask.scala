@@ -171,7 +171,7 @@ class SetRebalanceDurableTask(
 
   /** Given a non-empty pending list, either (a) finish an already-completed transfer by
    *  removing it, (b) drop a transfer whose pool has left planning state, or (c) go through
-   *  every not-started transfer whose backoff allows it, replacing an unusable destination or
+   *  every not-started transfer whose backoff allows it, replacing an unusable or full destination or
    *  starting the transfer. In-flight transfers are simply waited for. Re-enters processNext()
    *  after a removal; the poll was already armed by run(). */
   private def drive(pending: List[Transfer]): Future[Unit] =
@@ -207,7 +207,7 @@ class SetRebalanceDurableTask(
                   .map(_ => ())
 
   /** Make progress on one not-started transfer: replace its destination if that is no longer
-   *  usable, otherwise try to start it. Never fails; errors are logged and retried by the poll. */
+   *  usable or has no room left, otherwise try to start it. Never fails; errors are logged and retried by the poll. */
   private def advance(t: Transfer,
                       setState: StorageDeviceSetState,
                       planningState: State.PlanningState): Future[Unit] =
@@ -221,24 +221,28 @@ class SetRebalanceDurableTask(
         // can pass the same check and together take the pool below the floor. TransferStarter
         // detects that after the start commits and rolls this transfer back (RolledBack), which
         // is why RolledBack backs off here. See the TransferStarter and TransferSafety scaladoc.
-        TransferStarter.start(client, storeId, toDevice).transform:
+        TransferStarter.start(client, storeId, toDevice).transformWith:
           case Success(StartResult.Started) =>
             backoff.succeeded(storeId)
-            Success(())
+            Future.unit
           case Success(StartResult.RolledBack) =>
             logger.info(s"Rebalance set $setId: start of $storeId was rolled back; backing off")
             backoff.failed(storeId)
-            Success(())
+            Future.unit
           case Success(StartResult.Rejected) =>
             // Not admissible right now; the poll re-evaluates.
-            Success(())
+            Future.unit
+          case Success(StartResult.NoRoom) =>
+            // Something else filled the destination after planning. Pick another now rather
+            // than waiting for room that may never come.
+            replaceDestination(t, setState, planningState)
           case Failure(err) =>
             // Ambiguous: transferStore failed, or the rollback's abort failed and left the
             // transfer started. Either way the next poll's classify sees the true state (a
             // started transfer reads as InFlight), so just back off.
             logger.warn(s"Rebalance set $setId: start of $storeId failed (will retry via poll): $err")
             backoff.failed(storeId)
-            Success(())
+            Future.unit
     f.recover:
       case err =>
         logger.warn(s"Rebalance set $setId: could not advance transfer of $storeId " +
@@ -248,7 +252,8 @@ class SetRebalanceDurableTask(
   private def usable(device: StorageDeviceState): Boolean =
     !device.isFailed && device.isOperational && !client.offlineHosts().contains(device.hostId)
 
-  /** Pick a new destination for a not-started transfer whose planned one is unusable and write
+  /** Pick a new destination for a not-started transfer whose planned one is unusable, or that
+   *  TransferStarter found without room for the store, and write
    *  it back into pendingTransfers. The entry is never dropped: when nothing usable can be
    *  selected it is left as is for the next poll. Selection soft-excludes the pool's devices and
    *  the destinations of its other pending transfers, as the migration task does. */
@@ -271,8 +276,8 @@ class SetRebalanceDurableTask(
     val currentDevice = planningState.devices.values.find(_.stores.contains(storeId)).map(_.deviceId)
 
     def skip(why: String): Future[Unit] =
-      logger.info(s"Rebalance set $setId: no new destination for $storeId (planned $toDevice is " +
-        s"unusable): $why; will retry")
+      logger.info(s"Rebalance set $setId: no new destination for $storeId (planned $toDevice cannot " +
+        s"take it): $why; will retry")
       Future.unit
 
     // Never guess a size: a requirement of 0 would accept a device with no room for the store.
@@ -305,7 +310,7 @@ class SetRebalanceDurableTask(
                     if !usable(dev) then
                       next(s"selected $candidate is itself unusable")
                     else
-                      logger.info(s"Rebalance set $setId: replacing unusable destination $toDevice " +
+                      logger.info(s"Rebalance set $setId: replacing destination $toDevice " +
                         s"of $storeId with $candidate")
                       replacePending(t, (storeId, fromDevice, candidate))
 

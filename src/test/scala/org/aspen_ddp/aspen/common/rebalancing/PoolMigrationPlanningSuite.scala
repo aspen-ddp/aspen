@@ -168,3 +168,24 @@ class PoolMigrationPlanningSuite extends IntegrationTestSuite:
         ptr <- allocator.allocateKeyValueObject(
                  Map(org.aspen_ddp.aspen.common.objects.Key(99) -> Value(Array[Byte](0))))
       yield ptr
+
+  atest("getStateForRebalancePlanning counts stores still arriving as each device's incomingSize"):
+    given ExecutionContext = executionContext
+    val setId = StorageDeviceSetId.BootstrapStorageDeviceSetId
+    // Indices no host serves, so no reconcile or usage tracker acts on what is written for them.
+    val transferring = StoreId(PoolId.BootstrapPoolId, 8.toByte)
+    val rebuilding = StoreId(PoolId.BootstrapPoolId, 9.toByte)
+    for
+      _ <- net.createSecondDevice()
+      _ <- setStoreSize(transferring, 5000L)
+      _ <- setStoreSize(rebuilding, 700L)
+      _ <- setDeviceState(net.secondDeviceId)(_
+             .setStoreEntry(transferring, StorageDeviceState.StoreStatus.TransferringIn,
+                            Some(StorageDeviceId.BootstrapStorageDeviceId))
+             .setStoreEntry(rebuilding, StorageDeviceState.StoreStatus.Rebuilding, None))
+      _ <- waitForTransactionsToComplete()
+      setState <- client.getStorageDeviceSetState(setId)
+      planning <- State.getStateForRebalancePlanning(client, setState)
+    yield
+      planning.devices(net.secondDeviceId).incomingSize should be(5700L)
+      planning.devices(StorageDeviceId.BootstrapStorageDeviceId).incomingSize should be(0L)

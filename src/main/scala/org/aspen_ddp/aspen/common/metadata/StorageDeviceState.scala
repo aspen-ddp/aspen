@@ -102,6 +102,22 @@ case class StorageDeviceState(storageDeviceId: StorageDeviceId,
     this.copy(stores = stores.map: (storeId, entry) =>
       if entry.status == from then storeId -> entry.copy(status = to) else storeId -> entry)
 
+  /** Stores this device is committed to receive whose bytes are not, or not all, on it yet, and
+   *  so are missing from the self-reported `currentUsage`: transfers in and rebuilds in progress
+   *  here, plus the transfers in `pendingTransfers` (its set's rebalance plan) that name this
+   *  device and have not started. A started one appears here as TransferringIn and a completed
+   *  one as an ordinary entry, so neither is counted twice.
+   *
+   *  Callers reserve each store's full size. Bytes already copied are then counted twice until
+   *  the store arrives, which errs toward the device looking fuller than it is. */
+  def incomingStores(pendingTransfers: List[(StoreId, StorageDeviceId, StorageDeviceId)]): Set[StoreId] =
+    val inProgress = stores.collect:
+      case (sid, entry) if entry.status == StorageDeviceState.StoreStatus.TransferringIn ||
+                           entry.status == StorageDeviceState.StoreStatus.Rebuilding => sid
+    val planned = pendingTransfers.collect:
+      case (sid, _, to) if to == storageDeviceId && !stores.contains(sid) => sid
+    inProgress.toSet ++ planned
+
   def setHost(hostId: HostId): StorageDeviceState =
     this.copy(hostId=hostId)
 

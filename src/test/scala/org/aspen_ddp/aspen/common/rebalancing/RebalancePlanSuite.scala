@@ -206,3 +206,30 @@ class RebalancePlanSuite extends AnyFunSuite with Matchers:
       device(1, 1, 80, 100, store(1, 0, 40)),
       device(2, 2, 0, 0))
     Plan.computePlan(st) shouldBe Nil
+
+  test("incoming: bytes still arriving on a device count toward its fill ratio"):
+    // The same state as "migrates a store from a full device to an empty one", except dev2 is
+    // already receiving 80 bytes from an earlier plan. It is effectively as full as dev1.
+    val st = planState(
+      device(1, 1, 80, 100, store(1, 0, 40)),
+      device(2, 2, 0, 100).copy(incomingSize = 80))
+    Plan.computePlan(st) shouldBe Nil
+
+  test("incoming: a device whose free space is reserved by incoming stores does not fit a move"):
+    // Reliability wants a pool-1 store off dev1, and dev2 is the only other device. Its usage
+    // alone has room, but the bytes already on their way there leave none.
+    val st = planState(
+      device(1, 1, 20, 100, store(1, 0, 10), store(1, 1, 10)),
+      device(2, 2, 0, 100).copy(incomingSize = 95))
+    Plan.computePlan(st) shouldBe Nil
+
+  test("incoming: one plan never sends an empty device more than it can hold"):
+    // Each 30-byte store on dev1-dev3 belongs to a distinct pool, so every one of them is a
+    // candidate for the empty dev4. Only those that fit beside its 50 incoming bytes may go.
+    val st = planState(
+      device(1, 1, 90, 100, store(1, 0, 30), store(2, 0, 30), store(3, 0, 30)),
+      device(2, 2, 90, 100, store(4, 0, 30), store(5, 0, 30), store(6, 0, 30)),
+      device(3, 3, 90, 100, store(7, 0, 30), store(8, 0, 30), store(9, 0, 30)),
+      device(4, 4, 0, 100).copy(incomingSize = 50))
+    val plan = Plan.computePlan(st)
+    plan.filter(_.toDevice == devId(4)).size should be <= 1

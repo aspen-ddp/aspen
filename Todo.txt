@@ -1,14 +1,6 @@
 TODO
 ====
 
-With the recent addition of support for rebalancing doing multiple transfers in parallel, are we taking the
-size of the transferring-to stores into account when we run the rebalancing algorithm to determine which
-stores to move? For example, if we have an empty store and run the calculations to transfer stores and we
-do not take this into account, *every* store will try to transfer here simultaneously which could exceed
-the drive capacity. We need to ensure that the size of all stores currently assigned to transfer to the
-device are included in the size calculations for future transfers. This may already be taken into account.
-This task is to verify that that is true and fix it if not.
-
 FixedSizeIndexedFile Store Backend
   A store backend that stores data in a flat file broken up into fixed-sized chunks that store the slice data
   along with its associated metadata.

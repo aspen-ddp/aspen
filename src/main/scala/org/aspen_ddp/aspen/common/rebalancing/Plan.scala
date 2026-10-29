@@ -49,8 +49,10 @@ object Plan:
     val location: mutable.Map[StoreId, StorageDeviceId] =
       mutable.Map.from(
         state.devices.values.flatMap(d => d.stores.keys.map(sid => sid -> d.deviceId)))
+    /** Bytes still to arrive count as used: without them every move of every plan made while
+     *  transfers are in flight could target the same nearly empty device. */
     val usage: mutable.Map[StorageDeviceId, Long] =
-      mutable.Map.from(state.devices.map((id, d) => id -> d.currentUsage))
+      mutable.Map.from(state.devices.map((id, d) => id -> (d.currentUsage + d.incomingSize)))
 
     val pinned: mutable.Set[StoreId] = mutable.Set.empty
     val transfers: mutable.ArrayBuffer[Transfer] = mutable.ArrayBuffer.empty

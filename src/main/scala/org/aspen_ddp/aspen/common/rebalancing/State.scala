@@ -19,12 +19,18 @@ object State:
   /** `currentUsage` and `totalSize` are the device's own self-reported usage and capacity
    *  (from StorageDeviceState), authoritative for the device's overall capacity. The per-store
    *  sizes in `stores` (each Store.currentSize) come from the pool's separate per-store usage
-   *  accounting, so they need not sum to `currentUsage`. */
+   *  accounting, so they need not sum to `currentUsage`.
+   *
+   *  `incomingSize` is the summed size of the stores the device is committed to receive but
+   *  that `currentUsage` does not yet reflect (`StorageDeviceState.incomingStores`). Planning
+   *  treats it as used, so a device already receiving stores is not chosen for more than it
+   *  can hold. */
   case class Device(deviceId: StorageDeviceId,
                     hostId: HostId,
                     currentUsage: Long,
                     totalSize: Long,
-                    stores: Map[StoreId, Store])
+                    stores: Map[StoreId, Store],
+                    incomingSize: Long = 0L)
 
   case class PlanningState(devices: Map[StorageDeviceId, Device], pools: Map[PoolId, Pool])
 
@@ -59,7 +65,12 @@ object State:
         deviceStates <- runBoundedParallel(storageDeviceSet.memberDevices, maxConcurrentReads)(
                           client.getStorageDeviceState)
 
-        poolIds = deviceStates.flatMap(ds => ownedStores(ds).keys).map(_.poolId).toSet
+        incomingByDevice = deviceStates.map(ds =>
+                             ds.storageDeviceId -> ds.incomingStores(storageDeviceSet.pendingTransfers)).toMap
+
+        // Pools of incoming stores are read for their sizes too, though only owned ones are planned.
+        ownedPoolIds = deviceStates.flatMap(ds => ownedStores(ds).keys).map(_.poolId).toSet
+        poolIds = ownedPoolIds ++ incomingByDevice.values.flatten.map(_.poolId)
 
         poolPairs <- runBoundedParallel(poolIds.toSeq, maxConcurrentReads): poolId =>
                        client.getStoragePoolPointer(poolId)
@@ -80,7 +91,7 @@ object State:
                    _.status == StoragePoolState.MigrationStatus.InProgress) => poolId
           .toSet
 
-        val plannedPoolIds = poolIds -- migratingPools
+        val plannedPoolIds = ownedPoolIds -- migratingPools
 
         def storeSize(storeId: StoreId): Long =
           poolKvos.get(storeId.poolId)
@@ -110,12 +121,17 @@ object State:
         // The store-placement guards -- createNewStoragePool, transferStore, stageDeviceUpdate,
         // updateStateForTransferredStore -- are why a tombstone cannot be handed a store. They
         // are not why it cannot appear here; none of them touches memberDevices.
+        //
+        // A store of a migrating pool still counts toward incomingSize: the bytes are coming
+        // whoever initiated the transfer.
         val devices: Map[StorageDeviceId, Device] =
           deviceStates.map: ds =>
             val itsStores = ownedStores(ds).keys
               .filter(storesById.contains)
               .map(sid => sid -> storesById(sid)).toMap
-            ds.storageDeviceId -> Device(ds.storageDeviceId, ds.hostId, ds.currentUsage, ds.totalSize, itsStores)
+            val incomingSize = incomingByDevice(ds.storageDeviceId).toSeq.map(storeSize).sum
+            ds.storageDeviceId -> Device(ds.storageDeviceId, ds.hostId, ds.currentUsage, ds.totalSize,
+                                         itsStores, incomingSize)
           .toMap
 
         val pools: Map[PoolId, Pool] =

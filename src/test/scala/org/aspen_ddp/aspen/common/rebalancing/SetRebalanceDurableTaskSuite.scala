@@ -136,6 +136,26 @@ class SetRebalanceDurableTaskSuite extends SetRebalanceDurableTaskSuiteBase:
       remaining shouldBe empty
       dst should be(Some(StorageDeviceState.StoreStatus.Active))
 
+  atest("a pending transfer whose destination has no room left gets a new destination"):
+    given ExecutionContext = executionContext
+    val s0 = storeId(0)
+    // A store at an index no host serves, already on its way to the second device and larger
+    // than all of it: what another initiator could have started after this plan was made.
+    val phantom = storeId(9)
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- setStoreSize(phantom, 2_000_000L)
+      _ <- updateDevice(net.secondDeviceId)(_.setStoreEntry(phantom,
+             StorageDeviceState.StoreStatus.TransferringIn, Some(boot)))
+      _ <- writePending(List((s0, boot, net.secondDeviceId)))
+      _ = startTask()
+      _ <- awaitUntil("the destination to be replaced")(
+             pendingTransfers().map(_ == List((s0, boot, net.thirdDeviceId))))
+      dst <- statusOf(net.secondDeviceId, s0)
+    yield
+      dst should be(None)
+
   atest("rebalance does not treat a Shutdown device as usable"):
     given ExecutionContext = executionContext
     val s0 = storeId(0)

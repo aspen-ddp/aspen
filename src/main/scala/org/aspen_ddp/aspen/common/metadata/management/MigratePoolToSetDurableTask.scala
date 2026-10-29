@@ -301,6 +301,13 @@ class MigratePoolToSetDurableTask(
                 // Not admissible right now; the next poll re-evaluates.
                 attempt(tail, exclude)
 
+              case Success(StartResult.NoRoom) =>
+                // Filled by another initiator since selection. The next attempt selects afresh,
+                // and selection already counts what the device is receiving.
+                logger.info(s"Pool migration ${poolId.uuid}: $destination has no room for $storeId")
+                backoff.failed(storeId)
+                attempt(tail, exclude + destination)
+
               case Failure(err) =>
                 // Ambiguous: transferStore failed (a lost race, a read failure), or the
                 // rollback's abort failed and left the transfer started. Either way the next

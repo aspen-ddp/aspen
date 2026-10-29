@@ -341,3 +341,47 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
     yield
       picks.toSet should be(Set(net.thirdDeviceId))
       failed
+
+  /** A store of the bootstrap pool at an index no host serves, so neither a host's reconcile nor
+   *  its usage tracker acts on the metadata these tests write for it. */
+  private val phantom = StoreId(PoolId.BootstrapPoolId, 9.toByte)
+
+  atest("selectDeviceForStore counts a store transferring in against the device's free space"):
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(StorageDeviceId.BootstrapStorageDeviceId)(_.copy(totalSize = 100L))
+      before <- client.getStorageDeviceSetState(bootSetId)
+                  .flatMap(_.selectDeviceForStore(500L, Set.empty, client))
+      // The second device has 1,000,000 bytes free on its own, but 999,600 are on their way.
+      _ <- setStoreSize(phantom, 999_600L)
+      _ <- setDeviceState(net.secondDeviceId)(_.setStoreEntry(phantom,
+             StorageDeviceState.StoreStatus.TransferringIn, Some(StorageDeviceId.BootstrapStorageDeviceId)))
+      set <- client.getStorageDeviceSetState(bootSetId)
+      failed <- recoverToSucceededIf[AllocationError](set.selectDeviceForStore(500L, Set.empty, client))
+      fits <- set.selectDeviceForStore(400L, Set.empty, client)
+    yield
+      before should be(net.secondDeviceId)
+      fits should be(net.secondDeviceId)
+      failed
+
+  atest("selectDeviceForStore counts a planned, not-yet-started transfer against its destination"):
+    given ExecutionContext = executionContext
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- setDeviceState(StorageDeviceId.BootstrapStorageDeviceId)(_.copy(totalSize = 100L))
+      _ <- setStoreSize(phantom, 999_600L)
+      setPtr <- client.getStorageDeviceSetPointer(bootSetId)
+      setDos <- client.read(setPtr)
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.overwrite(setPtr, setDos.revision, DataBuffer(StorageDeviceSetState(setDos).copy(
+               pendingTransfers = List((phantom, StorageDeviceId.BootstrapStorageDeviceId,
+                                        net.secondDeviceId))).toBytes))
+             Future.unit
+      _ <- waitForTransactionsToComplete()
+      set <- client.getStorageDeviceSetState(bootSetId)
+      failed <- recoverToSucceededIf[AllocationError](set.selectDeviceForStore(500L, Set.empty, client))
+    yield
+      failed

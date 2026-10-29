@@ -2,9 +2,11 @@ package org.aspen_ddp.aspen
 
 import org.aspen_ddp.aspen.client.{AspenClient, RegisteredTypeFactory}
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
-import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
+import org.aspen_ddp.aspen.common.util.long2byte
 import org.scalatest.{FutureOutcome, Tag, compatible}
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -88,6 +90,21 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
         tx.update(ptr, None, None,
           List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision)),
           List(Insert(StorageDeviceState.StateKey, updated.encode())))
+
+  /** Record `size` as the store's size in its pool's per-store usage accounting, as the host's
+    * usage tracker would. A store index no host reports on keeps the tracker from overwriting it. */
+  def setStoreSize(storeId: StoreId, size: Long): Future[Unit] =
+    given scala.concurrent.ExecutionContext = executionContext
+    val key = StoragePoolState.getStoreUsageKey(storeId.poolIndex)
+    client.transactUntilSuccessful: tx =>
+      for
+        ptr <- client.getStoragePoolPointer(storeId.poolId)
+        kvos <- client.read(ptr)
+      yield
+        val req = kvos.contents.get(key) match
+          case Some(vs) => KeyRevision(key, vs.revision)
+          case None => DoesNotExist(key)
+        tx.update(ptr, None, None, List(req), List(Insert(key, long2byte(size))))
 
   /** Writes what shutdownStorageDevice writes -- Active stores Offline, the device ShuttingDown --
     * without its pool write-threshold check. For tests whose device holds a pool's only stores,

@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.common.rebalancing
 
 import org.aspen_ddp.aspen.client.AspenClient
-import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
+import org.aspen_ddp.aspen.common.metadata.{StorageDeviceId, StorageDeviceSetState}
 import org.aspen_ddp.aspen.common.store.StoreId
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -12,6 +12,10 @@ import scala.util.Random
 enum StartResult:
   /** The admission rule failed on fresh state; nothing was started. */
   case Rejected
+  /** The destination lacks room for the store beside what it is already receiving; nothing was
+   *  started. Unlike `Rejected` this will not clear on its own soon, so the caller should pick
+   *  another destination. */
+  case NoRoom
   /** The transfer was started and the pool is still at or above the floor. Also returned when the
    *  pool was found below the floor but the rollback found nothing to undo, because the transfer
    *  had already been aborted or completed by someone else. */
@@ -33,7 +37,11 @@ object TransferStarter:
    *  instant of the start. It contains the race as follows:
    *
    *    1. Re-read the pool's state immediately before the start and check `isSafe` against it and
-   *       the current `offlineHosts()`. Fails -> `Rejected`, nothing started.
+   *       the current `offlineHosts()`. Fails -> `Rejected`, nothing started. Then check that the
+   *       store fits on the destination beside the stores it is already committed to receive
+   *       (`StorageDeviceSetState.availableSpace`). Fails -> `NoRoom`, nothing started. The fit
+   *       check races competing starts the same way admission does, but it is not verified
+   *       afterwards: an overcommitted destination fails a transfer, it does not lose data.
    *    2. `transferStore`.
    *    3. Re-read the pool's state after it commits. If `TransferSafety.isBelowFloor` (the same
    *       clamped floor as admission, never the raw write threshold), abort the transfer just
@@ -84,10 +92,21 @@ object TransferStarter:
       if !admitted then
         Future.successful(StartResult.Rejected)
       else
+        // The store's own size is unknown only if its pool records none, in which case nothing
+        // can be checked. Planning makes the same 0-byte assumption.
+        val size = before.pools.get(storeId.poolId).flatMap(_.stores.get(storeId)).fold(0L)(_.currentSize)
         for
-          _ <- beforeTransfer()
-          _ <- client.transferStore(storeId, destination)
-          result <- verify()
+          dst <- client.getStorageDeviceState(destination)
+          free <- StorageDeviceSetState.availableSpace(client, dst, excluding = Set(storeId))
+          result <-
+            if size > free then
+              Future.successful(StartResult.NoRoom)
+            else
+              for
+                _ <- beforeTransfer()
+                _ <- client.transferStore(storeId, destination)
+                result <- verify()
+              yield result
         yield result
 
 /** Per-store exponential backoff for starts that were `RolledBack` (or otherwise failed).

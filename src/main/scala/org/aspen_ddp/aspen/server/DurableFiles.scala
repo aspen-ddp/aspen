@@ -18,7 +18,8 @@ object DurableFiles:
 
   /** Replaces `file` with `content`. Atomic: the bytes go to a temp file in the same directory,
    *  which is forced and renamed over `file`, and the directory is then forced. A crash leaves
-   *  either the old file or the new one, never a partial one; at worst a stray temp file. */
+   *  either the old file or the new one, never a partial one; at worst a stray temp file. A write
+   *  that fails before the rename removes its temp file before rethrowing. */
   def write(file: os.Path, content: Array[Byte]): Unit =
     writeWith(file): out =>
       out.write(content)
@@ -29,17 +30,24 @@ object DurableFiles:
   /** As `write`, with the content produced by `fill` writing to a buffered stream. */
   def writeWith(file: os.Path)(fill: OutputStream => Unit): Unit =
     val tmp = file / os.up / s".${file.last}.tmp"
-    val channel = FileChannel.open(tmp.toNIO,
-      StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
     try
-      // Not closed: closing the stream would close the channel before it is forced.
-      val out = new BufferedOutputStream(Channels.newOutputStream(channel))
-      fill(out)
-      out.flush()
-      channel.force(true)
-    finally
-      channel.close()
-    os.move(tmp, file, replaceExisting = true, atomicMove = true)
+      val channel = FileChannel.open(tmp.toNIO,
+        StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
+      try
+        // Not closed: closing the stream would close the channel before it is forced.
+        val out = new BufferedOutputStream(Channels.newOutputStream(channel))
+        fill(out)
+        out.flush()
+        channel.force(true)
+      finally
+        channel.close()
+      os.move(tmp, file, replaceExisting = true, atomicMove = true)
+    catch
+      case e: Throwable =>
+        // Best effort: a failed removal must not hide the original error.
+        try os.remove(tmp)
+        catch case r: Throwable => e.addSuppressed(r)
+        throw e
     syncDirectory(file / os.up)
 
   /** Removes `file` if present, then forces its directory so the removal is durable too. */

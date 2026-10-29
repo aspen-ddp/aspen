@@ -3,13 +3,6 @@ TODO
 
 Follow-ups from the physical device move work (docs/superpowers/specs/2026-10-28-physical-device-move-design.md)
 
-DurableFiles leaves its temp file behind on failure
-  - Context: DurableFiles.writeWith writes `.<name>.tmp` next to the target, forces it, renames it into place,
-    and syncs the directory. If fill, force or the move throws, the temp file stays in the device or store
-    directory. Nothing reads these files, so it is clutter rather than a correctness problem.
-  - Recommended fix: wrap everything up to the move in try/catch, remove the temp file with os.remove, and
-    rethrow.
-
 Rebuild's final rename is not directory-synced
   - Context: RebuildingStore.finish moves the staging directory to its final store path with os.move but does
     not fsync the device directory. The transfer-in promotion in Host.scala does sync it

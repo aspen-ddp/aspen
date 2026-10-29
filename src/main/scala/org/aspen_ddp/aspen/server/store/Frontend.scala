@@ -217,7 +217,7 @@ class Frontend(val storeId: StoreId,
 
       os.metadata = Metadata(op.revision, rc, op.timestamp)
       os.data = op.data
-      val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
+      val cs = CommitState(op.pointer, os.metadata, os.objectType, os.data)
       val txid = TransactionId(op.revision.lastUpdateTxUUID)
       // No need to wait for this to complete
       commit(os, cs, txid)
@@ -233,7 +233,7 @@ class Frontend(val storeId: StoreId,
         case Some(storeData) =>
           os.metadata = Metadata(current.revision, current.refcount, current.timestamp)
           os.data = storeData
-          val cs = CommitState(os.objectId, os.metadata,
+          val cs = CommitState(current.pointer, os.metadata,
             current.pointer.objectType, os.data)
           val txid = TransactionId(current.revision.lastUpdateTxUUID)
           backend.repair(cs, completion)

@@ -323,7 +323,7 @@ class RebuildingStore(client: AspenClient,
     fos.map: os =>
       val (objectType, metadata) = metadataOf(os)
       val localData = os.getRebuildDataForStore(storeId)
-      backend.rebuildWrite(os.id, objectType, metadata, localData.getOrElse(DataBuffer()))
+      backend.rebuildWrite(ptr, objectType, metadata, localData.getOrElse(DataBuffer()))
 
   private def recordRestored(key: Key): Future[Unit] =
     val checkpointNow = synchronized:

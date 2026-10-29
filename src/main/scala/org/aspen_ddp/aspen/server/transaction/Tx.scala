@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState}
+import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
 import org.aspen_ddp.aspen.server.store.{Frontend, ObjectState, RequirementsApplyer, RequirementsChecker, RequirementsLocker}
 import scribe.Logging
 
@@ -28,6 +28,9 @@ class Tx( trs: TransactionRecoveryState,
   private val storeId = trs.storeId
   private val serializedTxd = trs.serializedTxd
   private val objectUpdates = trs.objectUpdates
+  private val pointersById: Map[ObjectId, ObjectPointer] = objectPointers.iterator.map(p => p.id -> p).toMap
+
+  private def pointerOf(objectId: ObjectId): ObjectPointer = pointersById(objectId)
   private var disposition = trs.disposition
   private var collisions: List[TransactionId] = Nil
   private var status = trs.status
@@ -97,7 +100,7 @@ class Tx( trs: TransactionRecoveryState,
         if (os.metadata.revision == r.requiredMetadata.revision) {
           os.metadata = r.requiredMetadata
           os.data = r.data
-          val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
+          val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data)
           val txid = TransactionId(r.requiredMetadata.revision.lastUpdateTxUUID)
           // No need to wait for this to complete
           frontend.commit(os, cs, txid)
@@ -174,7 +177,9 @@ class Tx( trs: TransactionRecoveryState,
     pendingObjectCommits = toCommit.size
 
     toCommit.foreach { os =>
-      val cs = CommitState(os.objectId, os.metadata, os.objectType, os.data)
+      val allocating = txd.allocatingObjects.contains(os.objectId)
+      val form = UpdateForm.of(os.objectId, txd.requirements, ou, allocating)
+      val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data, allocating, form)
 
       frontend.commit(os, cs, transactionId)
     }

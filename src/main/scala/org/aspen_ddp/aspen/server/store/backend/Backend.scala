@@ -34,7 +34,7 @@ trait Backend extends Logging {
 
   def bootstrapOverwrite(objectId: ObjectId, data:DataBuffer): Unit
 
-  def rebuildWrite(objectId: ObjectId,
+  def rebuildWrite(pointer: ObjectPointer,
                    objectType: ObjectType.Value,
                    metadata: Metadata,
                    data:DataBuffer): Unit

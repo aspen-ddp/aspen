@@ -230,11 +230,11 @@ class RocksDBBackend(dbPath: os.Path,
     db.bootstrapPut(key, value)
   }
 
-  override def rebuildWrite(objectId: ObjectId,
+  override def rebuildWrite(pointer: ObjectPointer,
                             objectType: ObjectType.Value,
                             metadata: Metadata,
                             data: DataBuffer): Unit =
-    val key = tokey(objectId)
+    val key = tokey(pointer.id)
     val value = encodeDBValue(objectType, metadata, data)
     db.rebuildWrite(key, value)
 

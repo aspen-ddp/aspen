@@ -93,14 +93,8 @@ object JournalFormat:
     val bb = ByteBuffer.wrap(bytes)
     val target = n + 1
     val low = target.toByte
-    // Never look inside the claimed extent of the batch at o: that is its own payload
-    val lenAtO = if bytes.length - o >= 4 then bb.getInt(o.toInt) else -1
-    val boundsOk = lenAtO >= 8 && o + 4L + lenAtO + 4L <= bytes.length
-    val firstStart =
-      if boundsOk && validBatchLength(bytes, salt, o) < 0 then o + 4L + lenAtO + 4L
-      else if boundsOk then o
-      else o + 4
-    var p = firstStart + 4
+    // Every position after o is a candidate: skipping a claimed extent would let a rotted len hide later batches
+    var p = o + 4
     var found = false
     while !found && p + 8 <= bytes.length do
       if bytes(p.toInt + 7) == low && bb.getLong(p.toInt) == target then

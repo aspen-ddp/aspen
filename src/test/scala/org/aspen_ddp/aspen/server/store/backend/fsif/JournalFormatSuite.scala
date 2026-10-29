@@ -124,25 +124,27 @@ class JournalFormatSuite extends FileBasedTests:
     val ok = JournalRecord.Delta(1, 2, h, List(DeltaRange(10, new Array[Byte](6))))
     JournalFormat.scan(hdr ++ JournalFormat.encodeBatch(Salt, 0, List(ok))) shouldBe a[Scan.Valid]
 
-  test("torn batch embedding a later batch in user data stays a torn tail"):
+  test("torn batch embedding a later batch (different salt) in user data stays a torn tail"):
     val head = file(batches.take(2))
-    for embedSalt <- List(Salt, Salt + 1) do
-      val inner = JournalFormat.encodeBatch(embedSalt, 3, List(mapping(1)))
-      val h = delta(9).asInstanceOf[JournalRecord.Delta].header.copy(sliceLength = inner.length)
-      val carrier = JournalRecord.Delta(1, 2, h, List(DeltaRange(0, inner)))
-      val torn = JournalFormat.encodeBatch(Salt, 2, List(carrier))
-      val idx = torn.indexOfSlice(inner)
-      idx should be > 0
-      // Truncation makes the carrier's len run past EOF, so only the salt protects then (different salt only).
-      // With a CRC-failing but in-bounds carrier the extent skip protects even a same-salt embedded batch.
-      val flipped = torn.clone()
-      flipped(flipped.length - 1) = (flipped(flipped.length - 1) ^ 1).toByte
-      val variants = List(flipped) ++
-        (if embedSalt == Salt then Nil else List(torn.take(idx + inner.length), torn.take(torn.length - 1)))
-      for v <- variants do
-        JournalFormat.scan(head ++ v) match
-          case Scan.Valid(_, _, recs, len, next) =>
-            recs.size shouldBe 3
-            len shouldBe head.length
-            next shouldBe 2
-          case other => fail(s"salt $embedSalt: $other")
+    val inner = JournalFormat.encodeBatch(Salt + 1, 3, List(mapping(1)))
+    val h = delta(9).asInstanceOf[JournalRecord.Delta].header.copy(sliceLength = inner.length)
+    val carrier = JournalRecord.Delta(1, 2, h, List(DeltaRange(0, inner)))
+    val torn = JournalFormat.encodeBatch(Salt, 2, List(carrier))
+    val idx = torn.indexOfSlice(inner)
+    idx should be > 0
+    for v <- List(torn.take(idx + inner.length), torn.take(torn.length - 1)) do
+      JournalFormat.scan(head ++ v) match
+        case Scan.Valid(_, _, recs, len, next) =>
+          recs.size shouldBe 3
+          len shouldBe head.length
+          next shouldBe 2
+        case other => fail(other.toString)
+
+  test("mid-journal batch with a rotted len (larger, in bounds) is corrupt"):
+    val full = file(batches)
+    val b0 = JournalFormat.HeaderSize
+    val rotted = full.clone()
+    val len = java.nio.ByteBuffer.wrap(rotted).getInt(b0)
+    java.nio.ByteBuffer.wrap(rotted).putInt(b0, len + 20)
+    b0 + 4 + len + 20 + 4 should be <= rotted.length
+    JournalFormat.scan(rotted) shouldBe a[Scan.Corrupt]

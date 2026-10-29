@@ -21,7 +21,7 @@ object IndexFile:
   private val Magic = "FSIFINDX".getBytes("US-ASCII")
   private val EntrySize = 20
 
-  private def sizeFor(segmentCount: Int): Long = 16L + segmentCount.toLong * EntrySize + 4
+  private[fsif] def sizeFor(segmentCount: Int): Long = 16L + segmentCount.toLong * EntrySize + 4
 
   def encode(seq: Long, map: IndexMap): Array[Byte] =
     val n = map.slots.length

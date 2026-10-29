@@ -81,7 +81,7 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
 
   private def send(batch: Batch, truncateFirst: Boolean): Unit =
     val pos = durable
-    io.execute: () =>
+    io.execute(new FsifBackend.IoTask(FsifBackend.IoKind.Journal, () => {
       val result = Try:
         // A retry also clears any tail left by a failed recovery truncate
         if truncateFirst then file.truncate(pos)
@@ -93,6 +93,7 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
           file.force()
         catch case NonFatal(_) => () // retry() truncates again
       serial.execute(() => completed(batch, result))
+    }))
 
   private def completed(batch: Batch, result: Try[Unit]): Unit =
     // After failAll the batch's Futures have already failed

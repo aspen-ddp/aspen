@@ -31,6 +31,8 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   private var crashed = false
   private val oneShot = mutable.ArrayBuffer[Rule]()
   private val persistent = mutable.ArrayBuffer[Rule]()
+  /** Ops allowed before every later one fails (crashAfterOps); negative means unlimited */
+  private var opsLeft = -1L
 
   def open(name: String): FsifFile = lock.synchronized:
     live()
@@ -50,6 +52,13 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   def failWhile(fault: Fault, file: String => Boolean = _ => true,
                 ops: Set[FaultOp] = FaultOp.values.toSet)(p: => Boolean): Unit = lock.synchronized:
     persistent += Rule(fault, file, ops, () => p)
+
+  /** After `n` more writes, forces or truncates (across all files), every later one fails with no effect and
+   *  throws, as if the machine had stopped. Call `crash()` afterward for the durable image.
+   */
+  def crashAfterOps(n: Int): Unit = lock.synchronized:
+    require(n >= 0)
+    opsLeft = n
 
   /** New instance holding only the resulting durable image. This instance must not be used afterward. */
   def crash(): SimulatedFsifFiles = lock.synchronized:
@@ -94,6 +103,10 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   /** Every write, force and truncate passes through here, so op counting has one place to live. */
   private def beginOp(name: String, op: FaultOp): Unit =
     live()
+    if opsLeft == 0 then
+      throw new IOException("Input/output error (simulated crash: no further I/O)")
+    if opsLeft > 0 then
+      opsLeft -= 1
     val i = oneShot.indexWhere(r => r.file(name) && r.ops.contains(op))
     if i >= 0 then
       throw ioException(oneShot.remove(i).fault)

@@ -7,6 +7,8 @@ import scala.collection.mutable
   */
 private[fsif] final class PendingDelta(val header: SegmentHeader, val ranges: List[DeltaRange]):
   var durable = false
+  /** Sequence of the journal this Delta was appended to: a checkpoint to seq+1 waits for it to be applied */
+  var journalSeq = 0L
   val bytes: Long = SegmentHeader.Size.toLong + ranges.iterator.map(_.bytes.length.toLong).sum
 
 /** Serial-executor state of one slot.

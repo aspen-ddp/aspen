@@ -43,6 +43,9 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitError, C
   *     (which includes any record that cancelled one) is durable; then force `data`.
   *  3. Write index s+1 into the other index file and force it.
   *  4. Empty journal s and index s, forcing each.
+  *
+  * Tail compaction (Compaction.scala): after every serial task, free tail slots are truncated away and, if no move
+  * is outstanding, the occupant of the highest used slot is moved into the lowest free slot below it.
   */
 class FsifBackend(val storeId: StoreId,
                   val path: os.Path,
@@ -66,11 +69,15 @@ class FsifBackend(val storeId: StoreId,
 
   // ---- State, owned by serial ----
   private val index: IndexMap = recovered.index
-  private var slotCount: Int = recovered.slotCount
+  @volatile private var slotTotal: Int = recovered.slotCount
   /** Slots that are mapped, reserved (copy-on-write or rebuild targets) or waiting for the slot-freeing rule */
   private val used = new java.util.BitSet
   index.slots.foreach(s => if s >= 0 then used.set(s))
   private val slotStates = mutable.HashMap[Int, SlotState]()
+  /** slot -> the ext mapped to it, for every mapped slot */
+  private val slotOwner = mutable.HashMap[Int, Int]()
+  for x <- index.slots.indices do
+    if index.slots(x) >= 0 then slotOwner(index.slots(x)) = x
   /** Exts with a copy-on-write in progress, holding the operations that arrived meanwhile, in order */
   private val gated = mutable.HashMap[Int, mutable.ArrayDeque[() => Unit]]()
   private var readsInFlight = 0
@@ -115,14 +122,56 @@ class FsifBackend(val storeId: StoreId,
 
   @volatile private var handler: Option[CompletionHandler] = None
 
+  private val compaction = new Compaction(new Compaction.Host:
+    def fatal: Boolean = FsifBackend.this.fatal.isDefined
+    def used: java.util.BitSet = FsifBackend.this.used
+    def slotCount: Int = slotTotal
+    def setSlotCount(n: Int): Unit = slotTotal = n
+    def dataFile: FsifFile = FsifBackend.this.dataFile
+    def movable(slot: Int): Option[(Int, ObjectId)] =
+      slotOwner.get(slot).filter: x =>
+        index.slots(x) == slot && !gated.contains(x) && !rebuildMaps.contains(x) &&
+          !slotStates.get(slot).exists(_.dead)
+      .map(x => (x, index.ids(x)))
+    def maps(x: Int, slot: Int, id: ObjectId): Boolean = index.slots(x) == slot && index.ids(x) == id
+    def slotState(slot: Int): SlotState = FsifBackend.this.slotState(slot)
+    def readDone(st: SlotState): Unit =
+      st.prune()
+      if st.dead then tryFree(st) else dropIfUnused(st)
+    def runIo[A](kind: IoKind)(work: => A)(done: Try[A] => Unit): Unit =
+      try io.execute(new IoTask(kind, () => {
+        val r = Try(work)
+        post(done(r))
+      }))
+      catch case NonFatal(t) => done(Failure(t))
+    def failStop(t: Throwable): Unit =
+      logger.error(s"FSIF store $storeId: compaction I/O failed: $t")
+      FsifBackend.this.failStop(t)
+    def commitMove(x: Int, id: ObjectId, from: Int, to: Int)(done: Try[Unit] => Unit): Unit =
+      assign(x, to, id)
+      val dead = kill(from)
+      onDurable(appendRecords(List(JournalRecord.Mapping(x, to, id)))): r =>
+        if r.isSuccess then unmapDurable(dead)
+        done(r)
+  , layout)
+
+  // Compaction resumes after recovery without waiting for the first operation
+  post(())
+
   // ---- Backend interface ----
 
   def isWriteFrozen: Boolean = false
 
+  /** Slots the data file is laid out for: every occupied or reserved slot is below it */
+  def slotCount: Int = slotTotal
+
+  private[fsif] def compactionStats: CompactionStats = compaction.stats
+
   override def setCompletionHandler(h: CompletionHandler): Unit = handler = Some(h)
 
-  /** Completes when no journal batch, in-place write, copy-on-write, read, commit or checkpoint is outstanding.
-    * After a fatal error, held in-place writes no longer count.
+  /** Completes when no journal batch, in-place write, copy-on-write, read, commit, checkpoint or compaction move is
+    * outstanding. Moves start after every completion while one is possible, so afterwards none is possible and the
+    * free tail slots are truncated away. After a fatal error, held in-place writes no longer count.
     */
   def quiesce(): Future[Unit] =
     val p = Promise[Unit]()
@@ -197,6 +246,7 @@ class FsifBackend(val storeId: StoreId,
     rebuildLock.synchronized:
       val slot = onSerialSync:
         throwIfFatal()
+        compaction.cancel(x) // the segment is written to X's slot directly, bypassing a move's copy
         val s = rebuildMaps.get(x).map(_._1).getOrElse:
           if index.slots(x) >= 0 then index.slots(x) else allocateSlot()
         rebuildMaps(x) = (s, pointer.id)
@@ -214,8 +264,8 @@ class FsifBackend(val storeId: StoreId,
         rebuildMaps.clear()
         maps.foreach:
           case (x, (slot, id)) =>
-            index.slots(x) = slot
-            index.ids(x) = id
+            compaction.cancel(x)
+            assign(x, slot, id)
         if maps.isEmpty then
           appended.success(())
         else
@@ -243,6 +293,12 @@ class FsifBackend(val storeId: StoreId,
           logger.error(s"FSIF store $storeId: internal error in a checkpoint: $t")
           failStop(t)
           advanceCheckpoint()
+      try compaction.drive()
+      catch
+        case NonFatal(t) =>
+          logger.error(s"FSIF store $storeId: compaction failed: $t")
+          failStop(t)
+          compaction.drive()
       checkQuiesce()
 
   private def onSerialSync[A](f: => A): A =
@@ -303,7 +359,7 @@ class FsifBackend(val storeId: StoreId,
       ps.foreach(_.trySuccess(()))
 
   private def idle: Boolean =
-    gated.isEmpty && writesInFlight == 0 && readsInFlight == 0 && checkpoint.isEmpty &&
+    gated.isEmpty && writesInFlight == 0 && readsInFlight == 0 && checkpoint.isEmpty && compaction.idle &&
       (fatal.isDefined || (journal.idle && unappliedCount == 0))
 
   // ---- Failure handling ----
@@ -329,14 +385,22 @@ class FsifBackend(val storeId: StoreId,
 
   // ---- Slot allocation and freeing ----
 
+  /** Maps ext x to `slot` (-1: unmapped) as occupant `id`, keeping `slotOwner` in step */
+  private def assign(x: Int, slot: Int, id: ObjectId): Unit =
+    val old = index.slots(x)
+    if old >= 0 && slotOwner.get(old).contains(x) then slotOwner.remove(old)
+    index.slots(x) = slot
+    index.ids(x) = id
+    if slot >= 0 then slotOwner(slot) = x
+
   /** The lowest free slot, always: recovery bounds slots by assuming that allocation never skips one */
   private def allocateSlot(): Int =
     val s = used.nextClearBit(0)
-    if s > slotCount then
-      throw new IllegalStateException(s"lowest free slot $s is above the slot count $slotCount")
+    if s > slotTotal then
+      throw new IllegalStateException(s"lowest free slot $s is above the slot count $slotTotal")
     used.set(s)
-    if s == slotCount then
-      slotCount += 1
+    if s == slotTotal then
+      slotTotal += 1
     s
 
   private def slotState(slot: Int): SlotState = slotStates.getOrElseUpdate(slot, new SlotState(slot))
@@ -387,6 +451,7 @@ class FsifBackend(val storeId: StoreId,
     st.version += 1
     unappliedCount += 1
     unappliedBytes += pd.bytes
+    compaction.onDelta(slot, pd)
     pd
 
   /** Starts the next coalesced in-place write for `st` if none is in flight. Physical writes per slot are serial. */
@@ -641,9 +706,9 @@ class FsifBackend(val storeId: StoreId,
       val target = if slot < 0 then allocateSlot() else slot
       def install(): Unit =
         if slot >= 0 then
+          compaction.cancel(x)
           cancelQueued(slotState(slot))
-        index.slots(x) = target
-        index.ids(x) = id
+        assign(x, target, id)
         val d: JournalRecord.Delta = JournalRecord.Delta(x, target, header, List(DeltaRange(0, bytes)))
         appendDelta(target, List(JournalRecord.Mapping(x, target, id), d), d, reply)
       if slot < 0 && tailCows.headOption.exists(_ < target) then
@@ -693,8 +758,8 @@ class FsifBackend(val storeId: StoreId,
         case Some(f) => onDurable(f)(r => reply(if r.isSuccess then Left(()) else Right(CommitError.IOFailure)))
         case None => reply(Left(()))
     else
-      index.slots(x) = -1
-      index.ids(x) = Zero
+      compaction.cancel(x)
+      assign(x, -1, Zero)
       val dead = kill(slot)
       val f = appendRecords(List(JournalRecord.Mapping(x, -1, Zero)))
       unmapping(x) = f
@@ -710,7 +775,8 @@ class FsifBackend(val storeId: StoreId,
     * X is gated meanwhile, so every later record for X follows the Mapping and targets f.
     */
   private def copyOnWrite(x: Int, id: ObjectId, header: SegmentHeader, bytes: Array[Byte], reply: Reply): Unit =
-    val before = slotCount
+    compaction.cancel(x)
+    val before = slotTotal
     val f = allocateSlot()
     if f == before then
       tailCows += f
@@ -749,8 +815,7 @@ class FsifBackend(val storeId: StoreId,
       else
         replyOnError(reply):
           val old = index.slots(x)
-          index.slots(x) = f
-          index.ids(x) = id
+          assign(x, f, id)
           val dead = if old >= 0 then Some(kill(old)) else None
           onDurable(appendRecords(List(JournalRecord.Mapping(x, f, id)))):
             case Success(_) =>
@@ -899,7 +964,10 @@ object FsifBackend:
   final class OperationFailed(msg: String) extends Exception(msg)
 
   private[fsif] enum IoKind:
-    case Read, InPlace, Cow, Journal, Checkpoint
+    case Read, InPlace, Cow, Journal, Checkpoint, MoveRead, MoveWrite, MoveForce
+
+  /** Test counters: moves started, moves whose Map(X, f) is durable, and moves cancelled */
+  private[fsif] final case class CompactionStats(started: Int, mapped: Int, cancelled: Int)
 
   /** An io task, labelled so tests can hold one kind back */
   private[fsif] final class IoTask(val kind: IoKind, body: () => Unit) extends Runnable:

@@ -425,13 +425,15 @@ class FsifBackendSuite extends FileBasedTests:
     h.slotOccupant(0) shouldBe Some(oid(7))
     h.commitOk(overwrite(p, bytes(700, 2), 2))
     h.quiesce()
-    h.slotOccupant(1) shouldBe Some(oid(7))
+    // The copy went to slot 1 and freed slot 0, so compaction then moved it down into slot 0
+    h.backend.compactionStats.mapped shouldBe 1
+    h.backend.slotCount shouldBe 1
+    h.slotOccupant(0) shouldBe Some(oid(7))
     h.readData(p).toList shouldBe bytes(700, 2).toList
-    // The old slot is free again: the lowest free slot goes to the next allocation
     val q = ptr(8, oid(8))
     h.commitOk(alloc(q, bytes(20, 3), 3))
     h.quiesce()
-    h.slotOccupant(0) shouldBe Some(oid(8))
+    h.slotOccupant(1) shouldBe Some(oid(8))
     h.crash()
     h.readData(p).toList shouldBe bytes(700, 2).toList
     h.readData(q).toList shouldBe bytes(20, 3).toList
@@ -588,8 +590,10 @@ class FsifBackendSuite extends FileBasedTests:
       case Left(rs) => rs.data.getByteArray.toList shouldBe bytes(100, 1).toList
       case Right(err) => err shouldBe ReadError.ObjectNotFound
     h.quiesce()
+    // Slot 0 was freed once the read ended, and compaction moved ext 2 down into it
+    h.await(h.backend.mapping(2))._1 shouldBe 0
     h.commitOk(alloc(ptr(3, oid(3)), bytes(20, 4), 4))
-    h.await(h.backend.mapping(3))._1 shouldBe 0
+    h.await(h.backend.mapping(3))._1 shouldBe 1
     h.readData(ptr(2, oid(2))).toList shouldBe bytes(50, 3).toList
     h.readData(ptr(3, oid(3))).toList shouldBe bytes(20, 4).toList
 

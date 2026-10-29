@@ -33,6 +33,8 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   private val persistent = mutable.ArrayBuffer[Rule]()
   /** Ops allowed before every later one fails (crashAfterOps); negative means unlimited */
   private var opsLeft = -1L
+  /** Writes, forces and truncates that took effect, across all files */
+  private var opsDone = 0L
 
   def open(name: String): FsifFile = lock.synchronized:
     live()
@@ -59,6 +61,9 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   def crashAfterOps(n: Int): Unit = lock.synchronized:
     require(n >= 0)
     opsLeft = n
+
+  /** Writes, forces and truncates that have taken effect so far, across all files (faulted ones excluded) */
+  def opCount: Long = lock.synchronized(opsDone)
 
   /** New instance holding only the resulting durable image. This instance must not be used afterward. */
   def crash(): SimulatedFsifFiles = lock.synchronized:
@@ -112,6 +117,7 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
       throw ioException(oneShot.remove(i).fault)
     persistent.filterInPlace(r => r.active())
     persistent.find(r => r.file(name) && r.ops.contains(op)).foreach(r => throw ioException(r.fault))
+    opsDone += 1
 
   private def ioException(f: Fault): IOException = f match
     case Fault.OutOfSpace => new IOException("No space left on device")

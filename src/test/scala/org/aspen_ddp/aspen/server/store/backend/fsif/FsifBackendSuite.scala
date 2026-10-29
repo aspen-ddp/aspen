@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.store.backend.fsif
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
@@ -92,7 +93,8 @@ class FsifBackendSuite extends FileBasedTests:
     */
   private final class Harness(seed: Int = 0, val lay: FsifLayout = layout,
                               mkIo: () => ExecutionContext = () => InlineEc,
-                              tuning: FsifTuning = FsifTuning(cowThreshold = 256)):
+                              tuning: FsifTuning = FsifTuning(cowThreshold = 256),
+                              wrap: FsifFiles => FsifFiles = f => f):
     var files = new SimulatedFsifFiles(rng(seed))
     FsifRecovery.initialize(files, lay)
     val fatals = new ConcurrentLinkedQueue[Throwable]()
@@ -102,7 +104,7 @@ class FsifBackendSuite extends FileBasedTests:
     private var txn = 0
 
     private def open(): FsifBackend =
-      val b = new FsifBackend(storeId, tdir / "fsif", lay, files, io, tuning, t => fatals.add(t))
+      val b = new FsifBackend(storeId, tdir / "fsif", lay, wrap(files), io, tuning, t => fatals.add(t))
       b.setCompletionHandler(rec)
       b
 
@@ -323,6 +325,97 @@ class FsifBackendSuite extends FileBasedTests:
     val rs = h.read(p).swap.toOption.get
     rs.metadata shouldBe md(4)
     rs.data.getByteArray.toList shouldBe bytes(60, 4).toList
+
+  test("repair of a never-allocated object allocates it (Ruling 18)"):
+    for (size, label) <- List((40, "journaled"), (700, "copy-on-write")) do
+      withClue(label):
+        val h = new Harness
+        val p = ptr(9, oid(9))
+        h.read(p) shouldBe Right(ReadError.ObjectNotFound)
+        h.repair(overwrite(p, bytes(size, 1), 5)).isSuccess shouldBe true
+        h.readData(p).toList shouldBe bytes(size, 1).toList
+        h.crash()
+        val rs = h.read(p).swap.toOption.get
+        rs.metadata shouldBe md(5)
+        rs.data.getByteArray.toList shouldBe bytes(size, 1).toList
+        // A plain commit to an unmapped X is still a mismatch
+        h.commit(overwrite(ptr(10, oid(10)), bytes(10, 2), 2)) shouldBe Right(CommitError.ObjectMismatch)
+
+  test("repair after a CorruptedObject read restores the object"):
+    val h = new Harness
+    val p = ptr(3, oid(3))
+    h.commitOk(alloc(p, bytes(100, 1), 1))
+    h.quiesce()
+    val f = h.files.open("data")
+    f.write(layout.slotOffset(0) + SegmentHeader.Size + 10, Array.fill[Byte](8)(0x5A))
+    h.read(p) shouldBe Right(ReadError.CorruptedObject)
+    h.repair(overwrite(p, bytes(100, 1), 2)).isSuccess shouldBe true
+    h.readData(p).toList shouldBe bytes(100, 1).toList
+    h.quiesce()
+    h.readData(p).toList shouldBe bytes(100, 1).toList
+    h.crash()
+    h.readData(p).toList shouldBe bytes(100, 1).toList
+
+  test("repair at an ext held by a different object fails with the mismatch"):
+    val h = new Harness
+    h.commitOk(alloc(ptr(4, oid(40)), bytes(30, 1), 1))
+    h.repair(overwrite(ptr(4, oid(41)), bytes(30, 2), 2)).isFailure shouldBe true
+    h.repair(overwrite(ptr(4, oid(41)), bytes(700, 2), 2)).isFailure shouldBe true
+    h.readData(ptr(4, oid(40))).toList shouldBe bytes(30, 1).toList
+    h.read(ptr(4, oid(41))) shouldBe Right(ReadError.ObjectNotFound)
+
+  test("deleting an unmapped ext appends nothing and never completes before an earlier delete"):
+    val h = new Harness(mkIo = () => new ManualEc)
+    val p = ptr(2, oid(2))
+    h.commitOk(alloc(p, bytes(30, 1), 1))
+    h.quiesce()
+    val f1 = h.issueCommit(delete(p, 2))
+    val f2 = h.issueCommit(delete(p, 3))
+    val io = h.io.asInstanceOf[ManualEc]
+    while io.pending > 0 do
+      (f2.isCompleted && !f1.isCompleted) shouldBe false
+      io.runOne()
+    h.await(f1) shouldBe Left(())
+    h.await(f2) shouldBe Left(())
+    h.quiesce()
+    def journalSize = h.files.open("journal.a").size
+    val before = journalSize
+    h.commitOk(delete(p, 4))
+    h.commitOk(delete(ptr(30, oid(30)), 1))
+    h.quiesce()
+    journalSize shouldBe before
+
+  test("a read whose header read tears while the slot changes is retried, not reported corrupt"):
+    val gate = new GateEc(isKind(FsifBackend.IoKind.Read))
+    val tearing = new AtomicBoolean(false)
+    val h = new Harness(mkIo = () => gate, wrap = f => new TearingFiles(f, tearing))
+    val p = ptr(1, oid(1))
+    val v1 = bytes(100, 1)
+    h.commitOk(alloc(p, v1, 1))
+    h.quiesce() // nothing pending, so the read takes its length from the disk header
+    val held = h.issueRead(p)
+    h.commitOk(writeRange(p, v1, 5, bytes(4, 9), 2)) // its in-place write runs while the read is held
+    tearing.set(true)
+    gate.release()
+    val v2 = v1.clone()
+    System.arraycopy(bytes(4, 9), 0, v2, 5, 4)
+    h.await(held) match
+      case Left(rs) => rs.data.getByteArray.toList shouldBe v2.toList
+      case Right(err) => fail(s"read failed: $err")
+    tearing.get shouldBe false
+
+  test("a rejected io task fails the commit and still lets quiesce complete"):
+    for kind <- List(FsifBackend.IoKind.Cow, FsifBackend.IoKind.InPlace) do
+      withClue(kind.toString):
+        val h = new Harness(mkIo = () => new RejectingEc(isKind(kind)))
+        val p = ptr(1, oid(1))
+        val size = if kind == FsifBackend.IoKind.Cow then 700 else 40
+        val r = h.commit(alloc(p, bytes(size, 1), 1))
+        if kind == FsifBackend.IoKind.Cow then r shouldBe Right(CommitError.IOFailure)
+        h.quiesce()
+        h.fatals.size shouldBe 1
+        h.commit(overwrite(p, bytes(size, 2), 2)) shouldBe Right(CommitError.IOFailure)
+        h.quiesce()
 
   test("a commit larger than cowThreshold goes through copy-on-write and frees its old slot"):
     val h = new Harness
@@ -586,6 +679,34 @@ object FsifBackendSuite:
       next.foreach(_.run())
     def runAll(): Unit =
       while pending > 0 do runOne()
+
+  /** Runs tasks inline but rejects those matching `reject`, as a shut-down pool would */
+  final class RejectingEc(reject: Runnable => Boolean) extends ExecutionContext:
+    def execute(r: Runnable): Unit =
+      if reject(r) then throw new java.util.concurrent.RejectedExecutionException("rejected") else r.run()
+    def reportFailure(t: Throwable): Unit = throw t
+
+  /** While `tear` is set, the next header-sized read of `data` returns garbage (then clears `tear`), as a pread
+    * racing a pwrite of the header can
+    */
+  final class TearingFiles(underlying: FsifFiles, tear: AtomicBoolean) extends FsifFiles:
+    def exists(name: String): Boolean = underlying.exists(name)
+    def open(name: String): FsifFile =
+      val f = underlying.open(name)
+      if name != FsifRecovery.DataFile then
+        f
+      else
+        new FsifFile:
+          def size: Long = f.size
+          def read(position: Long, length: Int): Array[Byte] =
+            if length == SegmentHeader.Size && tear.compareAndSet(true, false) then
+              Array.fill[Byte](length)(0x7F)
+            else
+              f.read(position, length)
+          def write(position: Long, bytes: Array[Byte]): Unit = f.write(position, bytes)
+          def truncate(size: Long): Unit = f.truncate(size)
+          def force(): Unit = f.force()
+          def close(): Unit = f.close()
 
   def isKind(kind: FsifBackend.IoKind)(r: Runnable): Boolean = r match
     case t: FsifBackend.IoTask => t.kind == kind

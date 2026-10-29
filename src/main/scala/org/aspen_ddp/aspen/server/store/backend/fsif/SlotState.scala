@@ -28,6 +28,10 @@ private[fsif] final class SlotState(val slot: Int):
   var reads = 0
   var dead = false
   var unmapDurable = false
+  /** Bumped whenever the Delta list changes or an in-place write starts or ends, so a read can tell whether the
+    * bytes it read raced with a write
+    */
+  var version = 0L
 
   /** Index of the first Delta that is neither written nor being written */
   def queuedFrom: Int = applied + writing

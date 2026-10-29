@@ -74,6 +74,8 @@ class FsifBackend(val storeId: StoreId,
     */
   private val tailCows = mutable.TreeSet[Int]()
   private val awaitingTail = mutable.ArrayBuffer[(Int, () => Unit)]()
+  /** The pending Map(X, -1) of each X unmapped by a delete whose record is not yet durable */
+  private val unmapping = mutable.HashMap[Int, Future[Unit]]()
   /** Rebuild writes whose Mapping is appended by the next rebuildFlush: ext -> (slot, id) */
   private val rebuildMaps = mutable.LinkedHashMap[Int, (Int, ObjectId)]()
   /** Serializes rebuildWrite / rebuildFlush callers, whose segment writes run on the calling thread */
@@ -109,13 +111,14 @@ class FsifBackend(val storeId: StoreId,
       }
     }(using ExecutionContext.parasitic)
 
+  /** The held data and active journal handles, plus the other journal and both index files (not held) */
   override def estimateSize(): Long =
-    val names = FsifRecovery.DataFile +: (FsifRecovery.IndexFiles ++ FsifRecovery.JournalFiles)
+    val others = FsifRecovery.IndexFiles ++ FsifRecovery.JournalFiles.filter(_ != recovered.activeJournal)
     def sizeOf(name: String): Long =
       val f = files.open(name)
       try f.size
       finally f.close()
-    names.filter(files.exists).map(sizeOf).sum
+    dataFile.size + journalFile.size + others.filter(files.exists).map(sizeOf).sum
 
   override def bootstrapAllocate(objectId: ObjectId, objectType: ObjectType.Value, metadata: Metadata,
                                  data: DataBuffer): Unit =
@@ -128,10 +131,10 @@ class FsifBackend(val storeId: StoreId,
 
   override def commit(state: CommitState, transactionId: TransactionId): Unit =
     val id = state.objectId
-    post(update(state, r => handler.foreach(_.complete(Commit(storeId, id, transactionId, r)))))
+    post(update(state, repairing = false, r => handler.foreach(_.complete(Commit(storeId, id, transactionId, r)))))
 
   override def repair(state: CommitState, complete: Promise[Unit]): Unit =
-    post(update(state, promiseReply(complete, s"repair of ${state.objectId}")))
+    post(update(state, repairing = true, promiseReply(complete, s"repair of ${state.objectId}")))
 
   override def repairDelete(objectId: ObjectId, storePointer: Array[Byte], complete: Promise[Unit]): Unit =
     post(startRepairDelete(objectId, storePointer, promiseReply(complete, s"repairDelete of $objectId")))
@@ -290,6 +293,7 @@ class FsifBackend(val storeId: StoreId,
 
   private def cancelQueued(st: SlotState): Unit =
     val dropped = st.cancelQueued()
+    st.version += 1
     unappliedCount -= dropped.size
     unappliedBytes -= dropped.iterator.map(_.bytes).sum
 
@@ -316,7 +320,9 @@ class FsifBackend(val storeId: StoreId,
 
   private def addDelta(slot: Int, d: JournalRecord.Delta): PendingDelta =
     val pd = new PendingDelta(d.header, d.ranges)
-    slotState(slot).deltas += pd
+    val st = slotState(slot)
+    st.deltas += pd
+    st.version += 1
     unappliedCount += 1
     unappliedBytes += pd.bytes
     pd
@@ -330,16 +336,21 @@ class FsifBackend(val storeId: StoreId,
         writesInFlight += 1
         val base = layout.slotOffset(st.slot)
         val header = SegmentHeader.encode(batch.last.header)
-        io.execute(new IoTask(IoKind.InPlace, () => {
-          val r = Try {
-            batch.foreach(_.ranges.foreach(r => dataFile.write(base + SegmentHeader.Size + r.offset, r.bytes)))
-            dataFile.write(base, header)
-          }
-          post(inPlaceDone(st, batch, r))
-        }))
+        st.version += 1
+        try
+          io.execute(new IoTask(IoKind.InPlace, () => {
+            val r = Try {
+              batch.foreach(_.ranges.foreach(r => dataFile.write(base + SegmentHeader.Size + r.offset, r.bytes)))
+              dataFile.write(base, header)
+            }
+            post(inPlaceDone(st, batch, r))
+          }))
+        catch
+          case NonFatal(t) => inPlaceDone(st, batch, Failure(t))
 
   private def inPlaceDone(st: SlotState, batch: List[PendingDelta], r: Try[Unit]): Unit =
     writesInFlight -= 1
+    st.version += 1
     r match
       case Failure(t) =>
         logger.error(s"FSIF store $storeId: in-place write to slot ${st.slot} failed: $t")
@@ -360,7 +371,7 @@ class FsifBackend(val storeId: StoreId,
 
   // ---- Commit and repair ----
 
-  private def update(state: CommitState, reply0: Reply): Unit =
+  private def update(state: CommitState, repairing: Boolean, reply0: Reply): Unit =
     var replied = false
     val reply: Reply = r =>
       if !replied then
@@ -376,17 +387,20 @@ class FsifBackend(val storeId: StoreId,
             if state.data.size > layout.segmentPayloadSize then
               reply(Right(CommitError.SliceTooLarge))
             else
-              withExt(x)(replyOnError(reply)(updateExt(x, state, reply)))
+              withExt(x)(replyOnError(reply)(updateExt(x, state, repairing, reply)))
     catch
       case NonFatal(t) =>
         reply(Right(CommitError.IOFailure))
         throw t
 
   /** The commit decision table, run once X has no copy-on-write in progress */
-  private def updateExt(x: Int, state: CommitState, reply: Reply): Unit =
+  private def updateExt(x: Int, state: CommitState, repairing: Boolean, reply: Reply): Unit =
     val id = state.objectId
     val slot = index.slots(x)
     val occupant = index.ids(x)
+    // Ruling 18: Frontend repairs a missed allocation with allocating = false, so a repair allocates an unmapped X.
+    // A repair never overwrites a different occupant: that missed delete heals first through repairDelete.
+    val allocating = if repairing then slot < 0 else state.allocating
     if fatal.isDefined then
       reply(Right(CommitError.IOFailure))
     else if state.metadata.refcount.count == 0 then
@@ -395,10 +409,10 @@ class FsifBackend(val storeId: StoreId,
         reply(Right(CommitError.ObjectMismatch))
       else
         deleteExt(x, reply)
-    else if !state.allocating && (slot < 0 || occupant != id) then
+    else if !allocating && (slot < 0 || occupant != id) then
       reply(Right(CommitError.ObjectMismatch))
     else
-      if state.allocating && slot >= 0 && occupant != id then
+      if allocating && slot >= 0 && occupant != id then
         logger.warn(s"FSIF store $storeId: allocating $id at ext $x over $occupant (a missed delete); overwriting it")
       val header = SegmentHeader.forSlice(state.objectType, id, x, state.metadata, state.data)
       val bytes = state.data.getByteArray
@@ -458,17 +472,28 @@ class FsifBackend(val storeId: StoreId,
       case Failure(_) =>
         reply(Right(CommitError.IOFailure))
 
+  /** Unmaps X. An already unmapped X appends nothing: it completes at once, or once the record that unmapped it is
+    * durable, so the acknowledgement never precedes the delete it relies on.
+    */
   private def deleteExt(x: Int, reply: Reply): Unit =
     val slot = index.slots(x)
-    index.slots(x) = -1
-    index.ids(x) = Zero
-    val dead = if slot >= 0 then Some(kill(slot)) else None
-    onDurable(journal.append(List(JournalRecord.Mapping(x, -1, Zero)))):
-      case Success(_) =>
-        dead.foreach(unmapDurable)
-        reply(Left(()))
-      case Failure(_) =>
-        reply(Right(CommitError.IOFailure))
+    if slot < 0 then
+      unmapping.get(x) match
+        case Some(f) => onDurable(f)(r => reply(if r.isSuccess then Left(()) else Right(CommitError.IOFailure)))
+        case None => reply(Left(()))
+    else
+      index.slots(x) = -1
+      index.ids(x) = Zero
+      val dead = kill(slot)
+      val f = journal.append(List(JournalRecord.Mapping(x, -1, Zero)))
+      unmapping(x) = f
+      onDurable(f):
+        case Success(_) =>
+          if unmapping.get(x).contains(f) then unmapping.remove(x)
+          unmapDurable(dead)
+          reply(Left(()))
+        case Failure(_) =>
+          reply(Right(CommitError.IOFailure))
 
   /** Durable-before-map: the whole segment is written to a free slot f and forced before Mapping(X, f) is appended.
     * X is gated meanwhile, so every later record for X follows the Mapping and targets f.
@@ -480,13 +505,17 @@ class FsifBackend(val storeId: StoreId,
       tailCows += f
     gated(x) = mutable.ArrayDeque()
     val segment = SegmentHeader.encode(header) ++ bytes
-    io.execute(new IoTask(IoKind.Cow, () => {
-      val r = Try {
-        dataFile.write(layout.slotOffset(f), segment)
-        dataFile.force()
-      }
-      post(cowWritten(x, id, f, r, reply))
-    }))
+    try
+      io.execute(new IoTask(IoKind.Cow, () => {
+        val r = Try {
+          dataFile.write(layout.slotOffset(f), segment)
+          dataFile.force()
+        }
+        post(cowWritten(x, id, f, r, reply))
+      }))
+    catch
+      // A rejected task fails like a failed write: fail-stop, reply, and release the gate and tail slot
+      case NonFatal(t) => cowWritten(x, id, f, Failure(t), reply)
 
   private def cowWritten(x: Int, id: ObjectId, f: Int, r: Try[Unit], reply: Reply): Unit =
     try
@@ -571,6 +600,7 @@ class FsifBackend(val storeId: StoreId,
       readsInFlight += 1
       // Any Delta that grows the slice past this length arrives later, so stays in the list until this read ends
       val issueLength = st.newestHeader.map(_.sliceLength).getOrElse(-1)
+      val issueVersion = st.version
       val base = layout.slotOffset(slot)
       try
         io.execute(new IoTask(IoKind.Read, () => {
@@ -580,13 +610,13 @@ class FsifBackend(val storeId: StoreId,
             val length = math.max(issueLength, disk.map(_.sliceLength).getOrElse(0))
             (disk, if length > 0 then dataFile.read(base + SegmentHeader.Size, length) else Array.emptyByteArray)
           }
-          post(finishRead(pointer, x, st, r))
+          post(finishRead(pointer, x, st, issueVersion, r))
         }))
       catch
         case NonFatal(t) =>
-          finishRead(pointer, x, st, Failure(t))
+          finishRead(pointer, x, st, issueVersion, Failure(t))
 
-  private def finishRead(pointer: ObjectPointer, x: Int, st: SlotState,
+  private def finishRead(pointer: ObjectPointer, x: Int, st: SlotState, issueVersion: Long,
                          r: Try[(Option[SegmentHeader], Array[Byte])]): Unit =
     st.reads -= 1
     readsInFlight -= 1
@@ -597,7 +627,11 @@ class FsifBackend(val storeId: StoreId,
       else if moved then
         None
       else
-        Some(Try(assemble(pointer.id, x, st, r)).getOrElse(Right(ReadError.CorruptedObject)))
+        val res = Try(assemble(pointer.id, x, st, r)).getOrElse(Right(ReadError.CorruptedObject))
+        // A disk read racing an in-place write can tear the header (pread/pwrite are not atomic), e.g. its length
+        // when no Delta was pending at issue. If the slot changed meanwhile, the failure may be that race: retry.
+        val raced = res == Right(ReadError.CorruptedObject) && r.isSuccess && st.version != issueVersion
+        if raced then None else Some(res)
     st.prune()
     if st.dead then
       tryFree(st)
@@ -605,7 +639,7 @@ class FsifBackend(val storeId: StoreId,
       dropIfUnused(st)
     result match
       case Some(res) => completeRead(pointer.id, res)
-      case None => startRead(pointer) // X was deleted, replaced or moved meanwhile: look it up again
+      case None => startRead(pointer) // X moved or changed meanwhile, or the read raced a write: read again
 
   private def assemble(id: ObjectId, x: Int, st: SlotState,
                        r: Try[(Option[SegmentHeader], Array[Byte])]): Either[ReadState, ReadError.Value] =

@@ -13,13 +13,14 @@ enum JournalRecord:
   case Mapping(ext: Int, slot: Int, objectId: ObjectId)
   case Delta(ext: Int, slot: Int, header: SegmentHeader, ranges: List[DeltaRange])
 
-/** Header: "FSIFJRNL"(8) seq(8) CRC(4 over the first 16 bytes).
-  * Batch: len(4) batchNo(8) records... crc(4); len counts batchNo + records, crc covers len + batchNo + records.
+/** Header: "FSIFJRNL"(8) seq(8) salt(8) CRC(4 over the first 24 bytes).
+  * Batch: len(4) batchNo(8) records... crc(4); len counts batchNo + records, crc covers salt(8, not stored) + len +
+  * batchNo + records. The salt keeps user data embedded in a torn batch from ever passing as a later batch.
   * Record: len(4) type(1) payload; len counts type + payload.
   * Mapping (1): ext 4, slot 4, msb 8, lsb 8. Delta (2): ext 4, slot 4, header 61, rangeCount 4, (offset 4, length 4, bytes)*
   */
 object JournalFormat:
-  val HeaderSize = 20
+  val HeaderSize = 28
   private val Magic = "FSIFJRNL".getBytes("US-ASCII")
   private val MappingType: Byte = 1
   private val DeltaType: Byte = 2
@@ -29,12 +30,19 @@ object JournalFormat:
     c.update(a, off, len)
     c.getValue.toInt
 
-  def encodeHeader(seq: Long): Array[Byte] =
+  private def saltedCrc(salt: Long, a: Array[Byte], off: Int, len: Int): Int =
+    val c = new CRC32
+    c.update(ByteBuffer.allocate(8).putLong(salt).array())
+    c.update(a, off, len)
+    c.getValue.toInt
+
+  def encodeHeader(seq: Long, salt: Long): Array[Byte] =
     val arr = new Array[Byte](HeaderSize)
     val bb = ByteBuffer.wrap(arr)
     bb.put(Magic)
     bb.putLong(seq)
-    bb.putInt(crc(arr, 0, 16))
+    bb.putLong(salt)
+    bb.putInt(crc(arr, 0, 24))
     arr
 
   private def encodeRecord(r: JournalRecord): Array[Byte] =
@@ -53,23 +61,23 @@ object JournalFormat:
           bb.putInt(r.offset).putInt(r.bytes.length).put(r.bytes)
         bb.array()
 
-  def encodeBatch(batchNumber: Long, records: List[JournalRecord]): Array[Byte] =
+  def encodeBatch(salt: Long, batchNumber: Long, records: List[JournalRecord]): Array[Byte] =
     val encoded = records.map(encodeRecord)
     val body = 8 + encoded.map(_.length).sum
     val arr = new Array[Byte](4 + body + 4)
     val bb = ByteBuffer.wrap(arr)
     bb.putInt(body).putLong(batchNumber)
     encoded.foreach(bb.put)
-    bb.putInt(crc(arr, 0, 4 + body))
+    bb.putInt(saltedCrc(salt, arr, 0, 4 + body))
     arr
 
   enum Scan:
     case Empty
-    case Valid(seq: Long, records: Vector[JournalRecord], validLength: Long, nextBatch: Long)
+    case Valid(seq: Long, salt: Long, records: Vector[JournalRecord], validLength: Long, nextBatch: Long)
     case Corrupt(reason: String)
 
   /** Total batch length at o if a CRC-valid batch with any number sits there, else -1 */
-  private def validBatchLength(bytes: Array[Byte], o: Long): Int =
+  private def validBatchLength(bytes: Array[Byte], salt: Long, o: Long): Int =
     val total = bytes.length.toLong
     if total - o < 4 then
       -1
@@ -79,16 +87,24 @@ object JournalFormat:
         -1
       else
         val end = o.toInt + 4 + len
-        if ByteBuffer.wrap(bytes).getInt(end) == crc(bytes, o.toInt, 4 + len) then 4 + len + 4 else -1
+        if ByteBuffer.wrap(bytes).getInt(end) == saltedCrc(salt, bytes, o.toInt, 4 + len) then 4 + len + 4 else -1
 
-  private def findLater(bytes: Array[Byte], o: Long, n: Long): Boolean =
+  private def findLater(bytes: Array[Byte], salt: Long, o: Long, n: Long): Boolean =
     val bb = ByteBuffer.wrap(bytes)
     val target = n + 1
-    var p = o + 4
+    val low = target.toByte
+    // Never look inside the claimed extent of the batch at o: that is its own payload
+    val lenAtO = if bytes.length - o >= 4 then bb.getInt(o.toInt) else -1
+    val boundsOk = lenAtO >= 8 && o + 4L + lenAtO + 4L <= bytes.length
+    val firstStart =
+      if boundsOk && validBatchLength(bytes, salt, o) < 0 then o + 4L + lenAtO + 4L
+      else if boundsOk then o
+      else o + 4
+    var p = firstStart + 4
     var found = false
     while !found && p + 8 <= bytes.length do
-      if bytes(p.toInt) == (target >>> 56).toByte && bb.getLong(p.toInt) == target then
-        found = validBatchLength(bytes, p - 4) > 0
+      if bytes(p.toInt + 7) == low && bb.getLong(p.toInt) == target then
+        found = validBatchLength(bytes, salt, p - 4) > 0
       p += 1
     found
 
@@ -145,17 +161,18 @@ object JournalFormat:
   def scan(bytes: Array[Byte]): Scan =
     val headerOk = bytes.length >= HeaderSize &&
       java.util.Arrays.equals(bytes, 0, 8, Magic, 0, 8) &&
-      ByteBuffer.wrap(bytes).getInt(16) == crc(bytes, 0, 16)
+      ByteBuffer.wrap(bytes).getInt(24) == crc(bytes, 0, 24)
     if !headerOk then
       if bytes.length <= HeaderSize then Scan.Empty else Scan.Corrupt("invalid journal header")
     else
       val seq = ByteBuffer.wrap(bytes).getLong(8)
+      val salt = ByteBuffer.wrap(bytes).getLong(16)
       val records = Vector.newBuilder[JournalRecord]
       var o = HeaderSize.toLong
       var n = 0L
       var result: Option[Scan] = None
       while result.isEmpty && o < bytes.length do
-        val size = validBatchLength(bytes, o)
+        val size = validBatchLength(bytes, salt, o)
         val number = if size > 0 then ByteBuffer.wrap(bytes).getLong(o.toInt + 4) else -1L
         if size > 0 && number == n then
           try
@@ -165,8 +182,8 @@ object JournalFormat:
           catch
             case e: BadRecord =>
               result = Some(Scan.Corrupt(s"batch $n at $o: ${e.getMessage}"))
-        else if findLater(bytes, o, n) then
+        else if findLater(bytes, salt, o, n) then
           result = Some(Scan.Corrupt(s"batch $n at $o is invalid but a later batch is valid"))
         else
-          result = Some(Scan.Valid(seq, records.result(), o, n))
-      result.getOrElse(Scan.Valid(seq, records.result(), o, n))
+          result = Some(Scan.Valid(seq, salt, records.result(), o, n))
+      result.getOrElse(Scan.Valid(seq, salt, records.result(), o, n))

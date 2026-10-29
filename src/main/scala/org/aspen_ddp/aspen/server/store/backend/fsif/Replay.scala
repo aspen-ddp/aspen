@@ -4,6 +4,8 @@ package org.aspen_ddp.aspen.server.store.backend.fsif
   * Pure logic: no I/O. Callers write the returned Deltas, in order, to the data file.
   */
 object Replay:
+  final class InvalidRecord(msg: String) extends Exception(msg)
+
   final case class Result(index: IndexMap, apply: Vector[JournalRecord.Delta])
 
   /** Walks the records over a copy of `start` (which is never mutated) and returns the final index plus the Deltas to
@@ -17,34 +19,39 @@ object Replay:
     * the same slot with a new id or a move, starts a new incarnation of X, so only Deltas after X's last Mapping can
     * belong to the final occupancy. When that last Mapping put X into its final slot i, it is the installer. When
     * no Mapping for X exists, X is in i from `start`, which is position -1. A last Mapping to some other slot makes
-    * finalSlot(X) differ from the Delta's slot, or the Delta precedes it, so it is dropped. Deltas whose ext or slot
-    * is out of range, or whose ext ends unmapped, are dropped rather than raising an error; recovery validates the
+    * finalSlot(X) differ from the Delta's slot, or the Delta precedes it, so it is dropped. Deltas with a negative slot, or whose ext ends unmapped, are dropped rather than raising an error; recovery validates the
     * index separately, including double-mapped slots.
     */
+  private def checkExt(ext: Int, pos: Int, n: Int, kind: String): Unit =
+    if ext < 0 || ext >= n then
+      throw new InvalidRecord(s"$kind at journal position $pos has ext $ext outside [0, $n)")
+
   def run(start: IndexMap, records: Iterable[JournalRecord]): Result =
     val index = start.copy()
     val n = index.slots.length
+    val recs = records.toIndexedSeq
     val lastMapping = new java.util.HashMap[Int, Int]
 
     // Pass 1: maintain the mapping and the position of each ext's last Mapping
     var pos = 0
-    records.foreach: r =>
+    recs.foreach: r =>
       r match
         case JournalRecord.Mapping(ext, slot, id) =>
-          if ext >= 0 && ext < n then
-            index.slots(ext) = slot
-            index.ids(ext) = id
-            lastMapping.put(ext, pos)
-        case _ =>
+          checkExt(ext, pos, n, "Mapping")
+          index.slots(ext) = slot
+          index.ids(ext) = id
+          lastMapping.put(ext, pos)
+        case JournalRecord.Delta(ext, _, _, _) =>
+          checkExt(ext, pos, n, "Delta")
       pos += 1
 
     // Pass 2: keep the Deltas belonging to each ext's final occupancy
     val out = Vector.newBuilder[JournalRecord.Delta]
     pos = 0
-    records.foreach: r =>
+    recs.foreach: r =>
       r match
         case d: JournalRecord.Delta =>
-          if d.ext >= 0 && d.ext < n && d.slot >= 0 && d.slot < n && index.slots(d.ext) == d.slot &&
+          if d.slot >= 0 && index.slots(d.ext) == d.slot &&
             pos > lastMapping.getOrDefault(d.ext, -1)
           then out += d
         case _ =>

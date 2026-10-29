@@ -82,10 +82,31 @@ class ReplaySuite extends FileBasedTests:
     val r = Replay.run(startWith((X, 7, oid(X))), List(delta(X, 7, 1)))
     tags(r) shouldBe Vector(1)
 
-  test("out of range or unmapped deltas are dropped"):
+  test("deltas for an ext unmapped at the end or with a negative slot are dropped"):
     val r = Replay.run(startWith((X, 1, oid(X))),
-      List(delta(X, 1, 1), delta(40, 1, 2), delta(Y, 99, 3), delta(-1, 0, 4)))
+      List(delta(X, 1, 1), delta(Y, 3, 2), delta(X, -1, 3), map(Y, 3, oid(Y)), map(Y, -1, Zero), delta(Y, 3, 4)))
     tags(r) shouldBe Vector(1)
+
+  test("a slot at or beyond segmentCount is applied after a mapping"):
+    val r = Replay.run(IndexMap.empty(16), List(map(X, 16, oid(X)), delta(X, 16, 1)))
+    tags(r) shouldBe Vector(1)
+
+  test("a slot beyond segmentCount from start is applied"):
+    val r = Replay.run(startWith((X, 20, oid(X))), List(delta(X, 20, 1)))
+    tags(r) shouldBe Vector(1)
+
+  test("an ext out of range in a Mapping throws InvalidRecord"):
+    intercept[Replay.InvalidRecord](Replay.run(IndexMap.empty(16), List(map(16, 1, oid(1)))))
+    intercept[Replay.InvalidRecord](Replay.run(IndexMap.empty(16), List(map(-1, 1, oid(1)))))
+
+  test("an ext out of range in a Delta throws InvalidRecord"):
+    intercept[Replay.InvalidRecord](Replay.run(IndexMap.empty(16), List(delta(16, 1, 1))))
+    intercept[Replay.InvalidRecord](Replay.run(IndexMap.empty(16), List(delta(-1, 1, 1))))
+
+  test("a one-shot Iterable works"):
+    val recs = List(map(X, 5, oid(X)), delta(X, 5, 1), delta(X, 5, 2))
+    val once = recs.iterator.to(Iterable)
+    tags(Replay.run(IndexMap.empty(16), once)) shouldBe Vector(1, 2)
 
   test("start is not mutated"):
     val start = startWith((X, 1, oid(X)))

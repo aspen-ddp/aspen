@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.common.objects.Insert
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 
+import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
 class DeviceShutdownClientSuite extends IntegrationTestSuite:
@@ -136,6 +137,25 @@ class DeviceShutdownClientSuite extends IntegrationTestSuite:
       _ <- placeBootstrapStore(2, other)
       _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.Operational,
                                                     stores = Map(sid(1) -> StoreEntry(StoreStatus.Rebuilding, None))))
+      _ <- seed(Map(sid(2) -> StoreEntry(StoreStatus.Active, None)), DeviceStatus.Operational)
+      r <- client.shutdownStorageDevice(other).failed
+      after <- secondState()
+    yield
+      r shouldBe a[AspenClient.ShutdownWouldBreakPool]
+      after.status should be(DeviceStatus.Operational)
+      after.stores(sid(2)).status should be(StoreStatus.Active)
+
+  atest("shutdownStorageDevice counts a pool's store on an unregistered device as unavailable"):
+    given ExecutionContext = executionContext
+    val other = net.secondDeviceId
+    val missing = StorageDeviceId(UUID.fromString("eeeeeeee-0000-0000-0000-000000000001"))
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      // Store 1 names a device with no entry in the device tree. It must count as unavailable
+      // rather than fail the lookup, which the CLI would report as the target being not found.
+      _ <- placeBootstrapStore(1, missing)
+      _ <- placeBootstrapStore(2, other)
       _ <- seed(Map(sid(2) -> StoreEntry(StoreStatus.Active, None)), DeviceStatus.Operational)
       r <- client.shutdownStorageDevice(other).failed
       after <- secondState()

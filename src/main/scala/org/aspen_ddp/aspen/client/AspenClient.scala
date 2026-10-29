@@ -568,8 +568,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
    *  it would be left with fewer writable stores than its write threshold. A store is writable
    *  only if it sits on another Operational device whose state lists it as Active: Rebuilding,
    *  Offline, TransferringIn and other non-Active stores cannot take writes. A ShuttingDown,
-   *  Shutdown or Failed device counts as unavailable: its stores are offline or about to be. A pool named by an entry but no longer registered is skipped, as there is
-   *  nothing left to keep writable.
+   *  Shutdown or Failed device counts as unavailable: its stores are offline or about to be. So does
+   *  a device a pool names but that is not registered, so that only the target device's own lookup
+   *  can fail with NoSuchElementException. A pool named by an entry but no longer registered is
+   *  skipped, as there is nothing left to keep writable.
    *
    *  Run inside the shutdown's transaction, so a collision retry re-reads everything. Each other
    *  device counted as Operational has its revision locked by the transaction: two devices of
@@ -587,12 +589,13 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                    case _: NoSuchElementException => None)
       others = pools.flatten.flatMap(_.stores.map(_.storageDeviceId)).distinct.filter(_ != deviceId)
       otherStates <- Future.sequence(others.map: id =>
-                       for
-                         ptr <- getStorageDevicePointer(id)
-                         kvos <- read(ptr)
-                       yield (id, ptr, kvos))
+                       getStorageDevicePointer(id).map(Some(_)).recover:
+                         case _: NoSuchElementException => None
+                       .flatMap:
+                         case Some(ptr) => read(ptr).map(kvos => Some((id, ptr, kvos)))
+                         case None => Future.successful(None))
     yield
-      val operational = otherStates.flatMap: (id, ptr, kvos) =>
+      val operational = otherStates.flatten.flatMap: (id, ptr, kvos) =>
         val state = StorageDeviceState(kvos)
         if state.isOperational then Some(id -> (ptr, kvos, state)) else None
       .toMap

@@ -3,15 +3,6 @@ TODO
 
 Follow-ups from the physical device move work (docs/superpowers/specs/2026-10-28-physical-device-move-design.md)
 
-shutdown-device / restart-device report "not found" for the wrong device
-  - Context: cmdline Main.changeDeviceStatus turns any NoSuchElementException into
-    "storage device '<id>' not found". checkPoolsStayWritable reads the pointer of every other device named
-    by the affected pools (getStorageDevicePointer). If one of those devices is missing, it throws the same
-    exception, so the operator is told that the device they named does not exist.
-  - Recommended fix: in checkPoolsStayWritable, recover a missing pointer for another device and treat that
-    device as unavailable. This is the conservative direction and matches how a missing pool is skipped. Then
-    only the target device's own lookup can produce "not found".
-
 DurableFiles leaves its temp file behind on failure
   - Context: DurableFiles.writeWith writes `.<name>.tmp` next to the target, forces it, renames it into place,
     and syncs the directory. If fill, force or the move throws, the temp file stays in the device or store

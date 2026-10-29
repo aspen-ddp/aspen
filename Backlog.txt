@@ -81,3 +81,20 @@ For maximum recovery speed, DurableRecoveryManagerTask
   + End-location can be throttled so as not to overload bandwidth
   + Data can be rebuilt at maximum speed (no choke points)
   + Rebuilt data can be read from dist data structure at a speed penalty
+
+DurableFiles' directory fsync is Linux-only
+  - DurableFiles.syncDirectory opens a directory with FileChannel READ and forces it. Only Linux makes
+    that a real directory fsync. Windows refuses to open a directory as a channel, so syncDirectory is a
+    no-op there (one warning logged) and renames and removals of markers, CRL save files and store
+    directories can be lost on power loss. macOS accepts it but the JDK issues a plain fsync, not
+    F_FULLFSYNC, so entries can sit in the drive's write cache.
+  - Windows fix: NTFS has no directory fsync, but a rename can be made durable itself. Use JNA to call
+    kernel32 MoveFileExW(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH); WRITE_THROUGH
+    makes the call return only once the rename is flushed to disk. Route DurableFiles.writeWith's rename
+    and the store-directory moves (rebuild finish, transfer-in promotion, discard) through it, and make
+    syncDirectory a no-op on Windows without the warning. For removals (DurableFiles.remove), open the
+    directory with CreateFileW(GENERIC_WRITE, FILE_FLAG_BACKUP_SEMANTICS) and call FlushFileBuffers on
+    the handle, or replace the remove with a write-through rename of the file into a discard directory.
+    File data itself is already handled: FileChannel.force maps to FlushFileBuffers on Windows.
+  - macOS fix: via JNA, call fcntl(fd, F_FULLFSYNC) on the directory and on each forced file instead of
+    relying on FileChannel.force.

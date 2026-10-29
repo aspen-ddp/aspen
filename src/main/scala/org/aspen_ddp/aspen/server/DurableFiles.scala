@@ -3,6 +3,8 @@ package org.aspen_ddp.aspen.server
 import java.io.{BufferedOutputStream, OutputStream}
 import java.nio.channels.{Channels, FileChannel}
 import java.nio.file.StandardOpenOption
+import java.util.concurrent.atomic.AtomicBoolean
+import scribe.Logging
 
 /** Small files that must survive a power cut or a pulled disk the moment their write returns:
  *  the device markers, the per-store transfer-out marker and CRL save file that a shutdown
@@ -13,8 +15,10 @@ import java.nio.file.StandardOpenOption
  *  a zero-length one. Every write here forces the file's data, then forces the directory that
  *  names it, so both the bytes and the directory entry are on stable storage. java.nio is used
  *  only because os-lib has no fsync (see CLAUDE.md); paths cross the boundary with toNIO.
+ *
+ *  The durability claim holds on Linux only, the supported host platform. See `syncDirectory`.
  */
-object DurableFiles:
+object DurableFiles extends Logging:
 
   /** Replaces `file` with `content`. Atomic: the bytes go to a temp file in the same directory,
    *  which is forced and renamed over `file`, and the directory is then forced. A crash leaves
@@ -57,8 +61,26 @@ object DurableFiles:
       syncDirectory(file / os.up)
 
   /** Forces a directory's entries to stable storage. Opening a directory for READ and forcing it
-   *  is how Linux exposes fsync on a directory. */
+   *  is how Linux exposes fsync on a directory.
+   *
+   *  Elsewhere it degrades rather than fails, with a warning logged once. Windows cannot open a
+   *  directory this way at all, so the call is a no-op there. macOS accepts it but issues a plain
+   *  fsync rather than F_FULLFSYNC, so the entries may still sit in the drive's cache. */
   def syncDirectory(dir: os.Path): Unit =
-    val channel = FileChannel.open(dir.toNIO, StandardOpenOption.READ)
-    try channel.force(true)
-    finally channel.close()
+    if isWindows then
+      warnOnce("directory fsync is unsupported on Windows; renames and removals are not durable")
+    else
+      if isMacOS then
+        warnOnce("directory fsync on macOS does not issue F_FULLFSYNC; renames and removals may not be durable")
+      val channel = FileChannel.open(dir.toNIO, StandardOpenOption.READ)
+      try channel.force(true)
+      finally channel.close()
+
+  private val osName = System.getProperty("os.name", "").toLowerCase
+  private val isWindows = osName.startsWith("windows")
+  private val isMacOS = osName.startsWith("mac")
+  private val warned = new AtomicBoolean(false)
+
+  private def warnOnce(message: String): Unit =
+    if warned.compareAndSet(false, true) then
+      logger.warn(s"DurableFiles: $message. Linux is the supported host platform.")

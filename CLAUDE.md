@@ -172,6 +172,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   flipped to Rebuilding by the reconcile, and the directory is discarded before the rebuild. Adoption of a Shutdown
   device does the same for such stores instead of refusing the device. A network transfer validates the staged copy's
   save file before promotion and retries on failure, since the source still holds the state
+- `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That durability
+  holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync on macOS,
+  each logging one warning
 
 ### Hybrid Logical Clock (HLC) Timestamps
 - Provides timestamps that are guaranteed to be later than some previously observed event(s)

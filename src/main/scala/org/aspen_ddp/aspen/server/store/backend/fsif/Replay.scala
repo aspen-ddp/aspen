@@ -8,6 +8,10 @@ object Replay:
 
   final case class Result(index: IndexMap, apply: Vector[JournalRecord.Delta])
 
+  private def checkExt(ext: Int, pos: Int, n: Int, kind: String): Unit =
+    if ext < 0 || ext >= n then
+      throw new InvalidRecord(s"$kind at journal position $pos has ext $ext outside [0, $n)")
+
   /** Walks the records over a copy of `start` (which is never mutated) and returns the final index plus the Deltas to
     * apply, in journal order.
     *
@@ -19,13 +23,11 @@ object Replay:
     * the same slot with a new id or a move, starts a new incarnation of X, so only Deltas after X's last Mapping can
     * belong to the final occupancy. When that last Mapping put X into its final slot i, it is the installer. When
     * no Mapping for X exists, X is in i from `start`, which is position -1. A last Mapping to some other slot makes
-    * finalSlot(X) differ from the Delta's slot, or the Delta precedes it, so it is dropped. Deltas with a negative slot, or whose ext ends unmapped, are dropped rather than raising an error; recovery validates the
-    * index separately, including double-mapped slots.
+    * finalSlot(X) differ from the Delta's slot, or the Delta precedes it, so it is dropped. Deltas with a negative slot, or whose ext ends unmapped, are dropped. Slots have no upper bound (copy-on-write and slot
+    * freeing can place an object at or beyond segmentCount); recovery validates the index separately, including
+    * double-mapped slots. An ext outside [0, segmentCount) in any record can only come from a writer bug or
+    * corruption past the CRC, so it throws InvalidRecord.
     */
-  private def checkExt(ext: Int, pos: Int, n: Int, kind: String): Unit =
-    if ext < 0 || ext >= n then
-      throw new InvalidRecord(s"$kind at journal position $pos has ext $ext outside [0, $n)")
-
   def run(start: IndexMap, records: Iterable[JournalRecord]): Result =
     val index = start.copy()
     val n = index.slots.length

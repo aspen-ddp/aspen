@@ -201,25 +201,43 @@ class FsifBackendSuite extends FileBasedTests:
   test("appends into a reused slot never expose the previous occupant"):
     for seed <- 0 until 5 do
       withClue(s"seed=$seed"):
-        val h = new Harness(seed)
+        val h = new Harness(seed, mkIo = () => new FsifCheckpointSuite.HoldEc)
         val old = ptr(5, oid(50))
-        h.commitOk(alloc(old, Array.fill[Byte](1000)(0xAA.toByte), 1))
+        val pin = ptr(6, oid(60))
+        h.commitOk(alloc(old, Array.fill[Byte](1000)(0xAA.toByte), 1)) // copy-on-write into slot 0, forced
+        h.commitOk(alloc(pin, bytes(20, 6), 2))
+        h.quiesce()
         h.slotOccupant(0) shouldBe Some(oid(50))
-        h.commitOk(delete(old, 2))
-        h.quiesce()
+        h.slotOccupant(1) shouldBe Some(oid(60))
+        // Pin slot 1: a held read keeps it used after its delete, so it can neither be moved into the hole at
+        // slot 0 nor truncated away, and the hole keeps the old occupant's bytes
+        val io = h.io.asInstanceOf[FsifCheckpointSuite.HoldEc]
+        io.hold = FsifCheckpointSuite.oneShot(isKind(FsifBackend.IoKind.Read))
+        val heldRead = h.issueRead(pin)
+        h.commitOk(delete(pin, 3))
+        h.commitOk(delete(old, 4))
         val p = ptr(9, oid(90))
-        h.commitOk(alloc(p, Array(), 3))
-        h.quiesce()
-        h.slotOccupant(0) shouldBe Some(oid(90))
+        h.commitOk(alloc(p, Array(), 5))
+        h.await(h.backend.mapping(9))._1 shouldBe 0
+        h.backend.compactionStats.started shouldBe 0
+        def staleTail(from: Int): List[Byte] =
+          val f = h.files.open(FsifRecovery.DataFile)
+          try f.read(SegmentHeader.Size + from, 1000 - from).toList
+          finally f.close()
+        staleTail(0) shouldBe List.fill(1000)(0xAA.toByte)
         var expected = Array[Byte]()
         for i <- 0 until 100 do
           val add = Array.tabulate[Byte](10)(j => ((i + j) % 100).toByte)
-          h.commitOk(append(p, expected, add, i + 4))
+          h.commitOk(append(p, expected, add, i + 6))
           expected = expected ++ add
           h.readData(p).toList shouldBe expected.toList
           if i == 49 then
-            h.crash()
+            staleTail(expected.length) shouldBe List.fill(1000 - expected.length)(0xAA.toByte)
+            h.crash() // drops the held read; the new incarnation compacts and truncates past slot 0
+            h.await(h.backend.mapping(9))._1 shouldBe 0
+            staleTail(expected.length) shouldBe List.fill(1000 - expected.length)(0xAA.toByte)
             h.readData(p).toList shouldBe expected.toList
+        heldRead.isCompleted shouldBe false // it belonged to the crashed incarnation
         h.crash()
         h.readData(p).toList shouldBe expected.toList
         h.quiesce()

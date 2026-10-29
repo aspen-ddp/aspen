@@ -271,8 +271,10 @@ class FsifCompactionSuite extends FileBasedTests:
         h.readData(m.ps(2)) shouldBe m.vs(2).toList
         h.assertDense(0 until 4)
 
-    // A read of the moving object that is in flight on slot t when Map(X, f) becomes durable holds t: the file is not
-    // truncated under it, and the read completes with the right data (retried on f)
+    // Truncation runs synchronously on serial and only ever cuts slots with no read in flight, so a read can race it
+    // only by being in flight on a slot about to be freed. That is this case: a read of the moving object in flight
+    // on slot t when Map(X, f) becomes durable holds t, the file is not truncated under it, and the read completes
+    // with the right data (retried on f)
     val h = new Harness(mkIo = () => new HoldEc)
     val ps = (0 until 4).map(x => ptr(x, oid(x + 1)))
     for i <- 0 until 4 do h.commitOk(alloc(ps(i), bytes(100 + i, i), 1))

@@ -98,3 +98,20 @@ DurableFiles' directory fsync is Linux-only
     File data itself is already handled: FileChannel.force maps to FlushFileBuffers on Windows.
   - macOS fix: via JNA, call fcntl(fd, F_FULLFSYNC) on the directory and on each forced file instead of
     relying on FileChannel.force.
+
+Full storage devices: keep stores serving and route around them system-wide
+  - Once Paxos decides commit, every store must apply the update. If the backend cannot write it (device
+    full), Tx.commitComplete currently ignores the error and drops the CRL object data, losing the slice.
+  - Preallocation is not the answer: stores are deliberately over-allocated on a device and rebalanced as
+    they grow, and some backends (e.g. RocksDB) cannot preallocate at all. It must be solved at the system
+    level for every backend.
+  - A full store must NOT be taken offline. If every device fills at once, that takes the whole pool offline.
+    Instead:
+    - The backend freezes in-progress writes (completions held, CRL data retained) and keeps serving reads.
+    - A higher-level check notices the device is full and its stores start voting to abort transactions.
+    - Clients/transaction drivers know which stores are full, do not send them writes, and rely on entries in
+      the missed-update (error) tree to repair those slices once the store is writable again.
+    - Writability returns when a rebalance moves the store to a device with free space, or when other stores
+      migrate off the device. Frozen writes then resume, followed by repair of the missed updates.
+  - FSIF (docs/superpowers/specs/2026-10-29-fsif-backend-design.md) implements only the backend side: freeze
+    writes on ENOSPC, keep serving reads, retry until space returns.

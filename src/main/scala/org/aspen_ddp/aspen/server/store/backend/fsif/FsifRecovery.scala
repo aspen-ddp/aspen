@@ -13,8 +13,10 @@ import java.security.SecureRandom
 object FsifRecovery:
   final class StoreLost(msg: String) extends Exception(msg)
 
-  /** `salt` is the active journal's salt; new batches continue at `journalLength` with number `nextBatch` */
-  final case class Recovered(index: IndexMap, seq: Long, salt: Long, activeJournal: String,
+  /** `activeIndex` holds index `seq`; `salt` is the active journal's salt; new batches continue at
+    * `journalLength` with number `nextBatch`
+    */
+  final case class Recovered(index: IndexMap, seq: Long, salt: Long, activeIndex: String, activeJournal: String,
                              journalLength: Long, nextBatch: Long, slotCount: Int)
 
   val DataFile = "data"
@@ -45,10 +47,13 @@ object FsifRecovery:
       f.force()
 
   /** Fresh store: empty data, journal.a = header(seq 0) and index.a = (seq 0, empty map), each forced. The index is
-    * written last, so a valid index implies the rest of the store exists. index.b and journal.b are left absent
-    * (or emptied, if a previous store left them behind).
+    * written last, so a valid index implies the rest of the store exists. On a reused directory an old index.a is
+    * emptied first, so a crash part way through can never pair it with emptied or rewritten files. index.b and
+    * journal.b are left absent (or emptied, if a previous store left them behind).
     */
   def initialize(files: FsifFiles, layout: FsifLayout): Unit =
+    if files.exists(IndexFiles(0)) then
+      truncateToZero(files, IndexFiles(0))
     for name <- Seq(IndexFiles(1), JournalFiles(1)) do
       if files.exists(name) then
         truncateToZero(files, name)
@@ -102,7 +107,10 @@ object FsifRecovery:
     *     Classify the journals: seq < m is stale (also when Corrupt with a valid header), seq m is required,
     *     seq m+1 is optional, anything else that is not Empty loses the store.
     *  2. Replay journal m then journal m+1 from index m. Check every kept Delta's length and that no slot is
-    *     mapped twice, before writing anything.
+    *     mapped twice, and bound every kept Delta's slot and every final mapped slot, before writing anything.
+    *     Allocation takes the lowest free slot, so each Mapping to a slot >= 0 grows the slot count by at most one:
+    *     no legitimate slot exceeds max(D0 / stride, 1 + highest slot in index m) + that Mapping count, where D0
+    *     is the forced data size before applying. This stops a CRC-valid but bogus slot from growing data hugely.
     *  3. Write the kept Deltas in place and force data. Check that every mapped slot starts inside data.
     *  4. Truncate the active journal's torn tail and force it.
     *  5. With journal m+1: write the map at the end of journal m as index m+1 into the other index file and force
@@ -111,7 +119,7 @@ object FsifRecovery:
     *
     * Steps 1-2 only read. Step 3 writes absolute bytes, so repeating it is harmless, and until step 5 makes index
     * m+1 valid every rerun sees the same inputs. Step 4 removes only bytes that no rerun replays. Once index m+1 is
-    * valid (step 5), a rerun starts from it: data already holds every Delta of journal m (forced in step 3), which
+    * valid (step 5), a rerun starts from it: data already holds every kept Delta of journal m (forced in step 3), which
     * is exactly what a normal checkpoint guarantees before writing index m+1, and journal m becomes stale. The
     * files emptied in step 5 are ones a rerun ignores.
     */
@@ -148,7 +156,8 @@ object FsifRecovery:
     val next = journals.find(_.scan.seq == m + 1)
 
     // Step 2
-    val result = replay(start, current.scan.records ++ next.map(_.scan.records).getOrElse(Vector.empty))
+    val replayed = current.scan.records ++ next.map(_.scan.records).getOrElse(Vector.empty)
+    val result = replay(start, replayed)
     result.apply.foreach: d =>
       if d.header.sliceLength > layout.segmentPayloadSize then
         throw new StoreLost(s"Delta for ext ${d.ext} has slice length ${d.header.sliceLength} > " +
@@ -159,6 +168,20 @@ object FsifRecovery:
       if slot >= 0 then
         owner.put(slot, ext).foreach: prev =>
           throw new StoreLost(s"slot $slot is mapped by ext $prev and ext $ext")
+    val d0 = withFile(files, DataFile): data =>
+      data.force()
+      data.size
+    val startTop = start.slots.foldLeft(-1)(math.max)
+    val mappings = replayed.count:
+      case JournalRecord.Mapping(_, slot, _) => slot >= 0
+      case _ => false
+    val bound = math.max(d0 / layout.stride, startTop + 1L) + mappings
+    def checkBound(slot: Int, what: String): Unit =
+      if slot > bound then
+        throw new StoreLost(s"$what targets slot $slot beyond the reachable bound $bound")
+    result.apply.foreach(d => checkBound(d.slot, s"Delta for ext ${d.ext}"))
+    for ext <- 0 until n do
+      checkBound(result.index.slots(ext), s"the mapping of ext $ext")
     val checkpointMap = next.map(_ => replay(start, current.scan.records).index)
 
     // Step 3
@@ -204,5 +227,6 @@ object FsifRecovery:
     val slotCount = math.max(slotsInFile, highest + 1L)
     if slotCount > Int.MaxValue then
       throw new StoreLost(s"slot count $slotCount is too large")
-    Recovered(result.index, active.scan.seq, active.scan.salt, active.name, active.scan.validLength,
+    val activeIndex = if checkpointMap.isDefined then otherIndex else indexName
+    Recovered(result.index, active.scan.seq, active.scan.salt, activeIndex, active.name, active.scan.validLength,
       active.scan.nextBatch, slotCount.toInt)

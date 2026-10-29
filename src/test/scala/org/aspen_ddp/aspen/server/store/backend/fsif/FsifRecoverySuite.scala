@@ -117,6 +117,7 @@ class FsifRecoverySuite extends FileBasedTests:
     val files = fresh()
     val r = FsifRecovery.recover(files, layout)
     r.seq shouldBe 0
+    r.activeIndex shouldBe "index.a"
     r.activeJournal shouldBe "journal.a"
     r.journalLength shouldBe JournalFormat.HeaderSize
     r.nextBatch shouldBe 0
@@ -161,6 +162,7 @@ class FsifRecoverySuite extends FileBasedTests:
     val expected = first - 9 + (11 -> s4) + (7 -> s7)
     val r = FsifRecovery.recover(files, layout)
     r.seq shouldBe 1
+    r.activeIndex shouldBe "index.b"
     r.activeJournal shouldBe "journal.b"
     r.nextBatch shouldBe 2
     r.salt shouldBe saltOf(files, "journal.b")
@@ -177,6 +179,7 @@ class FsifRecoverySuite extends FileBasedTests:
     val again = files.crash()
     val r2 = FsifRecovery.recover(again, layout)
     r2.seq shouldBe 1
+    r2.activeIndex shouldBe "index.b"
     checkObjects(again, r2, expected)
 
   test("both index files invalid -> StoreLost"):
@@ -240,6 +243,53 @@ class FsifRecoverySuite extends FileBasedTests:
     appendBatches(files, "journal.a", 0, List(List(Mapping(1, 0, oid(1)), Delta(1, 0, h, List(DeltaRange(0, big))))))
     a[StoreLost] should be thrownBy FsifRecovery.recover(files, layout)
     files.open("data").size shouldBe 0
+
+  test("index and journal letters that disagree still recover, naming the active index"):
+    val files = fresh()
+    writeIndex(files, "index.b", 1, IndexMap.empty(layout.segmentCount))
+    FsifRecovery.writeJournalHeader(files.open("journal.a"), 1)
+    val (rs, s) = alloc(4, 0, oid(4), bytes(50, 1), 1)
+    appendBatches(files, "journal.a", 0, List(rs))
+    val r = FsifRecovery.recover(files, layout)
+    r.seq shouldBe 1
+    r.activeIndex shouldBe "index.b"
+    r.activeJournal shouldBe "journal.a"
+    checkObjects(files, r, Map(4 -> s))
+
+  test("a Mapping beyond the reachable slot bound -> StoreLost"):
+    val files = fresh()
+    // Empty data and index, one Mapping: bound = 0 + 1
+    val (rs, _) = alloc(1, 2, oid(1), bytes(10, 1), 1)
+    appendBatches(files, "journal.a", 0, List(rs))
+    a[StoreLost] should be thrownBy FsifRecovery.recover(files, layout)
+    files.open("data").size shouldBe 0
+
+  test("a chain of allocations each taking the next new top slot is accepted"):
+    val files = fresh()
+    val allocs = (0 until 6).map(i => (i + 10, alloc(i + 10, i, oid(i + 10), bytes(20, i), i + 1)))
+    appendBatches(files, "journal.a", 0, allocs.map(_._2._1).toList)
+    val r = FsifRecovery.recover(files, layout)
+    r.slotCount shouldBe 6
+    checkObjects(files, r, allocs.map((ext, a) => ext -> a._2).toMap)
+    // A further chain continues from the top; the data file now also covers the first six slots
+    val more = (6 until 9).map(i => (i + 10, alloc(i + 10, i, oid(i + 10), bytes(20, i), i + 1)))
+    appendBatches(files, "journal.a", 6, more.map(_._2._1).toList)
+    val r2 = FsifRecovery.recover(files, layout)
+    r2.slotCount shouldBe 9
+    checkObjects(files, r2, (allocs ++ more).map((ext, a) => ext -> a._2).toMap)
+
+  test("initialize on a reused directory empties the old index.a before anything else"):
+    val files = fresh()
+    threeObjects(files)
+    FsifRecovery.recover(files, layout)
+    var ops = List[String]()
+    files.failWhile(Fault.IoError, name => { ops = ops :+ name; false })(true)
+    FsifRecovery.initialize(files, layout)
+    ops.head shouldBe "index.a"
+    ops.last shouldBe "index.a"
+    val r = FsifRecovery.recover(files, layout)
+    r.index.slots.forall(_ == -1) shouldBe true
+    r.slotCount shouldBe 0
 
   test("a record with an ext outside [0, segmentCount) -> StoreLost"):
     val files = fresh()

@@ -565,9 +565,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         case _ => Future.successful(None)
 
   /** Fails the shutdown of `device` with `ShutdownWouldBreakPool` if any pool holding a store on
-   *  it would be left with fewer stores on other Operational devices than its write threshold.
-   *  A ShuttingDown, Shutdown or Failed device counts as unavailable: its stores are offline or
-   *  about to be. A pool named by an entry but no longer registered is skipped, as there is
+   *  it would be left with fewer writable stores than its write threshold. A store is writable
+   *  only if it sits on another Operational device whose state lists it as Active: Rebuilding,
+   *  Offline, TransferringIn and other non-Active stores cannot take writes. A ShuttingDown,
+   *  Shutdown or Failed device counts as unavailable: its stores are offline or about to be. A pool named by an entry but no longer registered is skipped, as there is
    *  nothing left to keep writable.
    *
    *  Run inside the shutdown's transaction, so a collision retry re-reads everything. Each other
@@ -591,15 +592,19 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                          kvos <- read(ptr)
                        yield (id, ptr, kvos))
     yield
-      val operational = otherStates.collect:
-        case (id, ptr, kvos) if StorageDeviceState(kvos).isOperational => id -> (ptr, kvos)
+      val operational = otherStates.flatMap: (id, ptr, kvos) =>
+        val state = StorageDeviceState(kvos)
+        if state.isOperational then Some(id -> (ptr, kvos, state)) else None
       .toMap
+      def writable(storeId: StoreId, e: StoragePoolState.StoreEntry): Boolean =
+        e.storageDeviceId != deviceId && operational.get(e.storageDeviceId).exists: (_, _, state) =>
+          state.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active)
       pools.flatten.find: pool =>
-        pool.stores.count(e => e.storageDeviceId != deviceId && operational.contains(e.storageDeviceId)) <
+        pool.stores.iterator.zipWithIndex.count((e, i) => writable(StoreId(pool.poolId, i.toByte), e)) <
           pool.ida.writeThreshold
       .foreach: pool =>
         throw StopRetrying(ShutdownWouldBreakPool(pool.poolId))
-      operational.valuesIterator.foreach: (ptr, kvos) =>
+      operational.valuesIterator.foreach: (ptr, kvos, _) =>
         tx.lockRevision(ptr, kvos.revision)
 
   /** Reverses `shutdownStorageDevice`: Offline stores become Active and the device Operational.

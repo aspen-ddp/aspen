@@ -123,6 +123,27 @@ class DeviceShutdownClientSuite extends IntegrationTestSuite:
       after.status should be(DeviceStatus.Operational)
       after.stores(sid(2)).status should be(StoreStatus.Active)
 
+  atest("shutdownStorageDevice counts only Active stores on other Operational devices"):
+    given ExecutionContext = executionContext
+    val other = net.secondDeviceId
+    for
+      _ <- net.createSecondDevice()
+      _ <- net.createThirdDevice()
+      _ <- waitForTransactionsToComplete()
+      // Store 0 on the bootstrap device, 1 Rebuilding on the Operational third device, 2 on the
+      // device being shut down: two stores would remain, exactly the threshold, but only one Active.
+      _ <- placeBootstrapStore(1, net.thirdDeviceId)
+      _ <- placeBootstrapStore(2, other)
+      _ <- setDeviceState(net.thirdDeviceId)(_.copy(status = DeviceStatus.Operational,
+                                                    stores = Map(sid(1) -> StoreEntry(StoreStatus.Rebuilding, None))))
+      _ <- seed(Map(sid(2) -> StoreEntry(StoreStatus.Active, None)), DeviceStatus.Operational)
+      r <- client.shutdownStorageDevice(other).failed
+      after <- secondState()
+    yield
+      r shouldBe a[AspenClient.ShutdownWouldBreakPool]
+      after.status should be(DeviceStatus.Operational)
+      after.stores(sid(2)).status should be(StoreStatus.Active)
+
   atest("shutdownStorageDevice proceeds when enough of each pool stays on Operational devices"):
     given ExecutionContext = executionContext
     val other = net.secondDeviceId

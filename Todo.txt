@@ -3,17 +3,6 @@ TODO
 
 Follow-ups from the physical device move work (docs/superpowers/specs/2026-10-28-physical-device-move-design.md)
 
-Pool write-threshold check counts unavailable stores as writable
-  - Context: AspenClient.checkPoolsStayWritable refuses shutdownStorageDevice with ShutdownWouldBreakPool
-    when a pool would be left with fewer than ida.writeThreshold writable stores. It counts every pool entry
-    whose device is Operational. Stores on an Operational device that are Rebuilding, Offline or TransferringIn
-    cannot take writes, but they are still counted, so a shutdown can be allowed even
-    though it leaves the pool below threshold.
-  - Recommended fix: count an entry only if its device is Operational and that device's
-    StorageDeviceState.stores lists the store as Active. The other device's state is already being read and
-    revision-locked, so this needs no extra reads. Add a test with a pool at exactly writeThreshold where one
-    of the other stores is Rebuilding; the shutdown must be refused.
-
 shutdown-device / restart-device report "not found" for the wrong device
   - Context: cmdline Main.changeDeviceStatus turns any NoSuchElementException into
     "storage device '<id>' not found". checkPoolsStayWritable reads the pointer of every other device named

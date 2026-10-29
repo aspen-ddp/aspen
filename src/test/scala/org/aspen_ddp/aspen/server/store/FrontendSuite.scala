@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxMessage, TxPrepare, TxResolved}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxCommitted, TxMessage, TxPrepare, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.MapBackend
+import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.TransactionStatusCache
 import org.scalatest.funsuite.AnyFunSuite
@@ -262,5 +262,32 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     Await.result(completion.future, Duration(5, SECONDS))
 
     backend.get(oid2) shouldBe None
+  }
+
+  test("backend commit errors are reported in TxCommitted") {
+    var handler: Option[CompletionHandler] = None
+    val backend = new MapBackend(storeId):
+      override def setCompletionHandler(h: CompletionHandler): Unit =
+        handler = Some(h)
+        super.setCompletionHandler(h)
+      override def commit(state: CommitState, transactionId: TransactionId): Unit =
+        handler.foreach(_.complete(Commit(storeId, state.objectId, transactionId,
+          Right(CommitError.IOFailure))))
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+
+    val txd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
+    val prepare = mkPrepare(txd, fromClient = true).copy(objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))))
+    frontend.receiveTransactionMessage(prepare)
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+
+    net.txMessage() match
+      case Some(c: TxCommitted) => c.objectCommitErrors shouldBe List(oid1)
+      case other => throw new AssertionError(s"Expected TxCommitted, got $other")
   }
 }

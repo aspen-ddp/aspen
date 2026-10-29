@@ -13,6 +13,7 @@ import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
+import scala.util.control.NonFatal
 import scala.language.implicitConversions
 
 object RocksDBBackend extends Logging {
@@ -244,28 +245,34 @@ class RocksDBBackend(dbPath: os.Path,
     val objectId = pointer.id
     logger.debug(s"RocksDBBackend beginning load of object: $objectId")
 
-    val key = tokey(objectId)
-    db.get(key).onComplete {
-      case Failure(err) => logger.error(s"RocksDBBackend failed to load object: $objectId. Error: $err")
-      case Success(oresult) =>
-        chandler.foreach { handler =>
-          oresult match {
-            case None =>
-              logger.info(s"RocksDBBackend ObjectNotFound: $objectId")
-              handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
-            case Some(value) =>
-              logger.debug(s"RocksDBBackend loaded object: $objectId")
-              try
-                val (objectType, metadata, data) = decodeDBValue(value)
-                val rs = ReadState(objectId, metadata, objectType, data, Set())
-                handler.complete(Read(storeId, objectId, Left(rs)))
-              catch
-                case e: RocksDBBackend.CorruptedObjectEncoding =>
-                  logger.error(s"RocksDBBackend found corrupted object $objectId: ${e.getMessage}")
-                  handler.complete(Read(storeId, objectId, Right(ReadError.CorruptedObject)))
+    def fail(err: Throwable): Unit =
+      logger.error(s"RocksDBBackend failed to load object: $objectId. Error: $err")
+      chandler.foreach(_.complete(Read(storeId, objectId, Right(ReadError.CorruptedObject))))
+
+    try
+      db.get(tokey(objectId)).onComplete {
+        case Failure(err) => fail(err)
+        case Success(oresult) =>
+          chandler.foreach { handler =>
+            oresult match {
+              case None =>
+                logger.info(s"RocksDBBackend ObjectNotFound: $objectId")
+                handler.complete(Read(storeId, objectId, Right(ReadError.ObjectNotFound)))
+              case Some(value) =>
+                logger.debug(s"RocksDBBackend loaded object: $objectId")
+                try
+                  val (objectType, metadata, data) = decodeDBValue(value)
+                  val rs = ReadState(objectId, metadata, objectType, data, Set())
+                  handler.complete(Read(storeId, objectId, Left(rs)))
+                catch
+                  case e: RocksDBBackend.CorruptedObjectEncoding =>
+                    logger.error(s"RocksDBBackend found corrupted object $objectId: ${e.getMessage}")
+                    handler.complete(Read(storeId, objectId, Right(ReadError.CorruptedObject)))
+            }
           }
-        }
-    }
+      }
+    catch
+      case NonFatal(err) => fail(err)
   }
 
   override def commit(state: CommitState, transactionId: TransactionId): Unit = {

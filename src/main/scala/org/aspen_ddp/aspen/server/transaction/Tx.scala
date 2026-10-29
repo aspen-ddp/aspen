@@ -176,6 +176,9 @@ class Tx( trs: TransactionRecoveryState,
 
     pendingObjectCommits = toCommit.size
 
+    // Assigned before the commit loop: a synchronous backend completes inside it
+    objectCommitErrors = uncommittable.toList
+
     toCommit.foreach { os =>
       val allocating = txd.allocatingObjects.contains(os.objectId)
       val form = UpdateForm.of(os.objectId, txd.requirements, ou, allocating)
@@ -183,8 +186,6 @@ class Tx( trs: TransactionRecoveryState,
 
       frontend.commit(os, cs, transactionId)
     }
-
-    objectCommitErrors = uncommittable.toList
 
     // Nothing was committed, so no commit completions will arrive to trigger the notification.
     // Without this the proposer never learns this store's outcome.
@@ -307,6 +308,11 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   def commitComplete(objectId: ObjectId, result: Either[Unit, CommitError.Value]): Unit = {
+    result match
+      case Right(err) =>
+        logger.error(s"Tx $transactionId. Store $storeId failed to commit object $objectId: $err")
+        objectCommitErrors = objectId :: objectCommitErrors
+      case Left(_) =>
     pendingObjectCommits -= 1
     if (pendingObjectCommits == 0)
       allObjectCommitsComplete()

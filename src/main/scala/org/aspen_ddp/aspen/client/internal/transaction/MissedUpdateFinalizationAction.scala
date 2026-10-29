@@ -46,10 +46,9 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   // allocationTree entry, which is the only other place those bytes are persisted, so
   // without this a repair pass cannot locate a deleted object's per-store state.
   //
-  // An empty value means "this object has no storePointer" -- but it is also what entries
-  // written before this change contain, and the two are indistinguishable. A repair pass
-  // must therefore treat an empty value as "delete by ObjectId alone" rather than as an
-  // error. See StoreRepairer.repairDeletion in aspen.server.repair.
+  // An empty value means "this object has no storePointer". A repair pass treats it as
+  // "delete by ObjectId alone" rather than as an error, which RocksDB stores still rely on.
+  // See StoreRepairer.repairDeletion in aspen.server.repair.
   def markMissedUpdates(): Unit = synchronized {
     // Build a map from ObjectId to ObjectPointer to recover pointers for ids in commitErrors
     val idToPointer = txd.allReferencedObjectsSet.map(ptr => ptr.id -> ptr).toMap

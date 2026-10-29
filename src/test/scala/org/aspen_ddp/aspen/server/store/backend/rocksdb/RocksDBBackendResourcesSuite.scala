@@ -1,6 +1,10 @@
 package org.aspen_ddp.aspen.server.store.backend.rocksdb
 
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend.ResourceConfig
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectId, ReadError}
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, Read}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -35,3 +39,22 @@ class RocksDBBackendResourcesSuite extends AnyFunSuite with Matchers:
   test("decodeDBValue rejects an unknown object type byte"):
     an [RocksDBBackend.CorruptedObjectEncoding] should be thrownBy
       RocksDBBackend.decodeDBValue(Array[Byte](7, 0, 0, 0, 0))
+
+  test("a read that fails in the database still completes"):
+    val dir = os.temp.dir()
+    try
+      val storeId = StoreId(PoolId(new java.util.UUID(0, 1)), 0)
+      val backend = new RocksDBBackend(dir, storeId, scala.concurrent.ExecutionContext.global)
+      val completed = scala.concurrent.Promise[Completion]()
+      backend.setCompletionHandler(new CompletionHandler:
+        override def complete(op: Completion): Unit = completed.trySuccess(op))
+      scala.concurrent.Await.result(backend.close(), scala.concurrent.duration.Duration(10, "s"))
+
+      val ptr = DataObjectPointer(ObjectId(new java.util.UUID(0, 2)), storeId.poolId, Array[Byte]())
+      backend.read(ptr)
+
+      scala.concurrent.Await.result(completed.future, scala.concurrent.duration.Duration(10, "s")) match
+        case r: Read => r.result should be(Right(ReadError.CorruptedObject))
+        case other => fail(s"Expected a Read, got $other")
+    finally
+      os.remove.all(dir)

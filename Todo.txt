@@ -3,15 +3,6 @@ TODO
 
 Follow-ups from the physical device move work (docs/superpowers/specs/2026-10-28-physical-device-move-design.md)
 
-Rebuild's final rename is not directory-synced
-  - Context: RebuildingStore.finish moves the staging directory to its final store path with os.move but does
-    not fsync the device directory. The transfer-in promotion in Host.scala does sync it
-    (DurableFiles.syncDirectory(devicePath)). If power is lost or the disk is pulled after a shutdown, the
-    rename can be lost. This fails safe: the device comes back with the staging dir, the adoption check finds
-    the Offline store missing its files, and the new host refuses the device. It still forces an operator to
-    restart the device on its original host instead of finishing the move.
-  - Recommended fix: call DurableFiles.syncDirectory(finalPath / os.up) right after the move in finish().
-
 Directory fsync assumes Linux
   - Context: DurableFiles.syncDirectory opens the directory with FileChannel READ and calls force(true). That
     works on Linux. It throws on Windows. On macOS it does not issue F_FULLFSYNC, so the data may not be

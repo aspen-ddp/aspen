@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import scribe.Logging
@@ -445,4 +445,7 @@ class RebuildingStore(client: AspenClient,
       RebuildState.removeAll(stagingPath)
 
       os.move(stagingPath, finalPath)
+      // Durable before the store is reported in place: a device shut down and moved after this
+      // must come back with the store at finalPath, or an adopting host refuses it.
+      DurableFiles.syncDirectory(finalPath / os.up)
       logger.info(s"Rebuild of $storeId: store in place at $finalPath")

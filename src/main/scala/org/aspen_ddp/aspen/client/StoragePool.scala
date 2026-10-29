@@ -4,8 +4,6 @@ import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.pool.PoolId
 
-import java.util.UUID
-
 trait StoragePool:
 
   val poolId: PoolId
@@ -32,6 +30,7 @@ trait StoragePool:
 
   private[aspen] def errorTree: TieredKeyValueList
   
-  private[aspen] def allocationStrategy: Option[UUID] = None
-  
-  private[aspen] def allocationStrategyConfig: Option[Array[Byte]] = None
+  /** Supplies ObjectPointers for objects allocated in this pool and is told of their deletion.
+    * Created on first use and cached.
+    */
+  private[aspen] def allocationStrategy: StoragePoolAllocationStrategy = StoragePoolAllocationStrategy.Default

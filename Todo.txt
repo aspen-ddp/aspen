@@ -1,19 +1,6 @@
 TODO
 ====
 
-Modify StoragePoolAllocationStrategy
-  - Currently the StoragePoolAllocationStrategy is created inside the PoolObjectAllocator, lets move this
-    to the StoragePool interface instead.
-    - change def allocationStrategy: Option[UUID] to def allocationStrategy[StoragePoolAllocationStrategy]
-      - Create the strategy on first use and cache the result rather than constructing it up-front
-  - Add the following method to StoragePoolAllocationStrategy
-    - def deleteObject(pointer: ObjectPointer)(using t: Transaction): Unit
-    - the Default object's deleteObject method should do nothing
-  - Whenever a transaction attempts to set the refcount for an object to zero, the deleteObject method
-    must be called. The expectation is that this method may add some finalization actions to the transaction
-  - Create a test to verify that a custom StoragePoolAllocationStrategy is created for a pool and that its
-    methods are called correctly during the allocation/deallocation process
-
 FixedSizeIndexedFile Store Backend
   A store backend that stores data in a flat file broken up into fixed-sized chunks that store the slice data
   along with its associated metadata.

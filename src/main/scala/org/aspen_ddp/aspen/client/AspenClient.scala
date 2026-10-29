@@ -106,6 +106,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                 storagePoolCache += poolId -> pool
               pool
 
+  /** Forgets the cached StoragePool so the next getStoragePool rereads the pool object */
+  private[aspen] def dropCachedStoragePool(poolId: PoolId): Unit = synchronized:
+    storagePoolCache -= poolId
+
   def getStoragePoolState(poolId: PoolId): Future[StoragePoolState] =
     given ExecutionContext = this.clientContext
     getStoragePoolPointer(poolId).flatMap: pointer =>

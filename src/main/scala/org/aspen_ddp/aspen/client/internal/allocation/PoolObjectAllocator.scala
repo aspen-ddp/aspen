@@ -12,19 +12,13 @@ class PoolObjectAllocator(val client: AspenClient,
 
   val allocatorId: ObjectAllocatorId = PoolObjectAllocatorId(pool.poolId)
   
-  private val allocationStrategy = pool.allocationStrategy match 
-    case None => StoragePoolAllocationStrategy.Default
-    case Some(uuid) => 
-      val factory = client.typeRegistry.getType[StoragePoolAllocationStrategy.Factory](uuid).get
-      factory.createStrategy(client, pool, pool.allocationStrategyConfig)
-  
   override def maxObjectSize: Option[Int] = pool.maxObjectSize
 
   override protected[client] def createDataObjectPointer()(using t: Transaction): Future[DataObjectPointer] =
-    allocationStrategy.createDataObjectPointer(pool.poolId)
+    pool.allocationStrategy.createDataObjectPointer(pool.poolId)
 
   override protected[client] def createKeyValueObjectPointer()(using t: Transaction): Future[KeyValueObjectPointer] = 
-    allocationStrategy.createKeyValueObjectPointer(pool.poolId)
+    pool.allocationStrategy.createKeyValueObjectPointer(pool.poolId)
     
 
   

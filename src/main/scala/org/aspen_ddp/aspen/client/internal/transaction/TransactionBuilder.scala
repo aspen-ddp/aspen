@@ -39,6 +39,7 @@ class TransactionBuilder(
   private  var requirements = List[TransactionRequirement]()
 
   private  var refcountUpdates = Set[ObjectPointer]()
+  private  var deletingObjects = List[ObjectPointer]() // Objects whose refcount is being set to zero
   private  var updatingObjects = Set[ObjectPointer]() // Tracks UUIDs of all objects being modified
   private  var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects
   private  var dataObjectUpdates = Map[ObjectPointer, DataBuffer]()
@@ -318,9 +319,14 @@ class TransactionBuilder(
     refcountUpdates += objectPointer
     requirements  = RefcountUpdate(objectPointer, requiredRefcount, refcount) :: requirements
 
-    if (refcount.count == 0)
+    if (refcount.count == 0) {
+      deletingObjects = objectPointer :: deletingObjects
       finalizationActions = DeletionFinalizationAction.createSerializedFA(objectPointer) :: finalizationActions
+    }
   }
+
+  /** Objects whose refcount this transaction sets to zero, in the order they were added */
+  def deletedObjects: List[ObjectPointer] = synchronized { deletingObjects.reverse }
 
   def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
     //println(s"   TXB BumpVersion txid $transactionUUID object ${objectPointer.uuid}")

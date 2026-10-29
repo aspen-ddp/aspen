@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AbortAfterCommit, AppendPosition, AspenClient, PostCommitTransactionModification, RangedWrite, RangedWriteState, Transaction, TransactionAborted}
+import org.aspen_ddp.aspen.client.{AbortAfterCommit, AppendPosition, AspenClient, PostCommitTransactionModification, RangedWrite, RangedWriteState, StoragePool, Transaction, TransactionAborted}
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
@@ -32,16 +32,17 @@ class TransactionImpl(val client: AspenClient,
   private  val bldr = new TransactionBuilder(id, chooseDesignatedLeader, client.clientId)
   private  var commitStarted = false
   private  var havePendingUpdates = false
+  private  var runningCommitHooks = false // Permits modification by allocation strategies after commit()
 
   private  val stack = org.aspen_ddp.aspen.common.util.getStack // for debugging
 
   def isEmpty: Boolean = synchronized { !havePendingUpdates }
 
   /** Runs `f` against the builder while holding the monitor. Once commit() has been called the
-    *  builder is frozen; it is read without the monitor while the transaction is built.
+    *  builder is frozen, except to the commit hooks; it is read without the monitor while the transaction is built.
     */
   private def modify[T](f: TransactionBuilder => T): T = synchronized {
-    if commitStarted then
+    if commitStarted && !runningCommitHooks then
       throw PostCommitTransactionModification()
     f(bldr)
   }
@@ -137,6 +138,37 @@ class TransactionImpl(val client: AspenClient,
 
   def result: Future[HLCTimestamp] = promise.future
 
+  /** Adds any pools referenced by the builder that are missing from `known` */
+  private def resolvePools(known: Map[PoolId, StoragePool])(using ExecutionContext): Future[Map[PoolId, StoragePool]] =
+    val missing = bldr.allReferencedPoolIds -- known.keySet
+    if missing.isEmpty then
+      Future.successful(known)
+    else
+      Future.sequence(missing.toList.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool)))
+        .map(known ++ _)
+
+  /** Tells each deleted object's allocation strategy of the deletion, then resolves every referenced pool.
+    *
+    *  The strategies may add to the transaction, including further deletions and objects in pools not yet
+    *  resolved, so this repeats until a pass adds neither. The monitor is held while they run, so the caller
+    *  cannot slip in modifications after commit().
+    */
+  private def runCommitHooks(pools: Map[PoolId, StoragePool],
+                             notified: Set[ObjectPointer])(using ExecutionContext): Future[Map[PoolId, StoragePool]] =
+    resolvePools(pools).flatMap: pools =>
+      val pending = bldr.deletedObjects.filterNot(notified.contains)
+      if pending.isEmpty then
+        Future.successful(pools)
+      else
+        synchronized {
+          runningCommitHooks = true
+          try
+            pending.foreach(ptr => pools(ptr.poolId).allocationStrategy.deleteObject(ptr)(using this))
+          finally
+            runningCommitHooks = false
+        }
+        runCommitHooks(pools, notified ++ pending)
+
   /** Begins the transaction commit process and returns a Future to its completion. This is the same future as
     *  returned by 'result'
     *
@@ -153,11 +185,7 @@ class TransactionImpl(val client: AspenClient,
         // Completely empty transactions succeed immediately
         promise.success(HLCTimestamp.now)
       } else
-        val poolIds = bldr.allReferencedPoolIds
-
-        val poolsFuture = Future.sequence(
-          poolIds.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool))
-        ).map(_.toMap)
+        val poolsFuture = runCommitHooks(Map.empty, Set.empty)
 
         poolsFuture.failed.foreach { cause =>
           promise.tryFailure(cause)

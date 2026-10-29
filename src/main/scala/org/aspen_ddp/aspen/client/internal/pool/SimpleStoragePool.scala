@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.pool
 
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, PoolObjectAllocatorId, StoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ObjectAllocator, PoolObjectAllocatorId, StoragePool, StoragePoolAllocationStrategy}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.metadata.StoragePoolState
 import org.aspen_ddp.aspen.common.objects.KeyValueObjectPointer
@@ -41,6 +41,12 @@ class SimpleStoragePool(val client: AspenClient,
     byte2uuid(vs.value.bytes)
     
   private val allocStrategyConfig: Option[Array[Byte]] = kvos.contents.get(StoragePoolState.AllocationStrategyConfigKey).map(_.value.bytes)
+
+  override private[aspen] lazy val allocationStrategy: StoragePoolAllocationStrategy = allocStrategy match
+    case None => StoragePoolAllocationStrategy.Default
+    case Some(uuid) =>
+      val factory = client.typeRegistry.getType[StoragePoolAllocationStrategy.Factory](uuid).get
+      factory.createStrategy(client, this, allocStrategyConfig)
   
   override def allocator: ObjectAllocator =
     client.getCachedAllocator(PoolObjectAllocatorId(poolId)) match
@@ -50,6 +56,3 @@ class SimpleStoragePool(val client: AspenClient,
         client.cacheAllocator(allocator)
         allocator
 
-  override private[aspen] def allocationStrategy: Option[UUID] = allocStrategy
-
-  override private[aspen] def allocationStrategyConfig: Option[Array[Byte]] = allocStrategyConfig

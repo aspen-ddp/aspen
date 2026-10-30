@@ -95,6 +95,11 @@ class Frontend(val storeId: StoreId,
   def backendOperationComplete(completion: Completion): Unit = completion match {
     case r: Read => backendReadComplete(r.objectId, r.result)
     case c: Commit =>
+      // commit() cached the new state before the backend stored it. The backend refused it, so the cache must not
+      // serve it: reads would return state the store does not hold, and readObjectForRepair would see a repair as
+      // already applied. Evicting a newer cached state too only costs a backend read.
+      if c.result.isRight then
+        objectCache.remove(c.objectId)
       transactions.get(c.transactionId).foreach { tx =>
         tx.commitComplete(c.objectId, c.result)
       }

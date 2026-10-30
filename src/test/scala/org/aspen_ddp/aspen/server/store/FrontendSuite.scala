@@ -290,4 +290,29 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       case Some(c: TxCommitted) => c.objectCommitErrors shouldBe List(oid1)
       case other => throw new AssertionError(s"Expected TxCommitted, got $other")
   }
+
+  test("a backend commit error evicts the state the commit cached") {
+    for err <- List(CommitError.InvalidPointer, CommitError.ObjectMismatch, CommitError.SliceTooLarge,
+                    CommitError.IOFailure) do
+      var handler: Option[CompletionHandler] = None
+      val backend = new MapBackend(storeId):
+        override def setCompletionHandler(h: CompletionHandler): Unit =
+          handler = Some(h)
+          super.setCompletionHandler(h)
+        override def commit(state: CommitState, transactionId: TransactionId): Unit =
+          handler.foreach(_.complete(Commit(storeId, state.objectId, transactionId, Right(err))))
+      val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+      val frontend = new Frontend(storeId, backend, cache, new TestNet, new TestCrl, new TransactionStatusCache())
+      backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+      val os = mkObjectState(oid1)
+      backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+
+      val txd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
+      val prepare = mkPrepare(txd, fromClient = true).copy(objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))))
+      frontend.receiveTransactionMessage(prepare)
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+
+      withClue(s"$err: ")(cache.get(oid1) shouldBe None)
+  }
 }

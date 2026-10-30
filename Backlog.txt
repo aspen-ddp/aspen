@@ -1,6 +1,18 @@
 Backlog
 =======
 
+StoreRepairer leaves missed-update (errorTree) entries behind after a successful repair
+  - Found during the FSIF integration test. Pre-existing and not FSIF-related.
+  - The delete at StoreRepairer.scala:140-146 is guarded by TimestampLessThan(key, os.timestamp), which fails only
+    when entry.ts < os.timestamp (RequirementsChecker.scala:266-270). So once the object is updated again after the
+    entry was written, the entry is never cleared, even when the repair brings the store fully current. This is
+    likely under append-heavy workloads, where a store that missed one update goes on to apply later ones.
+  - The guard's semantics also look inverted relative to its own doc comment: the comment says to keep the entry when
+    a new miss lands after the read, but the check passes in exactly that case (entry newer than the object).
+  - StoreRepairerSuite's "repaired and the entry removed" test passes only because it seeds the entry after the
+    object's last update.
+  - Decide the intended rule, fix the guard, and add tests for an object updated after its entry was written.
+
 Follow-up to the DataObject TKVL: a RandomAccessReedSolomon-specialized, append-based DataObject node
 encoding. Rather than a full overwrite on every kv insert/delete, append operations insert kv pairs
 and tombstones until the object is full. If compaction frees up enough space, the object can be

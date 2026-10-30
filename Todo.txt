@@ -1,6 +1,22 @@
 TODO
 ====
 
+Transactions spanning objects in more than one StoragePool always abort
+  - Found while writing the FSIF integration test. Pre-existing since the initial import; no existing test covered it
+    because every allocating test uses the bootstrap pool.
+  - Cause: Frontend.scala:88-90 builds each Tx with only txd.allHostedObjects(storeId), which TransactionDescription
+    (:92) filters to the store's own pool. Tx.scala:114 then passes the full txd.requirements to
+    RequirementsChecker.check, whose getState (RequirementsChecker.scala:31) throws MissingObject for any object not
+    loaded. Tx.scala:124 votes abort whenever that list is non-empty, so every store votes abort on a requirement for
+    an object in another pool.
+  - This breaks the core pattern of allocating in one pool and storing the pointer in an object in another (e.g. the
+    radicle or a TKVL node in a different pool).
+  - Needs a design decision: only the primary pool's stores take part in Paxos, so decide which stores check which
+    requirements (e.g. each store checks only the requirements for objects it hosts) and confirm the commit/abort
+    decision stays correct.
+  - Add tests that allocate in a non-bootstrap pool and link the pointer from an object in another pool. Once fixed,
+    FsifIntegrationSuite can link its objects from the radicle instead of relying on the allocation tree.
+
 FixedSizeIndexedFile Store Backend
   A store backend that stores data in a flat file broken up into fixed-sized chunks that store the slice data
   along with its associated metadata.

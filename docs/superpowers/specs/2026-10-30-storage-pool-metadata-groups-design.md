@@ -124,9 +124,13 @@ pool is created (tree splits allocate from whatever the group contains *at split
   group is `ExactMatch` with the bootstrap IDA and that same `maxSliceSize` (group rules require `ExactMatch` for a
   limit, and an unlimited group would reject a limited member). Otherwise it is unlimited; whether it is then
   `ExactMatch` on the bootstrap IDA or `AllowAll` is the builder's choice.
-- Child groups of a metadata group must also be metadata groups.
-- A metadata group may be nested inside an ordinary group. Membership of an ordinary group never decides where any
-  pool's metadata trees go.
+- Membership is symmetric: a pool or child group may join a group only when its metadata flag equals the group's
+  (`MetadataMembershipMismatch`). A metadata group therefore cannot be nested inside an ordinary group, nor the
+  reverse.
+- The default group's limit follows the bootstrap pool's `effectiveMaxSliceSize` (not the bare `maxSliceSize`):
+  `ExactMatch` plus that limit when limited, `AllowAll` otherwise.
+- The metadata group's location needs no recording in pool state: the encoded `Root` node allocator of each tree
+  already names the group.
 - The initial metadata pool's `maximumStoreSize` matches the bootstrap pool's.
 
 ## Left to the builder

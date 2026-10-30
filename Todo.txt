@@ -1,19 +1,6 @@
 TODO
 ====
 
-StoragePool metadata management changes:
-  Currently metadata is stored in the bootstrap pool. For large systems, this could be overwhelming. Lets change
-  the system such that an "aspen-default-storage-pool-metadata" AllocationGroup is created as part of the Bootstrap
-  process. Create an "aspen-initial-storage-pool-metadata" StoragePool with its metadata stored in the bootstrap pool
-  and add the new pool to the AllocationGroup. Add a DefaultStoragePoolMetadataAllocator to the Radicle and set it
-  to the UUID of the AllocationGroup. During StoragePool creation, if an explicit allocation group UUID is not
-  supplied, use the default allocation group UUID for allocating ErrorTrees, AllocationTrees, and AllocationStrategy
-  objects. Update the StoragePool creation method and cli to optionally accept an AllocationGroup UUID.
-  - Can update the ErrorTree handling logic to only skip missed transaction handling finalization action if the
-    TKVL node being modified is on the same pool the scan is being done for. If it is on a separate pool, no
-    infinite loop can occur so there is no reason to disable the finalization action. This should ensure that
-    only the bootstrap pool needs to disable missed transaction finalization actions on most systems.
-
 FixedSizedIndexFileAllocationStrategy
   - Use a KeyValue object to hold segments of an allocated indicies bitmap
     - 100Gib of 1Mib segments is 102400 indicies - 12k allocation bitmap

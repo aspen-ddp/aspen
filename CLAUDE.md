@@ -27,6 +27,17 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     with `IDAPolicy.ExactMatch`, is a floor: members must have no limit or one at least as large, and an unlimited
     group accepts only unlimited members
   - `maxSliceSize` is the source of truth for pools and groups; every `maxObjectSize` is derived from it and the IDA
+  - Metadata layout: an ordinary pool's ErrorTree/AllocationTree live in a metadata pool reached through a metadata
+    group; metadata pools' trees live in the bootstrap pool; the bootstrap pool's live in itself. All pool state
+    objects stay in the bootstrap pool
+  - `StoragePoolState.isMetadataPool` / `AllocationGroupState.isMetadataGroup` are fixed at creation. A pool or child
+    group may join a group only when its flag equals the group's (`MetadataMembershipMismatch`)
+  - Bootstrap creates `aspen-initial-storage-pool-metadata` and `aspen-default-storage-pool-metadata`; the group id is
+    in the Radicle (`DefaultStoragePoolMetadataAllocator`, `AspenClient.getDefaultMetadataGroupId`).
+    `createNewStoragePool(..., metadataGroup)` defaults to it; `createNewMetadataPool` and CLI `create-metadata-pool`,
+    `create-pool --metadata-group`, `create-allocation-group --metadata` build on it
+  - `MissedUpdateFinalizationAction` disables missed-update tracking on an ErrorTree write only when the transaction
+    references the pool the entry is about (in practice the bootstrap pool)
 - **Information Dispersal Algorithm (IDA)**:
   - Defines the replication/erasure-coding strategy used to provide robustness against data loss
   - Currently Replication, ReedSolomon and RandomAccessReedSolomon are supported

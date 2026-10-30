@@ -17,86 +17,25 @@ Transactions spanning objects in more than one StoragePool always abort
   - Add tests that allocate in a non-bootstrap pool and link the pointer from an object in another pool. Once fixed,
     FsifIntegrationSuite can link its objects from the radicle instead of relying on the allocation tree.
 
-FixedSizeIndexedFile Store Backend
-  A store backend that stores data in a flat file broken up into fixed-sized chunks that store the slice data
-  along with its associated metadata.
-  - place in store.backend.fsif package
-  - Two creation-time options:
-    - Segment size
-    - Number of segments
-  - At time of creation, the user will supply the desired IDA and maximum object size. The backend needs to
-    be configured with a segment size. This must be obtained by calling the IDA's minSliceSizeFor method as
-    IDAs often require padding bytes that will extend the required slice size slightly to accommodate those
-    extra bytes.
-  - Files:
-    - data
-    - index map
-    - journal
-  - Data
-    - Segmented into chunks of: <fixed-size-header><slice-data>
-    - Header
-      - 1-byte object type. KeyValue vs Data object
-      - 4-byte external index for validating that we read the right slice (compaction moves these around)
-      - 4-byte slice length
-      - 4-byte CRC32 to detect data corruption
-      - Serialized Metadata (revision,timestamp,refcount)
-    - Always read the full segment size then use 4-byte length in the header to drop the excess data
-      - For smaller objects, it may make sense to allocate a new, smaller array and copy the data over to
-        save RAM
-      - At some point the cost of the allocation + copy exceeds the benefit though and we should just keep
-        the array that has some wasted space.
-  - Journal
-    - Begins with an 8-byte sequence number
-    - Contains log of all external-index=internal-index made since index-map was written
-    - Updated in write batches. While a flush is pending, buffer changes
-    - When write finishes, complete batch promise
-    - Uses an a/b mechanism to close an old journal and start a new one
-      - start with journal.a file when it is closed switch to journal.b
-      - Instead of deleting journal.a, instead truncate it but retain the initial 8 byte sequence number
-      - At startup, the sequence number can be used to determine which journal file is active
-  - index map
-    - binary array: index into the array is the external index. value is the internal index. -1 means unassigned
-    - Uses the same a/b file handling mechanism as the journal
-      - file content is: <sequence-number><4-byte-CRC32><index-map-array>
-      - On load of the index map file
-        - If the file size isn't exactly the calculated size it should be, ignore it. It means we crashed while
-          in the process of creating the new index map file.
-          - Truncate the failed index map file
-          - Truncate the associated journal file
-          - Use the old index map and journal. They still contain perfectly valid content
-        - If the CRC validation check fails, the store is permanently lost. Throw an exception so the host can
-          initiate the rebuild process for this store
-    - Updated periodically
-      - When compactions and commits complete, check the length of the journal. If it exceeds 50% of the size of
-        the index map file, create a new index map
-        - Increment the serial number shared by the index map file and the journal file
-        - Copy the in-memory index map array and tell the journal to write all future journal entries to *both*
-          journal files (new journal file uses the updated serial number)
-        - In a background thread, write the new index map file with the new serial number and flush it.
-        - When the index map write completes:
-          - Tell the journal to truncate the old journal file. All subsequent writes to to just the new file
-          - Truncate the old index map file
-  - Compaction
-    - When segments earlier in the file are deallocated, we can reduce the size of the file by moving the segment
-      at the end of the file into that deallocated segment and then truncating the file. However, we must be
-      very careful to avoid race conditions while this is done.
-      - If the segment to be moved is currently being written, we must wait for that write to complete before
-        beginning the move operation
-      - If a segment is being moved, we must wait for that move to complete before writing an update to the
-        segment (which will go to the new location)
-      - Starting a compaction operation must be atomic with respect to allocating a segment. That is to say that
-        a write to an external index who's internal index is -1 (meaning that segment isn't being used) must not
-        choose the internal index that is being compacted.
-  - Backend Operation
-    - The Backend's interface methods run in the same thread that calls them. These methods plan I/O operations
-      but the actual reads and writes to files should occur on a pool of background I/O threads with Futures to
-      their completion. Multiple Backends should be able to share the same pool of threads.
-    - When operations complete, such as commits, reads, & compactions, they may take the opportunity to trigger
-      the next compaction operation if one isn't currently outstanding. This allows compaction to be driven
-      passively without the need for a dedicated thread. One compaction completion triggers the next and when
-      no more compactions are possible, the process ends. The first commit or read to a freshly booted backend
-      may trigger a compaction operation if any are possible and resumes the compaction process that failed to
-      complete before the backend shut down.
+StoreRepairer leaves missed-update (errorTree) entries behind after a successful repair
+  - Found during the FSIF integration test. Pre-existing and not FSIF-related.
+  - The delete at StoreRepairer.scala:140-146 is guarded by TimestampLessThan(key, os.timestamp), which fails only
+    when entry.ts < os.timestamp (RequirementsChecker.scala:266-270). So once the object is updated again after the
+    entry was written, the entry is never cleared, even when the repair brings the store fully current. This is
+    likely under append-heavy workloads, where a store that missed one update goes on to apply later ones.
+  - The guard's semantics also look inverted relative to its own doc comment: the comment says to keep the entry when
+    a new miss lands after the read, but the check passes in exactly that case (entry newer than the object).
+  - StoreRepairerSuite's "repaired and the entry removed" test passes only because it seeds the entry after the
+    object's last update.
+  - Decide the intended rule, fix the guard, and add tests for an object updated after its entry was written.
+  - The intended context here is that the repair operation executes while live operations are being carried out. A
+    repair operation may be started and the object will be restored with a timestamp of time t. When the repairer goes
+    to delete the entry from the repair tree, it can only do so if the timestamp of the error tree entry is less than
+    or equal to the timestamp of the repaired slice t. If an update to the object completed between the beginning of the
+    repair operation its completion, the timestamp in the repair tree would be greater than that of the repaired object.
+    That would mean that the repair operation restored the object to a less-then-current state and a new repair
+    operation is needed. A repair operation can only delete an entry from the repair tree if the timestamp of the
+    repaired object is equal to or greater than the timestamp of the repair tree entry.
 
 FixedSizedIndexFileAllocationStrategy
   - Use a KeyValue object to hold segments of an allocated indicies bitmap

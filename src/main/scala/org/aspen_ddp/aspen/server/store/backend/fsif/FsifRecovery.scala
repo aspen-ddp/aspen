@@ -27,6 +27,12 @@ object FsifRecovery:
   /** Every FSIF file of a store directory, indexes first */
   val AllFiles: Vector[String] = IndexFiles ++ JournalFiles :+ DataFile
 
+  /** `load` reads a file whole into one array, so a larger index or journal loses the store (StoreLost). No file the
+    * backend produces is larger: an index is at most IndexFile.sizeFor(FsifLayout.MaxSegmentCount), and a journal at
+    * most FsifBackend.journalLengthBound (FsifTuning.journalHardLimit).
+    */
+  val MaxLoadSize: Long = Int.MaxValue - 16L
+
   /** Every FSIF file is absent or zero-length: nothing in the directory can hold an object, so initializing it loses
     * nothing (FsifBackend.open of a directory without the marker)
     */
@@ -102,7 +108,7 @@ object FsifRecovery:
     else
       withFile(files, name): f =>
         val size = f.size
-        if size > Int.MaxValue - 16 then
+        if size > MaxLoadSize then
           throw new StoreLost(s"$name is too large to load ($size bytes)")
         f.force()
         Some(f.read(0, size.toInt))

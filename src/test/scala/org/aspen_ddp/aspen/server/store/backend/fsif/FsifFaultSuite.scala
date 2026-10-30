@@ -22,7 +22,7 @@ import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitStat
   Read, UpdateForm}
 
 class FsifFaultSuite extends FileBasedTests:
-  import FsifBackendSuite.{GateEc, InlineEc, ShuffleEc, isInPlace}
+  import FsifBackendSuite.{GateEc, InlineEc, ShuffleEc, isInPlace, isKind}
   import FsifFaultSuite.*
 
   private val layout = FsifLayout(1024, 64)
@@ -651,6 +651,231 @@ class FsifFaultSuite extends FileBasedTests:
     FsifIo.isOutOfSpace(new IOException("write failed", new IOException("EDQUOT"))) shouldBe true
     FsifIo.isOutOfSpace(new IOException("DISK QUOTA EXCEEDED")) shouldBe true
     FsifIo.isOutOfSpace(new IOException("Input/output error")) shouldBe false
+
+  // ---- Journal hard limit ----
+
+  private def journalSizes(h: Harness): List[Long] = FsifRecovery.JournalFiles.toList.map(h.files.size)
+
+  test("with data writes frozen, commits past journalHardLimit are held, not failed, and complete once it clears"):
+    val limit = 2048L
+    val h = new Harness(tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
+    val bound = FsifBackend.journalLengthBound(layout, FsifTuning(journalHardLimit = limit))
+    val ps = (1 to 3).map(x => ptr(x, oid(x)))
+    var v1 = bytes(100, 1)
+    val v2 = bytes(50, 2)
+    h.commitOk(alloc(ps(0), v1, 1))
+    h.commitOk(alloc(ps(1), v2, 1))
+    h.commitOk(alloc(ps(2), bytes(30, 3), 1))
+    h.quiesce()
+    val full = new AtomicBoolean(true)
+    h.files.failWhile(Fault.OutOfSpace, isData)(full.get)
+    // Journaled 8-byte write ranges are acknowledged (their bytes are in the journal) until the limit is reached
+    val writes = mutable.ArrayBuffer[(Future[CommitResult], Array[Byte])]()
+    for rev <- 2 until 40 do
+      val next = patched(v1, rev % 90, bytes(8, rev))
+      writes += ((h.issueCommit(writeRange(ps(0), v1, rev % 90, bytes(8, rev), rev)), next))
+      v1 = next
+    h.backend.isWriteFrozen shouldBe true
+    val ackedWrites = writes.takeWhile((f, _) => acked(f))
+    ackedWrites.size should be > 0
+    ackedWrites.size should be < writes.size
+    // Held in order: nothing after the first held commit is acknowledged
+    writes.drop(ackedWrites.size).foreach((f, _) => f.isCompleted shouldBe false)
+    // A delete and a copy-on-write overwrite are held behind them too
+    val del = h.issueCommit(delete(ps(1), 2))
+    val v3 = bytes(400, 4)
+    val cow = h.issueCommit(overwrite(ps(2), v3, 2))
+    for _ <- 0 until 5 do h.tick()
+    del.isCompleted shouldBe false
+    cow.isCompleted shouldBe false
+    writes.drop(ackedWrites.size).foreach((f, _) => f.isCompleted shouldBe false)
+    val (held, _) = h.await(h.backend.capState)
+    held shouldBe (writes.size - ackedWrites.size + 2)
+    h.backend.journalSeq shouldBe 0 // frozen: no checkpoint has run
+    all(journalSizes(h)) should be <= limit
+    // Reads still work, and see only what was admitted
+    h.readData(ps(0)) shouldBe ackedWrites.last._2.toList
+    h.readData(ps(1)) shouldBe v2.toList
+    h.fatals.isEmpty shouldBe true
+
+    full.set(false)
+    for (f, _) <- writes do h.await(f) shouldBe Left(())
+    h.await(del) shouldBe Left(())
+    h.await(cow) shouldBe Left(())
+    h.quiesce()
+    h.backend.isWriteFrozen shouldBe false
+    h.backend.journalSeq should be >= 1L
+    h.await(h.backend.capState) shouldBe ((0, 0L))
+    all(journalSizes(h)) should be <= bound
+    h.fatals.isEmpty shouldBe true
+    h.readData(ps(0)) shouldBe v1.toList
+    h.readOpt(ps(1)) shouldBe None
+    h.readData(ps(2)) shouldBe v3.toList
+    h.crash()
+    h.readData(ps(0)) shouldBe v1.toList
+    h.readOpt(ps(1)) shouldBe None
+    h.readData(ps(2)) shouldBe v3.toList
+
+  test("a crash while commits are held by journalHardLimit keeps every acknowledged write"):
+    val limit = 1500L
+    val h = new Harness(tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
+    val p = ptr(1, oid(1))
+    var v = bytes(200, 1)
+    h.commitOk(alloc(p, v, 1))
+    h.quiesce()
+    h.files.failWhile(Fault.OutOfSpace, isData)(true)
+    val writes = (2 until 30).map: rev =>
+      val next = patched(v, rev * 5, bytes(4, rev))
+      val f = h.issueCommit(writeRange(p, v, rev * 5, bytes(4, rev), rev))
+      v = next
+      (f, next)
+    val ackedWrites = writes.takeWhile((f, _) => acked(f))
+    ackedWrites.size should be > 0
+    ackedWrites.size should be < writes.size
+    all(journalSizes(h)) should be <= limit
+    h.crash()
+    // Every acknowledged write survives; a held one never reached the journal
+    h.readData(p) shouldBe ackedWrites.last._2.toList
+    h.fatals.isEmpty shouldBe true
+
+  test("commits past journalHardLimit are held while not frozen too, until a checkpoint switches journals"):
+    val gate = new GateEc(isKind(FsifBackend.IoKind.Checkpoint))
+    val limit = 1500L
+    val h = new Harness(mkIo = () => gate,
+      tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
+    val p = ptr(1, oid(1))
+    var v = bytes(200, 1)
+    h.commitOk(alloc(p, v, 1))
+    val writes = (2 until 40).map: rev =>
+      val next = patched(v, rev * 4, bytes(4, rev))
+      val f = h.issueCommit(writeRange(p, v, rev * 4, bytes(4, rev), rev))
+      v = next
+      (f, next)
+    // The limit started a checkpoint, whose header write is gated: commits fill the next journal's switch buffer up
+    // to the limit, then are held
+    h.backend.isWriteFrozen shouldBe false
+    h.backend.checkpointRunning shouldBe true
+    gate.heldCount should be > 0
+    val (held, _) = h.await(h.backend.capState)
+    held should be > 0
+    writes.takeRight(held).foreach((f, _) => f.isCompleted shouldBe false)
+    all(journalSizes(h)) should be <= limit
+    gate.release()
+    for (f, _) <- writes do h.await(f) shouldBe Left(())
+    h.quiesce()
+    h.backend.journalSeq should be >= 1L
+    h.await(h.backend.capState) shouldBe ((0, 0L))
+    all(journalSizes(h)) should be <= limit
+    h.readData(p) shouldBe v.toList
+    h.crash()
+    h.readData(p) shouldBe v.toList
+    h.fatals.isEmpty shouldBe true
+
+  test("a fail-stop fails the commits held by journalHardLimit with IOFailure"):
+    val limit = 1500L
+    val h = new Harness(tuning = FsifTuning(cowThreshold = 256, enospcRetry = retry, journalHardLimit = limit))
+    val p = ptr(1, oid(1))
+    var v = bytes(200, 1)
+    h.commitOk(alloc(p, v, 1))
+    h.quiesce()
+    val full = new AtomicBoolean(true)
+    h.files.failWhile(Fault.OutOfSpace, isData)(full.get)
+    val writes = (2 until 30).map: rev =>
+      val f = h.issueCommit(writeRange(p, v, rev * 5, bytes(4, rev), rev))
+      v = patched(v, rev * 5, bytes(4, rev))
+      f
+    val held = writes.dropWhile(acked)
+    held.size should be > 0
+    // The held retry of the in-place write now fails with an I/O error: fail-stop
+    full.set(false)
+    h.files.failWhile(Fault.IoError, isData)(true)
+    h.tick()
+    h.fatals.size shouldBe 1
+    for f <- held do h.await(f) shouldBe Right(CommitError.IOFailure)
+    h.await(h.backend.capState) shouldBe ((0, 0L))
+
+  test("a write range whose spans would encode larger than the slice is journaled as the whole slice"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    val v = bytes(800, 1)
+    h.commitOk(alloc(p, v, 1))
+    h.quiesce()
+    val before = h.files.size(FsifRecovery.JournalFiles(0))
+    // 400 one-byte spans: 400 * (8 + 1) bytes as ranges, 8 + 800 as the whole slice
+    val spans = (0 until 400).map(i => (i * 2, 1)).toList
+    val next = Array.tabulate[Byte](800)(j => if j % 2 == 0 then (v(j) + 1).toByte else v(j))
+    h.commitOk(CommitState(p, md(2), ObjectType.Data, DataBuffer(next), form = UpdateForm.Ranges(800, spans)))
+    h.files.size(FsifRecovery.JournalFiles(0)) - before shouldBe
+      JournalFormat.BatchOverhead + JournalFormat.DeltaRecordOverhead + JournalFormat.RangeOverhead + 800
+    h.readData(p) shouldBe next.toList
+    h.crash()
+    h.readData(p) shouldBe next.toList
+
+  test("random ENOSPC windows under a small journalHardLimit: the journal stays bounded and every commit lands"):
+    var heldSeeds = 0
+    for seed <- 0 until 20 do
+      withClue(s"seed=$seed"):
+        val r = rng(seed + 7000)
+        val limit = 700L + r.nextInt(1500)
+        val tuning = FsifTuning(cowThreshold = 256, journalBound = 4096, enospcRetry = retry, journalHardLimit = limit)
+        val bound = FsifBackend.journalLengthBound(layout, tuning)
+        val h = new Harness(seed, mkIo = () => new ShuffleEc(r), tuning = tuning)
+        val io = h.io.asInstanceOf[ShuffleEc]
+        val n = 6
+        val ps = (0 until n).map(x => ptr(x, oid(x + 1)))
+        val last = Array.fill[Option[Array[Byte]]](n)(None)
+        val commits = mutable.ArrayBuffer[Future[CommitResult]]()
+        val windows = mutable.ArrayBuffer[AtomicBoolean]()
+        var sawHeld = false
+        var rev = 1
+        for i <- 0 until 80 do
+          r.nextInt(12) match
+            case 0 =>
+              val w = new AtomicBoolean(true)
+              windows += w
+              val name = if r.nextInt(3) == 0 then FsifRecovery.JournalFiles(r.nextInt(2)) else FsifRecovery.DataFile
+              h.files.failWhile(Fault.OutOfSpace, _ == name)(w.get)
+            case 1 if windows.nonEmpty =>
+              windows.remove(r.nextInt(windows.size)).set(false)
+            case 2 =>
+              h.tick()
+            case _ =>
+              val x = r.nextInt(n)
+              rev += 1
+              val (cs, next) = last(x) match
+                case None =>
+                  val v = bytes(r.nextInt(500), rev)
+                  (alloc(ps(x), v, rev), Some(v))
+                case Some(old) =>
+                  r.nextInt(4) match
+                    case 0 if old.length > 0 =>
+                      val off = r.nextInt(old.length)
+                      val patch = bytes(1 + r.nextInt(math.min(16, old.length - off)), rev)
+                      (writeRange(ps(x), old, off, patch, rev), Some(patched(old, off, patch)))
+                    case 1 =>
+                      (delete(ps(x), rev), None)
+                    case _ =>
+                      val v = bytes(r.nextInt(500), rev) // over 256 bytes goes copy-on-write
+                      (overwrite(ps(x), v, rev), Some(v))
+              commits += h.issueCommit(cs)
+              last(x) = next
+          for _ <- 0 until r.nextInt(8) do io.runOne()
+          all(journalSizes(h)) should be <= bound
+          if i % 8 == 0 && h.await(h.backend.capState)._1 > 0 then sawHeld = true
+        if sawHeld then heldSeeds += 1
+        windows.foreach(_.set(false))
+        h.quiesce()
+        h.fatals.isEmpty shouldBe true
+        h.await(h.backend.capState) shouldBe ((0, 0L))
+        for (f, i) <- commits.zipWithIndex do
+          withClue(s"commit=$i"):
+            f.value.map(_.get) shouldBe Some(Left(()))
+        all(journalSizes(h)) should be <= bound
+        h.crash()
+        for x <- 0 until n do withClue(s"ext=$x after crash"):
+          h.readOpt(ps(x)) shouldBe last(x).map(_.toList)
+    info(s"seeds that held commits at the journal hard limit: $heldSeeds")
+    heldSeeds should be >= 5
 
   // ---- Seeded ----
 

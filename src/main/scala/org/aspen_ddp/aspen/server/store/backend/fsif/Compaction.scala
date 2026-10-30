@@ -64,7 +64,7 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
       move.foreach(finishIfDone)
     else if !host.frozen then
       move.foreach(m => pump(m))
-      if truncate() && move.isEmpty then
+      if truncate() && move.isEmpty && host.journalHasRoomForMove then
         start()
 
   /** X's occupant is about to change (copy-on-write, delete, re-allocation, rebuild): a move of X that has not yet
@@ -296,6 +296,8 @@ private[fsif] object Compaction:
     def failStop(t: Throwable): Unit
     /** Writes are frozen by ENOSPC: start nothing new */
     def frozen: Boolean
+    /** The active journal has room for one more move's Mapping under the hard limit, and nothing is held by it */
+    def journalHasRoomForMove: Boolean
     /** Forces `data` (one force at a time); `done` runs once a force issued after the call completes */
     def forceData(kind: FsifBackend.IoKind)(done: Try[Unit] => Unit): Unit
     /** Bumped by every data force that fails with ENOSPC */

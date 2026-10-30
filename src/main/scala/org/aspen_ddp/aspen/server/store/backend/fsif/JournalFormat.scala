@@ -64,12 +64,19 @@ object JournalFormat:
   /** Bytes a batch adds beyond its records: len(4) + batchNo(8) + crc(4) */
   val BatchOverhead = 16
 
+  /** Encoded size of a Mapping record, len prefix included */
+  val MappingRecordSize = 4 + 1 + 24
+  /** Encoded size of a Delta record with no ranges, len prefix included */
+  val DeltaRecordOverhead: Int = 4 + 1 + 4 + 4 + SegmentHeader.Size + 4
+  /** Bytes a Delta range adds beyond its bytes: offset(4) + length(4) */
+  val RangeOverhead = 8
+
   /** Encoded size of one record, len prefix included */
   def recordSize(r: JournalRecord): Int =
     r match
-      case _: JournalRecord.Mapping => 4 + 1 + 24
+      case _: JournalRecord.Mapping => MappingRecordSize
       case JournalRecord.Delta(_, _, _, ranges) =>
-        4 + 1 + 4 + 4 + SegmentHeader.Size + 4 + ranges.map(r => 8 + r.bytes.length).sum
+        DeltaRecordOverhead + ranges.map(r => RangeOverhead + r.bytes.length).sum
 
   def encodeBatch(salt: Long, batchNumber: Long, records: List[JournalRecord]): Array[Byte] =
     val encoded = records.map(encodeRecord)

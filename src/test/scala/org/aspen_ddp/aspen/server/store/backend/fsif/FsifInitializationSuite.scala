@@ -239,14 +239,36 @@ class FsifInitializationSuite extends FileBasedTests:
 
   test("segmentCount is bounded so the index file stays below 2 GiB"):
     val max = FsifLayout.MaxSegmentCount
-    IndexFile.sizeFor(max) should be <= (Int.MaxValue - 16).toLong
-    IndexFile.sizeFor(max + 1) should be > (Int.MaxValue - 16).toLong
+    FsifRecovery.MaxLoadSize shouldBe (Int.MaxValue - 16).toLong
+    IndexFile.sizeFor(max) should be <= FsifRecovery.MaxLoadSize
+    IndexFile.sizeFor(max + 1) should be > FsifRecovery.MaxLoadSize
     FsifLayout(1024, max).segmentCount shouldBe max
     FsifConfig(1024, max).segmentCount shouldBe max
     an[IllegalArgumentException] should be thrownBy FsifLayout(1024, max + 1)
     an[IllegalArgumentException] should be thrownBy FsifLayout(1024, 0)
     an[IllegalArgumentException] should be thrownBy FsifConfig(1024, max + 1)
     an[IllegalArgumentException] should be thrownBy FsifConfig(1024, Int.MaxValue)
+
+  test("journalHardLimit plus the largest append stays below what recovery can load, for every layout"):
+    val t = FsifTuning()
+    t.journalHardLimit shouldBe (1L << 30)
+    // appendBound is the encoded size of the largest batch one commit appends: a Mapping and a one-range Delta
+    for n <- Seq(0, 1, 1000, 1 << 20) do
+      val d = JournalRecord.Delta(0, 0, SegmentHeader.forSlice(ObjectType.Data, oid(1), 0, md(1), DataBuffer(bytes(n, 1))),
+        List(DeltaRange(0, bytes(n, 1))))
+      val batch = JournalFormat.encodeBatch(1L, 0L, List(JournalRecord.Mapping(0, 0, oid(1)), d))
+      FsifBackend.appendBound(n) shouldBe batch.length.toLong
+    FsifBackend.MappingAppendSize shouldBe
+      JournalFormat.encodeBatch(1L, 0L, List(JournalRecord.Mapping(0, -1, oid(1)))).length.toLong
+    // The default limit plus a batch of a 512 MiB slice (and a compaction Mapping) is far below the load limit
+    t.journalHardLimit + FsifBackend.appendBound(512 << 20) + FsifBackend.MappingAppendSize should be <
+      FsifRecovery.MaxLoadSize
+    for payload <- Seq(1024, 64 << 20, 1 << 30, FsifLayout.MaxSegmentPayloadSize) do withClue(s"payload=$payload"):
+      FsifBackend.journalLengthBound(FsifLayout(payload, 1), t) should be <= FsifRecovery.MaxLoadSize
+    FsifBackend.journalLengthBound(FsifLayout(1024, 1), t) shouldBe t.journalHardLimit
+    an[IllegalArgumentException] should be thrownBy FsifLayout(FsifLayout.MaxSegmentPayloadSize + 1, 1)
+    an[IllegalArgumentException] should be thrownBy FsifTuning(journalHardLimit = FsifRecovery.MaxLoadSize + 1)
+    an[IllegalArgumentException] should be thrownBy FsifTuning(journalHardLimit = 0)
 
   test("estimateSize sizes the files it does not hold without opening them"):
     val dir = tdir / "store"

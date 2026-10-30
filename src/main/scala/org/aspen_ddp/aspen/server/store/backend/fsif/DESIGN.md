@@ -219,7 +219,7 @@ fail-stop the store.
 ### 2.7 Checkpoints
 
 A checkpoint is triggered by `maybeCheckpoint` when the active journal exceeds
-`max(indexFileSize / 2, journalBound)`, or when an operation is held by the journal hard limit and the active
+`min(max(indexFileSize / 2, journalBound), journalHardLimit / 2)`, or when an operation is held by the journal hard limit and the active
 journal holds records (2.9). It can also be started by `rebuildFlush` or the test hook `checkpointNow`. Only one runs at a time, and none starts while frozen or failed. It moves from seq s to s+1
 (`startCheckpoint`, `advanceCheckpoint`, `writeNextHeader`, `finish`):
 
@@ -288,13 +288,19 @@ are never held.
   (`journalHasRoomForMove`).
 - Fail-stop fails every held operation with `IOFailure`. A close of a frozen store abandons them as it abandons
   held I/O (2.10).
+- **Exception: `rebuildFlush` chunks.** `rebuildFlush` calls `assign` for every buffered Mapping before its chunks
+  are admitted, so a held chunk has mutated the index. This is safe: the rebuild store is not live; `data` is forced
+  before any assign, so durable-before-map holds for any index snapshot; no Delta's cancellation depends on these
+  Mappings; and Barrier waits only on real appends.
+- The checkpoint threshold is clamped to `journalHardLimit / 2` (2.7), so a checkpoint normally starts well before
+  the limit holds anything.
 
 So no journal the backend writes is longer than `journalLengthBound = max(journalHardLimit, 28 +
 appendBound(segmentPayloadSize) + 45)`, which `FsifLayout.MaxSegmentPayloadSize` keeps within
 `FsifRecovery.MaxLoadSize`. With the defaults it is 1 GiB.
 
 **Why the limit cannot deadlock a checkpoint.** A held operation has mutated nothing (no index, slot or pending
-Delta change) and appended nothing, and no admitted operation waits for one. Every checkpoint condition looks only
+Delta change; rebuild chunks excepted, as above) and appended nothing, and no admitted operation waits for one. Every checkpoint condition looks only
 at admitted records: Draining waits for `oldTail`, the last append to journal s; Applying waits for journal-s
 Deltas; Barrier waits for `lastAppend`, the last admitted append. Writing header s+1 is not an append. So the switch
 always proceeds, and afterwards the active journal holds only the header and the switch buffer, which was itself
@@ -775,6 +781,9 @@ held, not failed, and complete once it clears" (L2 cannot be reached).
   through `MaxSegmentCount`, the journal through `journalHardLimit` (2.9). The cost moves elsewhere: a store frozen
   long enough to fill its journal to the limit (1 GiB) stops acknowledging commits until space returns, and
   recovery of such a journal reads and replays up to 1 GiB.
+- **Bounds that keep a journal loadable.** `FsifLayout` rejects a `segmentPayloadSize` above
+  `MaxSegmentPayloadSize` (about 2 GiB), and a span list whose encoding would exceed the whole slice is journaled as
+  the whole slice (2.5).
 - **The hard limit counts conservatively.** An admitted operation's bound counts until it replies, even once its
   records are in the journal, and a commit's bound assumes a Mapping plus the whole slice. Commits can therefore be
   held while the journal is still well below the limit, most while a frozen journal batch keeps commits from

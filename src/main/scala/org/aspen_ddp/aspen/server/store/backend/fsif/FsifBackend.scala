@@ -193,8 +193,11 @@ class FsifBackend(val storeId: StoreId,
   private var lastAppend: Future[Unit] = Future.unit
   /** Journal seq -> Deltas appended to that journal and neither applied in place nor cancelled */
   private val unappliedBySeq = mutable.HashMap[Long, Int]()
+  /** Clamped to half the hard limit, so a checkpoint starts well before the limit holds anything (an index near
+    * MaxSegmentCount alone would put max(indexFileSize / 2, journalBound) near 1 GiB)
+    */
   private val checkpointThreshold: Long =
-    math.max(IndexFile.sizeFor(layout.segmentCount) / 2, tuning.journalBound)
+    math.min(math.max(IndexFile.sizeFor(layout.segmentCount) / 2, tuning.journalBound), tuning.journalHardLimit / 2)
   /** Encoded bytes of the records in `switchBuffer`, each entry counted as its own batch */
   private var switchBytes = 0L
 
@@ -205,7 +208,7 @@ class FsifBackend(val storeId: StoreId,
   // with an upper bound on the journal bytes it can append. One that could take the active journal past the limit is
   // held in `capHeld`, in arrival order, neither completed nor failed, and a checkpoint is started so the journals
   // switch (`maybeCheckpoint`). Held operations have mutated nothing and appended nothing, so no checkpoint step ever
-  // waits for one. A copy-on-write's Mapping and a compaction move's Mapping are never held: the first is covered by
+  // waits for one (rebuildFlush's chunks are the one exception, safe for the reasons given there). A copy-on-write's Mapping and a compaction move's Mapping are never held: the first is covered by
   // its admitted commit's bound, the second by `MappingAppendSize` of headroom that every admission leaves free (one
   // move at a time, started only while that headroom is free: `journalHasRoomForMove`).
   /** Operations held by the hard limit, in arrival order. None of them has run. */
@@ -450,7 +453,10 @@ class FsifBackend(val storeId: StoreId,
           appended.success(())
         else
           // In chunks, each admitted under the journal's hard limit; they land in order, so the last one durable
-          // means all are
+          // means all are. The one exception to "a held operation has mutated nothing": the assigns above run
+          // before the chunks are admitted. That is safe: the store is not live, data was forced before any assign
+          // (durable-before-map holds for any index snapshot), no Delta's cancellation depends on these Mappings,
+          // and a checkpoint's Barrier waits only on real appends.
           val chunks = maps.map { case (x, (slot, id)) => JournalRecord.Mapping(x, slot, id) }
             .grouped(RebuildMappingsPerAppend).toList
           val done = chunks.map: records =>
@@ -1736,7 +1742,8 @@ object FsifBackend:
       try writeMarker()
       catch
         case NonFatal(t) =>
-          b.close()
+          try b.close()
+          catch case NonFatal(e) => t.addSuppressed(e)
           throw t
       scribe.warn(s"FSIF store $storeId at $path recovered without its marker; the marker is restored")
       b

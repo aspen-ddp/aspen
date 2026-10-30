@@ -82,6 +82,8 @@ pool is created (tree splits allocate from whatever the group contains *at split
 - A metadata group accepts as members only:
   - metadata pools, and
   - child groups that are themselves metadata groups.
+- A metadata pool may join only metadata groups (decided by the user: no valid use case for it joining an ordinary
+  group, several potential problems; the restriction can be lifted later if a need appears).
 - `AllocationGroupState.addPool` / `addGroup` refuse anything else with a new, specific error, raised before any state
   changes (same style as `MemberLimitIncompatible` / `MemberIDAMismatch`).
 - `createAllocationGroup` (API) and `create-allocation-group` (CLI) gain a way to request a metadata group.
@@ -123,10 +125,8 @@ pool is created (tree splits allocate from whatever the group contains *at split
   limit, and an unlimited group would reject a limited member). Otherwise it is unlimited; whether it is then
   `ExactMatch` on the bootstrap IDA or `AllowAll` is the builder's choice.
 - Child groups of a metadata group must also be metadata groups.
-- A metadata pool may also join ordinary (non-metadata) groups. That cannot create a loop, because its own metadata is
-  in the bootstrap pool regardless of where other pools' data lands.
-- A metadata group may be nested inside an ordinary group. Same reasoning: membership of an ordinary group never
-  decides where any pool's metadata trees go.
+- A metadata group may be nested inside an ordinary group. Membership of an ordinary group never decides where any
+  pool's metadata trees go.
 - The initial metadata pool's `maximumStoreSize` matches the bootstrap pool's.
 
 ## Left to the builder

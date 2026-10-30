@@ -113,6 +113,22 @@ class JournalWriterSuite extends FileBasedTests:
     reported.size shouldBe 1
     reported.peek().getMessage shouldBe "boom"
 
+  test("SerialExecutor keeps running later tasks after a task throws a fatal Throwable"):
+    for fatal <- List[Throwable](new InterruptedException("stop"), new scala.util.control.ControlThrowable {}) do
+      withClue(fatal.getClass.getName):
+        val ec = new ManualEc()
+        val serial = new SerialExecutor(ec)
+        val ran = mutable.ArrayBuffer[Int]()
+        serial.execute(() => ran += 1)
+        serial.execute(() => throw fatal)
+        serial.execute(() => ran += 3)
+        val escaped = intercept[Throwable](ec.runAll())
+        escaped shouldBe theSameInstanceAs(fatal)
+        ec.runAll()
+        serial.execute(() => ran += 4)
+        ec.runAll()
+        ran.toList shouldBe List(1, 3, 4)
+
   test("ten appends while the first batch is held produce exactly two batches"):
     val h = new Harness
     val first = h.append(List(rec(0)))

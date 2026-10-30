@@ -81,6 +81,17 @@ class FsifInitializationSuite extends FileBasedTests:
     cfg.segmentCount shouldBe 1000
     rs.maxObjectSize(cfg.segmentPayloadSize) should be >= (1 << 20)
 
+  test("segmentCount is bounded so the index file stays below 2 GiB"):
+    val max = FsifLayout.MaxSegmentCount
+    IndexFile.sizeFor(max) should be <= (Int.MaxValue - 16).toLong
+    IndexFile.sizeFor(max + 1) should be > (Int.MaxValue - 16).toLong
+    FsifLayout(1024, max).segmentCount shouldBe max
+    FsifConfig(1024, max).segmentCount shouldBe max
+    an[IllegalArgumentException] should be thrownBy FsifLayout(1024, max + 1)
+    an[IllegalArgumentException] should be thrownBy FsifLayout(1024, 0)
+    an[IllegalArgumentException] should be thrownBy FsifConfig(1024, max + 1)
+    an[IllegalArgumentException] should be thrownBy FsifConfig(1024, Int.MaxValue)
+
   test("estimateSize sizes the files it does not hold without opening them"):
     val dir = tdir / "store"
     close(FsifBackend.create(storeId, dir, layout, io, _ => ()))

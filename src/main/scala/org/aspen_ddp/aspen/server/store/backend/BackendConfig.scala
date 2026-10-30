@@ -26,7 +26,8 @@ case class RocksDBConfig(maxSliceSize: Option[Int] = None) extends BackendConfig
   */
 case class FsifConfig(segmentPayloadSize: Int, segmentCount: Int) extends BackendConfig:
   require(segmentPayloadSize > 0, s"segmentPayloadSize must be positive: $segmentPayloadSize")
-  require(segmentCount > 0, s"segmentCount must be positive: $segmentCount")
+  require(segmentCount > 0 && segmentCount <= fsif.FsifLayout.MaxSegmentCount,
+    s"segmentCount must be in [1, ${fsif.FsifLayout.MaxSegmentCount}] (an index file below 2 GiB): $segmentCount")
 
   val backendName: String = "fsif"
 

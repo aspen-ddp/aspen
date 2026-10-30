@@ -99,10 +99,10 @@ object Host:
   private case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
   /** An FSIF open (`create = false`, from tryLoadStore) or create (createNewStore) run on fsifOpenEc has ended.
    *  `previous` is the store's out-of-space wait before the open, for the backoff; `created` is completed for a
-   *  create once its store is loaded, or failed. */
+   *  create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served. */
   private case class FsifOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                 create: Boolean, previous: Option[SpaceWait], result: Try[Backend],
-                                created: Option[Promise[Unit]]) extends Event
+                                created: Option[Promise[Unit]], onServed: () => Unit) extends Event
   private case class InitializeTaskExecutor() extends Event
 
   /** What updateStateForTransferredStore decided about a transfer that has finished shipping
@@ -969,7 +969,13 @@ class Host(val client: AspenClient,
 
   // protected so tests can subclass with a recording implementation instead of opening a
   // real RocksDB backend. `stores` and `storageDevices` are already protected.
-  protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path): Unit =
+  //
+  // `onServed` runs, under the instance lock, once the store is recorded as served and its LoadStore queued:
+  // before this returns for RocksDB, but only when FsifOpened is handled for FSIF, whose open runs on fsifOpenEc.
+  // It never runs if the store is not served (skipped, already open or opening, or its open fails). A caller that
+  // must act once the store is served passes it rather than reading offlineStores after the call.
+  protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
+                             onServed: () => Unit = () => ()): Unit =
     val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
     if os.exists(storeCfgPath) then
       try
@@ -996,9 +1002,10 @@ class Host(val client: AspenClient,
           if fsifOpening.contains(storeCfg.storeId) || stores.contains(storeCfg.storeId) then
             logger.debug(s"Not loading store ${storeCfg.storeId} again: it is already open or opening")
           else
-            startFsifOpen(sds, storeCfg, potentialStoreFile, create = false, None)
+            startFsifOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
         else
           serveOpened(sds, storeCfg, potentialStoreFile, openBackend(storeCfg, potentialStoreFile, create = false))
+          onServed()
       catch
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
@@ -1015,7 +1022,8 @@ class Host(val client: AspenClient,
    *  on I/O or fsync), and posts the outcome as FsifOpened. Meanwhile the store is in its device's loadedStores and
    *  in fsifOpening, so a shutdown waits for it and no second open starts. Caller holds the instance lock. */
   private def startFsifOpen(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
-                            create: Boolean, created: Option[Promise[Unit]]): Unit =
+                            create: Boolean, created: Option[Promise[Unit]],
+                            onServed: () => Unit = () => ()): Unit =
     val storeId = storeCfg.storeId
     val previous = storesAwaitingSpace.get(storeId)
     storesAwaitingSpace -= storeId
@@ -1024,7 +1032,7 @@ class Host(val client: AspenClient,
     try
       fsifOpenEc.execute: () =>
         val result = Try(openBackend(storeCfg, storePath, create))
-        events.put(FsifOpened(sds, storeCfg, storePath, create, previous, result, created))
+        events.put(FsifOpened(sds, storeCfg, storePath, create, previous, result, created, onServed))
     catch
       case t: Throwable =>
         fsifOpening -= storeId
@@ -1041,7 +1049,7 @@ class Host(val client: AspenClient,
    *  - any other failure is logged and the store is not loaded, as for a backend that fails to open.
    *  ShutdownStore completions deferred meanwhile are then put again, after the LoadStore. */
   private def fsifOpened(event: FsifOpened): Unit =
-    val FsifOpened(sds, storeCfg, storePath, create, previous, result, created) = event
+    val FsifOpened(sds, storeCfg, storePath, create, previous, result, created, onServed) = event
     val storeId = storeCfg.storeId
     val deferred = fsifOpening.getOrElse(storeId, Nil)
     fsifOpening -= storeId
@@ -1064,6 +1072,7 @@ class Host(val client: AspenClient,
       case Success(backend) =>
         val served = serveOpened(sds, storeCfg, storePath, backend)
         created.foreach(_.completeWith(served))
+        onServed()
       case Failure(e: FsifRecovery.StoreLost) =>
         logger.error(s"Store $storeId cannot be loaded: FSIF recovery found its acknowledged state lost. " +
                      s"Rebuilding it. $storePath. Error: ${e.getMessage}")
@@ -2523,7 +2532,8 @@ class Host(val client: AspenClient,
    *  which is what clears its StoreOffline. Best-effort: a failed read only means peers find the
    *  store the slow way and keep it offline until their next recheck.
    */
-  private def gossipStoreOnline(storeId: StoreId): Unit =
+  // protected as a test seam, so a test can see that it was called without a readable pool
+  protected def gossipStoreOnline(storeId: StoreId): Unit =
     val onlineTimestamp = HLCTimestamp.now
     client.getStoragePoolStateAndTimestamp(storeId.poolId).onComplete:
       case Success((poolState, timestamp)) =>
@@ -3215,6 +3225,9 @@ class Host(val client: AspenClient,
    *  both this device's offlineStores and the host.s. Those two sets and the marker file are
    *  three representations of one fact and must not be allowed to disagree.
    *
+   *  StoreMoved is gossiped from tryLoadStore's onServed, once the store is served: at once for RocksDB, and for
+   *  FSIF when its open, which runs off the event thread, has succeeded. A store whose open fails is not gossiped.
+   *
    *  If the load fails after the marker is gone, tryLoadStore's own catch logs it and the store
    *  stays in offlineStores for the life of the process: this pass will not pick it up again,
    *  since it keys off the marker that is now removed. The next restart loads it normally. That
@@ -3243,9 +3256,7 @@ class Host(val client: AspenClient,
           false
 
     if markerRemoved then
-      tryLoadStore(local, storePath)
-      if !local.offlineStores.contains(storeId) then
-        gossipStoreOnline(storeId)
+      tryLoadStore(local, storePath, () => gossipStoreOnline(storeId))
 
   /** Drops a TransferringIn entry whose source device has been declared failed.
    *

@@ -251,7 +251,8 @@ private class RecordingHost(mgrClient: AspenClient,
   private lazy val storeLoadFailureOwed = new AtomicBoolean(failFirstStoreLoad)
 
   override protected def tryLoadStore(sds: Host.LocalStorageDeviceState,
-                                      potentialStoreFile: os.Path): Unit =
+                                      potentialStoreFile: os.Path,
+                                      onServed: () => Unit): Unit =
     synchronized:
       if storeLoadFailureOwed.getAndSet(false) then
         throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")

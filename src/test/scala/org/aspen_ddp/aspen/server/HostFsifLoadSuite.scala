@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision,
   ObjectType}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
@@ -55,6 +55,19 @@ private class FsifSeamHost(mgrClient: AspenClient,
   @volatile var openThreads: List[String] = Nil
 
   override protected def fsifOpenEc: ExecutionContext = openEc
+
+  /** Device states lookupStorageDeviceState returns instead of reading the tree, which holds none of these devices */
+  @volatile var deviceStates: Map[StorageDeviceId, StorageDeviceState] = Map()
+  /** Stores gossipStoreOnline was called for, most recent first. Recorded only: the test pool cannot be read */
+  @volatile var gossipedOnline: List[StoreId] = Nil
+
+  override protected def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
+    deviceStates.get(storageDeviceId) match
+      case Some(state) => Future.successful(state)
+      case None => super.lookupStorageDeviceState(storageDeviceId)
+
+  override protected def gossipStoreOnline(storeId: StoreId): Unit =
+    gossipedOnline = storeId :: gossipedOnline
 
   private def outOfSpace[A](op: => A): A =
     if deviceFull then throw new IOException("No space left on device") else op
@@ -352,3 +365,95 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
         os.exists(Backend.crlSaveFile(storeDir)) should be(true)
         os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 
+
+  /** An FSIF store left offline behind a transfer-out marker, whose device check then finds its entry Active with no
+   *  transfer outstanding (an abandoned transfer out) and reinstates it. FSIF opens are queued, not run: returns
+   *  once the reinstate has removed the marker and queued the store's open. */
+  private def reinstateAbandoned(host: FsifSeamHost, storeDir: os.Path,
+                                 queued: java.util.concurrent.ConcurrentLinkedQueue[Runnable]): Future[Unit] =
+    given ExecutionContext = executionContext
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
+      load(host) // skipped for its marker: offline
+      host.testingOnlyOfflineStores should contain(storeId)
+      host.openEc = new ExecutionContext:
+        def execute(r: Runnable): Unit = queued.add(r)
+        def reportFailure(t: Throwable): Unit = ()
+      host.deviceStates = Map(deviceA -> deviceState(deviceA,
+        Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+      host.testingOnlyCheckAllDevices()
+      yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+        host.testingOnlyActiveDeviceChecks should not contain deviceA
+        os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+        queued.size should be(1)
+
+  atest("an FSIF store reinstated after an abandoned transfer out gossips StoreMoved once its open completes"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    reinstateAbandoned(host, storeDir, queued).map: _ =>
+      // Still opening: not served, so nothing is gossiped yet
+      host.testingOnlyOfflineStores should contain(storeId)
+      host.gossipedOnline should be(Nil)
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // FsifOpened, then its LoadStore
+      host.getStoreIds should contain(storeId)
+      host.testingOnlyOfflineStores should not contain storeId
+      host.gossipedOnline should be(List(storeId))
+
+  atest("an FSIF store reinstated after an abandoned transfer out whose open fails is not gossiped"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    reinstateAbandoned(host, storeDir, queued).map: _ =>
+      host.outOfSpaceOpens = 1
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // FsifOpened: out of space, left offline
+      host.getStoreIds should not contain storeId
+      host.testingOnlyOfflineStores should contain(storeId)
+      host.gossipedOnline should be(Nil)
+
+  atest("an FSIF store reinstated after an abandoned transfer out whose recovery finds it lost is not gossiped"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    reinstateAbandoned(host, storeDir, queued).map: _ =>
+      os.remove(storeDir / FsifRecovery.IndexFiles(0))
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // FsifOpened: StoreLost, marked for rebuild and left offline
+      host.getStoreIds should not contain storeId
+      host.testingOnlyOfflineStores should contain(storeId)
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      host.gossipedOnline should be(Nil)
+
+  atest("a RocksDB store reinstated after an abandoned transfer out gossips StoreMoved within the device check"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = deviceDir / storeId.directoryName
+    os.makeDir.all(storeDir)
+    os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
+    os.write.over(storeDir / StoreTransfer.TransferOutMarkerFile, Array.emptyByteArray)
+    load(host) // skipped for its marker: offline
+    host.testingOnlyOfflineStores should contain(storeId)
+    host.deviceStates = Map(deviceA -> deviceState(deviceA,
+      Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None))))
+    host.testingOnlyCheckAllDevices()
+    yieldUntil(!host.testingOnlyActiveDeviceChecks.contains(deviceA)).map: _ =>
+      host.testingOnlyActiveDeviceChecks should not contain deviceA
+      // Opened synchronously, so gossiped by the check itself, before its LoadStore is handled
+      host.testingOnlyOfflineStores should not contain storeId
+      host.gossipedOnline should be(List(storeId))
+      host.testingOnlyHandleEvents()
+      host.getStoreIds should contain(storeId)
+      host.gossipedOnline should be(List(storeId))

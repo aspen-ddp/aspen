@@ -117,6 +117,8 @@ object Main {
                   maxObjectSize:Option[Int]=None,
                   segmentCount:Option[Int]=None,
                   allowAnyIda:Boolean=false,
+                  newGroupMetadata:Boolean=false,
+                  metadataGroup:Option[String]=None,
                   setId:String="",
                   newSetName:String="",
                   newSetLevel:Int=0,
@@ -134,6 +136,8 @@ object Main {
                   outputClientConfig:Option[os.Path]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
+
+  private case class GroupNotFound(name: String) extends Exception(s"allocation group '$name' not found")
 
   private case class HostNotFound(hostname: String)
     extends Exception(s"host '$hostname' not found")
@@ -439,6 +443,17 @@ object Main {
 
   private def createPoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
+    poolArgs(p) :+
+      opt[String]("metadata-group").valueName("<group-name>").
+        text("Metadata allocation group that supplies the pool's metadata trees (default: the system default group)").
+        action((x, c) => c.copy(metadataGroup = Some(x)))
+
+  /** create-metadata-pool takes everything create-pool does except --metadata-group */
+  private def createMetadataPoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    poolArgs(p)
+
+  private def poolArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
     List(
       clientConfigArg(p),
       bootstrapHostOption(p),
@@ -541,6 +556,9 @@ object Main {
         action((_, c) => c.copy(allowAnyIda = true)),
 
       maxSliceSizeOption(p),
+
+      opt[Unit]("metadata").text("Make this a metadata group: only metadata pools and metadata groups may join it").
+        action((_, c) => c.copy(newGroupMetadata = true)),
     )
 
   private def createFilesystemArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -774,6 +792,7 @@ object Main {
     Command("host", "Starts an Aspen Storage Host", hostArgs),
     Command("amoebafs", "Launches an AmoebaFS NFS server", amoebafsArgs),
     Command("create-pool", "Creates a new storage pool", createPoolArgs),
+    Command("create-metadata-pool", "Creates a new storage pool that holds other pools' metadata", createMetadataPoolArgs),
     Command("create-device-set", "Creates a new storage device set", createDeviceSetArgs),
     Command("create-allocation-group", "Creates a new allocation group", createAllocationGroupArgs),
     Command("create-filesystem", "Creates a new AmoebaFS filesystem", createFilesystemArgs),
@@ -824,7 +843,7 @@ object Main {
         failure("data-port, http-port, and store-transfer-port must all be different")
       else if c.mode == "create-allocation-group" then
         validateGroupIda(c)
-      else if c.mode == "create-pool" then
+      else if c.mode == "create-pool" || c.mode == "create-metadata-pool" then
         validatePoolBackend(c)
       else if c.mode == "system-rebalance-period" then
         // Validated here rather than in the handler so a malformed period is a usage error,
@@ -919,13 +938,18 @@ object Main {
             case "create-pool" =>
               val ida = createIDA(cfg)
               create_pool(session, cfg.newPoolName, ida, cfg.deviceSetName, cfg.maximumStoreSize,
-                cfg.maxSliceSize, poolBackendConfig(cfg, ida))
+                cfg.maxSliceSize, poolBackendConfig(cfg, ida), cfg.metadataGroup)
+            case "create-metadata-pool" =>
+              val ida = createIDA(cfg)
+              create_pool(session, cfg.newPoolName, ida, cfg.deviceSetName, cfg.maximumStoreSize,
+                cfg.maxSliceSize, poolBackendConfig(cfg, ida), metadataPool = true)
             case "create-device-set" => create_device_set(session, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "create-allocation-group" =>
               val (policy, ida) =
                 if cfg.allowAnyIda then (IDAPolicy.AllowAll, None)
                 else (IDAPolicy.ExactMatch, Some(createIDA(cfg)))
-              create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel, cfg.maxSliceSize, policy, ida)
+              create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel, cfg.maxSliceSize, policy, ida,
+                                      cfg.newGroupMetadata)
             case "create-filesystem" => create_filesystem(session, cfg.fsName, cfg.poolName)
             case "add-pool-to-group" => add_pool_to_group(session, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(session, cfg.srcGroupName, cfg.newGroupName)
@@ -1658,7 +1682,9 @@ object Main {
                   deviceSetName: String,
                   maximumStoreSize: Long,
                   maxSliceSize: Option[Int] = None,
-                  backendConfig: BackendConfig = RocksDBConfig()): Int = {
+                  backendConfig: BackendConfig = RocksDBConfig(),
+                  metadataGroupName: Option[String] = None,
+                  metadataPool: Boolean = false): Int = {
 
     configureLogging()
 
@@ -1670,7 +1696,16 @@ object Main {
 
     val f = for
       setId <- client.getStorageDeviceSetId(deviceSetName)
-      poolId <- client.createNewStoragePool(poolName, ida, maxSliceSize, backendConfig, setId, maximumStoreSize)
+      // A missing group name must not be mistaken for a missing device set below
+      groupId <- metadataGroupName match
+        case None => Future.successful(None)
+        case Some(g) => client.getAllocationGroupId(g).map(Some(_)).recoverWith:
+          case _: NoSuchElementException => Future.failed(GroupNotFound(g))
+      poolId <-
+        if metadataPool then
+          client.createNewMetadataPool(poolName, ida, maxSliceSize, backendConfig, setId, maximumStoreSize)
+        else
+          client.createNewStoragePool(poolName, ida, maxSliceSize, backendConfig, setId, maximumStoreSize, groupId)
     yield poolId
 
     // Translate the known failure modes into human-readable messages. The client's retry
@@ -1681,6 +1716,10 @@ object Main {
       case _: KeyAlreadyExists =>
         println(s"Error: a storage pool named '$poolName' already exists")
       // getStorageDeviceSetId throws this when the name is not registered.
+      case e: GroupNotFound =>
+        println(s"Error: allocation group '${e.name}' not found")
+      case _: AspenClient.NotAMetadataGroup =>
+        println(s"Error: allocation group '${metadataGroupName.getOrElse("")}' is not a metadata group")
       case _: NoSuchElementException =>
         println(s"Error: device set '$deviceSetName' not found")
       case e =>
@@ -1747,7 +1786,8 @@ object Main {
                               level: Int,
                               maxSliceSize: Option[Int] = None,
                               idaPolicy: IDAPolicy = IDAPolicy.ExactMatch,
-                              ida: Option[IDA] = None): Int = {
+                              ida: Option[IDA] = None,
+                              isMetadataGroup: Boolean = false): Int = {
 
     configureLogging()
 
@@ -1757,7 +1797,7 @@ object Main {
 
     given ExecutionContext = client.clientContext
 
-    val f = client.createAllocationGroup(name, level, maxSliceSize, idaPolicy, ida)
+    val f = client.createAllocationGroup(name, level, maxSliceSize, idaPolicy, ida, isMetadataGroup)
 
     // Translate the known failure mode into human-readable messages. The client's retry
     // strategy unwraps StopRetrying, so the future fails with the underlying cause.
@@ -2490,6 +2530,7 @@ object Main {
     lines += s"  IDA:          ${s.ida}"
     lines += s"  Max Slice Sz: ${s.maxSliceSize.map(_.toString).getOrElse("unbounded")}"
     lines += s"  Max Obj Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"
+    lines += s"  Metadata pool: ${if s.isMetadataPool then "yes" else "no"}"
     lines += s"  Device Set:   $set (${s.storageDeviceSet.uuid})"
     s.migration.foreach: m =>
       lines += s"  Migration:    ${m.status} -> ${m.targetSet.uuid}"
@@ -2544,6 +2585,7 @@ object Main {
     lines += s"  Level: ${s.level}"
     lines += s"  IDA Policy: ${s.idaPolicy}"
     lines += s"  IDA: ${s.ida.map(_.toString).getOrElse("any")}"
+    lines += s"  Metadata group: ${if s.isMetadataGroup then "yes" else "no"}"
     lines += s"  Usage: ${formatBytes(s.currentUsage)} / ${formatBytes(s.maximumSize)}"
     lines += s"  Max Slice Size:  ${s.maxSliceSize.map(_.toString).getOrElse("unbounded")}"
     lines += s"  Max Object Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"

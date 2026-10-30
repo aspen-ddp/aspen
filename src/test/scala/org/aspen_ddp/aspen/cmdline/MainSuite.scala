@@ -219,6 +219,58 @@ class MainSuite extends AnyFunSuite with Matchers:
     any should include ("IDA Policy: AllowAll")
     any should include ("IDA: any")
 
+  test("formatAllocationGroupState reports whether the group is a metadata group"):
+    val groupId = AllocationGroupId(UUID.fromString("66666666-6666-6666-6666-666666666666"))
+    Main.formatAllocationGroupState(AllocationGroupState(groupId, 0, "meta", Nil, Nil, isMetadataGroup = true)) should
+      include ("Metadata group: yes")
+    Main.formatAllocationGroupState(AllocationGroupState(groupId, 0, "gold", Nil, Nil)) should
+      include ("Metadata group: no")
+
+  test("formatPoolState reports whether the pool is a metadata pool"):
+    val poolId = PoolId(UUID.fromString("44444444-4444-4444-4444-444444444444"))
+    val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
+    val meta = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
+      RocksDBConfig(), setId, isMetadataPool = true)
+    Main.formatPoolState(meta, None) should include ("Metadata pool: yes")
+    val plain = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
+      RocksDBConfig(), setId)
+    Main.formatPoolState(plain, None) should include ("Metadata pool: no")
+
+  private val poolArgs = Seq("mypool", "Replication", "3", "2", "2", "myset")
+
+  private def parseCmd(cmd: String, args: String*): Option[Main.Args] =
+    withTempDir("parse-cmd"): dir =>
+      val cfgs = emptyFile(dir / "bootstrap.yaml")
+      Console.withErr(OutputStream.nullOutputStream()):
+        Main.buildParser.parse(Seq(cmd, cfgs) ++ args, Main.Args())
+
+  test("create-metadata-pool takes create-pool's positional arguments but not --metadata-group"):
+    val parsed = parseCmd("create-metadata-pool", (poolArgs :+ "4096")*)
+      .getOrElse(fail("create-metadata-pool did not parse"))
+    parsed.mode shouldBe "create-metadata-pool"
+    parsed.newPoolName shouldBe "mypool"
+    parsed.deviceSetName shouldBe "myset"
+    parsed.maximumStoreSize shouldBe 4096L
+    parseCmd("create-metadata-pool", (poolArgs ++ Seq("--metadata-group", "gold"))*) shouldBe None
+
+  test("create-metadata-pool applies the create-pool backend validation"):
+    parseCmd("create-metadata-pool", (poolArgs ++ Seq("--backend", "fsif", "--max-object-size", "4096",
+      "--segment-count", "100"))*) shouldBe None
+    parseCmd("create-metadata-pool", (poolArgs ++ Seq("--max-object-size", "4096"))*) shouldBe None
+
+  test("create-pool --metadata-group stores the group name"):
+    val named = parseCmd("create-pool", (poolArgs ++ Seq("--metadata-group", "gold"))*)
+      .getOrElse(fail("create-pool did not parse"))
+    named.metadataGroup shouldBe Some("gold")
+    val default = parseCmd("create-pool", poolArgs*).getOrElse(fail("create-pool did not parse"))
+    default.metadataGroup shouldBe None
+
+  test("create-allocation-group --metadata sets the flag"):
+    val flagged = parseGroup("g", "0", "replication", "3", "2", "2", "--metadata").getOrElse(fail("did not parse"))
+    flagged.newGroupMetadata shouldBe true
+    val plain = parseGroup("g", "0", "replication", "3", "2", "2").getOrElse(fail("did not parse"))
+    plain.newGroupMetadata shouldBe false
+
   private def parseGroup(args: String*): Option[Main.Args] =
     withTempDir("parse-group"): dir =>
       val cfgs = emptyFile(dir / "bootstrap.yaml")

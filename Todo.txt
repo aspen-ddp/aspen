@@ -4,8 +4,16 @@ TODO
 Add an iscsi server application similar to amoebafs. The goal is to implement block devices on top of Aspen that
 are exported via the iscsi protocol with "good" performance. TCMU seems to be a good balance between performance and
 implementation simplicity. A high-level design description of how this might be achieved is
-captured in features/iscsi-target.txt this should serve as the starting point for how to implement this feature but
-it should not be considered set-in-stone. Alternative solutions may be considered
+captured in @features/iscsi-target.txt this should serve as the starting point for how to implement this feature but
+it should not be considered set-in-stone. Alternative solutions may be considered. To implement the backend on top
+of Aspen, a DataObjectTKVL should be used to hold blocks of storage allocated from an ObjectAllocator configured with
+an FSIF IDA. The size of the blocks will be determined by the backend configuration which sets the segment size and
+overall maximum object size. When possible, Small reads and writes should be handled via byte ranges rather than whole
+object reads and writes. Reads typically benefit from pre-fetching which largely comes for free when reading whole
+objects but not all reads benefit from this (such as reading an inode). A balance or heuristic on when a small or
+full read should be done may need to be designed. Similar to AmoebaFS, this should be implemented in terms of a
+root object registered with the system object registry and allow for the creation of multiple virtual disks that
+can be served out over the TCMU interface.
 
 DataObject TKVL test suite sometimes reports hung tests during full test runs though it still succeeds. Although
 apparently not flaky, it suggests that these tests may be taking an inordinately long time to complete. Investigate

@@ -1,6 +1,39 @@
 Backlog
 =======
 
+System-level protection against correlated "lost store" declarations
+  - The main source of data loss in a system like this is not hardware. It is a systemic bug that wrongly triggers
+    one of the automatic lost-store paths: a store decides from local evidence alone that its content can't be
+    trusted, marks itself `rebuild-required`, and is rebuilt from its peers.
+    - One store wrongly declared lost costs only a rebuild.
+    - The same bug firing on many stores at once is unrecoverable once the content is gone, because the peers the
+      rebuild needs are the stores being thrown away. An upgrade to a version with a bad recovery check, a format
+      misread, or a wrong validation bound would all do this.
+    - Every automatic path is listed in the "Automatic lost store" section of
+      server/store/backend/fsif/DESIGN.md (FSIF), plus the host-level `crl_save.log` loss paths (all backends).
+  - This can't be fixed inside a store implementation, because each store sees only its own files. It needs a
+    system-level check.
+  - Store content must never be deleted automatically on purely local detection.
+    - Today `Host.discardLostStore` moves the directory into the device's discard directory and deletes it at once,
+      and `tryLoadDevice` empties that directory at startup.
+    - Instead, move it to `<storage-device>/suspected-loss/<store-dir>-<uuid>` and keep it. Record why, when, which
+      software version, and which check fired.
+    - A rebuild can still proceed into a fresh directory, so availability doesn't depend on the decision.
+  - A higher-level system check decides what happens to suspected-loss content.
+    - Look across the pool and the whole system for correlation:
+      - several stores of one pool declared lost within a short window;
+      - declarations clustered after an upgrade or on one software version;
+      - the same check firing on many hosts;
+      - more stores of a pool lost than its IDA tolerates.
+    - When the pattern looks systemic, stop automatically declaring stores lost (or at least stop rebuilding over
+      them), alert an operator, and keep every suspected-loss copy so a fixed version can recover them.
+    - Only when the loss is judged isolated and not potentially systemic does the system issue an explicit
+      deletion instruction for the retained content, through the usual object-based admin channel so it can't
+      be lost.
+  - Related: a rebuild that can't find enough healthy peers must fail loudly rather than rebuild from what's left.
+  - Track suspected-loss space use per device, since retained copies compete with live stores; see the "Full
+    storage devices" item.
+
 StoreRepairer leaves missed-update (errorTree) entries behind after a successful repair
   - Found during the FSIF integration test. Pre-existing and not FSIF-related.
   - The delete at StoreRepairer.scala:140-146 is guarded by TimestampLessThan(key, os.timestamp), which fails only

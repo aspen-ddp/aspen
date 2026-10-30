@@ -195,6 +195,12 @@ class FsifBackend(val storeId: StoreId,
 
   private[fsif] def compactionStats: CompactionStats = compaction.stats
 
+  /** Test hooks: a checkpoint / a compaction move is outstanding. Unsynchronized reads of serial-owned state, so only
+    * valid while no serial task can run concurrently (a single-threaded test io EC).
+    */
+  private[fsif] def checkpointRunning: Boolean = checkpoint.isDefined
+  private[fsif] def moveRunning: Boolean = !compaction.idle
+
   /** Test hook: how many times each kind of I/O has been held by ENOSPC */
   private[fsif] def holdStats: Map[String, Int] = holdCounts.synchronized(holdCounts.toMap)
 

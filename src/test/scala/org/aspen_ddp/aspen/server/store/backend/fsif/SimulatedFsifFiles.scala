@@ -65,6 +65,19 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   /** Writes, forces and truncates that have taken effect so far, across all files (faulted ones excluded) */
   def opCount: Long = lock.synchronized(opsDone)
 
+  /** New instance holding a copy of this one's durable image, with no pending ops, rules or op limit. Unlike
+   *  `crash()`, this instance stays usable and no random draws are made.
+   */
+  def snapshot(): SimulatedFsifFiles = lock.synchronized:
+    live()
+    val next = new SimulatedFsifFiles(new Random(0))
+    for (name, f) <- files do
+      val nf = new SimFile
+      nf.durable = f.durable.clone()
+      nf.cache.set(nf.durable)
+      next.files(name) = nf
+    next
+
   /** New instance holding only the resulting durable image. This instance must not be used afterward. */
   def crash(): SimulatedFsifFiles = lock.synchronized:
     live()

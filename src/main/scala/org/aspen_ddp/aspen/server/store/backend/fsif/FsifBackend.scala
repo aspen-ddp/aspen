@@ -29,8 +29,9 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitError, C
   *
   * Write paths (all journal records for an external index X are appended in commit order):
   *  - journaled: the commit's Delta (preceded by `Mapping(X, f, id)` when X gets a slot) is appended; the commit
-  *    completes when that batch is forced, and the Delta is then written in place in the background. Reads overlay
-  *    pending Deltas, so they never wait for the in-place write.
+  *    completes when that batch is forced, and the Delta is then written in place in the background. It stays
+  *    pending (overlaid on reads, holding back checkpoints, counted by backpressure) until a force of `data` issued
+  *    after that write succeeds. Reads overlay pending Deltas, so they never wait for the in-place write.
   *  - copy-on-write (Full and larger than `cowThreshold`): the whole segment is written to the lowest free slot f and
   *    `data` is forced; only then is `Mapping(X, f, id)` appended (durable-before-map). Operations on X that arrive
   *    meanwhile wait until that Mapping is appended, then target f.
@@ -40,8 +41,8 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitError, C
   *  1. Snapshot the map as of the last record appended to journal s; later records are buffered. Once every
   *     journal-s batch is durable, header s+1 is written and forced into the other journal file, and only then does a
   *     new writer take the buffered records (Ruling 19: no record of s+1 is durable unless all of s is).
-  *  2. Wait until every journal-s Delta is applied in place or cancelled, and until everything appended so far
-  *     (which includes any record that cancelled one) is durable; then force `data`.
+  *  2. Wait until every journal-s Delta is forced in place (a data force covering its write has succeeded) or
+  *     cancelled, and until everything appended so far (which includes any record that cancelled one) is durable.
   *  3. Write index s+1 into the other index file and force it.
   *  4. Empty journal s and index s, forcing each.
   *
@@ -50,7 +51,9 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitError, C
   *
   * Out of space (ENOSPC from any write, force or truncate) freezes writes instead of failing the store: the failed
   * operation and everything queued behind it are held, never completed with an error, and their I/O is retried every
-  * `tuning.enospcRetry` on `scheduler` until it succeeds. Commits are still accepted, reads go on (overlaying pending
+  * `tuning.enospcRetry` on `scheduler` until it succeeds. A failed force of `data` is never simply retried: Linux
+  * marks the failed pages clean, so every data write not yet covered by a successful force is issued again first
+  * (`dataLost`). Commits are still accepted, reads go on (overlaying pending
   * Deltas), and checkpoints, compaction and in-place writes pause and later resume where they stood. Any other I/O
   * error is fail-stop: commits complete with IOFailure, reads with CorruptedObject, and `onFatal` is called once.
   * Backpressure: a commit that arrives while unapplied Delta bytes exceed `tuning.unappliedBound` is acknowledged only
@@ -125,6 +128,36 @@ class FsifBackend(val storeId: StoreId,
   /** Successful commit replies held by backpressure, in order */
   private val throttled = mutable.ArrayBuffer[Reply]()
 
+  // ---- Data forces, owned by serial ----
+  //
+  // A failed fsync on Linux marks the failed pages clean, so retrying it succeeds without writing them. Every force
+  // of `data` therefore goes through `forceData`, which runs one at a time: a successful force with id k covers
+  // exactly the writes whose completion was seen on serial before it was issued (tag <= k). When one fails with
+  // ENOSPC (`dataLost`), every write not yet covered is treated as lost and issued again before anything relies on
+  // it: in-place Deltas written but unforced go back to their slot's queue, a move re-queues its writes into f, and a
+  // copy-on-write rewrites its segment. A write still in flight then is lost too (its issue epoch is stale).
+  /** The id the next data force gets; a write completing now is covered by that force */
+  private var nextForceId = 0L
+  private var dataForceInFlight = false
+  /** Callbacks for the next data force, with the io kind of the first (tests hold forces back by kind) */
+  private val dataForceWaiters = mutable.ArrayBuffer[(IoKind, Try[Unit] => Unit)]()
+  /** Bumped by every data force that fails with ENOSPC: a write issued in an older epoch may have been lost */
+  private var dataEpoch = 0L
+  /** In-place Deltas written but not forced, in completion order (so tags are nondecreasing); stale entries (the
+    * Delta re-queued, rewritten or cancelled since) are skipped
+    */
+  private val unforced = mutable.ArrayDeque[Unforced]()
+  private var unforcedCount = 0
+  private var unforcedBytes = 0L
+  /** A force started by `maybeForceData` is outstanding */
+  private var backgroundForce = false
+  /** Copy-on-write io (the segment write, or the force after it) in flight */
+  private var cowIo = 0
+  /** A data force failed with rebuild writes not yet mapped by a rebuildFlush: they may be lost, so this incarnation
+    * accepts no more rebuild writes or flushes (the rebuild resumes from its checkpoint in a new one)
+    */
+  @volatile private var rebuildLost = false
+
   // ---- Checkpoint state, owned by serial ----
   /** The index file holding index `currentSeq` */
   private var activeIndex: String = recovered.activeIndex
@@ -176,6 +209,8 @@ class FsifBackend(val storeId: StoreId,
     def failStop(t: Throwable): Unit =
       logger.error(s"FSIF store $storeId: compaction I/O failed: $t")
       FsifBackend.this.failStop(t)
+    def forceData(kind: IoKind)(done: Try[Unit] => Unit): Unit = FsifBackend.this.forceData(kind)(done)
+    def dataEpoch: Long = FsifBackend.this.dataEpoch
     def commitMove(x: Int, id: ObjectId, from: Int, to: Int)(done: Try[Unit] => Unit): Unit =
       assign(x, to, id)
       val dead = kill(from)
@@ -285,6 +320,7 @@ class FsifBackend(val storeId: StoreId,
     val header = SegmentHeader.forSlice(objectType, pointer.id, x, metadata, data)
     val segment = SegmentHeader.encode(header) ++ data.getByteArray
     rebuildLock.synchronized:
+      throwIfRebuildLost()
       val (slot, fresh) = onSerialSync:
         throwIfFatal()
         throwIfFrozen()
@@ -313,11 +349,18 @@ class FsifBackend(val storeId: StoreId,
   /** Forces `data`, then appends and forces the buffered Mappings (durable-before-map), then checkpoints. Throws an
     * out-of-space IOException if `data`'s force hits ENOSPC, or if the store is frozen before the Mappings are durable
     * or the checkpoint has finished (Ruling 21). Mappings already appended then stay held and land once space
-    * returns.
+    * returns. A force failure may have dropped rebuild writes not yet mapped, so after one this incarnation throws
+    * on every later rebuildWrite and rebuildFlush.
     */
   override def rebuildFlush(): Unit =
     rebuildLock.synchronized:
-      dataFile.force()
+      throwIfRebuildLost()
+      val forced = Promise[Unit]()
+      onSerialSync:
+        throwIfFatal()
+        forceData(IoKind.DataForce)(r => forced.tryComplete(r))
+      // A failure with ENOSPC set rebuildLost (dataLost) if any rebuild write was waiting for this force
+      Await.result(forced.future, Duration.Inf)
       val appended = Promise[Unit]()
       onSerialSync:
         throwIfFatal()
@@ -370,6 +413,7 @@ class FsifBackend(val storeId: StoreId,
           failStop(t)
           compaction.drive()
       releaseThrottled()
+      maybeForceData()
       checkQuiesce()
 
   private def onSerialSync[A](f: => A): A =
@@ -383,6 +427,11 @@ class FsifBackend(val storeId: StoreId,
   private def throwIfFrozen(): Unit =
     if frozen then
       throw outOfSpace()
+
+  private def throwIfRebuildLost(): Unit =
+    if rebuildLost then
+      throw new IOException(s"No space left on device: a force of FSIF store $storeId's data failed, so rebuild " +
+        "writes since the last rebuildFlush may be lost; reopen the store to resume the rebuild")
 
   /** Matches FsifIo.isOutOfSpace and RebuildingStore's out-of-space test */
   private def outOfSpace(): IOException =
@@ -442,7 +491,7 @@ class FsifBackend(val storeId: StoreId,
     */
   private def idle: Boolean =
     gated.isEmpty && writesInFlight == 0 && readsInFlight == 0 && checkpoint.isEmpty && compaction.idle &&
-      !journal.busy &&
+      !journal.busy && !dataForceInFlight && cowIo == 0 &&
       (fatal.isDefined || (!frozen && throttled.isEmpty && journal.idle && unappliedCount == 0))
 
   // ---- Failure handling ----
@@ -592,9 +641,37 @@ class FsifBackend(val storeId: StoreId,
   private def cancelQueued(st: SlotState): Unit =
     val dropped = st.cancelQueued()
     st.version += 1
-    unappliedCount -= dropped.size
-    unappliedBytes -= dropped.iterator.map(_.bytes).sum
-    dropped.foreach(resolved)
+    dropped.foreach(finishDelta)
+
+  /** A dead occupant's written but unforced Deltas are cancelled: never forced, never rewritten */
+  private def cancelWritten(st: SlotState): Unit =
+    for i <- st.forced until st.applied do
+      val pd = st.deltas(i)
+      if !pd.done then
+        dropUnforced(pd)
+        finishDelta(pd)
+    st.forced = st.applied
+
+  /** A data force failed: `st`'s written but unforced Deltas may not be on disk, so they are queued again */
+  private def requeueWritten(st: SlotState): Unit =
+    for i <- st.forced until st.applied do
+      dropUnforced(st.deltas(i))
+    st.applied = st.forced
+    st.version += 1
+
+  private def dropUnforced(pd: PendingDelta): Unit =
+    if pd.tag >= 0 then
+      pd.tag = -1
+      unforcedCount -= 1
+      unforcedBytes -= pd.bytes
+
+  /** A Delta is forced in place or cancelled: it no longer counts as unapplied or holds back a checkpoint */
+  private def finishDelta(pd: PendingDelta): Unit =
+    if !pd.done then
+      pd.done = true
+      unappliedCount -= 1
+      unappliedBytes -= pd.bytes
+      resolved(pd)
 
   /** The occupant of `slot` is dead (deleted, replaced by copy-on-write): its queued in-place writes are cancelled,
     * and the slot is freed once the unmapping record is durable (`unmapDurable`) and nothing is in flight on it.
@@ -602,6 +679,7 @@ class FsifBackend(val storeId: StoreId,
   private def kill(slot: Int): SlotState =
     val st = slotState(slot)
     cancelQueued(st)
+    cancelWritten(st)
     st.dead = true
     st.prune()
     released(st) // a held in-place write of the dead occupant was just cancelled
@@ -618,7 +696,7 @@ class FsifBackend(val storeId: StoreId,
 
   // ---- In-place writes ----
 
-  /** A Delta was applied in place or cancelled: it no longer holds back a checkpoint of its journal */
+  /** A Delta was forced in place or cancelled: it no longer holds back a checkpoint of its journal */
   private def resolved(pd: PendingDelta): Unit =
     val left = unappliedBySeq.getOrElse(pd.journalSeq, 0) - 1
     if left > 0 then unappliedBySeq(pd.journalSeq) = left else unappliedBySeq.remove(pd.journalSeq)
@@ -648,6 +726,7 @@ class FsifBackend(val storeId: StoreId,
         writesInFlight += 1
         val base = layout.slotOffset(st.slot)
         val header = SegmentHeader.encode(batch.last.header)
+        val epoch = dataEpoch
         st.version += 1
         try
           io.execute(new IoTask(IoKind.InPlace, () => {
@@ -655,10 +734,10 @@ class FsifBackend(val storeId: StoreId,
               batch.foreach(_.ranges.foreach(r => dataFile.write(base + SegmentHeader.Size + r.offset, r.bytes)))
               dataFile.write(base, header)
             }
-            post(inPlaceDone(st, batch, r))
+            post(inPlaceDone(st, batch, epoch, r))
           }))
         catch
-          case NonFatal(t) => inPlaceDone(st, batch, Failure(t))
+          case NonFatal(t) => inPlaceDone(st, batch, epoch, Failure(t))
         true
     else
       false
@@ -668,9 +747,15 @@ class FsifBackend(val storeId: StoreId,
     if !kick(st, retrying = true) then
       released(st)
 
-  private def inPlaceDone(st: SlotState, batch: List[PendingDelta], r: Try[Unit]): Unit =
+  /** A write is written but unforced: it waits in `unforced` for a data force that covers it */
+  private def inPlaceDone(st: SlotState, batch: List[PendingDelta], epoch: Long, r: Try[Unit]): Unit =
     writesInFlight -= 1
     st.version += 1
+    // A data force failed while this write was in flight: the slot's written run (left alone by dataLost while the
+    // write was in flight) and this batch may both be lost, so both are queued again
+    val lost = epoch != dataEpoch && !st.dead
+    if lost then
+      requeueWritten(st)
     r match
       case Failure(t) if fatal.isEmpty && FsifIo.isOutOfSpace(t) =>
         // The batch stays in the slot's list, queued again, so reads keep overlaying it until it lands
@@ -690,10 +775,19 @@ class FsifBackend(val storeId: StoreId,
         tryFree(st)
       case Success(_) =>
         st.writing = 0
-        st.applied += batch.size
-        unappliedCount -= batch.size
-        unappliedBytes -= batch.iterator.map(_.bytes).sum
-        batch.foreach(resolved)
+        if st.dead then
+          // The occupant died while this write was in flight: the batch is cancelled like the rest of its Deltas
+          st.applied += batch.size
+          st.forced = st.applied
+          batch.foreach(finishDelta)
+        else if !lost then
+          val tag = nextForceId
+          batch.foreach: pd =>
+            pd.tag = tag
+            unforced += Unforced(st, pd, tag)
+            unforcedCount += 1
+            unforcedBytes += pd.bytes
+          st.applied += batch.size
         released(st)
         st.prune()
         if st.dead then
@@ -701,6 +795,105 @@ class FsifBackend(val storeId: StoreId,
         else
           kick(st)
           dropIfUnused(st)
+
+  // ---- Data forces ----
+
+  /** Forces `data`; `done` runs on serial once a force issued after this call completes. Forces run one at a time,
+    * so a success covers every write completed before the call. On ENOSPC every waiter fails, including those for
+    * the next force, since a write they rely on may have been dropped (see `dataLost`); on any other failure the
+    * store fail-stops and every waiter fails.
+    */
+  private def forceData(kind: IoKind)(done: Try[Unit] => Unit): Unit =
+    dataForceWaiters += ((kind, done))
+    startDataForce()
+
+  private def startDataForce(): Unit =
+    if !dataForceInFlight && dataForceWaiters.nonEmpty then
+      val waiters = dataForceWaiters.toList
+      dataForceWaiters.clear()
+      fatal match
+        case Some(t) =>
+          val err = new IOException(s"FSIF store $storeId has failed", t)
+          waiters.foreach((_, cb) => cb(Failure(err)))
+        case None =>
+          val id = nextForceId
+          nextForceId += 1
+          dataForceInFlight = true
+          try
+            io.execute(new IoTask(waiters.head._1, () => {
+              val r = Try(dataFile.force())
+              post(dataForceDone(id, waiters, r))
+            }))
+          catch
+            case NonFatal(t) => dataForceDone(id, waiters, Failure(t))
+
+  private def dataForceDone(id: Long, waiters: List[(IoKind, Try[Unit] => Unit)], r: Try[Unit]): Unit =
+    dataForceInFlight = false
+    r match
+      case Success(_) =>
+        forcedUpTo(id)
+        waiters.foreach((_, cb) => cb(r))
+      case Failure(t) =>
+        if fatal.isEmpty && FsifIo.isOutOfSpace(t) then
+          logger.warn(s"FSIF store $storeId: a force of the data file is out of space; re-issuing every write it " +
+            "may have dropped before forcing again")
+          dataLost()
+        else
+          logger.error(s"FSIF store $storeId: a force of the data file failed: $t")
+          failStop(t)
+        val all = waiters ++ dataForceWaiters
+        dataForceWaiters.clear()
+        all.foreach((_, cb) => cb(Failure(t)))
+    startDataForce()
+
+  /** Data force `id` succeeded: every in-place Delta written before it was issued is forced */
+  private def forcedUpTo(id: Long): Unit =
+    val touched = mutable.LinkedHashSet[SlotState]()
+    while unforced.nonEmpty && unforced.head.tag <= id do
+      val u = unforced.removeHead()
+      if u.pd.tag == u.tag && !u.pd.done then
+        dropUnforced(u.pd)
+        finishDelta(u.pd)
+        touched += u.st
+    touched.foreach: st =>
+      while st.forced < st.applied && st.deltas(st.forced).done do
+        st.forced += 1
+      st.prune()
+      if st.dead then tryFree(st) else dropIfUnused(st)
+
+  /** A data force failed with ENOSPC, so any write not yet covered by a successful force may be gone: in-place Deltas
+    * written since are queued again (those with a write in flight when it completes), a move re-queues its writes
+    * into f, a copy-on-write in progress rewrites its segment (through its own hold), and unmapped rebuild writes
+    * make this incarnation refuse further rebuild work. Re-queued Deltas freeze the store, and the retry round rewrites
+    * them.
+    */
+  private def dataLost(): Unit =
+    dataEpoch += 1
+    var requeued = false
+    slotStates.values.foreach: st =>
+      if !st.dead && st.writing == 0 && st.applied > st.forced then
+        requeueWritten(st)
+        requeued = true
+    compaction.dataLost()
+    if rebuildMaps.nonEmpty then
+      rebuildLost = true
+    // A move or copy-on-write waiting for this force holds itself; Deltas written in place are rewritten by this hold
+    if requeued then
+      hold(DataLostHold, "data-force", () => {
+        slotStates.values.toList.foreach(st => kick(st, retrying = true))
+        released(DataLostHold)
+      }, () => ())
+
+  /** Run after every serial task: forces `data` when written but unforced Deltas are what something waits for (a
+    * quiesce, a throttled reply, a checkpoint's step 2) or exceed half of `tuning.unappliedBound`
+    */
+  private def maybeForceData(): Unit =
+    if fatal.isEmpty && !frozen && !backgroundForce && unforcedCount > 0 &&
+      (quiescers.nonEmpty || throttled.nonEmpty || unforcedBytes * 2 >= tuning.unappliedBound ||
+        checkpoint.exists(_.phase == CheckpointPhase.Applying))
+    then
+      backgroundForce = true
+      forceData(IoKind.DataForce)(_ => backgroundForce = false)
 
   // ---- Journal appends and checkpoints ----
 
@@ -757,7 +950,8 @@ class FsifBackend(val storeId: StoreId,
             if cp.oldTail.isCompleted && journal.idle then
               writeNextHeader(cp)
           case CheckpointPhase.Applying =>
-            // Step 2: every journal-s Delta is applied in place or cancelled. A cancelled one's slot may still be
+            // Step 2: every journal-s Delta is forced in place (maybeForceData forces the written ones) or
+            // cancelled. A cancelled one's slot may still be
             // mapped in the snapshot, so the record that cancelled it (appended to s+1 by now) must be durable too:
             // wait for everything appended so far.
             if !unappliedBySeq.keysIterator.exists(_ < cp.seq) then
@@ -793,8 +987,9 @@ class FsifBackend(val storeId: StoreId,
       buffered.foreach((records, p) => p.completeWith(journal.append(records)))
     }
 
-  /** Steps 2 (force data), 3 (index s+1 into the other index file) and 4 (empty journal s and index s). Each is
-    * idempotent, so the whole sequence can be re-run from its start.
+  /** Steps 3 (index s+1 into the other index file) and 4 (empty journal s and index s). Each is idempotent, so the
+    * whole sequence can be re-run from its start. Step 2's force of `data` is already done: a journal-s Delta counts
+    * as applied only once a data force covering its in-place write has succeeded.
     */
   private def finish(cp: Checkpoint): Unit =
     cp.phase = CheckpointPhase.Finishing
@@ -802,7 +997,6 @@ class FsifBackend(val storeId: StoreId,
     val newIndex = FsifRecovery.IndexFiles.find(_ != oldIndex).get
     val oldJournal = cp.oldFile.get
     checkpointIo(cp) {
-      dataFile.force()
       withFile(newIndex): f =>
         f.truncate(0)
         f.write(0, IndexFile.encode(cp.seq, cp.snapshot))
@@ -1002,20 +1196,36 @@ class FsifBackend(val storeId: StoreId,
     val segment = SegmentHeader.encode(header) ++ bytes
     val key = new Object
     def issue(): Unit =
+      val epoch = dataEpoch
+      cowIo += 1
       try
         io.execute(new IoTask(IoKind.Cow, () => {
-          val r = Try {
-            dataFile.write(layout.slotOffset(f), segment)
-            dataFile.force()
-          }
-          post(cowWritten(key, () => issue(), x, id, f, r, reply))
+          val r = Try(dataFile.write(layout.slotOffset(f), segment))
+          post(segmentWritten(epoch, r))
         }))
       catch
         // A rejected task fails like a failed write: fail-stop, reply, and release the gate and tail slot
-        case NonFatal(t) => cowWritten(key, () => issue(), x, id, f, Failure(t), reply)
+        case NonFatal(t) => segmentWritten(epoch, Failure(t))
+    def segmentWritten(epoch: Long, r: Try[Unit]): Unit =
+      cowIo -= 1
+      r match
+        case Success(_) if epoch != dataEpoch =>
+          // A data force failed while the segment was being written, so it may be lost: held, then rewritten
+          cowWritten(key, () => issue(), x, id, f, Failure(new IOException("No space left on device: a data force " +
+            "failed during the copy-on-write")), reply)
+        case Success(_) =>
+          cowIo += 1
+          forceData(IoKind.Cow): fr =>
+            cowIo -= 1
+            cowWritten(key, () => issue(), x, id, f, fr, reply)
+        case Failure(_) =>
+          cowWritten(key, () => issue(), x, id, f, r, reply)
     issue()
 
-  /** ENOSPC holds the copy-on-write with X still gated and f reserved; the retry rewrites and forces the segment */
+  /** ENOSPC on the segment's write or force (including a data force that failed for another write: every waiter
+    * fails then) holds the copy-on-write with X still gated and f reserved; the retry rewrites and forces the segment,
+    * which the failed force may have dropped
+    */
   private def cowWritten(key: AnyRef, reissue: () => Unit, x: Int, id: ObjectId, f: Int, r: Try[Unit],
                          reply: Reply): Unit =
     r match
@@ -1208,11 +1418,17 @@ object FsifBackend:
   /** An operation held by ENOSPC: `retry` re-issues its I/O, `abort` ends it on fail-stop */
   private final class HeldOp(val retry: () => Unit, val abort: () => Unit)
 
+  /** Hold key of the in-place Deltas re-queued by a data force that failed with ENOSPC */
+  private object DataLostHold
+
+  /** An in-place Delta of `st` written but unforced; covered by data force `tag` (stale once `pd.tag` differs) */
+  private final case class Unforced(st: SlotState, pd: PendingDelta, tag: Long)
+
   /** A repair or repairDelete that could not be applied */
   final class OperationFailed(msg: String) extends Exception(msg)
 
   private[fsif] enum IoKind:
-    case Read, InPlace, Cow, Journal, Checkpoint, MoveRead, MoveWrite, MoveForce
+    case Read, InPlace, Cow, Journal, Checkpoint, MoveRead, MoveWrite, MoveForce, DataForce
 
   /** Test counters: moves started, moves whose Map(X, f) is durable, and moves cancelled */
   private[fsif] final case class CompactionStats(started: Int, mapped: Int, cancelled: Int)

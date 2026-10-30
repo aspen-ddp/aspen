@@ -21,7 +21,12 @@ enum FaultOp:
  *  write beyond the current size extends the file with a zero-filled gap. Creating a file is durable,
  *  as NioFsifFiles syncs the directory.
  *
- *  Thread-safe: one lock per instance. A faulted op has no effect at all.
+ *  A faulted write or truncate has no effect at all. A faulted `force` (failNext / failWhile) discards every op
+ *  pending on that file, applying none of them to the durable image, as Linux does after a failed writeback (it
+ *  marks the pages clean): reads still see them, but no later force makes them durable, and a crash drops them.
+ *  The stop of `crashAfterOps` is not a writeback failure and leaves pending ops in place for `crash()`.
+ *
+ *  Thread-safe: one lock per instance.
  */
 final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   import SimulatedFsifFiles.*
@@ -35,6 +40,8 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
   private var opsLeft = -1L
   /** Writes, forces and truncates that took effect, across all files */
   private var opsDone = 0L
+  /** Faults thrown by failNext / failWhile rules, by (file, op) */
+  private val faults = mutable.Map[(String, FaultOp), Int]()
 
   def open(name: String): FsifFile = lock.synchronized:
     live()
@@ -68,6 +75,9 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
 
   /** Writes, forces and truncates that have taken effect so far, across all files (faulted ones excluded) */
   def opCount: Long = lock.synchronized(opsDone)
+
+  /** Faults thrown so far by failNext / failWhile rules on `file` for `op` */
+  def faultCount(file: String, op: FaultOp): Int = lock.synchronized(faults.getOrElse((file, op), 0))
 
   /** New instance holding a copy of this one's durable image, with no pending ops, rules or op limit. Unlike
    *  `crash()`, this instance stays usable and no random draws are made.
@@ -122,8 +132,10 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
     if crashed then
       throw new IllegalStateException("SimulatedFsifFiles used after crash()")
 
-  /** Every write, force and truncate passes through here, so op counting has one place to live. */
-  private def beginOp(name: String, op: FaultOp): Unit =
+  /** Every write, force and truncate passes through here, so op counting has one place to live. A rule's fault on
+   *  a force first discards `f`'s pending ops (a failed writeback).
+   */
+  private def beginOp(name: String, f: SimFile, op: FaultOp): Unit =
     live()
     if opsLeft == 0 then
       throw new IOException("Input/output error (simulated crash: no further I/O)")
@@ -131,10 +143,16 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
       opsLeft -= 1
     val i = oneShot.indexWhere(r => r.file(name) && r.ops.contains(op))
     if i >= 0 then
-      throw ioException(oneShot.remove(i).fault)
+      throw faulted(name, f, op, oneShot.remove(i).fault)
     persistent.filterInPlace(r => r.active())
-    persistent.find(r => r.file(name) && r.ops.contains(op)).foreach(r => throw ioException(r.fault))
+    persistent.find(r => r.file(name) && r.ops.contains(op)).foreach(r => throw faulted(name, f, op, r.fault))
     opsDone += 1
+
+  private def faulted(name: String, f: SimFile, op: FaultOp, fault: Fault): IOException =
+    faults((name, op)) = faults.getOrElse((name, op), 0) + 1
+    if op == FaultOp.Force then
+      f.pending.clear()
+    ioException(fault)
 
   private def ioException(f: Fault): IOException = f match
     case Fault.OutOfSpace => new IOException("No space left on device")
@@ -158,21 +176,27 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
 
     def write(position: Long, bytes: Array[Byte]): Unit = lock.synchronized:
       check()
-      beginOp(name, FaultOp.Write)
+      beginOp(name, f, FaultOp.Write)
       val copy = bytes.clone()
       f.cache.write(position, copy)
       f.pending += Op.Write(position, copy)
 
     def truncate(size: Long): Unit = lock.synchronized:
       check()
-      beginOp(name, FaultOp.Truncate)
+      beginOp(name, f, FaultOp.Truncate)
       f.cache.truncate(size)
       f.pending += Op.Truncate(size)
 
     def force(): Unit = lock.synchronized:
       check()
-      beginOp(name, FaultOp.Force)
-      f.durable = f.cache.copyBytes()
+      beginOp(name, f, FaultOp.Force)
+      // The pending ops, not the cache: bytes a failed force discarded stay out of the durable image
+      val image = new Image
+      image.set(f.durable)
+      f.pending.foreach:
+        case Op.Write(pos, bytes) => image.write(pos, bytes)
+        case Op.Truncate(size) => image.truncate(size)
+      f.durable = image.copyBytes()
       f.pending.clear()
 
     def close(): Unit = lock.synchronized:

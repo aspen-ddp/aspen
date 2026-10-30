@@ -343,6 +343,94 @@ class FsifFaultSuite extends FileBasedTests:
     h.readData(ps(1)) shouldBe vs(1).toList
     h.readData(ps(2)) shouldBe vs(2).toList
 
+  // ---- A failed data force drops every write since the last good one (Linux marks the pages clean) ----
+
+  private def isData(name: String): Boolean = name == FsifRecovery.DataFile
+
+  test("ENOSPC on the data force of a checkpoint's step 2 re-issues the in-place writes before the journal is emptied"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    val v1 = bytes(100, 1)
+    h.commitOk(alloc(p, v1, 1))
+    h.quiesce()
+    val v2 = patched(v1, 10, bytes(8, 2))
+    h.commitOk(writeRange(p, v1, 10, bytes(8, 2), 2)) // acknowledged and written in place, not yet forced
+    h.files.failNext(Fault.OutOfSpace, isData, Set(FaultOp.Force)) // drops that write
+    val cp = h.backend.checkpointNow()
+    h.files.faultCount(FsifRecovery.DataFile, FaultOp.Force) shouldBe 1
+    cp.isCompleted shouldBe false
+    h.backend.isWriteFrozen shouldBe true
+    h.readData(p) shouldBe v2.toList
+    h.await(cp) // the fault is spent: the retry rewrites the Delta, forces it, and only then empties journal 0
+    h.backend.journalSeq shouldBe 1
+    h.backend.isWriteFrozen shouldBe false
+    h.quiesce()
+    h.fatals.isEmpty shouldBe true
+    h.crash()
+    h.readData(p) shouldBe v2.toList
+
+  test("ENOSPC on a copy-on-write's data force re-issues the segment and another object's unforced in-place write"):
+    val h = new Harness
+    val p = ptr(1, oid(1))
+    val q = ptr(2, oid(2))
+    val vq = bytes(80, 2)
+    h.commitOk(alloc(p, bytes(40, 1), 1))
+    h.commitOk(alloc(q, vq, 1))
+    h.quiesce()
+    val vq2 = patched(vq, 20, bytes(6, 3))
+    h.commitOk(writeRange(q, vq, 20, bytes(6, 3), 2)) // written in place, not yet forced
+    h.files.failNext(Fault.OutOfSpace, isData, Set(FaultOp.Force))
+    val vp = bytes(600, 4) // larger than cowThreshold
+    val f = h.issueCommit(overwrite(p, vp, 2))
+    h.files.faultCount(FsifRecovery.DataFile, FaultOp.Force) shouldBe 1
+    f.isCompleted shouldBe false
+    h.backend.isWriteFrozen shouldBe true
+    h.await(f) shouldBe Left(())
+    h.await(h.backend.checkpointNow()) // empties journal 0, which holds q's Delta
+    h.quiesce()
+    h.fatals.isEmpty shouldBe true
+    h.crash()
+    h.readData(p) shouldBe vp.toList
+    h.readData(q) shouldBe vq2.toList
+
+  test("ENOSPC on a compaction move's data force re-issues its copy into f before Map(X, f)"):
+    val h = new Harness
+    val ps = (0 until 3).map(x => ptr(x, oid(x + 1)))
+    val vs = (0 until 3).map(i => bytes(60 + i * 30, i))
+    for i <- 0 until 3 do h.commitOk(alloc(ps(i), vs(i), 1))
+    h.quiesce()
+    h.files.failNext(Fault.OutOfSpace, isData, Set(FaultOp.Force))
+    h.commitOk(delete(ps(0), 2)) // ext 2 moves from slot 2 into slot 0; the move's force drops the copy
+    h.files.faultCount(FsifRecovery.DataFile, FaultOp.Force) shouldBe 1
+    h.backend.compactionStats.mapped shouldBe 0
+    h.quiesce()
+    h.backend.compactionStats.mapped shouldBe 1
+    h.slotOf(2) shouldBe 0
+    h.await(h.backend.checkpointNow())
+    h.quiesce()
+    h.fatals.isEmpty shouldBe true
+    h.crash()
+    h.readData(ps(2)) shouldBe vs(2).toList
+    h.readData(ps(1)) shouldBe vs(1).toList
+
+  test("after a data force fails with a rebuild write unmapped, that incarnation refuses further rebuild work"):
+    val h = new Harness
+    h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1)))
+    h.files.failNext(Fault.OutOfSpace, isData, Set(FaultOp.Force)) // drops the segment just written
+    val fl = guarded(h.backend.rebuildFlush())
+    FsifIo.isOutOfSpace(fl.failed.get) shouldBe true
+    // Space is back, but a flush now would map a segment that is not on disk
+    val w = guarded(h.backend.rebuildWrite(ptr(2, oid(2)), ObjectType.Data, md(1), DataBuffer(bytes(30, 2))))
+    FsifIo.isOutOfSpace(w.failed.get) shouldBe true
+    val again = guarded(h.backend.rebuildFlush())
+    FsifIo.isOutOfSpace(again.failed.get) shouldBe true
+    h.crash() // a new incarnation resumes the rebuild from scratch
+    h.read(ptr(1, oid(1))) shouldBe Right(ReadError.ObjectNotFound)
+    h.backend.rebuildWrite(ptr(1, oid(1)), ObjectType.Data, md(1), DataBuffer(bytes(30, 1)))
+    guarded(h.backend.rebuildFlush()).get
+    h.crash()
+    h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList
+
   test("a crash while frozen recovers the acknowledged state; held commits are old or new, never torn"):
     val cases = List[String => Boolean](_ => true, isJournal, _ == FsifRecovery.DataFile)
     for (files, c) <- cases.zipWithIndex do

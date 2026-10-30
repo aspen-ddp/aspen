@@ -433,6 +433,8 @@ class FsifModelSuite extends FileBasedTests:
       for x <- 0 until Exts do
         ackedCommits += history(x).drop(1).count(_.acked)
         unackedAtCrash += history(x).count(!_.acked)
+      // Rules (and so faults) live only in the incarnation's files, which this crash replaces
+      cov.dataForceFaults += files.faultCount(FsifRecovery.DataFile, FaultOp.Force)
       files = files.crash()
       recover()
       verifyRecovered()
@@ -538,15 +540,18 @@ class FsifModelSuite extends FileBasedTests:
 
     private def openWindow(): Unit =
       val flag = new AtomicBoolean(true)
-      val (fileName, file) = rnd.nextInt(4) match
+      val (fileName, file) = rnd.nextInt(5) match
         case 0 => ("all", (_: String) => true)
         case 1 => ("journals", (n: String) => n.startsWith("journal"))
-        case 2 => ("data", (n: String) => n == FsifRecovery.DataFile)
+        case 2 | 3 => ("data", (n: String) => n == FsifRecovery.DataFile)
         case _ => ("indexes", (n: String) => n.startsWith("index"))
-      val (opsName, ops) = rnd.nextInt(3) match
-        case 0 => ("all", FaultOp.values.toSet)
-        case 1 => ("write", Set(FaultOp.Write))
-        case _ => ("force", Set(FaultOp.Force))
+      // ENOSPC on a data force drops every write since the last good force (the simulator discards them), so it is
+      // the most demanding fault: data windows are forces only half the time
+      val (opsName, ops) = if fileName == "data" && rnd.nextBoolean() then ("force", Set(FaultOp.Force)) else
+        rnd.nextInt(3) match
+          case 0 => ("all", FaultOp.values.toSet)
+          case 1 => ("write", Set(FaultOp.Write))
+          case _ => ("force", Set(FaultOp.Force))
       files.failWhile(Fault.OutOfSpace, file, ops)(flag.get)
       window = Some(flag)
       windowEnd = op + 1 + rnd.nextInt(10)
@@ -668,6 +673,7 @@ class FsifModelSuite extends FileBasedTests:
       // A stale index lives only between a checkpoint's index force and its emptying of the old one
       total.staleIndexImages should be >= 1
       total.laterIndexImages should be >= CoverageFloor
+      total.dataForceFaults should be >= CoverageFloor
       if interruptRecovery then
         total.inRecovery should be >= CoverageFloor
         total.inRecoveryCheckpoint should be >= CoverageFloor
@@ -695,6 +701,8 @@ object FsifModelSuite:
     var midCheckpointImages = 0
     var staleIndexImages = 0
     var laterIndexImages = 0
+    /** Data forces that failed with ENOSPC (each dropping the writes since the last good one) */
+    var dataForceFaults = 0
     def +(o: Coverage): Coverage =
       val c = new Coverage
       c.crashes = crashes + o.crashes
@@ -707,11 +715,12 @@ object FsifModelSuite:
       c.midCheckpointImages = midCheckpointImages + o.midCheckpointImages
       c.staleIndexImages = staleIndexImages + o.staleIndexImages
       c.laterIndexImages = laterIndexImages + o.laterIndexImages
+      c.dataForceFaults = dataForceFaults + o.dataForceFaults
       c
     override def toString: String =
       s"crashes=$crashes inCheckpoint=$inCheckpoint inMove=$inMove frozen=$frozen " +
         s"midCheckpointImages=$midCheckpointImages staleIndexImages=$staleIndexImages " +
-        s"laterIndexImages=$laterIndexImages inRecovery=$inRecovery " +
+        s"laterIndexImages=$laterIndexImages dataForceFaults=$dataForceFaults inRecovery=$inRecovery " +
         s"inRecoveryCheckpoint=$inRecoveryCheckpoint recoveryCompleted=$recoveryCompleted"
 
   final case class Result(seed: Int, digest: String, cov: Coverage)

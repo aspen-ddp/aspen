@@ -7,24 +7,35 @@ import scala.collection.mutable
   */
 private[fsif] final class PendingDelta(val header: SegmentHeader, val ranges: List[DeltaRange]):
   var durable = false
+  /** Written in place and not yet covered by a successful force of `data`: the id of the first data force that
+    * covers it (FsifBackend's `nextForceId` when the write completed), else -1
+    */
+  var tag = -1L
+  /** Forced in place or cancelled: no longer counted as unapplied, and no longer holding back a checkpoint */
+  var done = false
   /** Sequence of the journal this Delta was appended to: a checkpoint to seq+1 waits for it to be applied */
   var journalSeq = 0L
   val bytes: Long = SegmentHeader.Size.toLong + ranges.iterator.map(_.bytes.length.toLong).sum
 
 /** Serial-executor state of one slot.
   *
-  * `deltas` holds the slot's Deltas in commit order, in three runs:
-  *  - `[0, applied)`: written in place, but kept because a read was in flight when the write finished. A read
-  *    overlays every Delta in the list, so one that raced with an in-place write still sees all of its bytes;
+  * `deltas` holds the slot's Deltas in commit order, in four runs:
+  *  - `[0, forced)`: written in place and covered by a successful force of `data` (or cancelled), but kept because a
+  *    read was in flight. A read overlays every Delta in the list, so one that raced with an in-place write still
+  *    sees all of its bytes;
+  *  - `[forced, applied)`: written in place but not yet forced. A failed force may have dropped them (Linux marks
+  *    failed-writeback pages clean, so a retried force would not write them), so they stay overlaid and are
+  *    re-queued (`applied` set back to `forced`) when a data force fails;
   *  - `[applied, applied + writing)`: being written in place on io (one coalesced write task);
   *  - the rest: queued, durable ones first (journal batches complete in order).
   *
-  * The written run is dropped whenever no read is in flight. A slot whose occupant died (deleted or moved by
+  * The forced run is dropped whenever no read is in flight. A slot whose occupant died (deleted or moved by
   * copy-on-write) is `dead`: its queued Deltas are cancelled and it becomes free (the slot-freeing rule) once
   * `unmapDurable`, `reads == 0` and `writing == 0`.
   */
 private[fsif] final class SlotState(val slot: Int):
   val deltas: mutable.ArrayBuffer[PendingDelta] = mutable.ArrayBuffer()
+  var forced = 0
   var applied = 0
   var writing = 0
   var reads = 0
@@ -48,11 +59,12 @@ private[fsif] final class SlotState(val slot: Int):
     deltas.remove(from, deltas.size - from)
     dropped
 
-  /** Drops the written run if no read can still need it */
+  /** Drops the forced run if no read can still need it */
   def prune(): Unit =
-    if reads == 0 && applied > 0 then
-      deltas.remove(0, applied)
-      applied = 0
+    if reads == 0 && forced > 0 then
+      deltas.remove(0, forced)
+      applied -= forced
+      forced = 0
 
   /** The run of durable Deltas that may be written next, or empty if a write is in flight */
   def nextWritable(): List[PendingDelta] =

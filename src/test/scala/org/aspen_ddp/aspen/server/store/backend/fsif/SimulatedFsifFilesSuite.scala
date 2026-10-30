@@ -129,6 +129,22 @@ class SimulatedFsifFilesSuite extends FileBasedTests:
     f.write(0, filled(10, 1))
     f.size shouldBe 10
 
+  test("a faulted force discards the pending ops: reads still see them, but no later force makes them durable"):
+    for (fault, seed) <- List(Fault.OutOfSpace, Fault.IoError).zipWithIndex do
+      val fs = new SimulatedFsifFiles(rng(seed))
+      val f = fs.open("a")
+      f.write(0, filled(1024, 1))
+      f.force()
+      f.write(0, filled(512, 2))
+      fs.failNext(fault, ops = Set(FaultOp.Force))
+      intercept[IOException](f.force())
+      fs.faultCount("a", FaultOp.Force) shouldBe 1
+      f.read(0, 512) shouldBe filled(512, 2) // still in the page cache
+      f.write(512, filled(512, 3))
+      f.force() // succeeds, but covers only the write made after the failure
+      val r = fs.crash().open("a").read(0, 1024)
+      withClue(s"$fault: ")(r shouldBe (filled(512, 1) ++ filled(512, 3)))
+
   test("IoError is not out of space"):
     val fs = new SimulatedFsifFiles(new Random(1))
     val f = fs.open("a")

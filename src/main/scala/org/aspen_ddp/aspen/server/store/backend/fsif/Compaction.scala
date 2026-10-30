@@ -18,7 +18,9 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
   *  4. Deltas for X appended to t after the copy was assembled (`onDelta`) are also written to f, in order and one
   *     write task at a time. Their records are journaled with target t and acknowledged normally.
   *  5. Once no write into f is in flight or queued, `data` is forced. Map(X, f) is appended only when no write into
-  *     f was issued after that force started; otherwise another force follows (durable-before-map).
+  *     f was issued after that force started; otherwise another force follows (durable-before-map). Every write into
+  *     f (the copy included) is kept until a force covers it: a data force that fails with ENOSPC may have dropped
+  *     it (Linux marks the pages clean), so it is queued again (`dataLost`).
   *  6. Appending the Map kills t (cancelling its queued in-place writes, which f already holds) in the same serial
   *     task, and t is freed once the Map is durable, under the slot-freeing rule.
   *
@@ -86,6 +88,17 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
         pd.ranges.foreach(r => m.queue += ((base + SegmentHeader.Size + r.offset, r.bytes)))
         m.queue += ((base, SegmentHeader.encode(pd.header)))
         pump(m)
+
+  /** A force of `data` failed with ENOSPC, so the move's writes into f since its last good force may be gone: they
+    * are queued again ahead of the rest, in order. A write in flight now is re-queued when it completes (`written`
+    * sees the stale epoch), together with those before it.
+    */
+  def dataLost(): Unit =
+    move.foreach: m =>
+      if !m.cancelled && !m.mapAppended && !m.writing && m.written.nonEmpty then
+        m.queue.prependAll(m.written)
+        m.written.clear()
+        m.dirty = true
 
   /** Returns false if the truncate hit ENOSPC and is held (the retry round runs it again) */
   private def truncate(): Boolean =
@@ -171,43 +184,59 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
         m.writing = true
         m.dirty = true
         m.io += 1
-        host.runIo(IoKind.MoveWrite)(writes.foreach((pos, b) => host.dataFile.write(pos, b)))(r => written(m, writes, r))
+        val epoch = host.dataEpoch
+        host.runIo(IoKind.MoveWrite)(writes.foreach((pos, b) => host.dataFile.write(pos, b)))(r =>
+          written(m, writes, epoch, r))
       else if m.assembled && !m.forcing then
         if m.dirty then
           m.forcing = true
           m.dirty = false
           m.io += 1
-          host.runIo(IoKind.MoveForce)(host.dataFile.force())(r => forced(m, r))
+          val covered = m.written.size
+          host.forceData(IoKind.MoveForce)(r => forced(m, covered, r))
         else
           appendMap(m)
 
-  private def written(m: Move, writes: List[(Long, Array[Byte])], r: Try[Unit]): Unit =
+  /** `epoch`: the backend's data epoch when the writes were issued; a data force failed since if it differs */
+  private def written(m: Move, writes: List[(Long, Array[Byte])], epoch: Long, r: Try[Unit]): Unit =
     m.io -= 1
     m.writing = false
+    // Lost with the writes into f before them: every one goes back to the front of the queue, in order
+    val lost = epoch != host.dataEpoch
+    def requeue(ws: List[(Long, Array[Byte])]): Unit =
+      m.queue.prependAll(ws)
+      if lost then
+        m.queue.prependAll(m.written)
+        m.written.clear()
+      m.dirty = true
     r match
       case Failure(t) if outOfSpace(t) =>
         if m.cancelled then
           finishIfDone(m)
         else
-          // Back to the front of the queue, still in order: the retry issues them again
-          m.queue.prependAll(writes)
+          // The retry issues them again
+          requeue(writes)
           holdMove(m, "move-write")
       case Failure(t) =>
         host.failStop(t)
         finishIfDone(m)
       case Success(_) =>
+        if lost then requeue(writes) else m.written ++= writes
         host.released(m)
         if m.cancelled || host.fatal then finishIfDone(m) else pump(m)
 
-  private def forced(m: Move, r: Try[Unit]): Unit =
+  /** `covered`: how many of `m.written` had completed when the force was requested, so a success covers them */
+  private def forced(m: Move, covered: Int, r: Try[Unit]): Unit =
     m.io -= 1
     m.forcing = false
+    if r.isSuccess then
+      m.written.remove(0, math.min(covered, m.written.size))
     r match
       case Failure(t) if outOfSpace(t) =>
         if m.cancelled then
           finishIfDone(m)
         else
-          m.dirty = true // the force did not happen
+          m.dirty = true // the force did not happen, and dataLost has re-queued the writes it may have dropped
           holdMove(m, "move-force")
       case Failure(t) =>
         host.failStop(t)
@@ -267,6 +296,10 @@ private[fsif] object Compaction:
     def failStop(t: Throwable): Unit
     /** Writes are frozen by ENOSPC: start nothing new */
     def frozen: Boolean
+    /** Forces `data` (one force at a time); `done` runs once a force issued after the call completes */
+    def forceData(kind: FsifBackend.IoKind)(done: Try[Unit] => Unit): Unit
+    /** Bumped by every data force that fails with ENOSPC */
+    def dataEpoch: Long
     /** Holds an operation whose I/O hit ENOSPC: `retry` runs in the backend's next retry round, `abort` on fail-stop */
     def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit
     /** The held operation `key` succeeded or became moot; no effect if it is not held */
@@ -287,6 +320,10 @@ private[fsif] object Compaction:
     var mapAppended = false
     /** Writes into f not yet issued, in order: (file position, bytes) */
     val queue: mutable.ArrayBuffer[(Long, Array[Byte])] = mutable.ArrayBuffer()
+    /** Writes into f completed and not yet covered by a successful data force, in order. A force failure may have
+      * dropped them, so they are kept to be issued again.
+      */
+    val written: mutable.ArrayBuffer[(Long, Array[Byte])] = mutable.ArrayBuffer()
     var writing = false
     var forcing = false
     /** A write into f was issued after the most recent force started (or no force has run yet) */

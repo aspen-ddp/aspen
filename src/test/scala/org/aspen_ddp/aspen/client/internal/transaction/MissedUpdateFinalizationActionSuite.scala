@@ -6,9 +6,14 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, ObjectId, Obj
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, TransactionDescription, TransactionId}
 
+import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceSetId
+import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
+
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future}
 
 /** Tests for MissedUpdateFinalizationAction's storePointer persistence.
   *
@@ -166,3 +171,30 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       // property of the pointer, so the re-mark writes identical bytes over the first entry.
       entry.isDefined shouldBe true
       decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
+
+  /** Stages an errorTree write for `poolId` on a fresh transaction, applies limitTracking and
+    * returns whether tracking is still enabled. The transaction is aborted afterward.
+    */
+  private def trackingAfterErrorWrite(poolId: PoolId): Future[Boolean] =
+    for
+      pool <- client.getStoragePool(poolId)
+      tx = client.newTransaction()
+      _ <- pool.errorTree.set(Key(Array[Byte](1)), Value(Array[Byte](2)))(using tx)
+      _ = MissedUpdateFinalizationAction.limitTracking(poolId, tx)
+      enabled = tx.missedUpdateTrackingEnabled
+      _ = tx.abort(new Exception("test complete"))
+    yield enabled
+
+  atest("an ErrorTree write for the bootstrap pool disables tracking"):
+    trackingAfterErrorWrite(Radicle.poolId).map(_ shouldBe false)
+
+  atest("an ErrorTree write for the initial metadata pool keeps tracking"):
+    // Its trees live in the bootstrap pool, so the write cannot loop back on itself
+    trackingAfterErrorWrite(PoolId.InitialMetadataPoolId).map(_ shouldBe true)
+
+  atest("an ErrorTree write for an ordinary pool keeps tracking"):
+    for
+      poolId <- client.createNewStoragePool("tracking-pool", Replication(1, 1), None, RocksDBConfig(),
+                                            StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      enabled <- trackingAfterErrorWrite(poolId)
+    yield enabled shouldBe true

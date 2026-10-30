@@ -5,6 +5,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction, TransactionCreationError, UnknownStoragePool}
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
@@ -105,9 +106,9 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
       for {
         pool <- client.getStoragePool(storeId.poolId)
         tx = client.newTransaction()
-        _ = tx.disableMissedUpdateTracking()
         _ <- pool.errorTree.set(key,
                MissedUpdateFinalizationAction.encodeErrorEntry(txd.startTimestamp, storePointer))(using tx)
+        _ = MissedUpdateFinalizationAction.limitTracking(storeId.poolId, tx)
         _ <- tx.commit()
       } yield {
         logger.trace(s"COMPLETED - Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
@@ -119,6 +120,14 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
 object MissedUpdateFinalizationAction extends RegisteredTypeFactory with FinalizationActionFactory {
   val typeUUID: UUID = UUID.fromString("E1F61997-61A7-4C86-A211-0EBA601DEDA3")
+
+  /** Disables missed-update tracking on `tx`, an ErrorTree write about `entryPool`, only when the
+    * write itself touches that pool. Only then could a missed update of the write mark an entry in
+    * the same tree. Metadata placement keeps every other pool's ErrorTree out of the pool it describes.
+    */
+  def limitTracking(entryPool: PoolId, tx: Transaction): Unit =
+    if tx.referencedPoolIds.contains(entryPool) then
+      tx.disableMissedUpdateTracking()
 
   var errorTimeout = Duration(250, MILLISECONDS)
 

@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, KeyValueOperation, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
@@ -118,8 +119,10 @@ trait Transaction {
     */
   protected[client] def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit
 
-  /** Used by MissedUpdateFinalizationActions and by AspenClient.newRepairTransaction to prevent
-    *  circular loops when marking objects as having missed update transactions.
+  /** Used by AspenClient.newRepairTransaction and, via MissedUpdateFinalizationAction.limitTracking,
+    *  by ErrorTree writes that reference the pool the entry is about. Such a write could miss an
+    *  update on the very tree it writes, a circular loop. ErrorTree writes for other pools keep
+    *  tracking since their trees live in other pools.
     *  This method should NOT be used for any other purposes.
     *
     */
@@ -129,6 +132,9 @@ trait Transaction {
     *  transaction factory is testable; the flag is otherwise write-only.
     */
   private[aspen] def missedUpdateTrackingEnabled: Boolean
+
+  /** The ids of every pool holding an object this transaction requires, updates or allocates */
+  private[aspen] def referencedPoolIds: Set[PoolId]
 
   /** Sets the delay in Milliseconds after which peers will be marked as having missed the commit of the transaction
     */

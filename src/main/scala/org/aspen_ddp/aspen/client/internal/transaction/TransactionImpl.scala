@@ -51,6 +51,10 @@ class TransactionImpl(val client: AspenClient,
     bldr.missedUpdateTrackingEnabled
   }
 
+  def referencedPoolIds: Set[PoolId] = modify { bldr =>
+    bldr.allReferencedPoolIds
+  }
+
   def disableMissedUpdateTracking(): Unit = modify { bldr =>
     bldr.disableMissedUpdateTracking()
   }

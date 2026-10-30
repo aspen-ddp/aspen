@@ -451,7 +451,10 @@ class FsifBackend(val storeId: StoreId,
 
   private def newJournal(f: FsifFile, start: Long, next: Long, salt: Long): JournalWriter =
     var w: JournalWriter = null
-    w = new JournalWriter(f, start, next, salt, io, serial, t => journalError(w, t), () => released(w))
+    // onSettled: an io task abandoned by failAll has ended; run the guarded epilogue so a quiesce or close waiting
+    // on `!journal.busy` completes
+    w = new JournalWriter(f, start, next, salt, io, serial, t => journalError(w, t), () => released(w),
+      () => post(()))
     w
 
   /** The writer has truncated back to its durable length and holds the failed batch and everything behind it */
@@ -499,10 +502,12 @@ class FsifBackend(val storeId: StoreId,
     if fatal.isEmpty && heldOps.nonEmpty then
       val round = heldOps.toList
       heldOps.clear()
+      // The whole round counts as retrying before any retry runs: one that releases synchronously must not find
+      // both maps empty and unfreeze while later ops of the round are still unretried
+      round.foreach((key, op) => retryingOps(key) = op)
       round.foreach: (key, op) =>
         // A retry earlier in this round may have fail-stopped, which aborted the rest
-        if fatal.isEmpty then
-          retryingOps(key) = op
+        if fatal.isEmpty && retryingOps.contains(key) then
           op.retry()
 
   private def addFreezeWaiter(p: Promise[Unit]): Unit =

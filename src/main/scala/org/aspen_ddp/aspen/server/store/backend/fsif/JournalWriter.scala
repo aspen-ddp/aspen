@@ -16,11 +16,13 @@ import scala.util.control.NonFatal
   * effort), so a torn tail never precedes later batches. The writer then keeps the failed batch and everything
   * buffered, with their Futures pending, calls `onError` with the original exception and sends nothing more until
   * `retry()` (which re-sends the same batch under the same batch number) or `failAll`. Once a retried batch is
-  * forced, `onResumed` is called, before that batch's Futures complete.
+  * forced, `onResumed` is called, before that batch's Futures complete. When an io task ends after `failAll` (so no
+  * Future completes and `busy` just turned false), `onSettled` is called so the owner can re-check its idle state.
   */
 final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, salt: Long,
                           io: ExecutionContext, serial: SerialExecutor, onError: Throwable => Unit,
-                          onResumed: () => Unit = () => ()):
+                          onResumed: () => Unit = () => (),
+                          onSettled: () => Unit = () => ()):
   import JournalWriter.Batch
 
   private var durable = startLength
@@ -114,8 +116,10 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
 
   private def completed(batch: Batch, result: Try[Unit]): Unit =
     sending = false
-    // After failAll the batch's Futures have already failed
-    if failed.isEmpty then
+    // After failAll the batch's Futures have already failed: nothing completes, so tell the owner busy has cleared
+    if failed.isDefined then
+      onSettled()
+    else
       result match
         case Success(_) =>
           durable += batch.bytes.length

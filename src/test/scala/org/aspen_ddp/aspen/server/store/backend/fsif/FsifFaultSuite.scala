@@ -465,6 +465,35 @@ class FsifFaultSuite extends FileBasedTests:
       h.crash()
       h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList
 
+  test("close after a fail-stop completes once the journal batch that was in flight settles"):
+    import FsifCheckpointSuite.{HoldEc, oneShot}
+    val h = new Harness(mkIo = () => new HoldEc)
+    val ec = h.io.asInstanceOf[HoldEc]
+    val p1 = ptr(1, oid(1))
+    val p2 = ptr(2, oid(2))
+    h.commitOk(alloc(p1, bytes(40, 1), 1))
+    h.commitOk(alloc(p2, bytes(40, 2), 1))
+    h.quiesce()
+    ec.hold = oneShot(FsifBackendSuite.isKind(FsifBackend.IoKind.Journal))
+    val held = h.issueCommit(writeRange(p1, bytes(40, 1), 3, bytes(4, 9), 2)) // its batch's io is held
+    ec.heldCount shouldBe 1
+    h.files.failNext(Fault.IoError, _ == FsifRecovery.DataFile)
+    val cow = h.issueCommit(overwrite(p2, bytes(600, 3), 2)) // copy-on-write: a data I/O error, fail-stop
+    h.await(cow) shouldBe Right(CommitError.IOFailure)
+    h.await(held) shouldBe Right(CommitError.IOFailure)
+    h.fatals.size shouldBe 1
+    val closed = h.backend.close()
+    closed.isCompleted shouldBe false // the journal's io still runs on its file
+    ec.release()
+    Await.result(closed, Timeout)
+    h.fatals.size shouldBe 1
+
+  test("EDQUOT (disk quota exceeded) counts as out of space"):
+    FsifIo.isOutOfSpace(new IOException("Disk quota exceeded")) shouldBe true
+    FsifIo.isOutOfSpace(new IOException("write failed", new IOException("EDQUOT"))) shouldBe true
+    FsifIo.isOutOfSpace(new IOException("DISK QUOTA EXCEEDED")) shouldBe true
+    FsifIo.isOutOfSpace(new IOException("Input/output error")) shouldBe false
+
   // ---- Seeded ----
 
   test("random ENOSPC windows with commits, checkpoints and compaction: every commit succeeds and survives a crash"):

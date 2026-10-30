@@ -78,6 +78,9 @@ trait Transaction {
    *  in-transaction (e.g. clearing many bits of a shared allocation index) would risk collisions with concurrent
    *  allocations. A no-op for ordinary pools. Applies to every deletion in the transaction.
    *
+   *  FSIF pools support deferred deletions in only one FSIF pool per transaction: deferred deletions in a second
+   *  FSIF pool fail the transaction with IllegalArgumentException.
+   *
    *  Throws PostCommitTransactionModification if commit() has already been called.
    */
   def deferAllocationRelease(): Unit

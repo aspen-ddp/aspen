@@ -115,6 +115,7 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
     * nothing else runs it.
     */
   private def runTask(kvos: KeyValueObjectState): Future[Unit] =
+    // createTask ignores the TaskExecutor
     val task = FsifReleaseIndicesTask.createTask(client, DurableTaskPointer(kvos.pointer), kvos.revision,
       kvos.contents, null)
     for
@@ -273,24 +274,35 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       tasks.size should be(1)
       afterTask should be(Set())
 
+  /** Deletes `ptr` in a deferring transaction; `fail` adds a requirement that aborts it */
+  private def deferredDelete(ptr: ObjectPointer, fail: Boolean): Future[Unit] =
+    for
+      meta <- client.readMetadata(ptr)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(ptr, meta.refcount, meta.refcount.decrement())
+      _ = tx.deferAllocationRelease()
+      _ = if fail then tx.update(radicle, None, None, List(DoesNotExist(Radicle.SystemIdKey)), Nil)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+    yield ()
+
   atest("an aborted deferred delete enrolls no task"):
     for
       (_, allocator, bitmap) <- install(16)
       o <- allocateOne(allocator)
       before <- systemTasks()
-      meta <- client.readMetadata(o)
-      tx = client.newTransaction()
-      _ = tx.setRefcount(o, meta.refcount, meta.refcount.decrement())
-      _ = tx.deferAllocationRelease()
-      _ = tx.update(radicle, None, None, List(DoesNotExist(Radicle.SystemIdKey)), Nil)
-      failure <- tx.commit().failed
+      failure <- deferredDelete(o, fail = true).failed
       _ <- waitForTransactionsToComplete()
-      after <- systemTasks()
+      afterAbort <- systemTasks()
       bits <- setBits(bitmap)
+      // The same transaction without the failing requirement does enroll one, so the abort is what prevented it
+      _ <- deferredDelete(o, fail = false)
+      afterCommit <- releaseTasks()
     yield
       failure shouldBe a[TransactionAborted]
-      after.size should be(before.size)
+      afterAbort.size should be(before.size)
       bits should be(Set(indexOf(o)))
+      afterCommit.size should be(1)
 
   atest("deferring in a transaction that also allocates still sets the new bit in the transaction"):
     for
@@ -312,3 +324,54 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       afterCommit should be(Set(indexOf(o), indexOf(p)))
       tasks.size should be(1)
       afterTask should be(Set(indexOf(p)))
+
+  atest("a deferring transaction that also allocates in the bootstrap pool commits and enrolls the task"):
+    // The bootstrap pool's Default strategy needs no commit hook, so the task-state allocation the FSIF hook adds
+    // there never counts as growth of an already-prepared pool, whatever order the hooks would run in
+    for
+      (_, allocator, bitmap) <- install(16)
+      o <- allocateOne(allocator)
+      radiclePool <- client.getStoragePool(Radicle.poolId)
+      meta <- client.readMetadata(o)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(o, meta.refcount, meta.refcount.decrement())
+      _ = tx.deferAllocationRelease()
+      other <- radiclePool.allocator.allocateDataObject(DataBuffer(Array[Byte](3)))(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      otherMeta <- client.readMetadataOptional(other)
+      afterCommit <- setBits(bitmap)
+      tasks <- releaseTasks()
+      _ <- runTask(tasks.head)
+      afterTask <- setBits(bitmap)
+    yield
+      otherMeta.isDefined should be(true)
+      afterCommit should be(Set(indexOf(o)))
+      tasks.size should be(1)
+      afterTask should be(Set())
+
+  atest("deferred deletions in two FSIF pools in one transaction fail it with IllegalArgumentException"):
+    for
+      (poolA, allocatorA, bitmapA) <- install(16)
+      (poolB, allocatorB, bitmapB) <- install(16)
+      a <- allocateOne(allocatorA)
+      b <- allocateOne(allocatorB)
+      before <- systemTasks()
+      metaA <- client.readMetadata(a)
+      metaB <- client.readMetadata(b)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(a, metaA.refcount, metaA.refcount.decrement())
+      _ = tx.setRefcount(b, metaB.refcount, metaB.refcount.decrement())
+      _ = tx.deferAllocationRelease()
+      failure <- tx.commit().failed
+      _ <- waitForTransactionsToComplete()
+      after <- systemTasks()
+      bitsA <- setBits(bitmapA)
+      bitsB <- setBits(bitmapB)
+    yield
+      failure shouldBe an[IllegalArgumentException]
+      failure.getMessage should include(poolA.toString)
+      failure.getMessage should include(poolB.toString)
+      after.size should be(before.size)
+      bitsA should be(Set(indexOf(a)))
+      bitsB should be(Set(indexOf(b)))

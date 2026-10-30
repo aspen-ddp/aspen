@@ -270,14 +270,16 @@ class TransactionImpl(val client: AspenClient,
     *
     *  The hooks may add to the transaction, including objects in pools not yet resolved or prepared, so this repeats
     *  until a pass finds no pool with work its hook hasn't been given. A pool whose hook already ran must not gain
-    *  allocations or deletions: that fails with IllegalStateException. The hooks run one at a time, through
+    *  allocations or deletions: that fails with IllegalStateException. Pools whose strategy's `needsCommitHook` is
+    *  false are skipped entirely: never called, never recorded, never reported as grown. The hooks run one at a time, through
     *  hookView, so the caller cannot modify the transaction after commit().
     */
   private def runCommitHooks(pools: Map[PoolId, StoragePool],
                              prepared: Map[PoolId, (Set[ObjectPointer], Set[ObjectPointer])])
                             (using ExecutionContext): Future[Map[PoolId, StoragePool]] =
     resolvePools(pools).flatMap: pools =>
-      val byPool = objectsByPool()
+      // Pools whose strategy needs no hook are neither called nor recorded, so they can never be reported as grown
+      val byPool = objectsByPool().filter((poolId, _) => pools(poolId).allocationStrategy.needsCommitHook)
       val grown = prepared.keys.filter(poolId => byPool(poolId) != prepared(poolId))
       val fresh = byPool.keys.filterNot(prepared.contains).toList
       if grown.nonEmpty then

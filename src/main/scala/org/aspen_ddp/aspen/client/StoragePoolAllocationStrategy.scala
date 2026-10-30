@@ -13,6 +13,8 @@ object StoragePoolAllocationStrategy:
                        configData: Option[Array[Byte]]): StoragePoolAllocationStrategy
 
   object Default extends StoragePoolAllocationStrategy:
+    override def needsCommitHook: Boolean = false
+
     override def createDataObjectPointer(poolId: PoolId)(using t: Transaction): Future[DataObjectPointer] =
       Future.successful(new DataObjectPointer(ObjectId(UUID.randomUUID()), poolId, Array.empty))
 
@@ -39,6 +41,11 @@ trait StoragePoolAllocationStrategy:
   def createDataObjectPointer(poolId: PoolId)(using t: Transaction): Future[DataObjectPointer]
 
   def createKeyValueObjectPointer(poolId: PoolId)(using t: Transaction): Future[KeyValueObjectPointer]
+
+  /** False means prepareCommit is never called for this pool and the pool is exempt from the commit hooks' growth
+   *  check, so other pools' hooks may add allocations and deletions to it.
+   */
+  def needsCommitHook: Boolean = true
 
   /** Called while `t` is being committed, once for each pool in which `t` allocates or deletes objects, after every
    *  object the caller added. `allocated` holds only staged allocations; `deferRelease` is

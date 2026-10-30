@@ -59,6 +59,12 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
         val (indexCount, bitmap) = decodeConfig(bytes)
         new Strategy(client, indexCount, bitmap)
 
+  /** Transaction attachment key, shared by every Strategy instance, naming the one FSIF pool whose deferred release
+    * the transaction enrolled
+    */
+  private object DeferredReleaseKey
+  private final class DeferredReleasePool(val poolId: PoolId)
+
   /** One transaction's view of one pool's bitmap. Guarded by its own monitor. */
   private final class TxState:
     private val readPromise = Promise[KeyValueObjectState]()
@@ -126,10 +132,17 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
       // The indices are taken here so a bad pointer fails the transaction even when its release is deferred
       Future(deleted.map(p => FsifIndexBitmap.indexOf(p.storePointer, indexCount))).flatMap: deletedIndices =>
         if deferRelease && deletedIndices.nonEmpty then
-          for
-            _ <- updateBits(poolId, allocated, Nil)
-            _ <- FsifReleaseIndicesTask.prepare(client, poolId, deletedIndices)
-          yield ()
+          // Each enrollment updates the shared system task registry, which a transaction may update only once
+          val enrolled = t.attachment(DeferredReleaseKey)(new DeferredReleasePool(poolId)).poolId
+          if enrolled != poolId then
+            Future.failed(new IllegalArgumentException(
+              "deferAllocationRelease supports deferred deletions in only one FSIF pool per transaction; " +
+              s"got $enrolled and $poolId"))
+          else
+            for
+              _ <- updateBits(poolId, allocated, Nil)
+              _ <- FsifReleaseIndicesTask.prepare(client, poolId, deletedIndices)
+            yield ()
         else
           updateBits(poolId, allocated, deletedIndices)
 
@@ -141,7 +154,7 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
 
     /** Reads the transaction's view of the bitmap, sets the bits of `allocated` and clears those of `released`, and
       * adds one update guarded by the revision of every segment key it changes. An already-set bit for an allocation
-      * fails it; an already-clear bit for a release is logged and skipped. Adds nothing when no bit changes.
+      * throws IllegalStateException, failing the transaction; an already-clear bit for a release is logged and skipped. Adds nothing when no bit changes.
       */
     private def updateBits(poolId: PoolId, allocated: List[ObjectPointer], released: Seq[Int])
                           (using t: Transaction): Future[Unit] =

@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.client.{AppendPosition, AspenClient, RangedWrite, Reg
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
@@ -228,19 +228,25 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
     withClue(s"bytes differ at index ${mismatch.getOrElse(-1)}: "):
       mismatch should be(None)
 
-  /** Allocates a DataObject holding `content` in the FSIF pool, in a transaction touching nothing else.
-    *
-    * It is not linked from the radicle: a transaction spanning two pools aborts today, because every store checks
-    * every requirement and finds the other pool's objects missing (see the task report). The pointer is still
-    * recorded durably: the allocation's finalization action enters it in the pool's allocation tree.
+  /** The radicle key linking an object allocated by these tests */
+  private def linkKey(dp: DataObjectPointer): Key = Key(dp.id.toBytes)
+
+  /** Allocates a DataObject holding `content` in the FSIF pool and links it from the radicle, in the bootstrap pool,
+    * in the same transaction. `radicleRevision` adds a revision requirement on the radicle.
     */
-  private def allocate(content: Array[Byte]): Future[DataObjectPointer] =
+  private def allocate(content: Array[Byte], radicleRevision: Option[ObjectRevision] = None): Future[DataObjectPointer] =
     given tx: Transaction = client.newTransaction()
     for
       pool <- client.getStoragePool(poolId)
       dp <- pool.allocator.allocateDataObject(DataBuffer(content))
+      _ = tx.update(radicle, radicleRevision, None, List(KeyValueUpdate.DoesNotExist(linkKey(dp))),
+                    List(Insert(linkKey(dp), dp.toArray)))
       _ <- tx.commit()
     yield dp
+
+  /** The pointer the radicle links under `dp`'s key, if any */
+  private def radicleLink(dp: DataObjectPointer): Future[Option[Array[Byte]]] =
+    client.read(radicle).map(_.contents.get(linkKey(dp)).map(_.value.bytes))
 
   private def appendAll(start: AppendPosition, chunks: List[Array[Byte]]): Future[AppendPosition] =
     chunks.foldLeft(Future.successful(start)): (fpos, chunk) =>
@@ -361,7 +367,11 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
       finalPos <- client.readAppendPosition(dp)
       _ <- readsWithStoresDown(dp, expected)
       otherState <- client.read(other)
+      dpLink <- radicleLink(dp)
+      otherLink <- radicleLink(other)
     yield
+      dpLink.map(_.toList) should be(Some(dp.toArray.toList))
+      otherLink.map(_.toList) should be(Some(other.toArray.toList))
       List(externalIndex(dp), externalIndex(other)) should be(List(0, 1))
       start.length should be(0)
       last.length should be(expected.length)
@@ -370,6 +380,30 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
       bytesShouldMatch(ranges(1).data.getByteArray, expected.takeRight(64))
       bytesShouldMatch(otherState.data.getByteArray, Array[Byte](1, 2, 3))
       succeed
+
+  atest("a failed requirement on the radicle aborts an allocation in the FSIF pool linked from it"):
+    var allocated: Option[DataObjectPointer] = None
+    for
+      _ <- setUp()
+      before <- client.read(radicle)
+      aborted <- allocate(Array[Byte](1, 2, 3), Some(new ObjectRevision(UUID.randomUUID())))
+                   .map: dp =>
+                     allocated = Some(dp)
+                     false
+                   .recover { case _ => true }
+      _ <- waitForTransactionsToComplete()
+      after <- client.read(radicle)
+      // The rejected transaction leaves the next allocation free to link from the radicle
+      dp <- allocate(Array[Byte](4, 5))
+      _ <- waitForTransactionsToComplete()
+      state <- client.read(dp)
+      link <- radicleLink(dp)
+    yield
+      aborted should be(true)
+      allocated should be(None)
+      after.contents.keySet should be(before.contents.keySet)
+      bytesShouldMatch(state.data.getByteArray, Array[Byte](4, 5))
+      link.map(_.toList) should be(Some(dp.toArray.toList))
 
   atest("rangedWrites updates a middle range of an object on FSIF stores"):
     val rnd = new Random(2)

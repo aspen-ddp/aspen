@@ -3,12 +3,12 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxCommitted, TxMessage, TxPrepare, TxResolved}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxCommitted, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
@@ -33,6 +33,8 @@ object FrontendSuite {
   val rev0 = new ObjectRevision(new UUID(0, 7))
   val ida = Replication(3, 2)
   val op1 = DataObjectPointer(oid1, poolId, Array[Byte]())
+  val otherPoolId = PoolId(new UUID(0,8))
+  val otherPtr = DataObjectPointer(ObjectId(new UUID(0,9)), otherPoolId, Array[Byte]())
 
   class TestNet extends Messenger {
 
@@ -314,5 +316,44 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
 
       withClue(s"$err: ")(cache.get(oid1) shouldBe None)
+  }
+
+  /** Prepares a transaction updating op1 (requiring `op1Revision`) and an object in another pool, and returns the
+    * store's disposition. The other pool's object is neither hosted nor loaded by this store.
+    */
+  def crossPoolPrepare(op1Revision: ObjectRevision): (MapBackend, TestNet, TransactionDisposition.Value) =
+    val (frontend, backend, _, net) = mkFrontendWithNet()
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+
+    val txd = mktxd().copy(
+      requirements = List(DataUpdate(op1, op1Revision, DataUpdateOperation.Overwrite),
+                          DataUpdate(otherPtr, rev0, DataUpdateOperation.Overwrite)),
+      poolIDAMap = Map(poolId -> ida, otherPoolId -> ida))
+    val prepare = mkPrepare(txd, fromClient = true).copy(objectUpdates = List(
+      ObjectUpdate(oid1, DataBuffer(Array[Byte](1))), ObjectUpdate(otherPtr.id, DataBuffer(Array[Byte](2)))))
+    frontend.receiveTransactionMessage(prepare)
+
+    net.txMessage() match
+      case Some(r: TxPrepareResponse) =>
+        frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+        (backend, net, r.disposition)
+      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+
+  test("a store votes commit when the transaction's other requirements are for objects in another pool") {
+    val (backend, net, disposition) = crossPoolPrepare(rev0)
+
+    disposition shouldBe TransactionDisposition.VoteCommit
+    net.txMessage() match
+      case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+      case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](1)
+    backend.get(otherPtr.id) shouldBe None
+  }
+
+  test("a store votes abort on a failed requirement of an object it hosts in a cross-pool transaction") {
+    val (_, _, disposition) = crossPoolPrepare(new ObjectRevision(new UUID(0, 10)))
+
+    disposition shouldBe TransactionDisposition.VoteAbort
   }
 }

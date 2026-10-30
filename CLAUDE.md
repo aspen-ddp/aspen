@@ -150,6 +150,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     round-trips and optimize data flow. The details are only important when working on transaction message
     handling.
   - The CRL is used to store the persistent state required by the Paxos protocol
+  - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
+    non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:
   - The client builds a TransactionDescription and sends it plus object data to the stores
   - The stores check all local state against the TransactionRequirements and determine their Commit/Abort decision

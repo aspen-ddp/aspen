@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -29,6 +29,12 @@ class Tx( trs: TransactionRecoveryState,
   private val serializedTxd = trs.serializedTxd
   private val objectUpdates = trs.objectUpdates
   private val pointersById: Map[ObjectId, ObjectPointer] = objectPointers.iterator.map(p => p.id -> p).toMap
+
+  // Only the requirements of objects this store hosts, plus non-object requirements. Other pools' stores vote on
+  // their own objects: the driver tallies each object's votes from its own pool's stores
+  private val requirements: List[TransactionRequirement] = txd.requirements.filter:
+    case tor: TransactionObjectRequirement => pointersById.contains(tor.objectPointer.id)
+    case _ => true
 
   private def pointerOf(objectId: ObjectId): ObjectPointer = pointersById(objectId)
   private var disposition = trs.disposition
@@ -63,7 +69,7 @@ class Tx( trs: TransactionRecoveryState,
   private def unlock(): Unit = if (locked) {
     locked = false
 
-    RequirementsLocker.unlock(transactionId, txd.requirements, objects)
+    RequirementsLocker.unlock(transactionId, requirements, objects)
   }
 
 
@@ -111,7 +117,7 @@ class Tx( trs: TransactionRecoveryState,
     // Determine local disposition
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
-    val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, txd.requirements, objects, ou,
+    val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
       frontend.maxSliceSize)
 
     // Find all objects with transaction collisions for inclusion into the response message
@@ -157,7 +163,7 @@ class Tx( trs: TransactionRecoveryState,
 
     val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
 
-    val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, txd.requirements,
+    val result = RequirementsApplyer.apply(transactionId, txd.startTimestamp, requirements,
       objects, ou, frontend.maxSliceSize)
 
     // Objects that threw partway through their update hold partially-applied, potentially
@@ -181,7 +187,7 @@ class Tx( trs: TransactionRecoveryState,
 
     toCommit.foreach { os =>
       val allocating = txd.allocatingObjects.contains(os.objectId)
-      val form = UpdateForm.of(os.objectId, txd.requirements, ou, allocating)
+      val form = UpdateForm.of(os.objectId, requirements, ou, allocating)
       val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data, allocating, form)
 
       frontend.commit(os, cs, transactionId)

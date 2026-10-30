@@ -3,12 +3,12 @@ package org.aspen_ddp.aspen.server.store.backend.fsif
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.UUID
-import java.util.concurrent.{Executors, ThreadFactory}
+import java.util.concurrent.{Executors, ScheduledExecutorService, ThreadFactory, TimeUnit}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
-import scala.concurrent.duration.Duration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
@@ -46,6 +46,14 @@ import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitError, C
   *
   * Tail compaction (Compaction.scala): after every serial task, free tail slots are truncated away and, if no move
   * is outstanding, the occupant of the highest used slot is moved into the lowest free slot below it.
+  *
+  * Out of space (ENOSPC from any write, force or truncate) freezes writes instead of failing the store: the failed
+  * operation and everything queued behind it are held, never completed with an error, and their I/O is retried every
+  * `tuning.enospcRetry` on `scheduler` until it succeeds. Commits are still accepted, reads go on (overlaying pending
+  * Deltas), and checkpoints, compaction and in-place writes pause and later resume where they stood. Any other I/O
+  * error is fail-stop: commits complete with IOFailure, reads with CorruptedObject, and `onFatal` is called once.
+  * Backpressure: a commit that arrives while unapplied Delta bytes exceed `tuning.unappliedBound` is acknowledged only
+  * once they no longer do.
   */
 class FsifBackend(val storeId: StoreId,
                   val path: os.Path,
@@ -53,7 +61,8 @@ class FsifBackend(val storeId: StoreId,
                   files: FsifFiles,
                   io: ExecutionContext,
                   tuning: FsifTuning = FsifTuning(),
-                  onFatal: Throwable => Unit = _ => ()) extends Backend:
+                  onFatal: Throwable => Unit = _ => (),
+                  scheduler: FsifBackend.RetryScheduler = FsifBackend.SharedRetryScheduler) extends Backend:
   import FsifBackend.*
 
   private type Reply = Either[Unit, CommitError.Value] => Unit
@@ -64,8 +73,7 @@ class FsifBackend(val storeId: StoreId,
   /** The journal the current writer appends to: its handle and name follow a checkpoint's journal switch */
   @volatile private var journalFile: FsifFile = files.open(recovered.activeJournal)
   @volatile private var activeJournal: String = recovered.activeJournal
-  private var journal = new JournalWriter(journalFile, recovered.journalLength, recovered.nextBatch, recovered.salt,
-    io, serial, onJournalError)
+  private var journal = newJournal(journalFile, recovered.journalLength, recovered.nextBatch, recovered.salt)
 
   // ---- State, owned by serial ----
   private val index: IndexMap = recovered.index
@@ -100,6 +108,21 @@ class FsifBackend(val storeId: StoreId,
   /** Serializes rebuildWrite / rebuildFlush callers, whose segment writes run on the calling thread */
   private val rebuildLock = new Object
 
+  // ---- Out-of-space freeze and backpressure, owned by serial ----
+  /** Some operation's I/O failed with ENOSPC and has not yet succeeded on a retry */
+  @volatile private var frozen = false
+  /** Operations held by ENOSPC, waiting for the next retry round, in the order they failed */
+  private val heldOps = mutable.LinkedHashMap[AnyRef, HeldOp]()
+  /** Held operations whose retry is in flight */
+  private val retryingOps = mutable.LinkedHashMap[AnyRef, HeldOp]()
+  private var retryScheduled = false
+  /** Promises that fail with out-of-space as soon as the store freezes (rebuildFlush waits on them) */
+  private val freezeWaiters = mutable.ArrayBuffer[Promise[Unit]]()
+  /** Test counter: holds by kind of I/O */
+  private val holdCounts = mutable.HashMap[String, Int]()
+  /** Successful commit replies held by backpressure, in order */
+  private val throttled = mutable.ArrayBuffer[Reply]()
+
   // ---- Checkpoint state, owned by serial ----
   /** The index file holding index `currentSeq` */
   private var activeIndex: String = recovered.activeIndex
@@ -124,6 +147,10 @@ class FsifBackend(val storeId: StoreId,
 
   private val compaction = new Compaction(new Compaction.Host:
     def fatal: Boolean = FsifBackend.this.fatal.isDefined
+    def frozen: Boolean = FsifBackend.this.frozen
+    def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit =
+      FsifBackend.this.hold(key, kind, retry, abort)
+    def released(key: AnyRef): Unit = FsifBackend.this.released(key)
     def used: java.util.BitSet = FsifBackend.this.used
     def slotCount: Int = slotTotal
     def setSlotCount(n: Int): Unit = slotTotal = n
@@ -160,18 +187,23 @@ class FsifBackend(val storeId: StoreId,
 
   // ---- Backend interface ----
 
-  def isWriteFrozen: Boolean = false
+  /** Writes are frozen by a full device: held I/O is retried every `tuning.enospcRetry` while reads go on */
+  def isWriteFrozen: Boolean = frozen
 
   /** Slots the data file is laid out for: every occupied or reserved slot is below it */
   def slotCount: Int = slotTotal
 
   private[fsif] def compactionStats: CompactionStats = compaction.stats
 
+  /** Test hook: how many times each kind of I/O has been held by ENOSPC */
+  private[fsif] def holdStats: Map[String, Int] = holdCounts.synchronized(holdCounts.toMap)
+
   override def setCompletionHandler(h: CompletionHandler): Unit = handler = Some(h)
 
   /** Completes when no journal batch, in-place write, copy-on-write, read, commit, checkpoint or compaction move is
-    * outstanding. Moves start after every completion while one is possible, so afterwards none is possible and the
-    * free tail slots are truncated away. After a fatal error, held in-place writes no longer count.
+    * outstanding and the store is not frozen. Moves start after every completion while one is possible, so afterwards
+    * none is possible and the free tail slots are truncated away. After a fatal error, held work no longer counts
+    * (io still in flight does).
     */
   def quiesce(): Future[Unit] =
     val p = Promise[Unit]()
@@ -232,7 +264,8 @@ class FsifBackend(val storeId: StoreId,
 
   /** Rebuild only: the store is not live, so nothing else touches X's slot. Writes the segment in place on the
     * calling thread and buffers the Mapping for `rebuildFlush`. Throws IllegalArgumentException on an invalid pointer
-    * or a slice larger than a segment.
+    * or a slice larger than a segment, and an out-of-space IOException while writes are frozen or if the write itself
+    * hits ENOSPC (Ruling 21: RebuildingStore handles it; the store does not wait for space).
     */
   override def rebuildWrite(pointer: ObjectPointer, objectType: ObjectType.Value, metadata: Metadata,
                             data: DataBuffer): Unit =
@@ -244,22 +277,44 @@ class FsifBackend(val storeId: StoreId,
     val header = SegmentHeader.forSlice(objectType, pointer.id, x, metadata, data)
     val segment = SegmentHeader.encode(header) ++ data.getByteArray
     rebuildLock.synchronized:
-      val slot = onSerialSync:
+      val (slot, fresh) = onSerialSync:
         throwIfFatal()
+        throwIfFrozen()
         compaction.cancel(x) // the segment is written to X's slot directly, bypassing a move's copy
-        val s = rebuildMaps.get(x).map(_._1).getOrElse:
-          if index.slots(x) >= 0 then index.slots(x) else allocateSlot()
-        rebuildMaps(x) = (s, pointer.id)
-        s
-      dataFile.write(layout.slotOffset(slot), segment)
+        rebuildMaps.get(x) match
+          case Some((s, _)) =>
+            rebuildMaps(x) = (s, pointer.id)
+            (s, false)
+          case None =>
+            val mapped = index.slots(x) >= 0
+            val s = if mapped then index.slots(x) else allocateSlot()
+            rebuildMaps(x) = (s, pointer.id)
+            (s, !mapped)
+      try dataFile.write(layout.slotOffset(slot), segment)
+      catch
+        case NonFatal(t) =>
+          // A slot taken for this write alone is released, so the next flush never maps an unwritten segment.
+          // Otherwise the slot holds an earlier or mapped copy of X that the resumed rebuild writes again.
+          if fresh then
+            onSerialSync:
+              if rebuildMaps.get(x).exists(_._1 == slot) then
+                rebuildMaps.remove(x)
+                used.clear(slot)
+          throw t
 
-  /** Forces `data`, then appends and forces the buffered Mappings (durable-before-map) */
+  /** Forces `data`, then appends and forces the buffered Mappings (durable-before-map), then checkpoints. Throws an
+    * out-of-space IOException if `data`'s force hits ENOSPC, or if the store is frozen before the Mappings are durable
+    * or the checkpoint has finished (Ruling 21). Mappings already appended then stay held and land once space
+    * returns.
+    */
   override def rebuildFlush(): Unit =
     rebuildLock.synchronized:
       dataFile.force()
       val appended = Promise[Unit]()
       onSerialSync:
         throwIfFatal()
+        throwIfFrozen()
+        addFreezeWaiter(appended)
         val maps = rebuildMaps.toList
         rebuildMaps.clear()
         maps.foreach:
@@ -270,9 +325,16 @@ class FsifBackend(val storeId: StoreId,
           appended.success(())
         else
           val records = maps.map { case (x, (slot, id)) => JournalRecord.Mapping(x, slot, id) }
-          onDurable(appendRecords(records))(appended.complete)
+          onDurable(appendRecords(records))(r => appended.tryComplete(r)) // a freeze may have failed it
+      // Completes when durable, on fail-stop, or with out-of-space when the store freezes
       Await.result(appended.future, Duration.Inf)
-      Await.result(checkpointNow(), Duration.Inf)
+      val checkpointed = Promise[Unit]()
+      onSerialSync:
+        throwIfFatal()
+        throwIfFrozen()
+        addFreezeWaiter(checkpointed)
+        startCheckpoint().onComplete(r => checkpointed.tryComplete(r))(using ExecutionContext.parasitic)
+      Await.result(checkpointed.future, Duration.Inf)
 
   // ---- Serial plumbing ----
 
@@ -299,6 +361,7 @@ class FsifBackend(val storeId: StoreId,
           logger.error(s"FSIF store $storeId: compaction failed: $t")
           failStop(t)
           compaction.drive()
+      releaseThrottled()
       checkQuiesce()
 
   private def onSerialSync[A](f: => A): A =
@@ -308,6 +371,14 @@ class FsifBackend(val storeId: StoreId,
 
   private def throwIfFatal(): Unit =
     fatal.foreach(t => throw new IOException(s"FSIF store $storeId has failed", t))
+
+  private def throwIfFrozen(): Unit =
+    if frozen then
+      throw outOfSpace()
+
+  /** Matches FsifIo.isOutOfSpace and RebuildingStore's out-of-space test */
+  private def outOfSpace(): IOException =
+    new IOException(s"No space left on device: FSIF store $storeId has frozen writes")
 
   /** Runs `op` now, or after the copy-on-write in progress for `x` has appended its Mapping */
   private def withExt(x: Int)(op: => Unit): Unit =
@@ -358,30 +429,126 @@ class FsifBackend(val storeId: StoreId,
       quiescers.clear()
       ps.foreach(_.trySuccess(()))
 
+  /** After a fatal error, held work no longer counts, but io still in flight does (including the journal's, which
+    * failAll does not wait for), so `close` never closes a file under it
+    */
   private def idle: Boolean =
     gated.isEmpty && writesInFlight == 0 && readsInFlight == 0 && checkpoint.isEmpty && compaction.idle &&
-      (fatal.isDefined || (journal.idle && unappliedCount == 0))
+      !journal.busy &&
+      (fatal.isDefined || (!frozen && throttled.isEmpty && journal.idle && unappliedCount == 0))
 
   // ---- Failure handling ----
+  //
+  // Out of space freezes writes. Every I/O source (journal write/force/truncate, copy-on-write write/force, in-place
+  // write, checkpoint step, compaction write/force and truncation) that fails with ENOSPC calls `hold` with a key, a
+  // `retry` that re-issues exactly the failed I/O (each such step is re-runnable from its start) and an `abort` for
+  // fail-stop. Nothing held completes, with an error or otherwise. While any operation is held the store is frozen:
+  // in-place writes, checkpoint steps, compaction moves and truncation start nothing new (their own held retries
+  // excepted), commits are still accepted (their journal batches buffer behind a held one), and reads go on,
+  // overlaying pending Deltas. Every `tuning.enospcRetry` a retry round re-issues every held operation; one that
+  // succeeds calls `released`, one that hits ENOSPC again is held again. When none is held or retrying, the store
+  // unfreezes and the paused work resumes. Any other I/O error, including one during a retry, is fail-stop.
 
-  /** The one place that decides what a journal write or force failure means. Task 12 adds the ENOSPC freeze and
-    * retry here; for now every failure is fail-stop.
+  private def newJournal(f: FsifFile, start: Long, next: Long, salt: Long): JournalWriter =
+    var w: JournalWriter = null
+    w = new JournalWriter(f, start, next, salt, io, serial, t => journalError(w, t), () => released(w))
+    w
+
+  /** The writer has truncated back to its durable length and holds the failed batch and everything behind it */
+  private def journalError(w: JournalWriter, t: Throwable): Unit =
+    if fatal.isEmpty && FsifIo.isOutOfSpace(t) then
+      hold(w, "journal", () => w.retry(), () => ())
+    else
+      failStop(t)
+
+  /** Holds an operation whose I/O hit ENOSPC, freezing the store; `retry` runs in the next retry round */
+  private def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit =
+    if fatal.isEmpty then
+      holdCounts.synchronized(holdCounts(kind) = holdCounts.getOrElse(kind, 0) + 1)
+      retryingOps.remove(key)
+      heldOps(key) = new HeldOp(retry, abort)
+      if !frozen then
+        logger.warn(s"FSIF store $storeId: out of space; writes frozen, retrying every ${tuning.enospcRetry}")
+        frozen = true
+        val waiters = freezeWaiters.toList
+        freezeWaiters.clear()
+        waiters.foreach(_.tryFailure(outOfSpace()))
+      scheduleRetry()
+
+  /** The held operation `key` succeeded (or became moot); the last one to do so unfreezes the store. No effect if
+    * `key` is not held.
     */
-  private def onJournalError(t: Throwable): Unit = failStop(t)
+  private def released(key: AnyRef): Unit =
+    if retryingOps.remove(key).isDefined || heldOps.remove(key).isDefined then
+      if frozen && heldOps.isEmpty && retryingOps.isEmpty then
+        logger.info(s"FSIF store $storeId: space is available again; writes resume")
+        frozen = false
+        // Paused in-place writes restart now; checkpoints, compaction and backpressure resume in a guarded task's
+        // epilogue (not every caller is guarded, e.g. the journal writer's completion)
+        slotStates.values.toList.foreach(st => kick(st))
+        post(())
 
-  /** Stops accepting writes: pending commits complete with IOFailure (through their failed journal futures), later
-    * commits likewise, and reads with CorruptedObject. Calls onFatal once.
+  private def scheduleRetry(): Unit =
+    if !retryScheduled then
+      retryScheduled = true
+      scheduler.schedule(tuning.enospcRetry, () => post(retryRound()))
+
+  /** Re-issues every held operation's I/O */
+  private def retryRound(): Unit =
+    retryScheduled = false
+    if fatal.isEmpty && heldOps.nonEmpty then
+      val round = heldOps.toList
+      heldOps.clear()
+      round.foreach: (key, op) =>
+        // A retry earlier in this round may have fail-stopped, which aborted the rest
+        if fatal.isEmpty then
+          retryingOps(key) = op
+          op.retry()
+
+  private def addFreezeWaiter(p: Promise[Unit]): Unit =
+    freezeWaiters.filterInPlace(!_.isCompleted)
+    freezeWaiters += p
+
+  /** Stops accepting writes: pending commits complete with IOFailure (through their failed journal futures and the
+    * held operations' aborts), later commits likewise, and reads with CorruptedObject. ENOSPC retries stop. Calls
+    * onFatal once.
     */
   private def failStop(t: Throwable): Unit =
     if fatal.isEmpty then
       logger.error(s"FSIF store $storeId: fatal I/O error, failing the store: $t")
       fatal = Some(t)
+      frozen = false
       journal.failAll(t)
       val buffered = switchBuffer.toList
       switchBuffer.clear()
       buffered.foreach((_, p) => p.tryFailure(t))
+      val held = (heldOps.values ++ retryingOps.values).toList
+      heldOps.clear()
+      retryingOps.clear()
+      held.foreach: op =>
+        try op.abort()
+        catch case NonFatal(e) => logger.error(s"FSIF store $storeId: aborting a held operation threw $e")
+      val acks = throttled.toList
+      throttled.clear()
+      acks.foreach(_(Right(CommitError.IOFailure)))
       try onFatal(t)
       catch case NonFatal(e) => logger.error(s"FSIF store $storeId: onFatal threw $e")
+
+  /** Backpressure: a successful reply of a commit that arrived while unapplied Delta bytes exceeded
+    * `tuning.unappliedBound` waits until they no longer do
+    */
+  private def ack(reply: Reply, wasThrottled: Boolean): Unit =
+    if wasThrottled && unappliedBytes > tuning.unappliedBound then
+      throttled += reply
+    else
+      reply(Left(()))
+
+  /** Run after every serial task */
+  private def releaseThrottled(): Unit =
+    if throttled.nonEmpty && unappliedBytes <= tuning.unappliedBound then
+      val acks = throttled.toList
+      throttled.clear()
+      acks.foreach(_(Left(())))
 
   // ---- Slot allocation and freeing ----
 
@@ -424,6 +591,7 @@ class FsifBackend(val storeId: StoreId,
     cancelQueued(st)
     st.dead = true
     st.prune()
+    released(st) // a held in-place write of the dead occupant was just cancelled
     st
 
   private def unmapDurable(st: SlotState): Unit =
@@ -454,11 +622,15 @@ class FsifBackend(val storeId: StoreId,
     compaction.onDelta(slot, pd)
     pd
 
-  /** Starts the next coalesced in-place write for `st` if none is in flight. Physical writes per slot are serial. */
-  private def kick(st: SlotState): Unit =
-    if fatal.isEmpty && !st.dead && slotStates.get(st.slot).contains(st) then
+  /** Starts the next coalesced in-place write for `st` if none is in flight. Physical writes per slot are serial.
+    * While frozen, only a retry of `st`'s own held write starts one. Returns whether a write was started.
+    */
+  private def kick(st: SlotState, retrying: Boolean = false): Boolean =
+    if fatal.isEmpty && (!frozen || retrying) && !st.dead && slotStates.get(st.slot).contains(st) then
       val batch = st.nextWritable()
-      if batch.nonEmpty then
+      if batch.isEmpty then
+        false
+      else
         st.writing = batch.size
         writesInFlight += 1
         val base = layout.slotOffset(st.slot)
@@ -474,11 +646,30 @@ class FsifBackend(val storeId: StoreId,
           }))
         catch
           case NonFatal(t) => inPlaceDone(st, batch, Failure(t))
+        true
+    else
+      false
+
+  /** A held in-place write's retry; the write is moot if its occupant died or its Deltas went meanwhile */
+  private def retryInPlace(st: SlotState): Unit =
+    if !kick(st, retrying = true) then
+      released(st)
 
   private def inPlaceDone(st: SlotState, batch: List[PendingDelta], r: Try[Unit]): Unit =
     writesInFlight -= 1
     st.version += 1
     r match
+      case Failure(t) if fatal.isEmpty && FsifIo.isOutOfSpace(t) =>
+        // The batch stays in the slot's list, queued again, so reads keep overlaying it until it lands
+        logger.warn(s"FSIF store $storeId: in-place write to slot ${st.slot} is out of space; holding it")
+        st.writing = 0
+        if st.dead then
+          // The occupant died while this write was in flight, so kill() could not cancel the batch: cancel it now
+          cancelQueued(st)
+          tryFree(st)
+          released(st)
+        else
+          hold(st, "in-place", () => retryInPlace(st), () => tryFree(st))
       case Failure(t) =>
         logger.error(s"FSIF store $storeId: in-place write to slot ${st.slot} failed: $t")
         st.writing = 0
@@ -490,6 +681,7 @@ class FsifBackend(val storeId: StoreId,
         unappliedCount -= batch.size
         unappliedBytes -= batch.iterator.map(_.bytes).sum
         batch.foreach(resolved)
+        released(st)
         st.prune()
         if st.dead then
           tryFree(st)
@@ -515,7 +707,7 @@ class FsifBackend(val storeId: StoreId,
 
   /** The trigger, run after every serial task (so after every commit and compaction completion) */
   private def maybeCheckpoint(): Unit =
-    if checkpoint.isEmpty && fatal.isEmpty && journal.length > checkpointThreshold then
+    if checkpoint.isEmpty && fatal.isEmpty && !frozen && journal.length > checkpointThreshold then
       startCheckpoint()
 
   /** Step 1 begins: the map as of the last record appended to journal s is index s+1's content, and every later
@@ -543,6 +735,8 @@ class FsifBackend(val storeId: StoreId,
       if fatal.isDefined then
         if !cp.ioInFlight then
           abandon(cp)
+      else if frozen then
+        () // paused where it stands; a held step of its own is retried by the retry round
       else
         cp.phase match
           case CheckpointPhase.Draining =>
@@ -579,7 +773,7 @@ class FsifBackend(val storeId: StoreId,
       cp.oldFile = Some(journalFile)
       journalFile = f
       activeJournal = name
-      journal = new JournalWriter(f, JournalFormat.HeaderSize, 0, salt, io, serial, onJournalError)
+      journal = newJournal(f, JournalFormat.HeaderSize, 0, salt)
       cp.phase = CheckpointPhase.Applying
       val buffered = switchBuffer.toList
       switchBuffer.clear()
@@ -624,35 +818,46 @@ class FsifBackend(val storeId: StoreId,
     try f(file)
     finally file.close()
 
-  /** Runs one checkpoint step on io, then `next` on serial. A failure is fail-stop (Ruling 15); a success that
-    * arrives after a fatal error is handed to `discard`.
+  /** Runs one checkpoint step on io, then `next` on serial. ENOSPC holds the step, which the retry round re-runs
+    * from its start; any other failure is fail-stop (Ruling 15). A success that arrives after a fatal error is handed
+    * to `discard`.
     */
   private def checkpointIo[A](cp: Checkpoint, discard: A => Unit = (_: A) => ())(work: => A)(next: A => Unit): Unit =
-    cp.ioInFlight = true
-    def done(r: Try[A]): Unit =
-      cp.ioInFlight = false
-      r match
-        case Failure(t) =>
-          logger.error(s"FSIF store $storeId: checkpoint to seq ${cp.seq} failed: $t")
-          failStop(t)
-        case Success(a) =>
-          if fatal.isDefined then discard(a) else next(a)
-    try
-      io.execute(new IoTask(IoKind.Checkpoint, () => {
-        val r = Try(work)
-        post(done(r))
-      }))
-    catch
-      case NonFatal(t) => done(Failure(t))
+    val step = () => work
+    def run(): Unit =
+      cp.ioInFlight = true
+      def done(r: Try[A]): Unit =
+        cp.ioInFlight = false
+        r match
+          case Failure(t) if fatal.isEmpty && FsifIo.isOutOfSpace(t) =>
+            logger.warn(s"FSIF store $storeId: checkpoint to seq ${cp.seq} is out of space; holding it")
+            hold(cp, "checkpoint", () => run(), () => ())
+          case Failure(t) =>
+            logger.error(s"FSIF store $storeId: checkpoint to seq ${cp.seq} failed: $t")
+            failStop(t)
+          case Success(a) =>
+            released(cp)
+            if fatal.isDefined then discard(a) else next(a)
+      try
+        io.execute(new IoTask(IoKind.Checkpoint, () => {
+          val r = Try(step())
+          post(done(r))
+        }))
+      catch
+        case NonFatal(t) => done(Failure(t))
+    run()
 
   // ---- Commit and repair ----
 
   private def update(state: CommitState, repairing: Boolean, reply0: Reply): Unit =
     var replied = false
+    val wasThrottled = unappliedBytes > tuning.unappliedBound
     val reply: Reply = r =>
       if !replied then
         replied = true
-        reply0(r)
+        r match
+          case Left(_) => ack(reply0, wasThrottled)
+          case Right(_) => reply0(r)
     try
       if fatal.isDefined then
         reply(Right(CommitError.IOFailure))
@@ -743,7 +948,7 @@ class FsifBackend(val storeId: StoreId,
     onDurable(appendRecords(records)):
       case Success(_) =>
         pd.durable = true
-        slotStates.get(slot).foreach(kick)
+        slotStates.get(slot).foreach(st => kick(st))
         reply(Left(()))
       case Failure(_) =>
         reply(Right(CommitError.IOFailure))
@@ -782,30 +987,42 @@ class FsifBackend(val storeId: StoreId,
       tailCows += f
     gated(x) = mutable.ArrayDeque()
     val segment = SegmentHeader.encode(header) ++ bytes
-    try
-      io.execute(new IoTask(IoKind.Cow, () => {
-        val r = Try {
-          dataFile.write(layout.slotOffset(f), segment)
-          dataFile.force()
-        }
-        post(cowWritten(x, id, f, r, reply))
-      }))
-    catch
-      // A rejected task fails like a failed write: fail-stop, reply, and release the gate and tail slot
-      case NonFatal(t) => cowWritten(x, id, f, Failure(t), reply)
+    val key = new Object
+    def issue(): Unit =
+      try
+        io.execute(new IoTask(IoKind.Cow, () => {
+          val r = Try {
+            dataFile.write(layout.slotOffset(f), segment)
+            dataFile.force()
+          }
+          post(cowWritten(key, () => issue(), x, id, f, r, reply))
+        }))
+      catch
+        // A rejected task fails like a failed write: fail-stop, reply, and release the gate and tail slot
+        case NonFatal(t) => cowWritten(key, () => issue(), x, id, f, Failure(t), reply)
+    issue()
 
-  private def cowWritten(x: Int, id: ObjectId, f: Int, r: Try[Unit], reply: Reply): Unit =
-    try
-      r match
-        case Failure(t) =>
-          logger.error(s"FSIF store $storeId: copy-on-write to slot $f failed: $t")
-          failStop(t)
-          reply(Right(CommitError.IOFailure))
-          releaseExt(x)
-        case Success(_) =>
-          // No wait for lower tail slots: forcing f made the durable data size reach past f and any gap below it
-          cowMap(x, id, f, reply)
-    finally tailCowDone(f)
+  /** ENOSPC holds the copy-on-write with X still gated and f reserved; the retry rewrites and forces the segment */
+  private def cowWritten(key: AnyRef, reissue: () => Unit, x: Int, id: ObjectId, f: Int, r: Try[Unit],
+                         reply: Reply): Unit =
+    r match
+      case Failure(t) if fatal.isEmpty && FsifIo.isOutOfSpace(t) =>
+        logger.warn(s"FSIF store $storeId: copy-on-write to slot $f is out of space; holding it")
+        hold(key, "copy-on-write", reissue,
+          () => cowWritten(key, reissue, x, id, f, Failure(fatal.getOrElse(t)), reply))
+      case _ =>
+        released(key)
+        try
+          r match
+            case Failure(t) =>
+              logger.error(s"FSIF store $storeId: copy-on-write to slot $f failed: $t")
+              failStop(t)
+              reply(Right(CommitError.IOFailure))
+              releaseExt(x)
+            case Success(_) =>
+              // No wait for lower tail slots: forcing f made the durable data size reach past f and any gap below it
+              cowMap(x, id, f, reply)
+        finally tailCowDone(f)
 
   /** Appends Mapping(X, f) for a forced copy-on-write segment, then lets X's held operations run */
   private def cowMap(x: Int, id: ObjectId, f: Int, reply: Reply): Unit =
@@ -857,12 +1074,13 @@ class FsifBackend(val storeId: StoreId,
       decodeStorePointer(pointer.storePointer, layout.segmentCount) match
         case None => completeRead(pointer.id, Right(ReadError.ObjectNotFound))
         case Some(x) =>
-          withExt(x):
-            try readExt(pointer, x)
-            catch
-              case NonFatal(t) =>
-                logger.error(s"FSIF store $storeId: read of ${pointer.id} failed: $t")
-                completeRead(pointer.id, Right(ReadError.CorruptedObject))
+          // Not behind X's gate: while X is gated its index entry is unchanged (the gated operation assigns it in the
+          // task that releases the gate), and a copy-on-write held by ENOSPC must not hold reads
+          try readExt(pointer, x)
+          catch
+            case NonFatal(t) =>
+              logger.error(s"FSIF store $storeId: read of ${pointer.id} failed: $t")
+              completeRead(pointer.id, Right(ReadError.CorruptedObject))
 
   private def readExt(pointer: ObjectPointer, x: Int): Unit =
     val slot = index.slots(x)
@@ -943,6 +1161,20 @@ class FsifBackend(val storeId: StoreId,
 object FsifBackend:
   private val Zero = ObjectId(new UUID(0, 0))
 
+  /** Runs a task once after a delay: the ENOSPC retry timer */
+  trait RetryScheduler:
+    def schedule(delay: FiniteDuration, task: Runnable): Unit
+
+  /** Host-wide retry timer: one daemon thread named fsif-retry */
+  object SharedRetryScheduler extends RetryScheduler:
+    private lazy val executor: ScheduledExecutorService =
+      Executors.newSingleThreadScheduledExecutor: r =>
+        val t = new Thread(r, "fsif-retry")
+        t.setDaemon(true)
+        t
+    def schedule(delay: FiniteDuration, task: Runnable): Unit =
+      executor.schedule(task, delay.toNanos, TimeUnit.NANOSECONDS)
+
   /** Draining: buffering, waiting for journal s to be durable. Header: buffering, header s+1 being written.
     * Applying: waiting for journal-s Deltas. Barrier: waiting for the records appended so far. Finishing: io for
     * steps 2-4.
@@ -959,6 +1191,9 @@ object FsifBackend:
     /** Journal s's handle once the writer has switched, until step 4 has emptied it */
     var oldFile: Option[FsifFile] = None
     def switching: Boolean = phase == CheckpointPhase.Draining || phase == CheckpointPhase.Header
+
+  /** An operation held by ENOSPC: `retry` re-issues its I/O, `abort` ends it on fail-stop */
+  private final class HeldOp(val retry: () => Unit, val abort: () => Unit)
 
   /** A repair or repairDelete that could not be applied */
   final class OperationFailed(msg: String) extends Exception(msg)

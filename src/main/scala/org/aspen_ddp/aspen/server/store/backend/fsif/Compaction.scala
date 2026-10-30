@@ -32,6 +32,10 @@ import org.aspen_ddp.aspen.common.objects.ObjectId
   * would replay still maps it. It is not forced: the next force of `data` covers it, and recovery is correct whether
   * a crash keeps it or not.
   *
+  * Out of space: while the backend is frozen, nothing new starts (no truncation, no move, no write or force into f).
+  * A move write or force, or a truncation, that hits ENOSPC is held through `host.hold` and re-issued by the retry
+  * round; once the store unfreezes, `drive` resumes a paused move where it stands. Every step re-runs from its start.
+  *
   * Moves run concurrently with checkpoints. Deltas to t keep being applied to t in place, so a checkpoint's wait
   * for journal-s Deltas is unaffected; the Deltas that kill(t) cancels are cancelled by Map(X, f) in the same serial
   * task, which the checkpoint's Barrier makes durable before index s+1 (taken with X -> t) is written; and f was
@@ -52,13 +56,13 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
   /** No move outstanding */
   def idle: Boolean = move.isEmpty
 
-  /** Run after every serial task: truncate free tail slots, then start a move if none is outstanding */
+  /** Run after every serial task: truncate free tail slots, then resume or start a move. Paused while frozen. */
   def drive(): Unit =
     if host.fatal then
       move.foreach(finishIfDone)
-    else
-      truncate()
-      if move.isEmpty then
+    else if !host.frozen then
+      move.foreach(m => pump(m))
+      if truncate() && move.isEmpty then
         start()
 
   /** X's occupant is about to change (copy-on-write, delete, re-allocation, rebuild): a move of X that has not yet
@@ -83,18 +87,32 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
         m.queue += ((base, SegmentHeader.encode(pd.header)))
         pump(m)
 
-  private def truncate(): Unit =
+  /** Returns false if the truncate hit ENOSPC and is held (the retry round runs it again) */
+  private def truncate(): Boolean =
     val top = host.used.length() // highest used slot + 1, or 0
     // At runtime every write lands inside a slot below the slot count, so only the file found at startup can
     // reach past slotCount * stride (a partial last slot, or a dropped truncate): check that once
     if top < host.slotCount || checkSize then
-      checkSize = false
       val target = top * layout.stride
       // Shrink only. A file ending inside slot top - 1 (its in-place write still pending) stays as it is: growing it
       // would write a byte at the end of that slot, which could land after a concurrent write of a full segment.
-      if host.dataFile.size > target then
-        host.dataFile.truncate(target)
-      host.setSlotCount(top)
+      val ok =
+        if host.dataFile.size > target then
+          try
+            host.dataFile.truncate(target)
+            true
+          catch
+            case t: Throwable if FsifIo.isOutOfSpace(t) =>
+              host.hold(TruncateHold, "truncate", () => if truncate() then host.released(TruncateHold), () => ())
+              false
+        else
+          true
+      if ok then
+        checkSize = false
+        host.setSlotCount(top)
+      ok
+    else
+      true
 
   private def start(): Unit =
     val t = host.used.length() - 1
@@ -140,16 +158,20 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
     st.newestHeader.foreach(h => System.arraycopy(SegmentHeader.encode(h), 0, img, 0, SegmentHeader.Size))
     img
 
-  /** Issues the next write into f, or the force once all writes are done, or appends the Map */
-  private def pump(m: Move): Unit =
-    if !m.cancelled && !m.mapAppended && !host.fatal && !m.writing then
+  /** Issues the next write into f, or the force once all writes are done, or appends the Map. While frozen, only a
+    * retry of the move's own held write or force issues anything.
+    */
+  private def pump(m: Move, retrying: Boolean = false): Unit =
+    if !m.cancelled && !m.mapAppended && !host.fatal && !m.writing && (!host.frozen || retrying) &&
+      move.contains(m)
+    then
       if m.queue.nonEmpty then
         val writes = m.queue.toList
         m.queue.clear()
         m.writing = true
         m.dirty = true
         m.io += 1
-        host.runIo(IoKind.MoveWrite)(writes.foreach((pos, b) => host.dataFile.write(pos, b)))(r => written(m, r))
+        host.runIo(IoKind.MoveWrite)(writes.foreach((pos, b) => host.dataFile.write(pos, b)))(r => written(m, writes, r))
       else if m.assembled && !m.forcing then
         if m.dirty then
           m.forcing = true
@@ -159,26 +181,53 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
         else
           appendMap(m)
 
-  private def written(m: Move, r: Try[Unit]): Unit =
+  private def written(m: Move, writes: List[(Long, Array[Byte])], r: Try[Unit]): Unit =
     m.io -= 1
     m.writing = false
     r match
+      case Failure(t) if outOfSpace(t) =>
+        if m.cancelled then
+          finishIfDone(m)
+        else
+          // Back to the front of the queue, still in order: the retry issues them again
+          m.queue.prependAll(writes)
+          holdMove(m, "move-write")
       case Failure(t) =>
         host.failStop(t)
         finishIfDone(m)
       case Success(_) =>
+        host.released(m)
         if m.cancelled || host.fatal then finishIfDone(m) else pump(m)
 
   private def forced(m: Move, r: Try[Unit]): Unit =
     m.io -= 1
     m.forcing = false
     r match
+      case Failure(t) if outOfSpace(t) =>
+        if m.cancelled then
+          finishIfDone(m)
+        else
+          m.dirty = true // the force did not happen
+          holdMove(m, "move-force")
       case Failure(t) =>
         host.failStop(t)
         finishIfDone(m)
       case Success(_) =>
+        host.released(m)
         // pump appends the Map only if no write into f was issued after this force started
         if m.cancelled || host.fatal then finishIfDone(m) else pump(m)
+
+  /** ENOSPC on a move's write or force: a live move is held, a cancelled one just ends */
+  private def outOfSpace(t: Throwable): Boolean = !host.fatal && FsifIo.isOutOfSpace(t)
+
+  private def holdMove(m: Move, kind: String): Unit =
+    host.hold(m, kind, () => retryMove(m), () => finishIfDone(m))
+
+  /** Re-issues the held write or force; if nothing needed issuing (or the move ended), the hold is moot */
+  private def retryMove(m: Move): Unit =
+    pump(m, retrying = true)
+    if m.io == 0 then
+      host.released(m)
 
   private def appendMap(m: Move): Unit =
     if !host.maps(m.x, m.from, m.id) then
@@ -196,6 +245,7 @@ private[fsif] final class Compaction(host: Compaction.Host, layout: FsifLayout):
       if !host.fatal then
         host.used.clear(m.to)
       move = None
+      host.released(m) // a held write or force of a cancelled move is moot
 
 private[fsif] object Compaction:
   /** What compaction needs from its backend; every call is made on the backend's serial executor */
@@ -215,10 +265,19 @@ private[fsif] object Compaction:
     /** Runs `work` on io and `done` on serial (guarded); a rejected task completes `done` with the failure */
     def runIo[A](kind: FsifBackend.IoKind)(work: => A)(done: Try[A] => Unit): Unit
     def failStop(t: Throwable): Unit
+    /** Writes are frozen by ENOSPC: start nothing new */
+    def frozen: Boolean
+    /** Holds an operation whose I/O hit ENOSPC: `retry` runs in the backend's next retry round, `abort` on fail-stop */
+    def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit
+    /** The held operation `key` succeeded or became moot; no effect if it is not held */
+    def released(key: AnyRef): Unit
     /** Maps X to `to`, kills `from` and appends Map(X, to) in this serial task; frees `from` once it is durable,
       * then calls `done`
       */
     def commitMove(x: Int, id: ObjectId, from: Int, to: Int)(done: Try[Unit] => Unit): Unit
+
+  /** Hold key of a truncation of `data` that hit ENOSPC */
+  private object TruncateHold
 
   private final class Move(val x: Int, val id: ObjectId, val from: Int, val to: Int):
     /** io tasks in flight: the read of t, a write into f, the force */

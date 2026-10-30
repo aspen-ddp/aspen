@@ -15,10 +15,12 @@ import scala.util.control.NonFatal
   * If a batch's write or force fails, the io thread truncates back to the last durable length and forces (best
   * effort), so a torn tail never precedes later batches. The writer then keeps the failed batch and everything
   * buffered, with their Futures pending, calls `onError` with the original exception and sends nothing more until
-  * `retry()` (which re-sends the same batch under the same batch number) or `failAll`.
+  * `retry()` (which re-sends the same batch under the same batch number) or `failAll`. Once a retried batch is
+  * forced, `onResumed` is called, before that batch's Futures complete.
   */
 final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, salt: Long,
-                          io: ExecutionContext, serial: SerialExecutor, onError: Throwable => Unit):
+                          io: ExecutionContext, serial: SerialExecutor, onError: Throwable => Unit,
+                          onResumed: () => Unit = () => ()):
   import JournalWriter.Batch
 
   private var durable = startLength
@@ -26,6 +28,10 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
   // The batch in flight, or the failed batch awaiting retry()
   private var current: Option[Batch] = None
   private var paused = false
+  /** The batch in flight was re-sent by retry() */
+  private var retried = false
+  /** An io task is running, whether or not failAll has abandoned its batch */
+  private var sending = false
   private var failed: Option[Throwable] = None
 
   private val buffered = mutable.ArrayBuffer[JournalRecord]()
@@ -52,10 +58,16 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
   /** Nothing in flight, awaiting retry or buffered */
   def idle: Boolean = current.isEmpty && bufferedPromises.isEmpty
 
+  /** An io task may still touch the file. Unlike `idle`, this stays true after failAll until that task ends, so the
+    * file must not be closed or reused before it is false.
+    */
+  def busy: Boolean = sending
+
   /** After `onError`: re-sends the failed batch under the same batch number. No effect otherwise. */
   def retry(): Unit =
     if failed.isEmpty && paused then
       paused = false
+      retried = true
       current.foreach(send(_, truncateFirst = true))
 
   /** Permanently failed: every pending and future append fails with `t` */
@@ -81,7 +93,8 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
 
   private def send(batch: Batch, truncateFirst: Boolean): Unit =
     val pos = durable
-    io.execute(new FsifBackend.IoTask(FsifBackend.IoKind.Journal, () => {
+    sending = true
+    try io.execute(new FsifBackend.IoTask(FsifBackend.IoKind.Journal, () => {
       val result = Try:
         // A retry also clears any tail left by a failed recovery truncate
         if truncateFirst then file.truncate(pos)
@@ -94,8 +107,13 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
         catch case NonFatal(_) => () // retry() truncates again
       serial.execute(() => completed(batch, result))
     }))
+    catch
+      case t: Throwable =>
+        sending = false
+        throw t
 
   private def completed(batch: Batch, result: Try[Unit]): Unit =
+    sending = false
     // After failAll the batch's Futures have already failed
     if failed.isEmpty then
       result match
@@ -103,7 +121,10 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
           durable += batch.bytes.length
           batchNumber += 1
           current = None
+          val resumed = retried
+          retried = false
           sendBuffered()
+          if resumed then onResumed()
           batch.promises.foreach(_.success(()))
         case Failure(t) =>
           paused = true

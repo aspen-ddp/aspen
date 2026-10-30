@@ -528,7 +528,9 @@ class FsifModelSuite extends FileBasedTests:
         if !cands.exists(e => sameState(e.state, got)) then
           fail(s"x=$x recovered as $got; allowed (last acknowledged first): ${cands.mkString(", ")}")
         if !sameState(cands.head.state, got) then unackedSurvived += 1
-        for id <- cands.flatMap(_.state).map(_.id).distinct if !got.exists(_.id == id) do
+        // Every id ever issued at x since the last recovery, not only the candidates: none but the recovered one
+        // may read back
+        for id <- history(x).flatMap(_.state).map(_.id).distinct if !got.exists(_.id == id) do
           val r = syncRead(backend, handler, io, x, id)
           if r != Right(ReadError.ObjectNotFound) then
             fail(s"x=$x recovered as $got, but a read of candidate ${id.uuid.getLeastSignificantBits} gives $r")

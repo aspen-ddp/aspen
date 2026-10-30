@@ -310,6 +310,9 @@ class FsifCheckpointSuite extends FileBasedTests:
           h.read(p) shouldBe Right(ReadError.ObjectNotFound)
 
   test("a crash at any file op during a checkpoint with commits in flight keeps every acknowledged write"):
+    // Coverage: seeds whose crash cut the checkpoint short, and seeds whose checkpoint completed first
+    var cutShort = 0
+    var completed = 0
     for seed <- 0 until 50 do
       withClue(s"seed=$seed"):
         val r = rng(seed + 5000)
@@ -329,9 +332,9 @@ class FsifCheckpointSuite extends FileBasedTests:
         val cpAt = r.nextInt(opCount)
         for i <- 0 until opCount do
           if i == cpAt then
-            // Counted from the checkpoint's start: the crash lands inside it or just after it (about 12 ops plus
+            // Counted from the checkpoint's start: the crash lands inside it or just after it (a dozen or more ops plus
             // those of the commits in flight)
-            h.files.crashAfterOps(r.nextInt(40))
+            h.files.crashAfterOps(r.nextInt(70))
             h.backend.checkpointNow()
           val x = r.nextInt(n)
           rev += 1
@@ -358,6 +361,9 @@ class FsifCheckpointSuite extends FileBasedTests:
           for _ <- 0 until r.nextInt(6) do io.runOne()
         io.runAll()
         if h.fatals.isEmpty then h.backend.journalSeq shouldBe 1
+        // The I/O stop was armed as the checkpoint started, so a stop before seq 1 is durable landed inside it
+        if h.backend.journalSeq == 1 then completed += 1
+        else if !h.fatals.isEmpty then cutShort += 1
         h.crash()
         for x <- 0 until n do
           withClue(s"ext=$x"):
@@ -368,6 +374,9 @@ class FsifCheckpointSuite extends FileBasedTests:
               case Right(ReadError.ObjectNotFound) => None
               case Right(e) => fail(s"read failed: $e")
             allowed should contain(got)
+    info(s"checkpoints cut short by the crash: $cutShort, completed before it: $completed")
+    cutShort should be >= 10
+    completed should be >= 10
 
 object FsifCheckpointSuite:
   /** Runs every task inline, except that tasks matching `hold` are queued until released */

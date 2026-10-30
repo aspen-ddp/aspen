@@ -449,10 +449,8 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
       // With no index file left, recovery cannot reconstruct the acknowledged state: StoreLost
       _ <- crashAndRestart: () =>
              FsifRecovery.IndexFiles.map(lostDir / _).filter(os.exists(_)).foreach(os.remove)
-      // The new host's startup load found the store lost and marked it, before any event ran
-      _ = withClue("after the restart: "):
-            os.exists(lostDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
-            host.containsStore(storeIds(lost)) should be(false)
+      // The new host's startup load (recovery, off the event thread) finds the store lost and marks it, so the
+      // reconcile flips its entry to Rebuilding: awaitRebuilt sees that state
       sawRebuilding <- awaitRebuilt(storeIds(lost))
       _ <- awaitStoresServed()
       _ <- verify(dp, expected)

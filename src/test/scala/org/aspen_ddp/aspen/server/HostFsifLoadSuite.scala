@@ -48,6 +48,13 @@ private class FsifSeamHost(mgrClient: AspenClient,
   /** While set, every write, force and truncate of an FSIF store opened from now on fails with ENOSPC */
   @volatile var deviceFull: Boolean = false
   @volatile var lastBackend: Option[FsifBackend] = None
+  /** Where FSIF opens run. Synchronous by default, so a test's testingOnlyHandleEvents also handles the FsifOpened
+   *  the open posts; a test may set the production pool instead. */
+  @volatile var openEc: ExecutionContext = ExecutionContext.parasitic
+  /** Names of the threads FSIF opens ran on */
+  @volatile var openThreads: List[String] = Nil
+
+  override protected def fsifOpenEc: ExecutionContext = openEc
 
   private def outOfSpace[A](op: => A): A =
     if deviceFull then throw new IOException("No space left on device") else op
@@ -70,6 +77,7 @@ private class FsifSeamHost(mgrClient: AspenClient,
   override protected def openFsifBackend(storeId: StoreId, path: os.Path, layout: FsifLayout,
                                          onFatal: Throwable => Unit): Backend =
     opens += 1
+    openThreads = Thread.currentThread.getName :: openThreads
     if outOfSpaceOpens > 0 then
       outOfSpaceOpens -= 1
       throw new IOException("No space left on device")
@@ -294,4 +302,53 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
         host.deviceFull = false
         load(host)
         host.getStoreIds should contain(storeId)
+
+  atest("an FSIF store's recovery runs off the event thread and its outcome is served by an event"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      // Runs the open on another thread, and completes `opened` once that task (which posts FsifOpened) has ended
+      val opened = Promise[Unit]()
+      val pool = ExecutionContext.global
+      host.openEc = new ExecutionContext:
+        def execute(r: Runnable): Unit = pool.execute: () =>
+          try r.run()
+          finally opened.trySuccess(())
+        def reportFailure(t: Throwable): Unit = pool.reportFailure(t)
+      val eventThread = Thread.currentThread.getName
+      load(host)
+      opened.future.map: _ =>
+        host.openThreads.head should not be eventThread
+        host.testingOnlyHandleEvents() // FsifOpened, then the LoadStore it queues
+        host.getStoreIds should contain(storeId)
+        host.testingOnlyOfflineStores should not contain storeId
+
+  atest("a close that arrives while an FSIF store is still opening waits for the open, then closes it served"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+      host.openEc = new ExecutionContext:
+        def execute(r: Runnable): Unit = queued.add(r)
+        def reportFailure(t: Throwable): Unit = ()
+      load(host)
+      queued.size should be(1)
+      load(host) // a second load while it opens starts no second open
+      queued.size should be(1)
+      val closed = host.closeStore(storeId)
+      host.testingOnlyHandleEvents()
+      closed.isCompleted should be(false) // deferred until the open ends
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // FsifOpened, LoadStore, then the deferred ShutdownStore
+      closed.map: _ =>
+        host.getStoreIds should not contain storeId
+        host.testingOnlyOfflineStores should contain(storeId)
+        os.exists(Backend.crlSaveFile(storeDir)) should be(true)
+        os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 

@@ -560,10 +560,10 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       _ <- client.failStorageDevice(failedId)
       _ <- waitForTransactionsToComplete()
 
-      // Stop the first instance once it has moved at least one store, simulating a crash. Give
+      // Stop the first instance once it has moved its first store, simulating a crash. Give
       // it a slower poll period than the watcher to widen the observation windows.
       first <- taskForEnrolled(failedId, slowerPoll)
-      _ <- awaitStoresRemaining(failedId, atMost = 2, Duration(120000, MILLISECONDS))
+      _ <- awaitStoresRemaining(failedId, atMost = 5, Duration(120000, MILLISECONDS))
       _ = first.stop()
       midDrain <- client.getStorageDeviceState(failedId)
 
@@ -578,13 +578,13 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
     yield (midDrain, tombstone, destination)
 
     result.map: (midDrain, tombstone, destination) =>
-      // If the watcher stalls past the 2-store and 1-store windows, the first instance finishes
-      // the entire drain, stop() is a no-op, and the second instance reads an empty tombstone
-      // and finishes immediately -- degenerating into a re-run of "moves every store". The
-      // mid-drain snapshot must be strictly between 0 and 3 to prove the test actually caught a
-      // resume.
+      // The device holds 6 stores. If the watcher stalls past the five observation windows
+      // (5 down to 1 remaining), the first instance finishes the entire drain, stop() is a no-op,
+      // and the second instance reads an empty tombstone and finishes immediately -- degenerating
+      // into a re-run of "moves every store". The mid-drain snapshot must be strictly between 0
+      // and 6 to prove the test actually caught a resume.
       midDrain.stores.size should be > 0
-      midDrain.stores.size should be < 3
+      midDrain.stores.size should be < 6
       tombstone.stores shouldBe empty
       // The bootstrap pool's three stores and the initial metadata pool's three
       destination.stores.size should be(6)

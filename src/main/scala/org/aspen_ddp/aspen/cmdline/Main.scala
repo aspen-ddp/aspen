@@ -2530,7 +2530,7 @@ object Main {
     lines += s"  IDA:          ${s.ida}"
     lines += s"  Max Slice Sz: ${s.maxSliceSize.map(_.toString).getOrElse("unbounded")}"
     lines += s"  Max Obj Size: ${s.maxObjectSize.map(_.toString).getOrElse("unbounded")}"
-    lines += s"  Metadata pool: ${if s.isMetadataPool then "yes" else "no"}"
+    lines += s"  Meta Pool:    ${if s.isMetadataPool then "yes" else "no"}"
     lines += s"  Device Set:   $set (${s.storageDeviceSet.uuid})"
     s.migration.foreach: m =>
       lines += s"  Migration:    ${m.status} -> ${m.targetSet.uuid}"

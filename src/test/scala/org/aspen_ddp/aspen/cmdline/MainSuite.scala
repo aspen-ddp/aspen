@@ -231,10 +231,10 @@ class MainSuite extends AnyFunSuite with Matchers:
     val setId  = StorageDeviceSetId(UUID.fromString("33333333-3333-3333-3333-333333333333"))
     val meta = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
       RocksDBConfig(), setId, isMetadataPool = true)
-    Main.formatPoolState(meta, None) should include ("Metadata pool: yes")
+    Main.formatPoolState(meta, None) should include ("Meta Pool:    yes")
     val plain = StoragePoolState(poolId, "mypool", Replication(3, 2), None, Array.empty,
       RocksDBConfig(), setId)
-    Main.formatPoolState(plain, None) should include ("Metadata pool: no")
+    Main.formatPoolState(plain, None) should include ("Meta Pool:    no")
 
   private val poolArgs = Seq("mypool", "Replication", "3", "2", "2", "myset")
 

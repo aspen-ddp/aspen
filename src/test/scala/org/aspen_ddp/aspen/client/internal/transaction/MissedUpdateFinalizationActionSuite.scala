@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, ObjectId, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -197,4 +198,27 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       poolId <- client.createNewStoragePool("tracking-pool", Replication(1, 1), None, RocksDBConfig(),
                                             StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
       enabled <- trackingAfterErrorWrite(poolId)
+    yield enabled shouldBe true
+
+  /** Runs markMissedUpdate itself for a store of `poolId` and returns whether the transaction it
+    * committed still tracks missed updates, which pins limitTracking to after the errorTree write.
+    */
+  private def trackingAfterMarkMissedUpdate(poolId: PoolId): Future[Boolean] =
+    val ptr = pointerWith(Array[Byte](1))
+    var tracking: Option[Boolean] = None
+    val fa = new MissedUpdateFinalizationAction(client, txdFor(ptr)):
+      override private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] =
+        tracking = Some(tx.missedUpdateTrackingEnabled)
+        super.commitErrorTreeTransaction(tx)
+    fa.markMissedUpdate(StoreId(poolId, 0.toByte), ptr.id, Array[Byte](1)).map: _ =>
+      tracking.get
+
+  atest("markMissedUpdate disables tracking for a bootstrap pool entry"):
+    trackingAfterMarkMissedUpdate(Radicle.poolId).map(_ shouldBe false)
+
+  atest("markMissedUpdate keeps tracking for an ordinary pool entry"):
+    for
+      poolId <- client.createNewStoragePool("mark-pool", Replication(1, 1), None, RocksDBConfig(),
+                                            StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      enabled <- trackingAfterMarkMissedUpdate(poolId)
     yield enabled shouldBe true

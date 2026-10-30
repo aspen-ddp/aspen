@@ -473,6 +473,9 @@ abstract class BaseAspenClient(
 
   override protected def createStoragePool(config: StoragePoolState,
                                            metadataGroup: Option[AllocationGroupId]): Future[PoolId] =
+    // Metadata pools' trees live in the bootstrap pool, every other pool's in a metadata group
+    require(config.isMetadataPool == metadataGroup.isEmpty,
+      s"Pool ${config.name}: isMetadataPool=${config.isMetadataPool} but metadataGroup=$metadataGroup")
     // Only a collision is retried: a taken pool name (KeyAlreadyExists), a failed device and an
     // allocation failure are all permanent. The test client's runCreate performs a single
     // attempt regardless.

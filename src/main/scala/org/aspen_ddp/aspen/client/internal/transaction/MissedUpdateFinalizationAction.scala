@@ -77,6 +77,9 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     }
   }
 
+  // Test seam: lets a test observe the transaction markMissedUpdate is about to commit
+  private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] = tx.commit().map(_ => ())
+
   def markMissedUpdate(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte]): Future[Unit] = {
     //println(s"Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
 
@@ -109,7 +112,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
         _ <- pool.errorTree.set(key,
                MissedUpdateFinalizationAction.encodeErrorEntry(txd.startTimestamp, storePointer))(using tx)
         _ = MissedUpdateFinalizationAction.limitTracking(storeId.poolId, tx)
-        _ <- tx.commit()
+        _ <- commitErrorTreeTransaction(tx)
       } yield {
         logger.trace(s"COMPLETED - Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
         ()
@@ -125,7 +128,7 @@ object MissedUpdateFinalizationAction extends RegisteredTypeFactory with Finaliz
     * write itself touches that pool. Only then could a missed update of the write mark an entry in
     * the same tree. Metadata placement keeps every other pool's ErrorTree out of the pool it describes.
     */
-  def limitTracking(entryPool: PoolId, tx: Transaction): Unit =
+  private[aspen] def limitTracking(entryPool: PoolId, tx: Transaction): Unit =
     if tx.referencedPoolIds.contains(entryPool) then
       tx.disableMissedUpdateTracking()
 

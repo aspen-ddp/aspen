@@ -868,8 +868,15 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       executor <- setup()
       groupId <- createMetadataGroup("meta-group", 0)
       _ <- waitForTransactionsToComplete()
+      psBefore <- readPool(Radicle.poolId)
+      agsBefore <- readGroupState(groupId)
       _ <- expectMetadataMismatch(AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor)), false)
-    yield succeed
+      _ <- waitForTransactionsToComplete()
+      psAfter <- readPool(Radicle.poolId)
+      agsAfter <- readGroupState(groupId)
+    yield
+      psAfter should be(psBefore)
+      agsAfter should be(agsBefore)
 
   atest("a metadata group nests only in a metadata group"):
     given ExecutionContext = executionContext
@@ -895,8 +902,15 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       childId <- client.createAllocationGroup("ordinary-child", level = 0, idaPolicy = IDAPolicy.AllowAll)
       parentId <- createMetadataGroup("meta-parent", 1)
       _ <- waitForTransactionsToComplete()
+      childBefore <- readGroupState(childId)
+      parentBefore <- readGroupState(parentId)
       _ <- expectMetadataMismatch(AllocationGroupState.addGroup(client, childId, parentId, Some(executor)), false)
-    yield succeed
+      _ <- waitForTransactionsToComplete()
+      childAfter <- readGroupState(childId)
+      parentAfter <- readGroupState(parentId)
+    yield
+      childAfter should be(childBefore)
+      parentAfter should be(parentBefore)
 
   atest("createNewMetadataPool records isMetadataPool and keeps its trees in the bootstrap pool"):
     given ExecutionContext = executionContext

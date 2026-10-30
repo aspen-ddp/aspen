@@ -113,6 +113,7 @@ class FsifModelSuite extends FileBasedTests:
     */
   private final class ProbeFiles(under: FsifFiles, onCrashIo: () => Unit) extends FsifFiles:
     def exists(name: String): Boolean = under.exists(name)
+    def size(name: String): Long = under.size(name)
     def open(name: String): FsifFile =
       val f = under.open(name)
       new FsifFile:

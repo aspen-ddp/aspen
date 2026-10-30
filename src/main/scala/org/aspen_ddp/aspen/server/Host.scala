@@ -66,6 +66,18 @@ object Host:
    *  can be handled, since every backend is opened under the instance lock; it stays empty if the constructor
    *  threw. */
   private case class BackendFailed(storeId: StoreId, backend: AtomicReference[Backend], err: Throwable) extends Event
+
+  /** The close of a store (ShutdownStore) found its backend failed-stop: the store was marked rebuild-required
+   *  rather than closed cleanly, so a caller must not mark it as cleanly closed (transfer-out marker) or ship it. */
+  final case class StoreFailedOnClose(storeId: StoreId)
+    extends Exception(s"Store $storeId failed on an I/O error while closing; it is marked for rebuild")
+
+  /** An FSIF store waiting for space to load: retried once `scansLeft` more device scans have passed. Each failed
+   *  retry doubles `waitScans`, up to the cap (SpaceRetryCap in scans). */
+  private final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int, scansLeft: Int)
+
+  /** Longest wait between load retries of a store whose device is out of space */
+  val SpaceRetryCap: Duration = Duration(5, MINUTES)
   private case class Exit() extends Event
   private case class RecoveryEvent() extends Event
   private case class HeartbeatEvent() extends Event
@@ -299,10 +311,19 @@ class Host(val client: AspenClient,
   private var offlineStores: Set[StoreId] = Set()
   private var creatingStores: Set[StoreId] = Set()
   // FSIF stores whose backend could not be opened because their device is out of space. Each is
-  // offline and unloaded; every ScanDevices (deviceScanPeriod, 10 s) tries the load again, and it
-  // leaves this map when the load succeeds or fails for any other reason. Never marked for
+  // offline and unloaded, and ScanDevices (every deviceScanPeriod, 10 s) tries the load again with
+  // an exponential backoff counted in scans: next scan, then 2, 4, ... scans later, capped at
+  // SpaceRetryCap. Each retry runs recovery on the event thread, as a RocksDB open does. A store
+  // leaves this map when its load succeeds or fails for any other reason. Never marked for
   // rebuild: the store's data is intact, it just cannot finish recovery until space returns.
-  private var storesAwaitingSpace: Map[StoreId, (LocalStorageDeviceState, os.Path)] = Map()
+  private var storesAwaitingSpace: Map[StoreId, SpaceWait] = Map()
+
+  /** SpaceRetryCap in device scans, at least 1 */
+  private val spaceRetryCapScans: Int =
+    if deviceScanPeriod.isFinite && deviceScanPeriod.toMillis > 0 then
+      math.max(1L, SpaceRetryCap.toMillis / deviceScanPeriod.toMillis).toInt
+    else
+      1
   private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
   // Completed when the rebuild of each store in rebuildingStores has released its slot, its
   // outcome acted on. What a shutdown waits on for the rebuilds it cancels.
@@ -684,6 +705,9 @@ class Host(val client: AspenClient,
    *  later damage -- and the host that wrote it no longer holds the state either. Refusing the
    *  device would not bring the state back, so the store is adopted as Rebuilding instead.
    *
+   *  A store carrying `rebuild-required` is CrlLost whatever else its directory holds: its host
+   *  marked it because its state cannot be trusted (an FSIF backend that failed while closing).
+   *
    *  The CRL file is parsed, not just found: loadValidStoreState rejects a file cut short, and one
    *  whose header names another store, so a file copied from another store's directory does not
    *  pass for this one's state.
@@ -691,6 +715,10 @@ class Host(val client: AspenClient,
   private def adoptionClass(storeId: StoreId, storePath: os.Path): AdoptionClass =
     if !os.isDir(storePath) then
       AdoptionClass.Unclean
+    else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+      // Marked by the host that closed it (a backend that failed during its close): never loaded
+      // again whatever else is present, so its state is lost and it is adopted as Rebuilding.
+      AdoptionClass.CrlLost
     else if os.exists(storePath / StoreTransfer.TransferredInMarkerFile) then
       AdoptionClass.Clean
     else if os.exists(storePath / StoreTransfer.TransferOutMarkerFile) then
@@ -970,7 +998,7 @@ class Host(val client: AspenClient,
       offlineStores += storeId
       sds.offlineStores += storeId
       sds.loadedStores -= storeId
-    val awaiting = storesAwaitingSpace.contains(storeId)
+    val previous = storesAwaitingSpace.get(storeId)
     storesAwaitingSpace -= storeId
     try
       Some(openBackend(storeCfg, storePath, create = false))
@@ -991,29 +1019,33 @@ class Host(val client: AspenClient,
           checkStorageDevice(sds.storageDeviceId)
         None
       case e: Throwable if isFsif(storeCfg) && FsifIo.isOutOfSpace(e) =>
-        if awaiting then
-          logger.debug(s"Store $storeId still cannot be loaded: its device is out of space. Error: $e")
+        val waitScans = previous.map(w => math.min(w.waitScans * 2, spaceRetryCapScans)).getOrElse(1)
+        if previous.isDefined then
+          logger.debug(s"Store $storeId still cannot be loaded: its device is out of space. Retrying in " +
+                       s"$waitScans device scans. Error: $e")
         else
           logger.warn(s"Store $storeId cannot be loaded: its device is out of space. Leaving it offline and " +
-                      s"retrying every device scan until space returns. $storePath. Error: $e")
+                      s"retrying, with backoff, until space returns. $storePath. Error: $e")
         leaveOffline()
-        storesAwaitingSpace += storeId -> (sds, storePath)
+        storesAwaitingSpace += storeId -> SpaceWait(sds, storePath, waitScans, waitScans)
         None
 
   private def isFsif(storeCfg: StoreConfig): Boolean = storeCfg.backend.isInstanceOf[StoreConfig.Fsif]
 
-  /** Retries the load of every store in storesAwaitingSpace whose device is still loaded here, not shutting down,
-   *  and still has it offline and unloaded. Others are dropped: whatever replaced or removed them has taken over.
-   *  Caller holds the instance lock. */
+  /** Called once per device scan. Retries the load of every store in storesAwaitingSpace whose backoff has run
+   *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
+   *  are dropped: whatever replaced or removed them has taken over. Caller holds the instance lock. */
   private def retryStoresAwaitingSpace(): Unit =
-    storesAwaitingSpace.foreach: (storeId, entry) =>
-      val (sds, storePath) = entry
-      val deviceId = sds.storageDeviceId
-      if ! storageDevices.get(deviceId).exists(_ eq sds) || stores.contains(storeId) ||
-         ! sds.offlineStores.contains(storeId) || ! os.exists(storePath / StoreConfig.configFilename) then
+    storesAwaitingSpace.foreach: (storeId, wait) =>
+      val deviceId = wait.sds.storageDeviceId
+      if ! storageDevices.get(deviceId).exists(_ eq wait.sds) || stores.contains(storeId) ||
+         ! wait.sds.offlineStores.contains(storeId) ||
+         ! os.exists(wait.storePath / StoreConfig.configFilename) then
         storesAwaitingSpace -= storeId
+      else if wait.scansLeft > 1 then
+        storesAwaitingSpace += storeId -> wait.copy(scansLeft = wait.scansLeft - 1)
       else if ! shuttingDownDevices.contains(deviceId) then
-        tryLoadStore(sds, storePath)
+        tryLoadStore(wait.sds, wait.storePath)
 
   /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. Caller holds the instance
    *  lock, which BackendFailed relies on. */
@@ -1886,7 +1918,7 @@ class Host(val client: AspenClient,
                                 s"it offline and retrying every device scan. Error: $e")
                     offlineStores += storeId
                     local.offlineStores += storeId
-                    storesAwaitingSpace += storeId -> (local, storePath)
+                    storesAwaitingSpace += storeId -> SpaceWait(local, storePath, 1, 1)
                     throw e
 
               // Recorded as tryLoadStore records a load, so a shutdown of this device finds the
@@ -2226,6 +2258,26 @@ class Host(val client: AspenClient,
     case b: FsifBackend => b.hasFailed
     case _ => false
 
+  /** A store closed by ShutdownStore whose backend failed-stop meanwhile: its page-cache state can't be trusted, so
+   *  it is rebuilt rather than treated as cleanly closed. Marked rebuild-required, and the CRL save file the close
+   *  just wrote is removed so nothing takes the directory for a clean close; it is dropped from loadedStores so a
+   *  shutdown retry does not pick it again. Caller holds the instance lock. */
+  private def failedOnClose(store: Store): Unit =
+    val storeId = store.storeId
+    val path = store.backend.path
+    logger.error(s"Store $storeId failed on an I/O error while closing. Marking it for rebuild instead of " +
+                 s"closing it cleanly. $path")
+    offlineStores += storeId
+    storageDevices.get(store.storageDeviceId).foreach: sds =>
+      sds.loadedStores -= storeId
+      sds.offlineStores += storeId
+    try
+      markRebuildRequired(path)
+      DurableFiles.remove(Backend.crlSaveFile(path))
+    catch
+      case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $path: $t")
+    checkStorageDevice(store.storageDeviceId)
+
   /** An FSIF backend failed-stop: page-cache state can no longer be trusted, so the store is rebuilt. If it is
    *  served, it is unloaded as UnloadFailedStore does, its CRL state dropped (the rebuild discards the directory),
    *  marked rebuild-required and left offline, and its device checked so the reconcile flips its entry to
@@ -2255,8 +2307,22 @@ class Host(val client: AspenClient,
         crl.closeStore(storeId).onComplete: _ =>
           store.close()
         checkStorageDevice(store.storageDeviceId)
-      case _ =>
-        logger.info(s"Ignoring the failure of a backend of store $storeId that is not being served. Error: $err")
+      case served =>
+        // Not served: its LoadStore is still queued (and retires it), it was replaced by a newer
+        // backend, or it was closed. Unless replaced, its directory is marked, so a store closed
+        // around the failure is never later served, shipped or adopted as cleanly closed.
+        backend match
+          case Some(b) if served.isEmpty && !stores.valuesIterator.exists(_.backend.path == b.path) &&
+                          os.isDir(b.path) &&
+                          storageDevices.valuesIterator.exists(_.devicePath == b.path / os.up) =>
+            logger.error(s"Store $storeId failed on an I/O error after it stopped being served. Marking it for " +
+                         s"rebuild. Error: $err")
+            try
+              markRebuildRequired(b.path)
+            catch
+              case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at ${b.path}: $t")
+          case _ =>
+            logger.info(s"Ignoring the failure of a replaced backend of store $storeId. Error: $err")
 
   /** Flips the entry of a store whose CRL state was lost from Active to Rebuilding, on its own
    *  device. Nothing else changes: the pool already names this device and host. Writes nothing
@@ -2733,7 +2799,12 @@ class Host(val client: AspenClient,
    */
   private def closeStoresForShutdown(local: LocalStorageDeviceState): Future[Unit] =
     runSequentially(storesToClose(local)): storeId =>
-      closeStoreForShutdown(storeId).map: _ =>
+      // A store whose backend failed while closing is marked rebuild-required instead of closed
+      // cleanly (see failedOnClose), and an adopter takes it as Rebuilding.
+      closeStoreForShutdown(storeId).transform:
+        case Failure(_: StoreFailedOnClose) => Success(false)
+        case other => other.map(_ => true)
+      .map: clean =>
         synchronized:
           // ShutdownStore records this too. Done here as well so the bookkeeping that later
           // steps read does not depend on how the store was closed.
@@ -2742,7 +2813,8 @@ class Host(val client: AspenClient,
           // Forced to disk, as the CRL file ShutdownStore saved beside it was: once Shutdown
           // commits the disk may be pulled at any moment, and an adopter refuses a store whose
           // marker or CRL file did not survive.
-          DurableFiles.write(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
+          if clean then
+            DurableFiles.write(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
           gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
     .map(_ => ())
 
@@ -3692,7 +3764,13 @@ class Host(val client: AspenClient,
             crl.closeStore(storeId).foreach: trs =>
               CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)
               store.close().foreach: _ =>
-                completion.success(())
+                // An FSIF close completes even after a fail-stop during it, and this store is no
+                // longer served, so its BackendFailed (if any) would find nothing to act on.
+                if backendHasFailed(store.backend) then
+                  synchronized(failedOnClose(store))
+                  completion.failure(StoreFailedOnClose(storeId))
+                else
+                  completion.success(())
         
       case null => // nothing to do
       

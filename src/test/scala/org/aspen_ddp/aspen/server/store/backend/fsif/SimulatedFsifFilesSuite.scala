@@ -33,9 +33,12 @@ class SimulatedFsifFilesSuite extends FileBasedTests:
 
   test("reads and size see unforced writes"):
     val fs = new SimulatedFsifFiles(new Random(1))
+    fs.size("a") shouldBe 0L
+    fs.exists("a") shouldBe false
     val f = fs.open("a")
     f.write(10, filled(5, 3))
     f.size shouldBe 15
+    fs.size("a") shouldBe 15L
     f.read(0, 20) shouldBe (Array.fill(10)(0.toByte) ++ filled(5, 3))
     f.read(12, 100) shouldBe filled(3, 3)
     f.read(100, 4) shouldBe Array.empty[Byte]
@@ -185,11 +188,14 @@ class SimulatedFsifFilesSuite extends FileBasedTests:
   test("NioFsifFiles round-trips write, read, truncate and force"):
     val files = new NioFsifFiles(tdir)
     files.exists("x") shouldBe false
+    files.size("x") shouldBe 0L
+    files.exists("x") shouldBe false
     val f = files.open("x")
     files.exists("x") shouldBe true
     f.write(0, filled(100, 3))
     f.write(200, filled(10, 4))
     f.size shouldBe 210
+    files.size("x") shouldBe 210L
     f.read(95, 10) shouldBe (filled(5, 3) ++ new Array[Byte](5))
     f.read(205, 100) shouldBe filled(5, 4)
     f.read(500, 4) shouldBe Array.empty[Byte]

@@ -244,15 +244,12 @@ class FsifBackend(val storeId: StoreId,
       }
     }(using ExecutionContext.parasitic)
 
-  /** The held data and active journal handles, plus the other journal and both index files (not held) */
+  /** The held data and active journal handles, plus the other journal and both index files (not held, so sized
+    * without opening them) */
   override def estimateSize(): Long =
     val active = activeJournal
     val others = FsifRecovery.IndexFiles ++ FsifRecovery.JournalFiles.filter(_ != active)
-    def sizeOf(name: String): Long =
-      val f = files.open(name)
-      try f.size
-      finally f.close()
-    dataFile.size + journalFile.size + others.filter(files.exists).map(sizeOf).sum
+    dataFile.size + journalFile.size + others.map(files.size).sum
 
   override def bootstrapAllocate(objectId: ObjectId, objectType: ObjectType.Value, metadata: Metadata,
                                  data: DataBuffer): Unit =

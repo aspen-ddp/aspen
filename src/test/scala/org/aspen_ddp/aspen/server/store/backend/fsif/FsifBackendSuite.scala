@@ -713,6 +713,7 @@ object FsifBackendSuite:
     */
   final class TearingFiles(underlying: FsifFiles, tear: AtomicBoolean) extends FsifFiles:
     def exists(name: String): Boolean = underlying.exists(name)
+    def size(name: String): Long = underlying.size(name)
     def open(name: String): FsifFile =
       val f = underlying.open(name)
       if name != FsifRecovery.DataFile then

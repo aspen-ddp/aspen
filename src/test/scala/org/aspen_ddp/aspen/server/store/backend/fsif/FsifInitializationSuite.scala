@@ -80,3 +80,22 @@ class FsifInitializationSuite extends FileBasedTests:
     cfg.segmentPayloadSize.toLong shouldBe rs.minSliceSizeFor(1 << 20)
     cfg.segmentCount shouldBe 1000
     rs.maxObjectSize(cfg.segmentPayloadSize) should be >= (1 << 20)
+
+  test("estimateSize sizes the files it does not hold without opening them"):
+    val dir = tdir / "store"
+    close(FsifBackend.create(storeId, dir, layout, io, _ => ()))
+    val opens = new java.util.concurrent.atomic.AtomicInteger(0)
+    val nio = new NioFsifFiles(dir)
+    val counting = new FsifFiles:
+      def open(name: String): FsifFile =
+        opens.incrementAndGet()
+        nio.open(name)
+      def exists(name: String): Boolean = nio.exists(name)
+      def size(name: String): Long = nio.size(name)
+    val b = new FsifBackend(storeId, dir, layout, counting, io)
+    try
+      val before = opens.get
+      val expected = Seq(FsifRecovery.DataFile) ++ FsifRecovery.IndexFiles ++ FsifRecovery.JournalFiles
+      b.estimateSize() shouldBe expected.map(n => nio.size(n)).sum
+      opens.get shouldBe before
+    finally close(b)

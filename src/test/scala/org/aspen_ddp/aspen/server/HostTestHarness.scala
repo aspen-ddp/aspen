@@ -480,7 +480,14 @@ private class RecordingHost(mgrClient: AspenClient,
   override protected def closeStoreForShutdown(storeId: StoreId): Future[Unit] =
     synchronized:
       shutdownCloses += storeId
-    shutdownCloseGate.get.map(_.future).getOrElse(Future.unit)
+    if failingShutdownCloses.get.contains(storeId) then
+      Future.failed(Host.StoreFailedOnClose(storeId))
+    else
+      shutdownCloseGate.get.map(_.future).getOrElse(Future.unit)
+
+  /** Stores whose shutdown close fails as a ShutdownStore does when the backend failed-stop during it. Lazy, as
+   *  above. */
+  lazy val failingShutdownCloses = new AtomicReference[Set[StoreId]](Set())
 
   /** Every store closeStoreForTransferOut was called for, in call order. Lazy, as above. */
   lazy val transferOutCloses: mutable.ListBuffer[StoreId] = mutable.ListBuffer[StoreId]()

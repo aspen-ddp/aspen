@@ -12,6 +12,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.runSequentially
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 
@@ -210,7 +211,13 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
         ("no", (file, _) => os.remove(file)),
         ("a truncated", (file, _) => os.write.over(file, "")),
         ("another store's", (file, s) =>
-          CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file))) do
+          CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file)),
+        // As a close whose backend failed-stop leaves it (Host.failedOnClose): marked, no CRL file, no
+        // transfer-out marker
+        ("a failed-on-close store's", (file, _) =>
+          os.remove(file)
+          os.remove(file / os.up / StoreTransfer.TransferOutMarkerFile)
+          os.write.over(file / os.up / RebuildingStore.RebuildRequiredMarkerFile, ""))) do
     atest(s"a store with $what CRL save file is adopted as Rebuilding and rebuilt"):
       given ExecutionContext = executionContext
       val rebuilds = new RecordingRebuildFactory

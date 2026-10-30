@@ -21,6 +21,8 @@ trait FsifFile:
 trait FsifFiles:
   /** Creates the file if missing */
   def open(name: String): FsifFile
+  /** The file's current size (including unforced writes), or 0 if it does not exist. Opens nothing. */
+  def size(name: String): Long
   def exists(name: String): Boolean
 
 object FsifIo:
@@ -50,6 +52,10 @@ final class NioFsifFiles(dir: os.Path) extends FsifFiles:
     new NioFsifFile(channel)
 
   def exists(name: String): Boolean = os.exists(dir / name)
+
+  def size(name: String): Long =
+    val path = dir / name
+    if os.exists(path) then os.size(path) else 0L
 
 private final class NioFsifFile(channel: FileChannel) extends FsifFile:
 

@@ -974,7 +974,6 @@ object Main {
     System.exit(exitCode)
   }
 
-  /** A group needs either the four IDA arguments or --allow-any-ida, never both. Reported as a usage error. */
   /** --max-object-size and --segment-count go with --backend fsif, which requires both */
   private def validatePoolBackend(c: Args): Either[String, Unit] =
     if c.backend == "fsif" then
@@ -994,6 +993,7 @@ object Main {
     else
       RocksDBConfig()
 
+  /** A group needs either the four IDA arguments or --allow-any-ida, never both. Reported as a usage error. */
   private def validateGroupIda(c: Args): Either[String, Unit] =
     val gaveIda = c.idaType.nonEmpty || c.width != 0 || c.readThreshold != 0 || c.writeThreshold != 0
     if c.allowAnyIda && gaveIda then

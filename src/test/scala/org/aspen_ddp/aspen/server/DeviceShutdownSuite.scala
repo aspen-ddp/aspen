@@ -142,6 +142,21 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       hostState.storageDevices should contain(deviceA)
       host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
 
+  atest("a store whose backend fails during its shutdown close gets no transfer-out marker"):
+    given ExecutionContext = executionContext
+    for
+      (host, deviceDir) <- setUp(Map(s0 -> active, s1 -> active), loaded = Set(s0, s1))
+      _ <- addToBootstrapHost(deviceA)
+      _ = host.failingShutdownCloses.set(Set(s0))
+      _ <- shutDown(host)
+      st <- state(deviceA)
+    yield
+      host.shutdownCloses.toSet should be(Set(s0, s1))
+      os.exists(deviceDir / s0.directoryName / StoreTransfer.TransferOutMarkerFile) should be(false)
+      os.exists(deviceDir / s1.directoryName / StoreTransfer.TransferOutMarkerFile) should be(true)
+      st.status should be(DeviceStatus.Shutdown)
+      host.shutdownOutcomes.toList should be(List(ShutdownOutcome.Completed))
+
   atest("shutdown cancels a running rebuild and does not restart it"):
     given ExecutionContext = executionContext
     val rebuilds = new CancellableRebuildFactory

@@ -45,6 +45,10 @@ final class SimulatedFsifFiles(rnd: Random) extends FsifFiles:
     live()
     files.contains(name)
 
+  def size(name: String): Long = lock.synchronized:
+    live()
+    files.get(name).map(_.cache.size).getOrElse(0L)
+
   /** The next matching write/force/truncate throws, then the fault is spent */
   def failNext(fault: Fault, file: String => Boolean = _ => true,
                ops: Set[FaultOp] = FaultOp.values.toSet): Unit = lock.synchronized:

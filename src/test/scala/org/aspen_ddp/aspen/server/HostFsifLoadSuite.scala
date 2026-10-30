@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout, FsifRecovery}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout, FsifRecovery, FsifTuning, NioFsifFiles}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -37,6 +37,8 @@ private class FsifSeamHost(mgrClient: AspenClient,
   @volatile var outOfSpaceOpens: Int = 0
   @volatile var opens: Int = 0
   @volatile var onFatals: List[Throwable => Unit] = Nil
+  /** Backends opened from now on report hasFailed while this is set, as one that failed-stop does */
+  @volatile var reportFailed: Boolean = false
 
   override protected def openFsifBackend(storeId: StoreId, path: os.Path, layout: FsifLayout,
                                          onFatal: Throwable => Unit): Backend =
@@ -45,7 +47,11 @@ private class FsifSeamHost(mgrClient: AspenClient,
       outOfSpaceOpens -= 1
       throw new IOException("No space left on device")
     onFatals = onFatal :: onFatals
-    super.openFsifBackend(storeId, path, layout, onFatal)
+    if !os.exists(path / FsifBackend.InitializedMarkerFile) then
+      super.openFsifBackend(storeId, path, layout, onFatal)
+    else
+      new FsifBackend(storeId, path, layout, new NioFsifFiles(path), FsifBackend.sharedIo, FsifTuning(), onFatal):
+        override def hasFailed: Boolean = super.hasFailed || FsifSeamHost.this.reportFailed
 
 class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
 
@@ -109,11 +115,16 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
       host.testingOnlyOfflineStores should contain(storeId)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 
-      // Still full on the first retry
+      // Still full on the first retry, the next scan
       host.testingOnlyScanDevices()
       host.testingOnlyHandleEvents()
       host.opens should be(2)
       host.getStoreIds should not contain storeId
+
+      // Backed off: the next retry waits two scans
+      host.testingOnlyScanDevices()
+      host.testingOnlyHandleEvents()
+      host.opens should be(2)
 
       host.testingOnlyScanDevices()
       host.testingOnlyHandleEvents()
@@ -126,6 +137,25 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
       host.testingOnlyScanDevices()
       host.testingOnlyHandleEvents()
       host.opens should be(3)
+
+  atest("out-of-space load retries back off exponentially, capped at five minutes of scans"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      host.outOfSpaceOpens = Int.MaxValue
+      load(host)
+      val retriedAt = (1 to 100).filter: scan =>
+        val before = host.opens
+        host.testingOnlyScanDevices()
+        host.testingOnlyHandleEvents()
+        host.opens > before
+      // Waits of 1, 2, 4, 8, 16 scans, then the cap: 5 minutes of 10 s scans
+      retriedAt.toList should be(List(1, 3, 7, 15, 31, 61, 91))
+      host.getStoreIds should not contain storeId
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
 
   atest("a served FSIF store that fails fatally is unloaded, marked for rebuild and left offline"):
     val hostRoot = newHostDir()
@@ -144,7 +174,25 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
       host.testingOnlyOfflineStores should contain(storeId)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
 
-  atest("a fatal failure of an FSIF backend no longer served is ignored"):
+  atest("a fatal failure of an FSIF backend closed and not replaced marks the store for rebuild"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    load(host)
+    val closedOnFatal = host.onFatals.head
+    val closed = host.closeStore(storeId)
+    host.testingOnlyHandleEvents()
+    closed.map: _ =>
+      host.getStoreIds should not contain storeId
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+
+      closedOnFatal(new IOException("Input/output error"))
+      host.testingOnlyHandleEvents()
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+
+  atest("a fatal failure of an FSIF backend replaced by a newer one is ignored"):
     val hostRoot = newHostDir()
     val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
     val host = newSeamHost(hostRoot)
@@ -152,12 +200,35 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
     val storeDir = writeFsifStoreConfig(deviceDir)
     load(host)
     val staleOnFatal = host.onFatals.head
-    host.closeStore(storeId)
+    val closed = host.closeStore(storeId)
     host.testingOnlyHandleEvents()
-    host.getStoreIds should not contain storeId
+    closed.map: _ =>
+      load(host)
+      host.getStoreIds should contain(storeId)
+      host.onFatals.size should be(2)
 
-    staleOnFatal(new IOException("Input/output error"))
-    host.testingOnlyHandleEvents()
-
-    Future.successful:
+      staleOnFatal(new IOException("Input/output error"))
+      host.testingOnlyHandleEvents()
+      host.getStoreIds should contain(storeId)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+
+  atest("an FSIF store that fails during its close is marked for rebuild, not closed cleanly"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      load(host)
+      host.getStoreIds should contain(storeId)
+      // The close's final I/O fails: the backend reports failed by the time its close completes
+      host.reportFailed = true
+      val closed = host.closeStore(storeId)
+      host.testingOnlyHandleEvents()
+      closed.failed.map: err =>
+        err should be(Host.StoreFailedOnClose(storeId))
+        host.testingOnlyHandleEvents()
+        host.getStoreIds should not contain storeId
+        host.testingOnlyOfflineStores should contain(storeId)
+        os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+        os.exists(Backend.crlSaveFile(storeDir)) should be(false)

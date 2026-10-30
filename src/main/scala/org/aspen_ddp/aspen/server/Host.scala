@@ -74,7 +74,11 @@ object Host:
 
   /** An FSIF store waiting for space to load: retried once `scansLeft` more device scans have passed. Each failed
    *  retry doubles `waitScans`, up to the cap (SpaceRetryCap in scans). */
-  private final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int, scansLeft: Int)
+  /** A store whose load awaits space. `onServed` is the waiting load's tryLoadStore callback: the next open of the
+   *  store (a retry or any other load) takes it over, and it is dropped with the entry if the store leaves the wait
+   *  for any other reason. */
+  private final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int, scansLeft: Int,
+                                     onServed: () => Unit = () => ())
 
   /** Longest wait between load retries of a store whose device is out of space */
   val SpaceRetryCap: Duration = Duration(5, MINUTES)
@@ -1027,12 +1031,17 @@ class Host(val client: AspenClient,
     val storeId = storeCfg.storeId
     val previous = storesAwaitingSpace.get(storeId)
     storesAwaitingSpace -= storeId
+    // A load that failed for lack of space handed its callback to this open, which now runs it, once, if it serves
+    // the store
+    val servedCallback = previous match
+      case Some(wait) => () => { wait.onServed(); onServed() }
+      case None => onServed
     fsifOpening += storeId -> Nil
     sds.loadedStores += storeId
     try
       fsifOpenEc.execute: () =>
         val result = Try(openBackend(storeCfg, storePath, create))
-        events.put(FsifOpened(sds, storeCfg, storePath, create, previous, result, created, onServed))
+        events.put(FsifOpened(sds, storeCfg, storePath, create, previous, result, created, servedCallback))
     catch
       case t: Throwable =>
         fsifOpening -= storeId
@@ -1095,7 +1104,7 @@ class Host(val client: AspenClient,
           logger.warn(s"Store $storeId cannot be created: device ${sds.storageDeviceId} is out of space. Leaving " +
                       s"it offline and retrying every device scan. Error: $e")
           leaveOffline()
-          storesAwaitingSpace += storeId -> SpaceWait(sds, storePath, 1, 1)
+          storesAwaitingSpace += storeId -> SpaceWait(sds, storePath, 1, 1, onServed)
         else
           val waitScans = previous.map(w => math.min(w.waitScans * 2, spaceRetryCapScans)).getOrElse(1)
           if previous.isDefined then
@@ -1105,7 +1114,7 @@ class Host(val client: AspenClient,
             logger.warn(s"Store $storeId cannot be loaded: its device is out of space. Leaving it offline and " +
                         s"retrying, with backoff, until space returns. $storePath. Error: $e")
           leaveOffline()
-          storesAwaitingSpace += storeId -> SpaceWait(sds, storePath, waitScans, waitScans)
+          storesAwaitingSpace += storeId -> SpaceWait(sds, storePath, waitScans, waitScans, onServed)
         created.foreach(_.tryFailure(e))
       case Failure(e) =>
         logger.warn(s"Failed to load store $storePath. Error: $e")
@@ -1120,7 +1129,8 @@ class Host(val client: AspenClient,
 
   /** Called once per device scan. Retries the load of every store in storesAwaitingSpace whose backoff has run
    *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
-   *  are dropped: whatever replaced or removed them has taken over. Caller holds the instance lock. */
+   *  are dropped, with their onServed callback unrun: whatever replaced or removed them has taken over. A retry's
+   *  open takes the callback over from the entry (startFsifOpen). Caller holds the instance lock. */
   private def retryStoresAwaitingSpace(): Unit =
     storesAwaitingSpace.foreach: (storeId, wait) =>
       val deviceId = wait.sds.storageDeviceId

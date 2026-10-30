@@ -457,3 +457,58 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
       host.testingOnlyHandleEvents()
       host.getStoreIds should contain(storeId)
       host.gossipedOnline should be(List(storeId))
+
+  atest("a reinstated FSIF store whose first open is out of space gossips StoreMoved once, when a retry serves it"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    reinstateAbandoned(host, storeDir, queued).map: _ =>
+      host.outOfSpaceOpens = 1
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // FsifOpened: out of space, left offline awaiting space
+      host.getStoreIds should not contain storeId
+      host.gossipedOnline should be(Nil)
+
+      host.testingOnlyScanDevices() // the retry: its open is queued
+      queued.size should be(1)
+      host.gossipedOnline should be(Nil)
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // FsifOpened served, then its LoadStore
+      host.getStoreIds should contain(storeId)
+      host.gossipedOnline should be(List(storeId))
+
+      // Exactly once: later scans and events gossip nothing more
+      host.testingOnlyScanDevices()
+      host.testingOnlyHandleEvents()
+      queued.size should be(0)
+      host.gossipedOnline should be(List(storeId))
+
+  atest("a reinstated FSIF store dropped from the space wait never runs its gossip, even if loaded later"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    reinstateAbandoned(host, storeDir, queued).map: _ =>
+      host.outOfSpaceOpens = 1
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // out of space, awaiting space
+      val cfg = os.read.bytes(storeDir / StoreConfig.configFilename)
+      os.remove(storeDir / StoreConfig.configFilename)
+      host.testingOnlyScanDevices() // its config is gone: dropped from the wait, no retry
+      queued.size should be(0)
+      host.gossipedOnline should be(Nil)
+
+      // A later, unrelated load serves it without the dropped callback
+      os.write(storeDir / StoreConfig.configFilename, cfg)
+      host.testingOnlyScanDevices()
+      queued.size should be(0) // no longer waiting
+      load(host)
+      queued.poll().run()
+      host.testingOnlyHandleEvents()
+      host.getStoreIds should contain(storeId)
+      host.gossipedOnline should be(Nil)

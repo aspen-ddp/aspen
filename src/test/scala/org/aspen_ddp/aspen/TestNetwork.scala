@@ -14,6 +14,7 @@ import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientRequest, ClientResponse, Gossip, HostMessage, Read, ReadResponse, TxMessage}
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
@@ -155,6 +156,15 @@ class TestNetwork(executionContext: ExecutionContext,
   /** Hosts the client messenger reports offline. Everything is online unless a test says otherwise. */
   @volatile var offlineHostIds: Set[HostId] = Set.empty
 
+  /** Hosts other than smgr, each serving every store of the pools mapped to it. Messages to the stores of an
+   *  unmapped pool go to smgr. handleEvents drains every mapped host, and a test remaps a pool to model a restart.
+   */
+  @volatile var poolHosts: Map[PoolId, Host] = Map()
+
+  private def hostFor(storeId: StoreId): Host = poolHosts.getOrElse(storeId.poolId, smgr)
+
+  private def allHosts: List[Host] = smgr :: poolHosts.values.toList.distinct.filterNot(_ eq smgr)
+
   private var readCounting = false
   private var countedReads: Set[(UUID, ObjectId)] = Set()
 
@@ -182,13 +192,13 @@ class TestNetwork(executionContext: ExecutionContext,
         case r: Read if r.fromClient == client.clientId => recordRead(r)
         case _ => ()
       handleEvents()
-      smgr.receiveClientRequest(msg)
+      hostFor(msg.toStore).receiveClientRequest(msg)
       handleEvents()
     }
 
     def sendTransactionMessage(msg: TxMessage): Unit = {
       handleEvents()
-      smgr.receiveTransactionMessage(msg)
+      hostFor(msg.to).receiveTransactionMessage(msg)
       handleEvents()
     }
 
@@ -348,7 +358,7 @@ class TestNetwork(executionContext: ExecutionContext,
           printStack()
 
     synchronized:
-      smgr.testingOnlyHandleEvents()
+      allHosts.foreach(_.testingOnlyHandleEvents())
   }
 
   // process load store events
@@ -391,25 +401,25 @@ class TestNetwork(executionContext: ExecutionContext,
 
   override def sendTransactionMessage(msg: TxMessage): Unit = {
     handleEvents()
-    smgr.receiveTransactionMessage(msg)
+    hostFor(msg.to).receiveTransactionMessage(msg)
     handleEvents()
   }
 
   override def sendTransactionMessages(msg: List[TxMessage]): Unit = {
     handleEvents()
-    msg.foreach(smgr.receiveTransactionMessage)
+    msg.foreach(m => hostFor(m.to).receiveTransactionMessage(m))
     handleEvents()
   }
 
   override def dropCacheForStore(storeId: StoreId): Unit = ()
 
-  def hasTransactions: Boolean = smgr.hasTransactions
+  def hasTransactions: Boolean = allHosts.exists(_.hasTransactions)
 
   def printTransactionStatus(): Unit = {
-    if smgr.hasTransactions then
+    if hasTransactions then
       val test = client.getSystemAttribute("unittest.name")
       println(s"*********** Transaction Status. Hung Test: $test ***********")
-      smgr.logTransactionStatus(s => println(s))
+      allHosts.foreach(_.logTransactionStatus(s => println(s)))
       println("******************************************")
   }
 
@@ -423,7 +433,7 @@ class TestNetwork(executionContext: ExecutionContext,
 
     val myRunnable: Runnable = () => {
       var count = 0
-      while smgr.hasTransactions do
+      while hasTransactions do
         count += 1
         if (count == 20)
           printTransactionStatus()

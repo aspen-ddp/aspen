@@ -31,9 +31,9 @@ object on more stores than the IDA tolerates. That is data loss.
 
 ## Non-goals
 
-- **The allocation strategy** (the bitmap of allocated external indices, its DurableTask-based clearing, and
-  wiring it into `StoragePoolState`). It is the second Todo item and gets its own design. This design defines
-  only the `storePointer` contract it must satisfy.
+- **The allocation strategy** (the bitmap of allocated external indices and its release). Specified separately in
+  `2026-10-30-fsif-allocation-strategy-design.md`. This design defines only the `storePointer` contract it must
+  satisfy.
 - **Efficient KeyValue objects.** They must work correctly, but putting them in an FSIF pool is usually a
   mistake. Every KV update is treated as a whole-object write.
 - **Bootstrap pool support.** The bootstrap pool stays RocksDB.

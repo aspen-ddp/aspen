@@ -777,12 +777,11 @@ class MainSuite extends AnyFunSuite with Matchers:
       val rocks = parse().getOrElse(fail("create-pool did not parse"))
       Main.poolBackendConfig(rocks, Main.createIDA(rocks)) shouldBe RocksDBConfig()
 
-      // Parsed and sized as it will be once FSIF pools are enabled
       val fsif = rocks.copy(backend = "fsif", maxObjectSize = Some(4096), segmentCount = Some(100))
-      Main.validatePoolBackend(fsif, fsifEnabled = true) shouldBe Right(())
+      Main.validatePoolBackend(fsif) shouldBe Right(())
       Main.poolBackendConfig(fsif, Main.createIDA(fsif)) shouldBe FsifConfig.forObjectSize(Replication(3, 2), 4096, 100)
-      Main.validatePoolBackend(fsif.copy(maxObjectSize = None), fsifEnabled = true).isLeft shouldBe true
-      Main.validatePoolBackend(fsif.copy(segmentCount = None), fsifEnabled = true).isLeft shouldBe true
+      Main.validatePoolBackend(fsif.copy(maxObjectSize = None)).isLeft shouldBe true
+      Main.validatePoolBackend(fsif.copy(segmentCount = None)).isLeft shouldBe true
 
       parse("--backend", "fsif") shouldBe None
       parse("--backend", "fsif", "--max-object-size", "4096") shouldBe None
@@ -791,15 +790,22 @@ class MainSuite extends AnyFunSuite with Matchers:
       parse("--backend", "lmdb") shouldBe None
       parse("--backend", "fsif", "--max-object-size", "0", "--segment-count", "100") shouldBe None
 
-  test("create-pool refuses --backend fsif until an allocation strategy produces 4-byte storePointers"):
-    withTempDir("parse-fsif-refused"): dir =>
+  test("create-pool accepts --backend fsif"):
+    withTempDir("parse-fsif-accepted"): dir =>
+      val cfgs = emptyFile(dir / "bootstrap.yaml")
+      val parsed = Main.buildParser.parse(Seq("create-pool", cfgs, "mypool", "Replication", "3", "2", "2", "myset",
+        "--backend", "fsif", "--max-object-size", "4096", "--segment-count", "100"), Main.Args())
+      parsed.map(_.backend) shouldBe Some("fsif")
+
+  test("create-metadata-pool refuses --backend fsif"):
+    withTempDir("parse-fsif-metadata-refused"): dir =>
       val cfgs = emptyFile(dir / "bootstrap.yaml")
       val err = new java.io.ByteArrayOutputStream()
       val parsed = Console.withErr(err):
-        Main.buildParser.parse(Seq("create-pool", cfgs, "mypool", "Replication", "3", "2", "2", "myset",
+        Main.buildParser.parse(Seq("create-metadata-pool", cfgs, "mypool", "Replication", "3", "2", "2", "myset",
           "--backend", "fsif", "--max-object-size", "4096", "--segment-count", "100"), Main.Args())
       parsed shouldBe None
-      err.toString should include("4-byte storePointers")
+      err.toString should include("--backend fsif is not supported for metadata pools")
 
   test("host --load-jars names a version directory under <host-directory>/jars"):
     withTempDir("parse-load-jars"): dir =>

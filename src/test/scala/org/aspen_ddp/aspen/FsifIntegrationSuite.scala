@@ -1,14 +1,14 @@
 package org.aspen_ddp.aspen
 
-import org.aspen_ddp.aspen.client.{AppendPosition, AspenClient, RangedWrite, RegisteredTypeFactory, Transaction}
+import org.aspen_ddp.aspen.client.{AppendPosition, AspenClient, RangedWrite, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
-import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState, StoragePoolState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceSetId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, ObjectRevision}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, uuid2byte}
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{Host, HostTestHarness, StoreConfig}
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, FsifConfig}
@@ -89,7 +89,6 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
     * pointer's IDA to the bootstrap pool's.
     */
   override def testIda: IDA = RandomAccessReedSolomon(5, 3, 4, 64)
-
 
   private given ExecutionContext = executionContext
 
@@ -483,4 +482,31 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
       storesShouldBeFsifOnDisk()
       os.exists(lostDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
       os.exists(deviceDir / RebuildingStore.RebuildDirectory / storeIds(lost).directoryName) should be(false)
+      succeed
+
+  atest("FSIF pool allocations come from its bitmap and a deleted object's index is reused"):
+    val firstContent = Array[Byte](1, 2, 3)
+    val secondContent = Array[Byte](4, 5, 6)
+    val thirdContent = Array[Byte](7, 8, 9, 10)
+    for
+      _ <- setUp()
+      first <- allocate(firstContent)
+      second <- allocate(secondContent)
+      _ <- waitForTransactionsToComplete()
+      meta <- client.readMetadata(first)
+      deleteTx = client.newTransaction()
+      _ = deleteTx.setRefcount(first, meta.refcount, meta.refcount.decrement())
+      _ <- deleteTx.commit()
+      _ <- waitForTransactionsToComplete()
+      third <- allocate(thirdContent)
+      _ <- waitForTransactionsToComplete()
+      _ <- readsWithStoresDown(third, thirdContent)
+      _ <- readsWithStoresDown(second, secondContent)
+    yield
+      val indices = List(first, second, third).map(externalIndex)
+      withClue(s"indices $indices: "):
+        indices.take(2).distinct.size should be(2)
+        // The deleted object's bit was cleared in its transaction, so the new object cannot share the live one's
+        indices(2) should not be indices(1)
+        indices.foreach(_ should (be >= 0 and be < segmentCount))
       succeed

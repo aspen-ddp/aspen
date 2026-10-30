@@ -1,25 +1,6 @@
 TODO
 ====
 
-FixedSizedIndexFileAllocationStrategy
-  - Use a KeyValue object to hold segments of an allocated indicies bitmap
-    - 100Gib of 1Mib segments is 102400 indicies - 12k allocation bitmap
-  - Can use a bitmap KeyValue object to hold 100 1k segments of the bitmap
-  - Allocator chooses one at random for allocating. Therefore low chance of collision
-  - *** Note that this choice must be cached in the Transaction instance
-    - When attempting to allocate multiple objects from the same pool in the transaction, we need to re-use
-      this same bitmap. Only choose another if it is full.
-    - We'll also need to be able to register a callback to be called at the beginning of the transaction build
-      process.
-      - This will aggregate all the allocations into a list of Insert operations with key revision guards
-        and adds an update to the KeyValue object to the transaction
-    - Deletions need to be similarly tracked
-  - deleteObject method will need to become asynchronous. It should set the bit to zero for each object
-    deallocated by the transaction. Ensure the bitmap object for a pool is only read once per transaction.
-  - Add this allocation strategy and a pointer to a KeyValue object with the KeyValue content holding the
-    zeroed bitmaps to the StoragePoolState object of new pools being created with the FixedSizeIndexedFile
-    backend.
-
 Add an iscsi server application similar to amoebafs. The goal is to implement block devices on top of Aspen that
 are exported via the iscsi protocol with "good" performance. TCMU seems to be a good balance between performance and
 implementation simplicity. A high-level design description of how this might be achieved is

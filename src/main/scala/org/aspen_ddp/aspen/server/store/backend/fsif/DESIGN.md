@@ -35,8 +35,8 @@ Terms used throughout:
 
 ### Non-goals
 
-- **The allocation strategy.** Nothing produces 4-byte storePointers yet. `cmdline/Main.scala` refuses
-  `create-pool --backend fsif` (`FsifPoolsEnabled = false`), and tests construct FSIF pools directly.
+- **The allocation strategy.** It lives outside the backend: `FsifIndexAllocationStrategy` produces the 4-byte
+  storePointers (see `docs/superpowers/specs/2026-10-30-fsif-allocation-strategy-design.md`).
 - **Efficient KeyValue objects.** They work, but every KV update is a `Full` write.
 - **Bootstrap pool.** `bootstrapAllocate` and `bootstrapOverwrite` throw `UnsupportedOperationException`.
 - **Hole punching.** Rejected in favour of tail compaction, which uses only `truncate`.
@@ -804,8 +804,8 @@ held, not failed, and complete once it clears" (L2 cannot be reached).
   objects from the radicle.
 - **StoreRepairer leaves errorTree entries behind** after a successful repair (pre-existing; `Backlog.txt`).
   Found during the FSIF integration test.
-- **create-pool is gated.** `cmdline/Main.scala` has `FsifPoolsEnabled = false` until an allocation strategy
-  produces 4-byte storePointers (`Todo.txt`: FixedSizedIndexFileAllocationStrategy).
+- **FSIF metadata pools are refused.** `create-pool --backend fsif` works; `createNewMetadataPool` and
+  `create-metadata-pool` refuse FSIF, since the strategy's bitmap lives in the metadata group.
 - **Correlated lost-store declarations** (section 4) need system-level protection (`Backlog.txt`). A missing marker
   is no longer destructive (4.6), but a crash during a fresh store's `initialize` can still declare that new store
   lost.

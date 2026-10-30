@@ -145,8 +145,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   found with ServiceLoader. Duplicate UUIDs (including against built-ins) fail startup naming both classes and jars
 - DataStores are pluggable: RocksDB, in-memory Map, and FSIF (`server.store.backend.fsif`, a flat file of fixed-size
   segments located by a 4-byte storePointer, with a journal and checkpointed index). FSIF freezes writes on ENOSPC
-  and keeps serving reads. `create-pool --backend fsif` is refused until an allocation strategy yields 4-byte
-  storePointers
+  and keeps serving reads. FSIF pools use `FsifIndexAllocationStrategy` (a per-pool bitmap KeyValue object in
+  the metadata group; bits set/cleared in the transaction, or by a system DurableTask after
+  `Transaction.deferAllocationRelease()`, which allows one FSIF pool per transaction). Metadata pools can't use FSIF.
 
 ## Subsystem Details
 

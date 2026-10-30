@@ -196,7 +196,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   private[aspen] def getAllocationGroupPointer(allocationGroupId: AllocationGroupId): Future[DataObjectPointer]
   private[aspen] def getStorageDeviceSetPointer(storageDeviceSetId: StorageDeviceSetId): Future[DataObjectPointer]
 
-  protected def createStoragePool(config: StoragePoolState): Future[PoolId]
+  /** @param metadataGroup the metadata group whose pools hold the new pool's ErrorTree and AllocationTree, or
+    *                      `None` to keep them in the bootstrap pool
+    */
+  protected def createStoragePool(config: StoragePoolState, metadataGroup: Option[AllocationGroupId]): Future[PoolId]
 
   /** Creates a new allocation group.
     *
@@ -209,12 +212,15 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     *                    any member. Fixed for the group's lifetime.
     * @param ida         the IDA members must equal. Required for `ExactMatch` and must be `None` for `AllowAll`;
     *                    anything else throws `IllegalArgumentException`.
+    * @param isMetadataGroup true for a metadata group, which accepts only metadata pools and other metadata
+    *                        groups. Fixed for the group's lifetime.
     */
   def createAllocationGroup(groupName: String,
                             level: Int,
                             maxSliceSize: Option[Int] = None,
                             idaPolicy: IDAPolicy = IDAPolicy.ExactMatch,
-                            ida: Option[IDA] = None): Future[AllocationGroupId]
+                            ida: Option[IDA] = None,
+                            isMetadataGroup: Boolean = false): Future[AllocationGroupId]
 
   def createStorageDeviceSet(name: String, level: Int, parent: Option[StorageDeviceSetId]): Future[StorageDeviceSetId]
 
@@ -351,6 +357,29 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                            backendConfig: BackendConfig,
                            storageDeviceSet: StorageDeviceSetId,
                            maximumStoreSize: Long): Future[PoolId] =
+    createNewPool(name, ida, maxSliceSize, backendConfig, storageDeviceSet, maximumStoreSize,
+      isMetadataPool = false, metadataGroup = None)
+
+  /** Creates a new metadata pool: one that holds the metadata trees of other pools and may join only metadata
+    * groups. Its own trees live in the bootstrap pool. Arguments are as for `createNewStoragePool`.
+    */
+  def createNewMetadataPool(name: String,
+                            ida: IDA,
+                            maxSliceSize: Option[Int],
+                            backendConfig: BackendConfig,
+                            storageDeviceSet: StorageDeviceSetId,
+                            maximumStoreSize: Long): Future[PoolId] =
+    createNewPool(name, ida, maxSliceSize, backendConfig, storageDeviceSet, maximumStoreSize,
+      isMetadataPool = true, metadataGroup = None)
+
+  private def createNewPool(name: String,
+                            ida: IDA,
+                            maxSliceSize: Option[Int],
+                            backendConfig: BackendConfig,
+                            storageDeviceSet: StorageDeviceSetId,
+                            maximumStoreSize: Long,
+                            isMetadataPool: Boolean,
+                            metadataGroup: Option[AllocationGroupId]): Future[PoolId] =
     maxSliceSize.foreach: limit =>
       if limit < ida.minSliceSize then
         throw new IllegalArgumentException(
@@ -390,9 +419,10 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         backendConfig,
         storageDeviceSet,
         0L,
-        maximumStoreSize
+        maximumStoreSize,
+        isMetadataPool = isMetadataPool
       )
-      _ <- createStoragePool(config)
+      _ <- createStoragePool(config, metadataGroup)
     yield
       poolId
       

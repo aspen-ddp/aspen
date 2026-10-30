@@ -1,9 +1,9 @@
 package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.GroupObjectAllocatorId
+import org.aspen_ddp.aspen.client.{GroupObjectAllocatorId, PoolObjectAllocatorId}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.management.UpdateAllocationGroupUsageTask
@@ -797,3 +797,118 @@ class AllocationGroupStateSuite extends IntegrationTestSuite:
       parent <- readGroupState(parentId)
     yield
       parent.members.exists(_.uuid == childId.uuid) should be(true)
+
+  // ---- metadata membership rule ----
+
+  private def createMetadataGroup(name: String, level: Int): Future[AllocationGroupId] =
+    client.createAllocationGroup(name, level, idaPolicy = IDAPolicy.AllowAll, isMetadataGroup = true)
+
+  private def createMetadataPool(name: String): Future[PoolId] =
+    client.createNewMetadataPool(name, limitIda, None, RocksDBConfig(),
+      StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+
+  private def expectMetadataMismatch(f: Future[Unit], memberIsMetadata: Boolean): Future[org.scalatest.Assertion] =
+    given ExecutionContext = executionContext
+    f.map(_ => fail("expected MetadataMembershipMismatch")).recover:
+      case e: AllocationGroupState.MetadataMembershipMismatch =>
+        (e.memberIsMetadata, e.groupIsMetadata) should be((memberIsMetadata, !memberIsMetadata))
+
+  atest("a metadata pool joins a metadata group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      poolId <- createMetadataPool("meta-pool")
+      groupId <- createMetadataGroup("meta-group", 0)
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addPool(client, poolId, groupId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      ps <- readPool(poolId)
+      ags <- readGroupState(groupId)
+    yield
+      ags.members.exists(_.uuid == poolId.uuid) should be(true)
+      ps.allocationGroups should contain(groupId.uuid)
+
+  atest("a metadata pool cannot join an ordinary group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      poolId <- createMetadataPool("meta-pool")
+      groupId <- client.createAllocationGroup("ordinary", level = 0, idaPolicy = IDAPolicy.AllowAll)
+      _ <- waitForTransactionsToComplete()
+      psBefore <- readPool(poolId)
+      agsBefore <- readGroupState(groupId)
+      _ <- expectMetadataMismatch(AllocationGroupState.addPool(client, poolId, groupId, Some(executor)), true)
+      _ <- waitForTransactionsToComplete()
+      psAfter <- readPool(poolId)
+      agsAfter <- readGroupState(groupId)
+    yield
+      psAfter should be(psBefore)
+      agsAfter should be(agsBefore)
+
+  atest("an ordinary pool cannot join a metadata group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      poolId <- createPool("ordinary-pool", None)
+      groupId <- createMetadataGroup("meta-group", 0)
+      _ <- waitForTransactionsToComplete()
+      psBefore <- readPool(poolId)
+      agsBefore <- readGroupState(groupId)
+      _ <- expectMetadataMismatch(AllocationGroupState.addPool(client, poolId, groupId, Some(executor)), false)
+      _ <- waitForTransactionsToComplete()
+      psAfter <- readPool(poolId)
+      agsAfter <- readGroupState(groupId)
+    yield
+      psAfter should be(psBefore)
+      agsAfter should be(agsBefore)
+
+  atest("the bootstrap pool cannot join a metadata group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      groupId <- createMetadataGroup("meta-group", 0)
+      _ <- waitForTransactionsToComplete()
+      _ <- expectMetadataMismatch(AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor)), false)
+    yield succeed
+
+  atest("a metadata group nests only in a metadata group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- createMetadataGroup("meta-child", 0)
+      metaParentId <- createMetadataGroup("meta-parent", 1)
+      ordinaryParentId <- client.createAllocationGroup("ordinary-parent", level = 1, idaPolicy = IDAPolicy.AllowAll)
+      _ <- waitForTransactionsToComplete()
+      _ <- expectMetadataMismatch(AllocationGroupState.addGroup(client, childId, ordinaryParentId, Some(executor)), true)
+      _ <- AllocationGroupState.addGroup(client, childId, metaParentId, Some(executor))
+      _ <- waitForTransactionsToComplete()
+      parent <- readGroupState(metaParentId)
+      child <- readGroupState(childId)
+    yield
+      parent.members.exists(_.uuid == childId.uuid) should be(true)
+      child.parentGroups should contain(metaParentId)
+
+  atest("an ordinary group cannot nest in a metadata group"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      childId <- client.createAllocationGroup("ordinary-child", level = 0, idaPolicy = IDAPolicy.AllowAll)
+      parentId <- createMetadataGroup("meta-parent", 1)
+      _ <- waitForTransactionsToComplete()
+      _ <- expectMetadataMismatch(AllocationGroupState.addGroup(client, childId, parentId, Some(executor)), false)
+    yield succeed
+
+  atest("createNewMetadataPool records isMetadataPool and keeps its trees in the bootstrap pool"):
+    given ExecutionContext = executionContext
+    for
+      poolId <- createMetadataPool("meta-pool")
+      ps <- client.getStoragePoolState(poolId)
+      ptr <- client.getStoragePoolPointer(poolId)
+      kvos <- client.read(ptr)
+    yield
+      ps.isMetadataPool should be(true)
+      for key <- List(StoragePoolState.ErrorTreeKey, StoragePoolState.AllocationTreeKey) do
+        val root = Root(client, kvos.contents(key).value.bytes)
+        root.rootKeyValuePointer.get.poolId should be(Radicle.poolId)
+        root.nodeAllocator.tiers.head._1 should be(PoolObjectAllocatorId(Radicle.poolId))
+      succeed

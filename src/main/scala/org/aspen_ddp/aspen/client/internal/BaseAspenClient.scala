@@ -321,7 +321,8 @@ abstract class BaseAspenClient(
   override def createAllocationGroup(groupName: String, level: Int,
                                      maxSliceSize: Option[Int],
                                      idaPolicy: IDAPolicy,
-                                     ida: Option[IDA]): Future[AllocationGroupId] =
+                                     ida: Option[IDA],
+                                     isMetadataGroup: Boolean): Future[AllocationGroupId] =
     idaPolicy match
       case IDAPolicy.ExactMatch =>
         if ida.isEmpty then
@@ -349,7 +350,8 @@ abstract class BaseAspenClient(
       Nil,
       maxSliceSize,
       idaPolicy,
-      ida
+      ida,
+      isMetadataGroup
     )
 
     runCreate(StopRetrying.unlessCollision): tx =>
@@ -469,7 +471,8 @@ abstract class BaseAspenClient(
 
         deviceId
 
-  override protected def createStoragePool(config: StoragePoolState): Future[PoolId] =
+  override protected def createStoragePool(config: StoragePoolState,
+                                           metadataGroup: Option[AllocationGroupId]): Future[PoolId] =
     // Only a collision is retried: a taken pool name (KeyAlreadyExists), a failed device and an
     // allocation failure are all permanent. The test client's runCreate performs a single
     // attempt regardless.

@@ -55,6 +55,14 @@ object AllocationGroupState:
     extends Exception(s"Member $memberId with IDA ${memberIda.getOrElse("none (AllowAll)")} cannot join a " +
       s"group requiring IDA ${groupIda.getOrElse("none")}")
 
+  /** Thrown when a pool or group cannot join a group because their metadata flags differ: metadata pools and
+    * metadata groups belong only in metadata groups, and nothing else may join one. Raised before any state
+    * changes.
+    */
+  final case class MetadataMembershipMismatch(memberId: UUID, memberIsMetadata: Boolean, groupIsMetadata: Boolean)
+    extends Exception(s"Member $memberId (metadata: $memberIsMetadata) cannot join a group " +
+      s"(metadata: $groupIsMetadata)")
+
   /** Throws `MemberIDAMismatch` unless a member with IDA `memberIda` may join `group`. Uses `==`, which compares
     * the IDA type and every parameter. `IDA.compare` orders by failure tolerance only and must not be used here.
     */
@@ -77,6 +85,11 @@ object AllocationGroupState:
     if !ok then
       throw MemberLimitIncompatible(memberId, memberLimit, group.maxSliceSize)
 
+  /** Throws `MetadataMembershipMismatch` unless the member's metadata flag equals `group`'s. */
+  private def checkMemberMetadata(memberId: UUID, memberIsMetadata: Boolean, group: AllocationGroupState): Unit =
+    if memberIsMetadata != group.isMetadataGroup then
+      throw MetadataMembershipMismatch(memberId, memberIsMetadata, group.isMetadataGroup)
+
   def apply(cfg: Array[Byte]): AllocationGroupState = Codec.decode(codec.AllocationGroupState.parseFrom(cfg))
   def apply(dos: DataObjectState): AllocationGroupState = apply(dos.data.getByteArray)
 
@@ -92,6 +105,7 @@ object AllocationGroupState:
       if ps.allocationGroups.contains(parentId.uuid) && ags.members.exists(_.uuid == poolId.uuid) then
         None
       else
+        checkMemberMetadata(ps.poolId.uuid, ps.isMetadataPool, ags)
         checkMemberLimit(ps.poolId.uuid, ps.effectiveMaxSliceSize, ags)
         checkMemberIda(ps.poolId.uuid, Some(ps.ida), ags)
 
@@ -198,6 +212,7 @@ object AllocationGroupState:
         if child.level >= parent.level then
           throw new InvalidLevel()
 
+        checkMemberMetadata(child.groupId.uuid, child.isMetadataGroup, parent)
         checkMemberLimit(child.groupId.uuid, child.maxSliceSize, parent)
         checkMemberIda(child.groupId.uuid, child.ida, parent)
 

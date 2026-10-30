@@ -2,9 +2,12 @@ package org.aspen_ddp.aspen.common.metadata
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.internal.MetadataTree
-import org.aspen_ddp.aspen.client.{AllocationError, AspenClient}
+import org.aspen_ddp.aspen.client.{AllocationError, AspenClient, GroupObjectAllocatorId, TestTransactions}
+import org.aspen_ddp.aspen.client.tkvl.{KeyValueListPointer, Root, SinglePoolNodeAllocator}
 import org.aspen_ddp.aspen.common.Radicle
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyAlreadyExists}
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyAlreadyExists, KeyValueObjectPointer, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.ida.{RandomAccessReedSolomon, ReedSolomon, Replication}
 import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
@@ -184,6 +187,135 @@ class StorageDeviceSetIntegrationSuite extends IntegrationTestSuite:
       pool.maxSliceSize should be(Some(1000))
       pool.maxObjectSize should be(Some(1000))
       pool.allocator.maxObjectSize should be(Some(1000))
+
+  private val bootSet = StorageDeviceSetId.BootstrapStorageDeviceSetId
+
+  private def createOrdinaryPool(name: String, metadataGroup: Option[AllocationGroupId] = None): Future[PoolId] =
+    client.createNewStoragePool(name, Replication(1, 1), None, RocksDBConfig(), bootSet, 0L, metadataGroup)
+
+  /** The pool's ErrorTree and AllocationTree roots, freshly read */
+  private def treeRoots(poolId: PoolId): Future[List[Root]] =
+    given ExecutionContext = executionContext
+    for
+      ptr <- client.getStoragePoolPointer(poolId)
+      kvos <- client.read(ptr)
+    yield
+      List(StoragePoolState.ErrorTreeKey, StoragePoolState.AllocationTreeKey).map: key =>
+        Root(client, kvos.contents(key).value.bytes)
+
+  /** Loads a store for each of the pool's IDA elements into the test network's host */
+  private def serveStores(poolId: PoolId, width: Int): Future[Unit] =
+    given ExecutionContext = executionContext
+    val loads = (0 until width).toList.map: i =>
+      net.smgr.loadStore(net.storageDeviceId, new MapBackend(StoreId(poolId, i.toByte)), None)
+    handleEvents()
+    Future.sequence(loads).map(_ => ())
+
+  /** Every node reachable from `root`: down from each upper-tier node and right along every tier */
+  private def reachableNodes(root: Root): Future[List[KeyValueObjectPointer]] =
+    given ExecutionContext = executionContext
+    def visit(pending: List[(Int, KeyValueObjectPointer)],
+              seen: Set[ObjectId],
+              found: List[KeyValueObjectPointer]): Future[List[KeyValueObjectPointer]] =
+      pending match
+        case Nil => Future.successful(found)
+        case (_, ptr) :: rest if seen.contains(ptr.id) => visit(rest, seen, found)
+        case (tier, ptr) :: rest =>
+          client.read(ptr).flatMap: kvos =>
+            val right = kvos.right.map(v => (tier, KeyValueListPointer(v.bytes).pointer)).toList
+            val down =
+              if tier == 0 then
+                Nil
+              else
+                kvos.contents.values.toList.map: vs =>
+                  ObjectPointer(vs.value.bytes) match
+                    case p: KeyValueObjectPointer => (tier - 1, p)
+                    case p => fail(s"upper-tier entry is not a KeyValueObjectPointer: $p")
+            visit(right ++ down ++ rest, seen + ptr.id, ptr :: found)
+    visit(List((root.tier, root.rootKeyValuePointer.get)), Set.empty, Nil)
+
+  atest("createNewStoragePool puts the trees in the default metadata group"):
+    given ExecutionContext = executionContext
+    for
+      poolId <- createOrdinaryPool("ordinary")
+      _ <- waitForTransactionsToComplete()
+      roots <- treeRoots(poolId)
+      poolPtr <- client.getStoragePoolPointer(poolId)
+    yield
+      roots.foreach: root =>
+        root.rootKeyValuePointer.get.poolId should be(PoolId.InitialMetadataPoolId)
+        root.nodeAllocator.tiers.head._1 should be(GroupObjectAllocatorId(AllocationGroupId.DefaultMetadataGroupId))
+      poolPtr.poolId should be(Radicle.poolId)
+
+  atest("createNewStoragePool uses an explicit metadata group"):
+    given ExecutionContext = executionContext
+    for
+      metaPoolId <- client.createNewMetadataPool("meta-pool", Replication(1, 1), None, RocksDBConfig(), bootSet, 0L)
+      _ <- serveStores(metaPoolId, 1)
+      groupId <- client.createAllocationGroup("meta-group", 0, idaPolicy = IDAPolicy.AllowAll, isMetadataGroup = true)
+      _ <- waitForTransactionsToComplete()
+      _ <- AllocationGroupState.addPool(client, metaPoolId, groupId)
+      _ <- waitForTransactionsToComplete()
+      poolId <- createOrdinaryPool("ordinary", Some(groupId))
+      _ <- waitForTransactionsToComplete()
+      roots <- treeRoots(poolId)
+    yield
+      roots.foreach: root =>
+        root.rootKeyValuePointer.get.poolId should be(metaPoolId)
+        root.nodeAllocator.tiers.head._1 should be(GroupObjectAllocatorId(groupId))
+      succeed
+
+  atest("createNewStoragePool refuses a non-metadata group"):
+    given ExecutionContext = executionContext
+    for
+      groupId <- client.createAllocationGroup("ordinary-group", 0, idaPolicy = IDAPolicy.AllowAll)
+      _ <- waitForTransactionsToComplete()
+      before <- client.listStoragePools()
+      err <- createOrdinaryPool("ordinary", Some(groupId)).failed
+      _ <- waitForTransactionsToComplete()
+      after <- client.listStoragePools()
+    yield
+      err shouldBe a[AspenClient.NotAMetadataGroup]
+      err.asInstanceOf[AspenClient.NotAMetadataGroup].groupId should be(groupId)
+      after should be(before)
+
+  atest("an ordinary pool's ErrorTree splits within the metadata group"):
+    given ExecutionContext = executionContext
+    // Each entry is a fifth of the default node size, so a handful force the tier-0 root to split
+    val value = Value(new Array[Byte](SinglePoolNodeAllocator.DefaultMaxNodeSize / 5))
+    for
+      poolId <- createOrdinaryPool("ordinary")
+      _ <- waitForTransactionsToComplete()
+      pool <- client.getStoragePool(poolId)
+      _ <- (0 until 8).foldLeft(Future.unit): (f, i) =>
+        f.flatMap: _ =>
+          val tx = TestTransactions.withoutMissedUpdateTracking(client.newTransaction())
+          for
+            _ <- pool.errorTree.set(Key(i), value)(using tx)
+            _ <- tx.commit()
+            _ <- waitForTransactionsToComplete()
+          yield ()
+      roots <- treeRoots(poolId)
+      errorRoot = roots.head
+      nodes <- reachableNodes(errorRoot)
+    yield
+      errorRoot.tier should be >= 1
+      nodes.size should be >= 3
+      nodes.foreach(_.poolId should be(PoolId.InitialMetadataPoolId))
+      succeed
+
+  atest("createNewStoragePool fails clearly when the metadata group is empty"):
+    given ExecutionContext = executionContext
+    for
+      _ <- AllocationGroupState.removePool(client, PoolId.InitialMetadataPoolId, AllocationGroupId.DefaultMetadataGroupId)
+      _ <- waitForTransactionsToComplete()
+      before <- client.listStoragePools()
+      err <- createOrdinaryPool("ordinary").failed
+      _ <- waitForTransactionsToComplete()
+      after <- client.listStoragePools()
+    yield
+      err shouldBe a[AllocationError]
+      after should be(before)
 
   atest("createStorageDeviceSet rejects a parent at an equal or lower level"):
     given ExecutionContext = executionContext

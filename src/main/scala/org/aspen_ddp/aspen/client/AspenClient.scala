@@ -47,6 +47,10 @@ object AspenClient:
   class ShutdownWouldBreakPool(val poolId: PoolId)
     extends Exception(s"Shutting down the device would leave pool ${poolId.uuid} with fewer stores " +
                       s"on operational devices than its write threshold")
+  /** createNewStoragePool was named a group that is not a metadata group, so it cannot hold the new pool's metadata
+   *  trees. Thrown before any transaction. */
+  class NotAMetadataGroup(val groupId: AllocationGroupId)
+    extends Exception(s"Allocation group ${groupId.uuid} is not a metadata group")
 
 /** The primary interface for applications using Aspen object storage: object allocation,
  *  transaction building, and object retrieval.
@@ -347,6 +351,9 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     * @param backendConfig the stores' backend. Its own optional `maxSliceSize` combines with the pool's as
     *                      `min(pool, backend)`; that effective limit is what stores enforce and what the pool's
     *                      `maxObjectSize` is derived from.
+    * @param metadataGroup the metadata group whose pools hold the new pool's ErrorTree and AllocationTree, or
+    *                      `None` for the default one (`getDefaultMetadataGroupId`). Fails with `NotAMetadataGroup`,
+    *                      before any transaction, if the group is not a metadata group.
     * @throws IllegalArgumentException (immediately, before any state changes) if `maxSliceSize` or the backend's
     *                                  `maxSliceSize` is smaller than `ida.minSliceSize`, since such a limit admits
     *                                  no objects at all
@@ -356,9 +363,21 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                            maxSliceSize: Option[Int],
                            backendConfig: BackendConfig,
                            storageDeviceSet: StorageDeviceSetId,
-                           maximumStoreSize: Long): Future[PoolId] =
+                           maximumStoreSize: Long,
+                           metadataGroup: Option[AllocationGroupId] = None): Future[PoolId] =
+    given ExecutionContext = this.clientContext
+
+    def resolvedGroup: Future[Option[AllocationGroupId]] =
+      for
+        groupId <- metadataGroup.fold(getDefaultMetadataGroupId())(Future.successful)
+        group <- getAllocationGroupState(groupId)
+      yield
+        if !group.isMetadataGroup then
+          throw NotAMetadataGroup(groupId)
+        Some(groupId)
+
     createNewPool(name, ida, maxSliceSize, backendConfig, storageDeviceSet, maximumStoreSize,
-      isMetadataPool = false, metadataGroup = None)
+      isMetadataPool = false, metadataGroup = resolvedGroup)
 
   /** Creates a new metadata pool: one that holds the metadata trees of other pools and may join only metadata
     * groups. Its own trees live in the bootstrap pool. Arguments are as for `createNewStoragePool`.
@@ -370,7 +389,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                             storageDeviceSet: StorageDeviceSetId,
                             maximumStoreSize: Long): Future[PoolId] =
     createNewPool(name, ida, maxSliceSize, backendConfig, storageDeviceSet, maximumStoreSize,
-      isMetadataPool = true, metadataGroup = None)
+      isMetadataPool = true, metadataGroup = Future.successful(None))
 
   private def createNewPool(name: String,
                             ida: IDA,
@@ -379,7 +398,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                             storageDeviceSet: StorageDeviceSetId,
                             maximumStoreSize: Long,
                             isMetadataPool: Boolean,
-                            metadataGroup: Option[AllocationGroupId]): Future[PoolId] =
+                            metadataGroup: => Future[Option[AllocationGroupId]]): Future[PoolId] =
     maxSliceSize.foreach: limit =>
       if limit < ida.minSliceSize then
         throw new IllegalArgumentException(
@@ -392,6 +411,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
     given ExecutionContext = this.clientContext
     val poolId = PoolId(UUID.randomUUID())
     for
+      // Resolved after the synchronous checks above, so an invalid limit throws before any read
+      group <- metadataGroup
       set <- getStorageDeviceSetState(storageDeviceSet)
       firstIds <- set.selectDevicesForPool(ida.width, this)
       firstDevices <- Future.sequence(firstIds.map(sid => getStorageDeviceState(sid)))
@@ -422,7 +443,7 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
         maximumStoreSize,
         isMetadataPool = isMetadataPool
       )
-      _ <- createStoragePool(config, metadataGroup)
+      _ <- createStoragePool(config, group)
     yield
       poolId
       

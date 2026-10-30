@@ -1,13 +1,14 @@
 package org.aspen_ddp.aspen.server.store
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.PoolObjectAllocatorId
-import org.aspen_ddp.aspen.client.tkvl.Root
+import org.aspen_ddp.aspen.client.{GroupObjectAllocatorId, PoolObjectAllocatorId}
+import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root}
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.{IDA, Replication}
 import org.aspen_ddp.aspen.common.metadata.{IDAPolicy, StorageDeviceId, StorageDeviceSetId, StoragePoolState}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
 import scala.concurrent.ExecutionContext
 
@@ -71,3 +72,16 @@ class LimitedBootstrapMetadataSuite extends IntegrationTestSuite:
       ags.idaPolicy should be(IDAPolicy.ExactMatch)
       ags.ida should be(Some(net.ida))
       ags.maxSliceSize should be(Some(4096))
+
+  atest("an ordinary pool's tree node size fits the group limit"):
+    given ExecutionContext = executionContext
+    for
+      poolId <- client.createNewStoragePool("ordinary", Replication(1, 1), None, RocksDBConfig(),
+                  StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      _ <- waitForTransactionsToComplete()
+      ptr <- client.getStoragePoolPointer(poolId)
+      kvos <- client.read(ptr)
+    yield
+      val root = Root(client, kvos.contents(StoragePoolState.ErrorTreeKey).value.bytes)
+      root.nodeAllocator.tiers.head._1 should be(GroupObjectAllocatorId(AllocationGroupId.DefaultMetadataGroupId))
+      root.nodeAllocator.getMaxNodeSize(0) should be <= NodeAllocator.nodeSizeLimit(net.ida, Some(4096)).get

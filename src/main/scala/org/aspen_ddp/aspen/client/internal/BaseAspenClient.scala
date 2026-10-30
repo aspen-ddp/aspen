@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.{ReadDriver, ReadManager}
 import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, DesignatedLeader, TransactionImpl, TransactionManager}
 import org.aspen_ddp.aspen.client.registries.{NamespacedUUIDRegistry, UUIDObjectRegistry}
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, SinglePoolNodeAllocator, TieredKeyValueList, TreeKind}
 // Explicit: common.objects also defines a ReadError (an Enumeration object). Only the client
 // one is a type, so the wildcards below would resolve correctly anyway, but name it outright.
 import org.aspen_ddp.aspen.client.ReadError
@@ -479,13 +479,23 @@ abstract class BaseAspenClient(
     val fStaged = runCreate(StopRetrying.unlessCollision): tx =>
       given Transaction = tx
 
+      // The allocator for the trees' root nodes and the NodeAllocator their later nodes come from
+      def treeAllocators(): Future[(ObjectAllocator, NodeAllocator)] = metadataGroup match
+        case None =>
+          getStoragePool(radicle.poolId).map: radiclePool =>
+            (radiclePool.allocator, SinglePoolNodeAllocator.forPool(this, radiclePool))
+        case Some(groupId) =>
+          val allocatorId = GroupObjectAllocatorId(groupId)
+          getAllocator(allocatorId).map: groupAllocator =>
+            val maxNodeSize = NodeAllocator.fittingNodeSize(SinglePoolNodeAllocator.DefaultMaxNodeSize,
+              NodeAllocator.nodeSizeLimit(groupAllocator, TreeKind.KeyValueObjects))
+            (groupAllocator, new NodeAllocator(this, List((allocatorId, maxNodeSize))))
+
       def createPoolObj(alloc: ObjectAllocator): Future[KeyValueObjectPointer] =
         for
-          errTreeRoot <- alloc.allocateKeyValueObject(Map())
-          allocTreeRoot <- alloc.allocateKeyValueObject(Map())
-
-          radiclePool <- getStoragePool(radicle.poolId)
-          nodeAllocator = SinglePoolNodeAllocator.forPool(this, radiclePool)
+          (treeAlloc, nodeAllocator) <- treeAllocators()
+          errTreeRoot <- treeAlloc.allocateKeyValueObject(Map())
+          allocTreeRoot <- treeAlloc.allocateKeyValueObject(Map())
 
           poolConfig = config.encode()
           errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), nodeAllocator).encode()

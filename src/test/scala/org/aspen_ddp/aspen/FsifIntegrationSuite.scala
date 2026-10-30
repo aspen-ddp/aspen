@@ -80,7 +80,7 @@ object FsifIntegrationSuite:
   *
   * The bootstrap pool stays on the TestNetwork's in-memory host. The FSIF pool's five stores live on one device of a
   * real Host (FsifTestHost) with its own HostId, device set and directory tree; TestNetwork routes the pool's
-  * messages to it. Pointers come from FsifTestIndexStrategy, set on the pool right after creation.
+  * messages to it. Pointers come from the pool's FsifIndexAllocationStrategy, installed at creation.
   */
 class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
   import FsifIntegrationSuite.delay
@@ -90,7 +90,6 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
     */
   override def testIda: IDA = RandomAccessReedSolomon(5, 3, 4, 64)
 
-  override def userTypeFactories: List[RegisteredTypeFactory] = List(FsifTestIndexStrategy)
 
   private given ExecutionContext = executionContext
 
@@ -178,25 +177,9 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
       pid <- client.createNewStoragePool("fsif-pool", ida, None, fsifConfig, setId, 0L)
       _ = poolId = pid
       _ = net.poolHosts += poolId -> host
-      _ <- setAllocationStrategy()
       _ = host.testingOnlyCheckAllDevices()
       _ <- awaitStoresServed()
     yield ()
-
-  /** Points the pool at FsifTestIndexStrategy in one transaction, then drops the client's cached pool so the next
-    * allocation uses it. Nothing in src/main writes AllocationStrategyKey yet: choosing a strategy at pool creation
-    * belongs to the allocation-strategy design.
-    */
-  private def setAllocationStrategy(): Future[Unit] =
-    for
-      poolPtr <- client.getStoragePoolPointer(poolId)
-      kvos <- client.read(poolPtr)
-      tx = client.newTransaction()
-      _ = tx.update(poolPtr, Some(kvos.revision), None, List(KeyValueUpdate.DoesNotExist(StoragePoolState.AllocationStrategyKey)),
-                    List(Insert(StoragePoolState.AllocationStrategyKey, uuid2byte(FsifTestIndexStrategy.typeUUID))))
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-    yield client.dropCachedStoragePool(poolId)
 
   /** Crash-only restart: the host is dropped, never shut down, and a new one starts from the same directories.
     *

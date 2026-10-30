@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{KeyValueObjectState, RegisteredTypeFactory, TransactionAborted}
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, ObjectSizeLimitExceeded, RegisteredTypeFactory, TransactionAborted}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceSetId, StoragePoolState}
@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.util.{byte2int, byte2uuid}
 import org.aspen_ddp.aspen.compute.{DurableTaskPointer, ServiceEntry}
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskServiceState}
-import org.aspen_ddp.aspen.server.store.backend.{MapBackend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{FsifConfig, MapBackend, RocksDBConfig}
 
 import scala.concurrent.{ExecutionContext, Future}
 
@@ -375,3 +375,56 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       after.size should be(before.size)
       bitsA should be(Set(indexOf(a)))
       bitsB should be(Set(indexOf(b)))
+
+  private def readPoolState(poolId: PoolId): Future[KeyValueObjectState] =
+    client.getStoragePoolPointer(poolId).flatMap(client.read(_))
+
+  atest("a new FSIF pool records the strategy and a zeroed bitmap in its metadata group"):
+    for
+      poolId <- client.createNewStoragePool(s"fsif-new-${java.util.UUID.randomUUID()}", ida, None,
+                  FsifConfig.forObjectSize(ida, 4096, 3000), StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      _ <- waitForTransactionsToComplete()
+      kvos <- readPoolState(poolId)
+      (indexCount, bitmapPtr) = FsifIndexAllocationStrategy.decodeConfig(
+        kvos.contents(StoragePoolState.AllocationStrategyConfigKey).value.bytes)
+      bitmap <- client.read(bitmapPtr)
+      groupId <- client.getDefaultMetadataGroupId()
+      group <- client.getAllocationGroupState(groupId)
+      pool <- client.getStoragePool(poolId)
+    yield
+      byte2uuid(kvos.contents(StoragePoolState.AllocationStrategyKey).value.bytes) should be(
+        FsifIndexAllocationStrategy.typeUUID)
+      indexCount should be(3000)
+      group.members.exists(_.uuid == bitmapPtr.poolId.uuid) should be(true)
+      bitmap.contents.size should be(3)
+      bitmap.contents.values.foreach: vs =>
+        vs.value.bytes.foreach(_ should be(0.toByte))
+      pool.allocationStrategy shouldBe a[FsifIndexAllocationStrategy.Strategy]
+
+  atest("a new RocksDB pool has no allocation strategy"):
+    for
+      poolId <- client.createNewStoragePool(s"rocks-new-${java.util.UUID.randomUUID()}", ida, None, RocksDBConfig(),
+                  StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
+      kvos <- readPoolState(poolId)
+    yield
+      kvos.contents.contains(StoragePoolState.AllocationStrategyKey) should be(false)
+
+  atest("createNewMetadataPool refuses FSIF"):
+    client.createNewMetadataPool(s"fsif-meta-${java.util.UUID.randomUUID()}", ida, None,
+      FsifConfig.forObjectSize(ida, 4096, 3000), StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L).failed.map: e =>
+      e shouldBe an[IllegalArgumentException]
+
+class FsifBitmapSizeLimitSuite extends IntegrationTestSuite:
+
+  override def testPoolMaxSliceSize: Option[Int] = Some(1024)
+
+  private given ExecutionContext = executionContext
+
+  atest("a bitmap larger than its allocator's object limit fails with ObjectSizeLimitExceeded"):
+    for
+      radiclePool <- client.getStoragePool(Radicle.poolId)
+      tx = client.newTransaction()
+      failure <- FsifIndexAllocationStrategy.prepareBitmap(64 * 1024, radiclePool.allocator)(using tx)
+        .flatMap(_ => tx.commit()).failed
+    yield
+      failure shouldBe an[ObjectSizeLimitExceeded]

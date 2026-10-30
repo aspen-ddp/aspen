@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
 import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
-import org.aspen_ddp.aspen.server.store.backend.BackendConfig
+import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, FsifConfig}
 import scribe.Logging
 
 import java.nio.charset.StandardCharsets
@@ -388,8 +388,12 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
                             backendConfig: BackendConfig,
                             storageDeviceSet: StorageDeviceSetId,
                             maximumStoreSize: Long): Future[PoolId] =
-    createNewPool(name, ida, maxSliceSize, backendConfig, storageDeviceSet, maximumStoreSize,
-      isMetadataPool = true, metadataGroup = Future.successful(None))
+    backendConfig match
+      case _: FsifConfig =>
+        Future.failed(IllegalArgumentException("FSIF is not supported for metadata pools"))
+      case _ =>
+        createNewPool(name, ida, maxSliceSize, backendConfig, storageDeviceSet, maximumStoreSize,
+          isMetadataPool = true, metadataGroup = Future.successful(None))
 
   private def createNewPool(name: String,
                             ida: IDA,

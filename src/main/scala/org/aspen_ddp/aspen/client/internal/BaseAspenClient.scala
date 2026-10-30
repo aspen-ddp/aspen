@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.client.internal
 
-import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
+import org.aspen_ddp.aspen.client.internal.allocation.{FsifIndexAllocationStrategy, PoolObjectAllocator}
+import org.aspen_ddp.aspen.server.store.backend.FsifConfig
 import org.aspen_ddp.aspen.client.internal.network.Messenger as ClientMessenger
 import org.aspen_ddp.aspen.client.internal.read.{ReadDriver, ReadManager}
 import org.aspen_ddp.aspen.client.internal.transaction.{ClientTransactionDriver, DesignatedLeader, TransactionImpl, TransactionManager}
@@ -504,11 +505,18 @@ abstract class BaseAspenClient(
           errorTree = Root(0, ByteArrayKeyOrdering, Some(errTreeRoot), nodeAllocator).encode()
           allocTree = Root(0, ByteArrayKeyOrdering, Some(allocTreeRoot), nodeAllocator).encode()
 
+          // An FSIF pool selects FsifIndexAllocationStrategy and gets its zeroed index bitmap from the same
+          // metadata allocator as the trees
+          strategyEntries <- config.backendConfig match
+            case FsifConfig(_, segmentCount) =>
+              FsifIndexAllocationStrategy.prepareBitmap(segmentCount, treeAlloc)
+            case _ => Future.successful(Map[Key, Value]())
+
           poolPtr <- alloc.allocateKeyValueObject(Map(
             StoragePoolState.ConfigKey -> Value(poolConfig),
             StoragePoolState.ErrorTreeKey -> Value(errorTree),
             StoragePoolState.AllocationTreeKey -> Value(allocTree)
-          ))
+          ) ++ strategyEntries)
         yield
           poolPtr
 

@@ -21,7 +21,8 @@ import scala.util.Random
   * A transaction reads the bitmap once per pool, on its first allocation or at commit. Its allocations take free
   * bits from one randomly chosen segment until that segment is full. At commit, one update to the bitmap sets the
   * bits of its staged allocations and clears those of its deletions, guarded by the revision of every segment key it
-  * changes, so a concurrent change to one of those segments aborts the transaction.
+  * touches, so a concurrent change to one of those segments, or a view older than a deleted object's allocation,
+  * aborts the transaction.
   *
   * A transaction that called `deferAllocationRelease()` leaves its deletions' bits set and instead enrolls a system
   * FsifReleaseIndicesTask that clears them later. The task exists iff the delete commits, so no index leaks or is
@@ -73,6 +74,8 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
     var segment: Option[Int] = None
     /** Indices handed out by this transaction, staged or not */
     var reserved: Set[Int] = Set()
+    /** True once updateBits has added the transaction's one update to the bitmap */
+    var bitmapUpdated = false
 
     /** The transaction's read of the bitmap, started on the first call. The read is issued outside every lock. */
     def read(client: AspenClient, bitmap: KeyValueObjectPointer): Future[KeyValueObjectState] =
@@ -153,17 +156,26 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
       updateBits(poolId, Nil, indices)
 
     /** Reads the transaction's view of the bitmap, sets the bits of `allocated` and clears those of `released`, and
-      * adds one update guarded by the revision of every segment key it changes. An already-set bit for an allocation
-      * throws IllegalStateException, failing the transaction; an already-clear bit for a release is logged and skipped. Adds nothing when no bit changes.
+      * adds one update guarded by the revision of every segment key it touches, changed or not. An already-set bit
+      * for an allocation throws IllegalStateException, failing the transaction. An already-clear bit for a release
+      * is logged and skipped, but its segment stays guarded: a deleted object exists at commit, so its allocation
+      * committed and set the bit, and a clear bit means this view may predate that. The guard then aborts the
+      * transaction rather than leaking the index. Adds nothing when there is nothing to allocate or release.
       */
     private def updateBits(poolId: PoolId, allocated: List[ObjectPointer], released: Seq[Int])
                           (using t: Transaction): Future[Unit] =
       if allocated.isEmpty && released.isEmpty then
         Future.unit
       else
-        state(poolId).read(client, bitmap).map: kvos =>
-          var segments = Map[Int, Array[Byte]]()
-          def current(segment: Int): Array[Byte] = segments.getOrElse(segment, segmentBytes(kvos, segment))
+        val st = state(poolId)
+        st.read(client, bitmap).map: kvos =>
+          st.synchronized:
+            if st.bitmapUpdated then
+              throw new IllegalStateException(s"FSIF pool $poolId: bitmap updated twice in transaction ${t.id.uuid}")
+            st.bitmapUpdated = true
+          var guarded = Set[Int]()
+          var changed = Map[Int, Array[Byte]]()
+          def current(segment: Int): Array[Byte] = changed.getOrElse(segment, segmentBytes(kvos, segment))
 
           allocated.foreach: ptr =>
             val index = FsifIndexBitmap.indexOf(ptr.storePointer, indexCount)
@@ -171,18 +183,19 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
             val bytes = current(segment)
             if FsifIndexBitmap.isSet(bytes, bit) then
               throw new IllegalStateException(s"FSIF pool $poolId: index $index of ${ptr.id} is already allocated")
-            segments += segment -> FsifIndexBitmap.withBit(bytes, bit, true)
+            guarded += segment
+            changed += segment -> FsifIndexBitmap.withBit(bytes, bit, true)
 
           released.foreach: index =>
             val (segment, bit) = FsifIndexBitmap.locate(index)
             val bytes = current(segment)
+            guarded += segment
             if FsifIndexBitmap.isSet(bytes, bit) then
-              segments += segment -> FsifIndexBitmap.withBit(bytes, bit, false)
+              changed += segment -> FsifIndexBitmap.withBit(bytes, bit, false)
             else
-              logger.warn(s"FSIF pool $poolId: released index $index is already free")
+              logger.warn(s"FSIF pool $poolId: released index $index is clear in this transaction's view")
 
-          if segments.nonEmpty then
-            val keys = segments.keys.toList.sorted.map(FsifIndexBitmap.segmentKey)
-            t.update(bitmap, None, None,
-              keys.map(k => KeyValueUpdate.KeyRevision(k, kvos.contents(k).revision)),
-              segments.toList.map((s, bytes) => Insert(FsifIndexBitmap.segmentKey(s), bytes)))
+          val keys = guarded.toList.sorted.map(FsifIndexBitmap.segmentKey)
+          t.update(bitmap, None, None,
+            keys.map(k => KeyValueUpdate.KeyRevision(k, kvos.contents(k).revision)),
+            changed.toList.sortBy(_._1).map((s, bytes) => Insert(FsifIndexBitmap.segmentKey(s), bytes)))

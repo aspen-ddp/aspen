@@ -278,11 +278,11 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
 
       failure <- tx.commit().failed
       _ <- waitForTransactionsToComplete()
-      remaining <- client.readMetadataOptional(ptr)
     yield
       failure shouldBe a[RuntimeException]
       failure.getMessage should be("boom")
-      remaining should be(None)
+      // The failure came from the one hook call, which was given the allocation
+      strategy.callsFor(tx) should be(List((List(ptr), Nil, false)))
 
   atest("a hook may add an update to the transaction"):
     given ExecutionContext = executionContext

@@ -484,7 +484,7 @@ class FsifIntegrationSuite extends IntegrationTestSuite with HostTestHarness:
       os.exists(deviceDir / RebuildingStore.RebuildDirectory / storeIds(lost).directoryName) should be(false)
       succeed
 
-  atest("FSIF pool allocations come from its bitmap and a deleted object's index is reused"):
+  atest("FSIF pool allocations come from its bitmap and stay distinct from live ones across a delete"):
     val firstContent = Array[Byte](1, 2, 3)
     val secondContent = Array[Byte](4, 5, 6)
     val thirdContent = Array[Byte](7, 8, 9, 10)

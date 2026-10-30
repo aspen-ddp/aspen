@@ -8,6 +8,7 @@ import org.aspen_ddp.aspen.common.metadata.{StorageDeviceSetId, StoragePoolState
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.util.{byte2int, byte2uuid}
@@ -192,6 +193,75 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       afterDelete should be(Set())
       indexOf(second) should be(0)
       bits should be(Set(0))
+
+  atest("a delete whose bitmap view predates its object's allocation aborts and leaves the bit set"):
+    for
+      (_, allocator, bitmap) <- install(16)
+      tx = client.newTransaction()
+      // Reads tx's view of the bitmap before o's allocation commits
+      _ <- allocator.createDataObjectPointer()(using tx)
+      o <- allocateOne(allocator)
+      meta <- client.readMetadata(o)
+      _ = tx.setRefcount(o, meta.refcount, meta.refcount.decrement())
+      failure <- tx.commit().failed
+      _ <- waitForTransactionsToComplete()
+      afterAbort <- setBits(bitmap)
+      stillThere <- client.readMetadataOptional(o)
+      // A fresh delete reads the current bitmap and clears the bit
+      _ <- delete(o)
+      afterRetry <- setBits(bitmap)
+    yield
+      failure shouldBe a[TransactionAborted]
+      afterAbort should be(Set(indexOf(o)))
+      stillThere.isDefined should be(true)
+      afterRetry should be(Set())
+
+  atest("a task release whose bitmap view predates the index's allocation aborts and leaves the bit set"):
+    // FsifReleaseIndicesTask's step clears its bits through prepareRelease; a step commit that aborts is retried
+    for
+      (poolId, allocator, bitmap) <- install(16)
+      pool <- client.getStoragePool(poolId)
+      strategy = pool.allocationStrategy.asInstanceOf[FsifIndexAllocationStrategy.Strategy]
+      tx = client.newTransaction()
+      _ <- allocator.createDataObjectPointer()(using tx)
+      o <- allocateOne(allocator)
+      _ <- strategy.prepareRelease(poolId, Seq(indexOf(o)))(using tx)
+      failure <- tx.commit().failed
+      _ <- waitForTransactionsToComplete()
+      afterAbort <- setBits(bitmap)
+      retry = client.newTransaction()
+      _ <- strategy.prepareRelease(poolId, Seq(indexOf(o)))(using retry)
+      _ <- retry.commit()
+      _ <- waitForTransactionsToComplete()
+      afterRetry <- setBits(bitmap)
+    yield
+      failure shouldBe a[TransactionAborted]
+      afterAbort should be(Set(indexOf(o)))
+      afterRetry should be(Set())
+
+  atest("one bitmap update can set bits in two segments"):
+    // 1025 indices: segment 0 holds 0-1023, segment 1 holds only 1024. With 0-1022 pre-set, each segment has one free
+    // index, so two allocations in one transaction take one from each, whichever segment is chosen first
+    for
+      (_, allocator, bitmap) <- install(1025)
+      kvos <- client.read(bitmap)
+      key0 = FsifIndexBitmap.segmentKey(0)
+      filled = (0 until 1023).foldLeft(kvos.contents(key0).value.bytes)((bytes, b) =>
+                 FsifIndexBitmap.withBit(bytes, b, true))
+      fill = client.newTransaction()
+      _ = fill.update(bitmap, None, None, List(KeyValueUpdate.KeyRevision(key0, kvos.contents(key0).revision)),
+            List(Insert(key0, filled)))
+      _ <- fill.commit()
+      _ <- waitForTransactionsToComplete()
+      tx = client.newTransaction()
+      p1 <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
+      p2 <- allocator.allocateDataObject(DataBuffer(Array[Byte](2)))(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      bits <- setBits(bitmap)
+    yield
+      Set(indexOf(p1), indexOf(p2)) should be(Set(1023, 1024))
+      bits should be((0 to 1024).toSet)
 
   atest("an index freed in a transaction is not reallocated in it"):
     for

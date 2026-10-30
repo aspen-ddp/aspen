@@ -799,9 +799,6 @@ held, not failed, and complete once it clears" (L2 cannot be reached).
   (`gossipStoreOnline`) for every Active store right after `tryLoadDevice`. For FSIF stores the open is still
   running on `fsifOpenEc`, and it may yet find the store lost or out of space. The reinstated-transfer path waits
   for `onServed`, but this restart and adoption path does not.
-- **Cross-pool transactions always abort** (pre-existing; `Todo.txt` "Transactions spanning objects in more than
-  one StoragePool always abort"). `FsifIntegrationSuite` relies on the allocation tree rather than linking its
-  objects from the radicle.
 - **StoreRepairer leaves errorTree entries behind** after a successful repair (pre-existing; `Backlog.txt`).
   Found during the FSIF integration test.
 - **FSIF metadata pools are refused.** `create-pool --backend fsif` works; `createNewMetadataPool` and

@@ -79,7 +79,13 @@ trait Transaction {
    *  allocations. A no-op for ordinary pools. Applies to every deletion in the transaction.
    *
    *  FSIF pools support deferred deletions in only one FSIF pool per transaction: deferred deletions in a second
-   *  FSIF pool fail the transaction with IllegalArgumentException.
+   *  FSIF pool fail the transaction with IllegalArgumentException. A deferred FSIF release enrolls a system durable
+   *  task, which updates the shared system task registry, so a transaction that also enrolls a system durable task
+   *  of its own fails the same way.
+   *
+   *  These failures, like an FSIF deletion whose storePointer is not a valid index, are permanent: rebuilding the
+   *  same transaction fails again. Generic retry loops (`retryUntilSuccessful`, `ExponentialBackoffRetryStrategy`)
+   *  do not distinguish them and will retry forever, so do not wrap such transactions in unbounded retries.
    *
    *  Throws PostCommitTransactionModification if commit() has already been called.
    */

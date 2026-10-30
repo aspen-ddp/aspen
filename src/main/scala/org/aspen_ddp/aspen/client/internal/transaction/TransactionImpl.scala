@@ -217,7 +217,10 @@ class TransactionImpl(val client: AspenClient,
 
     def note(note: String): Unit = hookModify(_.note(note))
 
-    def deferAllocationRelease(): Unit = hookModify(_ => releaseDeferred = true)
+    /** Every hook is passed the deferRelease the caller chose, so the hooks may not change it */
+    def deferAllocationRelease(): Unit =
+      throw new IllegalStateException(s"Transaction ${id.uuid}: deferAllocationRelease called by an allocation " +
+        "strategy's commit hook")
 
     private[aspen] def allocationReleaseDeferred: Boolean = TransactionImpl.this.allocationReleaseDeferred
 
@@ -271,18 +274,31 @@ class TransactionImpl(val client: AspenClient,
     *  The hooks may add to the transaction, including objects in pools not yet resolved or prepared, so this repeats
     *  until a pass finds no pool with work its hook hasn't been given. A pool whose hook already ran must not gain
     *  allocations or deletions: that fails with IllegalStateException. Pools whose strategy's `needsCommitHook` is
-    *  false are skipped entirely: never called, never recorded, never reported as grown. The hooks run one at a time, through
-    *  hookView, so the caller cannot modify the transaction after commit().
+    *  false are skipped entirely: never called, never recorded, never reported as grown. The hooks run one at a time,
+    *  through hookView, so the caller cannot modify the transaction after commit(). The pass that finds nothing left
+    *  to do deactivates hookView under the monitor, so it may not be modified once that pass has checked it.
     */
   private def runCommitHooks(pools: Map[PoolId, StoragePool],
                              prepared: Map[PoolId, (Set[ObjectPointer], Set[ObjectPointer])])
                             (using ExecutionContext): Future[Map[PoolId, StoragePool]] =
     resolvePools(pools).flatMap: pools =>
-      // Pools whose strategy needs no hook are neither called nor recorded, so they can never be reported as grown
-      val byPool = objectsByPool().filter((poolId, _) => pools(poolId).allocationStrategy.needsCommitHook)
-      val grown = prepared.keys.filter(poolId => byPool(poolId) != prepared(poolId))
-      val fresh = byPool.keys.filterNot(prepared.contains).toList
-      if grown.nonEmpty then
+      // Checked under the monitor, and the hooks deactivated in the same block when every pool is resolved and none
+      // is fresh, so nothing a hook started without waiting for can modify the transaction after this final check
+      val (unresolved, grown, fresh) = synchronized:
+        val unresolved = (bldr.allReferencedPoolIds -- pools.keySet).nonEmpty
+        if unresolved then
+          (true, Nil, Nil)
+        else
+          // Pools whose strategy needs no hook are neither called nor recorded, so they can never be reported as grown
+          val byPool = objectsByPool().filter((poolId, _) => pools(poolId).allocationStrategy.needsCommitHook)
+          val grown = prepared.keys.filter(poolId => byPool(poolId) != prepared(poolId)).toList
+          val fresh = byPool.keys.filterNot(prepared.contains).toList
+          if grown.isEmpty && fresh.isEmpty then
+            hooksActive = false
+          (false, grown, fresh)
+      if unresolved then
+        runCommitHooks(pools, prepared)
+      else if grown.nonEmpty then
         Future.failed(new IllegalStateException(s"Transaction ${id.uuid} gained allocations or deletions in " +
           s"pool(s) ${grown.mkString(", ")} after their allocation strategy's prepareCommit ran"))
       else if fresh.isEmpty then
@@ -326,8 +342,8 @@ class TransactionImpl(val client: AspenClient,
           promise.tryFailure(cause)
         }
 
+        // runCommitHooks deactivated the hooks when it succeeded
         poolsFuture.foreach { pools =>
-          synchronized { hooksActive = false }
           try
             val poolIDAMap = pools.map((poolId, pool) => poolId -> pool.ida)
             val poolMaxObjectSizeMap = pools.map((poolId, pool) => poolId -> pool.maxObjectSize)

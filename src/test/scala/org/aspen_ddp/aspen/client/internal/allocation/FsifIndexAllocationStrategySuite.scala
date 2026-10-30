@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{RegisteredTypeFactory, TransactionAborted}
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, RegisteredTypeFactory, TransactionAborted}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.{StorageDeviceSetId, StoragePoolState}
@@ -9,7 +9,11 @@ import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, O
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
-import org.aspen_ddp.aspen.common.util.byte2int
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.common.util.{byte2int, byte2uuid}
+import org.aspen_ddp.aspen.compute.{DurableTaskPointer, ServiceEntry}
+import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
+import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskServiceState}
 import org.aspen_ddp.aspen.server.store.backend.{MapBackend, RocksDBConfig}
 
 import scala.concurrent.{ExecutionContext, Future}
@@ -91,6 +95,30 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       tx = client.newTransaction()
       _ = tx.setRefcount(ptr, meta.refcount, meta.refcount.decrement())
       _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+    yield ()
+
+  /** Every enrolled system task's state object, read fresh */
+  private def systemTasks(): Future[List[KeyValueObjectState]] =
+    val services = TieredKeyValueList(client, KVObjectRootManager(client, Radicle.ServicesTreeKey, Radicle.pointer))
+    for
+      vs <- services.get(Key(SystemTaskExecutorService.ServiceUUID))
+      enrolled <- SystemTaskServiceState.scan(client, ServiceEntry.decode(vs.get.value.bytes).statePointer)
+      tasks <- Future.sequence(enrolled.map((_, ptr) => client.read(ptr)))
+    yield tasks
+
+  private def releaseTasks(): Future[List[KeyValueObjectState]] =
+    systemTasks().map(_.filter: kvos =>
+      byte2uuid(kvos.contents(SimpleTaskExecutor.TaskTypeKey).value.bytes) == FsifReleaseIndicesTask.typeUUID)
+
+  /** Runs one enrolled task to completion in this client. No host claims the SystemTaskExecutorService here, so
+    * nothing else runs it.
+    */
+  private def runTask(kvos: KeyValueObjectState): Future[Unit] =
+    val task = FsifReleaseIndicesTask.createTask(client, DurableTaskPointer(kvos.pointer), kvos.revision,
+      kvos.contents, null)
+    for
+      _ <- task.completed
       _ <- waitForTransactionsToComplete()
     yield ()
 
@@ -222,3 +250,65 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       legacy.storePointer.isEmpty should be(true)
       failure shouldBe an[IllegalArgumentException]
       remaining.isDefined should be(true)
+
+  atest("a deferred release keeps the bit set and enrolls one task that clears it"):
+    for
+      (_, allocator, bitmap) <- install(16)
+      o <- allocateOne(allocator)
+      before <- systemTasks()
+      meta <- client.readMetadata(o)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(o, meta.refcount, meta.refcount.decrement())
+      _ = tx.deferAllocationRelease()
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      afterDelete <- setBits(bitmap)
+      all <- systemTasks()
+      tasks <- releaseTasks()
+      _ <- runTask(tasks.head)
+      afterTask <- setBits(bitmap)
+    yield
+      afterDelete should be(Set(indexOf(o)))
+      all.size should be(before.size + 1)
+      tasks.size should be(1)
+      afterTask should be(Set())
+
+  atest("an aborted deferred delete enrolls no task"):
+    for
+      (_, allocator, bitmap) <- install(16)
+      o <- allocateOne(allocator)
+      before <- systemTasks()
+      meta <- client.readMetadata(o)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(o, meta.refcount, meta.refcount.decrement())
+      _ = tx.deferAllocationRelease()
+      _ = tx.update(radicle, None, None, List(DoesNotExist(Radicle.SystemIdKey)), Nil)
+      failure <- tx.commit().failed
+      _ <- waitForTransactionsToComplete()
+      after <- systemTasks()
+      bits <- setBits(bitmap)
+    yield
+      failure shouldBe a[TransactionAborted]
+      after.size should be(before.size)
+      bits should be(Set(indexOf(o)))
+
+  atest("deferring in a transaction that also allocates still sets the new bit in the transaction"):
+    for
+      (_, allocator, bitmap) <- install(16)
+      o <- allocateOne(allocator)
+      meta <- client.readMetadata(o)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(o, meta.refcount, meta.refcount.decrement())
+      _ = tx.deferAllocationRelease()
+      p <- allocator.allocateDataObject(DataBuffer(Array[Byte](2)))(using tx)
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      afterCommit <- setBits(bitmap)
+      tasks <- releaseTasks()
+      _ <- runTask(tasks.head)
+      afterTask <- setBits(bitmap)
+    yield
+      indexOf(p) should not be indexOf(o)
+      afterCommit should be(Set(indexOf(o), indexOf(p)))
+      tasks.size should be(1)
+      afterTask should be(Set(indexOf(p)))

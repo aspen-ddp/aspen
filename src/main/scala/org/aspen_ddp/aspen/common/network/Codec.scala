@@ -15,7 +15,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, PreTransactionOpportunisticRebuild, RefcountUpdate, RevisionLock, SerializedFinalizationAction, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
-import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, FsifConfig, RocksDBConfig}
 
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
@@ -1188,10 +1188,22 @@ object Codec extends Logging:
 
   def encodeBackendConfig(o: BackendConfig): codec.BackendConfig = o match
     case _: RocksDBConfig => codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB
+    case _: FsifConfig => codec.BackendConfig.BACKEND_CONFIG_FSIF
 
-  def decodeBackendConfig(m: codec.BackendConfig, maxSliceSize: Option[Int]): BackendConfig = m match
-    case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig(maxSliceSize)
-    case codec.BackendConfig.Unrecognized(v) => throw new EncodingError(f"Invalid Backend Config: $v")
+  /** @param maxSliceSize     StoragePoolState.backendMaxSliceSize, None when 0. An FSIF config's segmentPayloadSize.
+    * @param fsifSegmentCount StoragePoolState.fsifSegmentCount: an FSIF config's segmentCount, 0 for other backends
+    */
+  def decodeBackendConfig(m: codec.BackendConfig, maxSliceSize: Option[Int], fsifSegmentCount: Int): BackendConfig =
+    m match
+      case codec.BackendConfig.BACKEND_CONFIG_ROCKS_DB => RocksDBConfig(maxSliceSize)
+      case codec.BackendConfig.BACKEND_CONFIG_FSIF =>
+        // uint32 fields: values above Int.MaxValue arrive negative
+        val payload = maxSliceSize.getOrElse(0)
+        if payload <= 0 || fsifSegmentCount <= 0 then
+          throw new EncodingError(s"Invalid FSIF Backend Config: segmentPayloadSize $payload, " +
+                                  s"segmentCount $fsifSegmentCount")
+        FsifConfig(payload, fsifSegmentCount)
+      case codec.BackendConfig.Unrecognized(v) => throw new EncodingError(f"Invalid Backend Config: $v")
 
   def encodePoolMigrationStatus(o: StoragePoolState.MigrationStatus): codec.PoolMigrationStatus = o match
     case StoragePoolState.MigrationStatus.InProgress => codec.PoolMigrationStatus.POOL_MIGRATION_STATUS_IN_PROGRESS
@@ -1229,6 +1241,10 @@ object Codec extends Logging:
       migration = o.migration.map(encode),
       backendMaxSliceSize = o.backendConfig match
         case RocksDBConfig(limit) => limit.getOrElse(0)
+        case FsifConfig(segmentPayloadSize, _) => segmentPayloadSize,
+      fsifSegmentCount = o.backendConfig match
+        case FsifConfig(_, segmentCount) => segmentCount
+        case _: RocksDBConfig => 0
     )
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
@@ -1238,7 +1254,7 @@ object Codec extends Logging:
     val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
     val stores = m.stores.map(decode).toArray
     val backendConfig = decodeBackendConfig(m.backendConfig,
-      if m.backendMaxSliceSize == 0 then None else Some(m.backendMaxSliceSize))
+      if m.backendMaxSliceSize == 0 then None else Some(m.backendMaxSliceSize), m.fsifSegmentCount)
     val currentUsage = m.currentUsage
     val maximumStoreSize = m.maximumStoreSize
     val allocationGroups = m.allocationGroups.map(decodeUUID).toList

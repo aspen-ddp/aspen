@@ -558,6 +558,7 @@ message PoolStoreEntry {
 
 enum BackendConfig {
   BACKEND_CONFIG_ROCKS_DB = 0;
+  BACKEND_CONFIG_FSIF = 1;
 }
 
 enum PoolMigrationStatus {
@@ -582,8 +583,10 @@ message StoragePoolState {
   repeated UUID allocationGroups = 9;
   UUID storageDeviceSet = 10;
   PoolMigration migration = 11;
-  // the backend's own slice limit; 0 means none
+  // the backend's own slice limit; 0 means none. An FSIF backend's segmentPayloadSize, which must be set
   uint32 backendMaxSliceSize = 12;
+  // the FSIF backend's segmentCount; 0 for every other backend
+  uint32 fsifSegmentCount = 13;
 }
 
 enum AllocationGroupMemberType {

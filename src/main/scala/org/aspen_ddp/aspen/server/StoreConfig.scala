@@ -11,6 +11,12 @@ backend:
   storage-engine: rocksdb
   max-slice-size: 2048      # optional, backend limit
 pool-max-slice-size: 4096   # optional, pool limit
+
+or, for an FSIF store:
+backend:
+  storage-engine: fsif
+  segment-payload-size: 4096  # required, the backend limit
+  segment-count: 1000         # required
 */
 /** @param poolMaxSliceSize The pool's maxSliceSize, copied from the StoragePoolState when the store was created.
   *                         None means the pool has no limit.
@@ -29,11 +35,14 @@ case class StoreConfig(storeId: StoreId,
       case (None, b) => b
 
   def yamlConfig: String =
-    val backendLimit = backend.maxSliceSize.map(v => s"\n  max-slice-size: $v").getOrElse("")
+    val backendAttrs = backend match
+      case b: StoreConfig.RocksDB => b.maxSliceSize.map(v => s"\n  max-slice-size: $v").getOrElse("")
+      case b: StoreConfig.Fsif =>
+        s"\n  segment-payload-size: ${b.segmentPayloadSize}\n  segment-count: ${b.segmentCount}"
     val poolLimit = poolMaxSliceSize.map(v => s"\npool-max-slice-size: $v").getOrElse("")
     s"""store-id: $storeId
        |backend:
-       |  storage-engine: ${backend.name}$backendLimit$poolLimit
+       |  storage-engine: ${backend.name}$backendAttrs$poolLimit
        |""".stripMargin
 
 
@@ -59,9 +68,32 @@ object StoreConfig extends YObject[StoreConfig]:
 
     def create(o: Object): RocksDB = RocksDB(positiveLimit("backend.max-slice-size", maxSliceSize.get(o)))
 
+  /** An FSIF store: see FsifConfig. Its segment payload size is its slice limit. */
+  case class Fsif(segmentPayloadSize: Int, segmentCount: Int) extends StorageBackend:
+    def name: String = "fsif"
+    def maxSliceSize: Option[Int] = Some(segmentPayloadSize)
+
+  object Fsif extends YObject[Fsif]:
+    val segmentPayloadSize: Required[Int] = Required("segment-payload-size", YInt)
+    val segmentCount: Required[Int] = Required("segment-count", YInt)
+
+    val attrs: List[Attr] = segmentPayloadSize :: segmentCount :: Nil
+
+    def create(o: Object): Fsif =
+      def positive(key: String, v: Int): Int =
+        if v <= 0 then
+          throw new FormatError(s"backend.$key must be positive, got $v")
+        v
+      Fsif(positive("segment-payload-size", segmentPayloadSize.get(o)),
+           positive("segment-count", segmentCount.get(o)))
+
 
   val storeId: Required[StoreId] = Required("store-id", StoreId.YStoreId)
-  val backend: Required[RocksDB] = Required("backend", Choice("storage-engine", Map("rocksdb" -> RocksDB)))
+  /** Format is invariant, so each backend's YObject is wrapped to produce the common StorageBackend */
+  private def anyBackend(f: Format[? <: StorageBackend]): Format[StorageBackend] = o => f.format(o)
+
+  val backend: Required[StorageBackend] = Required("backend",
+    Choice("storage-engine", Map("rocksdb" -> anyBackend(RocksDB), "fsif" -> anyBackend(Fsif))))
 
   val poolMaxSliceSize: Optional[Int] = Optional("pool-max-slice-size", YInt)
 

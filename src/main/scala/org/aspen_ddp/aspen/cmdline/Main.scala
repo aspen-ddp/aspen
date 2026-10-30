@@ -29,7 +29,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, FsifConfig, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
@@ -113,6 +113,9 @@ object Main {
                   deviceSetName:String="",
                   maximumStoreSize:Long=0L,
                   maxSliceSize:Option[Int]=None,
+                  backend:String="rocksdb",
+                  maxObjectSize:Option[Int]=None,
+                  segmentCount:Option[Int]=None,
                   allowAnyIda:Boolean=false,
                   setId:String="",
                   newSetName:String="",
@@ -463,6 +466,27 @@ object Main {
 
       maxSliceSizeOption(p),
 
+      opt[String]("backend").valueName("rocksdb|fsif").
+        text("Store backend (default: rocksdb)").
+        validate(x =>
+          if x == "rocksdb" || x == "fsif" then success
+          else failure(s"--backend must be rocksdb or fsif, got $x")).
+        action((x, c) => c.copy(backend = x)),
+
+      opt[Int]("max-object-size").valueName("<bytes>").
+        text("Largest object an fsif pool holds; sizes its segments (required with --backend fsif)").
+        validate(x =>
+          if x > 0 then success
+          else failure(s"--max-object-size must be positive, got $x")).
+        action((x, c) => c.copy(maxObjectSize = Some(x))),
+
+      opt[Int]("segment-count").valueName("<n>").
+        text("Objects each store of an fsif pool can hold (required with --backend fsif)").
+        validate(x =>
+          if x > 0 then success
+          else failure(s"--segment-count must be positive, got $x")).
+        action((x, c) => c.copy(segmentCount = Some(x))),
+
       arg[Long]("<maximum-store-size>").optional().text("Maximum per-store size in bytes (0 = default/unbounded)").
         action((x, c) => c.copy(maximumStoreSize = x)),
     )
@@ -800,6 +824,8 @@ object Main {
         failure("data-port, http-port, and store-transfer-port must all be different")
       else if c.mode == "create-allocation-group" then
         validateGroupIda(c)
+      else if c.mode == "create-pool" then
+        validatePoolBackend(c)
       else if c.mode == "system-rebalance-period" then
         // Validated here rather than in the handler so a malformed period is a usage error,
         // reported before any client or network is built.
@@ -890,8 +916,10 @@ object Main {
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
-            case "create-pool" => create_pool(session, cfg.newPoolName, createIDA(cfg), cfg.deviceSetName, cfg.maximumStoreSize,
-              cfg.maxSliceSize)
+            case "create-pool" =>
+              val ida = createIDA(cfg)
+              create_pool(session, cfg.newPoolName, ida, cfg.deviceSetName, cfg.maximumStoreSize,
+                cfg.maxSliceSize, poolBackendConfig(cfg, ida))
             case "create-device-set" => create_device_set(session, cfg.newSetName, cfg.newSetLevel, cfg.parentSetName)
             case "create-allocation-group" =>
               val (policy, ida) =
@@ -947,6 +975,25 @@ object Main {
   }
 
   /** A group needs either the four IDA arguments or --allow-any-ida, never both. Reported as a usage error. */
+  /** --max-object-size and --segment-count go with --backend fsif, which requires both */
+  private def validatePoolBackend(c: Args): Either[String, Unit] =
+    if c.backend == "fsif" then
+      if c.maxObjectSize.isEmpty || c.segmentCount.isEmpty then
+        Left("--backend fsif requires --max-object-size and --segment-count")
+      else
+        Right(())
+    else if c.maxObjectSize.nonEmpty || c.segmentCount.nonEmpty then
+      Left("--max-object-size and --segment-count apply only to --backend fsif")
+    else
+      Right(())
+
+  /** The create-pool backend: FSIF segments are sized from the pool's IDA (FsifConfig.forObjectSize) */
+  private[cmdline] def poolBackendConfig(c: Args, ida: IDA): BackendConfig =
+    if c.backend == "fsif" then
+      FsifConfig.forObjectSize(ida, c.maxObjectSize.get, c.segmentCount.get)
+    else
+      RocksDBConfig()
+
   private def validateGroupIda(c: Args): Either[String, Unit] =
     val gaveIda = c.idaType.nonEmpty || c.width != 0 || c.readThreshold != 0 || c.writeThreshold != 0
     if c.allowAnyIda && gaveIda then
@@ -1583,7 +1630,8 @@ object Main {
                   ida: IDA,
                   deviceSetName: String,
                   maximumStoreSize: Long,
-                  maxSliceSize: Option[Int] = None): Int = {
+                  maxSliceSize: Option[Int] = None,
+                  backendConfig: BackendConfig = RocksDBConfig()): Int = {
 
     configureLogging()
 
@@ -1595,7 +1643,7 @@ object Main {
 
     val f = for
       setId <- client.getStorageDeviceSetId(deviceSetName)
-      poolId <- client.createNewStoragePool(poolName, ida, maxSliceSize, RocksDBConfig(), setId, maximumStoreSize)
+      poolId <- client.createNewStoragePool(poolName, ida, maxSliceSize, backendConfig, setId, maximumStoreSize)
     yield poolId
 
     // Translate the known failure modes into human-readable messages. The client's retry

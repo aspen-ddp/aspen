@@ -25,7 +25,7 @@ trait FsifFiles:
 
 object FsifIo:
   /** True if "no space left" (ENOSPC) or a quota error (EDQUOT, "disk quota exceeded") appears, ignoring case, in
-   *  the message of the throwable or of any cause. Otherwise the same matching as RebuildingStore.isOutOfSpace. */
+   *  the message of the throwable or of any cause. RebuildingStore.isOutOfSpace uses it too. */
   def isOutOfSpace(t: Throwable): Boolean =
     def matches(e: Throwable): Boolean =
       val msg = Option(e.getMessage).getOrElse("").toLowerCase
@@ -38,15 +38,15 @@ final class NioFsifFiles(dir: os.Path) extends FsifFiles:
 
   def open(name: String): FsifFile =
     val path = dir / name
-    val created = !os.exists(path)
     val channel = FileChannel.open(path.toNIO,
       StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE)
-    if created then
-      try DurableFiles.syncDirectory(dir)
-      catch
-        case t: Throwable =>
-          channel.close()
-          throw t
+    // Always, not only when this call creates the file: a crash between an earlier open's create and its sync
+    // could otherwise leave the directory entry non-durable for good. open is rare, so this is cheap.
+    try DurableFiles.syncDirectory(dir)
+    catch
+      case t: Throwable =>
+        channel.close()
+        throw t
     new NioFsifFile(channel)
 
   def exists(name: String): Boolean = os.exists(dir / name)

@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.*
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
-import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
+import org.aspen_ddp.aspen.server.store.backend.{FsifConfig, RocksDBConfig}
 
 import java.util.UUID
 
@@ -546,6 +546,22 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
       storageDeviceSet = StorageDeviceSetId(uuid(8)))
     Codec.decode(Codec.encode(pool(Some(2048)))).backendConfig shouldBe RocksDBConfig(Some(2048))
     Codec.decode(Codec.encode(pool(None))).backendConfig shouldBe RocksDBConfig(None)
+
+  test("StoragePoolState round-trip keeps an FSIF backend config"):
+    val original = StoragePoolState(
+      PoolId(uuid(1)), "p", Replication(3, 2), Some(8192), Array.empty, FsifConfig(4097, 1000),
+      storageDeviceSet = StorageDeviceSetId(uuid(8)))
+    val decoded = Codec.decode(Codec.encode(original))
+    decoded.backendConfig shouldBe FsifConfig(4097, 1000)
+    decoded shouldBe original
+    decoded.effectiveMaxSliceSize shouldBe Some(4097)
+
+  test("an FSIF backend config without a segment payload size or count does not decode"):
+    val encoded = Codec.encode(StoragePoolState(
+      PoolId(uuid(1)), "p", Replication(3, 2), None, Array.empty, FsifConfig(4097, 1000),
+      storageDeviceSet = StorageDeviceSetId(uuid(8))))
+    an[EncodingError] should be thrownBy Codec.decode(encoded.withBackendMaxSliceSize(0))
+    an[EncodingError] should be thrownBy Codec.decode(encoded.withFsifSegmentCount(0))
 
   test("StoragePoolState round-trip"):
     val original = StoragePoolState(

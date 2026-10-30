@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.util.YamlFormat
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.tls.{CertificateVerifier, Pem}
 import org.aspen_ddp.aspen.server.{BootstrapHttpServer, HostConfig, UserJarLoader}
-import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
+import org.aspen_ddp.aspen.server.store.backend.{FsifConfig, RocksDBConfig}
 import org.yaml.snakeyaml.parser.ParserException
 
 import java.util.UUID
@@ -702,6 +702,27 @@ class MainSuite extends AnyFunSuite with Matchers:
       parsed.writeThreshold shouldBe 2
       parsed.deviceSetName shouldBe "myset"
       parsed.maximumStoreSize shouldBe 4096L
+
+  test("create-pool --backend fsif sizes its segments from the IDA and requires both sizing options"):
+    withTempDir("parse-fsif"): dir =>
+      val cfgs = emptyFile(dir / "bootstrap.yaml")
+      def parse(extra: String*) = Console.withErr(OutputStream.nullOutputStream()):
+        Main.buildParser.parse(
+          Seq("create-pool", cfgs, "mypool", "Replication", "3", "2", "2", "myset") ++ extra, Main.Args())
+
+      val rocks = parse().getOrElse(fail("create-pool did not parse"))
+      Main.poolBackendConfig(rocks, Main.createIDA(rocks)) shouldBe RocksDBConfig()
+
+      val fsif = parse("--backend", "fsif", "--max-object-size", "4096", "--segment-count", "100")
+        .getOrElse(fail("create-pool --backend fsif did not parse"))
+      Main.poolBackendConfig(fsif, Main.createIDA(fsif)) shouldBe FsifConfig.forObjectSize(Replication(3, 2), 4096, 100)
+
+      parse("--backend", "fsif") shouldBe None
+      parse("--backend", "fsif", "--max-object-size", "4096") shouldBe None
+      parse("--backend", "fsif", "--segment-count", "100") shouldBe None
+      parse("--segment-count", "100") shouldBe None
+      parse("--backend", "lmdb") shouldBe None
+      parse("--backend", "fsif", "--max-object-size", "0", "--segment-count", "100") shouldBe None
 
   test("host --load-jars names a version directory under <host-directory>/jars"):
     withTempDir("parse-load-jars"): dir =>

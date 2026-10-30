@@ -82,6 +82,36 @@ backend:
     cfg.yamlConfig should not include "max-slice-size"
     roundTrip(cfg) should be(cfg)
 
+  test("yaml round trip of an FSIF backend"):
+    val cfg = StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), Some(8192))
+    cfg.yamlConfig should include("storage-engine: fsif")
+    cfg.yamlConfig should include("segment-payload-size: 4097")
+    cfg.yamlConfig should include("segment-count: 1000")
+    roundTrip(cfg) should be(cfg)
+    cfg.effectiveMaxSliceSize should be(Some(4097))
+    StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None).effectiveMaxSliceSize should be(Some(4097))
+    roundTrip(StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None)) should be(
+      StoreConfig(storeId0, StoreConfig.Fsif(4097, 1000), None))
+
+  test("an FSIF backend needs a positive segment payload size and count"):
+    def load(backend: String): StoreConfig =
+      val f = os.temp(prefix = "aspen-store-fsif", suffix = ".yaml")
+      try
+        os.write.over(f,
+          s"""store-id: 00000000-0000-0000-0000-000000000000:0
+             |backend:
+             |  storage-engine: fsif
+             |$backend""".stripMargin)
+        StoreConfig.loadStoreConfig(f)
+      finally
+        os.remove(f)
+
+    load("  segment-payload-size: 10\n  segment-count: 2\n").backend should be(StoreConfig.Fsif(10, 2))
+    a[YamlFormat.FormatError] should be thrownBy load("  segment-count: 2\n")
+    a[YamlFormat.FormatError] should be thrownBy load("  segment-payload-size: 10\n")
+    a[YamlFormat.FormatError] should be thrownBy load("  segment-payload-size: 0\n  segment-count: 2\n")
+    a[YamlFormat.FormatError] should be thrownBy load("  segment-payload-size: 10\n  segment-count: 0\n")
+
   test("effectiveMaxSliceSize is the smaller, the only one, or None"):
     StoreConfig(storeId0, StoreConfig.RocksDB(Some(2048)), Some(4096)).effectiveMaxSliceSize should be(Some(2048))
     StoreConfig(storeId0, StoreConfig.RocksDB(Some(8192)), Some(4096)).effectiveMaxSliceSize should be(Some(4096))

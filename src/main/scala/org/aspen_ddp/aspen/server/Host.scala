@@ -11,7 +11,8 @@ import org.aspen_ddp.aspen.common.transaction.TransactionStatus
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runSequentially}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler, FsifConfig, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifIo, FsifLayout, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.store.{Frontend, Store}
@@ -35,6 +36,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 import org.aspen_ddp.aspen.common.rebalancing.{RebalancingDurableService, RebalancingMessage, TransferComplete}
 
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicReference
 import java.util.UUID
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -60,6 +62,10 @@ object Host:
                                   maxSliceSize: Option[Long], completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   private case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
+  /** An FSIF backend failed-stop (its onFatal). `backend` is set once its constructor returns, before the event
+   *  can be handled, since every backend is opened under the instance lock; it stays empty if the constructor
+   *  threw. */
+  private case class BackendFailed(storeId: StoreId, backend: AtomicReference[Backend], err: Throwable) extends Event
   private case class Exit() extends Event
   private case class RecoveryEvent() extends Event
   private case class HeartbeatEvent() extends Event
@@ -292,6 +298,11 @@ class Host(val client: AspenClient,
 
   private var offlineStores: Set[StoreId] = Set()
   private var creatingStores: Set[StoreId] = Set()
+  // FSIF stores whose backend could not be opened because their device is out of space. Each is
+  // offline and unloaded; every ScanDevices (deviceScanPeriod, 10 s) tries the load again, and it
+  // leaves this map when the load succeeds or fails for any other reason. Never marked for
+  // rebuild: the store's data is intact, it just cannot finish recovery until space returns.
+  private var storesAwaitingSpace: Map[StoreId, (LocalStorageDeviceState, os.Path)] = Map()
   private var rebuildingStores: Map[StoreId, StoreRebuild] = Map()
   // Completed when the rebuild of each store in rebuildingStores has released its slot, its
   // outcome acted on. What a shutdown waits on for the rebuilds it cancels.
@@ -931,15 +942,103 @@ class Host(val client: AspenClient,
           offlineStores += storeCfg.storeId
           sds.offlineStores += storeCfg.storeId
         else
-          val backend = storeCfg.backend match
-            case b: StoreConfig.RocksDB => new RocksDBBackend(potentialStoreFile, storeCfg.storeId, ec)
-          sds.loadedStores += backend.storeId
-          sds.offlineStores -= backend.storeId
-          offlineStores -= backend.storeId
-          logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
-          loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong))
+          openBackendForLoad(sds, storeCfg, potentialStoreFile).foreach: backend =>
+            sds.loadedStores += backend.storeId
+            sds.offlineStores -= backend.storeId
+            offlineStores -= backend.storeId
+            logger.info(s"Loading store ${storeCfg.storeId}: $potentialStoreFile")
+            loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong))
       catch
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
+
+  /** Opens the backend of the store at `storePath` for tryLoadStore, or returns None when the store was left
+   *  offline instead. Only an FSIF backend is ever left offline here; any other failure to open is thrown, as it
+   *  always was, to tryLoadStore's catch, which logs it and loads nothing.
+   *
+   *  - FsifRecovery.StoreLost: the store's acknowledged state is gone. It is marked rebuild-required and left
+   *    offline, as crlSaveFileLost leaves a store, and the reconcile then flips its entry to Rebuilding.
+   *  - Out of space (FsifIo.isOutOfSpace): recovery could not finish on a full device. The data is intact, so the
+   *    store is left offline and unloaded, recorded in storesAwaitingSpace, and every ScanDevices retries it.
+   *
+   *  Caller holds the instance lock.
+   */
+  private def openBackendForLoad(sds: LocalStorageDeviceState,
+                                 storeCfg: StoreConfig,
+                                 storePath: os.Path): Option[Backend] =
+    val storeId = storeCfg.storeId
+    def leaveOffline(): Unit =
+      offlineStores += storeId
+      sds.offlineStores += storeId
+      sds.loadedStores -= storeId
+    val awaiting = storesAwaitingSpace.contains(storeId)
+    storesAwaitingSpace -= storeId
+    try
+      Some(openBackend(storeCfg, storePath, create = false))
+    catch
+      case e: FsifRecovery.StoreLost =>
+        logger.error(s"Store $storeId cannot be loaded: FSIF recovery found its acknowledged state lost. " +
+                     s"Rebuilding it. $storePath. Error: ${e.getMessage}")
+        leaveOffline()
+        try
+          markRebuildRequired(storePath)
+        catch
+          case t: Throwable =>
+            // Offline for the life of this process either way. The next start recovers the
+            // same files and lands here again.
+            logger.error(s"Failed to mark store $storeId for rebuild at $storePath: $t")
+        // A device still being loaded is checked once it is registered.
+        if storageDevices.get(sds.storageDeviceId).exists(_ eq sds) then
+          checkStorageDevice(sds.storageDeviceId)
+        None
+      case e: Throwable if isFsif(storeCfg) && FsifIo.isOutOfSpace(e) =>
+        if awaiting then
+          logger.debug(s"Store $storeId still cannot be loaded: its device is out of space. Error: $e")
+        else
+          logger.warn(s"Store $storeId cannot be loaded: its device is out of space. Leaving it offline and " +
+                      s"retrying every device scan until space returns. $storePath. Error: $e")
+        leaveOffline()
+        storesAwaitingSpace += storeId -> (sds, storePath)
+        None
+
+  private def isFsif(storeCfg: StoreConfig): Boolean = storeCfg.backend.isInstanceOf[StoreConfig.Fsif]
+
+  /** Retries the load of every store in storesAwaitingSpace whose device is still loaded here, not shutting down,
+   *  and still has it offline and unloaded. Others are dropped: whatever replaced or removed them has taken over.
+   *  Caller holds the instance lock. */
+  private def retryStoresAwaitingSpace(): Unit =
+    storesAwaitingSpace.foreach: (storeId, entry) =>
+      val (sds, storePath) = entry
+      val deviceId = sds.storageDeviceId
+      if ! storageDevices.get(deviceId).exists(_ eq sds) || stores.contains(storeId) ||
+         ! sds.offlineStores.contains(storeId) || ! os.exists(storePath / StoreConfig.configFilename) then
+        storesAwaitingSpace -= storeId
+      else if ! shuttingDownDevices.contains(deviceId) then
+        tryLoadStore(sds, storePath)
+
+  /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. Caller holds the instance
+   *  lock, which BackendFailed relies on. */
+  private def openBackend(storeCfg: StoreConfig, storePath: os.Path, create: Boolean): Backend =
+    val storeId = storeCfg.storeId
+    storeCfg.backend match
+      case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
+      case b: StoreConfig.Fsif =>
+        val layout = FsifLayout(b.segmentPayloadSize, b.segmentCount)
+        val ref = new AtomicReference[Backend]()
+        // Called once, on an FSIF io thread: only enqueues, so it never blocks there.
+        val onFatal: Throwable => Unit = err => events.put(BackendFailed(storeId, ref, err))
+        val backend =
+          if create then FsifBackend.create(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
+          else openFsifBackend(storeId, storePath, layout, onFatal)
+        ref.set(backend)
+        backend
+
+  /** Opens an existing FSIF store, initializing it first if its creation never completed. protected as a test
+   *  seam: a subclass can fail the open or keep `onFatal`. */
+  protected def openFsifBackend(storeId: StoreId,
+                                storePath: os.Path,
+                                layout: FsifLayout,
+                                onFatal: Throwable => Unit): Backend =
+    FsifBackend.open(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
 
   def start(): Unit =
     threadPool.submit(new Runnable {
@@ -1769,14 +1868,26 @@ class Host(val client: AspenClient,
               logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
               Future.successful(false)
             else
-              val storeConfig = pstate.backendConfig match
-                case cfg: RocksDBConfig => StoreConfig(storeId, StoreConfig.RocksDB(cfg.maxSliceSize), pstate.maxSliceSize)
+              val backendCfg = pstate.backendConfig match
+                case cfg: RocksDBConfig => StoreConfig.RocksDB(cfg.maxSliceSize)
+                case cfg: FsifConfig => StoreConfig.Fsif(cfg.segmentPayloadSize, cfg.segmentCount)
+              val storeConfig = StoreConfig(storeId, backendCfg, pstate.maxSliceSize)
 
               os.makeDir.all(storePath)
               os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)
 
-              val backend = storeConfig.backend match
-                case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
+              val backend =
+                try openBackend(storeConfig, storePath, create = true)
+                catch
+                  case e: Throwable if isFsif(storeConfig) && FsifIo.isOutOfSpace(e) =>
+                    // The next check finds the directory and flips the entry without loading it, so it is
+                    // handed to the out-of-space retries: their load initializes it again (it has no marker).
+                    logger.warn(s"Store $storeId cannot be created: device $deviceId is out of space. Leaving " +
+                                s"it offline and retrying every device scan. Error: $e")
+                    offlineStores += storeId
+                    local.offlineStores += storeId
+                    storesAwaitingSpace += storeId -> (local, storePath)
+                    throw e
 
               // Recorded as tryLoadStore records a load, so a shutdown of this device finds the
               // store and closes it.
@@ -2088,9 +2199,15 @@ class Host(val client: AspenClient,
   private def crlSaveFileLost(storageDeviceId: StorageDeviceId,
                               backend: Backend,
                               err: Throwable): Unit =
-    val storeId = backend.storeId
-    logger.error(s"Store $storeId cannot be loaded: its CRL save file is unusable and its transaction " +
+    logger.error(s"Store ${backend.storeId} cannot be loaded: its CRL save file is unusable and its transaction " +
                  s"state is lost. Rebuilding it. Error: $err")
+    retireUnservedStore(storageDeviceId, backend)
+
+  /** crlSaveFileLost's steps, for any store that must never serve: closes `backend` unserved, marks the store
+   *  rebuild-required, leaves it offline, and checks the device so the reconcile flips its entry to Rebuilding.
+   *  The close is not awaited. Caller holds the instance lock. */
+  private def retireUnservedStore(storageDeviceId: StorageDeviceId, backend: Backend): Unit =
+    val storeId = backend.storeId
     offlineStores += storeId
     storageDevices.get(storageDeviceId).foreach: sds =>
       sds.loadedStores -= storeId
@@ -2100,10 +2217,46 @@ class Host(val client: AspenClient,
       markRebuildRequired(backend.path)
     catch
       case t: Throwable =>
-        // Offline for the life of this process either way. The next start re-reads the same
-        // unusable file and lands here again.
+        // Offline for the life of this process either way. The next start finds the same
+        // unusable state and lands here again.
         logger.error(s"Failed to mark store $storeId for rebuild at ${backend.path}: $t")
     checkStorageDevice(storageDeviceId)
+
+  private def backendHasFailed(backend: Backend): Boolean = backend match
+    case b: FsifBackend => b.hasFailed
+    case _ => false
+
+  /** An FSIF backend failed-stop: page-cache state can no longer be trusted, so the store is rebuilt. If it is
+   *  served, it is unloaded as UnloadFailedStore does, its CRL state dropped (the rebuild discards the directory),
+   *  marked rebuild-required and left offline, and its device checked so the reconcile flips its entry to
+   *  Rebuilding. The mark is written before the close, so a crash meanwhile still never serves it. Nothing is
+   *  awaited: the close completes in the background. A backend not (or no longer) served is ignored: either its
+   *  LoadStore is still queued, and retires it on seeing it failed, or it was closed and replaced.
+   *
+   *  Caller holds the instance lock. */
+  private def backendFailed(storeId: StoreId, backend: Option[Backend], err: Throwable): Unit =
+    stores.get(storeId) match
+      case Some(store) if backend.exists(_ eq store.backend) =>
+        logger.error(s"Store $storeId failed on an I/O error and can no longer be trusted. Taking it offline and " +
+                     s"rebuilding it. Error: $err")
+        stores -= storeId
+        offlineStores += storeId
+        store.objectCache.clear()
+        storageDevices.get(store.storageDeviceId).foreach: sds =>
+          sds.loadedStores -= storeId
+          sds.offlineStores += storeId
+        try
+          markRebuildRequired(store.backend.path)
+        catch
+          case t: Throwable =>
+            // Offline for the life of this process either way. A restart recovers whatever is
+            // durable, which a failed store may well still hold.
+            logger.error(s"Failed to mark store $storeId for rebuild at ${store.backend.path}: $t")
+        crl.closeStore(storeId).onComplete: _ =>
+          store.close()
+        checkStorageDevice(store.storageDeviceId)
+      case _ =>
+        logger.info(s"Ignoring the failure of a backend of store $storeId that is not being served. Error: $err")
 
   /** Flips the entry of a store whose CRL state was lost from Active to Rebuilding, on its own
    *  device. Nothing else changes: the pool already names this device and host. Writes nothing
@@ -3432,13 +3585,23 @@ class Host(val client: AspenClient,
       case LoadStore(storageDeviceId, backend, maxSliceSize, p) =>
         // The save file is read before the Store exists: a store whose CRL state cannot be
         // recovered must never serve, not even briefly.
+        val failed = backendHasFailed(backend)
         val savedState =
-          if os.exists(backend.crlSaveFile) then
+          if failed then
+            // Failed-stop between its open and this event. Its BackendFailed found nothing to
+            // unload, or will, so it is retired here.
+            Left(new java.io.IOException(s"the backend of store ${backend.storeId} failed before it was served"))
+          else if os.exists(backend.crlSaveFile) then
             CrashRecoveryLog.loadValidStoreState(backend.crlSaveFile, backend.storeId).map(Some(_))
           else
             Right(None)
 
         savedState match
+          case Left(err) if failed =>
+            logger.error(s"Store ${backend.storeId} cannot be loaded: its backend failed. Rebuilding it. Error: $err")
+            retireUnservedStore(storageDeviceId, backend)
+            p.failure(err)
+
           case Left(err) =>
             crlSaveFileLost(storageDeviceId, backend, err)
             p.failure(err)
@@ -3464,6 +3627,9 @@ class Host(val client: AspenClient,
                                  s"offline. Error: $err")
                     events.put(UnloadFailedStore(backend.storeId, store))
                     p.failure(err)
+
+      case BackendFailed(storeId, ref, err) =>
+        backendFailed(storeId, Option(ref.get), err)
 
       case UnloadFailedStore(storeId, store) =>
         if stores.get(storeId).exists(_ eq store) then
@@ -3502,6 +3668,7 @@ class Host(val client: AspenClient,
         // loads is checked at once, as CheckAllDevices would, so its Initializing stores are
         // created now rather than up to checkStorageDevicePeriod from now.
         checkForNewDevices().foreach(checkStorageDevice)
+        retryStoresAwaitingSpace()
 
       case InitializeTaskExecutor() =>
         initializeTaskExecutor()
@@ -3510,6 +3677,13 @@ class Host(val client: AspenClient,
         stores.get(storeId) match
           case None => completion.success(())
           case Some(store) =>
+            store.backend match
+              case b: FsifBackend if b.isWriteFrozen =>
+                // Never awaited here, so nothing on this thread waits; whatever waits on the
+                // completion (a device shutdown, a transfer out) waits for the space.
+                logger.warn(s"Closing store $storeId while its device is out of space: the close, and anything " +
+                            s"waiting on it, completes only once space returns and its held writes finish")
+              case _ =>
             stores -= storeId
             offlineStores += storeId
             store.objectCache.clear()

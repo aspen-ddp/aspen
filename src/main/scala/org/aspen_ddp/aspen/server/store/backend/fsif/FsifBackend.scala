@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectType, ReadError}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
+import org.aspen_ddp.aspen.server.DurableFiles
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitError, CommitState, CompletionHandler, Read,
   UpdateForm}
 
@@ -92,7 +93,8 @@ class FsifBackend(val storeId: StoreId,
   private var writesInFlight = 0
   private var unappliedCount = 0
   private var unappliedBytes = 0L
-  private var fatal: Option[Throwable] = None
+  /** Volatile so `hasFailed` can be read from any thread */
+  @volatile private var fatal: Option[Throwable] = None
   private val quiescers = mutable.ArrayBuffer[Promise[Unit]]()
   /** Copy-on-write targets that grew the slot count and are not yet forced. Recovery bounds every slot by
     * max(forced data size / stride, 1 + highest indexed slot) + the Mappings it replays (Ruling 12), and such a slot
@@ -189,6 +191,9 @@ class FsifBackend(val storeId: StoreId,
 
   /** Writes are frozen by a full device: held I/O is retried every `tuning.enospcRetry` while reads go on */
   def isWriteFrozen: Boolean = frozen
+
+  /** The store has failed-stop on an I/O error (and `onFatal` has been, or is about to be, called) */
+  def hasFailed: Boolean = fatal.isDefined
 
   /** Slots the data file is laid out for: every occupied or reserved slot is below it */
   def slotCount: Int = slotTotal
@@ -1237,10 +1242,35 @@ object FsifBackend:
       val x = ByteBuffer.wrap(sp).getInt
       if x >= 0 && x < segmentCount then Some(x) else None
 
+  /** Present, and durable, in a store directory once `initializeStore` has completed. A directory without it was
+    * never fully created, so it never held data, and `open` initializes it again (Ruling 23). With it, the store is
+    * recovered, and a store that cannot be is lost (StoreLost). It is an ordinary file of the store directory, so a
+    * transfer carries it with the rest and a rebuild's staging directory brings its own.
+    */
+  val InitializedMarkerFile = "fsif-initialized"
+
+  /** Initializes a fresh, empty store in `path` (created if missing), then durably writes the marker. Re-runnable: a
+    * crash part way through leaves no marker, and running it again starts over.
+    */
+  def initializeStore(path: os.Path, layout: FsifLayout): Unit =
+    os.makeDir.all(path)
+    FsifRecovery.initialize(new NioFsifFiles(path), layout)
+    DurableFiles.write(path / InitializedMarkerFile, "")
+
   /** Creates and initializes a new store in `path`, then opens it */
   def create(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
              onFatal: Throwable => Unit): FsifBackend =
-    os.makeDir.all(path)
-    val files = new NioFsifFiles(path)
-    FsifRecovery.initialize(files, layout)
-    new FsifBackend(storeId, path, layout, files, io, FsifTuning(), onFatal)
+    initializeStore(path, layout)
+    new FsifBackend(storeId, path, layout, new NioFsifFiles(path), io, FsifTuning(), onFatal)
+
+  /** Opens the existing store in `path`, first initializing it if its creation never completed (no marker).
+    *
+    * @throws FsifRecovery.StoreLost if the store's acknowledged state cannot be recovered
+    * @throws java.io.IOException    on an I/O error, including running out of space (FsifIo.isOutOfSpace)
+    */
+  def open(storeId: StoreId, path: os.Path, layout: FsifLayout, io: ExecutionContext,
+           onFatal: Throwable => Unit, tuning: FsifTuning = FsifTuning()): FsifBackend =
+    if !os.exists(path / InitializedMarkerFile) then
+      scribe.warn(s"FSIF store $storeId at $path was never fully created. Initializing it as an empty store")
+      initializeStore(path, layout)
+    new FsifBackend(storeId, path, layout, new NioFsifFiles(path), io, tuning, onFatal)

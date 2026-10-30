@@ -8,7 +8,8 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
-import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, FsifConfig, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifIo, FsifLayout, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import scribe.Logging
 
@@ -182,13 +183,15 @@ class RebuildingStore(client: AspenClient,
       pstate <- client.getStoragePoolState(storeId.poolId)
       _ = if !os.exists(stagingPath / StoreConfig.configFilename) then
             // Written up front so the directory is loadable the instant it is moved into place.
-            val backendLimit = pstate.backendConfig match
-              case cfg: RocksDBConfig => cfg.maxSliceSize
+            val backendCfg = pstate.backendConfig match
+              case cfg: RocksDBConfig => StoreConfig.RocksDB(cfg.maxSliceSize)
+              case cfg: FsifConfig => StoreConfig.Fsif(cfg.segmentPayloadSize, cfg.segmentCount)
             os.write.over(stagingPath / StoreConfig.configFilename,
-              StoreConfig(storeId, StoreConfig.RocksDB(backendLimit), pstate.maxSliceSize).yamlConfig)
+              StoreConfig(storeId, backendCfg, pstate.maxSliceSize).yamlConfig)
       _ = synchronized:
             backend = pstate.backendConfig match
               case _: RocksDBConfig => new RocksDBBackend(stagingPath, storeId, summon)
+              case cfg: FsifConfig => openFsifStaging(cfg)
       pool <- client.getStoragePool(storeId.poolId)
       tree = pool.allocationTree
       _ <- resume.flatMap(_.lastRestoredKey) match
@@ -205,6 +208,27 @@ class RebuildingStore(client: AspenClient,
       _ <- retryFailures()
       _ <- finish()
     yield ()
+
+  /** Opens the staging FSIF store: initialized on the first pass (or if that pass was cut off before its marker),
+   *  recovered on a resume. A fail-stop latches the abort, so the pass fails with the checkpoint left for the next
+   *  one. A staging store that cannot be recovered is discarded, checkpoint and all, so the next pass starts over
+   *  rather than failing on it forever.
+   */
+  private def openFsifStaging(cfg: FsifConfig): Backend =
+    val layout = FsifLayout(cfg.segmentPayloadSize, cfg.segmentCount)
+    def onFatal(err: Throwable): Unit =
+      logger.error(s"Rebuild of $storeId: the staging FSIF store failed. Abandoning this pass. Error: $err")
+      synchronized:
+        if abortCause.isEmpty then
+          abortCause = Some(err)
+    try
+      FsifBackend.open(storeId, stagingPath, layout, FsifBackend.sharedIo, onFatal)
+    catch
+      case e: FsifRecovery.StoreLost =>
+        logger.error(s"Rebuild of $storeId: the staging FSIF store cannot be recovered. Discarding it to start " +
+                     s"over. Error: ${e.getMessage}")
+        cleanupStaging()
+        throw e
 
   /** Copy one object's slice of this store into the backend.
    *
@@ -290,14 +314,9 @@ class RebuildingStore(client: AspenClient,
 
   /** Best-effort detection of a full destination. Backends surface it differently -- RocksDB
    *  wraps it, the JDK throws IOException -- so this matches on the message as well as the
-   *  type. A false negative only costs the slower path through recordFailure. */
-  private def isOutOfSpace(err: Throwable): Boolean =
-    def matches(t: Throwable): Boolean =
-      val msg = Option(t.getMessage).getOrElse("").toLowerCase
-      msg.contains("no space left") || msg.contains("disk full") ||
-        msg.contains("insufficient space") || msg.contains("injected out of space")
-
-    Iterator.iterate(err)(_.getCause).takeWhile(_ != null).take(8).exists(matches)
+   *  type. A false negative only costs the slower path through recordFailure. The matching is
+   *  FsifIo.isOutOfSpace's, which also counts a quota error (EDQUOT) as a full device. */
+  private def isOutOfSpace(err: Throwable): Boolean = FsifIo.isOutOfSpace(err)
 
   private def attemptRestore(key: Key, ptr: ObjectPointer): Future[Unit] =
     if failBytes.contains(key.bytes.toList) then

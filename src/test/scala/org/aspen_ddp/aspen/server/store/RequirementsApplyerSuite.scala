@@ -2,9 +2,9 @@ package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, XorRegion}
+import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, Replication, XorRegion}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, RefcountUpdate, TransactionId}
 import org.scalatest.funsuite.AnyFunSuite
@@ -35,6 +35,32 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     ObjectType.Data,
     DataBuffer(Array[Byte](1, 2, 3))
   )
+
+  private def applyKVInsert(requiredRevision: Option[ObjectRevision], timestamp: HLCTimestamp): ObjectState = {
+    val kvos = new KVObjectState
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, kvos.encode())
+    o.kvState = Some(kvos)
+    val payload = KeyValueOperation.encode(List(Insert(Key(Array[Byte](1)), Array[Byte](2))), Replication(3, 2))(0)
+    val req = KeyValueUpdate(kp1, requiredRevision, None, Nil)
+    val result = RequirementsApplyer.apply(tx1, timestamp, List(req), HashMap(oid1 -> o), HashMap(oid1 -> payload))
+    assert(result.skipped.isEmpty)
+    assert(result.failed.isEmpty)
+    o
+  }
+
+  test("KeyValueUpdate without a required revision advances the timestamp but not the revision") {
+    val ts = HLCTimestamp(100)
+    val o = applyKVInsert(None, ts)
+    assert(o.metadata.revision == rev1)
+    assert(o.metadata.timestamp == ts)
+  }
+
+  test("KeyValueUpdate with a required revision advances the timestamp and the revision") {
+    val ts = HLCTimestamp(100)
+    val o = applyKVInsert(Some(rev1), ts)
+    assert(o.metadata.revision == ObjectRevision(tx1))
+    assert(o.metadata.timestamp == ts)
+  }
 
   test("DataUpdate applies with no skips or failures") {
     val o = mkDataObject()

@@ -1,26 +1,6 @@
 TODO
 ====
 
-StoreRepairer leaves missed-update (errorTree) entries behind after a successful repair
-  - Found during the FSIF integration test. Pre-existing and not FSIF-related.
-  - The delete at StoreRepairer.scala:140-146 is guarded by TimestampLessThan(key, os.timestamp), which fails only
-    when entry.ts < os.timestamp (RequirementsChecker.scala:266-270). So once the object is updated again after the
-    entry was written, the entry is never cleared, even when the repair brings the store fully current. This is
-    likely under append-heavy workloads, where a store that missed one update goes on to apply later ones.
-  - The guard's semantics also look inverted relative to its own doc comment: the comment says to keep the entry when
-    a new miss lands after the read, but the check passes in exactly that case (entry newer than the object).
-  - StoreRepairerSuite's "repaired and the entry removed" test passes only because it seeds the entry after the
-    object's last update.
-  - Decide the intended rule, fix the guard, and add tests for an object updated after its entry was written.
-  - The intended context here is that the repair operation executes while live operations are being carried out. A
-    repair operation may be started and the object will be restored with a timestamp of time t. When the repairer goes
-    to delete the entry from the repair tree, it can only do so if the timestamp of the error tree entry is less than
-    or equal to the timestamp of the repaired slice t. If an update to the object completed between the beginning of the
-    repair operation its completion, the timestamp in the repair tree would be greater than that of the repaired object.
-    That would mean that the repair operation restored the object to a less-then-current state and a new repair
-    operation is needed. A repair operation can only delete an entry from the repair tree if the timestamp of the
-    repaired object is equal to or greater than the timestamp of the repair tree entry.
-
 FixedSizedIndexFileAllocationStrategy
   - Use a KeyValue object to hold segments of an allocated indicies bitmap
     - 100Gib of 1Mib segments is 102400 indicies - 12k allocation bitmap
@@ -46,3 +26,8 @@ are exported via the iscsi protocol with "good" performance. TCMU seems to be a 
 implementation simplicity. A high-level design description of how this might be achieved is
 captured in features/iscsi-target.txt this should serve as the starting point for how to implement this feature but
 it should not be considered set-in-stone. Alternative solutions may be considered
+
+DataObject TKVL test suite sometimes reports hung tests during full test runs though it still succeeds. Although
+apparently not flaky, it suggests that these tests may be taking an inordinately long time to complete. Investigate
+to see if these tests are slower than they should be and where the hung transactions are occurring. Determine if
+this is purely a test issue that can be fixed or if there may be an underlying system issue that needs to be addressed.

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, ObjectId, ObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, ObjectId, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, TransactionDescription, TransactionId}
 
@@ -38,6 +38,16 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     bb.putLong(objectId.uuid.getLeastSignificantBits)
     Key(keyBytes)
 
+  private val missedTimestamp = HLCTimestamp(1000L)
+
+  /** Splits an errorTree value into [missedTimestamp:8][storePointer...], written out here for
+    * the same reason as buildErrorKey.
+    */
+  private def decodeErrorValue(value: Value): (HLCTimestamp, Seq[Byte]) =
+    val bb = ByteBuffer.wrap(value.bytes)
+    bb.order(ByteOrder.BIG_ENDIAN)
+    (HLCTimestamp(bb.getLong()), value.bytes.toSeq.drop(8))
+
   private def pointerWith(storePointer: Array[Byte]): DataObjectPointer =
     DataObjectPointer(ObjectId(UUID.randomUUID()), Radicle.poolId, storePointer)
 
@@ -47,7 +57,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
   private def txdFor(ptrs: ObjectPointer*): TransactionDescription =
     TransactionDescription(
       transactionId = TransactionId(UUID.randomUUID()),
-      startTimestamp = HLCTimestamp(1000L),
+      startTimestamp = missedTimestamp,
       primaryObject = ptrs.head,
       designatedLeaderUID = 0.toByte,
       requirements = ptrs.toList.map: p =>
@@ -57,7 +67,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       poolIDAMap = Map(ptrs.head.poolId -> net.ida)
     )
 
-  atest("errorTree value carries the object's storePointer bytes"):
+  atest("errorTree value carries the missed timestamp and the object's storePointer bytes"):
     val storePointer = Array[Byte](1, 2, 3, 4)
     val ptr = pointerWith(storePointer)
 
@@ -74,11 +84,11 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry2 <- pool.errorTree.get(buildErrorKey(net.storeId2, ptr.id))
     yield
       entry0.isDefined shouldBe true
-      entry0.get.value.bytes.toSeq shouldBe storePointer.toSeq
+      decodeErrorValue(entry0.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
       entry1.isDefined shouldBe true
-      entry1.get.value.bytes.toSeq shouldBe storePointer.toSeq
+      decodeErrorValue(entry1.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
       entry2.isDefined shouldBe true
-      entry2.get.value.bytes.toSeq shouldBe storePointer.toSeq
+      decodeErrorValue(entry2.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
 
   atest("storePointer is recovered by id when commitErrors reports the object"):
     val storePointer = Array[Byte](5, 6, 7, 8)
@@ -96,7 +106,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry <- pool.errorTree.get(buildErrorKey(net.storeId2, ptr.id))
     yield
       entry.isDefined shouldBe true
-      entry.get.value.bytes.toSeq shouldBe storePointer.toSeq
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))
 
   atest("a commitErrors id absent from the txd still records an entry"):
     val ptr = pointerWith(Array[Byte](9, 10))
@@ -114,11 +124,11 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry <- pool.errorTree.get(buildErrorKey(net.storeId1, unrelatedId))
     yield
       entry.isDefined shouldBe true
-      entry.get.value.bytes.toSeq shouldBe ObjectPointer.EmptyArray.toSeq
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, ObjectPointer.EmptyArray.toSeq))
 
-  atest("an empty storePointer round-trips as an empty value"):
+  atest("an empty storePointer round-trips after the timestamp"):
     // Guards against a fix that writes an encoded pointer or a length prefix rather than the
-    // raw bytes -- both would show up here as a non-empty value.
+    // raw bytes -- both would show up here as bytes after the timestamp.
     val ptr = pointerWith(ObjectPointer.EmptyArray)
 
     val fa = new MissedUpdateFinalizationAction(client, txdFor(ptr))
@@ -130,7 +140,7 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       entry <- pool.errorTree.get(buildErrorKey(net.storeId0, ptr.id))
     yield
       entry.isDefined shouldBe true
-      entry.get.value.bytes.toSeq shouldBe ObjectPointer.EmptyArray.toSeq
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, ObjectPointer.EmptyArray.toSeq))
 
   atest("marking the same object twice is idempotent"):
     val storePointer = Array[Byte](11, 12, 13)
@@ -155,4 +165,4 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       // errorTree.set is an unconditional last-write-wins replace and storePointer is a stable
       // property of the pointer, so the re-mark writes identical bytes over the first entry.
       entry.isDefined shouldBe true
-      entry.get.value.bytes.toSeq shouldBe storePointer.toSeq
+      decodeErrorValue(entry.get.value) shouldBe ((missedTimestamp, storePointer.toSeq))

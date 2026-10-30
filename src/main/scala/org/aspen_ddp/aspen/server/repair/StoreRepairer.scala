@@ -1,10 +1,11 @@
 package org.aspen_ddp.aspen.server.repair
 
 import org.aspen_ddp.aspen.client.{AspenClient, StoragePool}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateFinalizationAction
 import org.aspen_ddp.aspen.client.tkvl.KeyValueListNode
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer,
-                                           ObjectId, ObjectPointer}
+                                           ObjectId, ObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.client.KeyValueObjectState.ValueState
@@ -61,20 +62,26 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
       logger.debug(s"Abandoning repair scan of $storeId: no longer repairable here")
       Future.unit
     else
-      // Wrap synchronous portion to convert throws into failed Futures. decodeObjectId and
-      // ObjectPointer construction both decode and can throw on malformed input; a throw that
+      // Wrap synchronous portion to convert throws into failed Futures. decodeObjectId,
+      // decodeErrorEntry and ObjectPointer construction all decode and can throw on malformed
+      // input; a throw that
       // escapes before a Future is produced would hang the scan instead of letting foreachInRange
       // log the failure and continue.
       Future.unit.flatMap: _ =>
         seen.incrementAndGet()
         val objectId = decodeObjectId(key)
+        val (missedTimestamp, storePointer) = MissedUpdateFinalizationAction.decodeErrorEntry(value.value)
 
         for
           oAllocation <- pool.allocationTree.get(Key(objectId.toBytes))
           _ <- oAllocation match
             case Some(allocation) =>
-              repairUpdate(storeId, ObjectPointer(allocation.value.bytes), node, key).map: _ =>
-                repaired.incrementAndGet()
+              repairUpdate(storeId, ObjectPointer(allocation.value.bytes), missedTimestamp,
+                           value.revision, node, key).map: current =>
+                if current then
+                  repaired.incrementAndGet()
+                else
+                  deferred.incrementAndGet()
                 ()
 
             case None =>
@@ -86,7 +93,7 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
                 // The entry value holds the storePointer bytes captured when the update was
                 // missed -- the only surviving copy, since deletion removed the allocation tree
                 // entry. Empty means "delete by ObjectId alone".
-                repairDeletion(storeId, objectId, value.value.bytes, node, key).map: _ =>
+                repairDeletion(storeId, objectId, storePointer, node, key).map: _ =>
                   repaired.incrementAndGet()
                   ()
               else
@@ -97,8 +104,12 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
                 Future.unit
         yield ()
 
-  private def repairUpdate(storeId: StoreId, ptr: ObjectPointer,
-                           node: KeyValueListNode, key: Key): Future[Unit] =
+  /** Installs the object's current state on the store. The result is false when that state
+    * predates the missed update the entry records, so the entry was left for the next pass.
+    */
+  private def repairUpdate(storeId: StoreId, ptr: ObjectPointer, missedTimestamp: HLCTimestamp,
+                           entryRevision: ObjectRevision,
+                           node: KeyValueListNode, key: Key): Future[Boolean] =
     val fos = ptr match
       case kp: KeyValueObjectPointer => client.read(kp)
       case dp: DataObjectPointer => client.read(dp)
@@ -109,9 +120,15 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
       os <- fos
       _ = target.repair(storeId, os, completion)
       _ <- completion.future
-      _ <- deleteErrorEntryIfUnchanged(os.timestamp, node, key)
+      current = os.timestamp >= missedTimestamp
+      _ <- (if current then deleteErrorEntryIfUnchanged(entryRevision, node, key) else Future.unit)
     yield
-      logger.info(s"Repair complete for object ${ptr.id} on store $storeId")
+      if current then
+        logger.info(s"Repair complete for object ${ptr.id} on store $storeId")
+      else
+        logger.info(s"Repair of object ${ptr.id} on store $storeId installed a state older than " +
+                    s"its missed update. Leaving the entry for the next pass")
+      current
 
   private def repairDeletion(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte],
                              node: KeyValueListNode, key: Key): Future[Unit] =
@@ -133,16 +150,17 @@ class StoreRepairer(client: AspenClient, target: RepairTarget)
     yield ()
 
   /** Deletion of the entry is best effort. A transient error or a collision only costs another
-    * pass. The timestamp guard is the point: if the entry's timestamp moved between reading the
-    * object and writing it to the store, another update was missed in that window, and letting
-    * the delete fail is how the next pass learns to try again.
+    * pass. The revision guard is the point: the caller compared the repaired state against the
+    * missed timestamp it scanned, and a store that misses another update while the repair is
+    * underway rewrites the entry with that newer timestamp. Requiring the scanned revision makes
+    * the delete fail in that case, which is how the next pass learns to try again.
     */
-  private def deleteErrorEntryIfUnchanged(timestamp: HLCTimestamp,
+  private def deleteErrorEntryIfUnchanged(entryRevision: ObjectRevision,
                                           node: KeyValueListNode, key: Key): Future[Unit] =
     val tx = client.newRepairTransaction()
     val fdelete = node.delete(key,
       None,
-      List(KeyValueUpdate.TimestampLessThan(key, timestamp)),
+      List(KeyValueUpdate.KeyRevision(key, entryRevision)),
       (_, _) => Future.unit)(using tx)
     for
       _ <- fdelete

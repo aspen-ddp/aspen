@@ -182,6 +182,34 @@ class KeyValueObjectReaderSuite extends AnyFunSuite with Matchers {
     }
   }
 
+  test("A store behind on revision but sharing the newest timestamp loses the tie") {
+    // s0 missed r1 but applied a later revision-less update, so it reports t2 like the others
+    val r = TestReader(ida3)
+    r.ok(0, (r0, t2), Set(), a0)
+    r.result should be (None)
+    r.ok(1, (r1, t2), Set(), a1)
+    r.result should be (None)
+    r.ok(2, (r1, t2), Set(), a1)
+    r.result should not be (None)
+    r.rereadCandidates.keySet should be (Set(s0))
+    r.result.get match {
+      case Left(_) => fail()
+      case Right(os) =>
+        os.revision should be (r1)
+        os.asInstanceOf[KeyValueObjectState].contents.head._2 should be (ValueState(bar, r1, t1))
+    }
+  }
+
+  test("The restored timestamp is the newest among stores holding the revision") {
+    val r = TestReader(ida3)
+    r.ok(0, (r1, t1), Set(), a1)
+    r.ok(1, (r1, t2), Set(), a1)
+    r.result.get match {
+      case Left(_) => fail()
+      case Right(os) => os.timestamp should be (t2)
+    }
+  }
+
   test("Resolve multiple kv pair, simple") {
     val r = TestReader(ida3)
     r.ok(0, v0, Set(), a0, b0)

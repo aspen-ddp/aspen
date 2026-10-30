@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.{ObjectState as ClientObjectState, Transaction
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.tkvl.TieredKeyValueList
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, Value}
+import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 
@@ -30,8 +30,23 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     bb.putLong(objectId.uuid.getLeastSignificantBits)
     Key(bb.array())
 
-  /** Records what the service asked the host to do, and lets the test make the store depart. */
-  private class RecordingTarget(hosted: List[StoreId]) extends RepairTarget:
+  /** Duplicated rather than shared with MissedUpdateFinalizationAction for the same reason as
+    * buildErrorKey: [missedTimestamp:8][storePointer...], big-endian.
+    */
+  private def buildErrorValue(missedTimestamp: HLCTimestamp, storePointer: Array[Byte]): Value =
+    val bb = ByteBuffer.allocate(8 + storePointer.length)
+    bb.order(ByteOrder.BIG_ENDIAN)
+    bb.putLong(missedTimestamp.asLong)
+    bb.put(storePointer)
+    Value(bb.array())
+
+  /** Records what the service asked the host to do, and lets the test make the store depart.
+    * `duringRepair` runs before a repair completes, standing in for live traffic that lands
+    * while the repair is underway.
+    */
+  private class RecordingTarget(hosted: List[StoreId],
+                                duringRepair: ObjectId => Future[Unit] = _ => Future.unit)
+      extends RepairTarget:
     val departed = new AtomicBoolean(false)
     @volatile var repairs: List[ObjectId] = Nil
     @volatile var deletions: List[(ObjectId, Seq[Byte])] = Nil
@@ -42,7 +57,7 @@ class StoreRepairerSuite extends IntegrationTestSuite:
 
     def repair(sid: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
       synchronized { repairs = repairs :+ os.pointer.id }
-      completion.success(())
+      completion.completeWith(duringRepair(os.pointer.id))
 
     def repairDelete(sid: StoreId, objectId: ObjectId,
                      storePointer: Array[Byte], completion: Promise[Unit]): Unit =
@@ -55,11 +70,12 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   /** Seeds an errorTree entry directly. Provoking a real missed update is not deterministic in
     * TestNetwork, and the entry's shape is all StoreRepairer cares about.
     */
-  private def seedErrorEntry(objectId: ObjectId, storePointer: Array[Byte]): Future[Unit] =
+  private def seedErrorEntry(objectId: ObjectId, storePointer: Array[Byte],
+                             missedTimestamp: HLCTimestamp = HLCTimestamp.Zero): Future[Unit] =
     errorTree.flatMap: tree =>
       val tx: Transaction = client.newRepairTransaction()
       given Transaction = tx
-      tree.set(buildErrorKey(0.toByte, objectId), Value(storePointer)).flatMap: _ =>
+      tree.set(buildErrorKey(0.toByte, objectId), buildErrorValue(missedTimestamp, storePointer)).flatMap: _ =>
         tx.commit().map(_ => ())
 
   private def errorEntryExists(objectId: ObjectId): Future[Boolean] =
@@ -68,7 +84,9 @@ class StoreRepairerSuite extends IntegrationTestSuite:
   /** Allocates a real object. AllocationFinalizationAction writes the allocationTree entry, so
     * nothing here has to fake one -- waiting for the transaction to settle is enough.
     */
-  private def allocateObject(): Future[ObjectId] =
+  private def allocateObject(): Future[ObjectId] = allocateObjectPointer().map(_.id)
+
+  private def allocateObjectPointer(): Future[KeyValueObjectPointer] =
     val f = client.transactUntilSuccessful: tx =>
       given Transaction = tx
       for
@@ -79,21 +97,87 @@ class StoreRepairerSuite extends IntegrationTestSuite:
     for
       ptr <- f
       _ <- net.waitForTransactionsToComplete()
-    yield ptr.id
+    yield ptr
+
+  /** Commits a fresh update to the object and returns its new timestamp. No required revision,
+    * as with TKVL inserts: the object's timestamp must advance anyway.
+    */
+  private def updateObject(ptr: KeyValueObjectPointer): Future[HLCTimestamp] =
+    for
+      _ <- client.transactUntilSuccessful: tx =>
+             tx.update(ptr, None, None, Nil, List(Insert(Key(Array[Byte](9)), Array[Byte](10))))
+             Future.unit
+      _ <- net.waitForTransactionsToComplete()
+      os <- client.read(ptr)
+    yield os.timestamp
 
   test("an entry whose object is in the allocation tree is repaired and the entry removed"):
     val target = RecordingTarget(List(storeId))
     val repairer = StoreRepairer(client, target)
     for
-      objectId <- allocateObject()
-      _ <- seedErrorEntry(objectId, Array[Byte](1, 2, 3))
+      ptr <- allocateObjectPointer()
+      os <- client.read(ptr)
+      _ <- seedErrorEntry(ptr.id, Array[Byte](1, 2, 3), os.timestamp)
       result <- repairer.scan(storeId, RepairPolicy.Default)
-      stillThere <- errorEntryExists(objectId)
+      stillThere <- errorEntryExists(ptr.id)
     yield
-      target.repairs should contain (objectId)
+      target.repairs should contain (ptr.id)
       result.repaired shouldBe 1
       result.deferred shouldBe 0
       stillThere shouldBe false
+
+  test("an entry is removed when its object was updated again after the miss"):
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target)
+    for
+      ptr <- allocateObjectPointer()
+      missed <- client.read(ptr).map(_.timestamp)
+      _ <- seedErrorEntry(ptr.id, Array[Byte](1), missed)
+      // The update lands after the entry was written, so the entry's key timestamp predates it
+      updated <- updateObject(ptr)
+      result <- repairer.scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      updated should be > missed
+      result.repaired shouldBe 1
+      result.deferred shouldBe 0
+      stillThere shouldBe false
+
+  test("an entry whose missed update is newer than the repaired state is left in place"):
+    val target = RecordingTarget(List(storeId))
+    val repairer = StoreRepairer(client, target)
+    for
+      ptr <- allocateObjectPointer()
+      os <- client.read(ptr)
+      _ <- seedErrorEntry(ptr.id, Array[Byte](1), HLCTimestamp.happensAfter(os.timestamp))
+      result <- repairer.scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(ptr.id)
+    yield
+      target.repairs should contain (ptr.id)
+      result.repaired shouldBe 0
+      result.deferred shouldBe 1
+      stillThere shouldBe true
+
+  test("an update missed while the repair is underway leaves the entry in place"):
+    // The repair reads the object, then the store misses an update and the entry is rewritten
+    // with that update's timestamp before the repair completes.
+    @volatile var ptr: Option[KeyValueObjectPointer] = None
+    val target = RecordingTarget(List(storeId), duringRepair = objectId =>
+      for
+        missed <- updateObject(ptr.get)
+        _ <- seedErrorEntry(objectId, Array[Byte](1), missed)
+      yield ())
+    val repairer = StoreRepairer(client, target)
+    for
+      p <- allocateObjectPointer()
+      _ = ptr = Some(p)
+      os <- client.read(p)
+      _ <- seedErrorEntry(p.id, Array[Byte](1), os.timestamp)
+      _ <- repairer.scan(storeId, RepairPolicy.Default)
+      stillThere <- errorEntryExists(p.id)
+    yield
+      target.repairs should contain (p.id)
+      stillThere shouldBe true
 
   test("an aged entry with no allocation is deleted from the store and the tree"):
     val objectId = ObjectId(new UUID(7, 7))

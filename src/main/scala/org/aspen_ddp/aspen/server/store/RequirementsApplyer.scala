@@ -65,8 +65,11 @@ object RequirementsApplyer extends Logging {
             val state = objects(ptr.id)
             val kvs = state.kvState.get
 
-            r.requiredRevision.foreach { _ =>
-              state.metadata = state.metadata.copy(revision=ObjectRevision(transactionId), timestamp=timestamp)
+            // Every update advances the object's timestamp, so the object's timestamp tells repair whether a store
+            // has caught up. Only an update with a required revision moves the revision.
+            state.metadata = r.requiredRevision match {
+              case Some(_) => state.metadata.copy(revision=ObjectRevision(transactionId), timestamp=timestamp)
+              case None => state.metadata.copy(timestamp=timestamp)
             }
 
             val kvops = KeyValueOperation.decode(objectUpdates(ptr.id), ObjectRevision(transactionId), timestamp)

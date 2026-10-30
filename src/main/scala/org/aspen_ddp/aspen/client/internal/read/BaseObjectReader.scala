@@ -131,16 +131,24 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
   }
 
   private def getStoreStates(): (List[StoreStateType], List[StoreStateType]) =
-    val mostRecent = responses.valuesIterator.foldLeft((ObjectRevision.Null, HLCTimestamp.Zero)): (t, r) =>
-      r match
-        case Left(_) => t
-        case Right(ss) => if (ss.timestamp > t._2) (ss.revision, ss.timestamp) else t
-
-
     val allStoreStates = responses.valuesIterator.collect { case Right(ss) => ss }.toList
 
-    val matchingStoreStates = allStoreStates.filter: ss =>
-      if mostRecent._1 == ss.revision then
+    // A KeyValue update without a required revision advances a store's timestamp but not its revision, so a store
+    // that missed the latest revision can still share the highest timestamp. The tie goes to the revision more
+    // stores hold: it committed, so it reached a majority. While that is still even, no revision is chosen and no
+    // store is marked behind until more responses arrive.
+    val ranked = allStoreStates.groupBy(_.revision)
+      .map((revision, states) => (states.map(_.timestamp).max, states.size) -> revision)
+      .toList
+      .sortBy(_._1)(using Ordering[(HLCTimestamp, Int)].reverse)
+
+    val mostRecent = ranked match
+      case (rank, _) :: (next, _) :: _ if rank == next => None
+      case (_, revision) :: _ => Some(revision)
+      case Nil => None
+
+    val matchingStoreStates = if mostRecent.isEmpty then Nil else allStoreStates.filter: ss =>
+      if mostRecent.contains(ss.revision) then
         true
       else
         knownBehind += ss.storeId -> ss.readTimestamp
@@ -161,7 +169,8 @@ abstract class BaseObjectReader[PointerType <: ObjectPointer, StoreStateType <: 
       // The current refcount is the one with the highest updateSerial
       val refcount = matchingStoreStates.foldLeft(ObjectRefcount(-1,0))((ref, ss) => if (ss.refcount.updateSerial > ref.updateSerial) ss.refcount else ref)
       val revision = matchingStoreStates.head.revision
-      val timestamp = matchingStoreStates.head.timestamp
+      // Stores holding the same revision may differ in timestamp, see getStoreStates
+      val timestamp = matchingStoreStates.map(_.timestamp).max
 
       val readTime = matchingStoreStates.foldLeft(HLCTimestamp.now)((maxts, ss) => if (ss.readTimestamp > maxts) ss.readTimestamp else maxts)
 

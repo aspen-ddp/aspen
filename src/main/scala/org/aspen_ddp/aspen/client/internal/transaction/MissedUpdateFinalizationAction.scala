@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction, TransactionCreationError, UnknownStoragePool}
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription}
@@ -42,11 +43,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     })
   }
 
-  // Records missed updates with storePointer bytes. Object deletion removes the pool's
-  // allocationTree entry, which is the only other place those bytes are persisted, so
-  // without this a repair pass cannot locate a deleted object's per-store state.
+  // Records missed updates with the missed transaction's timestamp and storePointer bytes. Object
+  // deletion removes the pool's allocationTree entry, which is the only other place those bytes
+  // are persisted, so without this a repair pass cannot locate a deleted object's per-store state.
   //
-  // An empty value means "this object has no storePointer". A repair pass treats it as
+  // An empty storePointer means "this object has no storePointer". A repair pass treats it as
   // "delete by ObjectId alone" rather than as an error, which RocksDB stores still rely on.
   // See StoreRepairer.repairDeletion in aspen.server.repair.
   def markMissedUpdates(): Unit = synchronized {
@@ -105,7 +106,8 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
         pool <- client.getStoragePool(storeId.poolId)
         tx = client.newTransaction()
         _ = tx.disableMissedUpdateTracking()
-        _ <- pool.errorTree.set(key, Value(storePointer))(using tx)
+        _ <- pool.errorTree.set(key,
+               MissedUpdateFinalizationAction.encodeErrorEntry(txd.startTimestamp, storePointer))(using tx)
         _ <- tx.commit()
       } yield {
         logger.trace(s"COMPLETED - Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
@@ -119,6 +121,29 @@ object MissedUpdateFinalizationAction extends RegisteredTypeFactory with Finaliz
   val typeUUID: UUID = UUID.fromString("E1F61997-61A7-4C86-A211-0EBA601DEDA3")
 
   var errorTimeout = Duration(250, MILLISECONDS)
+
+  /** An errorTree entry's value: the missed transaction's start timestamp, big-endian, then the
+    * object's storePointer bytes (possibly empty).
+    *
+    * The timestamp is the one a store gives the object when it applies that transaction, so a
+    * repair that installs a state at least that new has caught the store up past the miss. The
+    * entry's own key timestamp cannot serve: it belongs to the later transaction that wrote it.
+    */
+  def encodeErrorEntry(missedTimestamp: HLCTimestamp, storePointer: Array[Byte]): Value =
+    val bb = ByteBuffer.allocate(HLCTimestamp.EncodedSize + storePointer.length)
+    bb.order(ByteOrder.BIG_ENDIAN)
+    bb.putLong(missedTimestamp.asLong)
+    bb.put(storePointer)
+    Value(bb.array())
+
+  /** Inverse of `encodeErrorEntry`: the missed transaction's timestamp and the storePointer */
+  def decodeErrorEntry(value: Value): (HLCTimestamp, Array[Byte]) =
+    val bb = ByteBuffer.wrap(value.bytes)
+    bb.order(ByteOrder.BIG_ENDIAN)
+    val ts = HLCTimestamp(bb.getLong())
+    val storePointer = new Array[Byte](bb.remaining())
+    bb.get(storePointer)
+    (ts, storePointer)
 
   def createFinalizationAction(client: AspenClient,
                                txd: TransactionDescription,

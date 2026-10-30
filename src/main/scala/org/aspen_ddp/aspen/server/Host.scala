@@ -317,6 +317,8 @@ class Host(val client: AspenClient,
   // leaves this map when its load succeeds or fails for any other reason. Never marked for
   // rebuild: the store's data is intact, it just cannot finish recovery until space returns.
   private var storesAwaitingSpace: Map[StoreId, SpaceWait] = Map()
+  // Stores marked rebuild-required whose transfer out returnLostTransferToRebuild is aborting.
+  private var abortingLostTransfers: Set[StoreId] = Set()
 
   /** SpaceRetryCap in device scans, at least 1 */
   private val spaceRetryCapScans: Int =
@@ -1826,10 +1828,27 @@ class Host(val client: AspenClient,
         if shuttingDownDevices.contains(sourceDs.storageDeviceId) then
           err(s"Source device ${sourceDs.storageDeviceId} for transfer of store ${m.storeId} is " +
               s"being shut down")
+        val markedPath = sourceDs.devicePath / m.storeId.directoryName
+        if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut &&
+           os.exists(markedPath / RebuildingStore.RebuildRequiredMarkerFile) then
+          // Ruling 25: a store marked for rebuild (its backend failed, here during an earlier
+          // request's close) has no trustworthy state to ship, and the destination would refuse
+          // its missing CRL save file forever. It goes back to the rebuild path instead.
+          returnLostTransferToRebuild(m.storeId, sourceDs)
+          err(s"Not starting the transfer out of store ${m.storeId}: it is marked rebuild-required")
         if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
           // A retransmitted request finds the store already closed, and its going offline already gossiped
           val wasLoaded = stores.contains(m.storeId)
           val fclosed = closeStoreForTransferOut(m.storeId)
+
+          fclosed.failed.foreach:
+            case e: StoreFailedOnClose =>
+              logger.error(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
+                           s"its backend failed while closing. Returning it to the rebuild path")
+              synchronized(returnLostTransferToRebuild(m.storeId, sourceDs))
+            case t =>
+              logger.warn(s"Not starting the transfer out of store ${m.storeId}, transfer ${m.transferUUID}: " +
+                          s"its close failed. Error: $t")
 
           fclosed.foreach: _ =>
             synchronized {
@@ -1843,6 +1862,11 @@ class Host(val client: AspenClient,
                  !storageDevices.get(sourceDs.storageDeviceId).contains(sourceDs) then
                 logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
                             s"${sourceDs.storageDeviceId} began shutting down while the store closed")
+              else if os.exists(storePath / RebuildingStore.RebuildRequiredMarkerFile) then
+                // Marked while it closed (a BackendFailed for it): as above, never shipped.
+                logger.error(s"Not starting the transfer out of store ${m.storeId}: it was marked " +
+                             s"rebuild-required while it closed")
+                returnLostTransferToRebuild(m.storeId, sourceDs)
               else try
                 // Written before archiving, so it travels with the store and keeps this copy
                 // offline across restarts until the transfer is resolved one way or the other.
@@ -1864,6 +1888,30 @@ class Host(val client: AspenClient,
             }
       }
   }
+
+  /** Ruling 25: takes a TransferringOut store marked rebuild-required back to the rebuild path. The transfer is
+   *  aborted (AspenClient.abortStoreTransfer: the source entry back to Active, or Offline on a device shutting
+   *  down, and the destination's TransferringIn entry removed), and the device is checked, so the reconcile's
+   *  lost-CRL pass flips the now Active entry to Rebuilding. One abort at a time per store: retransmits arriving
+   *  meanwhile do nothing more. Caller holds the instance lock. */
+  private def returnLostTransferToRebuild(storeId: StoreId, sds: LocalStorageDeviceState): Unit =
+    if ! abortingLostTransfers.contains(storeId) then
+      abortingLostTransfers += storeId
+      logger.warn(s"Aborting the transfer out of store $storeId, which is marked rebuild-required, so it is rebuilt")
+      val fabort =
+        try abortLostTransfer(storeId)
+        catch case t: Throwable => Future.failed(t)
+      fabort.onComplete: result =>
+        synchronized:
+          abortingLostTransfers -= storeId
+          result.failed.foreach: t =>
+            logger.warn(s"Failed to abort the transfer out of store $storeId for its rebuild. A retransmitted " +
+                        s"request tries again. Error: $t")
+          if storageDevices.get(sds.storageDeviceId).exists(_ eq sds) then
+            checkStorageDevice(sds.storageDeviceId)
+
+  /** The abort returnLostTransferToRebuild issues. A seam for tests. */
+  protected def abortLostTransfer(storeId: StoreId): Future[Boolean] = client.abortStoreTransfer(storeId)
 
   /** Creates and loads an Initializing store, then flips its entry out of Initializing.
    *

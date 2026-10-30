@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout, FsifRecovery, FsifTuning, NioFsifFiles}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
-import org.aspen_ddp.aspen.server.transfer.StoreTransferService
+import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 
 import java.io.IOException
 import java.util.UUID
@@ -232,3 +232,4 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
         host.testingOnlyOfflineStores should contain(storeId)
         os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
         os.exists(Backend.crlSaveFile(storeDir)) should be(false)
+        os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)

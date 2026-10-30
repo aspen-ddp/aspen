@@ -503,7 +503,24 @@ private class RecordingHost(mgrClient: AspenClient,
   override protected def closeStoreForTransferOut(storeId: StoreId): Future[Unit] =
     synchronized:
       transferOutCloses += storeId
-    transferOutCloseGate.get.map(_.future).getOrElse(super.closeStoreForTransferOut(storeId))
+    failNextTransferOutClose.getAndSet(None) match
+      case Some(leave) =>
+        leave()
+        Future.failed(Host.StoreFailedOnClose(storeId))
+      case None =>
+        transferOutCloseGate.get.map(_.future).getOrElse(super.closeStoreForTransferOut(storeId))
+
+  /** Makes the next transfer-out close fail as a ShutdownStore does when the backend failed-stop during it, after
+   *  running the given function, which leaves the store as Host.failedOnClose would. Lazy, as above. */
+  lazy val failNextTransferOutClose = new AtomicReference[Option[() => Unit]](None)
+
+  /** Every abortLostTransfer call, in order. Lazy, as above. */
+  lazy val lostTransferAborts: mutable.ListBuffer[StoreId] = mutable.ListBuffer[StoreId]()
+
+  override protected def abortLostTransfer(storeId: StoreId): Future[Boolean] =
+    synchronized:
+      lostTransferAborts += storeId
+    super.abortLostTransfer(storeId)
 
   /** Every outcome completeDeviceShutdown returned, in order. Lazy, as above. */
   lazy val shutdownOutcomes: mutable.ListBuffer[ShutdownOutcome] = mutable.ListBuffer[ShutdownOutcome]()

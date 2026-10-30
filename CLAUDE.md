@@ -170,8 +170,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - A `crl_save.log` in a store's final directory is the only copy of its CRL state: if it fails to load (missing,
   truncated, or naming another store) the store is never served. It gets a `rebuild-required` marker, its entry is
   flipped to Rebuilding by the reconcile, and the directory is discarded before the rebuild. Adoption of a Shutdown
-  device does the same for such stores instead of refusing the device. A network transfer validates the staged copy's
-  save file before promotion and retries on failure, since the source still holds the state
+  device does the same for such stores instead of refusing the device, and adopts any `rebuild-required` directory as
+  Rebuilding whatever its other markers. A network transfer validates the staged copy's save file before promotion and
+  retries on failure, since the source still holds the state
+- A backend fail-stop during a store's close marks it `rebuild-required` instead of closing it cleanly (no
+  `transferring-out`, no `crl_save.log`). Such a store is never transferred: its transfer is aborted so it is rebuilt
 - `server.DurableFiles` forces files and their directories so markers and moves survive a pulled disk. That durability
   holds on Linux only, the supported host platform: directory fsync is a no-op on Windows and a plain fsync on macOS,
   each logging one warning

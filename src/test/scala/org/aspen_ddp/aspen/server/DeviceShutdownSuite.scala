@@ -581,6 +581,50 @@ class DeviceShutdownSuite extends IntegrationTestSuite with HostTestHarness:
       st.stores(movingStore).status should be(StoreStatus.Offline)
       st.status should be(DeviceStatus.Shutdown)
 
+  atest("a transfer out whose store fails during its close is never sent and goes back to be rebuilt"):
+    given ExecutionContext = executionContext
+    val hostRoot = newHostDir()
+    val sourceId = StorageDeviceId.BootstrapStorageDeviceId
+    val deviceDir = writeDevice(hostRoot, "dev0", sourceId)
+    val sends = new StagedSendService
+    val rebuilds = new RecordingRebuildFactory
+    val host = newHost(hostRoot, transferService = sends, storeRebuildFactory = rebuilds)
+    val movingStore = StoreId(PoolId.BootstrapPoolId, 1)
+    val storeDir = deviceDir / movingStore.directoryName
+    os.makeDir.all(storeDir)
+    val local = host.loadedDevices(sourceId)
+    local.loadedStores = local.loadedStores + movingStore
+    def ask() = host.testingOnlyStartStoreTransferOut(StartStoreTransfer(host.hostId, client.clientId,
+      sourceId, movingStore, HLCTimestamp.now, UUID.randomUUID()))
+
+    for
+      _ <- net.createSecondDevice()
+      _ <- waitForTransactionsToComplete()
+      _ <- client.transferStore(movingStore, net.secondDeviceId)
+      _ <- waitForTransactionsToComplete()
+      // The close fails as ShutdownStore's does for a backend that failed-stop: marked, offline, unloaded
+      _ = host.failNextTransferOutClose.set(Some(() =>
+            os.write.over(storeDir / RebuildingStore.RebuildRequiredMarkerFile, "")
+            local.loadedStores = local.loadedStores - movingStore
+            local.offlineStores = local.offlineStores + movingStore))
+      _ <- ask()
+      _ <- pumpUntil(host.lostTransferAborts.nonEmpty)
+      // A retransmit meanwhile is refused before anything is closed, written or sent
+      retransmit <- ask().failed
+      _ <- pumpUntil(false, rounds = 5)
+      _ <- pumpUntilEntry(sourceId, movingStore)(_.exists(_.status == StoreStatus.Rebuilding))
+      _ <- pumpUntil(rebuilds.created.nonEmpty)
+      st <- state(sourceId)
+      dest <- state(net.secondDeviceId)
+    yield
+      retransmit.getMessage should include("rebuild-required")
+      sends.transfersOut should be(Vector())
+      host.transferOutCloses.toList should be(List(movingStore))
+      os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+      st.stores(movingStore).status should be(StoreStatus.Rebuilding)
+      dest.stores.get(movingStore) should be(None)
+      rebuilds.created.map(_.storeId).toList should be(List(movingStore))
+
   atest("a transfer out whose store closes as its device starts shutting down does not begin"):
     given ExecutionContext = executionContext
     val hostRoot = newHostDir()

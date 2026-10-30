@@ -669,6 +669,15 @@ class FsifBackendSuite extends FileBasedTests:
     FsifBackend.decodeStorePointer(sp(64), 64) shouldBe None
     FsifBackend.decodeStorePointer(Array(0, 0, 3), 64) shouldBe None
 
+  test("a store on the shared io pool drains its serial work on fsif-serial threads, apart from the io"):
+    val layout = FsifLayout(1024, 64)
+    val b = FsifBackend.create(StoreId(poolId, 0), tdir / "shared", layout, FsifBackend.sharedIo, _ => ())
+    val thread = Promise[String]()
+    b.setCompletionHandler(_ => thread.trySuccess(Thread.currentThread.getName))
+    b.commit(alloc(ptr(1, oid(1)), bytes(40, 1), 1), TransactionId(new UUID(1, 1)))
+    Await.result(thread.future, 10.seconds) should startWith("fsif-serial-")
+    Await.result(b.close(), 10.seconds)
+
   test("a journal I/O error fails the commit, fail-stops the store and calls onFatal once"):
     val h = new Harness
     val p = ptr(1, oid(1))

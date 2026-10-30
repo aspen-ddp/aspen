@@ -66,12 +66,16 @@ class FsifBackend(val storeId: StoreId,
                   io: ExecutionContext,
                   tuning: FsifTuning = FsifTuning(),
                   onFatal: Throwable => Unit = _ => (),
-                  scheduler: FsifBackend.RetryScheduler = FsifBackend.SharedRetryScheduler) extends Backend:
+                  scheduler: FsifBackend.RetryScheduler = FsifBackend.SharedRetryScheduler,
+                  serialEc: Option[ExecutionContext] = None) extends Backend:
   import FsifBackend.*
 
   private type Reply = Either[Unit, CommitError.Value] => Unit
 
-  private val serial = new SerialExecutor(io)
+  /** Drains run apart from the blocking I/O: on `serialEc`, else on `sharedSerial` for a store on `sharedIo` (so one
+    * hung device's fsyncs cannot starve every store's serial work), else on `io` itself (tests: one deterministic EC)
+    */
+  private val serial = new SerialExecutor(serialEc.getOrElse(if io eq FsifBackend.sharedIo then sharedSerial else io))
   private val recovered = FsifRecovery.recover(files, layout)
   private val dataFile = files.open(FsifRecovery.DataFile)
   /** The journal the current writer appends to: its handle and name follow a checkpoint's journal switch */
@@ -1508,6 +1512,19 @@ object FsifBackend:
       t
     ExecutionContext.fromExecutorService(
       Executors.newFixedThreadPool(math.max(4, Runtime.getRuntime.availableProcessors), factory))
+
+  /** Host-wide pool the serial executors of stores on `sharedIo` drain on: max(2, availableProcessors) daemon threads
+    * named fsif-serial-N. Serial tasks leave reads, writes and forces to `sharedIo` (compaction's truncate of free tail
+    * slots is the one call made inline), so a device hung in an fsync ties up io threads, not every store's serial work.
+    */
+  lazy val sharedSerial: ExecutionContext =
+    val counter = new AtomicInteger(0)
+    val factory: ThreadFactory = r =>
+      val t = new Thread(r, s"fsif-serial-${counter.getAndIncrement()}")
+      t.setDaemon(true)
+      t
+    ExecutionContext.fromExecutorService(
+      Executors.newFixedThreadPool(math.max(2, Runtime.getRuntime.availableProcessors), factory))
 
   /** The external index: exactly 4 bytes, a big-endian Int in [0, segmentCount) */
   def decodeStorePointer(sp: Array[Byte], segmentCount: Int): Option[Int] =

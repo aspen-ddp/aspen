@@ -3799,10 +3799,11 @@ class Host(val client: AspenClient,
           case Some(store) =>
             store.backend match
               case b: FsifBackend if b.isWriteFrozen =>
-                // Never awaited here, so nothing on this thread waits; whatever waits on the
-                // completion (a device shutdown, a transfer out) waits for the space.
-                logger.warn(s"Closing store $storeId while its device is out of space: the close, and anything " +
-                            s"waiting on it, completes only once space returns and its held writes finish")
+                // The close abandons the held writes as a crash would (Ruling 27): they were never
+                // acknowledged, so the CRL saved below keeps their data, and acknowledged commits are
+                // durable in the store's journal. It completes without waiting for space.
+                logger.warn(s"Closing store $storeId while its device is out of space: its held writes are " +
+                            s"abandoned, as in a crash, and redone from the CRL when it next loads")
               case _ =>
             stores -= storeId
             offlineStores += storeId

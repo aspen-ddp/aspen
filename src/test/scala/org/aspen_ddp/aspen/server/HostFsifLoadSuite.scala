@@ -2,20 +2,26 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.{IntegrationTestSuite, TestNetwork}
 import org.aspen_ddp.aspen.client.AspenClient
+import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.metadata.HostId
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision,
+  ObjectType}
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout, FsifRecovery, FsifTuning, NioFsifFiles}
+import org.aspen_ddp.aspen.server.store.backend.{CommitState, UpdateForm}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifFile, FsifFiles, FsifLayout, FsifRecovery,
+  FsifTuning, NioFsifFiles}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
 
 import java.io.IOException
 import java.util.UUID
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.concurrent.duration.{Duration, SECONDS}
 
 /** A real Host whose FSIF backends are opened through `openFsifBackend`, which it can make fail with out-of-space and
@@ -39,6 +45,27 @@ private class FsifSeamHost(mgrClient: AspenClient,
   @volatile var onFatals: List[Throwable => Unit] = Nil
   /** Backends opened from now on report hasFailed while this is set, as one that failed-stop does */
   @volatile var reportFailed: Boolean = false
+  /** While set, every write, force and truncate of an FSIF store opened from now on fails with ENOSPC */
+  @volatile var deviceFull: Boolean = false
+  @volatile var lastBackend: Option[FsifBackend] = None
+
+  private def outOfSpace[A](op: => A): A =
+    if deviceFull then throw new IOException("No space left on device") else op
+
+  /** NioFsifFiles whose files fail every mutation with ENOSPC while `deviceFull` is set */
+  private final class FullableFiles(path: os.Path) extends FsifFiles:
+    private val under = new NioFsifFiles(path)
+    def exists(name: String): Boolean = under.exists(name)
+    def size(name: String): Long = under.size(name)
+    def open(name: String): FsifFile =
+      val f = under.open(name)
+      new FsifFile:
+        def size: Long = f.size
+        def read(position: Long, length: Int): Array[Byte] = f.read(position, length)
+        def write(position: Long, bytes: Array[Byte]): Unit = outOfSpace(f.write(position, bytes))
+        def truncate(size: Long): Unit = outOfSpace(f.truncate(size))
+        def force(): Unit = outOfSpace(f.force())
+        def close(): Unit = f.close()
 
   override protected def openFsifBackend(storeId: StoreId, path: os.Path, layout: FsifLayout,
                                          onFatal: Throwable => Unit): Backend =
@@ -50,8 +77,11 @@ private class FsifSeamHost(mgrClient: AspenClient,
     if !os.exists(path / FsifBackend.InitializedMarkerFile) then
       super.openFsifBackend(storeId, path, layout, onFatal)
     else
-      new FsifBackend(storeId, path, layout, new NioFsifFiles(path), FsifBackend.sharedIo, FsifTuning(), onFatal):
+      val b = new FsifBackend(storeId, path, layout, new FullableFiles(path), FsifBackend.sharedIo, FsifTuning(),
+          onFatal):
         override def hasFailed: Boolean = super.hasFailed || FsifSeamHost.this.reportFailed
+      lastBackend = Some(b)
+      b
 
 class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
 
@@ -233,3 +263,35 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
         os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
         os.exists(Backend.crlSaveFile(storeDir)) should be(false)
         os.exists(storeDir / StoreTransfer.TransferOutMarkerFile) should be(false)
+
+  atest("closing an FSIF store frozen by a full device completes without space returning, and it loads again"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      load(host)
+      host.getStoreIds should contain(storeId)
+      val backend = host.lastBackend.get
+      host.deviceFull = true
+      // A repair allocates an unmapped ext (Ruling 18); its journal batch hits ENOSPC and freezes the store
+      val id = ObjectId(new UUID(1, 2))
+      val ptr = DataObjectPointer(id, storeId.poolId, java.nio.ByteBuffer.allocate(4).putInt(0).array())
+      val md = Metadata(ObjectRevision(TransactionId(new UUID(3, 4))), ObjectRefcount(1, 1), HLCTimestamp(1))
+      val repaired = Promise[Unit]()
+      backend.repair(CommitState(ptr, md, ObjectType.Data, DataBuffer(Array[Byte](1, 2, 3)), form = UpdateForm.Full),
+        repaired)
+      // Transfer-out and device shutdown close a store this way
+      val closed = host.closeStore(storeId)
+      host.testingOnlyHandleEvents()
+      closed.map: _ =>
+        backend.isWriteFrozen should be(true)
+        repaired.isCompleted should be(false) // abandoned, never acknowledged
+        host.getStoreIds should not contain storeId
+        os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+        os.exists(Backend.crlSaveFile(storeDir)) should be(true)
+        host.deviceFull = false
+        load(host)
+        host.getStoreIds should contain(storeId)
+

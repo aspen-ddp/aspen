@@ -151,8 +151,18 @@ class FsifBackend(val storeId: StoreId,
   private var unforcedBytes = 0L
   /** A force started by `maybeForceData` is outstanding */
   private var backgroundForce = false
-  /** Copy-on-write io (the segment write, or the force after it) in flight */
+  /** Copy-on-write segment writes in flight */
   private var cowIo = 0
+  /** Compaction io tasks (move read, write or truncate-free I/O run through `runIo`) in flight */
+  private var compactionIo = 0
+
+  // ---- Close, owned by serial ----
+  /** close() has been called */
+  private var closing = false
+  /** Closing while frozen: held I/O is abandoned as in a crash (Ruling 27). Nothing new is issued, held operations
+    * are never retried or completed, and the store stays frozen; close waits only for io already in flight.
+    */
+  private var abandoned = false
   /** A data force failed with rebuild writes not yet mapped by a rebuildFlush: they may be lost, so this incarnation
     * accepts no more rebuild writes or flushes (the rebuild resumes from its checkpoint in a new one)
     */
@@ -201,11 +211,18 @@ class FsifBackend(val storeId: StoreId,
       st.prune()
       if st.dead then tryFree(st) else dropIfUnused(st)
     def runIo[A](kind: IoKind)(work: => A)(done: Try[A] => Unit): Unit =
+      compactionIo += 1
       try io.execute(new IoTask(kind, () => {
         val r = Try(work)
-        post(done(r))
+        post {
+          compactionIo -= 1
+          done(r)
+        }
       }))
-      catch case NonFatal(t) => done(Failure(t))
+      catch
+        case NonFatal(t) =>
+          compactionIo -= 1
+          done(Failure(t))
     def failStop(t: Throwable): Unit =
       logger.error(s"FSIF store $storeId: compaction I/O failed: $t")
       FsifBackend.this.failStop(t)
@@ -271,11 +288,27 @@ class FsifBackend(val storeId: StoreId,
     post(p.completeWith(startCheckpoint()))
     p.future
 
+  /** Completes once nothing is outstanding (as `quiesce`), then closes the files. A store frozen by ENOSPC (or that
+    * freezes while closing) does not wait for space (Ruling 27): its held I/O is abandoned exactly as a crash would
+    * abandon it, and the close waits only for io already in flight. That is safe: held commits were never
+    * acknowledged (Tx keeps their data in the CRL), acknowledged Deltas are durable in the journal and replay at
+    * recovery, and a held checkpoint, copy-on-write or move step re-runs or is moot at recovery. Abandoned commits,
+    * repairs and repairDeletes never complete: after a close the host no longer routes this store's completions, and
+    * a late one could reach a store reloaded under the same id.
+    */
   override def close(): Future[Unit] =
-    quiesce().transform { _ =>
+    val p = Promise[Unit]()
+    post {
+      closing = true
+      if frozen && fatal.isEmpty then
+        abandonHeld()
+      quiescers += p
+    }
+    p.future.transform { _ =>
       Try {
         dataFile.close()
         journalFile.close()
+        checkpoint.flatMap(_.oldFile).foreach(_.close())
       }
     }(using ExecutionContext.parasitic)
 
@@ -487,13 +520,34 @@ class FsifBackend(val storeId: StoreId,
       ps.foreach(_.trySuccess(()))
 
   /** After a fatal error, held work no longer counts, but io still in flight does (including the journal's, which
-    * failAll does not wait for), so `close` never closes a file under it
+    * failAll does not wait for), so `close` never closes a file under it. After an abandoning close only io in
+    * flight counts.
     */
   private def idle: Boolean =
-    gated.isEmpty && writesInFlight == 0 && readsInFlight == 0 && checkpoint.isEmpty && compaction.idle &&
-      !journal.busy && !dataForceInFlight && cowIo == 0 &&
-      (fatal.isDefined || (!frozen && throttled.isEmpty && journal.idle && unappliedCount == 0))
+    if abandoned then
+      !ioInFlight
+    else
+      gated.isEmpty && writesInFlight == 0 && readsInFlight == 0 && checkpoint.isEmpty && compaction.idle &&
+        !journal.busy && !dataForceInFlight && cowIo == 0 &&
+        (fatal.isDefined || (!frozen && throttled.isEmpty && journal.idle && unappliedCount == 0))
 
+  /** An io task of this store may still touch its files */
+  private def ioInFlight: Boolean =
+    writesInFlight > 0 || readsInFlight > 0 || cowIo > 0 || compactionIo > 0 || dataForceInFlight ||
+      checkpoint.exists(_.ioInFlight) || journal.busy
+
+  /** Ruling 27: a close of a frozen store abandons everything held. Called on serial once both hold. */
+  private def abandonHeld(): Unit =
+    if !abandoned then
+      logger.warn(s"FSIF store $storeId: closing while out of space; abandoning ${heldOps.size + retryingOps.size} " +
+        "held operations as a crash would (acknowledged commits are durable in the journal)")
+      abandoned = true
+      heldOps.clear()
+      retryingOps.clear()
+      journal.abandon()
+      val waiters = freezeWaiters.toList
+      freezeWaiters.clear()
+      waiters.foreach(_.tryFailure(outOfSpace()))
   // ---- Failure handling ----
   //
   // Out of space freezes writes. Every I/O source (journal write/force/truncate, copy-on-write write/force, in-place
@@ -523,7 +577,7 @@ class FsifBackend(val storeId: StoreId,
 
   /** Holds an operation whose I/O hit ENOSPC, freezing the store; `retry` runs in the next retry round */
   private def hold(key: AnyRef, kind: String, retry: () => Unit, abort: () => Unit): Unit =
-    if fatal.isEmpty then
+    if fatal.isEmpty && !abandoned then
       holdCounts.synchronized(holdCounts(kind) = holdCounts.getOrElse(kind, 0) + 1)
       retryingOps.remove(key)
       heldOps(key) = new HeldOp(retry, abort)
@@ -533,14 +587,20 @@ class FsifBackend(val storeId: StoreId,
         val waiters = freezeWaiters.toList
         freezeWaiters.clear()
         waiters.foreach(_.tryFailure(outOfSpace()))
-      scheduleRetry()
+      if closing then
+        abandonHeld()
+        // Not every caller is guarded (the journal writer's completion is not): the waiting close re-checks idle
+        // in a guarded task's epilogue
+        post(())
+      else
+        scheduleRetry()
 
   /** The held operation `key` succeeded (or became moot); the last one to do so unfreezes the store. No effect if
     * `key` is not held.
     */
   private def released(key: AnyRef): Unit =
     if retryingOps.remove(key).isDefined || heldOps.remove(key).isDefined then
-      if frozen && heldOps.isEmpty && retryingOps.isEmpty then
+      if frozen && !abandoned && heldOps.isEmpty && retryingOps.isEmpty then
         logger.info(s"FSIF store $storeId: space is available again; writes resume")
         frozen = false
         // Paused in-place writes restart now; checkpoints, compaction and backpressure resume in a guarded task's
@@ -556,7 +616,7 @@ class FsifBackend(val storeId: StoreId,
   /** Re-issues every held operation's I/O */
   private def retryRound(): Unit =
     retryScheduled = false
-    if fatal.isEmpty && heldOps.nonEmpty then
+    if fatal.isEmpty && !abandoned && heldOps.nonEmpty then
       val round = heldOps.toList
       heldOps.clear()
       // The whole round counts as retrying before any retry runs: one that releases synchronously must not find
@@ -815,6 +875,7 @@ class FsifBackend(val storeId: StoreId,
         case Some(t) =>
           val err = new IOException(s"FSIF store $storeId has failed", t)
           waiters.foreach((_, cb) => cb(Failure(err)))
+        case None if abandoned => () // nothing new is issued, and abandoned work never completes
         case None =>
           val id = nextForceId
           nextForceId += 1
@@ -1044,7 +1105,7 @@ class FsifBackend(val storeId: StoreId,
             failStop(t)
           case Success(a) =>
             released(cp)
-            if fatal.isDefined then discard(a) else next(a)
+            if fatal.isDefined || abandoned then discard(a) else next(a)
       try
         io.execute(new IoTask(IoKind.Checkpoint, () => {
           val r = Try(step())
@@ -1089,7 +1150,9 @@ class FsifBackend(val storeId: StoreId,
     // Ruling 18: Frontend repairs a missed allocation with allocating = false, so a repair allocates an unmapped X.
     // A repair never overwrites a different occupant: that missed delete heals first through repairDelete.
     val allocating = if repairing then slot < 0 else state.allocating
-    if fatal.isDefined then
+    if abandoned then
+      () // released from behind a gate after an abandoning close: never completes, as if the store had crashed
+    else if fatal.isDefined then
       reply(Right(CommitError.IOFailure))
     else if state.metadata.refcount.count == 0 then
       if slot >= 0 && occupant != id then
@@ -1214,10 +1277,7 @@ class FsifBackend(val storeId: StoreId,
           cowWritten(key, () => issue(), x, id, f, Failure(new IOException("No space left on device: a data force " +
             "failed during the copy-on-write")), reply)
         case Success(_) =>
-          cowIo += 1
-          forceData(IoKind.Cow): fr =>
-            cowIo -= 1
-            cowWritten(key, () => issue(), x, id, f, fr, reply)
+          forceData(IoKind.Cow)(fr => cowWritten(key, () => issue(), x, id, f, fr, reply))
         case Failure(_) =>
           cowWritten(key, () => issue(), x, id, f, r, reply)
     issue()
@@ -1278,7 +1338,9 @@ class FsifBackend(val storeId: StoreId,
           reply(Left(()))
         case Some(x) =>
           withExt(x)(replyOnError(reply):
-            if fatal.isDefined then
+            if abandoned then
+              ()
+            else if fatal.isDefined then
               reply(Right(CommitError.IOFailure))
             else if index.slots(x) >= 0 && index.ids(x) == objectId then
               deleteExt(x, reply)

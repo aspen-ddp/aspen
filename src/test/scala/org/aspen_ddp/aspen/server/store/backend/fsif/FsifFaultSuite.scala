@@ -118,6 +118,13 @@ class FsifFaultSuite extends FileBasedTests:
       b.setCompletionHandler(rec)
       b
 
+    /** A new incarnation on the same files, as after a clean close (nothing is dropped). Rules stay in force. */
+    def reopen(): Unit =
+      io = mkIo()
+      rec = new Recorder
+      fatals = new ConcurrentLinkedQueue[Throwable]()
+      backend = open()
+
     /** Faults are not carried over: the new instance starts without rules */
     def crash(): Unit =
       files = files.crash()
@@ -552,6 +559,69 @@ class FsifFaultSuite extends FileBasedTests:
       h.fatals.isEmpty shouldBe true
       h.crash()
       h.readData(ptr(1, oid(1))) shouldBe bytes(30, 1).toList
+
+  // ---- Ruling 27: closing a frozen store abandons its held I/O as a crash would ----
+
+  /** Awaits `f` without running retry rounds: a close must not need space to return */
+  private def awaitNoRetry[A](h: Harness, f: Future[A]): A =
+    h.pump()
+    Await.result(f, Timeout)
+
+  test("close of a frozen store completes without space returning, and a reopen recovers the acknowledged state"):
+    for (files, c) <- List[String => Boolean](_ => true, isJournal, isData).zipWithIndex do
+      withClue(s"case=$c"):
+        val h = new Harness(c)
+        val ps = (0 until 4).map(x => ptr(x, oid(x + 1)))
+        val v = (0 until 4).map(x => bytes(60 + x * 10, x))
+        for x <- 0 until 4 do h.commitOk(alloc(ps(x), v(x), 1))
+        h.quiesce()
+        val full = new AtomicBoolean(true)
+        h.files.failWhile(Fault.OutOfSpace, isData)(full.get)
+        // Acknowledged (journaled) with its in-place write held, then the chosen files fill as well
+        h.commitOk(writeRange(ps(0), v(0), 3, bytes(5, 9), 2))
+        val v0 = patched(v(0), 3, bytes(5, 9))
+        h.backend.isWriteFrozen shouldBe true
+        h.files.failWhile(Fault.OutOfSpace, files)(full.get)
+        val held = List(
+          h.issueCommit(writeRange(ps(1), v(1), 1, bytes(4, 7), 3)),
+          h.issueCommit(overwrite(ps(2), bytes(500, 8), 3)), // copy-on-write
+          h.issueCommit(delete(ps(3), 3)))
+        val cp = h.backend.checkpointNow()
+        h.tick()
+        h.backend.isWriteFrozen shouldBe true
+        awaitNoRetry(h, h.backend.close())
+        h.backend.isWriteFrozen shouldBe true // still frozen: the held I/O was abandoned, not finished
+        for _ <- 0 until 3 do h.tick() // a retry round after the close does nothing
+        h.pump()
+        h.fatals.isEmpty shouldBe true
+        // Held operations never complete: the host no longer routes this store's completions
+        for f <- held do f.value.forall(_ == scala.util.Success(Left(()))) shouldBe true
+        cp.value.forall(_.isFailure) shouldBe true
+        full.set(false)
+        h.reopen()
+        h.readData(ps(0)) shouldBe v0.toList
+        h.readData(ps(1)) should (equal(v(1).toList) or equal(patched(v(1), 1, bytes(4, 7)).toList))
+        h.readData(ps(2)) should (equal(v(2).toList) or equal(bytes(500, 8).toList))
+        h.readOpt(ps(3)) should (equal(Some(v(3).toList)) or equal(None))
+        h.quiesce()
+        h.fatals.isEmpty shouldBe true
+
+  test("a store that freezes while its close waits for an in-place write still closes"):
+    val gate = new GateEc(isInPlace)
+    val h = new Harness(mkIo = () => gate)
+    val p = ptr(1, oid(1))
+    val v1 = bytes(50, 1)
+    h.commitOk(alloc(p, v1, 1))
+    gate.heldCount shouldBe 1
+    val closed = h.backend.close()
+    closed.isCompleted shouldBe false // the in-place write is in flight
+    h.files.failWhile(Fault.OutOfSpace, isData)(true)
+    gate.release() // the write hits ENOSPC: the store freezes while closing, and the close abandons it
+    awaitNoRetry(h, closed)
+    h.backend.isWriteFrozen shouldBe true
+    h.fatals.isEmpty shouldBe true
+    h.crash()
+    h.readData(p) shouldBe v1.toList
 
   test("close after a fail-stop completes once the journal batch that was in flight settles"):
     import FsifCheckpointSuite.{HoldEc, oneShot}

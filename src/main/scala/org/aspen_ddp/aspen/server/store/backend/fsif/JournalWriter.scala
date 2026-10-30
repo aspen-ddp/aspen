@@ -35,6 +35,8 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
   /** An io task is running, whether or not failAll has abandoned its batch */
   private var sending = false
   private var failed: Option[Throwable] = None
+  /** abandon() was called: nothing more is sent and no pending Future completes */
+  private var abandoned = false
 
   private val buffered = mutable.ArrayBuffer[JournalRecord]()
   private var bufferedSize = 0L
@@ -67,10 +69,18 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
 
   /** After `onError`: re-sends the failed batch under the same batch number. No effect otherwise. */
   def retry(): Unit =
-    if failed.isEmpty && paused then
+    if failed.isEmpty && !abandoned && paused then
       paused = false
       retried = true
       current.foreach(send(_, truncateFirst = true))
+
+  /** The owner is closing without waiting for the batches still pending (a crash-equivalent close of a store frozen
+    * by ENOSPC): nothing more is sent, and no pending or later Future ever completes. An io task in flight still ends
+    * (`busy` turns false, then `onSettled` is called), so the file is not closed under it.
+    */
+  def abandon(): Unit =
+    abandoned = true
+    paused = false
 
   /** Permanently failed: every pending and future append fails with `t` */
   def failAll(t: Throwable): Unit =
@@ -85,7 +95,7 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
       promises.foreach(_.failure(t))
 
   private def sendBuffered(): Unit =
-    if current.isEmpty && !paused && failed.isEmpty && bufferedPromises.nonEmpty then
+    if current.isEmpty && !paused && !abandoned && failed.isEmpty && bufferedPromises.nonEmpty then
       val batch = Batch(JournalFormat.encodeBatch(salt, batchNumber, buffered.toList), bufferedPromises.toList)
       buffered.clear()
       bufferedSize = 0
@@ -116,8 +126,9 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
 
   private def completed(batch: Batch, result: Try[Unit]): Unit =
     sending = false
-    // After failAll the batch's Futures have already failed: nothing completes, so tell the owner busy has cleared
-    if failed.isDefined then
+    // After failAll the batch's Futures have already failed, and after abandon none completes: tell the owner busy
+    // has cleared
+    if failed.isDefined || abandoned then
       onSettled()
     else
       result match

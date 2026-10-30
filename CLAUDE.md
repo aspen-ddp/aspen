@@ -132,7 +132,10 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - `aspen host --load-jars=<version>` loads user RegisteredTypeFactory lists from every jar in `<host-dir>/jars/<version>/`
   (may be a symlink, e.g. `latest`) via `UserJarLoader`: one URLClassLoader, parent-first, `AspenTypeProvider` classes
   found with ServiceLoader. Duplicate UUIDs (including against built-ins) fail startup naming both classes and jars
-- DataStores are pluggable. Currently only a RocksDB and in-memory Map are supported.
+- DataStores are pluggable: RocksDB, in-memory Map, and FSIF (`server.store.backend.fsif`, a flat file of fixed-size
+  segments located by a 4-byte storePointer, with a journal and checkpointed index). FSIF freezes writes on ENOSPC
+  and keeps serving reads. `create-pool --backend fsif` is refused until an allocation strategy yields 4-byte
+  storePointers
 
 ## Subsystem Details
 

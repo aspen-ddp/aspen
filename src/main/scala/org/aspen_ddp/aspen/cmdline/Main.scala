@@ -974,11 +974,24 @@ object Main {
     System.exit(exitCode)
   }
 
+  /** FSIF stores accept only 4-byte storePointers (the external index), and the default allocation strategy hands
+   *  out empty ones, so every write to an FSIF pool created today would fail with InvalidPointer. create-pool
+   *  refuses --backend fsif until an allocation strategy that produces them exists (Todo:
+   *  FixedSizedIndexFileAllocationStrategy); flipping this enables it. Tests construct FSIF pools directly.
+   */
+  private[cmdline] val FsifPoolsEnabled = false
+
+  private[cmdline] val FsifPoolsRefused =
+    "--backend fsif is not supported yet: FSIF pools need an allocation strategy that produces 4-byte " +
+      "storePointers, which is not implemented (Todo: FixedSizedIndexFileAllocationStrategy)"
+
   /** --max-object-size and --segment-count go with --backend fsif, which requires both */
-  private def validatePoolBackend(c: Args): Either[String, Unit] =
+  private[cmdline] def validatePoolBackend(c: Args, fsifEnabled: Boolean = FsifPoolsEnabled): Either[String, Unit] =
     if c.backend == "fsif" then
       if c.maxObjectSize.isEmpty || c.segmentCount.isEmpty then
         Left("--backend fsif requires --max-object-size and --segment-count")
+      else if !fsifEnabled then
+        Left(FsifPoolsRefused)
       else
         Right(())
     else if c.maxObjectSize.nonEmpty || c.segmentCount.nonEmpty then

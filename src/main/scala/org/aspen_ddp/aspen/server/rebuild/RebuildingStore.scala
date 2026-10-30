@@ -210,8 +210,8 @@ class RebuildingStore(client: AspenClient,
       _ <- finish()
     yield ()
 
-  /** Opens the staging FSIF store: initialized on the first pass (or if that pass was cut off before its marker),
-   *  recovered on a resume. A fail-stop latches the abort, so the pass fails with the checkpoint left for the next
+  /** Opens the staging FSIF store: initialized on the first pass (or if that pass was cut off before writing
+   *  anything), recovered on a resume. A fail-stop latches the abort, so the pass fails with the checkpoint left for the next
    *  one. A staging store that cannot be recovered is discarded, checkpoint and all, so the next pass starts over
    *  rather than failing on it forever.
    */

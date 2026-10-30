@@ -2,6 +2,8 @@ package org.aspen_ddp.aspen.server.store.backend.fsif
 
 import java.security.SecureRandom
 
+import scala.util.control.NonFatal
+
 /** Store initialization and crash recovery: picks the newest valid index, replays the journals that follow it,
   * applies the surviving Deltas in place, and finishes an interrupted checkpoint.
   *
@@ -22,6 +24,14 @@ object FsifRecovery:
   val DataFile = "data"
   val IndexFiles: Vector[String] = Vector("index.a", "index.b")
   val JournalFiles: Vector[String] = Vector("journal.a", "journal.b")
+  /** Every FSIF file of a store directory, indexes first */
+  val AllFiles: Vector[String] = IndexFiles ++ JournalFiles :+ DataFile
+
+  /** Every FSIF file is absent or zero-length: nothing in the directory can hold an object, so initializing it loses
+    * nothing (FsifBackend.open of a directory without the marker)
+    */
+  def isBlank(files: FsifFiles): Boolean =
+    AllFiles.forall(name => !files.exists(name) || files.size(name) == 0)
 
   private val random = new SecureRandom
 
@@ -50,8 +60,27 @@ object FsifRecovery:
     * written last, so a valid index implies the rest of the store exists. On a reused directory an old index.a is
     * emptied first, so a crash part way through can never pair it with emptied or rewritten files. index.b and
     * journal.b are left absent (or emptied, if a previous store left them behind).
+    *
+    * A failure (not a crash) truncates every file back to empty before rethrowing, best effort, so a retry finds a
+    * blank directory. After a crash on a fresh directory the next open (no marker) finds: files still empty, so it
+    * initializes again; journal.a's header without a valid index.a (written or torn), so StoreLost; or a forced
+    * index.a, so recovery yields the empty initial store (FsifInitializationSuite crash sweep).
     */
   def initialize(files: FsifFiles, layout: FsifLayout): Unit =
+    try writeInitial(files, layout)
+    catch
+      case NonFatal(t) =>
+        // A live failure (e.g. ENOSPC) leaves every file empty where it can, so the next open finds the directory
+        // blank and initializes it again rather than recovering a partial store. Truncation needs no space. A crash
+        // here instead leaves whatever the writes reached, and the next open recovers it (FsifBackend.open).
+        for name <- AllFiles do
+          try
+            if files.exists(name) && files.size(name) > 0 then
+              truncateToZero(files, name)
+          catch case NonFatal(e) => t.addSuppressed(e)
+        throw t
+
+  private def writeInitial(files: FsifFiles, layout: FsifLayout): Unit =
     if files.exists(IndexFiles(0)) then
       truncateToZero(files, IndexFiles(0))
     for name <- Seq(IndexFiles(1), JournalFiles(1)) do

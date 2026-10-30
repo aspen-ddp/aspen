@@ -1104,7 +1104,8 @@ class Host(val client: AspenClient,
       case Failure(e) if FsifIo.isOutOfSpace(e) =>
         if create then
           // The next check finds the directory and flips the entry without loading it, so it is handed to the
-          // out-of-space retries: their load initializes it again (it has no marker).
+          // out-of-space retries: their load initializes it again (no marker, and the failed initialize left its
+          // files empty).
           logger.warn(s"Store $storeId cannot be created: device ${sds.storageDeviceId} is out of space. Leaving " +
                       s"it offline and retrying every device scan. Error: $e")
           leaveOffline()
@@ -1168,8 +1169,9 @@ class Host(val client: AspenClient,
         ref.set(backend)
         backend
 
-  /** Opens an existing FSIF store, initializing it first if its creation never completed. protected as a test
-   *  seam: a subclass can fail the open or keep `onFatal`. */
+  /** Opens an existing FSIF store (FsifBackend.open: a directory without the marker is initialized only if its
+   *  files are blank, otherwise recovered). protected as a test seam: a subclass can fail the open or keep
+   *  `onFatal`. */
   protected def openFsifBackend(storeId: StoreId,
                                 storePath: os.Path,
                                 layout: FsifLayout,

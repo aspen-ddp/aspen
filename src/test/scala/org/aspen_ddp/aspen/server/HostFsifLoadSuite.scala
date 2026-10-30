@@ -129,9 +129,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
     val host = newSeamHost(hostRoot)
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
-    // As a crash part way through initialize leaves it: data and journal, no index, no marker
-    os.write(storeDir / FsifRecovery.DataFile, Array.fill[Byte](10)(1))
-    os.write(storeDir / FsifRecovery.JournalFiles(0), Array.fill[Byte](10)(2))
+    // As a crash early in initialize leaves it: data and journal created but still empty, no index, no marker
+    os.write(storeDir / FsifRecovery.DataFile, Array[Byte]())
+    os.write(storeDir / FsifRecovery.JournalFiles(0), Array[Byte]())
     load(host)
 
     Future.successful:
@@ -139,6 +139,23 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
       host.testingOnlyOfflineStores should not contain storeId
       os.exists(storeDir / FsifBackend.InitializedMarkerFile) should be(true)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+
+  atest("an FSIF store without its marker whose files hold no valid index is marked for rebuild, not emptied"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    os.write(storeDir / FsifRecovery.DataFile, Array.fill[Byte](10)(1))
+    os.write(storeDir / FsifRecovery.JournalFiles(0), Array.fill[Byte](10)(2))
+    load(host)
+
+    Future.successful:
+      host.getStoreIds should not contain storeId
+      host.testingOnlyOfflineStores should contain(storeId)
+      os.exists(storeDir / FsifBackend.InitializedMarkerFile) should be(false)
+      os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
+      os.read.bytes(storeDir / FsifRecovery.DataFile).toList should be(List.fill[Byte](10)(1))
 
   atest("an FSIF store whose recovery finds it lost is marked for rebuild and left offline"):
     val hostRoot = newHostDir()

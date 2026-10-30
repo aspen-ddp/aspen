@@ -1574,13 +1574,27 @@ object Main {
         os.write(storeRoot / StoreConfig.configFilename, storeConfig.yamlConfig)
         new RocksDBBackend(storeRoot, storeId, ec)
 
+    // The initial metadata pool's stores start empty, so their backends are left for the host to open
+    val metadataStoreIds =
+      for
+        poolIndex <- 0 until bootstrapIda.width
+      yield
+        val storeId = StoreId(PoolId.InitialMetadataPoolId, poolIndex.toByte)
+        val storeRoot = bootstrapDevDir / storeId.toString
+        val storeConfig = StoreConfig(storeId, StoreConfig.RocksDB(None), None)
+
+        println(s"Creating data store $storeId. Path $storeRoot")
+        os.makeDir.all(storeRoot)
+        os.write(storeRoot / StoreConfig.configFilename, storeConfig.yamlConfig)
+        storeId
+
     val bootstrapStorageDevice = StorageDeviceState(
       storageDevConfig.storageDeviceId,
       hostConfig.hostId,
       0L,
       0L,
-      bootstrapStores.map(backend =>
-        backend.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
+      (bootstrapStores.map(_.storeId) ++ metadataStoreIds).map(storeId =>
+        storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)
       ).toMap,
       StorageDeviceSetId.BootstrapStorageDeviceSetId
     )

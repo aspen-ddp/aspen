@@ -9,10 +9,12 @@ import org.aspen_ddp.aspen.client.tkvl.{NodeAllocator, Root, SinglePoolNodeAlloc
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.tls.{CertificateAuthority, Pem}
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
+import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, HostId, HostState, IDAPolicy, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState, fixed_ids}
 import org.aspen_ddp.aspen.common.config.BootstrapConfig
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Key, KeyOrdering, KeyValueObjectPointer, LexicalKeyOrdering, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.store.backend.{Backend, RocksDBConfig}
 import org.aspen_ddp.aspen.common.util.uuid2byte
@@ -28,6 +30,10 @@ object Bootstrap:
     *
     * Both must be at least `ida.minSliceSize`. The stores' enforced limits come from their store config files,
     * which the caller writes, and are not set here; they must match the pool state's `effectiveMaxSliceSize`.
+    *
+    * Also creates the initial metadata pool, which shares the bootstrap pool's IDA, limits and device, and the
+    * default metadata group containing it. Its stores start empty, so nothing is written to them, but
+    * `bootstrapStorageDeviceState` must list them.
     */
   def initialize(aspenSystemId: UUID,
                  ida: IDA,
@@ -44,6 +50,10 @@ object Bootstrap:
     backendMaxSliceSize.foreach: limit =>
       require(limit >= ida.minSliceSize,
         s"backend maxSliceSize ($limit) must be at least ${ida.minSliceSize} for $ida")
+    for i <- 0 until ida.width do
+      val storeId = StoreId(PoolId.InitialMetadataPoolId, i.toByte)
+      require(bootstrapStorageDeviceState.stores.contains(storeId),
+        s"The bootstrap storage device must list initial metadata pool store $storeId")
 
     val storeEntrys = (0 until ida.width).map{ _ => 
       StoragePoolState.StoreEntry(bootstrapHostState.hostId, bootstrapStorageDeviceState.storageDeviceId)
@@ -57,6 +67,29 @@ object Bootstrap:
       storeEntrys,
       RocksDBConfig(backendMaxSliceSize),
       StorageDeviceSetId.BootstrapStorageDeviceSetId)
+
+    val metadataPoolState = StoragePoolState(
+      PoolId.InitialMetadataPoolId,
+      PoolId.InitialMetadataPoolName,
+      ida,
+      maxSliceSize,
+      storeEntrys.clone(),
+      RocksDBConfig(backendMaxSliceSize),
+      StorageDeviceSetId.BootstrapStorageDeviceSetId,
+      allocationGroups = List(AllocationGroupId.DefaultMetadataGroupId.uuid),
+      isMetadataPool = true)
+
+    // The group's limit is checked against its members' effective limits, so it uses the pool's effective one
+    val metadataGroupState = AllocationGroupState(
+      AllocationGroupId.DefaultMetadataGroupId,
+      0,
+      AllocationGroupId.DefaultMetadataGroupName,
+      List(AllocationGroupState.Member(AllocationGroupState.MemberType.Pool, PoolId.InitialMetadataPoolId.uuid, 0, 0)),
+      Nil,
+      metadataPoolState.effectiveMaxSliceSize,
+      if metadataPoolState.effectiveMaxSliceSize.isDefined then IDAPolicy.ExactMatch else IDAPolicy.AllowAll,
+      metadataPoolState.effectiveMaxSliceSize.map(_ => ida),
+      isMetadataGroup = true)
 
     val bootstrapConfig = BootstrapConfig.generateBootstrapConfig(
       aspenSystemId = aspenSystemId,
@@ -146,6 +179,19 @@ object Bootstrap:
       StoragePoolState.ErrorTreeKey -> errorTree,
       StoragePoolState.AllocationTreeKey -> allocTree
     ))
+
+    // A metadata pool's own trees live in the bootstrap pool
+    val metadataErrTreeRoot = allocate()
+    val metadataAllocTreeRoot = allocate()
+    val metadataPoolPointer = allocate(List(
+      StoragePoolState.ConfigKey -> metadataPoolState.encode(),
+      StoragePoolState.ErrorTreeKey ->
+        Root(0, ByteArrayKeyOrdering, Some(metadataErrTreeRoot), bootstrapNodeAllocator).encode(),
+      StoragePoolState.AllocationTreeKey ->
+        Root(0, ByteArrayKeyOrdering, Some(metadataAllocTreeRoot), bootstrapNodeAllocator).encode()
+    ))
+
+    val metadataGroupPtr = allocateData(metadataGroupState.toBytes)
     
     val storageDevicePtr = allocate(List(
       StorageDeviceState.StateKey ->  bootstrapStorageDeviceState.encode()
@@ -162,7 +208,7 @@ object Bootstrap:
       parent = None,
       memberDevices = List(bootstrapStorageDeviceState.storageDeviceId),
       memberSets = Nil,
-      assignedPools = List(PoolId.BootstrapPoolId)
+      assignedPools = List(PoolId.BootstrapPoolId, PoolId.InitialMetadataPoolId)
     )
     
     // Create registry trees 
@@ -172,6 +218,10 @@ object Bootstrap:
     val namespacedRegistryTree = allocateTree(
       LexicalKeyOrdering,
       NamespacedUUIDRegistry.makeKey("pool", PoolId.BootstrapPoolName) -> uuid2byte(Radicle.poolId.uuid),
+      NamespacedUUIDRegistry.makeKey("pool", PoolId.InitialMetadataPoolName) ->
+        uuid2byte(PoolId.InitialMetadataPoolId.uuid),
+      NamespacedUUIDRegistry.makeKey("group", AllocationGroupId.DefaultMetadataGroupName) ->
+        uuid2byte(AllocationGroupId.DefaultMetadataGroupId.uuid),
       NamespacedUUIDRegistry.makeKey("host", bootstrapHostState.name) -> uuid2byte(bootstrapHostState.hostId.uuid),
       NamespacedUUIDRegistry.makeKey("device-set", bootstrapDeviceSet.name) -> uuid2byte(fixed_ids.BootstrapStorageDeviceSetId.uuid),
     )
@@ -180,9 +230,13 @@ object Bootstrap:
     val storagePoolsTree = allocateTree(
       ByteArrayKeyOrdering,
       Key(Radicle.poolId.uuid) -> poolPointer.toArray,
+      Key(PoolId.InitialMetadataPoolId.uuid) -> metadataPoolPointer.toArray,
     )
     
-    val allocationGroupsTree = allocateTree(ByteArrayKeyOrdering)
+    val allocationGroupsTree = allocateTree(
+      ByteArrayKeyOrdering,
+      Key(AllocationGroupId.DefaultMetadataGroupId.uuid) -> metadataGroupPtr.toArray
+    )
 
     val hostsTree = allocateTree(
       ByteArrayKeyOrdering,
@@ -258,6 +312,7 @@ object Bootstrap:
       Radicle.ServicesTreeKey -> servicesTree.encode(),
       Radicle.CACertificateKey -> caCertificatePtr.toArray,
       Radicle.CAPrivateKeyKey -> caPrivateKeyPtr.toArray,
+      Radicle.DefaultStoragePoolMetadataAllocatorKey -> uuid2byte(AllocationGroupId.DefaultMetadataGroupId.uuid),
     )
  
     val radicle = allocate(radicleContent, Some(Radicle.objectId))

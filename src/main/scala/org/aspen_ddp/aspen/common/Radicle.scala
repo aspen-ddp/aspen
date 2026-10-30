@@ -26,5 +26,7 @@ object Radicle:
   private[aspen] val ServicesTreeKey = Key(Array[Byte](9))
   private[aspen] val CACertificateKey = Key(Array[Byte](10))
   private[aspen] val CAPrivateKeyKey = Key(Array[Byte](11))
+  /** UUID of the allocation group that holds new pools' metadata trees */
+  private[aspen] val DefaultStoragePoolMetadataAllocatorKey = Key(Array[Byte](12))
 
 

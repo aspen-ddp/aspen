@@ -40,8 +40,9 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
                        "task completion")
       _ <- waitForTransactionsToComplete()
 
+      // The bootstrap pool's three stores and the initial metadata pool's three
       staged <- client.getStorageDeviceState(net.secondDeviceId)
-      _ = staged.stores.size should be(3)
+      _ = staged.stores.size should be(6)
 
       // Consumer: create a host after the producer finishes, so its constructor-time
       // device scan and the drain do not race.
@@ -53,24 +54,25 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
       _ <- waitForTransactionsToComplete()
 
       rebuilt <- client.getStorageDeviceState(net.secondDeviceId)
-      expectedStores = List(
+      bootstrapStores = List(
         StoreId(PoolId.BootstrapPoolId, 0.toByte),
         StoreId(PoolId.BootstrapPoolId, 1.toByte),
         StoreId(PoolId.BootstrapPoolId, 2.toByte)
       )
+      expectedStores = bootstrapStores ++ net.metadataStores.map(_.storeId)
     yield
       // Every entry on net.secondDeviceId reads Active (the metadata flip landed).
-      rebuilt.stores.size should be(3)
+      rebuilt.stores.size should be(6)
       rebuilt.stores.values.foreach: entry =>
         entry.status should be(StorageDeviceState.StoreStatus.Active)
 
-      // The host decided to adopt all three stores, and the adoption happened after the
+      // The host decided to adopt all six stores, and the adoption happened after the
       // metadata flip to Active (loading is downstream of the metadata decision).
       val expectedLoadRequests = expectedStores.map(s => (net.secondDeviceId, s))
       host.loadStoreByIdRequests.toSet should be(expectedLoadRequests.toSet)
-      // Three stores means exactly three load calls, not six (an unconditional load plus the
+      // Six stores means exactly six load calls, not twelve (an unconditional load plus the
       // legitimate one would be hidden by .toSet).
-      host.loadStoreByIdRequests.size should be(3)
+      host.loadStoreByIdRequests.size should be(6)
 
       expectedStores.foreach: sid =>
         val key = (net.secondDeviceId, sid)
@@ -81,16 +83,17 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
           loadSeq should be(defined)
           flipSeq.get should be < loadSeq.get
 
-      // On disk, each store's final directory exists with a loadable StoreConfig, holds flushed
-      // object data (not just scaffolding), and its staging directory under rebuilding/ is gone.
+      // On disk, each store's final directory exists with a loadable StoreConfig and its staging
+      // directory under rebuilding/ is gone. Each bootstrap store also holds flushed object data
+      // (not just scaffolding); the initial metadata pool's stores are empty, so have none.
       expectedStores.foreach: sid =>
         val finalPath = deviceDir / sid.directoryName
         os.exists(finalPath) should be(true)
         StoreConfig.loadStoreConfig(finalPath / StoreConfig.configFilename).storeId should
           be(sid)
 
-        // The store holds flushed object data, not just a config file.
-        os.list(finalPath).count(_.last.endsWith(".sst")) should be > 0
+        if bootstrapStores.contains(sid) then
+          os.list(finalPath).count(_.last.endsWith(".sst")) should be > 0
 
         val stagingPath = deviceDir / RebuildingStore.RebuildDirectory / sid.directoryName
         os.exists(stagingPath) should be(false)

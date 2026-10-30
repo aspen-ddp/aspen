@@ -9,3 +9,6 @@ case class PoolId(uuid: UUID) extends AnyVal
 object PoolId:
   val BootstrapPoolName = "aspen-bootstrap"
   val BootstrapPoolId: PoolId = fixed_ids.BootstrapPoolId
+
+  val InitialMetadataPoolName = "aspen-initial-storage-pool-metadata"
+  val InitialMetadataPoolId: PoolId = fixed_ids.InitialMetadataPoolId

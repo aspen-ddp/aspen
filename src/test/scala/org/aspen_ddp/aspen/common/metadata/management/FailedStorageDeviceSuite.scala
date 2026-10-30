@@ -239,7 +239,8 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
     given ExecutionContext = executionContext
     val failedId = StorageDeviceId.BootstrapStorageDeviceId
     val result = for
-      // A live destination in the same set. The bootstrap device carries all three stores.
+      // A live destination in the same set. The bootstrap device carries all three stores of both the bootstrap
+      // pool and the initial metadata pool.
       _ <- net.createSecondDevice()
       _ <- waitForTransactionsToComplete()
 
@@ -254,13 +255,14 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       tombstone <- client.getStorageDeviceState(failedId)
       destination <- client.getStorageDeviceState(net.secondDeviceId)
       poolState <- client.getStoragePoolState(PoolId.BootstrapPoolId)
-    yield (tombstone, destination, poolState)
+      metadataPoolState <- client.getStoragePoolState(PoolId.InitialMetadataPoolId)
+    yield (tombstone, destination, poolState, metadataPoolState)
 
-    result.map: (tombstone, destination, poolState) =>
+    result.map: (tombstone, destination, poolState, metadataPoolState) =>
       tombstone.isFailed should be(true)
       tombstone.stores shouldBe empty
 
-      destination.stores.size should be(3)
+      destination.stores.size should be(6)
       val dstStatuses = destination.stores.values.map(_.status).toSet
       dstStatuses should be(Set(StorageDeviceState.StoreStatus.Rebuilding))
       val dstTransfers = destination.stores.values.map(_.transferDevice).toSet
@@ -270,6 +272,7 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       poolState.stores.size should be(3)
       val poolDevices = poolState.stores.map(_.storageDeviceId).toSet
       poolDevices should be(Set(net.secondDeviceId))
+      metadataPoolState.stores.map(_.storageDeviceId).toSet should be(Set(net.secondDeviceId))
 
   atest("the drain regenerates the bootstrap config for a bootstrap-pool store"):
     given ExecutionContext = executionContext
@@ -583,4 +586,5 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       midDrain.stores.size should be > 0
       midDrain.stores.size should be < 3
       tombstone.stores shouldBe empty
-      destination.stores.size should be(3)
+      // The bootstrap pool's three stores and the initial metadata pool's three
+      destination.stores.size should be(6)

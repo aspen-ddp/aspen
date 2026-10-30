@@ -111,6 +111,10 @@ class TestNetwork(executionContext: ExecutionContext,
   val store1 = stores(1)
   val store2 = stores(2)
 
+  /** The initial metadata pool's stores, one per IDA element. Bootstrap writes nothing to them. */
+  val metadataStores: List[MapBackend] =
+    (0 until ida.width).toList.map(i => new MapBackend(StoreId(PoolId.InitialMetadataPoolId, i.toByte)))
+
   val storeId0 = store0.storeId
   val storeId1 = store1.storeId
   val storeId2 = store2.storeId
@@ -126,7 +130,8 @@ class TestNetwork(executionContext: ExecutionContext,
     bootstrapHost.hostId,
     0L,
     0L,
-    stores.map(s => s.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)).toMap,
+    (stores ++ metadataStores).map(s =>
+      s.storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)).toMap,
     StorageDeviceSetId.BootstrapStorageDeviceSetId
   )
 
@@ -231,7 +236,7 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(60, SECONDS))
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
-  stores.foreach(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))
+  (stores ++ metadataStores).foreach(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))
 
   // ---- Rebalancing test helpers -------------------------------------------------
 

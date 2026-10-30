@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.transaction.TransactionDescription
-import org.aspen_ddp.aspen.common.util.uuid2byte
+import org.aspen_ddp.aspen.common.util.{byte2uuid, uuid2byte}
 import org.aspen_ddp.aspen.server.store.backend.BackendConfig
 import scribe.Logging
 
@@ -685,6 +685,17 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
 
     client.read(radicle).map: radicleKvos =>
       new String(radicleKvos.contents(Radicle.BootstrapConfigKey).value.bytes, StandardCharsets.UTF_8)
+
+  /** The allocation group whose metadata pools hold new pools' metadata trees, as recorded in the Radicle.
+    * Fails with `IllegalStateException` if the Radicle has no such entry.
+    */
+  def getDefaultMetadataGroupId(): Future[AllocationGroupId] =
+    given ExecutionContext = this.clientContext
+
+    client.read(radicle).map: radicleKvos =>
+      radicleKvos.contents.get(Radicle.DefaultStoragePoolMetadataAllocatorKey) match
+        case Some(vs) => AllocationGroupId(byte2uuid(vs.value.bytes))
+        case None => throw new IllegalStateException("The Radicle has no default storage pool metadata group")
 
   /** Signs a certificate binding `id` to `publicKey` using the cluster CA stored in the radicle.
    *

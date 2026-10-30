@@ -323,6 +323,26 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       placed should be(false)
       os.exists(dev / storeId.directoryName) should be(true)
 
+  atest("an abort latched while finish closes the backend keeps the staging copy out of place"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    var rebuildRef: RebuildingStore = null
+    for
+      _ <- populate(6)
+      _ <- net.waitForTransactionsToComplete()
+      // As a fail-stop of the staging store's final I/O would: the abort arrives once the walk is done
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+                                    checkpointInterval = 2,
+                                    testingOnlyOnFinishClosed = () => rebuildRef.cancel())
+      _ = rebuildRef = rebuild
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+    yield
+      outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
+      os.exists(dev / storeId.directoryName) should be(false)
+      os.exists(staging) should be(true)
+      RebuildState.load(staging).isDefined should be(true)
+
   // A shutdown waits for its cancelled rebuilds, so a cancelled walk must stop reading at once
   // rather than read the rest of the allocation tree as no-ops.
   atest("a cancelled walk issues no further reads and closes promptly"):

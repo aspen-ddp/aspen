@@ -64,7 +64,8 @@ class RebuildingStore(client: AspenClient,
                       testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
                       testingOnlyTrackRestoredKeys: Boolean = false,
                       maxFailedObjects: Int = RebuildState.MaxFailedObjects,
-                      testingOnlyOnRestored: () => Unit = () => ()) extends StoreRebuild with Logging:
+                      testingOnlyOnRestored: () => Unit = () => (),
+                      testingOnlyOnFinishClosed: () => Unit = () => ()) extends StoreRebuild with Logging:
 
   import RebuildingStore.*
 
@@ -458,6 +459,10 @@ class RebuildingStore(client: AspenClient,
   private def finish(): Future[Unit] =
     backend.rebuildFlush()
     closeBackend().map: _ =>
+      testingOnlyOnFinishClosed()
+      // An abort latched while the backend closed (a fail-stop of the staging FSIF store's last I/O, a cancel)
+      // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
+      synchronized(abortCause).foreach(cause => throw cause)
       // The temp file only exists if a crash caught a save between its write and its rename, and
       // only survives if this pass never checkpointed. Dropping it here keeps it out of the
       // directory that is about to become a live store.

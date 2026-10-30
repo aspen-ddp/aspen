@@ -73,6 +73,24 @@ trait Transaction {
 
 
 
+  /** Asks the allocation strategies of the pools this transaction deletes from to release what they reserved for the
+   *  deleted objects after the transaction commits, instead of within it. Intended for bulk deletes, where releasing
+   *  in-transaction (e.g. clearing many bits of a shared allocation index) would risk collisions with concurrent
+   *  allocations. A no-op for ordinary pools. Applies to every deletion in the transaction.
+   *
+   *  Throws PostCommitTransactionModification if commit() has already been called.
+   */
+  def deferAllocationRelease(): Unit
+
+  /** True if deferAllocationRelease() has been called. Passed to each allocation strategy's prepareCommit */
+  private[aspen] def allocationReleaseDeferred: Boolean
+
+  /** Per-transaction state for allocation strategies. Returns the value stored under `key`, first storing `init` if
+   *  there is none; `init` runs at most once per key. Synchronized, and usable both before commit() and while the
+   *  commit hooks run.
+   */
+  private[aspen] def attachment[T <: AnyRef](key: AnyRef)(init: => T): T
+
   /** Adds a human-readable note that may be used for debugging transactions */
   def note(note: String): Unit
 

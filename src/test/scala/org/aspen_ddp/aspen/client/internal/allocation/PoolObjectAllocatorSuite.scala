@@ -1,34 +1,58 @@
 package org.aspen_ddp.aspen.client.internal.allocation
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StoragePool, StoragePoolAllocationStrategy, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, PostCommitTransactionModification, RegisteredTypeFactory, StoragePool, StoragePoolAllocationStrategy, Transaction}
 import org.aspen_ddp.aspen.common.metadata.StoragePoolState
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription}
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.DoesNotExist
+import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, TransactionDescription, TransactionId}
 import org.aspen_ddp.aspen.common.util.uuid2byte
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 
 import java.util.UUID
 import scala.collection.concurrent.TrieMap
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 object PoolObjectAllocatorSuite:
 
   val StrategyTypeUUID: UUID = UUID.fromString("6f0e5a4c-1d3b-4e77-9a21-0c8d5b7e4f10")
 
+  type HookCall = (List[ObjectPointer], List[ObjectPointer], Boolean)
+
   /** Random ObjectId, but the configured bytes verbatim as the storePointer. The non-empty
    *  storePointer is what distinguishes this from StoragePoolAllocationStrategy.Default and
-   *  proves the pool's config data reached the strategy. */
+   *  proves the pool's config data reached the strategy.
+   *
+   *  Every prepareCommit call is recorded by transaction id, since other transactions may allocate from the same
+   *  pool while a test runs. `entered`, `gate`, `fail` and `onPrepare` apply only to the `target` transaction. */
   class TestStrategy(configData: Option[Array[Byte]]) extends StoragePoolAllocationStrategy:
     private def storePointer: Array[Byte] = configData.getOrElse(Array.empty)
 
-    @volatile var deleted: List[ObjectPointer] = Nil
+    @volatile var calls: List[(TransactionId, HookCall)] = Nil
+    @volatile var target: Option[TransactionId] = None
+    @volatile var entered: Option[Promise[Unit]] = None
+    @volatile var gate: Option[Promise[Unit]] = None
+    @volatile var fail: Boolean = false
+    @volatile var onPrepare: Transaction => Future[Unit] = _ => Future.unit
 
-    override def deleteObject(pointer: ObjectPointer)(using t: Transaction): Unit =
+    def callsFor(tx: Transaction): List[HookCall] = calls.filter(_._1 == tx.id).map(_._2)
+
+    override def prepareCommit(poolId: PoolId, allocated: List[ObjectPointer], deleted: List[ObjectPointer],
+                               deferRelease: Boolean)(using t: Transaction): Future[Unit] =
       synchronized:
-        deleted = pointer :: deleted
-      t.addFinalizationAction(FinalizationActionId(DeletionRecorder.typeUUID), Some(pointer.id.toBytes))
+        calls = calls :+ (t.id -> (allocated, deleted, deferRelease))
+      deleted.foreach: ptr =>
+        t.addFinalizationAction(FinalizationActionId(DeletionRecorder.typeUUID), Some(ptr.id.toBytes))
+      if !target.contains(t.id) then
+        Future.unit
+      else
+        given ExecutionContext = ExecutionContext.parasitic
+        entered.foreach(_.trySuccess(()))
+        if fail then
+          Future.failed(new RuntimeException("boom"))
+        else
+          gate.map(_.future).getOrElse(Future.unit).flatMap(_ => onPrepare(t))
 
     override def createDataObjectPointer(poolId: PoolId)(using t: Transaction): Future[DataObjectPointer] =
       Future.successful(new DataObjectPointer(ObjectId(UUID.randomUUID()), poolId, storePointer))
@@ -148,7 +172,7 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
     yield
       ptr.storePointer.isEmpty should be(true)
 
-  atest("custom allocation strategy is created once, on first use, and told of deletions"):
+  atest("custom allocation strategy is created once, on first use, and told of allocations and deletions"):
     given ExecutionContext = executionContext
     for
       pool <- customStrategyPool()
@@ -160,7 +184,6 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
       strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
-      deletedAfterAllocation = strategy.deleted
 
       meta <- client.readMetadata(ptr)
       deleteTx = client.newTransaction()
@@ -170,8 +193,8 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       remaining <- client.readMetadataOptional(ptr)
     yield
       createdBeforeUse should be(0)
-      deletedAfterAllocation should be(Nil)
-      strategy.deleted should be(List(ptr))
+      strategy.callsFor(tx) should be(List((List(ptr), Nil, false)))
+      strategy.callsFor(deleteTx) should be(List((Nil, List(ptr), false)))
       DeletionRecorder.executionsFor(ptr.id) should be >= 1
       TestStrategyFactory.createdFor(pool) should be(1)
       remaining should be(None)
@@ -192,5 +215,109 @@ class PoolObjectAllocatorSuite extends IntegrationTestSuite:
       _ <- incTx.commit()
       _ <- waitForTransactionsToComplete()
     yield
-      pool.allocationStrategy.asInstanceOf[TestStrategy].deleted should be(Nil)
+      val strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
+      strategy.callsFor(tx) should be(List((List(ptr), Nil, false)))
+      strategy.callsFor(incTx) should be(Nil)
       DeletionRecorder.executionsFor(ptr.id) should be(0)
+
+  atest("deferAllocationRelease reaches prepareCommit"):
+    given ExecutionContext = executionContext
+    for
+      pool <- customStrategyPool()
+      allocator = new PoolObjectAllocator(client, pool)
+
+      tx = client.newTransaction()
+      ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
+      _ <- tx.commit()
+
+      meta <- client.readMetadata(ptr)
+      deleteTx = client.newTransaction()
+      _ = deleteTx.setRefcount(ptr, meta.refcount, meta.refcount.decrement())
+      _ = deleteTx.deferAllocationRelease()
+      _ <- deleteTx.commit()
+      _ <- waitForTransactionsToComplete()
+    yield
+      pool.allocationStrategy.asInstanceOf[TestStrategy].callsFor(deleteTx) should be(List((Nil, List(ptr), true)))
+
+  atest("modifying a transaction while its commit hooks run throws PostCommitTransactionModification"):
+    given ExecutionContext = executionContext
+    for
+      pool <- customStrategyPool()
+      allocator = new PoolObjectAllocator(client, pool)
+
+      tx = client.newTransaction()
+      ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
+      strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
+      entered = Promise[Unit]()
+      gate = Promise[Unit]()
+      _ = strategy.entered = Some(entered)
+      _ = strategy.gate = Some(gate)
+      _ = strategy.target = Some(tx.id)
+
+      committed = tx.commit()
+      _ <- entered.future
+      _ = intercept[PostCommitTransactionModification](tx.note("x"))
+      _ = gate.success(())
+      _ <- committed
+      _ <- waitForTransactionsToComplete()
+      dos <- client.read(ptr)
+    yield
+      dos.data.size should be(1)
+
+  atest("a failing prepareCommit aborts the transaction with its exception"):
+    given ExecutionContext = executionContext
+    for
+      pool <- customStrategyPool()
+      allocator = new PoolObjectAllocator(client, pool)
+
+      tx = client.newTransaction()
+      ptr <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
+      strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
+      _ = strategy.fail = true
+      _ = strategy.target = Some(tx.id)
+
+      failure <- tx.commit().failed
+      _ <- waitForTransactionsToComplete()
+      remaining <- client.readMetadataOptional(ptr)
+    yield
+      failure shouldBe a[RuntimeException]
+      failure.getMessage should be("boom")
+      remaining should be(None)
+
+  atest("a hook may add an update to the transaction"):
+    given ExecutionContext = executionContext
+    val key = Key(UUID.randomUUID().toString.getBytes)
+    val value = Value(Array[Byte](5, 6))
+    for
+      pool <- customStrategyPool()
+      allocator = new PoolObjectAllocator(client, pool)
+
+      tx = client.newTransaction()
+      _ <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
+      strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
+      _ = strategy.onPrepare = t =>
+        t.update(radicle, None, None, List(DoesNotExist(key)), List(Insert(key, value.bytes)))
+        Future.unit
+      _ = strategy.target = Some(tx.id)
+
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      kvos <- client.read(radicle)
+    yield
+      kvos.contents(key).value.bytes should be(value.bytes)
+
+  atest("a hook that allocates in a pool whose hook already ran fails the transaction"):
+    given ExecutionContext = executionContext
+    for
+      pool <- customStrategyPool()
+      allocator = new PoolObjectAllocator(client, pool)
+
+      tx = client.newTransaction()
+      _ <- allocator.allocateDataObject(DataBuffer(Array[Byte](1)))(using tx)
+      strategy = pool.allocationStrategy.asInstanceOf[TestStrategy]
+      _ = strategy.onPrepare = t => allocator.allocateDataObject(DataBuffer(Array[Byte](2)))(using t).map(_ => ())
+      _ = strategy.target = Some(tx.id)
+
+      failure <- tx.commit().failed
+    yield
+      failure shouldBe an[IllegalStateException]

@@ -364,6 +364,9 @@ class TransactionBuilder(
     allocatingObjects += objectPtr
   }
 
+  /** Objects this transaction allocates */
+  def allocatedObjects: Set[ObjectPointer] = synchronized { allocatingObjects }
+
   def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit = synchronized {
     notifyOnResolution = notifyOnResolution ++ storesToNotify
   }

@@ -13,6 +13,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import scribe.Logging
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.control.NonFatal
 import scala.util.{Failure, Success}
 
 object TransactionImpl {
@@ -32,100 +33,135 @@ class TransactionImpl(val client: AspenClient,
   private  val bldr = new TransactionBuilder(id, chooseDesignatedLeader, client.clientId)
   private  var commitStarted = false
   private  var havePendingUpdates = false
-  private  var runningCommitHooks = false // Permits modification by allocation strategies after commit()
+  private  var hooksActive = false // True while the allocation strategies' commit hooks may modify the transaction
+  private  var releaseDeferred = false
+  private  val attachments = scala.collection.mutable.HashMap[AnyRef, AnyRef]()
 
   private  val stack = org.aspen_ddp.aspen.common.util.getStack // for debugging
 
   def isEmpty: Boolean = synchronized { !havePendingUpdates }
 
   /** Runs `f` against the builder while holding the monitor. Once commit() has been called the
-    *  builder is frozen, except to the commit hooks; it is read without the monitor while the transaction is built.
+    *  builder is frozen to the caller; it is read without the monitor while the transaction is built.
     */
   private def modify[T](f: TransactionBuilder => T): T = synchronized {
-    if commitStarted && !runningCommitHooks then
+    if commitStarted then
       throw PostCommitTransactionModification()
     f(bldr)
   }
 
-  def missedUpdateTrackingEnabled: Boolean = modify { bldr =>
-    bldr.missedUpdateTrackingEnabled
+  /** As modify, for the commit hooks via hookView. Permitted only while the hooks run */
+  private def hookModify[T](f: TransactionBuilder => T): T = synchronized {
+    if !hooksActive then
+      throw new IllegalStateException(s"Transaction ${id.uuid} modified by an allocation strategy after its commit hooks finished")
+    f(bldr)
   }
 
-  def referencedPoolIds: Set[PoolId] = modify { bldr =>
-    bldr.allReferencedPoolIds
-  }
+  private def access[T](byHook: Boolean)(f: TransactionBuilder => T): T =
+    if byHook then hookModify(f) else modify(f)
 
-  def disableMissedUpdateTracking(): Unit = modify { bldr =>
-    bldr.disableMissedUpdateTracking()
-  }
+  // Each operation is shared by this transaction (byHook = false) and hookView (byHook = true)
 
-  def setMissedCommitDelayInMs(msec: Int): Unit = modify { bldr =>
-    bldr.setMissedCommitDelayInMs(msec)
-  }
-
-  def append(position: AppendPosition, data: DataBuffer): AppendPosition =
+  private def doAppend(byHook: Boolean, position: AppendPosition, data: DataBuffer): AppendPosition =
     require(data.size > 0, "Cannot append empty data")
-    modify { bldr =>
+    access(byHook) { bldr =>
       havePendingUpdates = true
       bldr.append(position, data)
     }
     AppendPosition(position.pointer, revision, position.length + data.size)
 
-  def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean = false): Unit = modify { bldr =>
+  private def doRangedWrites(byHook: Boolean, state: RangedWriteState, writes: List[RangedWrite],
+                             zeroFill: Boolean): Unit = access(byHook) { bldr =>
     bldr.rangedWrites(state, writes, zeroFill)
     havePendingUpdates = true
   }
 
-  def overwrite(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit = modify { bldr =>
+  private def doOverwrite(byHook: Boolean, objectPointer: DataObjectPointer, requiredRevision: ObjectRevision,
+                          data: DataBuffer): Unit = access(byHook) { bldr =>
     havePendingUpdates = true
     bldr.overwrite(objectPointer, requiredRevision, data)
   }
 
-  def update(
-              pointer: KeyValueObjectPointer,
-              requiredRevision: Option[ObjectRevision],
-              contentLock: Option[FullContentLock],
-              requirements: List[KeyValueUpdate.KeyRequirement],
-              operations: List[KeyValueOperation]): Unit = modify { bldr =>
+  private def doUpdate(byHook: Boolean,
+                       pointer: KeyValueObjectPointer,
+                       requiredRevision: Option[ObjectRevision],
+                       contentLock: Option[FullContentLock],
+                       requirements: List[KeyValueUpdate.KeyRequirement],
+                       operations: List[KeyValueOperation]): Unit = access(byHook) { bldr =>
     havePendingUpdates = true
     bldr.update(pointer, requiredRevision, contentLock, requirements, operations)
   }
 
-  def setRefcount(objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount, refcount: ObjectRefcount): Unit = modify { bldr =>
+  private def doSetRefcount(byHook: Boolean, objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount,
+                            refcount: ObjectRefcount): Unit = access(byHook) { bldr =>
     havePendingUpdates = true
     bldr.setRefcount(objectPointer, requiredRefcount, refcount)
   }
 
-  def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = modify { bldr =>
+  private def doBumpVersion(byHook: Boolean, objectPointer: ObjectPointer,
+                            requiredRevision: ObjectRevision): Unit = access(byHook) { bldr =>
     havePendingUpdates = true
     bldr.bumpVersion(objectPointer, requiredRevision)
   }
 
-  def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = modify { bldr =>
-    bldr.lockRevision(objectPointer, requiredRevision)
-  }
-
-  def ensureHappensAfter(timestamp: HLCTimestamp): Unit = modify { bldr =>
-    bldr.ensureHappensAfter(timestamp)
-  }
-
-  def addFinalizationAction(finalizationActionId: FinalizationActionId, serializedContent: Option[Array[Byte]]): Unit = modify { bldr =>
+  private def doAddFinalizationAction(byHook: Boolean, finalizationActionId: FinalizationActionId,
+                                      serializedContent: Option[Array[Byte]]): Unit = access(byHook) { bldr =>
     serializedContent match {
       case Some(content) => bldr.addFinalizationAction(finalizationActionId, content)
       case None => bldr.addFinalizationAction(finalizationActionId)
     }
   }
 
-  def addAllocatingObject(objectPtr: ObjectPointer): Unit = modify { bldr =>
-    bldr.addAllocatingObject(objectPtr)
-  }
+  def missedUpdateTrackingEnabled: Boolean = modify(_.missedUpdateTrackingEnabled)
 
-  def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit = modify { bldr =>
-    bldr.addNotifyOnResolution(storesToNotify)
-  }
+  def referencedPoolIds: Set[PoolId] = modify(_.allReferencedPoolIds)
 
-  def note(note: String): Unit = modify { bldr =>
-    bldr.note(note)
+  def disableMissedUpdateTracking(): Unit = modify(_.disableMissedUpdateTracking())
+
+  def setMissedCommitDelayInMs(msec: Int): Unit = modify(_.setMissedCommitDelayInMs(msec))
+
+  def append(position: AppendPosition, data: DataBuffer): AppendPosition = doAppend(false, position, data)
+
+  def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean = false): Unit =
+    doRangedWrites(false, state, writes, zeroFill)
+
+  def overwrite(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit =
+    doOverwrite(false, objectPointer, requiredRevision, data)
+
+  def update(
+              pointer: KeyValueObjectPointer,
+              requiredRevision: Option[ObjectRevision],
+              contentLock: Option[FullContentLock],
+              requirements: List[KeyValueUpdate.KeyRequirement],
+              operations: List[KeyValueOperation]): Unit =
+    doUpdate(false, pointer, requiredRevision, contentLock, requirements, operations)
+
+  def setRefcount(objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount, refcount: ObjectRefcount): Unit =
+    doSetRefcount(false, objectPointer, requiredRefcount, refcount)
+
+  def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+    doBumpVersion(false, objectPointer, requiredRevision)
+
+  def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+    modify(_.lockRevision(objectPointer, requiredRevision))
+
+  def ensureHappensAfter(timestamp: HLCTimestamp): Unit = modify(_.ensureHappensAfter(timestamp))
+
+  def addFinalizationAction(finalizationActionId: FinalizationActionId, serializedContent: Option[Array[Byte]]): Unit =
+    doAddFinalizationAction(false, finalizationActionId, serializedContent)
+
+  def addAllocatingObject(objectPtr: ObjectPointer): Unit = modify(_.addAllocatingObject(objectPtr))
+
+  def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit = modify(_.addNotifyOnResolution(storesToNotify))
+
+  def note(note: String): Unit = modify(_.note(note))
+
+  def deferAllocationRelease(): Unit = modify(_ => releaseDeferred = true)
+
+  def allocationReleaseDeferred: Boolean = synchronized { releaseDeferred }
+
+  def attachment[T <: AnyRef](key: AnyRef)(init: => T): T = synchronized {
+    attachments.getOrElseUpdate(key, init).asInstanceOf[T]
   }
 
   def abort(reason: Throwable): Unit = synchronized {
@@ -142,6 +178,76 @@ class TransactionImpl(val client: AspenClient,
 
   def result: Future[HLCTimestamp] = promise.future
 
+  /** The transaction as the allocation strategies' commit hooks see it. It may be modified only while the hooks
+    *  run, and may not be committed. abort and abortAndThrow throw AbortAfterCommit, as they do for the caller.
+    */
+  private object hookView extends Transaction:
+    def client: AspenClient = TransactionImpl.this.client
+    val id: TransactionId = TransactionImpl.this.id
+
+    def append(position: AppendPosition, data: DataBuffer): AppendPosition = doAppend(true, position, data)
+
+    def rangedWrites(state: RangedWriteState, writes: List[RangedWrite], zeroFill: Boolean = false): Unit =
+      doRangedWrites(true, state, writes, zeroFill)
+
+    def overwrite(objectPointer: DataObjectPointer, requiredRevision: ObjectRevision, data: DataBuffer): Unit =
+      doOverwrite(true, objectPointer, requiredRevision, data)
+
+    def update(pointer: KeyValueObjectPointer,
+               requiredRevision: Option[ObjectRevision],
+               contentLock: Option[FullContentLock],
+               requirements: List[KeyValueUpdate.KeyRequirement],
+               operations: List[KeyValueOperation]): Unit =
+      doUpdate(true, pointer, requiredRevision, contentLock, requirements, operations)
+
+    def setRefcount(objectPointer: ObjectPointer, requiredRefcount: ObjectRefcount, refcount: ObjectRefcount): Unit =
+      doSetRefcount(true, objectPointer, requiredRefcount, refcount)
+
+    def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+      hookModify(_.lockRevision(objectPointer, requiredRevision))
+
+    def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+      doBumpVersion(true, objectPointer, requiredRevision)
+
+    def ensureHappensAfter(timestamp: HLCTimestamp): Unit = hookModify(_.ensureHappensAfter(timestamp))
+
+    def addFinalizationAction(finalizationActionId: FinalizationActionId,
+                              serializedContent: Option[Array[Byte]]): Unit =
+      doAddFinalizationAction(true, finalizationActionId, serializedContent)
+
+    def note(note: String): Unit = hookModify(_.note(note))
+
+    def deferAllocationRelease(): Unit = hookModify(_ => releaseDeferred = true)
+
+    private[aspen] def allocationReleaseDeferred: Boolean = TransactionImpl.this.allocationReleaseDeferred
+
+    private[aspen] def attachment[T <: AnyRef](key: AnyRef)(init: => T): T = TransactionImpl.this.attachment(key)(init)
+
+    def abortAndThrow(reason: Throwable): Nothing = TransactionImpl.this.abortAndThrow(reason)
+
+    def abort(reason: Throwable): Unit = TransactionImpl.this.abort(reason)
+
+    def isEmpty: Boolean = TransactionImpl.this.isEmpty
+
+    def result: Future[HLCTimestamp] = TransactionImpl.this.result
+
+    def commit(): Future[HLCTimestamp] =
+      throw new IllegalStateException(s"Transaction ${id.uuid} committed by an allocation strategy's commit hook")
+
+    protected[client] def addAllocatingObject(objectPtr: ObjectPointer): Unit =
+      hookModify(_.addAllocatingObject(objectPtr))
+
+    protected[client] def addNotifyOnResolution(storesToNotify: Set[StoreId]): Unit =
+      hookModify(_.addNotifyOnResolution(storesToNotify))
+
+    protected[client] def disableMissedUpdateTracking(): Unit = hookModify(_.disableMissedUpdateTracking())
+
+    private[aspen] def missedUpdateTrackingEnabled: Boolean = hookModify(_.missedUpdateTrackingEnabled)
+
+    private[aspen] def referencedPoolIds: Set[PoolId] = hookModify(_.allReferencedPoolIds)
+
+    protected[client] def setMissedCommitDelayInMs(msec: Int): Unit = hookModify(_.setMissedCommitDelayInMs(msec))
+
   /** Adds any pools referenced by the builder that are missing from `known` */
   private def resolvePools(known: Map[PoolId, StoragePool])(using ExecutionContext): Future[Map[PoolId, StoragePool]] =
     val missing = bldr.allReferencedPoolIds -- known.keySet
@@ -151,27 +257,48 @@ class TransactionImpl(val client: AspenClient,
       Future.sequence(missing.toList.map(poolId => client.getStoragePool(poolId).map(pool => poolId -> pool)))
         .map(known ++ _)
 
-  /** Tells each deleted object's allocation strategy of the deletion, then resolves every referenced pool.
+  /** The objects this transaction allocates and deletes, grouped by pool */
+  private def objectsByPool(): Map[PoolId, (Set[ObjectPointer], Set[ObjectPointer])] =
+    val allocated = bldr.allocatedObjects.groupBy(_.poolId)
+    val deleted = bldr.deletedObjects.toSet.groupBy(_.poolId)
+    (allocated.keySet ++ deleted.keySet).iterator.map: poolId =>
+      poolId -> (allocated.getOrElse(poolId, Set.empty), deleted.getOrElse(poolId, Set.empty))
+    .toMap
+
+  /** Calls the allocation strategy's prepareCommit for each pool in which the transaction allocates or deletes
+    *  objects, then resolves every referenced pool. `prepared` holds what each pool's hook was given.
     *
-    *  The strategies may add to the transaction, including further deletions and objects in pools not yet
-    *  resolved, so this repeats until a pass adds neither. The monitor is held while they run, so the caller
-    *  cannot slip in modifications after commit().
+    *  The hooks may add to the transaction, including objects in pools not yet resolved or prepared, so this repeats
+    *  until a pass finds no pool with work its hook hasn't been given. A pool whose hook already ran must not gain
+    *  allocations or deletions: that fails with IllegalStateException. The hooks run one at a time, through
+    *  hookView, so the caller cannot modify the transaction after commit().
     */
   private def runCommitHooks(pools: Map[PoolId, StoragePool],
-                             notified: Set[ObjectPointer])(using ExecutionContext): Future[Map[PoolId, StoragePool]] =
+                             prepared: Map[PoolId, (Set[ObjectPointer], Set[ObjectPointer])])
+                            (using ExecutionContext): Future[Map[PoolId, StoragePool]] =
     resolvePools(pools).flatMap: pools =>
-      val pending = bldr.deletedObjects.filterNot(notified.contains)
-      if pending.isEmpty then
+      val byPool = objectsByPool()
+      val grown = prepared.keys.filter(poolId => byPool(poolId) != prepared(poolId))
+      val fresh = byPool.keys.filterNot(prepared.contains).toList
+      if grown.nonEmpty then
+        Future.failed(new IllegalStateException(s"Transaction ${id.uuid} gained allocations or deletions in " +
+          s"pool(s) ${grown.mkString(", ")} after their allocation strategy's prepareCommit ran"))
+      else if fresh.isEmpty then
         Future.successful(pools)
       else
-        synchronized {
-          runningCommitHooks = true
-          try
-            pending.foreach(ptr => pools(ptr.poolId).allocationStrategy.deleteObject(ptr)(using this))
-          finally
-            runningCommitHooks = false
-        }
-        runCommitHooks(pools, notified ++ pending)
+        // Sequentially, and each pool's objects read just before its call: an earlier hook may add to a later pool
+        fresh.foldLeft(Future.successful(prepared)): (prev, poolId) =>
+          prev.flatMap: prepared =>
+            val (allocated, deleted) = objectsByPool()(poolId)
+            val deletedInOrder = bldr.deletedObjects.filter(deleted.contains)
+            val hook =
+              try
+                pools(poolId).allocationStrategy.prepareCommit(poolId, allocated.toList, deletedInOrder,
+                  allocationReleaseDeferred)(using hookView)
+              catch
+                case NonFatal(e) => Future.failed(e)
+            hook.map(_ => prepared + (poolId -> (allocated, deleted)))
+        .flatMap(prepared => runCommitHooks(pools, prepared))
 
   /** Begins the transaction commit process and returns a Future to its completion. This is the same future as
     *  returned by 'result'
@@ -189,13 +316,16 @@ class TransactionImpl(val client: AspenClient,
         // Completely empty transactions succeed immediately
         promise.success(HLCTimestamp.now)
       } else
-        val poolsFuture = runCommitHooks(Map.empty, Set.empty)
+        hooksActive = true
+        val poolsFuture = runCommitHooks(Map.empty, Map.empty)
 
         poolsFuture.failed.foreach { cause =>
+          synchronized { hooksActive = false }
           promise.tryFailure(cause)
         }
 
         poolsFuture.foreach { pools =>
+          synchronized { hooksActive = false }
           try
             val poolIDAMap = pools.map((poolId, pool) => poolId -> pool.ida)
             val poolMaxObjectSizeMap = pools.map((poolId, pool) => poolId -> pool.maxObjectSize)

@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.Future
 
 /** Test-only allocation strategy for FSIF pools: each pointer's storePointer is the next external index of its pool,
-  * as the 4-byte big-endian Int the FSIF storePointer contract requires. Indices are never reused, and deleteObject
+  * as the 4-byte big-endian Int the FSIF storePointer contract requires. Indices are never reused, and prepareCommit
   * releases nothing. The real allocation strategy (a bitmap with DurableTask-based clearing) is a separate design.
   *
   * The counter is kept per pool in the factory, not in the strategy: a StoragePool instance creates its strategy on
@@ -38,4 +38,5 @@ object FsifTestIndexStrategy extends StoragePoolAllocationStrategy.Factory with 
     override def createKeyValueObjectPointer(poolId: PoolId)(using t: Transaction): Future[KeyValueObjectPointer] =
       Future.successful(new KeyValueObjectPointer(ObjectId(UUID.randomUUID()), poolId, next()))
 
-    override def deleteObject(pointer: ObjectPointer)(using t: Transaction): Unit = ()
+    override def prepareCommit(poolId: PoolId, allocated: List[ObjectPointer], deleted: List[ObjectPointer],
+                               deferRelease: Boolean)(using t: Transaction): Future[Unit] = Future.unit

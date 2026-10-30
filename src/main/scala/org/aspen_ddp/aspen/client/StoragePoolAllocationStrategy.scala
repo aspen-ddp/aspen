@@ -19,7 +19,8 @@ object StoragePoolAllocationStrategy:
     override def createKeyValueObjectPointer(poolId: PoolId)(using t: Transaction): Future[KeyValueObjectPointer] =
       Future.successful(new KeyValueObjectPointer(ObjectId(UUID.randomUUID()), poolId, Array.empty))
 
-    override def deleteObject(pointer: ObjectPointer)(using t: Transaction): Unit = ()
+    override def prepareCommit(poolId: PoolId, allocated: List[ObjectPointer], deleted: List[ObjectPointer],
+                               deferRelease: Boolean)(using t: Transaction): Future[Unit] = Future.unit
 
 /**
  * Allows for user-defined strategies for creating ObjectPointers during object allocation.
@@ -39,9 +40,11 @@ trait StoragePoolAllocationStrategy:
 
   def createKeyValueObjectPointer(poolId: PoolId)(using t: Transaction): Future[KeyValueObjectPointer]
 
-  /** Called while `t` is being committed, once for each object in this pool whose refcount `t` sets to
-   *  zero. The strategy may add to `t`, typically finalization actions that release whatever it reserved
-   *  for the object. Runs after the caller's commit() but before the transaction is built, so `t` must not
-   *  be committed or aborted from here; throwing aborts it with the thrown exception.
+  /** Called while `t` is being committed, once for each pool in which `t` allocates or deletes objects, after every
+   *  object the caller added. `allocated` holds only staged allocations; `deferRelease` is
+   *  `t.allocationReleaseDeferred`. May add to `t` (including in other pools); must not commit or abort it; a
+   *  failure aborts it with that failure. Adding an allocation or deletion in a pool whose hook already ran fails
+   *  the transaction with IllegalStateException.
    */
-  def deleteObject(pointer: ObjectPointer)(using t: Transaction): Unit
+  def prepareCommit(poolId: PoolId, allocated: List[ObjectPointer], deleted: List[ObjectPointer],
+                    deferRelease: Boolean)(using t: Transaction): Future[Unit]

@@ -269,6 +269,8 @@ object AllocationGroupState:
 /** @param idaPolicy whether members must share the group's IDA. Fixed when the group is created.
   * @param ida       the IDA every member must equal: `Some` exactly when `idaPolicy` is `ExactMatch`. Fixed when the
   *                  group is created.
+  * @param isMetadataGroup true if this is a metadata group, one that allocates from metadata pools. Fixed when the
+  *                        group is created.
   * @param maxSliceSize the group's slice limit, or `None` for no limit. Fixed when the group is created and allowed
   *                     only with the `ExactMatch` policy. It is a floor: every pool below the group accepts slices
   *                     at least this large, so only pools and groups with no limit or one at least as large may
@@ -283,7 +285,8 @@ final case class AllocationGroupState(
                                      parentGroups: List[AllocationGroupId],
                                      maxSliceSize: Option[Int] = None,
                                      idaPolicy: IDAPolicy = IDAPolicy.AllowAll,
-                                     ida: Option[IDA] = None
+                                     ida: Option[IDA] = None,
+                                     isMetadataGroup: Boolean = false
                                      ):
 
   private var wselector: Option[WeightedSelector[AllocationGroupState.Member]] = None

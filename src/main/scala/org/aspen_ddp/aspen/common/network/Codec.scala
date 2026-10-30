@@ -1244,7 +1244,8 @@ object Codec extends Logging:
         case FsifConfig(segmentPayloadSize, _) => segmentPayloadSize,
       fsifSegmentCount = o.backendConfig match
         case FsifConfig(_, segmentCount) => segmentCount
-        case _: RocksDBConfig => 0
+        case _: RocksDBConfig => 0,
+      isMetadataPool = o.isMetadataPool
     )
 
   def decode(m: codec.StoragePoolState): StoragePoolState =
@@ -1262,7 +1263,7 @@ object Codec extends Logging:
     val migration = m.migration.map(decode)
 
     StoragePoolState(poolId, name, ida, maxSliceSize, stores, backendConfig,
-      storageDeviceSet, currentUsage, maximumStoreSize, allocationGroups, migration)
+      storageDeviceSet, currentUsage, maximumStoreSize, allocationGroups, migration, m.isMetadataPool)
 
 
   def encodeAllocationGroupMemberType(o: AllocationGroupState.MemberType): codec.AllocationGroupMemberType = o match
@@ -1305,7 +1306,8 @@ object Codec extends Logging:
       parentGroups = o.parentGroups.map(g => encodeUUID(g.uuid)),
       maxSliceSize = o.maxSliceSize.getOrElse(0),
       idaPolicy = encodeIDAPolicy(o.idaPolicy),
-      ida = o.ida.map(encode)
+      ida = o.ida.map(encode),
+      isMetadataGroup = o.isMetadataGroup
     )
 
   def decode(m: codec.AllocationGroupState): AllocationGroupState =
@@ -1316,7 +1318,8 @@ object Codec extends Logging:
     val parentGroups = m.parentGroups.map(u => AllocationGroupId(decodeUUID(u))).toList
     val maxSliceSize = if m.maxSliceSize == 0 then None else Some(m.maxSliceSize)
     val idaPolicy = decodeIDAPolicy(m.idaPolicy)
-    new AllocationGroupState(groupId, level, name, members, parentGroups, maxSliceSize, idaPolicy, m.ida.map(decode))
+    new AllocationGroupState(groupId, level, name, members, parentGroups, maxSliceSize, idaPolicy, m.ida.map(decode),
+      m.isMetadataGroup)
 
   def encode(o: StorageDeviceSetState): codec.StorageDeviceSetState =
     codec.StorageDeviceSetState(

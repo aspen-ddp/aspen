@@ -587,6 +587,8 @@ message StoragePoolState {
   uint32 backendMaxSliceSize = 12;
   // the FSIF backend's segmentCount; 0 for every other backend
   uint32 fsifSegmentCount = 13;
+  // fixed when the pool is created
+  bool isMetadataPool = 14;
 }
 
 enum AllocationGroupMemberType {
@@ -617,6 +619,8 @@ message AllocationGroupState {
   AllocationGroupIDAPolicy idaPolicy = 7;
   // present only for the EXACT_MATCH policy
   optional IDA ida = 8;
+  // fixed when the group is created
+  bool isMetadataGroup = 9;
 }
 
 message PendingTransfer {

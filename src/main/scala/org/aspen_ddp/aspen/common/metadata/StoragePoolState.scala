@@ -36,7 +36,9 @@ object StoragePoolState:
   def apply(kvos: KeyValueObjectState): StoragePoolState = StoragePoolState(kvos.contents(ConfigKey).value.bytes)
 
 
-/** @param maxSliceSize the pool's declared slice limit, in bytes, or `None` for no limit. Fixed when the pool is
+/** @param isMetadataPool true if this is a metadata pool, one that holds storage pools' metadata trees. Fixed when
+  *                       the pool is created.
+  * @param maxSliceSize the pool's declared slice limit, in bytes, or `None` for no limit. Fixed when the pool is
   *                     created. Stores enforce `effectiveMaxSliceSize`, which also accounts for the backend's own
   *                     limit. Most code should use `maxObjectSize` instead, which converts the effective limit into
   *                     the largest object the pool accepts.
@@ -52,7 +54,8 @@ final case class StoragePoolState(
                                    currentUsage: Long = 0,
                                    maximumStoreSize: Long = 0,
                                    allocationGroups: List[UUID] = Nil,
-                                   migration: Option[StoragePoolState.Migration] = None
+                                   migration: Option[StoragePoolState.Migration] = None,
+                                   isMetadataPool: Boolean = false
                                  ):
 
   def encode(): Array[Byte] = Codec.encode(this).toByteArray
@@ -72,7 +75,7 @@ final case class StoragePoolState(
 
   /** Every field, with `stores` as a Seq so it compares by content */
   private def contentFields = (poolId, name, ida, maxSliceSize, stores.toSeq, backendConfig, storageDeviceSet,
-    currentUsage, maximumStoreSize, allocationGroups, migration)
+    currentUsage, maximumStoreSize, allocationGroups, migration, isMetadataPool)
 
   override def equals(other: Any): Boolean = other match
     case that: StoragePoolState => contentFields == that.contentFields

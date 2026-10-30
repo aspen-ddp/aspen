@@ -594,6 +594,24 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     val decodedNoMax = Codec.decode(Codec.encode(noMaxSize))
     decodedNoMax.maxSliceSize shouldBe None
 
+  test("StoragePoolState round-trips isMetadataPool"):
+    val s = StoragePoolState(
+      PoolId(uuid(30)), "meta", Replication(3, 2), None,
+      Array.empty, RocksDBConfig(), StorageDeviceSetId(uuid(31)), isMetadataPool = true)
+    StoragePoolState(s.encode()).isMetadataPool shouldBe true
+    val d = StoragePoolState(
+      PoolId(uuid(32)), "plain", Replication(3, 2), None,
+      Array.empty, RocksDBConfig(), StorageDeviceSetId(uuid(31)))
+    StoragePoolState(d.encode()).isMetadataPool shouldBe false
+
+  test("AllocationGroupState round-trips isMetadataGroup"):
+    val g = AllocationGroupState(AllocationGroupId(uuid(40)), level = 0, name = "meta", members = Nil,
+      parentGroups = Nil, isMetadataGroup = true)
+    AllocationGroupState(g.toBytes).isMetadataGroup shouldBe true
+    val d = AllocationGroupState(AllocationGroupId(uuid(41)), level = 0, name = "plain", members = Nil,
+      parentGroups = Nil)
+    AllocationGroupState(d.toBytes).isMetadataGroup shouldBe false
+
   test("StoragePoolState migration field round-trip"):
     val withMigration = StoragePoolState(
       PoolId(uuid(20)), "migrating-pool", Replication(3, 2), None,

@@ -471,6 +471,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
       host.testingOnlyHandleEvents() // FsifOpened: out of space, left offline awaiting space
       host.getStoreIds should not contain storeId
       host.gossipedOnline should be(Nil)
+      host.testingOnlyAwaitingSpaceHasCallback(storeId) should be(Some(true))
 
       host.testingOnlyScanDevices() // the retry: its open is queued
       queued.size should be(1)
@@ -512,3 +513,33 @@ class HostFsifLoadSuite extends IntegrationTestSuite with HostTestHarness:
       host.testingOnlyHandleEvents()
       host.getStoreIds should contain(storeId)
       host.gossipedOnline should be(Nil)
+
+  atest("many out-of-space retries of an FSIF store build no callback chain, and a close deferred over its open completes"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
+      val retries = 10000
+      host.outOfSpaceOpens = retries
+      // Each load is an open that takes over the wait entry, as a retry's does, without the scans of backoff between
+      (1 to retries).foreach(_ => load(host))
+      host.opens should be(retries)
+      host.getStoreIds should not contain storeId
+      host.testingOnlyAwaitingSpaceHasCallback(storeId) should be(Some(false))
+
+      // The open that succeeds, with a close deferred over it
+      val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+      host.openEc = new ExecutionContext:
+        def execute(r: Runnable): Unit = queued.add(r)
+        def reportFailure(t: Throwable): Unit = ()
+      load(host)
+      val closed = host.closeStore(storeId)
+      host.testingOnlyHandleEvents()
+      closed.isCompleted should be(false)
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // FsifOpened, LoadStore, then the deferred ShutdownStore
+      closed.map: _ =>
+        host.getStoreIds should not contain storeId
+        host.gossipedOnline should be(Nil)

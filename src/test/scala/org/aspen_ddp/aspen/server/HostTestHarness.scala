@@ -252,7 +252,7 @@ private class RecordingHost(mgrClient: AspenClient,
 
   override protected def tryLoadStore(sds: Host.LocalStorageDeviceState,
                                       potentialStoreFile: os.Path,
-                                      onServed: () => Unit): Unit =
+                                      onServed: Option[() => Unit]): Unit =
     synchronized:
       if storeLoadFailureOwed.getAndSet(false) then
         throw new RuntimeException(s"Simulated store load failure for $potentialStoreFile")

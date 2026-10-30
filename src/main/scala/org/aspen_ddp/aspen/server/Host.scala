@@ -41,6 +41,7 @@ import java.util.UUID
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 
 object Host:
   private sealed abstract class Event
@@ -78,7 +79,7 @@ object Host:
    *  store (a retry or any other load) takes it over, and it is dropped with the entry if the store leaves the wait
    *  for any other reason. */
   private final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int, scansLeft: Int,
-                                     onServed: () => Unit = () => ())
+                                     onServed: Option[() => Unit] = None)
 
   /** Longest wait between load retries of a store whose device is out of space */
   val SpaceRetryCap: Duration = Duration(5, MINUTES)
@@ -106,7 +107,7 @@ object Host:
    *  create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served. */
   private case class FsifOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                 create: Boolean, previous: Option[SpaceWait], result: Try[Backend],
-                                created: Option[Promise[Unit]], onServed: () => Unit) extends Event
+                                created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
   private case class InitializeTaskExecutor() extends Event
 
   /** What updateStateForTransferredStore decided about a transfer that has finished shipping
@@ -976,10 +977,11 @@ class Host(val client: AspenClient,
   //
   // `onServed` runs, under the instance lock, once the store is recorded as served and its LoadStore queued:
   // before this returns for RocksDB, but only when FsifOpened is handled for FSIF, whose open runs on fsifOpenEc.
-  // It never runs if the store is not served (skipped, already open or opening, or its open fails). A caller that
-  // must act once the store is served passes it rather than reading offlineStores after the call.
+  // It never runs if the store is not served (skipped, already open or opening, or its open fails), except that an
+  // FSIF open that runs out of space hands it to the store's next open (SpaceWait). It runs at most once. A caller
+  // that must act once the store is served passes it rather than reading offlineStores after the call.
   protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
-                             onServed: () => Unit = () => ()): Unit =
+                             onServed: Option[() => Unit] = None): Unit =
     val storeCfgPath = potentialStoreFile / StoreConfig.configFilename
     if os.exists(storeCfgPath) then
       try
@@ -1009,7 +1011,7 @@ class Host(val client: AspenClient,
             startFsifOpen(sds, storeCfg, potentialStoreFile, create = false, None, onServed)
         else
           serveOpened(sds, storeCfg, potentialStoreFile, openBackend(storeCfg, potentialStoreFile, create = false))
-          onServed()
+          onServed.foreach(_())
       catch
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
@@ -1027,15 +1029,15 @@ class Host(val client: AspenClient,
    *  in fsifOpening, so a shutdown waits for it and no second open starts. Caller holds the instance lock. */
   private def startFsifOpen(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                             create: Boolean, created: Option[Promise[Unit]],
-                            onServed: () => Unit = () => ()): Unit =
+                            onServed: Option[() => Unit] = None): Unit =
     val storeId = storeCfg.storeId
     val previous = storesAwaitingSpace.get(storeId)
     storesAwaitingSpace -= storeId
     // A load that failed for lack of space handed its callback to this open, which now runs it, once, if it serves
-    // the store
-    val servedCallback = previous match
-      case Some(wait) => () => { wait.onServed(); onServed() }
-      case None => onServed
+    // the store. Composed only when both are real callbacks, so retries without one never nest
+    val servedCallback = (previous.flatMap(_.onServed), onServed) match
+      case (Some(waiting), Some(current)) => Some(() => { waiting(); current() })
+      case (waiting, current) => waiting.orElse(current)
     fsifOpening += storeId -> Nil
     sds.loadedStores += storeId
     try
@@ -1056,13 +1058,15 @@ class Host(val client: AspenClient,
    *  - out of space (FsifIo.isOutOfSpace): the data is intact, so the store is left offline and unloaded, recorded
    *    in storesAwaitingSpace, and ScanDevices retries it with backoff;
    *  - any other failure is logged and the store is not loaded, as for a backend that fails to open.
-   *  ShutdownStore completions deferred meanwhile are then put again, after the LoadStore. */
+   *  ShutdownStore completions deferred meanwhile are then put again, after the LoadStore, and then the load's
+   *  onServed callback, if any, runs for a served store. */
   private def fsifOpened(event: FsifOpened): Unit =
     val FsifOpened(sds, storeCfg, storePath, create, previous, result, created, onServed) = event
     val storeId = storeCfg.storeId
     val deferred = fsifOpening.getOrElse(storeId, Nil)
     fsifOpening -= storeId
     val registered = storageDevices.get(sds.storageDeviceId).exists(_ eq sds)
+    var servedCallback: Option[() => Unit] = None
     def leaveOffline(): Unit =
       offlineStores += storeId
       sds.offlineStores += storeId
@@ -1081,7 +1085,7 @@ class Host(val client: AspenClient,
       case Success(backend) =>
         val served = serveOpened(sds, storeCfg, storePath, backend)
         created.foreach(_.completeWith(served))
-        onServed()
+        servedCallback = onServed
       case Failure(e: FsifRecovery.StoreLost) =>
         logger.error(s"Store $storeId cannot be loaded: FSIF recovery found its acknowledged state lost. " +
                      s"Rebuilding it. $storePath. Error: ${e.getMessage}")
@@ -1121,6 +1125,10 @@ class Host(val client: AspenClient,
         sds.loadedStores -= storeId
         created.foreach(_.tryFailure(e))
     deferred.reverse.foreach(c => events.put(ShutdownStore(storeId, c)))
+    // After the replay, so a callback that throws cannot lose a deferred shutdown's completion
+    servedCallback.foreach: callback =>
+      try callback()
+      catch case NonFatal(t) => logger.warn(s"The served callback of store $storeId failed: $t")
 
   /** Where FSIF stores are opened (recovered) and created, off the event thread. protected as a test seam. */
   protected def fsifOpenEc: ExecutionContext = Host.FsifOpenEc
@@ -3266,7 +3274,7 @@ class Host(val client: AspenClient,
           false
 
     if markerRemoved then
-      tryLoadStore(local, storePath, () => gossipStoreOnline(storeId))
+      tryLoadStore(local, storePath, Some(() => gossipStoreOnline(storeId)))
 
   /** Drops a TransferringIn entry whose source device has been declared failed.
    *
@@ -3701,6 +3709,10 @@ class Host(val client: AspenClient,
     synchronized(activeDeviceChecks)
 
   /** Testing hook: the stores currently marked offline. */
+  /** Whether a store awaiting space holds a real onServed callback; None if it is not awaiting space */
+  private[aspen] def testingOnlyAwaitingSpaceHasCallback(storeId: StoreId): Option[Boolean] =
+    synchronized(storesAwaitingSpace.get(storeId).map(_.onServed.isDefined))
+
   private[aspen] def testingOnlyOfflineStores: Set[StoreId] =
     synchronized(offlineStores)
 

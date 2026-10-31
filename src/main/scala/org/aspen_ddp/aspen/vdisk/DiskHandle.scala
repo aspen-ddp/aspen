@@ -59,39 +59,41 @@ final class DiskHandle private (client: AspenClient,
       d.grow(newSize)
 
   def acquire(): Future[Unit] =
-    synchronized(releasing) match
-      case Some(r) => r.recover { case _ => () }.flatMap(_ => acquire())
-      case None => acquireNow()
-
-  private def acquireNow(): Future[Unit] =
-    // Decided under the monitor; the Futures and the old disk's close run after it is released
-    val (result, start) = synchronized:
-      takeover match
-        case Some(f) => (f, None)
+    // Decided under the monitor, including whether a release is in flight; the Futures and the old disk's close
+    // run after it is released
+    val decision = synchronized:
+      releasing match
+        case Some(r) => Left(r)
         case None =>
-          if disk.exists(_.state == DiskState.Serving) then
-            (Future.unit, None)
-          else
-            val p = Promise[Unit]()
-            takeover = Some(p.future)
-            (p.future, Some((p, disk, generation)))
-    start.foreach: (p, old, gen) =>
-      old.foreach(_.close())
-      VirtualDisk.acquire(client, name, config).onComplete: r =>
-        val discarded = synchronized:
-          takeover = None
-          r match
-            case Success(d) if gen == generation =>
-              disk = Some(d)
-              None
-            case Success(d) => Some(d)
-            case Failure(_) => None
-        discarded.foreach(_.close())
-        r match
-          case Success(_) if discarded.isDefined => p.failure(Fenced)
-          case Success(_) => p.success(())
-          case Failure(e) => p.failure(e)
-    result
+          takeover match
+            case Some(f) => Right((f, None))
+            case None =>
+              if disk.exists(_.state == DiskState.Serving) then
+                Right((Future.unit, None))
+              else
+                val p = Promise[Unit]()
+                takeover = Some(p.future)
+                Right((p.future, Some((p, disk, generation))))
+    decision match
+      case Left(r) => r.recover { case _ => () }.flatMap(_ => acquire())
+      case Right((result, start)) =>
+        start.foreach: (p, old, gen) =>
+          old.foreach(_.close())
+          VirtualDisk.acquire(client, name, config).onComplete: r =>
+            val discarded = synchronized:
+              takeover = None
+              r match
+                case Success(d) if gen == generation =>
+                  disk = Some(d)
+                  None
+                case Success(d) => Some(d)
+                case Failure(_) => None
+            discarded.foreach(_.close())
+            r match
+              case Success(_) if discarded.isDefined => p.failure(Fenced)
+              case Success(_) => p.success(())
+              case Failure(e) => p.failure(e)
+        result
 
   def release(): Future[Unit] =
     val (result, start) = synchronized:
@@ -100,10 +102,12 @@ final class DiskHandle private (client: AspenClient,
         case None =>
           val p = Promise[Unit]()
           releasing = Some(p.future)
-          (p.future, Some(p))
-    start.foreach: p =>
+          // No takeover can start while releasing is set, so this is the last one to wait for
+          (p.future, Some((p, takeover)))
+    start.foreach: (p, pending) =>
       // A failed takeover leaves nothing to wait for; release then closes whatever is held
-      val settled = synchronized(takeover).map(_.recover { case _ => () }).getOrElse(Future.unit)
+      val settled = pending.map(_.recover { case _ => () }).getOrElse(Future.unit)
+      // Built inside a Future so that a synchronous throw still fails p and clears releasing
       p.completeWith:
         settled.flatMap: _ =>
           synchronized(disk) match

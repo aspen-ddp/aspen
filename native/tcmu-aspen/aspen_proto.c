@@ -78,8 +78,8 @@ int aspen_parse_cfgstring(const char *cfg, char **disk, char **socket_path, char
 {
 	const size_t prefix_len = strlen(CFG_PREFIX);
 	const char *name;
+	const char *end;
 	const char *at;
-	const char *sock;
 	size_t name_len;
 
 	*disk = NULL;
@@ -89,22 +89,20 @@ int aspen_parse_cfgstring(const char *cfg, char **disk, char **socket_path, char
 	if (strncmp(cfg, CFG_PREFIX, prefix_len) != 0)
 		return fail(reason, "cfgstring must look like aspen/<disk>[@<socket path>]");
 
+	/* tcmu-runner appends its own options (";tcmur_cmd_time_out=N" and the like): ours end at ';'. */
 	name = cfg + prefix_len;
-	at = strchr(name, '@');
-	name_len = at ? (size_t)(at - name) : strlen(name);
+	end = strchr(name, ';');
+	if (end == NULL)
+		end = name + strlen(name);
+	at = memchr(name, '@', (size_t)(end - name));
+	name_len = (size_t)((at ? at : end) - name);
 	if (name_len == 0)
 		return fail(reason, "cfgstring has an empty disk name");
-
-	if (at) {
-		sock = at + 1;
-		if (*sock == '\0')
-			return fail(reason, "cfgstring has an empty socket path after '@'");
-	} else {
-		sock = ASPEN_DEFAULT_SOCKET;
-	}
+	if (at && at + 1 == end)
+		return fail(reason, "cfgstring has an empty socket path after '@'");
 
 	*disk = strndup(name, name_len);
-	*socket_path = strdup(sock);
+	*socket_path = at ? strndup(at + 1, (size_t)(end - at - 1)) : strdup(ASPEN_DEFAULT_SOCKET);
 	if (*disk == NULL || *socket_path == NULL) {
 		free(*disk);
 		free(*socket_path);

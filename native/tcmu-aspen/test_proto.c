@@ -84,6 +84,12 @@ static void test_cfgstring(void)
 {
 	expect_ok("aspen/disk1@/run/x.sock", "disk1", "/run/x.sock");
 	expect_ok("aspen/disk1", "disk1", ASPEN_DEFAULT_SOCKET);
+	expect_ok("aspen/d;x=1", "d", ASPEN_DEFAULT_SOCKET);
+	expect_ok("aspen/d@/s.sock;x=1", "d", "/s.sock");
+	expect_ok("aspen/d@/s.sock;tcmur_cmd_time_out=30;y=@z", "d", "/s.sock");
+	expect_ok("aspen/d;a@b", "d", ASPEN_DEFAULT_SOCKET);
+	expect_invalid("aspen/;x=1");
+	expect_invalid("aspen/d@;x=1");
 	expect_invalid("aspen/");
 	expect_invalid("aspen/@/x");
 	expect_invalid("aspen/d@");

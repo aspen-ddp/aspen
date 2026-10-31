@@ -279,7 +279,7 @@ static void wait_lost(struct tcmur_cmd *cmd)
 
 	CHECK(stub_wait_complete_lost(cmd, &rc, &lost_before, WAIT_MS) == 0);
 	CHECK(rc == TCMU_STS_BUSY);
-	CHECK(lost_before == 1);
+	CHECK(lost_before >= 1);
 }
 
 /* ---------------------------------------------------------------- fixtures */
@@ -294,7 +294,8 @@ static void fixture_init(struct fixture *f)
 {
 	char cfg[160];
 
-	snprintf(cfg, sizeof(cfg), "aspen/disk1@%s", sock_path);
+	/* tcmu-runner appends its own options after ';'; they must reach neither path nor name. */
+	snprintf(cfg, sizeof(cfg), "aspen/disk1@%s;tcmur_cmd_time_out=30", sock_path);
 	stub_dev_init(&f->dev, cfg, NUM_LBAS, BLOCK_SIZE);
 	stub_reset_conn_lost();
 	f->lfd = listen_socket();
@@ -356,6 +357,7 @@ static void test_check_config(void)
 
 	CHECK(handler->check_config("aspen/disk1", &reason));
 	CHECK(handler->check_config("aspen/disk1@/tmp/x.sock", &reason));
+	CHECK(handler->check_config("aspen/disk1@/tmp/x.sock;tcmur_cmd_time_out=30", &reason));
 	CHECK(!handler->check_config("aspen/", &reason));
 	CHECK(reason != NULL);
 	free(reason);
@@ -398,7 +400,9 @@ static void test_open(void)
 	CHECK(f.dev.unmap_enabled);
 	CHECK(f.dev.opt_unmap_gran == BLOCK_OBJECT_SIZE / BLOCK_SIZE);
 	CHECK(!f.dev.opt_unmap_split);
-	CHECK(f.dev.unmap_gran_align == 0);
+	/* Never 0 (tcmu-runner divides by it for WRITE SAME + UNMAP), and equal to the granularity. */
+	CHECK(f.dev.unmap_gran_align == BLOCK_OBJECT_SIZE / BLOCK_SIZE);
+	CHECK(f.dev.unmap_gran_align == f.dev.opt_unmap_gran);
 	CHECK(tcmur_dev_get_private(&f.dev) != NULL);
 
 	f.dfd = fd;
@@ -430,12 +434,53 @@ static int open_failing(uint32_t status, bool fail_lock)
 	d_reply_err(fd, &r, status);
 	req_free(&r);
 	ret = call_join(&c);
+	{
+		char err[256], want[64];
+
+		stub_last_err(err, sizeof(err));
+		snprintf(want, sizeof(want), "%s disk1 failed with status %u: scripted failure",
+			 fail_lock ? "LOCK" : "OPEN", status);
+		CHECK(strstr(err, want) != NULL);
+	}
 	d_expect_eof(fd);
 	CHECK(tcmur_dev_get_private(&f.dev) == NULL);
 	CHECK(stub_conn_lost_count() == 0);
 	close(fd);
 	fixture_done(&f);
 	return ret;
+}
+
+/* OPEN succeeds with the given geometry, which open must reject with -EINVAL. */
+static void open_bad_geometry(uint32_t block_object_size, uint32_t block_size)
+{
+	struct fixture f;
+	struct call c;
+	uint8_t geom[8];
+	struct req r;
+	int fd;
+
+	fixture_init(&f);
+	c = (struct call){.kind = CALL_OPEN, .dev = &f.dev};
+	call_start(&c);
+	fd = d_accept(f.lfd);
+	d_expect_req(fd, &r, ASPEN_OP_OPEN);
+	put_u32(geom, block_object_size);
+	put_u32(geom + 4, block_size);
+	d_reply(fd, r.op, ASPEN_ST_OK, r.id, geom, sizeof(geom));
+	req_free(&r);
+	CHECK(call_join(&c) == -EINVAL);
+	d_expect_eof(fd);
+	CHECK(tcmur_dev_get_private(&f.dev) == NULL);
+	close(fd);
+	fixture_done(&f);
+}
+
+/* A block object that is not a whole number of blocks would give a bad unmap alignment. */
+static void test_open_bad_block_object(void)
+{
+	open_bad_geometry(BLOCK_SIZE + 100, BLOCK_SIZE);
+	open_bad_geometry(BLOCK_SIZE / 2, BLOCK_SIZE);
+	open_bad_geometry(0, BLOCK_SIZE);
 }
 
 /* OPEN succeeds but the daemon's logical block size differs from tcmu's. */
@@ -772,6 +817,8 @@ static void test_reconfig(void)
 }
 
 /* After a loss: a new write is refused with BUSY, close sends nothing, and a reopen works. */
+/* After a loss: each new request is refused (BUSY, or -EINVAL for a resize) and notifies again,
+ * close sends nothing and notifies nothing, and a reopen works. */
 static void after_loss(struct fixture *f)
 {
 	struct test_cmd t;
@@ -779,11 +826,18 @@ static void after_loss(struct fixture *f)
 	uint8_t data[BLOCK_SIZE] = {0};
 	struct iovec iov = {data, sizeof(data)};
 	struct call c = {.kind = CALL_CLOSE, .dev = &f->dev};
+	struct tcmulib_cfg_info cfg = {.type = TCMULIB_CFG_DEV_SIZE, .data.dev_size = 4ULL << 20};
+	int n = stub_conn_lost_count();
 
+	CHECK(n >= 1);
 	CHECK(handler->write(&f->dev, cmd, &iov, 1, sizeof(data), 0) == TCMU_STS_BUSY);
+	CHECK(stub_conn_lost_count() == n + 1);
 	CHECK(handler->flush(&f->dev, cmd) == TCMU_STS_BUSY);
 	CHECK(handler->read(&f->dev, cmd, &iov, 1, sizeof(data), 0) == TCMU_STS_BUSY);
 	CHECK(handler->unmap(&f->dev, cmd, 0, BLOCK_SIZE) == TCMU_STS_BUSY);
+	CHECK(handler->reconfig(&f->dev, &cfg) == -EINVAL);
+	CHECK(stub_conn_lost_count() == n + 5);
+	n += 5;
 
 	/* The runner closes the device and reopens it. */
 	call_start(&c);
@@ -791,12 +845,12 @@ static void after_loss(struct fixture *f)
 	CHECK(tcmur_dev_get_private(&f->dev) == NULL);
 	close(f->dfd);
 	f->dfd = -1;
-	CHECK(stub_conn_lost_count() == 1);
+	CHECK(stub_conn_lost_count() == n);
 
 	do_open(f, true);
 	CHECK(write_flags(f, 0x2A, 0) == 0);
 	do_close(f);
-	CHECK(stub_conn_lost_count() == 1);
+	CHECK(stub_conn_lost_count() == n);
 }
 
 static void test_disconnect(void)
@@ -872,6 +926,76 @@ static void test_unknown_id(void)
 	CHECK(stub_wait_conn_lost(1, WAIT_MS) == 0);
 	after_loss(&f);
 	fixture_done(&f);
+}
+
+/* tcmu-runner drops the first notification (the device is still in recovery): the next refused
+ * I/O notifies again, so the device does not stay BUSY. */
+static void test_dropped_notify(void)
+{
+	struct fixture f;
+	struct test_cmd t;
+	struct tcmur_cmd *cmd;
+	uint8_t data[BLOCK_SIZE] = {0};
+	struct iovec iov = {data, sizeof(data)};
+
+	fixture_init(&f);
+	do_open(&f, false);
+	stub_ignore_conn_lost(1);
+	shutdown(f.dfd, SHUT_RDWR);
+	CHECK(stub_wait_conn_lost(1, WAIT_MS) == 0);
+	CHECK(stub_conn_lost_accepted() == 0);
+
+	cmd = make_cmd(&t, 0x2A, 0);
+	CHECK(handler->write(&f.dev, cmd, &iov, 1, sizeof(data), 0) == TCMU_STS_BUSY);
+	CHECK(stub_conn_lost_count() == 2);
+	CHECK(stub_conn_lost_accepted() == 1);
+	after_loss(&f);
+	fixture_done(&f);
+}
+
+/* An error reply's message is read in full (up to 1024 bytes) and logged; a longer one is a
+ * broken connection. The status is still reported correctly after the message. */
+static int open_with_message(const char *msg, uint32_t len, char *err, size_t err_len)
+{
+	struct fixture f;
+	struct call c;
+	struct req r;
+	int fd, ret;
+
+	fixture_init(&f);
+	c = (struct call){.kind = CALL_OPEN, .dev = &f.dev};
+	call_start(&c);
+	fd = d_accept(f.lfd);
+	d_expect_req(fd, &r, ASPEN_OP_OPEN);
+	d_reply(fd, r.op, ASPEN_ST_NOT_FOUND, r.id, msg, len);
+	req_free(&r);
+	ret = call_join(&c);
+	stub_last_err(err, err_len);
+	d_expect_eof(fd);
+	CHECK(tcmur_dev_get_private(&f.dev) == NULL);
+	CHECK(stub_conn_lost_count() == 0);
+	close(fd);
+	fixture_done(&f);
+	return ret;
+}
+
+static void test_open_error_message(void)
+{
+	static char msg[1025], err[2048], want[1100];
+
+	memset(msg, 'm', sizeof(msg));
+	memcpy(msg, "no such\ndisk\x01", 13);
+	CHECK(open_with_message(msg, 1024, err, sizeof(err)) == -ENOENT);
+	snprintf(want, sizeof(want), "OPEN disk1 failed with status %d: no such?disk?%.*s\n",
+		 ASPEN_ST_NOT_FOUND, 1024 - 13, msg + 13);
+	CHECK(strcmp(err, want) == 0);
+
+	CHECK(open_with_message("", 0, err, sizeof(err)) == -ENOENT);
+	snprintf(want, sizeof(want), "OPEN disk1 failed with status %d: \n", ASPEN_ST_NOT_FOUND);
+	CHECK(strcmp(err, want) == 0);
+
+	CHECK(open_with_message(msg, 1025, err, sizeof(err)) == -EIO);
+	CHECK(strstr(err, "status -1: connection failed") != NULL);
 }
 
 static void test_close(void)
@@ -974,6 +1098,7 @@ int main(void)
 	RUN(test_open);
 	RUN(test_open_failures);
 	RUN(test_open_block_size_mismatch);
+	RUN(test_open_bad_block_object);
 	RUN(test_fua);
 	RUN(test_write_iovecs);
 	RUN(test_read);
@@ -985,6 +1110,8 @@ int main(void)
 	RUN(test_disconnect);
 	RUN(test_oversized_reply);
 	RUN(test_unknown_id);
+	RUN(test_dropped_notify);
+	RUN(test_open_error_message);
 	RUN(test_close);
 	RUN(test_close_without_reply);
 	RUN(test_closed_device);

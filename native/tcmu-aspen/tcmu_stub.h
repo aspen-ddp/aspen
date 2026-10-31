@@ -4,6 +4,7 @@
 #define TCMU_STUB_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct tcmu_device {
@@ -34,8 +35,17 @@ int stub_wait_complete_lost(void *cmd, int *rc, int *conn_lost_before, int timeo
 /* Completions recorded and not yet consumed by stub_wait_complete. */
 int stub_unconsumed_completions(void);
 
+/* Every tcmu_notify_conn_lost call, including ignored ones. */
 int stub_conn_lost_count(void);
+/* Calls not ignored: what a runner would act on. */
+int stub_conn_lost_accepted(void);
+/* Resets both counts and stops ignoring. */
 void stub_reset_conn_lost(void);
+/* The next n calls are ignored, as tcmu-runner does while the device is in recovery. */
+void stub_ignore_conn_lost(int n);
+
+/* Copies the last tcmu_dev_err line (NUL-terminated, truncated to len - 1) into buf. */
+void stub_last_err(char *buf, size_t len);
 
 /* Waits up to timeout_ms for the conn_lost count to reach n. Returns 0, or -1 on timeout. */
 int stub_wait_conn_lost(int n, int timeout_ms);

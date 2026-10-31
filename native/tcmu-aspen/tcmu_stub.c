@@ -25,6 +25,9 @@ static struct {
 } completions[MAX_COMPLETIONS];
 static int ncompletions;
 static int conn_lost;
+static int conn_lost_ignored;
+static int conn_lost_to_ignore;
+static char last_err[4096];
 
 static void deadline_after(struct timespec *ts, int timeout_ms)
 {
@@ -94,6 +97,30 @@ int stub_unconsumed_completions(void)
 	return n;
 }
 
+int stub_conn_lost_accepted(void)
+{
+	int n;
+
+	pthread_mutex_lock(&stub_lock);
+	n = conn_lost - conn_lost_ignored;
+	pthread_mutex_unlock(&stub_lock);
+	return n;
+}
+
+void stub_ignore_conn_lost(int n)
+{
+	pthread_mutex_lock(&stub_lock);
+	conn_lost_to_ignore = n;
+	pthread_mutex_unlock(&stub_lock);
+}
+
+void stub_last_err(char *buf, size_t len)
+{
+	pthread_mutex_lock(&stub_lock);
+	snprintf(buf, len, "%s", last_err);
+	pthread_mutex_unlock(&stub_lock);
+}
+
 int stub_conn_lost_count(void)
 {
 	int n;
@@ -108,6 +135,8 @@ void stub_reset_conn_lost(void)
 {
 	pthread_mutex_lock(&stub_lock);
 	conn_lost = 0;
+	conn_lost_ignored = 0;
+	conn_lost_to_ignore = 0;
 	pthread_mutex_unlock(&stub_lock);
 }
 
@@ -157,6 +186,10 @@ void tcmu_notify_conn_lost(struct tcmu_device *dev)
 	(void)dev;
 	pthread_mutex_lock(&stub_lock);
 	conn_lost++;
+	if (conn_lost_to_ignore > 0) {
+		conn_lost_to_ignore--;
+		conn_lost_ignored++;
+	}
 	pthread_cond_broadcast(&stub_cond);
 	pthread_mutex_unlock(&stub_lock);
 }
@@ -223,6 +256,11 @@ void tcmu_err_message(struct tcmu_device *dev, const char *funcname, int linenr,
 	va_list ap;
 
 	(void)dev;
+	va_start(ap, fmt);
+	pthread_mutex_lock(&stub_lock);
+	vsnprintf(last_err, sizeof(last_err), fmt, ap);
+	pthread_mutex_unlock(&stub_lock);
+	va_end(ap);
 	va_start(ap, fmt);
 	log_message("ERR", funcname, linenr, fmt, ap);
 	va_end(ap);

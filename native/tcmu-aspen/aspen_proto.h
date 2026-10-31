@@ -57,7 +57,8 @@ void aspen_encode_req(uint8_t out[ASPEN_REQ_HDR_SIZE], const struct aspen_req_hd
 /* Returns 0, or -EPROTO on bad magic or version. */
 int aspen_decode_resp(const uint8_t in[ASPEN_RESP_HDR_SIZE], struct aspen_resp_hdr *h);
 
-/* cfg is tcmu's full cfgstring ("aspen/<disk>[@<socket>]"). Returns 0 with malloc'd *disk and
+/* cfg is tcmu's full cfgstring ("aspen/<disk>[@<socket>]", possibly followed by tcmu-runner's own
+ * ";option=value" suffixes, which are ignored: ours end at the first ';'). Returns 0 with malloc'd *disk and
  * *socket_path, or -EINVAL with *reason set to a malloc'd message. The caller frees the strings. */
 int aspen_parse_cfgstring(const char *cfg, char **disk, char **socket_path, char **reason);
 

@@ -4,8 +4,18 @@
  * Per device: one socket, one reader thread, and a table of pending requests keyed by request id.
  * I/O callouts queue a request and return TCMU_STS_OK; the reader completes the command with
  * tcmur_cmd_complete when the reply arrives. On connection loss every pending command completes
- * with TCMU_STS_BUSY, the runner is told once with tcmu_notify_conn_lost, and new I/O is refused
- * with TCMU_STS_BUSY until the runner closes and reopens the device. */
+ * with TCMU_STS_BUSY, the runner is told with tcmu_notify_conn_lost, and new I/O is refused with
+ * TCMU_STS_BUSY until the runner closes and reopens the device. tcmu-runner drops a notification
+ * while the device is already in recovery (for example when the connection is lost while the
+ * recovery that opened it is still finishing) or has no enabled TPG port, so every refused
+ * request notifies again unless close is running; the runner ignores the repeats it does not need.
+ *
+ * UNMAP: the unmap granularity alignment is one block object, like the optimal granularity, and
+ * split_unmaps is off. A plain UNMAP therefore reaches aspen_unmap as whole ranges. A WRITE SAME
+ * with the UNMAP bit (Linux's WRITE ZEROES) reaches aspen_unmap only when its start and length are
+ * block-object aligned; otherwise tcmu-runner emulates it by writing zeros through aspen_write,
+ * which is correct but does not release block objects. The alignment must not be 0: tcmu-runner
+ * 1.5.4 divides by it in handle_unmap_in_writesame. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <limits.h>
@@ -224,18 +234,25 @@ static struct pending *take_pending(struct aspen_dev *ad, uint64_t id)
 }
 
 /* Adds p to the table and returns its new id, or 0 if the connection is already lost.
- * Once added, p may be completed (and an async p freed) by the reader at any time. */
+ * Once added, p may be completed (and an async p freed) by the reader at any time.
+ * A refused request re-sends the loss notification unless close is running: tcmu-runner may
+ * have dropped the earlier one, and without it the device would stay BUSY forever. */
 static uint64_t add_pending(struct aspen_dev *ad, struct pending *p)
 {
 	uint64_t id = 0;
+	bool notify = false;
 
 	pthread_mutex_lock(&ad->lock);
 	if (!ad->lost) {
 		id = p->id = ad->next_id++;
 		p->next = ad->pending;
 		ad->pending = p;
+	} else {
+		notify = !ad->closing;
 	}
 	pthread_mutex_unlock(&ad->lock);
+	if (notify)
+		tcmu_notify_conn_lost(ad->dev);
 	return id;
 }
 
@@ -390,13 +407,16 @@ static int64_t sync_request(struct aspen_dev *ad, uint8_t op, uint64_t offset)
 
 /* Sends a request and reads its reply directly; used by open before the reader starts.
  * Returns the reply status, or -1 if the connection failed. An Ok reply must carry exactly
- * out_len bytes, which are copied to out. */
+ * out_len bytes, which are copied to out. An error reply's message (UTF-8, at most
+ * MAX_ERROR_PAYLOAD bytes) is read in full and left NUL-terminated in errmsg, with control
+ * characters replaced by '?'; errmsg is empty otherwise. */
 static int64_t exchange(struct aspen_dev *ad, struct aspen_req_hdr *h, const char *payload,
-			uint8_t *out, uint32_t out_len)
+			uint8_t *out, uint32_t out_len, char errmsg[MAX_ERROR_PAYLOAD + 1])
 {
 	struct iovec iov = {.iov_base = (void *)payload, .iov_len = h->payload_len};
 	struct aspen_resp_hdr r;
 
+	errmsg[0] = '\0';
 	h->id = ad->next_id++;
 	if (send_req(ad, h, &iov, 1) || recv_resp_hdr(ad->fd, &r))
 		return -1;
@@ -405,8 +425,16 @@ static int64_t exchange(struct aspen_dev *ad, struct aspen_req_hdr *h, const cha
 	if (r.status == ASPEN_ST_OK) {
 		if (r.payload_len != out_len || read_full(ad->fd, out, out_len))
 			return -1;
-	} else if (r.payload_len > MAX_ERROR_PAYLOAD || skip_bytes(ad->fd, r.payload_len)) {
-		return -1;
+	} else {
+		if (r.payload_len > MAX_ERROR_PAYLOAD || read_full(ad->fd, errmsg, r.payload_len))
+			return -1;
+		errmsg[r.payload_len] = '\0';
+		for (uint32_t i = 0; i < r.payload_len; i++) {
+			unsigned char c = (unsigned char)errmsg[i];
+
+			if (c < 0x20 || c == 0x7f)
+				errmsg[i] = '?';
+		}
 	}
 	return r.status;
 }
@@ -467,6 +495,7 @@ static int aspen_open(struct tcmu_device *dev, bool reopen)
 	char *disk, *socket_path, *reason;
 	struct aspen_dev *ad;
 	uint8_t geom[OPEN_REPLY_SIZE];
+	char errmsg[MAX_ERROR_PAYLOAD + 1];
 	int64_t st;
 	int ret = -EIO;
 
@@ -493,9 +522,10 @@ static int aspen_open(struct tcmu_device *dev, bool reopen)
 				   .offset = tcmu_dev_get_num_lbas(dev) * block_size,
 				   .length = block_size,
 				   .payload_len = (uint32_t)strlen(disk)};
-	st = exchange(ad, &h, disk, geom, sizeof(geom));
+	st = exchange(ad, &h, disk, geom, sizeof(geom), errmsg);
 	if (st != ASPEN_ST_OK) {
-		tcmu_dev_err(dev, "OPEN %s failed with status %lld\n", disk, (long long)st);
+		tcmu_dev_err(dev, "OPEN %s failed with status %lld: %s\n", disk, (long long)st,
+			     st < 0 ? "connection failed" : errmsg);
 		ret = st == ASPEN_ST_NOT_FOUND ? -ENOENT : st == ASPEN_ST_SIZE_MISMATCH ? -EINVAL : -EIO;
 		goto fail;
 	}
@@ -507,15 +537,24 @@ static int aspen_open(struct tcmu_device *dev, bool reopen)
 		goto fail;
 	}
 
+	if (get_u32(geom) < block_size || get_u32(geom) % block_size != 0) {
+		tcmu_dev_err(dev, "%s has a %u byte block object, not a multiple of %u byte blocks\n",
+			     disk, get_u32(geom), block_size);
+		ret = -EINVAL;
+		goto fail;
+	}
+
 	tcmu_dev_set_write_cache_enabled(dev, true);
 	tcmu_dev_set_unmap_enabled(dev, true);
 	tcmu_dev_set_opt_unmap_gran(dev, get_u32(geom) / block_size, false);
-	tcmu_dev_set_unmap_gran_align(dev, 0);
+	/* Never 0: see the UNMAP note at the top of the file. */
+	tcmu_dev_set_unmap_gran_align(dev, get_u32(geom) / block_size);
 
 	h = (struct aspen_req_hdr){.op = ASPEN_OP_LOCK};
-	st = exchange(ad, &h, NULL, NULL, 0);
+	st = exchange(ad, &h, NULL, NULL, 0, errmsg);
 	if (st != ASPEN_ST_OK) {
-		tcmu_dev_err(dev, "LOCK %s failed with status %lld\n", disk, (long long)st);
+		tcmu_dev_err(dev, "LOCK %s failed with status %lld: %s\n", disk, (long long)st,
+			     st < 0 ? "connection failed" : errmsg);
 		goto fail;
 	}
 

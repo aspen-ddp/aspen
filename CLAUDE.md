@@ -173,6 +173,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - Stores hold requirement locks from a commit vote until the transaction resolves. `SharedRevisionLock` is a
     non-exclusive requirement on an object's revision: many transactions may hold it, but it collides with any write
     to that object
+  - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
+    missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:

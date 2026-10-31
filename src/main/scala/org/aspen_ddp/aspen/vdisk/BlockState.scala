@@ -17,7 +17,9 @@ final class BlockState:
 
   var pointer: Option[DataObjectPointer] = None
 
-  /** The object's current revision and length, once a read or a commit has revealed them */
+  /** The object's current revision and length, once a read or a commit has revealed them. The owner's
+    * `CleanCache` entry for the block holds content at this revision, within this length
+    */
   var revision: Option[ObjectRevision] = None
   var length: Option[Int] = None
 
@@ -34,9 +36,6 @@ final class BlockState:
 
   /** Bumped by each commit. A read caches what it fetched only if no commit completed meanwhile */
   var generation: Long = 0L
-
-  /** Known committed content at `revision`, unbounded. Pieces lie within the object's length */
-  val clean: SegmentMap = SegmentMap()
 
   var timer: Option[ScheduledTask] = None
   /** Identifies the most recently armed timer, so a stale one that already fired cannot clear a newer one */

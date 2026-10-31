@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.vdisk
 
 import java.util.{Arrays, UUID}
 
-import org.aspen_ddp.aspen.client.{AspenClient, ObjectAllocator, RangedWriteState, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectRangeState, ObjectAllocator, RangedWriteState, Transaction}
 import org.aspen_ddp.aspen.client.tkvl.KVObjectRootManager
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
@@ -24,6 +24,10 @@ import scala.util.{Failure, Success}
   * All state is guarded by this object's monitor. Aspen calls and promise completions are collected while holding
   * it (see `locked`) and run after it is released. In-flight commit data stays in `BlockState.dirty` until the
   * commit succeeds, so a read's overlay is the dirty snapshot alone.
+  *
+  * Committed bytes are held in a bounded `CleanCache`, always at the block's known revision. Reads fetch only what
+  * neither cache holds. A read that `SequentialDetector` finds continuing a stream adds readahead, within the same
+  * block object, to the same fetch.
   */
 final class VirtualDisk private (val client: AspenClient,
                                  val info: DiskInfo,
@@ -56,10 +60,22 @@ final class VirtualDisk private (val client: AspenClient,
   private val awaitingData = mutable.LinkedHashSet[Long]()
   private var dataTxRunning = 0
   private var counters = Stats(0, 0, 0, 0, 0, 0)
+  private val cleanCache = CleanCache(config.cleanCacheBytes)
+  private val detector =
+    SequentialDetector(initialWindow = 4 * info.geometry.logicalBlockSize, maxWindow = config.maxReadahead)
+  private var fetches = 0L
 
   private[vdisk] def dirtyBytes: Long = synchronized(dirtyTotal)
   private[vdisk] def mapTxInFlight: Boolean = synchronized(mapTxRunning)
   private[vdisk] def stats: Stats = synchronized(counters)
+  /** Number of `readRanges` calls made by reads */
+  private[vdisk] def fetchCount: Long = synchronized(fetches)
+  private[vdisk] def cleanBytes(index: Long): Long = synchronized(cleanCache.get(index).map(_.bytes).getOrElse(0L))
+  private[vdisk] def dropClean(index: Long): Unit = synchronized(cleanCache.invalidate(index))
+  /** Performs every read fetch. Tests replace it to simulate a store serving an older revision */
+  @volatile private[vdisk] var rangeReader: RangeReader = (ptr, ranges) => client.readRanges(ptr, ranges)
+  /** Map and data transactions start once it completes. Tests use it to hold commits in flight */
+  @volatile private[vdisk] var commitGate: Future[Unit] = Future.unit
 
   // ---- BlockDevice ----
 
@@ -68,13 +84,23 @@ final class VirtualDisk private (val client: AspenClient,
     geom.validate(offset, length) match
       case Some(err) => Future.failed(err)
       case None =>
+        val readahead = if length == 0 then 0 else synchronized(detector.onRead(offset, length))
+        // The readahead stays within the block object holding the request's end, and within the disk
+        def fetchEnd(seg: BlockSegment): Int =
+          val end = seg.offsetInBlock + seg.length
+          if seg.offsetInRequest + seg.length < length || readahead == 0 then
+            end
+          else
+            val blockEnd = math.min(geom.blockObjectSize.toLong, geom.size - seg.blockIndex * geom.blockObjectSize)
+            math.min(end.toLong + readahead, blockEnd).toInt
         geom.segments(offset, length) match
           case Nil => Future.successful(Array.emptyByteArray)
-          case seg :: Nil => readSegment(seg)
+          case seg :: Nil => readSegment(seg, fetchEnd(seg))
           case segs =>
             val result = new Array[Byte](length)
             Future.sequence(segs.map: seg =>
-              readSegment(seg).map(bytes => System.arraycopy(bytes, 0, result, seg.offsetInRequest, seg.length))
+              readSegment(seg, fetchEnd(seg)).map: bytes =>
+                System.arraycopy(bytes, 0, result, seg.offsetInRequest, seg.length)
             ).map(_ => result)
 
   def write(offset: Long, data: Array[Byte], fua: Boolean): Future[Unit] =
@@ -162,6 +188,7 @@ final class VirtualDisk private (val client: AspenClient,
         st.timer = None
         st.takeAllWaiters().foreach(p => later(p.failure(err)))
       blocks.clear()
+      cleanCache.clear()
       awaitingMap.clear()
       awaitingData.clear()
       dirtyTotal = 0
@@ -259,7 +286,7 @@ final class VirtualDisk private (val client: AspenClient,
     val ptr = st.pointer.get
     val revision = st.revision
     val length = st.length
-    val clean = st.clean.snapshot
+    val clean = cleanPieces(b)
     launch:
       runDataTx(ptr, revision, length, clean, snap).onComplete: r =>
         locked:
@@ -272,7 +299,7 @@ final class VirtualDisk private (val client: AspenClient,
                   else counters.copy(rangedTxCount = counters.rangedTxCount + 1)
                 st.revision = Some(newRevision)
                 st.length = Some(newLength)
-                snap.pieces.foreach((o, bytes) => st.clean.put(o, bytes, 0))
+                snap.pieces.foreach((o, bytes) => cleanCache.merge(b, o, bytes))
                 committed(b, st, snap)
               case Failure(e) => fail(s"commit of block $b failed: $e")
             startQueued()
@@ -284,13 +311,14 @@ final class VirtualDisk private (val client: AspenClient,
       blocks.get(b).foreach(st => kick(b, st))
 
   /** Commits `snap` to a mapped block. Dirty data covering the whole block replaces it; anything else is a ranged
-    * write, whose pre-image comes from the clean cache when it holds every byte written, and otherwise from a read
+    * write, whose pre-image comes from the clean cache when it holds every byte written, and otherwise from a read.
+    * The clean cache may have evicted the block, or hold only part of it
     */
   private def runDataTx(ptr: DataObjectPointer,
                         revision: Option[ObjectRevision],
                         length: Option[Int],
-                        clean: SegmentSnapshot,
-                        snap: SegmentSnapshot): Future[DataCommit] =
+                        clean: Vector[(Int, Array[Byte])],
+                        snap: SegmentSnapshot): Future[DataCommit] = commitGate.flatMap: _ =>
     val blockSize = currentGeometry.blockObjectSize
     if covers(snap.pieces, 0, blockSize) then
       val content = new Array[Byte](blockSize)
@@ -306,8 +334,8 @@ final class VirtualDisk private (val client: AspenClient,
     else
       val writes = snap.writes
       val fstate = (revision, length) match
-        case (Some(r), Some(len)) if writes.forall(w => covers(clean.pieces, w.offset, math.min(w.end, len).toInt)) =>
-          val needed = clean.pieces.filter: (o, bytes) =>
+        case (Some(r), Some(len)) if writes.forall(w => covers(clean, w.offset, math.min(w.end, len).toInt)) =>
+          val needed = clean.filter: (o, bytes) =>
             o + bytes.length <= len && writes.exists(w => o < w.end && w.offset < o + bytes.length)
           Future.successful(RangedWriteState.fromRanges(ptr, r, len, needed.toList))
         case _ =>
@@ -363,13 +391,13 @@ final class VirtualDisk private (val client: AspenClient,
                     st.pointer = Some(insert._2)
                     st.revision = Some(revision)
                     st.length = Some(snap.end)
-                    st.clean.put(0, content._2, 0)
+                    cleanCache.merge(b, 0, content._2)
                     committed(b, st, snap)
                 case Failure(e) => fail(s"map transaction failed: $e")
               mapKickRequested = true
 
   private def runMapTx(contents: List[(Long, Array[Byte])])
-      : Future[(List[(Long, DataObjectPointer)], ObjectRevision)] =
+      : Future[(List[(Long, DataObjectPointer)], ObjectRevision)] = commitGate.flatMap: _ =>
     client.transact: tx =>
       given Transaction = tx
       tx.sharedLockRevision(info.fencePointer, fenceRevision)
@@ -389,10 +417,15 @@ final class VirtualDisk private (val client: AspenClient,
 
   // ---- Reads ----
 
+  /** The block's clean pieces. Under the monitor, they are at `revision` */
+  private def cleanPieces(b: Long): Vector[(Int, Array[Byte])] =
+    cleanCache.get(b).map(_.pieces).getOrElse(Vector.empty)
+
   /** Bytes of one segment: the dirty overlay over committed content, which comes from the clean cache or a ranged
-    * read. The overlay is taken before any I/O, so every write completed before the read is reflected
+    * read. The overlay is taken before any I/O, so every write completed before the read is reflected. A fetch also
+    * reads `[segment end, fetchEnd)` ahead into the clean cache
     */
-  private def readSegment(seg: BlockSegment): Future[Array[Byte]] =
+  private def readSegment(seg: BlockSegment, fetchEnd: Int): Future[Array[Byte]] =
     val from = seg.offsetInBlock
     val to = from + seg.length
     val start: Either[Future[Array[Byte]], (BlockState, SegmentSnapshot)] = synchronized:
@@ -408,30 +441,55 @@ final class VirtualDisk private (val client: AspenClient,
     start match
       case Left(result) => result
       case Right((st, overlay)) =>
-        ensureLookedUp(seg.blockIndex, st).flatMap(_ => fetchSegment(seg, st, overlay))
+        ensureLookedUp(seg.blockIndex, st).flatMap(_ => fetchSegment(seg, st, overlay, fetchEnd))
 
-  private def fetchSegment(seg: BlockSegment, st: BlockState, overlay: SegmentSnapshot): Future[Array[Byte]] =
+  private def fetchSegment(seg: BlockSegment,
+                           st: BlockState,
+                           overlay: SegmentSnapshot,
+                           fetchEnd: Int): Future[Array[Byte]] =
+    val b = seg.blockIndex
     val from = seg.offsetInBlock
     val to = from + seg.length
-    val (pointer, length, clean, generation) = synchronized((st.pointer, st.length, st.clean.snapshot, st.generation))
+    val (pointer, revision, length, clean, generation) =
+      synchronized((st.pointer, st.revision, st.length, cleanPieces(b), st.generation))
     pointer match
       case None => Future.successful(assemble(seg, Nil, overlay))
       case Some(ptr) =>
+        val held = clean ++ overlay.pieces
         // Bytes beyond the object's length are zeros. When the length is unknown a read past it comes back short
-        val missing = gaps(from, to, clean.pieces ++ overlay.pieces).flatMap: (a, e) =>
+        def needed(end: Int): List[(Int, Int)] = gaps(from, end, held).flatMap: (a, e) =>
           length match
             case Some(len) => if a < len then Some((a, math.min(e, len))) else None
             case None => Some((a, e))
-        if missing.isEmpty then
-          Future.successful(assemble(seg, clean.pieces, overlay))
+        if needed(to).isEmpty then
+          Future.successful(assemble(seg, clean, overlay))
         else
-          client.readRanges(ptr, missing.map((a, e) => (a, e - a))).map: states =>
+          // Readahead joins a fetch the request needs anyway, so a read served from the caches costs no I/O
+          val ranges = needed(fetchEnd)
+          synchronized:
+            fetches += 1
+          rangeReader(ptr, ranges.map((a, e) => (a, e - a))).flatMap: states =>
+            val fetchRevision = states.head.revision
             val fetched = states.map(s => (s.offset, s.data.getByteArray)).filter(_._2.nonEmpty)
-            synchronized:
-              // A commit completed during the read may have changed what was read
-              if stopped.isEmpty && st.generation == generation && states.forall(s => st.revision.forall(_ == s.revision)) then
-                fetched.foreach((o, bytes) => st.clean.put(o, bytes, 0))
-            assemble(seg, clean.pieces ++ fetched, overlay)
+            val outcome: Either[VDiskError, Boolean] = synchronized:
+              stopped match
+                case Some(err) => Left(err)
+                case None =>
+                  val current = st.revision
+                  // The owner is the only writer, so a known revision is authoritative. Bytes from any other
+                  // revision (a store still serving an older state) are neither cached nor returned
+                  if st.generation == generation && current.forall(_ == fetchRevision) then
+                    if current.isEmpty then
+                      st.revision = Some(fetchRevision)
+                    if st.length.isEmpty then
+                      st.length = states.flatMap(_.objectLength).headOption
+                    fetched.foreach((o, bytes) => cleanCache.merge(b, o, bytes))
+                  // A commit completed during the fetch is covered by the overlay or newer than the read
+                  Right(revision.exists(_ != fetchRevision) && !current.contains(fetchRevision))
+            outcome match
+              case Left(err) => Future.failed(err)
+              case Right(true) => fetchSegment(seg, st, overlay, fetchEnd)
+              case Right(false) => Future.successful(assemble(seg, clean ++ fetched, overlay))
 
 object VirtualDisk:
 
@@ -442,6 +500,8 @@ object VirtualDisk:
                                         maxConcurrentDataTx: Int,
                                         writesDuringCommit: Long,
                                         preImageReads: Long)
+
+  private[vdisk] type RangeReader = (DataObjectPointer, List[(Int, Int)]) => Future[List[DataObjectRangeState]]
 
   private final case class DataCommit(revision: ObjectRevision, length: Int, overwrote: Boolean)
 

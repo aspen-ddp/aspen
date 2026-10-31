@@ -1,16 +1,21 @@
 package org.aspen_ddp.aspen.vdisk
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.ObjectAllocator
+import org.aspen_ddp.aspen.client.{DataObjectRangeState, ObjectAllocator}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.common.Radicle
+import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
 
+import java.util.UUID
 import scala.collection.mutable.ListBuffer
-import scala.concurrent.Future
+import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.*
 
 class VirtualDiskSuite extends IntegrationTestSuite:
+
+  private type RangeReader = VirtualDisk.RangeReader
 
   override def testIda: IDA = RandomAccessReedSolomon(5, 3, 4, 64)
   override def testPoolMaxSliceSize: Option[Int] =
@@ -128,8 +133,8 @@ class VirtualDiskSuite extends IntegrationTestSuite:
     val rnd = new scala.util.Random(42)
     val model = new Array[Byte](DiskSize)
     // Writes are issued together without awaiting, over the first two blocks. With both blocks looked up and no
-    // coalescing window, the first write to each starts its commit before returning, so the rest land on a block
-    // whose commit is in flight
+    // coalescing window, the first write to each starts its commit before returning. The commit gate holds those
+    // commits, so the rest land on a block whose commit is in flight
     def burst(d: VirtualDisk, seedBase: Int): List[Future[Unit]] =
       (1 to 20).toList.map: i =>
         val offset = rnd.nextInt(8) * 4096
@@ -137,15 +142,22 @@ class VirtualDiskSuite extends IntegrationTestSuite:
         val data = pattern(len, seedBase + i)
         applyTo(model, offset, data)
         d.write(offset, data, fua = false)
+    def held(d: VirtualDisk, seedBase: Int): (List[Future[Unit]], Long) =
+      val gate = Promise[Unit]()
+      d.commitGate = gate.future
+      val writes = burst(d, seedBase)
+      val during = d.stats.writesDuringCommit
+      d.commitGate = Future.unit
+      gate.success(())
+      (writes, during)
     for
       _ <- createDisk()
       d1 <- acquire(Eager)
       _ <- d1.read(0, 2 * BlockSize)
       // First against the map transactions that create the blocks, then against data transactions
-      first = burst(d1, 0)
-      duringMap = d1.stats.writesDuringCommit
+      (first, duringMap) = held(d1, 0)
       _ <- d1.flush()
-      second = burst(d1, 100)
+      (second, duringData) = held(d1, 100)
       _ <- d1.flush()
       _ <- Future.sequence(first ++ second)
       own <- d1.read(0, DiskSize)
@@ -153,7 +165,7 @@ class VirtualDiskSuite extends IntegrationTestSuite:
       r <- d2.read(0, DiskSize)
     yield
       duringMap should be > 0L
-      d1.stats.writesDuringCommit should be > duringMap
+      duringData should be > duringMap
       own should be (model)
       r should be (model)
 
@@ -282,3 +294,91 @@ class VirtualDiskSuite extends IntegrationTestSuite:
       d1.stats.rangedTxCount should be (0L)
       d2.stats.overwriteTxCount should be (1L)
       r should be (again)
+
+  atest("sequential reads hit the clean cache"):
+    val data = pattern(BlockSize, 14)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, data, fua = false)
+      _ <- d1.write(BlockSize, data, fua = false)
+      _ <- d1.flush()
+      // A new owner starts with an empty clean cache
+      d2 <- acquire()
+      r0 <- d2.read(0, 4096)
+      // A random read stays small
+      afterRandom = d2.cleanBytes(0)
+      // The second read is sequential, so its fetch reads ahead to the end of the block, and no further
+      r1 <- d2.read(4096, 4096)
+      afterSequential = d2.fetchCount
+      r2 <- d2.read(8192, 4096)
+      r3 <- d2.read(12288, 4096)
+      reread <- d2.read(0, BlockSize)
+    yield
+      afterRandom should be (4096L)
+      afterSequential should be (2L)
+      d2.fetchCount should be (2L)
+      d2.cleanBytes(0) should be (BlockSize.toLong)
+      d2.cleanBytes(1) should be (0L)
+      (r0 ++ r1 ++ r2 ++ r3) should be (data)
+      reread should be (data)
+
+  atest("clean cache evicts beyond its byte bound"):
+    val data = pattern(BlockSize, 15)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, data, fua = false)
+      _ <- d1.write(BlockSize, data, fua = false)
+      _ <- d1.flush()
+      d2 <- acquire(VDiskConfig(cleanCacheBytes = 16384))
+      b0 <- d2.read(0, BlockSize)
+      b1 <- d2.read(BlockSize, BlockSize)
+      firstCached = d2.cleanBytes(0)
+      secondCached = d2.cleanBytes(1)
+      fetchesBefore = d2.fetchCount
+      again <- d2.read(0, BlockSize)
+    yield
+      b0 should be (data)
+      b1 should be (data)
+      firstCached should be (0L)
+      secondCached should be (BlockSize.toLong)
+      again should be (data)
+      d2.fetchCount should be (fetchesBefore + 1)
+
+  atest("a fetch returning another revision is refetched"):
+    val v1 = pattern(BlockSize, 16)
+    val v2 = pattern(4096, 17)
+    val model = v1.clone()
+    applyTo(model, 0, v2)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, v1, fua = false)
+      _ <- d1.flush()
+      _ <- d1.write(0, v2, fua = false)
+      _ <- d1.flush()
+      _ = d1.dropClean(0)
+      // The first fetch looks like a store still serving the first commit
+      _ = d1.rangeReader = staleOnce(v1)
+      r <- d1.read(0, BlockSize)
+      cached = d1.cleanBytes(0)
+      again <- d1.read(0, BlockSize)
+    yield
+      r should be (model)
+      d1.fetchCount should be (2L)
+      cached should be (BlockSize.toLong)
+      again should be (model)
+
+  /** A reader whose first call returns `old`'s bytes at an unknown revision, as a lagging store would */
+  private def staleOnce(old: Array[Byte]): RangeReader =
+    val first = new java.util.concurrent.atomic.AtomicBoolean(true)
+    (ptr, ranges) =>
+      client.readRanges(ptr, ranges).map: states =>
+        if first.getAndSet(false) then
+          val oldRevision = ObjectRevision(TransactionId(UUID.randomUUID()))
+          states.map: s =>
+            new DataObjectRangeState(s.pointer, oldRevision, s.refcount, s.timestamp, s.readTimestamp, s.ida,
+              s.offset, DataBuffer(old.slice(s.offset, s.offset + s.data.size)), s.objectLength)
+        else
+          states

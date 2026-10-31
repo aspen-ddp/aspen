@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.tkvl.{DataObjectTKVL, TKVLInsert}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, Value}
 
 import scala.collection.mutable
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 /** The disk's block index -> block object map. The owner is the map's only writer, so every entry it has looked up
   * or committed, absence included, stays valid in memory and no index is looked up over the network twice.
@@ -18,10 +18,20 @@ final class BlockMap(tree: DataObjectTKVL):
   private val known = mutable.HashMap[Long, Option[DataObjectPointer]]()
   private val pending = mutable.HashMap[Long, Future[Option[DataObjectPointer]]]()
 
-  def lookup(index: Long): Future[Option[DataObjectPointer]] = synchronized:
-    known.get(index) match
-      case Some(r) => Future.successful(r)
-      case None => pending.getOrElseUpdate(index, fetch(index))
+  def lookup(index: Long): Future[Option[DataObjectPointer]] =
+    // The placeholder is registered under the monitor and the tree read starts after it is released
+    val (result, started) = synchronized:
+      known.get(index) match
+        case Some(r) => (Future.successful(r), None)
+        case None =>
+          pending.get(index) match
+            case Some(f) => (f, None)
+            case None =>
+              val p = Promise[Option[DataObjectPointer]]()
+              pending(index) = p.future
+              (p.future, Some(p))
+    started.foreach(p => p.completeWith(fetch(index)))
+    result
 
   /** Reads the entry from the tree, bypassing what is held in memory, and holds the result */
   def refresh(index: Long): Future[Option[DataObjectPointer]] =

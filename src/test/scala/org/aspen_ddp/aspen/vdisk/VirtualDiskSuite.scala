@@ -637,6 +637,44 @@ class VirtualDiskSuite extends IntegrationTestSuite:
       gone shouldBe an [InvalidObject]
       mapped should be (None)
 
+  // The FUA data is never committed, so the write is durable only once the old object is deleted: until then a crash
+  // would leave the block reading its pre-FUA contents
+  atest("FUA and FLUSH waiting on a block that is unmapped complete once its object is deleted"):
+    val x = pattern(BlockSize, 41)
+    val dataStarted = Promise[Unit]()
+    val dataGate = Promise[Unit]()
+    val mapStarted = Promise[Unit]()
+    val mapGate = Promise[Unit]()
+    for
+      _ <- createDisk()
+      d1 <- acquire(Eager)
+      _ <- d1.write(BlockSize, x, fua = false)
+      _ <- d1.flush()
+      ptr = d1.blockPointer(1).get
+      _ = d1.commitGate = () =>
+        if dataStarted.trySuccess(()) then
+          dataGate.future
+        else
+          mapStarted.trySuccess(())
+          mapGate.future
+      fua = d1.write(BlockSize, pattern(4096, 42), fua = true)
+      _ <- dataStarted.future
+      flushed = d1.flush()
+      _ <- d1.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      _ = dataGate.success(())
+      // The deletion's map transaction starts once the superseded data commit has ended, and is held here
+      _ <- mapStarted.future
+      _ = (fua.isCompleted, flushed.isCompleted) should be ((false, false))
+      _ = mapGate.success(())
+      _ <- fua
+      gone <- client.readMetadata(ptr).failed
+      _ <- flushed
+      d2 <- acquire()
+      r <- d2.read(BlockSize, BlockSize)
+    yield
+      gone shouldBe an [InvalidObject]
+      r should be (new Array[Byte](BlockSize))
+
   atest("unmap during an in-flight map transaction deletes the object it creates"):
     val x = pattern(BlockSize, 38)
     val y = pattern(4096, 39)

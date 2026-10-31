@@ -39,7 +39,8 @@ import scala.util.{Failure, Success}
   * UNMAP drops a block's dirty data and makes it read as zeros at once. Its object, if it has one, and its map entry
   * are deleted by a later map transaction, once any commit in flight on the block has ended: a data commit the unmap
   * supersedes is not retried, and an object a superseded map attempt created is deleted too. A block written again
-  * first gets a new object in the same transaction that deletes the old one. FLUSH waits for the deletions.
+  * first gets a new object in the same transaction that deletes the old one. FLUSH waits for the deletions, and so
+  * does a FUA or FLUSH that was waiting on a write the unmap dropped.
   *
   * Writes wait only while the dirty total is at `dirtyHardLimit`, until writeback brings it below.
   */
@@ -374,9 +375,9 @@ final class VirtualDisk private (val client: AspenClient,
 
   // ---- UNMAP ----
 
-  /** Drops the block's dirty data, which completes its waiters, and makes it read as zeros. Unless it is known to
-    * have no object, the next map transaction that can deletes the one in the map, waiting for a commit in flight
-    * on the block to end first. Under the monitor
+  /** Drops the block's dirty data and makes it read as zeros. Unless it is known to have no object, the next map
+    * transaction that can deletes the one in the map, waiting for a commit in flight on the block to end first. Its
+    * FUA and FLUSH waiters complete once the deletions are done. Under the monitor
     */
   private def unmapBlock(b: Long)(using Deferred): Unit =
     val st = block(b)
@@ -385,9 +386,9 @@ final class VirtualDisk private (val client: AspenClient,
     st.timer = None
     dirtyTotal -= st.dirty.bytes
     st.dirty.removeUpTo(Long.MaxValue)
-    // Its writes are superseded, so FLUSH and FUA waiting for them are done
+    // Its writes are superseded and will never be committed
     st.committedSeq = math.max(st.committedSeq, nextSeq)
-    st.takeSatisfied().foreach(p => later(p.success(())))
+    val superseded = st.takeSatisfied()
     awaitingMap.remove(b)
     awaitingData.remove(b)
     // A commit in flight may yet create or change an object, which then has to be deleted too
@@ -401,6 +402,12 @@ final class VirtualDisk private (val client: AspenClient,
       queueDelete(b, refresh = false)
     if pendingDeletes.contains(b) then
       mapKickRequested = true
+    // The superseded writes are durable only once the block's old object is gone: until then a crash would leave it
+    // reading its earlier contents. Waiting for every outstanding deletion covers one already in a map transaction
+    if superseded.nonEmpty then
+      awaitDeletes(nextDeleteSeq) match
+        case None => superseded.foreach(p => later(p.success(())))
+        case Some(deleted) => superseded.foreach(p => later(p.completeWith(deleted)))
 
   private def queueDelete(b: Long, refresh: Boolean): Unit =
     nextDeleteSeq += 1

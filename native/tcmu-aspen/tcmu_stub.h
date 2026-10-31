@@ -28,6 +28,9 @@ void stub_dev_free(struct tcmu_device *dev);
  * Returns 0 with *rc set, or -1 on timeout. */
 int stub_wait_complete(void *cmd, int *rc, int timeout_ms);
 
+/* Like stub_wait_complete, and also reports the conn_lost count when cmd was completed. */
+int stub_wait_complete_lost(void *cmd, int *rc, int *conn_lost_before, int timeout_ms);
+
 /* Completions recorded and not yet consumed by stub_wait_complete. */
 int stub_unconsumed_completions(void);
 

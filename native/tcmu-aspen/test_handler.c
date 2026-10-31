@@ -272,6 +272,16 @@ static int wait_complete(struct tcmur_cmd *cmd)
 	return rc;
 }
 
+/* Waits for a command failed by a connection loss: BUSY, completed after conn_lost. */
+static void wait_lost(struct tcmur_cmd *cmd)
+{
+	int rc = -12345, lost_before = -1;
+
+	CHECK(stub_wait_complete_lost(cmd, &rc, &lost_before, WAIT_MS) == 0);
+	CHECK(rc == TCMU_STS_BUSY);
+	CHECK(lost_before == 1);
+}
+
 /* ---------------------------------------------------------------- fixtures */
 
 struct fixture {
@@ -426,6 +436,31 @@ static int open_failing(uint32_t status, bool fail_lock)
 	close(fd);
 	fixture_done(&f);
 	return ret;
+}
+
+/* OPEN succeeds but the daemon's logical block size differs from tcmu's. */
+static void test_open_block_size_mismatch(void)
+{
+	struct fixture f;
+	struct call c;
+	uint8_t geom[8];
+	struct req r;
+	int fd;
+
+	fixture_init(&f);
+	c = (struct call){.kind = CALL_OPEN, .dev = &f.dev};
+	call_start(&c);
+	fd = d_accept(f.lfd);
+	d_expect_req(fd, &r, ASPEN_OP_OPEN);
+	put_u32(geom, BLOCK_OBJECT_SIZE);
+	put_u32(geom + 4, 4096);
+	d_reply(fd, r.op, ASPEN_ST_OK, r.id, geom, sizeof(geom));
+	req_free(&r);
+	CHECK(call_join(&c) == -EINVAL);
+	d_expect_eof(fd);
+	CHECK(tcmur_dev_get_private(&f.dev) == NULL);
+	close(fd);
+	fixture_done(&f);
 }
 
 static void test_open_failures(void)
@@ -785,8 +820,8 @@ static void test_disconnect(void)
 	req_free(&r);
 
 	shutdown(f.dfd, SHUT_RDWR);
-	CHECK(wait_complete(w) == TCMU_STS_BUSY);
-	CHECK(wait_complete(rd) == TCMU_STS_BUSY);
+	wait_lost(w);
+	wait_lost(rd);
 	CHECK(stub_wait_conn_lost(1, WAIT_MS) == 0);
 	after_loss(&f);
 	fixture_done(&f);
@@ -810,7 +845,7 @@ static void test_oversized_reply(void)
 	d_expect_req(f.dfd, &r, ASPEN_OP_READ);
 	d_reply(f.dfd, r.op, ASPEN_ST_OK, r.id, big, sizeof(big));
 	req_free(&r);
-	CHECK(wait_complete(cmd) == TCMU_STS_BUSY);
+	wait_lost(cmd);
 	CHECK(stub_wait_conn_lost(1, WAIT_MS) == 0);
 	after_loss(&f);
 	fixture_done(&f);
@@ -833,7 +868,7 @@ static void test_unknown_id(void)
 	d_expect_req(f.dfd, &r, ASPEN_OP_READ);
 	d_reply(f.dfd, ASPEN_OP_FLUSH, ASPEN_ST_OK, r.id + 1000, NULL, 0);
 	req_free(&r);
-	CHECK(wait_complete(cmd) == TCMU_STS_BUSY);
+	wait_lost(cmd);
 	CHECK(stub_wait_conn_lost(1, WAIT_MS) == 0);
 	after_loss(&f);
 	fixture_done(&f);
@@ -880,6 +915,37 @@ static void test_close_without_reply(void)
 	fixture_done(&f);
 }
 
+/* After close and before a successful reopen, the runner may still send I/O and resizes. */
+static void test_closed_device(void)
+{
+	struct fixture f;
+	struct test_cmd t;
+	struct tcmur_cmd *cmd;
+	uint8_t data[BLOCK_SIZE] = {0};
+	struct iovec iov = {data, sizeof(data)};
+	struct tcmulib_cfg_info cfg = {.type = TCMULIB_CFG_DEV_SIZE};
+
+	fixture_init(&f);
+	do_open(&f, false);
+	do_close(&f);
+	close(f.dfd);
+	f.dfd = -1;
+
+	cmd = make_cmd(&t, 0x2A, 0);
+	CHECK(handler->write(&f.dev, cmd, &iov, 1, sizeof(data), 0) == TCMU_STS_BUSY);
+	CHECK(handler->read(&f.dev, cmd, &iov, 1, sizeof(data), 0) == TCMU_STS_BUSY);
+	CHECK(handler->flush(&f.dev, cmd) == TCMU_STS_BUSY);
+	CHECK(handler->unmap(&f.dev, cmd, 0, BLOCK_SIZE) == TCMU_STS_BUSY);
+	cfg.data.dev_size = 4ULL << 20;
+	CHECK(handler->reconfig(&f.dev, &cfg) == -EBUSY);
+
+	do_open(&f, true);
+	CHECK(write_flags(&f, 0x2A, 0) == 0);
+	do_close(&f);
+	CHECK(stub_conn_lost_count() == 0);
+	fixture_done(&f);
+}
+
 static void test_handler_registration(void)
 {
 	CHECK(strcmp(handler->name, "Aspen virtual disk") == 0);
@@ -907,6 +973,7 @@ int main(void)
 	RUN(test_check_config);
 	RUN(test_open);
 	RUN(test_open_failures);
+	RUN(test_open_block_size_mismatch);
 	RUN(test_fua);
 	RUN(test_write_iovecs);
 	RUN(test_read);
@@ -920,6 +987,7 @@ int main(void)
 	RUN(test_unknown_id);
 	RUN(test_close);
 	RUN(test_close_without_reply);
+	RUN(test_closed_device);
 
 	unlink(sock_path);
 	rmdir(tmpdir);

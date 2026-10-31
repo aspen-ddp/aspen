@@ -21,6 +21,7 @@ static pthread_cond_t stub_cond = PTHREAD_COND_INITIALIZER;
 static struct {
 	void *cmd;
 	int rc;
+	int conn_lost_before;
 } completions[MAX_COMPLETIONS];
 static int ncompletions;
 static int conn_lost;
@@ -53,6 +54,13 @@ void stub_dev_free(struct tcmu_device *dev)
 
 int stub_wait_complete(void *cmd, int *rc, int timeout_ms)
 {
+	int lost;
+
+	return stub_wait_complete_lost(cmd, rc, &lost, timeout_ms);
+}
+
+int stub_wait_complete_lost(void *cmd, int *rc, int *conn_lost_before, int timeout_ms)
+{
 	struct timespec deadline;
 	int ret = -1;
 
@@ -62,6 +70,7 @@ int stub_wait_complete(void *cmd, int *rc, int timeout_ms)
 		for (int i = 0; i < ncompletions; i++) {
 			if (completions[i].cmd == cmd) {
 				*rc = completions[i].rc;
+				*conn_lost_before = completions[i].conn_lost_before;
 				completions[i] = completions[--ncompletions];
 				ret = 0;
 				goto out;
@@ -137,6 +146,7 @@ void tcmur_cmd_complete(struct tcmu_device *dev, void *data, int rc)
 	}
 	completions[ncompletions].cmd = data;
 	completions[ncompletions].rc = rc;
+	completions[ncompletions].conn_lost_before = conn_lost;
 	ncompletions++;
 	pthread_cond_broadcast(&stub_cond);
 	pthread_mutex_unlock(&stub_lock);

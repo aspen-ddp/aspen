@@ -257,7 +257,9 @@ static void finish(struct aspen_dev *ad, struct pending *p, bool lost, uint32_t 
 	pthread_mutex_unlock(&ad->lock);
 }
 
-static void connection_lost(struct aspen_dev *ad)
+/* Fails every pending request, plus taken (a request the reader already took out of the table,
+ * or NULL). The runner is notified before any command completes, as target.c asks. */
+static void connection_lost(struct aspen_dev *ad, struct pending *taken)
 {
 	struct pending *p, *next, *async = NULL;
 	bool notify;
@@ -280,12 +282,14 @@ static void connection_lost(struct aspen_dev *ad)
 	pthread_cond_broadcast(&ad->cond);
 	pthread_mutex_unlock(&ad->lock);
 
+	if (notify)
+		tcmu_notify_conn_lost(ad->dev);
+	if (taken != NULL)
+		finish(ad, taken, true, 0);
 	for (p = async; p != NULL; p = next) {
 		next = p->next;
 		finish(ad, p, true, 0);
 	}
-	if (notify)
-		tcmu_notify_conn_lost(ad->dev);
 }
 
 /* ---------------------------------------------------------------- reader thread */
@@ -302,7 +306,7 @@ static void *reader_main(void *arg)
 {
 	struct aspen_dev *ad = arg;
 	struct aspen_resp_hdr h;
-	struct pending *p;
+	struct pending *p = NULL;
 	int ret;
 
 	while (recv_resp_hdr(ad->fd, &h) == 0) {
@@ -315,20 +319,18 @@ static void *reader_main(void *arg)
 		if (h.op != p->op || !payload_len_ok(p, &h)) {
 			tcmu_dev_err(ad->dev, "bad reply to request %llu: op %u, payload %u bytes\n",
 				     (unsigned long long)h.id, h.op, h.payload_len);
-			finish(ad, p, true, 0);
 			break;
 		}
 		if (h.status == ASPEN_ST_OK && p->op == ASPEN_OP_READ)
 			ret = read_into_iov(ad->fd, p->iov, p->iov_cnt, h.payload_len);
 		else
 			ret = skip_bytes(ad->fd, h.payload_len);
-		if (ret) {
-			finish(ad, p, true, 0);
+		if (ret)
 			break;
-		}
 		finish(ad, p, false, h.status);
+		p = NULL;
 	}
-	connection_lost(ad);
+	connection_lost(ad, p);
 	return NULL;
 }
 
@@ -340,8 +342,12 @@ static int queue_io(struct tcmu_device *dev, struct tcmur_cmd *cmd, struct aspen
 		    struct iovec *iov, size_t iov_cnt)
 {
 	struct aspen_dev *ad = tcmur_dev_get_private(dev);
-	struct pending *p = calloc(1, sizeof(*p));
+	struct pending *p;
 
+	/* Between close and a successful reopen the runner can still send I/O. */
+	if (ad == NULL)
+		return TCMU_STS_BUSY;
+	p = calloc(1, sizeof(*p));
 	if (p == NULL)
 		return TCMU_STS_NO_RESOURCE;
 	p->op = h->op;
@@ -494,6 +500,13 @@ static int aspen_open(struct tcmu_device *dev, bool reopen)
 		goto fail;
 	}
 
+	if (get_u32(geom + 4) != block_size) {
+		tcmu_dev_err(dev, "%s has %u byte blocks, tcmu uses %u\n", disk, get_u32(geom + 4),
+			     block_size);
+		ret = -EINVAL;
+		goto fail;
+	}
+
 	tcmu_dev_set_write_cache_enabled(dev, true);
 	tcmu_dev_set_unmap_enabled(dev, true);
 	tcmu_dev_set_opt_unmap_gran(dev, get_u32(geom) / block_size, false);
@@ -526,6 +539,8 @@ static void aspen_close(struct tcmu_device *dev)
 	struct aspen_dev *ad = tcmur_dev_get_private(dev);
 	int64_t st;
 
+	if (ad == NULL)
+		return;
 	pthread_mutex_lock(&ad->lock);
 	ad->closing = true;
 	pthread_mutex_unlock(&ad->lock);
@@ -547,6 +562,8 @@ static int aspen_reconfig(struct tcmu_device *dev, struct tcmulib_cfg_info *cfg)
 
 	if (cfg->type != TCMULIB_CFG_DEV_SIZE)
 		return -EOPNOTSUPP;
+	if (ad == NULL)
+		return -EBUSY; /* closed, and not yet reopened */
 	st = sync_request(ad, ASPEN_OP_RESIZE, cfg->data.dev_size);
 	if (st != ASPEN_ST_OK) {
 		tcmu_dev_err(dev, "RESIZE to %llu failed with status %lld\n",

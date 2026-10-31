@@ -28,8 +28,10 @@ object DiskCatalog:
              logicalBlockSize: Int = 4096): Future[DiskInfo] =
     given ExecutionContext = client.clientContext
 
-    val validation: Either[InvalidGeometry, DiskGeometry] =
-      if logicalBlockSize != 512 && logicalBlockSize != 4096 then
+    val validation: Either[VDiskError, DiskGeometry] =
+      if name.isEmpty || name.contains('@') then
+        Left(InvalidRequest(s"invalid disk name '$name': must be non-empty and contain no '@'"))
+      else if logicalBlockSize != 512 && logicalBlockSize != 4096 then
         Left(InvalidGeometry(s"logical block size $logicalBlockSize is not 512 or 4096"))
       else if !isAligned(size, logicalBlockSize) then
         Left(InvalidGeometry(s"size $size is not a positive multiple of $logicalBlockSize"))

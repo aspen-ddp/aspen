@@ -14,3 +14,4 @@ object VDiskError:
   final case class DiskNotFound(name: String) extends VDiskError(s"disk not found: $name")
   final case class DiskAlreadyExists(name: String) extends VDiskError(s"disk already exists: $name")
   final case class InvalidGeometry(reason: String) extends VDiskError(s"invalid geometry: $reason")
+  case object NotOwner extends VDiskError("this handle does not own the disk")

@@ -41,6 +41,15 @@ class DiskCatalogSuite extends IntegrationTestSuite:
     yield
       r should be (VDiskError.DiskAlreadyExists("d1"))
 
+  atest("create rejects a name containing '@' or an empty name"):
+    for
+      alloc <- allocator()
+      r1 <- DiskCatalog.create(client, "a@b", alloc, 65536).failed
+      r2 <- DiskCatalog.create(client, "", alloc, 65536).failed
+    yield
+      r1 shouldBe a [VDiskError.InvalidRequest]
+      r2 shouldBe a [VDiskError.InvalidRequest]
+
   atest("create rejects unaligned size"):
     for
       alloc <- allocator()

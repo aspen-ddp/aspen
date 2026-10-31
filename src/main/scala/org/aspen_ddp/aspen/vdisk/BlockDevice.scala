@@ -27,3 +27,20 @@ trait BlockDevice:
 
   /** Crash-only: discards dirty data without flushing it and fails pending requests with `Fenced` */
   def close(): Unit
+
+enum LockState:
+  case Unlocked, Locked, Fenced
+  case Failed(reason: String)
+
+/** A block device whose ownership of the underlying disk can be taken and given up, so a frontend can map its
+  * own lock operations onto it
+  */
+trait LockableBlockDevice extends BlockDevice:
+
+  /** Takes ownership (fencing any other owner). Idempotent while Locked; concurrent calls share one takeover */
+  def acquire(): Future[Unit]
+
+  /** Locked: flush, then close. Any other state: close. Ends Unlocked */
+  def release(): Future[Unit]
+
+  def lockState: LockState

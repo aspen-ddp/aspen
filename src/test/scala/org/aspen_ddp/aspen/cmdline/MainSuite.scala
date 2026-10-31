@@ -271,6 +271,18 @@ class MainSuite extends AnyFunSuite with Matchers:
       Console.withErr(OutputStream.nullOutputStream()):
         Main.buildParser.parse(Seq(cmd, cfgs) ++ args, Main.Args())
 
+  test("create-disk takes exactly one of --pool and --group"):
+    val pool = parseCmd("create-disk", "d", "1G", "--pool", "p").getOrElse(fail("--pool did not parse"))
+    pool.diskName shouldBe "d"
+    pool.diskSize shouldBe 1073741824L
+    pool.diskPoolName shouldBe Some("p")
+    pool.diskGroupName shouldBe None
+    val group = parseCmd("create-disk", "d", "1G", "--group", "g").getOrElse(fail("--group did not parse"))
+    group.diskGroupName shouldBe Some("g")
+    group.diskPoolName shouldBe None
+    parseCmd("create-disk", "d", "1G", "--pool", "p", "--group", "g") shouldBe None
+    parseCmd("create-disk", "d", "1G") shouldBe None
+
   test("create-metadata-pool takes create-pool's positional arguments but not --metadata-group"):
     val parsed = parseCmd("create-metadata-pool", (poolArgs :+ "4096")*)
       .getOrElse(fail("create-metadata-pool did not parse"))

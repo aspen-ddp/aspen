@@ -812,14 +812,16 @@ A virtual disk is a block device stored in Aspen. Disks are managed with the CLI
 config and `--bootstrap-host` options):
 
 ```
-aspen create-disk <disk-name> <pool-name> <size> [--block-size 512|4096]
+aspen create-disk <disk-name> <size> (--pool <pool-name> | --group <group-name>) [--block-size 512|4096]
 aspen list-disks
 aspen grow-disk <disk-name> <new-size>
 aspen delete-disk <disk-name>
 ```
 
 Sizes are byte counts with an optional `K`, `M`, `G` or `T` binary suffix (`100G`). The size must be a multiple of
-the logical block size (4096 by default). Disks can only grow. `delete-disk` removes the disk and all of its data.
+the logical block size (4096 by default). The disk's objects are allocated from the given storage pool or
+allocation group, which must have a maximum object size. Disks can only grow. `delete-disk` removes the disk and
+all of its data.
 
 ## Where To Go From Here
 The AmoebaFS implementation is a good source for examples of how to use Aspen as are portions of the

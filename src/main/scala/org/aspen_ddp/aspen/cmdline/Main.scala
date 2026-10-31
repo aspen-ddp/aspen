@@ -133,6 +133,8 @@ object Main {
                   diskName:String="",
                   diskSize:Long=0L,
                   diskBlockSize:Int=4096,
+                  diskPoolName:Option[String]=None,
+                  diskGroupName:Option[String]=None,
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
                   networkCacheDir:Option[os.Path]=None,
@@ -597,9 +599,12 @@ object Main {
       clientConfigArg(p),
       bootstrapHostOption(p),
       diskNameArg(p, "Name of the new virtual disk"),
-      arg[String]("<pool-name>").text("Name of the storage pool to allocate the disk's objects in").
-        action((x, c) => c.copy(poolName = x)),
       sizeArg(p, "<size>", "Disk size in bytes, with an optional K, M, G or T binary suffix"),
+      // checkConfig requires exactly one of --pool and --group
+      opt[String]("pool").valueName("<pool-name>").text("Storage pool to allocate the disk's objects in").
+        action((x, c) => c.copy(diskPoolName = Some(x))),
+      opt[String]("group").valueName("<group-name>").text("Allocation group to allocate the disk's objects in").
+        action((x, c) => c.copy(diskGroupName = Some(x))),
       opt[Int]("block-size").text("Logical block size, 512 or 4096 (default 4096)").
         validate(x => if x == 512 || x == 4096 then success else failure("Block size must be 512 or 4096")).
         action((x, c) => c.copy(diskBlockSize = x)),
@@ -896,6 +901,8 @@ object Main {
         validateGroupIda(c)
       else if c.mode == "create-pool" || c.mode == "create-metadata-pool" then
         validatePoolBackend(c)
+      else if c.mode == "create-disk" && c.diskPoolName.isDefined == c.diskGroupName.isDefined then
+        failure("create-disk requires exactly one of --pool and --group")
       else if c.mode == "system-rebalance-period" then
         // Validated here rather than in the handler so a malformed period is a usage error,
         // reported before any client or network is built.
@@ -1002,7 +1009,8 @@ object Main {
               create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel, cfg.maxSliceSize, policy, ida,
                                       cfg.newGroupMetadata)
             case "create-filesystem" => create_filesystem(session, cfg.fsName, cfg.poolName)
-            case "create-disk" => create_disk(session, cfg.diskName, cfg.poolName, cfg.diskSize, cfg.diskBlockSize)
+            case "create-disk" =>
+              create_disk(session, cfg.diskName, cfg.diskPoolName, cfg.diskGroupName, cfg.diskSize, cfg.diskBlockSize)
             case "list-disks" => list_disks(session)
             case "grow-disk" => grow_disk(session, cfg.diskName, cfg.diskSize)
             case "delete-disk" => delete_disk(session, cfg.diskName)
@@ -1280,22 +1288,37 @@ object Main {
     case VDiskError.InvalidGeometry(reason) => Some(reason)
     case _ => None
 
-  def create_disk(session: ClientSession, diskName: String, poolName: String, size: Long, blockSize: Int): Int =
+  /** Allocates the disk's objects in the named pool or, when no pool is given, the named allocation group */
+  def create_disk(session: ClientSession,
+                  diskName: String,
+                  poolName: Option[String],
+                  groupName: Option[String],
+                  size: Long,
+                  blockSize: Int): Int =
     configureLogging()
     val (client, network, _) = createAspenClient(session)
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
+    val allocator: Future[ObjectAllocator] = poolName match
+      case Some(name) =>
+        client.getStoragePoolId(name).flatMap(client.getStoragePool).map(pool => new PoolObjectAllocator(client, pool))
+      case None =>
+        val name = groupName.getOrElse("")
+        client.getAllocationGroupId(name).recoverWith:
+          case _: NoSuchElementException => Future.failed(GroupNotFound(name))
+        .flatMap(groupId => client.getAllocator(GroupObjectAllocatorId(groupId)))
+
     val f = for
-      poolId <- client.getStoragePoolId(poolName)
-      pool <- client.getStoragePool(poolId)
-      info <- DiskCatalog.create(client, diskName, new PoolObjectAllocator(client, pool), size, blockSize)
+      alloc <- allocator
+      info <- DiskCatalog.create(client, diskName, alloc, size, blockSize)
     yield info
 
     awaitAndReport(f):
       case Success(info) => println(s"Created disk ${formatDiskInfo(info)}")
+      case Failure(e: GroupNotFound) => println(s"Error: allocation group '${e.name}' not found")
       // getStoragePoolId throws this when the name is not registered.
-      case Failure(_: NoSuchElementException) => println(s"Error: storage pool '$poolName' not found")
+      case Failure(_: NoSuchElementException) => println(s"Error: storage pool '${poolName.getOrElse("")}' not found")
       case Failure(err) =>
         println(s"Error: ${diskErrorMessage(err).getOrElse(s"creating disk failed: ${err.getMessage}")}")
 

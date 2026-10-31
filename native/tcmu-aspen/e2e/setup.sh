@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Creates the tcmu aspen backstore, iSCSI target, LUN, ACL and portal, then logs in.
-# Run as root. Idempotent. Variables: DISK, SIZE, IQN, SOCKET, INITIATOR_IQN.
+# Run as root. Idempotent. Variables: DISK, SIZE, BLOCK_SIZE (the disk's logical block size), CONTROL (the
+# target_core_user control string; defaults to hw_block_size=$BLOCK_SIZE), IQN, SOCKET, INITIATOR_IQN.
 set -euo pipefail
 
 DISK="${DISK:-vd1}"
 SIZE="${SIZE:-10G}"
+BLOCK_SIZE="${BLOCK_SIZE:-4096}"
+CONTROL="${CONTROL:-hw_block_size=$BLOCK_SIZE}"
 IQN="${IQN:-iqn.2026-10.org.aspen-ddp:${DISK}}"
 SOCKET="${SOCKET:-/run/aspen/vdisk.sock}"
 INITIATOR_IQN="${INITIATOR_IQN:-$(sed -n 's/^InitiatorName=//p' /etc/iscsi/initiatorname.iscsi)}"
@@ -14,7 +17,8 @@ INITIATOR_IQN="${INITIATOR_IQN:-$(sed -n 's/^InitiatorName=//p' /etc/iscsi/initi
 [[ -S "$SOCKET" ]] || { echo "vdisk-server socket $SOCKET not found; start 'aspen vdisk-server'" >&2; exit 1; }
 
 if ! targetcli "/backstores/user:aspen/$DISK" ls >/dev/null 2>&1; then
-  targetcli "/backstores/user:aspen" create "name=$DISK" "size=$SIZE" "cfgstring=$DISK@$SOCKET"
+  targetcli "/backstores/user:aspen" create "name=$DISK" "size=$SIZE" "cfgstring=$DISK@$SOCKET" \
+    "control=$CONTROL"
 fi
 if ! targetcli "/iscsi/$IQN" ls >/dev/null 2>&1; then
   targetcli /iscsi create "$IQN"

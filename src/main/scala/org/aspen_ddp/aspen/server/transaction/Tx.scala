@@ -21,7 +21,9 @@ class Tx( trs: TransactionRecoveryState,
           private val crl: CrashRecoveryLog,
           private val statusCache: TransactionStatusCache,
           private val preTxRebuilds: List[PreTransactionOpportunisticRebuild],
-          private val objectPointers: List[ObjectPointer]) extends Logging {
+          private val objectPointers: List[ObjectPointer],
+          /** Recreated from persisted recovery state. See onAllObjectsLoaded */
+          val recovered: Boolean = false) extends Logging {
 
   val transactionId: TransactionId = txd.transactionId
 
@@ -131,26 +133,11 @@ class Tx( trs: TransactionRecoveryState,
       }
     }
 
-    // Determine local disposition
-    val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
-
-    val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
-      frontend.maxSliceSize)
-
-    // Find all objects with transaction collisions for inclusion into the response message
-    m.foreach { t => t._2 match {
-      case TransactionCollision(txid) =>
-        logger.trace(s"Tx ${txd.transactionId}. Collision with Tx $txid")
-        collisions = txid :: collisions
-      case _ =>
-    }}
-
-    disposition = if (m.isEmpty && l.isEmpty) TransactionDisposition.VoteCommit else TransactionDisposition.VoteAbort
-
-    if (disposition == TransactionDisposition.VoteAbort) {
-      m.foreach(t => logger.trace(s"Tx ${txd.transactionId}. Object: ${t._1.uuid}. Requirement Error: ${t._2}"))
-      l.foreach(e => logger.trace(s"Tx ${txd.transactionId}. Requirement Error: ${e}"))
-    }
+    // A recovered transaction keeps the vote it persisted: the vote may already have been counted, and recomputing it
+    // against state that changed since could contradict it. A recovered commit vote takes its locks again; a recovered
+    // abort vote must not become a commit vote that conflicts with a recovered commit vote it collided with.
+    if !(recovered && disposition != TransactionDisposition.Undetermined) then
+      determineDisposition()
 
     lock()
 
@@ -172,6 +159,31 @@ class Tx( trs: TransactionRecoveryState,
         logger.trace(s"AllObjectsLoaded. CRL Save Complete. Sending PrepareResponse for tx ${transactionId}")
         net.sendTransactionMessage(r)
       )
+    }
+
+    if recovered then
+      frontend.recoveredTransactionLoaded(transactionId)
+  }
+
+  private def determineDisposition(): Unit = {
+    val ou = objectUpdates.iterator.map(ou => ou.objectId -> ou.data).toMap
+
+    val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
+      frontend.maxSliceSize)
+
+    // Find all objects with transaction collisions for inclusion into the response message
+    m.foreach { t => t._2 match {
+      case TransactionCollision(txid) =>
+        logger.trace(s"Tx ${txd.transactionId}. Collision with Tx $txid")
+        collisions = txid :: collisions
+      case _ =>
+    }}
+
+    disposition = if (m.isEmpty && l.isEmpty) TransactionDisposition.VoteCommit else TransactionDisposition.VoteAbort
+
+    if (disposition == TransactionDisposition.VoteAbort) {
+      m.foreach(t => logger.trace(s"Tx ${txd.transactionId}. Object: ${t._1.uuid}. Requirement Error: ${t._2}"))
+      l.foreach(e => logger.trace(s"Tx ${txd.transactionId}. Requirement Error: ${e}"))
     }
   }
 

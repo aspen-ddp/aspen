@@ -676,4 +676,111 @@ class FrontendSuite extends AnyFunSuite with Matchers {
         r.collisions shouldBe List(txid1)
       case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
   }
+
+  // ---- Recovered transactions take their locks before newer transactions are handled ----
+
+  /** Holds backend reads until `deliver`, as a real backend completes them later through the Host's event queue */
+  class DeferredReadBackend extends MapBackend(storeId):
+    private var deferred: List[ObjectPointer] = Nil
+    override def read(pointer: ObjectPointer): Unit = deferred = deferred :+ pointer
+    def deliver(): Unit =
+      val reads = deferred
+      deferred = Nil
+      reads.foreach(super.read)
+
+  def commitVote(txid: TransactionId, reqs: List[TransactionRequirement]): TransactionRecoveryState =
+    TransactionRecoveryState(storeId, lockTxd(txid, reqs).serialize(),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
+      TransactionStatus.Unresolved, PersistentState.initial)
+
+  def sendPrepare(frontend: Frontend, txd: TransactionDescription): Unit =
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+
+  /** The prepare response sent last, for `txid` */
+  def responseFor(net: TestNet, txid: TransactionId): TxPrepareResponse =
+    net.txMessage() match
+      case Some(r: TxPrepareResponse) if r.transactionId == txid => r
+      case other => throw new AssertionError(s"Expected a TxPrepareResponse for $txid, got $other")
+
+  test("a prepare held during a crl_save.log load is handled after the recovered transactions take their locks") {
+    val backend = new DeferredReadBackend
+    populate(backend)
+    var recoverable: List[TransactionRecoveryState] = Nil
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = recoverable
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    frontend.awaitRecovery()
+
+    sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
+    recoverable = List(commitVote(txid1, List(overwrite(op1))))
+    frontend.recover()
+    backend.deliver() // The shared read of op1 completes after recover returned
+    backend.deliver() // and so does any read issued once the held prepare is handled
+
+    val r = responseFor(net, txid2)
+    r.disposition shouldBe TransactionDisposition.VoteAbort
+    r.collisions shouldBe List(txid1)
+  }
+
+  test("a prepare arriving during startup recovery is handled after the recovered transactions take their locks") {
+    val backend = new DeferredReadBackend
+    populate(backend)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+        List(commitVote(txid1, List(overwrite(op1))))
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+    sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
+    backend.deliver()
+    backend.deliver()
+
+    val r = responseFor(net, txid2)
+    r.disposition shouldBe TransactionDisposition.VoteAbort
+    r.collisions shouldBe List(txid1)
+  }
+
+  test("a recovered commit vote is kept although its requirements no longer hold") {
+    // It required a revision the object no longer has, as when its vote was persisted before another commit
+    val stale = DataUpdate(op1, new ObjectRevision(new UUID(0, 10)), DataUpdateOperation.Overwrite)
+    val backend = new MapBackend(storeId)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+        List(commitVote(txid1, List(stale)))
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    cache.insert(os)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+    sendPrepare(frontend, lockTxd(txid1, List(stale)))
+    responseFor(net, txid1).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("held messages are released when a recovered transaction's object fails to load") {
+    val backend = new DeferredReadBackend // op1 is never allocated, so its read fails
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+        List(commitVote(txid1, List(overwrite(op1))))
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, crl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+
+    sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
+    frontend.transactions.contains(txid2) shouldBe false
+    backend.deliver()
+    backend.deliver()
+
+    frontend.transactions.contains(txid2) shouldBe true
+    responseFor(net, txid2).disposition shouldBe TransactionDisposition.VoteAbort
+  }
 }

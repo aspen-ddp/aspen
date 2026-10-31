@@ -55,36 +55,62 @@ class Frontend(val storeId: StoreId,
     */
   private var referenced: Map[ObjectId, ObjectState] = Map()
 
-  /** Transaction messages held while the store's recovery state is still being loaded. See awaitRecovery */
-  private var heldMessages: Option[List[TxMessage]] = None
+  /** Transaction messages held, newest first, until recovery completes. See awaitRecovery and recoverTransactions */
+  private var heldMessages: List[TxMessage] = Nil
+
+  /** The store's CRL state is still being loaded (from a crl_save.log). See awaitRecovery */
+  private var awaitingCrl: Boolean = false
+
+  /** Recovered transactions whose objects have not all loaded yet */
+  private var recoveringTransactions: Set[TransactionId] = Set()
+
+  private def holding: Boolean = awaitingCrl || recoveringTransactions.nonEmpty
 
   recoverTransactions()
 
-  /** Recreates the transactions the CRL holds for this store that are not already known */
+  /** Recreates the transactions the CRL holds for this store that are not already known.
+    *
+    * Transaction messages are held until every recovered transaction has loaded its objects, and with them taken the
+    * locks of its recovered commit vote. A transaction started meanwhile could otherwise load a shared object first and
+    * take conflicting locks.
+    */
   private def recoverTransactions(): Unit =
     crl.getFullRecoveryState(storeId).foreach { trs =>
       val txd = TransactionDescription.deserialize(trs.serializedTxd)
       if !transactions.contains(txd.transactionId) then
         val pointers = txd.allHostedObjects(storeId)
-        val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers)
+        val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers, recovered = true)
         transactions += (txd.transactionId -> tx)
+        // A transaction with no objects here never loads any
+        if pointers.nonEmpty then
+          recoveringTransactions += txd.transactionId
         pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
     }
+
+  /** A recovered transaction has loaded (or failed to load) all its objects */
+  def recoveredTransactionLoaded(transactionId: TransactionId): Unit =
+    recoveringTransactions -= transactionId
+    releaseHeldMessages()
 
   /** The store's CRL state is being loaded after this Frontend was created (from a crl_save.log). Until recover is
     * called, transaction messages are held: started without their recovery state, transactions would hold no locks
     * and a prepare would replace the recovered Paxos acceptor state with an initial one.
     */
-  def awaitRecovery(): Unit =
-    if heldMessages.isEmpty then
-      heldMessages = Some(Nil)
+  def awaitRecovery(): Unit = awaitingCrl = true
 
-  /** The CRL now holds the store's recovery state: recreates its transactions, then handles the held messages */
+  /** The CRL now holds the store's recovery state: recreates its transactions. Held messages are handled, in arrival
+    * order, once those transactions have loaded their objects
+    */
   def recover(): Unit =
-    val held = heldMessages.getOrElse(Nil).reverse
-    heldMessages = None
+    awaitingCrl = false
     recoverTransactions()
-    held.foreach(receiveTransactionMessage)
+    releaseHeldMessages()
+
+  private def releaseHeldMessages(): Unit =
+    if !holding then
+      val held = heldMessages.reverse
+      heldMessages = Nil
+      held.foreach(handleTransactionMessage)
 
 
   def close(): Future[Unit] = backend.close()
@@ -139,9 +165,11 @@ class Frontend(val storeId: StoreId,
   private def cachedState(objectId: ObjectId): Option[ObjectState] =
     objectCache.get(objectId).filter(!_.reloadRequired)
 
-  def receiveTransactionMessage(msg: TxMessage): Unit = heldMessages match
-    case Some(held) => heldMessages = Some(msg :: held)
-    case None => handleTransactionMessage(msg)
+  def receiveTransactionMessage(msg: TxMessage): Unit =
+    if holding || heldMessages.nonEmpty then
+      heldMessages = msg :: heldMessages
+    else
+      handleTransactionMessage(msg)
 
   private def handleTransactionMessage(msg: TxMessage): Unit = msg match {
     case m: TxPrepare => receivePrepare(m)
@@ -350,6 +378,11 @@ class Frontend(val storeId: StoreId,
 
   def backendReadComplete(objectId: ObjectId,
                           result: Either[ReadState, ReadError.Value]): Unit = {
+    // Taken before dispatch: handling a read can start another read of the same object (a transaction message held
+    // for recovery is handled once a recovered transaction loads), which must not join this completed one
+    val waiting = pendingReads.get(objectId)
+    pendingReads -= objectId
+
     result match {
       case Left(rs) =>
         // A state still referenced by transactions is never replaced. See referenced
@@ -359,7 +392,7 @@ class Frontend(val storeId: StoreId,
           objectCache.insert(loaded)
         val os = inUse.getOrElse(loaded)
 
-        pendingReads.get(objectId).foreach { lpr =>
+        waiting.foreach { lpr =>
           lpr.foreach {
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. SUCCESS. Sending read response")
@@ -384,7 +417,7 @@ class Frontend(val storeId: StoreId,
         }
 
       case Right(err) =>
-        pendingReads.get(objectId).foreach { lpr =>
+        waiting.foreach { lpr =>
           lpr.foreach {
             case netRead: NetworkRead =>
               logger.trace(s"Completed backend load for read ${netRead.requestUUID}. ERROR $err. Sending read response")
@@ -403,7 +436,5 @@ class Frontend(val storeId: StoreId,
           }
         }
     }
-
-    pendingReads -= objectId
   }
 }

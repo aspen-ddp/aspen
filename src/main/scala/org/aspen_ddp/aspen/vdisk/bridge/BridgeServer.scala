@@ -60,14 +60,16 @@ final class BridgeServer(socketPath: os.Path, openDisk: String => Future[Lockabl
               ch.pipeline().addLast(new FrameDecoder, new BridgeSession(openDisk)))
         listener = bootstrap.bind(new DomainSocketAddress(tmpSock.toString)).sync().channel()
         os.perms.set(tmpSock, "rw-------")
+        // Read before linking, so nothing can throw once the socket is published; it is the same inode
+        val key = Files.readAttributes(tmpSock.toNIO, classOf[BasicFileAttributes],
+          LinkOption.NOFOLLOW_LINKS).fileKey()
         try
           Files.createLink(socketPath.toNIO, tmpSock.toNIO)
         catch
           case _: FileAlreadyExistsException =>
             checkExisting()
             Files.createLink(socketPath.toNIO, tmpSock.toNIO)
-        ownKey = Files.readAttributes(socketPath.toNIO, classOf[BasicFileAttributes],
-          LinkOption.NOFOLLOW_LINKS).fileKey()
+        ownKey = key
         group = g
       catch
         case t: Throwable =>

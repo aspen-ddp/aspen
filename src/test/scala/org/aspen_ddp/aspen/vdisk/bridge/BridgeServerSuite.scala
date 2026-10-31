@@ -501,10 +501,14 @@ class BridgeServerSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     a.start()
     val replacement = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
     try
+      // Keep the original inode alive so the replacement cannot be given the same inode number
+      val keep = dir / "keep"
+      java.nio.file.Files.createLink(keep.toNIO, path.toNIO)
       os.remove(path)
       replacement.bind(UnixDomainSocketAddress.of(path.toNIO))
       a.stop()
       os.exists(path, followLinks = false) should be (true)
+      os.remove(keep)
     finally
       replacement.close()
       os.remove.all(dir)

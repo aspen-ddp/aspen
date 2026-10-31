@@ -63,6 +63,12 @@ trait Transaction {
     */
   def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit
 
+  /** Like lockRevision, but any number of concurrent transactions may hold the lock on the same object. It blocks
+    * only transactions that modify or exclusively lock the object, so an overwrite of the object aborts every
+    * transaction that shared-locks the old revision and has not yet committed.
+    */
+  def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit
+
   /** Increments the overwrite count on the object revision by 1 but leaves the object data untouched */
   def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit
 

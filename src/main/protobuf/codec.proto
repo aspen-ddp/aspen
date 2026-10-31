@@ -121,6 +121,11 @@ message RevisionLock {
   ObjectRevision required_revision = 2;
 }
 
+message SharedRevisionLock {
+  ObjectPointer object_pointer = 1;
+  ObjectRevision required_revision = 2;
+}
+
 message KVReq {
   KeyRequirement requirement = 1;
   uint64 timestamp = 2;
@@ -159,6 +164,7 @@ message TransactionRequirement {
   RevisionLock revision_lock = 4;
   KeyValueUpdate kv_update = 5;
   LocalTimeRequirement localtime = 6;
+  SharedRevisionLock shared_revision_lock = 7;
 }
 
 message SerializedFinalizationAction {

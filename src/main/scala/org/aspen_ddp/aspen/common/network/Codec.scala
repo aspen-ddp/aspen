@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.paxos.{PersistentState, ProposalId}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, PreTransactionOpportunisticRebuild, RefcountUpdate, RevisionLock, SerializedFinalizationAction, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, FinalizationActionId, KeyValueUpdate, LocalTimeRequirement, ObjectUpdate, PreTransactionOpportunisticRebuild, RefcountUpdate, RevisionLock, SerializedFinalizationAction, SharedRevisionLock, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus, VersionBump}
 import org.aspen_ddp.aspen.server.crl.TransactionRecoveryState
 import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, FsifConfig, RocksDBConfig}
 
@@ -222,6 +222,16 @@ object Codec extends Logging:
       decode(m.requiredRevision.get))
 
 
+  def encode(o: SharedRevisionLock): codec.SharedRevisionLock =
+    codec.SharedRevisionLock(
+      objectPointer = Some(encode(o.objectPointer)),
+      requiredRevision = Some(encode(o.requiredRevision))
+    )
+
+  def decode(m: codec.SharedRevisionLock): SharedRevisionLock =
+    SharedRevisionLock(decode(m.objectPointer.get), decode(m.requiredRevision.get))
+
+
   def encode(o: KeyValueUpdate.KeyRequirement): codec.KVReq =
     val key = ByteString.copyFrom(o.key.bytes)
 
@@ -370,6 +380,7 @@ object Codec extends Logging:
       case tr: RefcountUpdate => codec.TransactionRequirement(refcountUpdate = Some(encode(tr)))
       case tr: VersionBump => codec.TransactionRequirement(versionBump = Some(encode(tr)))
       case tr: RevisionLock => codec.TransactionRequirement(revisionLock = Some(encode(tr)))
+      case tr: SharedRevisionLock => codec.TransactionRequirement(sharedRevisionLock = Some(encode(tr)))
       case tr: KeyValueUpdate => codec.TransactionRequirement(kvUpdate = Some(encode(tr)))
       case tr: LocalTimeRequirement => codec.TransactionRequirement(localtime = Some(encode(tr)))
 
@@ -378,6 +389,7 @@ object Codec extends Logging:
       .orElse(m.refcountUpdate.map(decode))
       .orElse(m.versionBump.map(decode))
       .orElse(m.revisionLock.map(decode))
+      .orElse(m.sharedRevisionLock.map(decode))
       .orElse(m.kvUpdate.map(decode))
       .orElse(m.localtime.map(decode))
       .getOrElse(throw new EncodingError("Unknown Transaction Requirement"))

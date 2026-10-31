@@ -36,6 +36,8 @@ object RequirementsLocker {
           case r: VersionBump => getState(r.objectPointer.id).lockedToTransaction = Some(transactionId)
 
           case r: RevisionLock => getState(r.objectPointer.id).lockedToTransaction = Some(transactionId)
+
+          case r: SharedRevisionLock => getState(r.objectPointer.id).sharedLocks += transactionId
         }
       } catch {
         case e: Throwable => println(s"UNEXPECTED ERROR IN TX Lock: $e")
@@ -120,6 +122,8 @@ object RequirementsLocker {
           case r: VersionBump => getState(r.objectPointer.id).lockedToTransaction = None
 
           case r: RevisionLock => getState(r.objectPointer.id).lockedToTransaction = None
+
+          case r: SharedRevisionLock => getState(r.objectPointer.id).sharedLocks -= transactionId
         }
       } catch {
         case e: Throwable => println(s"UNEXPECTED ERROR IN TX Lock: $e")

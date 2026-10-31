@@ -41,7 +41,8 @@ class TransactionBuilder(
   private  var refcountUpdates = Set[ObjectPointer]()
   private  var deletingObjects = List[ObjectPointer]() // Objects whose refcount is being set to zero
   private  var updatingObjects = Set[ObjectPointer]() // Tracks UUIDs of all objects being modified
-  private  var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects
+  private  var revisionLocks = Set[ObjectPointer]() // UUIDs of all revision-locked objects, shared or not
+  private  var sharedRevisionLocks = Set[ObjectPointer]() // UUIDs of all shared-revision-locked objects
   private  var dataObjectUpdates = Map[ObjectPointer, DataBuffer]()
   private  var appendUpdates = Map[ObjectPointer, (AppendPosition, DataBuffer)]()
   private  var rangedUpdates = Map[ObjectPointer, RangedUpdate]()
@@ -341,11 +342,20 @@ class TransactionBuilder(
 
   def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
     //println(s"   TXB LockRevision txid $transactionUUID object ${objectPointer.uuid}")
-    if (updatingObjects.contains(objectPointer))
+    if (updatingObjects.contains(objectPointer) || sharedRevisionLocks.contains(objectPointer))
       throw ConflictingRequirements(objectPointer)
 
     revisionLocks += objectPointer
     requirements = RevisionLock(objectPointer, requiredRevision) :: requirements
+  }
+
+  def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit = synchronized {
+    if updatingObjects.contains(objectPointer) || revisionLocks.contains(objectPointer) then
+      throw ConflictingRequirements(objectPointer)
+
+    revisionLocks += objectPointer
+    sharedRevisionLocks += objectPointer
+    requirements = SharedRevisionLock(objectPointer, requiredRevision) :: requirements
   }
 
   def ensureHappensAfter(timestamp: HLCTimestamp): Unit = HLCTimestamp.update(timestamp)

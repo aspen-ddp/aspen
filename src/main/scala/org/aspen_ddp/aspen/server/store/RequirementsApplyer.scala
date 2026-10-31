@@ -32,7 +32,7 @@ object RequirementsApplyer extends Logging {
 
     // Get a list of all objects that are unfit for accepting the changes in this transaction
     val skippedObjects = RequirementsChecker.check(transactionId, timestamp, requirements, objects, objectUpdates,
-      maxSliceSize)._1.keySet
+      maxSliceSize, applying = true)._1.keySet
 
     var failedObjects: Set[ObjectId] = Set()
 
@@ -106,6 +106,8 @@ object RequirementsApplyer extends Logging {
               timestamp=timestamp)
 
           case _: RevisionLock =>
+
+          case _: SharedRevisionLock =>
         }
       } catch {
         // Updates are applied in place, so an object that throws partway through is left in a

@@ -17,6 +17,14 @@ class ObjectState(val objectId: ObjectId,
 
   var lockedToTransaction: Option[TransactionId] = None
 
+  /** Transactions holding a SharedRevisionLock on this object */
+  var sharedLocks: Set[TransactionId] = Set()
+
+  /** System.nanoTime deadline before which new SharedRevisionLocks are refused, 0 = none. Set when an exclusive
+    * requirement collides with held shared locks. See SharedRevisionLock.ExclusivePreferenceWindow
+    */
+  var exclusiveWaitUntil: Long = 0
+
   var kvState: Option[KVObjectState] = objectType match {
     case ObjectType.KeyValue => Some(KVObjectState(data))
     case _ => None
@@ -25,6 +33,7 @@ class ObjectState(val objectId: ObjectId,
   def lockedWriteTransactions: Set[TransactionId] = {
     var s = Set[TransactionId]()
     lockedToTransaction.foreach { t => s += t }
+    s ++= sharedLocks
     kvState.foreach { kvs =>
       kvs.content.values.foreach { vs =>
         vs.lockedToTransaction.foreach { txid =>

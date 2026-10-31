@@ -16,6 +16,8 @@ object RequirementsChecker extends Logging {
 
   /**
     * @param maxSliceSize The store's effective slice size limit. None disables the size check. See checkSliceSize.
+    * @param applying True for the re-check of a committed transaction, which takes no new locks. The exclusive
+    *                 preference window only refuses new SharedRevisionLocks, so it is not enforced then.
     * @return Tuple of object specific errors and a list of non-object errors
     */
   def check(transactionId: TransactionId,
@@ -23,23 +25,40 @@ object RequirementsChecker extends Logging {
             requirements: List[TransactionRequirement],
             objects: Map[ObjectId, ObjectState],
             objectUpdates: Map[ObjectId, DataBuffer],
-            maxSliceSize: Option[Long] = None):
+            maxSliceSize: Option[Long] = None,
+            applying: Boolean = false):
   (Map[ObjectId, RequirementError], List[RequirementError]) = {
 
-    def getState(oid: ObjectId): ObjectState = {
-      objects.get(oid) match {
+    def checkExclusiveLock(oid: ObjectId, os: ObjectState): Unit =
+      os.lockedToTransaction.foreach { lockedTxId =>
+        if lockedTxId != transactionId then
+          throw ObjectErr(oid, TransactionCollision(lockedTxId))
+      }
+
+    /** State for every object requirement except SharedRevisionLock. Held shared locks block it and open the
+      * exclusive preference window so that new shared lockers back off until this transaction can get in.
+      */
+    def getState(oid: ObjectId): ObjectState =
+      objects.get(oid) match
         case None => throw ObjectErr(oid, MissingObject())
         case Some(os) =>
-          os.lockedToTransaction match {
-            case None => os
-            case Some(lockedTxId) =>
-              if (lockedTxId != transactionId)
-                throw ObjectErr(oid, TransactionCollision(lockedTxId))
-              else
-                os
+          checkExclusiveLock(oid, os)
+          os.sharedLocks.find(_ != transactionId).foreach { sharedTxId =>
+            os.exclusiveWaitUntil = System.nanoTime() + SharedRevisionLock.ExclusivePreferenceWindow.toNanos
+            throw ObjectErr(oid, TransactionCollision(sharedTxId))
           }
-      }
-    }
+          os
+
+    def getSharedState(oid: ObjectId): ObjectState =
+      objects.get(oid) match
+        case None => throw ObjectErr(oid, MissingObject())
+        case Some(os) =>
+          checkExclusiveLock(oid, os)
+          if !applying && os.exclusiveWaitUntil != 0 && System.nanoTime() - os.exclusiveWaitUntil < 0 then
+            // The waiting exclusive transaction is not tracked, so the collision names this one. It is never a
+            // completed transaction, which keeps the driver from treating the collision as a stale race.
+            throw ObjectErr(oid, TransactionCollision(transactionId))
+          os
 
     var objectErrors: Map[ObjectId, RequirementError] = Map()
     var nonObjectErrors: List[RequirementError] = Nil
@@ -97,6 +116,9 @@ object RequirementsChecker extends Logging {
           case r: VersionBump => checkRevision(getState(r.objectPointer.id), r.requiredRevision, txTimestamp)
 
           case r: RevisionLock => checkRevision(getState(r.objectPointer.id), r.requiredRevision, txTimestamp)
+
+          case r: SharedRevisionLock =>
+            checkRevision(getSharedState(r.objectPointer.id), r.requiredRevision, txTimestamp)
         }
       } catch {
         case err: ObjectErr => objectErrors += (err.objectId -> err.err)

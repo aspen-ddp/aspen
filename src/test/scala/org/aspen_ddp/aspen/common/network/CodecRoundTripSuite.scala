@@ -127,6 +127,14 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decoded.objectPointer.id shouldBe original.objectPointer.id
     decoded.requiredRevision.lastUpdateTxUUID shouldBe original.requiredRevision.lastUpdateTxUUID
 
+  test("SharedRevisionLock round-trip"):
+    val original: TransactionRequirement = SharedRevisionLock(dataPtr(1), rev(2))
+    Codec.decode(Codec.encode(original)) match
+      case d: SharedRevisionLock =>
+        d.objectPointer.id shouldBe dataPtr(1).id
+        d.requiredRevision shouldBe rev(2)
+      case other => fail(s"decoded as $other")
+
   test("KeyRequirement round-trip"):
     val key = Key(Array[Byte](1, 2, 3))
     val ts = HLCTimestamp(1000L)

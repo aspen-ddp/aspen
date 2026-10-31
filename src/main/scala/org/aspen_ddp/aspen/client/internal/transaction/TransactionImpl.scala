@@ -145,6 +145,9 @@ class TransactionImpl(val client: AspenClient,
   def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
     modify(_.lockRevision(objectPointer, requiredRevision))
 
+  def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+    modify(_.sharedLockRevision(objectPointer, requiredRevision))
+
   def ensureHappensAfter(timestamp: HLCTimestamp): Unit = modify(_.ensureHappensAfter(timestamp))
 
   def addFinalizationAction(finalizationActionId: FinalizationActionId, serializedContent: Option[Array[Byte]]): Unit =
@@ -205,6 +208,9 @@ class TransactionImpl(val client: AspenClient,
 
     def lockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
       hookModify(_.lockRevision(objectPointer, requiredRevision))
+
+    def sharedLockRevision(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
+      hookModify(_.sharedLockRevision(objectPointer, requiredRevision))
 
     def bumpVersion(objectPointer: ObjectPointer, requiredRevision: ObjectRevision): Unit =
       doBumpVersion(true, objectPointer, requiredRevision)

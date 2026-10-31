@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SliceSizeExceeded, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -218,6 +218,82 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
 
     assert(oerrs.isEmpty)
     assert(errs.isEmpty)
+  }
+
+  private def sharedLockFixture(): Map[ObjectId, ObjectState] =
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.Data, DataBuffer(new Array[Byte](0)))
+    Map(o.objectId -> o)
+
+  private val tx3 = TransactionId(new UUID(0, 7))
+
+  test("SharedRevisionLock okay") {
+    val objects = sharedLockFixture()
+    val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)),
+      objects, Map())
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  test("two SharedRevisionLocks on one object both pass") {
+    val objects = sharedLockFixture()
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)),
+      objects, Map())
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  /** Locks tx1 shared, then checks a tx2 DataUpdate on the same object */
+  private def collideWithSharedLock(objects: Map[ObjectId, ObjectState]): Map[ObjectId, RequirementError] =
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now,
+      List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects, Map(oid1 -> DataBuffer.Empty))
+    assert(errs.isEmpty)
+    oerrs
+
+  test("DataUpdate collides with a held SharedRevisionLock") {
+    val objects = sharedLockFixture()
+    val oerrs = collideWithSharedLock(objects)
+    assert(oerrs == Map(oid1 -> TransactionCollision(tx1)))
+    assert(objects(oid1).exclusiveWaitUntil > System.nanoTime())
+  }
+
+  test("SharedRevisionLock refused during the exclusive preference window") {
+    val objects = sharedLockFixture()
+    collideWithSharedLock(objects)
+    val (oerrs, errs) = RequirementsChecker.check(tx3, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)),
+      objects, Map())
+    assert(oerrs.keySet == Set(oid1))
+    assert(oerrs(oid1).isInstanceOf[TransactionCollision])
+    assert(errs.isEmpty)
+  }
+
+  test("a committing SharedRevisionLock is applied during the exclusive preference window") {
+    val objects = sharedLockFixture()
+    collideWithSharedLock(objects)
+    // Tx unlocks before applying, so the re-check at apply time must not be refused by the window
+    RequirementsLocker.unlock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)), objects, Map())
+    assert(result.uncommittable.isEmpty)
+  }
+
+  test("SharedRevisionLock fails on revision mismatch") {
+    val objects = sharedLockFixture()
+    val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(SharedRevisionLock(p1, rev2)),
+      objects, Map())
+    assert(oerrs == Map(oid1 -> RevisionMismatch()))
+    assert(errs.isEmpty)
+  }
+
+  test("SharedRevisionLock unlock releases the object for exclusive use") {
+    val objects = sharedLockFixture()
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    assert(objects(oid1).lockedWriteTransactions == Set(tx1))
+    RequirementsLocker.unlock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    assert(objects(oid1).sharedLocks.isEmpty)
+    val (oerrs, _) = RequirementsChecker.check(tx2, HLCTimestamp.now,
+      List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects, Map(oid1 -> DataBuffer.Empty))
+    assert(oerrs.isEmpty)
   }
 
   test("VersionBump failure on tx collision") {

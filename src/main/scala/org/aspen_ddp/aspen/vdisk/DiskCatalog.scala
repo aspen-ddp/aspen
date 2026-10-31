@@ -235,7 +235,9 @@ object DiskCatalog:
         case Some(config) => loadConfig(client, name, diskId, config).map(Some(_)).recover:
           case _: DiskNotFound => None  // config already deleted
       _ <- oinfo match
-        case Some(info) => deleteContents(info).recover { case _: DiskNotFound => () }  // finished by another delete
+        case Some(info) => deleteContents(info).recover:
+          // Config, fence or a map node vanished under us: another delete finished the job
+          case _: DiskNotFound | _: InvalidObject => ()
         case None => Future.unit
       // Object registration first: until the name is removed, a re-run still finds the disk to finish
       _ <- removeKey(Radicle.ObjectRegistryKey, Key(diskId))

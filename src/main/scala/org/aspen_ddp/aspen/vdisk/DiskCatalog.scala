@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList, TreeKind}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, IntegerKeyOrdering, Key, KeyAlreadyExists,
-  KeyValueObjectPointer, ObjectPointer, Value}
+  KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.vdisk.VDiskError.*
 
@@ -118,8 +118,9 @@ object DiskCatalog:
 
     load(client, name).flatMap: info =>
       client.transactUntilSuccessful { tx =>
-        client.read(info.configPointer, s"Growing virtual disk $name").map: state =>
-          val sizeState = state.contents(DiskConfig.SizeKey)
+        stopOnMissing(name, client.read(info.configPointer, s"Growing virtual disk $name")).map: state =>
+          val sizeState = state.contents.getOrElse(DiskConfig.SizeKey,
+            throw StopRetrying(DiskFailed(s"config of $name has no size")))
           val current = DiskConfig.decodeLong(sizeState.value.bytes)
           if newSize <= current then
             throw StopRetrying(InvalidGeometry(s"new size $newSize does not exceed current size $current"))
@@ -135,15 +136,50 @@ object DiskCatalog:
   /** Makes `owner` the disk's owner, fencing the previous one. Returns the new state and the revision at which it
     * committed.
     */
-  def takeOwnership(client: AspenClient, info: DiskInfo, owner: UUID): Future[(FenceState, org.aspen_ddp.aspen.common.objects.ObjectRevision)] =
+  def takeOwnership(client: AspenClient, info: DiskInfo, owner: UUID): Future[(FenceState, ObjectRevision)] =
     given ExecutionContext = client.clientContext
 
     client.transactUntilSuccessful { tx =>
-      client.read(info.fencePointer, s"Fence of virtual disk ${info.name}").map: state =>
-        val next = FenceState(FenceState.fromArray(state.data.getByteArray).epoch + 1, owner)
+      stopOnMissing(info.name, client.read(info.fencePointer, s"Fence of virtual disk ${info.name}")).map: state =>
+        val current =
+          try FenceState.fromArray(state.data.getByteArray)
+          catch case e: IllegalArgumentException => throw StopRetrying(DiskFailed(s"malformed fence: ${e.getMessage}"))
+        val next = FenceState(current.epoch + 1, owner)
         tx.overwrite(info.fencePointer, state.revision, DataBuffer(next.toArray))
         (next, tx.revision)
     }
+
+  /** A deleted object can never be read again, so a retry loop must give up rather than spin */
+  private def stopOnMissing[A](name: String, read: Future[A])(using ExecutionContext): Future[A] =
+    read.recoverWith:
+      case _: InvalidObject => Future.failed(StopRetrying(DiskNotFound(name)))
+
+  /** Sets the block's refcount to 0, under a shared lock on the fence revision the caller took ownership at. Fails
+    * with `Fenced` once the fence has moved on, since a newer owner may be adding blocks.
+    */
+  private[vdisk] def deleteBlock(client: AspenClient,
+                                 info: DiskInfo,
+                                 ptr: DataObjectPointer,
+                                 fenceRevision: ObjectRevision): Future[Unit] =
+    given ExecutionContext = client.clientContext
+
+    client.retryStrategy.retryUntilSuccessful:
+      client.read(ptr, s"Deleting block of virtual disk ${info.name}").flatMap: state =>
+        client.transact: tx =>
+          tx.sharedLockRevision(info.fencePointer, fenceRevision)
+          tx.setRefcount(ptr, state.refcount, state.refcount.update(0))
+          tx.deferAllocationRelease()
+          Future.unit
+      .recoverWith:
+        case _: InvalidObject => Future.unit  // already deleted by an earlier run
+        case e: StopRetrying => Future.failed(e)
+        case e =>
+          // A failed commit may be the shared lock losing to a newer owner, which no retry can fix
+          client.read(info.fencePointer).flatMap: fence =>
+            if fence.revision != fenceRevision then
+              Future.failed(StopRetrying(Fenced))
+            else
+              Future.failed(e)
 
   /** Deletes the disk and everything it holds. Each step can be re-run, so a crash midway leaves a disk that
     * `delete` can finish. Takes ownership first, which fences any live owner.
@@ -151,38 +187,43 @@ object DiskCatalog:
   def delete(client: AspenClient, name: String): Future[Unit] =
     given ExecutionContext = client.clientContext
 
-    def deleteBlock(value: Value): Future[Unit] =
-      val ptr = ObjectPointer(value.bytes).asInstanceOf[DataObjectPointer]
-      client.retryStrategy.retryUntilSuccessful:
-        client.read(ptr, s"Deleting block of virtual disk $name").flatMap: state =>
-          client.transact: tx =>
-            tx.setRefcount(ptr, state.refcount, state.refcount.update(0))
-            tx.deferAllocationRelease()
-            Future.unit
-        .recover:
-          case _: InvalidObject => ()  // already deleted by an earlier run
-
     def deleteContents(info: DiskInfo): Future[Unit] =
       for
-        _ <- takeOwnership(client, info, UUID.randomUUID())
+        (_, fenceRevision) <- takeOwnership(client, info, UUID.randomUUID())
         manager = KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer)
         tree <- manager.getDataObjectTree()
-        _ <- tree.deleteTree(Some((_, v) => deleteBlock(v)))
-        _ <- client.transactUntilSuccessful: tx =>
-          for
-            config <- client.read(info.configPointer)
-            fence <- client.read(info.fencePointer)
-          yield
-            tx.setRefcount(config.pointer, config.refcount, config.refcount.update(0))
-            tx.setRefcount(fence.pointer, fence.refcount, fence.refcount.update(0))
+        // Block deletions carry delete's own fence revision, so a newer owner cannot add blocks that then leak
+        _ <- tree.deleteTree(Some((_, v) =>
+          deleteBlock(client, info, ObjectPointer(v.bytes).asInstanceOf[DataObjectPointer], fenceRevision)))
+        _ <- deleteConfigAndFence(info)
       yield
         ()
 
+    // Whichever of the two is already gone is skipped; with both gone there is nothing to do
+    def deleteConfigAndFence(info: DiskInfo): Future[Unit] =
+      def readOpt[A](f: Future[A]): Future[Option[A]] = f.map(Some(_)).recover { case _: InvalidObject => None }
+      client.retryStrategy.retryUntilSuccessful:
+        for
+          config <- readOpt(client.read(info.configPointer))
+          fence <- readOpt(client.read(info.fencePointer))
+          _ <- if config.isEmpty && fence.isEmpty then Future.unit else
+            client.transact: tx =>
+              config.foreach(c => tx.setRefcount(c.pointer, c.refcount, c.refcount.update(0)))
+              fence.foreach(f => tx.setRefcount(f.pointer, f.refcount, f.refcount.update(0)))
+              Future.unit
+        yield
+          ()
+
+    // Skipped when already absent: a transaction that deletes nothing has nothing to commit
     def removeKey(treeKey: Key, key: Key): Future[Unit] =
       val tree = TieredKeyValueList(client, KVObjectRootManager(client, treeKey, Radicle.pointer))
-      client.transactUntilSuccessful: tx =>
-        given Transaction = tx
-        tree.prepareUpdates(Nil, List(key))
+      client.retryStrategy.retryUntilSuccessful:
+        tree.get(key).flatMap:
+          case None => Future.unit
+          case Some(_) =>
+            client.transact: tx =>
+              given Transaction = tx
+              tree.prepareUpdates(Nil, List(key))
 
     for
       diskId <- client.getRegisteredId(DiskConfig.RegistryNamespace, name).recoverWith:
@@ -194,7 +235,7 @@ object DiskCatalog:
         case Some(config) => loadConfig(client, name, diskId, config).map(Some(_)).recover:
           case _: DiskNotFound => None  // config already deleted
       _ <- oinfo match
-        case Some(info) => deleteContents(info)
+        case Some(info) => deleteContents(info).recover { case _: DiskNotFound => () }  // finished by another delete
         case None => Future.unit
       // Object registration first: until the name is removed, a re-run still finds the disk to finish
       _ <- removeKey(Radicle.ObjectRegistryKey, Key(diskId))

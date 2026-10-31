@@ -6,8 +6,9 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.ObjectAllocator
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.client.tkvl.KVObjectRootManager
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
+import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 import org.aspen_ddp.aspen.common.objects.{Key, Value}
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
 
@@ -138,3 +139,95 @@ class DiskCatalogSuite extends IntegrationTestSuite:
     yield
       reads.foreach(_ shouldBe a [org.aspen_ddp.aspen.client.InvalidObject])
       succeed
+
+  private def zeroRefcounts(info: DiskInfo): Future[Unit] =
+    client.transactUntilSuccessful: tx =>
+      for
+        config <- client.read(info.configPointer)
+        fence <- client.read(info.fencePointer)
+      yield
+        tx.setRefcount(config.pointer, config.refcount, config.refcount.update(0))
+        tx.setRefcount(fence.pointer, fence.refcount, fence.refcount.update(0))
+
+  private def removeKey(treeKey: Key, key: Key): Future[Unit] =
+    val tree = TieredKeyValueList(client, KVObjectRootManager(client, treeKey, Radicle.pointer))
+    client.transactUntilSuccessful: tx =>
+      given Transaction = tx
+      tree.prepareUpdates(Nil, List(key))
+
+  atest("takeOwnership on a deleted disk fails with DiskNotFound"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      _ <- DiskCatalog.delete(client, "d1")
+      r <- DiskCatalog.takeOwnership(client, info, UUID.randomUUID()).failed
+    yield
+      r should be (VDiskError.DiskNotFound("d1"))
+
+  atest("grow on a deleted disk fails with DiskNotFound"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      _ <- zeroRefcounts(info)
+      r <- DiskCatalog.grow(client, "d1", 131072).failed
+    yield
+      r should be (VDiskError.DiskNotFound("d1"))
+
+  atest("two concurrent deletes of one disk both finish"):
+    for
+      alloc <- allocator()
+      _ <- DiskCatalog.create(client, "d1", alloc, 65536)
+      rs <- Future.sequence(List(DiskCatalog.delete(client, "d1"), DiskCatalog.delete(client, "d1"))
+        .map(_.map(_ => None).recover { case e: VDiskError.DiskNotFound => Some(e) }))
+      r <- DiskCatalog.load(client, "d1").failed
+      ids <- client.listRegisteredIds("vdisk")
+    yield
+      rs.count(_.isEmpty) should be >= 1
+      r should be (VDiskError.DiskNotFound("d1"))
+      ids should be (Nil)
+
+  atest("delete finishes after config and fence were deleted but registrations remain"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      _ <- zeroRefcounts(info)
+      _ <- DiskCatalog.delete(client, "d1")
+      r <- DiskCatalog.load(client, "d1").failed
+      ids <- client.listRegisteredIds("vdisk")
+      obj <- client.getRegisteredKeyValueObject(info.diskId).failed
+    yield
+      r should be (VDiskError.DiskNotFound("d1"))
+      ids should be (Nil)
+      obj shouldBe a [NoSuchElementException]
+
+  atest("delete finishes after the object registration was removed but the name remains"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      _ <- removeKey(Radicle.ObjectRegistryKey, Key(info.diskId))
+      _ <- DiskCatalog.delete(client, "d1")
+      r <- DiskCatalog.load(client, "d1").failed
+      ids <- client.listRegisteredIds("vdisk")
+    yield
+      r should be (VDiskError.DiskNotFound("d1"))
+      ids should be (Nil)
+
+  atest("delete stops with Fenced when a newer owner takes the disk mid-delete"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      tree <- KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer).getDataObjectTree()
+      ptr <- client.transactUntilSuccessful: tx =>
+        given Transaction = tx
+        for
+          p <- alloc.allocateDataObject(DataBuffer(new Array[Byte](16)))
+          _ <- tree.set(Key(0L), Value(p.toArray))
+        yield p
+      // a block deleted under a stale fence revision must not commit
+      stale <- client.read(info.fencePointer)
+      _ <- DiskCatalog.takeOwnership(client, info, UUID.randomUUID())
+      r <- DiskCatalog.deleteBlock(client, info, ptr, stale.revision).failed
+      still <- client.read(ptr)
+    yield
+      r should be (VDiskError.Fenced)
+      still.pointer should be (ptr)

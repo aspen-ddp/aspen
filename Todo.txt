@@ -40,3 +40,15 @@ both be voted to commit. Pre-existing; decide whether an absent key should be lo
 that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where
 two simultaneous transactions attempt to blind-insert the same key. If locks are not taken, the order of applications
 could corrupt the key/value pair and make it non recoverable.
+
+vdisk tcmu bridge (part 2) follow-ups:
+- Run the root end-to-end setup in docs/vdisk-tcmu-setup.md (not yet run). Check dmesg after the first ext4 mount
+  (lazy-init zeroout), confirm hw_block_size=4096 / hw_max_sectors take effect, and test vdisk-server restart under a
+  mounted filesystem.
+- After `aspen grow-disk`, a tcmu reopen before the targetcli resize fails forever (OPEN SizeMismatch, reconfig -EBUSY
+  while closed). Either let OPEN accept a reported size smaller than Aspen's or document recreating the backstore.
+- handler_aspen.c: aspen_reconfig (netlink thread) reads the device private pointer without synchronising with
+  aspen_close (recovery thread); a resize racing a reopen could use freed state.
+- LockState.Fenced is learned only when a commit fails; part 3's get_lock_state needs an active fence check.
+- tcmu-runner 1.5.4 reports DPOFUA=0, so Linux never sends FUA writes (it emulates them with WRITE + SYNCHRONIZE CACHE).
+  Account for this in the part-4 measurements.

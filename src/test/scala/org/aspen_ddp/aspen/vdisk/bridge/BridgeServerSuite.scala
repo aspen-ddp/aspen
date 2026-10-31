@@ -32,7 +32,7 @@ class BridgeServerSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
   private val Geometry = DiskGeometry(Size, Block, 65536)
 
   /** Every call returns a Promise the test controls, unless `auto` is set, in which case calls complete at once */
-  private final class FakeDevice(var auto: Boolean = true, geo: DiskGeometry = Geometry)
+  private final class FakeDevice(@volatile var auto: Boolean = true, geo: DiskGeometry = Geometry)
       extends LockableBlockDevice:
 
     final case class Call[A](name: String, args: List[Any], promise: Promise[A])
@@ -491,5 +491,63 @@ class BridgeServerSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     try
       intercept[IllegalStateException](server.start())
       os.read(path) should be ("precious")
+    finally
+      os.remove.all(dir)
+
+  test("stop leaves a socket that replaced its own in place"):
+    val dir = os.temp.dir(prefix = "vdb")
+    val path = dir / "s.sock"
+    val a = new BridgeServer(path, _ => Future.successful(new FakeDevice()))
+    a.start()
+    val replacement = ServerSocketChannel.open(StandardProtocolFamily.UNIX)
+    try
+      os.remove(path)
+      replacement.bind(UnixDomainSocketAddress.of(path.toNIO))
+      a.stop()
+      os.exists(path, followLinks = false) should be (true)
+    finally
+      replacement.close()
+      os.remove.all(dir)
+
+  test("stop removes its own socket file"):
+    withServer(_ => Future.successful(new FakeDevice())): (path, server) =>
+      os.exists(path, followLinks = false) should be (true)
+      server.stop()
+      os.exists(path, followLinks = false) should be (false)
+
+  test("a FIFO at the path makes start fail and survives"):
+    val dir = os.temp.dir(prefix = "vdb")
+    val path = dir / "s.sock"
+    os.proc("mkfifo", path.toString).call()
+    val server = new BridgeServer(path, _ => Future.successful(new FakeDevice()))
+    try
+      intercept[IllegalStateException](server.start()).getMessage should include ("not a socket")
+      os.exists(path, followLinks = false) should be (true)
+    finally
+      os.remove.all(dir)
+
+  test("a bind path over the unix limit fails start with a clear message"):
+    val root = os.temp.dir(prefix = "vdb")
+    var parent = root
+    var i = 0
+    while parent.toString.length < 100 do
+      val room = 100 - parent.toString.length - 1
+      parent = parent / ("d" * math.max(1, math.min(room, 30)))
+    os.makeDir.all(parent)
+    parent.toString.length should be (100)
+    val path = parent / "x"
+    val server = new BridgeServer(path, _ => Future.successful(new FakeDevice()))
+    try
+      val e = intercept[IllegalStateException](server.start())
+      e.getMessage should include ("108")
+      os.list(parent) should be (Seq.empty)
+    finally
+      os.remove.all(root)
+
+  test("a missing parent directory makes start fail"):
+    val dir = os.temp.dir(prefix = "vdb")
+    val server = new BridgeServer(dir / "nope" / "s.sock", _ => Future.successful(new FakeDevice()))
+    try
+      intercept[Exception](server.start())
     finally
       os.remove.all(dir)

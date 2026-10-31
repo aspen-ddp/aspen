@@ -90,8 +90,6 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
   import TransactionDriverSuite._
 
-  val noTxCache = new TransactionStatusCache()
-
   test("Simple PrepareResponse Handling") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val prep = mkprep(1, 0, 0, txd)
@@ -108,7 +106,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1, 0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be(Nil)
 
@@ -119,7 +117,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1, 0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages.toSet should be(Set(
       TxAccept(ds0, ds0, txd.transactionId, ProposalId(1, 0), value = true),
@@ -143,7 +141,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -154,7 +152,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -165,7 +163,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -176,7 +174,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages.toSet should be (Set(
       TxAccept(ds0,ds0,txd.transactionId,ProposalId(1,0),value = true),
@@ -206,7 +204,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -217,7 +215,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -228,7 +226,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -239,7 +237,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages.toSet should be (Set(
       TxAccept(ds0,ds0,txd.transactionId,ProposalId(1,0),value = true),
@@ -270,7 +268,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -281,7 +279,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -292,7 +290,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -303,7 +301,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteCommit,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -314,7 +312,7 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteAbort,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages should be (Nil)
 
@@ -325,12 +323,51 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
       Right(TxPrepareResponse.Promise(None)),
       ProposalId(1,0),
       TransactionDisposition.VoteAbort,
-      Nil), noTxCache)
+      Nil))
 
     messenger.messages.toSet should be (Set(
       TxAccept(ds0,ds0,txd.transactionId,ProposalId(1,0),value = false),
       TxAccept(ds1,ds0,txd.transactionId,ProposalId(1,0),value = false),
       TxAccept(ds2,ds0,txd.transactionId,ProposalId(1,0),value = false)))
+  }
+
+  // A store's vote is fixed when the prepare is first evaluated, so a re-sent prepare gets the same collision back.
+  // Dropping responses that collide with a completed transaction (txdA) until it left the store's status cache
+  // stalled the colliding transaction for the cache's lifetime.
+  test("Abort votes colliding with a completed transaction resolve the transaction promptly") {
+    val txdA = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val prep = mkprep(1, 0, 0, txd)
+    val finalizer = new TFinalizer()
+    val messenger = new TMessenger()
+    var completed = false
+
+    val driver = new TTD(ds0, messenger, prep, finalizer, uuid => completed = true)
+
+    for from <- List(ds0, ds1) do
+      driver.receiveTxPrepareResponse(TxPrepareResponse(
+        ds0,
+        from,
+        txd.transactionId,
+        Right(TxPrepareResponse.Promise(None)),
+        ProposalId(1, 0),
+        TransactionDisposition.VoteAbort,
+        List(txdA.transactionId)))
+
+    messenger.messages.toSet should be(Set(
+      TxAccept(ds0, ds0, txd.transactionId, ProposalId(1, 0), value = false),
+      TxAccept(ds1, ds0, txd.transactionId, ProposalId(1, 0), value = false),
+      TxAccept(ds2, ds0, txd.transactionId, ProposalId(1, 0), value = false)))
+
+    for from <- List(ds0, ds1) do
+      driver.receiveTxAcceptResponse(TxAcceptResponse(
+        ds0,
+        from,
+        txd.transactionId,
+        ProposalId(1, 0),
+        Right(TxAcceptResponse.Accepted(false))))
+
+    completed should be(true)
   }
 
   test("Simple AcceptResponse Handling - Abort") {

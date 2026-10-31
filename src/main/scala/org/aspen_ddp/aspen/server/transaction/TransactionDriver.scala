@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer}
 import org.aspen_ddp.aspen.common.paxos
 import org.aspen_ddp.aspen.common.paxos.{Learner, Proposer}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionDisposition, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{TransactionDescription, TransactionDisposition}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import scribe.Logging
@@ -106,7 +106,6 @@ abstract class TransactionDriver(
   private val completionPromise: Promise[TransactionDescription] = Promise()
 
   private var shouldSendAcceptMessages: Boolean = false
-  private var targetedPrepare: Option[StoreId] = None
   private var clientResolved: Option[TransactionResolved] = None
   private var clientFinalized: Option[TransactionFinalized] = None
   private var txMessages: Option[List[TxMessage]] = None
@@ -157,9 +156,8 @@ abstract class TransactionDriver(
   // Must be called outside a syncrhonized block. Doing so avoids a race condition within the unit test
   // which can lead to a deadlock
   private def sendMessages(): Unit = {
-    val (sendAccept, tprep, cliResolved, cliFinalized, txMsgs) = synchronized {
+    val (sendAccept, cliResolved, cliFinalized, txMsgs) = synchronized {
       val sa = shouldSendAcceptMessages
-      val tp = targetedPrepare
       val cm = clientResolved
       val cf = clientFinalized
       val tm = txMessages
@@ -167,13 +165,12 @@ abstract class TransactionDriver(
       clientResolved = None
       clientFinalized = None
       txMessages = None
-      (sa, tp, cm, cf, tm)
+      (sa, cm, cf, tm)
     }
 
     if (sendAccept)
       sendAcceptMessages()
 
-    tprep.foreach(sendPrepareMessage)
     txMsgs.foreach(messenger.sendTransactionMessages)
     cliFinalized.foreach(messenger.sendClientResponse)
     cliResolved.foreach(messenger.sendClientResponse)
@@ -193,8 +190,7 @@ abstract class TransactionDriver(
     proposer.updateHighestProposalId(msg.proposalId)
   }
 
-  def receiveTxPrepareResponse(msg: TxPrepareResponse,
-                               transactionCache: TransactionStatusCache): Unit = {
+  def receiveTxPrepareResponse(msg: TxPrepareResponse): Unit = {
 
     synchronized {
       logger.trace(s"Received PrepareResponse ${msg.transactionId} ProposalId: ${msg.proposalId} current ProposalId ${proposer.currentProposalId} from ${msg.from}. Disposition: ${msg.disposition}")
@@ -202,21 +198,9 @@ abstract class TransactionDriver(
       if (msg.proposalId != proposer.currentProposalId)
         return
 
-      // If the response says there is a transaction collision with a transaction we know has successfully completed,
-      // there's a race condition. Drop the response and re-send the prepare. Eventually it will either be successfully
-      // processed or a different error will occur
-      val collisionsWithCompletedTransactions = msg.collisions.nonEmpty && msg.collisions.forall { txid =>
-        transactionCache.getStatus(txid) match {
-          case None => false
-          case Some(e) => e.status == TransactionStatus.Committed || e.status == TransactionStatus.Aborted
-        }
-      }
-
-      if (collisionsWithCompletedTransactions) {
-        // Race condition. Drop this message and re-send the prepare
-        targetedPrepare = Some(msg.from)
-        return
-      }
+      // A collision is an ordinary abort vote, even when the colliding transaction has since completed. A store's
+      // disposition is fixed when it first evaluates the prepare, so re-sending the prepare would only return the
+      // same collision. The client retries the aborted transaction instead.
 
       msg.response match {
         case Left(nack) =>

@@ -63,7 +63,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       transactionDrivers += txd.transactionId -> driver
 
       prepareResponseCache.getIfPresent(txd.transactionId).foreach { lst =>
-        lst.foreach(driver.receiveTxPrepareResponse(_, txStatusCache))
+        lst.foreach(driver.receiveTxPrepareResponse(_))
         prepareResponseCache.invalidate(txd.transactionId)
       }
     }
@@ -120,7 +120,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       case m: TxPrepareResponse =>
         // cache if driver doesn't exist deliver otherwise
         transactionDrivers.get(m.transactionId) match {
-          case Some(driver) => driver.receiveTxPrepareResponse(m, txStatusCache)
+          case Some(driver) => driver.receiveTxPrepareResponse(m)
           case None =>
             val lst = prepareResponseCache.getIfPresent(m.transactionId).getOrElse(Nil)
             prepareResponseCache.put(m.transactionId, m :: lst)

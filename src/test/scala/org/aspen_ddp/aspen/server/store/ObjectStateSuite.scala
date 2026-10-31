@@ -28,3 +28,11 @@ class ObjectStateSuite extends AnyFunSuite with Matchers:
     kvs.contentLocked = Some(tx2)
     kvs.rangeLocks += tx3
     os.lockedWriteTransactions shouldBe Set(tx1, tx2, tx3)
+
+  // A shared lock holder will not change the object, so readers must not wait for it
+  test("lockedWriteTransactions excludes SharedRevisionLock holders and lockHolders includes them"):
+    val os = kvObject()
+    os.lockedToTransaction = Some(tx1)
+    os.sharedLocks += tx2
+    os.lockedWriteTransactions shouldBe Set(tx1)
+    os.lockHolders shouldBe Set(tx1, tx2)

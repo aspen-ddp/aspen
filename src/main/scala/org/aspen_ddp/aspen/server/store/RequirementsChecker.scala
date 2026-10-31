@@ -47,7 +47,7 @@ object RequirementsChecker extends Logging {
 
     /** Locks on parts of a KV object (keys, absent keys, ranges). Requirements on the whole object collide with them */
     def checkPartLocks(oid: ObjectId, os: ObjectState): Unit =
-      collide(oid, os.lockedWriteTransactions -- os.sharedLocks)
+      collide(oid, os.lockedWriteTransactions)
 
     def loaded(oid: ObjectId): ObjectState =
       objects.get(oid) match

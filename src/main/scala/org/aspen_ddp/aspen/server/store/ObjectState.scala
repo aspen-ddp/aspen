@@ -36,10 +36,13 @@ class ObjectState(val objectId: ObjectId,
     case _ => None
   }
 
+  /** Transactions holding a lock that lets them change this object. Reported to readers, which wait for a store
+    * to apply such a transaction once they know it committed. SharedRevisionLock holders are excluded: they never
+    * change the object
+    */
   def lockedWriteTransactions: Set[TransactionId] = {
     var s = Set[TransactionId]()
     lockedToTransaction.foreach { t => s += t }
-    s ++= sharedLocks
     kvState.foreach { kvs =>
       kvs.content.values.foreach { vs =>
         vs.lockedToTransaction.foreach { txid =>
@@ -52,4 +55,7 @@ class ObjectState(val objectId: ObjectId,
     }
     s
   }
+
+  /** Every transaction holding any lock on this object, shared locks included */
+  def lockHolders: Set[TransactionId] = lockedWriteTransactions ++ sharedLocks
 }

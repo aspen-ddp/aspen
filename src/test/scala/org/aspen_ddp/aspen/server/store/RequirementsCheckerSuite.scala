@@ -328,7 +328,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
   test("SharedRevisionLock unlock releases the object for exclusive use") {
     val objects = sharedLockFixture()
     RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
-    assert(objects(oid1).lockedWriteTransactions == Set(tx1))
+    assert(objects(oid1).lockHolders == Set(tx1))
     RequirementsLocker.unlock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
     assert(objects(oid1).sharedLocks.isEmpty)
     val (oerrs, _) = RequirementsChecker.check(tx2, HLCTimestamp.now,

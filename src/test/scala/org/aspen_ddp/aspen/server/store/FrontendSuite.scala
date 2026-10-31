@@ -463,6 +463,24 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       TransactionDisposition.VoteCommit
   }
 
+  // Readers re-read while a store reports a lock held by a transaction they know committed. A shared lock holder never
+  // changes the object, so reporting it made reads of a fence spin until the holder resolved
+  test("a network read reports exclusive lock holders but not SharedRevisionLock holders") {
+    val (frontend, _, net) = lockFixture()
+
+    val a = lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0), overwrite(op1)))
+    prepare(frontend, net, a).disposition shouldBe TransactionDisposition.VoteCommit
+
+    def reportedLocks(ptr: ObjectPointer): Set[TransactionId] =
+      frontend.readObjectForNetwork(clientId, new UUID(1, 1), ptr, FullObject())
+      net.clientMessage() match
+        case Some(rr: ReadResponse) => rr.result.toOption.get.lockedWriteTransactions
+        case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+
+    reportedLocks(fencePtr) shouldBe Set()
+    reportedLocks(op1) shouldBe Set(txid1)
+  }
+
   test("a transaction that votes abort takes no locks") {
     val (frontend, _, net) = lockFixture()
 

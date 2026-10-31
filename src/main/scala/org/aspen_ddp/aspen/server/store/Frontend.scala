@@ -173,7 +173,7 @@ class Frontend(val storeId: StoreId,
   private def stateForTransaction(objectId: ObjectId): Option[ObjectState] =
     referenced.get(objectId) match
       // Transactions holding locks on a discarded state still reference it. Checks against it fail until they resolve
-      case Some(os) if !os.reloadRequired || os.lockedWriteTransactions.nonEmpty => Some(os)
+      case Some(os) if !os.reloadRequired || os.lockHolders.nonEmpty => Some(os)
       case Some(_) =>
         referenced -= objectId
         cachedState(objectId)

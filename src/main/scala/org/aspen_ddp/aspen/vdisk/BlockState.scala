@@ -41,6 +41,11 @@ final class BlockState:
   /** Bumped by each commit. A read caches what it fetched only if no commit completed meanwhile */
   var generation: Long = 0L
 
+  /** Bumped by each UNMAP of the block. A commit whose input was taken at an earlier count is superseded: what it
+    * writes is no longer the block's content
+    */
+  var unmaps: Long = 0L
+
   var timer: Option[ScheduledTask] = None
   /** Identifies the most recently armed timer, so a stale one that already fired cannot clear a newer one */
   var timerSeq: Long = 0L

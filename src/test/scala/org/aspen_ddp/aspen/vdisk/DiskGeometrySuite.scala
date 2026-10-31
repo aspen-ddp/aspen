@@ -36,6 +36,14 @@ class DiskGeometrySuite extends AnyFunSuite with Matchers:
     g.blocksFullyCovered(0, 65536) should be (List(0L, 1L, 2L, 3L))
     g.blocksFullyCovered(0, 16383) should be (Nil)
 
+  test("blocksFullyCovered counts a short last block reached by the range"):
+    val short = DiskGeometry(65536 + 4096, 4096, 16384)
+    short.blocksFullyCovered(65536, 4096) should be (List(4L))
+    short.blocksFullyCovered(49152, 20480) should be (List(3L, 4L))
+    short.blocksFullyCovered(0, 65536 + 4096) should be (List(0L, 1L, 2L, 3L, 4L))
+    short.blocksFullyCovered(65536, 0) should be (Nil)
+    short.blocksFullyCovered(61440, 4096) should be (Nil)
+
   test("randomized segments tile the request"):
     val rnd = Random(12345)
     val geom = DiskGeometry(1L << 24, 512, 8192)

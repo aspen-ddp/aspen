@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.vdisk
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.{DataObjectRangeState, ObjectAllocator}
+import org.aspen_ddp.aspen.client.{DataObjectRangeState, InvalidObject, ObjectAllocator}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
@@ -37,8 +37,8 @@ class VirtualDiskSuite extends IntegrationTestSuite:
   private def allocator(): Future[ObjectAllocator] =
     client.getStoragePool(Radicle.poolId).map(pool => new PoolObjectAllocator(client, pool))
 
-  private def createDisk(name: String = "d"): Future[DiskInfo] =
-    allocator().flatMap(alloc => DiskCatalog.create(client, name, alloc, DiskSize))
+  private def createDisk(name: String = "d", size: Long = DiskSize): Future[DiskInfo] =
+    allocator().flatMap(alloc => DiskCatalog.create(client, name, alloc, size))
 
   private def acquire(config: VDiskConfig = VDiskConfig(), name: String = "d"): Future[VirtualDisk] =
     VirtualDisk.acquire(client, name, config).map: d =>
@@ -504,6 +504,231 @@ class VirtualDiskSuite extends IntegrationTestSuite:
     yield
       err should be (VDiskError.Fenced)
       later should be (VDiskError.Fenced)
+
+  // ---- UNMAP ----
+
+  atest("unmap of a whole block reads back zeros and frees the object"):
+    val data = pattern(BlockSize, 30)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(BlockSize, data, fua = false)
+      _ <- d1.flush()
+      ptr = d1.blockPointer(1).get
+      _ <- d1.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      own <- d1.read(BlockSize, BlockSize)
+      _ <- d1.flush()
+      gone <- client.readMetadata(ptr).failed
+      d2 <- acquire()
+      mapped <- d2.lookupBlock(1)
+      r <- d2.read(BlockSize, BlockSize)
+    yield
+      own should be (new Array[Byte](BlockSize))
+      gone shouldBe an [InvalidObject]
+      d1.stats.deletedObjects should be (1L)
+      mapped should be (None)
+      r should be (new Array[Byte](BlockSize))
+
+  atest("partial unmap is ignored"):
+    val data = pattern(2 * BlockSize, 31)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, data, fua = false)
+      _ <- d1.flush()
+      _ <- d1.unmap(List((4096L, 8192L), (12288L, 8192L), (BlockSize + 4096L, 12288L)))
+      own <- d1.read(0, 2 * BlockSize)
+      _ <- d1.flush()
+      d2 <- acquire()
+      mapped0 <- d2.lookupBlock(0)
+      mapped1 <- d2.lookupBlock(1)
+      r <- d2.read(0, 2 * BlockSize)
+    yield
+      own should be (data)
+      d1.stats.deletedObjects should be (0L)
+      mapped0 should not be (None)
+      mapped1 should not be (None)
+      r should be (data)
+
+  atest("write, unmap, write before flush keeps the second write"):
+    val x = pattern(BlockSize, 32)
+    val z = pattern(4096, 33)
+    val y = pattern(4096, 34)
+    val model = new Array[Byte](DiskSize)
+    applyTo(model, BlockSize + 8192, y)
+    applyTo(model, 2 * BlockSize + 4096, y)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      // Block 1 is mapped and has more dirty data when it is unmapped, so the second write replaces its object
+      _ <- d1.write(BlockSize, x, fua = false)
+      _ <- d1.flush()
+      _ <- d1.write(BlockSize, z, fua = false)
+      // Block 2 has never been committed, and may still be being looked up
+      _ <- d1.write(2 * BlockSize, x, fua = false)
+      _ <- d1.unmap(List((BlockSize.toLong, 2L * BlockSize)))
+      _ <- d1.write(BlockSize + 8192, y, fua = false)
+      _ <- d1.write(2 * BlockSize + 4096, y, fua = false)
+      own <- d1.read(0, DiskSize)
+      _ <- d1.flush()
+      d2 <- acquire()
+      r <- d2.read(0, DiskSize)
+    yield
+      own should be (model)
+      d1.stats.deletedObjects should be (1L)
+      r should be (model)
+
+  atest("unmap to the end of the disk frees a short last block"):
+    val size = DiskSize + 4096L
+    val data = pattern(4096, 35)
+    for
+      _ <- createDisk(size = size)
+      d1 <- acquire(Held)
+      _ <- d1.write(DiskSize, data, fua = false)
+      _ <- d1.flush()
+      _ <- d1.unmap(List((DiskSize.toLong, 4096L)))
+      _ <- d1.flush()
+      d2 <- acquire()
+      mapped <- d2.lookupBlock(4)
+      r <- d2.read(DiskSize, 4096)
+    yield
+      d1.stats.deletedObjects should be (1L)
+      mapped should be (None)
+      r should be (new Array[Byte](4096))
+
+  atest("unmap rejects invalid ranges"):
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      unaligned <- d1.unmap(List((100L, 4096L))).failed
+      outside <- d1.unmap(List((0L, DiskSize + 4096L))).failed
+    yield
+      unaligned shouldBe a [VDiskError.InvalidRequest]
+      outside shouldBe a [VDiskError.OutOfRange]
+
+  atest("unmap during an in-flight data commit deletes the object once the commit is done"):
+    val x = pattern(BlockSize, 36)
+    val started = Promise[Unit]()
+    val gate = Promise[Unit]()
+    for
+      _ <- createDisk()
+      d1 <- acquire(Eager)
+      _ <- d1.write(BlockSize, x, fua = false)
+      _ <- d1.flush()
+      ptr = d1.blockPointer(1).get
+      _ = d1.commitGate = () =>
+        started.trySuccess(())
+        gate.future
+      // The block is mapped, so the write starts its data transaction, which is held once its input is taken
+      _ <- d1.write(BlockSize, pattern(4096, 37), fua = false)
+      _ <- started.future
+      _ <- d1.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      flushed = d1.flush()
+      held = flushed.isCompleted
+      _ = gate.success(())
+      _ <- flushed
+      own <- d1.read(BlockSize, BlockSize)
+      gone <- client.readMetadata(ptr).failed
+      d2 <- acquire()
+      mapped <- d2.lookupBlock(1)
+    yield
+      held should be (false)
+      own should be (new Array[Byte](BlockSize))
+      gone shouldBe an [InvalidObject]
+      mapped should be (None)
+
+  atest("unmap during an in-flight map transaction deletes the object it creates"):
+    val x = pattern(BlockSize, 38)
+    val y = pattern(4096, 39)
+    val model = new Array[Byte](BlockSize)
+    applyTo(model, 4096, y)
+    val started = Promise[Unit]()
+    val gate = Promise[Unit]()
+    for
+      _ <- createDisk()
+      d1 <- acquire(Eager)
+      // Once the block is known to be absent, the write starts its map transaction before returning. It is held
+      // once its content is taken
+      _ <- d1.read(BlockSize, 4096)
+      _ = d1.commitGate = () =>
+        started.trySuccess(())
+        gate.future
+      _ <- d1.write(BlockSize, x, fua = false)
+      inFlight = d1.mapTxInFlight
+      _ <- started.future
+      _ <- d1.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      _ <- d1.write(BlockSize + 4096, y, fua = false)
+      _ = gate.success(())
+      _ <- d1.flush()
+      own <- d1.read(BlockSize, BlockSize)
+      d2 <- acquire()
+      r <- d2.read(BlockSize, BlockSize)
+    yield
+      inFlight should be (true)
+      d1.stats.deletedObjects should be (1L)
+      own should be (model)
+      r should be (model)
+
+  // ---- Grow ----
+
+  atest("grow extends the device"):
+    val data = pattern(4096, 40)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      before <- d1.write(98304, data, fua = false).failed
+      _ <- d1.grow(131072)
+      _ <- d1.write(98304, data, fua = false)
+      _ <- d1.flush()
+      d2 <- acquire()
+      r <- d2.read(98304, 4096)
+    yield
+      before shouldBe a [VDiskError.OutOfRange]
+      d1.geometry.size should be (131072L)
+      d2.geometry.size should be (131072L)
+      r should be (data)
+
+  // ---- Dirty limit ----
+
+  private val Throttled = VDiskConfig(dirtyHardLimit = 32768, dirtySoftLimit = 16384, coalesceWindow = 10.seconds)
+
+  atest("writers wait at the hard dirty limit"):
+    val model = new Array[Byte](DiskSize)
+    val gate = Promise[Unit]()
+    for
+      _ <- createDisk()
+      d1 <- acquire(Throttled)
+      _ = d1.commitGate = () => gate.future
+      writes = (0 until 16).toList.map: i =>
+        val data = pattern(4096, 50 + i)
+        applyTo(model, i * 4096, data)
+        d1.write(i * 4096, data, fua = false)
+      done = writes.map(_.isCompleted)
+      _ = gate.success(())
+      _ <- Future.sequence(writes)
+      _ <- d1.flush()
+      own <- d1.read(0, DiskSize)
+      d2 <- acquire()
+      r <- d2.read(0, DiskSize)
+    yield
+      // The eighth write brings the dirty total to the limit, and nothing can be written back while the gate holds
+      done.take(7).forall(identity) should be (true)
+      done.drop(7).exists(identity) should be (false)
+      own should be (model)
+      r should be (model)
+
+  atest("a writer waiting at the hard dirty limit fails on close"):
+    for
+      _ <- createDisk()
+      d1 <- acquire(Throttled)
+      _ = d1.commitGate = () => Promise[Unit]().future
+      writes = (0 until 8).toList.map(i => d1.write(i * 4096, pattern(4096, 60 + i), fua = false))
+      waiting = writes.last.isCompleted
+      _ = d1.close()
+      err <- writes.last.failed
+    yield
+      waiting should be (false)
+      err should be (VDiskError.Fenced)
 
   /** A reader whose first call returns `old`'s bytes at an unknown revision, as a lagging store would */
   private def staleOnce(old: Array[Byte]): RangeReader =

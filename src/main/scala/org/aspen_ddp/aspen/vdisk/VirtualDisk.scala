@@ -5,7 +5,7 @@ import java.util.{Arrays, UUID}
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectRangeState, ObjectAllocator, StopRetrying}
 import org.aspen_ddp.aspen.client.tkvl.KVObjectRootManager
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
-import org.aspen_ddp.aspen.vdisk.BlockCommitter.{DataCommit, DataInput}
+import org.aspen_ddp.aspen.vdisk.BlockCommitter.{DataCommit, DataInput, MapEntry, MapResult, PendingDelete}
 import org.aspen_ddp.aspen.vdisk.VDiskError.*
 
 import scala.collection.mutable
@@ -35,6 +35,13 @@ import scala.util.{Failure, Success}
   * than these two fails the disk, unless its known revision was only learned from a read. A failed map transaction
   * is retried, adopting the object of any block that an earlier attempt did add. Once the disk is no longer
   * `Serving`, every pending and later request fails with the stop error, and no transaction is started.
+  *
+  * UNMAP drops a block's dirty data and makes it read as zeros at once. Its object, if it has one, and its map entry
+  * are deleted by a later map transaction, once any commit in flight on the block has ended: a data commit the unmap
+  * supersedes is not retried, and an object a superseded map attempt created is deleted too. A block written again
+  * first gets a new object in the same transaction that deletes the old one. FLUSH waits for the deletions.
+  *
+  * Writes wait only while the dirty total is at `dirtyHardLimit`, until writeback brings it below.
   */
 final class VirtualDisk private (val client: AspenClient,
                                  val info: DiskInfo,
@@ -66,13 +73,22 @@ final class VirtualDisk private (val client: AspenClient,
   /** Mapped blocks waiting for a free data transaction slot */
   private val awaitingData = mutable.LinkedHashSet[Long]()
   private var dataTxRunning = 0
-  private var counters = Stats(0, 0, 0, 0, 0, 0, 0, 0)
+  private var counters = Stats(0, 0, 0, 0, 0, 0, 0, 0, 0)
   private val cleanCache = CleanCache(config.cleanCacheBytes)
   private val detector =
     SequentialDetector(initialWindow = 4 * info.geometry.logicalBlockSize, maxWindow = config.maxReadahead)
   private var fetches = 0L
   /** Reads waiting on I/O. Stopping the disk fails them */
   private val pendingReads = mutable.HashSet[Promise[Array[Byte]]]()
+  /** Unmapped blocks whose map entry, if they have one, waits for a map transaction to delete it with its object */
+  private val pendingDeletes = mutable.TreeMap[Long, PendingDelete]()
+  private var nextDeleteSeq = 0L
+  /** Seqs of the deletions not yet done, whether pending or in the running map transaction */
+  private val outstandingDeletes = mutable.TreeSet[Long]()
+  /** FLUSHes waiting for every deletion up to a seq */
+  private val deleteWaiters = ListBuffer[(Long, Promise[Unit])]()
+  /** Writes waiting for the dirty total to drop below `dirtyHardLimit` */
+  private val throttled = ListBuffer[Promise[Unit]]()
 
   private[vdisk] def dirtyBytes: Long = synchronized(dirtyTotal)
   private[vdisk] def mapTxInFlight: Boolean = synchronized(mapTxRunning)
@@ -93,6 +109,8 @@ final class VirtualDisk private (val client: AspenClient,
   @volatile private[vdisk] var failNextCommitAfterSuccess: Boolean = false
   private[vdisk] def blockPointer(index: Long): Option[DataObjectPointer] =
     synchronized(blocks.get(index).flatMap(_.pointer))
+  /** The block's map entry, as this owner's map knows it */
+  private[vdisk] def lookupBlock(index: Long): Future[Option[DataObjectPointer]] = blockMap.lookup(index)
 
   def state: DiskState = synchronized:
     stopped match
@@ -152,7 +170,16 @@ final class VirtualDisk private (val client: AspenClient,
               val wait = if fua then st.awaitCommitted(seq) else Future.unit
               dirtied(seg.blockIndex, st, urgent = fua)
               wait
-            if fua then Future.sequence(waits).map(_ => ()) else Future.unit
+            val throttle =
+              if dirtyTotal >= config.dirtyHardLimit then
+                val p = Promise[Unit]()
+                throttled += p
+                // Writeback has to make room now, so no block waits out its coalescing window
+                blocks.foreach((b, st) => if st.timer.nonEmpty then kick(b, st))
+                p.future
+              else
+                Future.unit
+            if fua then Future.sequence(waits).flatMap(_ => throttle) else throttle
 
   def flush(): Future[Unit] = locked:
     stopped match
@@ -160,19 +187,43 @@ final class VirtualDisk private (val client: AspenClient,
       case None =>
         // dirty keeps an in-flight commit's pieces (or newer ones over them), so its maxSeq covers that commit too
         val targets = blocks.toList.filter((_, st) => !st.dirty.isEmpty)
-        if targets.isEmpty then
+        val deletes = awaitDeletes(nextDeleteSeq)
+        if targets.isEmpty && deletes.isEmpty then
           Future.unit
         else
           pendingFlushes += 1
-          val waits = targets.map((_, st) => st.awaitCommitted(st.dirty.maxSeq))
+          val waits = targets.map((_, st) => st.awaitCommitted(st.dirty.maxSeq)) ++ deletes
           targets.foreach((b, st) => kick(b, st))
+          if pendingDeletes.nonEmpty then
+            mapKickRequested = true
           val all = Future.sequence(waits).map(_ => ())
           all.onComplete(_ => synchronized { pendingFlushes -= 1 })
           all
 
-  def unmap(ranges: List[(Long, Long)]): Future[Unit] = throw NotImplementedError("unmap")
+  /** Completes at once. Each block the ranges cover entirely reads as zeros from now on, and its object is deleted
+    * by a later map transaction, which FLUSH waits for. Parts of blocks are left alone
+    */
+  def unmap(ranges: List[(Long, Long)]): Future[Unit] =
+    val geom = currentGeometry
+    ranges.view.flatMap((offset, length) => geom.validate(offset, length)).headOption match
+      case Some(err) => Future.failed(err)
+      case None => locked:
+        stopped match
+          case Some(err) => Future.failed(err)
+          case None =>
+            ranges.foreach((offset, length) => geom.blocksFullyCovered(offset, length).foreach(unmapBlock))
+            releaseThrottled()
+            Future.unit
 
-  def grow(newSize: Long): Future[Unit] = throw NotImplementedError("grow")
+  /** Commits the new size to the disk's config, then serves it. Requests in progress are unaffected */
+  def grow(newSize: Long): Future[Unit] =
+    synchronized(stopped) match
+      case Some(err) => Future.failed(err)
+      case None =>
+        DiskCatalog.grow(client, info.name, newSize).map: grown =>
+          synchronized:
+            if grown.geometry.size > currentGeometry.size then
+              currentGeometry = grown.geometry
 
   def close(): Unit = locked(stop(Fenced))
 
@@ -218,6 +269,12 @@ final class VirtualDisk private (val client: AspenClient,
       awaitingMap.clear()
       awaitingData.clear()
       dirtyTotal = 0
+      throttled.foreach(p => later(p.tryFailure(err)))
+      throttled.clear()
+      deleteWaiters.foreach((_, p) => later(p.tryFailure(err)))
+      deleteWaiters.clear()
+      pendingDeletes.clear()
+      outstandingDeletes.clear()
 
   /** A failed writeback lookup stops the disk */
   private def fail(reason: String)(using Deferred): Unit = stop(DiskFailed(reason))
@@ -229,7 +286,8 @@ final class VirtualDisk private (val client: AspenClient,
     st.inFlight.nonEmpty || st.lookupInFlight || awaitingMap.contains(b) || awaitingData.contains(b)
 
   private def urgent(st: BlockState): Boolean =
-    config.coalesceWindow.length == 0 || pendingFlushes > 0 || st.hasWaiters || dirtyTotal > config.dirtySoftLimit
+    config.coalesceWindow.length == 0 || pendingFlushes > 0 || st.hasWaiters || dirtyTotal > config.dirtySoftLimit ||
+      dirtyTotal >= config.dirtyHardLimit
 
   /** The block has new dirty data. Its map lookup, if still needed, runs during the coalescing window */
   private def dirtied(b: Long, st: BlockState, urgent: Boolean)(using Deferred): Unit =
@@ -299,8 +357,77 @@ final class VirtualDisk private (val client: AspenClient,
     st.generation += 1
     st.inFlight = None
     st.takeSatisfied().foreach(p => later(p.success(())))
+    releaseThrottled()
     if !st.dirty.isEmpty then
       dirtied(b, st, urgent = false)
+
+  private def releaseThrottled()(using Deferred): Unit =
+    if throttled.nonEmpty && dirtyTotal < config.dirtyHardLimit then
+      throttled.foreach(p => later(p.trySuccess(())))
+      throttled.clear()
+
+  // ---- UNMAP ----
+
+  /** Drops the block's dirty data, which completes its waiters, and makes it read as zeros. Unless it is known to
+    * have no object, the next map transaction that can deletes the one in the map, waiting for a commit in flight
+    * on the block to end first. Under the monitor
+    */
+  private def unmapBlock(b: Long)(using Deferred): Unit =
+    val st = block(b)
+    st.unmaps += 1
+    st.timer.foreach(_.cancel())
+    st.timer = None
+    dirtyTotal -= st.dirty.bytes
+    st.dirty.removeUpTo(Long.MaxValue)
+    // Its writes are superseded, so FLUSH and FUA waiting for them are done
+    st.committedSeq = math.max(st.committedSeq, nextSeq)
+    st.takeSatisfied().foreach(p => later(p.success(())))
+    awaitingMap.remove(b)
+    awaitingData.remove(b)
+    // A commit in flight may yet create or change an object, which then has to be deleted too
+    val mayBeMapped = !st.lookedUp || st.pointer.nonEmpty || st.inFlight.nonEmpty
+    st.lookedUp = true
+    st.pointer = None
+    forgetRevision(b, st)
+    // A fetch in progress caches nothing
+    st.generation += 1
+    if mayBeMapped && !pendingDeletes.contains(b) then
+      queueDelete(b, refresh = false)
+    if pendingDeletes.contains(b) then
+      mapKickRequested = true
+
+  private def queueDelete(b: Long, refresh: Boolean): Unit =
+    nextDeleteSeq += 1
+    pendingDeletes(b) = PendingDelete(nextDeleteSeq, refresh)
+    outstandingDeletes += nextDeleteSeq
+
+  /** Completes once every deletion up to `seq` is done, or None if they all are */
+  private def awaitDeletes(seq: Long): Option[Future[Unit]] =
+    if outstandingDeletes.headOption.exists(_ <= seq) then
+      val p = Promise[Unit]()
+      deleteWaiters += ((seq, p))
+      Some(p.future)
+    else
+      None
+
+  private def deleteDone(pd: PendingDelete)(using Deferred): Unit =
+    outstandingDeletes -= pd.seq
+    val first = outstandingDeletes.headOption
+    val (done, waiting) = deleteWaiters.partition((seq, _) => first.forall(_ > seq))
+    done.foreach((_, p) => later(p.trySuccess(())))
+    deleteWaiters.clear()
+    deleteWaiters ++= waiting
+
+  /** A map entry superseded by an unmap leaves its batch. An attempt may have created an object for it, so its
+    * deletion goes back to the pending ones, reading the map entry again. Under the monitor
+    */
+  private def requeueDelete(e: MapEntry): Unit =
+    pendingDeletes.get(e.index).toList ++ e.delete match
+      case Nil => queueDelete(e.index, refresh = true)
+      case ds =>
+        val seq = ds.map(_.seq).min
+        ds.foreach(d => if d.seq != seq then outstandingDeletes -= d.seq)
+        pendingDeletes(e.index) = PendingDelete(seq, refresh = true)
 
   /** Succeeds while this owner still holds the fence. Once another owner has taken it, the disk stops and this fails
     * with StopRetrying(Fenced). A failed read of the fence fails with that read's error
@@ -329,32 +456,53 @@ final class VirtualDisk private (val client: AspenClient,
     st.inFlight = Some(st.dirty.snapshot)
     dataTxRunning += 1
     counters = counters.copy(maxConcurrentDataTx = math.max(counters.maxConcurrentDataTx, dataTxRunning))
-    launch(committer.commitBlock(b, st))
+    launch(committer.commitBlock(b, st, st.unmaps))
 
-  /** What an attempt commits and the block state it is built on. Under the monitor */
-  private def dataInput(b: Long, st: BlockState): DataInput =
-    val snap = st.dirty.snapshot
-    st.inFlight = Some(snap)
-    DataInput(st.pointer.get, st.revision, st.length, cleanPieces(b), snap,
-      learned = st.revision.isEmpty || st.revisionLearned)
+  /** What an attempt commits and the block state it is built on, unless the block has been unmapped since `epoch`.
+    * That ends the commit loop. Under the monitor
+    */
+  private def dataInput(b: Long, st: BlockState, epoch: Long)(using Deferred): Option[DataInput] =
+    if st.unmaps != epoch then
+      dataSuperseded(b, st)
+      None
+    else
+      val snap = st.dirty.snapshot
+      st.inFlight = Some(snap)
+      Some(DataInput(st.pointer.get, st.revision, st.length, cleanPieces(b), snap,
+        learned = st.revision.isEmpty || st.revisionLearned, epoch))
 
-  /** The block's commit of `snap` succeeded, which ends its commit loop */
-  private def dataCommitted(b: Long, st: BlockState, snap: SegmentSnapshot, c: DataCommit)(using Deferred): Unit =
+  /** The block's commit of `input` succeeded, which ends its commit loop */
+  private def dataCommitted(b: Long, st: BlockState, input: DataInput, c: DataCommit)(using Deferred): Unit =
     dataTxRunning -= 1
     if stopped.isEmpty then
       counters =
         if c.overwrote then counters.copy(overwriteTxCount = counters.overwriteTxCount + 1)
         else counters.copy(rangedTxCount = counters.rangedTxCount + 1)
-      // Clean bytes are only known to be at the revision the commit replaced when that is the revision they were
-      // held at
-      if !st.revision.contains(c.base) then
-        cleanCache.invalidate(b)
-      st.revision = Some(c.revision)
-      st.length = Some(c.length)
-      st.revisionLearned = false
-      snap.pieces.foreach((o, bytes) => cleanCache.merge(b, o, bytes))
-      committed(b, st, snap)
+      if st.unmaps == input.epoch then
+        // Clean bytes are only known to be at the revision the commit replaced when that is the revision they were
+        // held at
+        if !st.revision.contains(c.base) then
+          cleanCache.invalidate(b)
+        st.revision = Some(c.revision)
+        st.length = Some(c.length)
+        st.revisionLearned = false
+        input.snap.pieces.foreach((o, bytes) => cleanCache.merge(b, o, bytes))
+      else
+        // Unmapped during the commit: the object's deletion was waiting for it
+        mapKickRequested = true
+      committed(b, st, input.snap)
     startQueued()
+
+  /** The block's commit loop ended without committing, since the block was unmapped */
+  private def dataSuperseded(b: Long, st: BlockState)(using Deferred): Unit =
+    dataTxRunning -= 1
+    st.inFlight = None
+    st.generation += 1
+    if stopped.isEmpty then
+      mapKickRequested = true
+      if !st.dirty.isEmpty then
+        dirtied(b, st, urgent = false)
+      startQueued()
 
   private def startQueued()(using Deferred): Unit =
     while stopped.isEmpty && dataTxRunning < config.maxInFlightDataTx && awaitingData.nonEmpty do
@@ -364,9 +512,12 @@ final class VirtualDisk private (val client: AspenClient,
 
   // ---- Map transactions ----
 
-  /** Starts a map transaction for the waiting blocks, in index order, unless one is already running */
+  /** Starts a map transaction for the waiting blocks, in index order, and for the pending deletions of blocks with
+    * no commit in flight, unless one is already running. A waiting block with a pending deletion replaces its
+    * object
+    */
   private def kickMap()(using Deferred): Unit =
-    if stopped.isEmpty && !mapTxRunning && awaitingMap.nonEmpty then
+    if stopped.isEmpty && !mapTxRunning && (awaitingMap.nonEmpty || pendingDeletes.nonEmpty) then
       val batch = ListBuffer[(Long, BlockState, SegmentSnapshot)]()
       var bytes = 0L
       val it = awaitingMap.iterator
@@ -380,49 +531,66 @@ final class VirtualDisk private (val client: AspenClient,
         else
           batch += ((b, st, snap))
           bytes += snap.end
-      val chosen = batch.toList
-      chosen.foreach: (b, st, snap) =>
+      val creates = batch.toList.map: (b, st, snap) =>
         awaitingMap.remove(b)
         st.inFlight = Some(snap)
-      mapTxRunning = true
-      launch(committer.commitMap(chosen.map((b, st, _) => (b, st))))
+        MapEntry(b, st, st.unmaps, create = true, pendingDeletes.remove(b))
+      // A block waiting for a map transaction it did not fit in replaces its object in a later one
+      val deletes = pendingDeletes.iterator
+        .filter((b, _) => blocks(b).inFlight.isEmpty && !awaitingMap.contains(b))
+        .take(MaxMapTxDeletes)
+        .toList
+        .map: (b, pd) =>
+          pendingDeletes.remove(b)
+          MapEntry(b, blocks(b), blocks(b).unmaps, create = false, Some(pd))
+      if creates.nonEmpty || deletes.nonEmpty then
+        mapTxRunning = true
+        launch(committer.commitMap(creates ++ deletes))
 
   /** The map transaction has nothing left to do. Under the monitor */
   private def mapDone(): Unit =
     mapTxRunning = false
     mapKickRequested = true
 
-  private def mapCommitted(inputs: List[(Long, BlockState, SegmentSnapshot)],
-                           contents: List[(Long, Array[Byte])],
-                           inserts: List[(Long, DataObjectPointer)],
-                           revision: ObjectRevision)(using Deferred): Unit =
+  private def mapCommitted(result: MapResult)(using Deferred): Unit =
     if stopped.isEmpty then
-      counters = counters.copy(mapTxCount = counters.mapTxCount + 1)
-      blockMap.recordCommitted(inserts, Nil)
-      inputs.lazyZip(inserts).lazyZip(contents).foreach: (entry, insert, content) =>
-        val (b, st, snap) = entry
-        st.pointer = Some(insert._2)
-        st.revision = Some(revision)
-        st.length = Some(snap.end)
-        st.revisionLearned = false
-        cleanCache.merge(b, 0, content._2)
-        committed(b, st, snap)
-    mapDone()
+      counters = counters.copy(mapTxCount = counters.mapTxCount + 1,
+        deletedObjects = counters.deletedObjects + result.deletedObjects)
+      blockMap.recordCommitted(result.created.map((c, ptr) => (c.entry.index, ptr)), result.deleted.map(_.index))
+      result.created.foreach: (c, ptr) =>
+        val b = c.entry.index
+        val st = c.entry.st
+        // A block unmapped meanwhile keeps reading as zeros, and the deletion that queued waits for this object
+        if st.unmaps == c.entry.epoch then
+          st.pointer = Some(ptr)
+          st.revision = Some(result.revision)
+          st.length = Some(c.snap.end)
+          st.revisionLearned = false
+          cleanCache.merge(b, 0, c.content)
+        c.entry.delete.foreach(deleteDone)
+        committed(b, st, c.snap)
+      result.deleted.foreach(_.delete.foreach(deleteDone))
 
-  /** A failed map attempt did create the block, so its object is adopted and its dirty data goes through a data
-    * transaction
+  /** A failed map attempt did create or replace the block's object, so the block adopts it and its dirty data goes
+    * through a data transaction. One unmapped meanwhile instead waits for the object's deletion
     */
-  private def adopted(index: Long, st: BlockState, ptr: DataObjectPointer, s: DataObjectRangeState)
-                     (using Deferred): Unit =
+  private def adopted(e: MapEntry, ptr: DataObjectPointer, s: DataObjectRangeState)(using Deferred): Unit =
     if stopped.isEmpty then
-      counters = counters.copy(adoptedBlocks = counters.adoptedBlocks + 1)
-      st.pointer = Some(ptr)
-      st.revision = Some(s.revision)
-      st.length = s.objectLength
-      st.revisionLearned = true
-      cleanCache.invalidate(index)
+      val st = e.st
+      e.delete.foreach(deleteDone)
       st.inFlight = None
-      kick(index, st)
+      if st.unmaps == e.epoch then
+        counters = counters.copy(adoptedBlocks = counters.adoptedBlocks + 1)
+        st.pointer = Some(ptr)
+        st.revision = Some(s.revision)
+        st.length = s.objectLength
+        st.revisionLearned = true
+        cleanCache.invalidate(e.index)
+        kick(e.index, st)
+      else
+        mapKickRequested = true
+        if !st.dirty.isEmpty then
+          dirtied(e.index, st, urgent = false)
 
   private object host extends BlockCommitter.Host:
     def checkServing(): Unit = synchronized(stopped).foreach(err => throw StopRetrying(err))
@@ -435,30 +603,40 @@ final class VirtualDisk private (val client: AspenClient,
     def blockObjectSize: Int = currentGeometry.blockObjectSize
     def preImageRead(): Unit = VirtualDisk.this.synchronized:
       counters = counters.copy(preImageReads = counters.preImageReads + 1)
-    def dataInput(b: Long, st: BlockState): DataInput = VirtualDisk.this.synchronized(VirtualDisk.this.dataInput(b, st))
-    def dataCommitted(b: Long, st: BlockState, snap: SegmentSnapshot, c: DataCommit, recovered: Boolean): Unit =
+    def superseded(st: BlockState, epoch: Long): Boolean = VirtualDisk.this.synchronized(st.unmaps != epoch)
+    def dataInput(b: Long, st: BlockState, epoch: Long): Option[DataInput] =
+      locked(VirtualDisk.this.dataInput(b, st, epoch))
+    def dataCommitted(b: Long, st: BlockState, input: DataInput, c: DataCommit, recovered: Boolean): Unit =
       locked:
         if recovered then
           counters = counters.copy(recoveredCommits = counters.recoveredCommits + 1)
-        VirtualDisk.this.dataCommitted(b, st, snap, c)
+        VirtualDisk.this.dataCommitted(b, st, input, c)
     def forgetRevision(b: Long, st: BlockState): Unit = VirtualDisk.this.synchronized:
       VirtualDisk.this.forgetRevision(b, st)
     def dataFailed(err: VDiskError): Unit = locked:
       dataTxRunning -= 1
       stop(err)
-    def mapInputs(batch: List[(Long, BlockState)]): List[(Long, BlockState, SegmentSnapshot)] =
-      VirtualDisk.this.synchronized:
-        batch.map: (b, st) =>
-          val snap = st.dirty.snapshot
-          st.inFlight = Some(snap)
-          (b, st, snap)
-    def mapCommitted(inputs: List[(Long, BlockState, SegmentSnapshot)],
-                     contents: List[(Long, Array[Byte])],
-                     inserts: List[(Long, DataObjectPointer)],
-                     revision: ObjectRevision): Unit = locked(VirtualDisk.this.mapCommitted(inputs, contents, inserts,
-      revision))
-    def adopted(index: Long, st: BlockState, ptr: DataObjectPointer, s: DataObjectRangeState): Unit =
-      locked(VirtualDisk.this.adopted(index, st, ptr, s))
+    def dropSuperseded(batch: List[MapEntry]): List[MapEntry] = locked:
+      val (superseded, kept) = batch.partition(e => e.create && e.st.unmaps != e.epoch)
+      superseded.foreach: e =>
+        e.st.inFlight = None
+        if stopped.isEmpty then
+          requeueDelete(e)
+          if !e.st.dirty.isEmpty then
+            dirtied(e.index, e.st, urgent = false)
+      kept
+    def mapInputs(creates: List[MapEntry]): List[SegmentSnapshot] = VirtualDisk.this.synchronized:
+      creates.map: e =>
+        val snap = e.st.dirty.snapshot
+        e.st.inFlight = Some(snap)
+        snap
+    def mapCommitted(result: MapResult): Unit = locked(VirtualDisk.this.mapCommitted(result))
+    def adopted(e: MapEntry, ptr: DataObjectPointer, s: DataObjectRangeState): Unit =
+      locked(VirtualDisk.this.adopted(e, ptr, s))
+    def mapEntryDone(e: MapEntry): Unit = locked:
+      if stopped.isEmpty then
+        blockMap.recordCommitted(Nil, List(e.index))
+        e.delete.foreach(deleteDone)
     def mapDone(): Unit = locked(VirtualDisk.this.mapDone())
     def mapFailed(err: VDiskError): Unit = locked:
       mapTxRunning = false
@@ -598,9 +776,13 @@ object VirtualDisk:
                                         writesDuringCommit: Long,
                                         preImageReads: Long,
                                         recoveredCommits: Long,
-                                        adoptedBlocks: Long)
+                                        adoptedBlocks: Long,
+                                        deletedObjects: Long)
 
   private[vdisk] type RangeReader = (DataObjectPointer, List[(Int, Int)]) => Future[List[DataObjectRangeState]]
+
+  /** Most deletions a single map transaction makes */
+  private val MaxMapTxDeletes = 256
 
   /** A fetch returned another revision than the block's known one */
   private object StaleFetch extends Exception("fetch returned a revision other than the known one"):

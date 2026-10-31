@@ -177,6 +177,94 @@ class VirtualDiskFailureSuite extends IntegrationTestSuite:
       own should be (model)
       r should be (model)
 
+  atest("a map KeyAlreadyExists with no attempt sent checks the fence before adopting"):
+    val x = pattern(Sector, 80)
+    val y = pattern(Sector, 81)
+    for
+      _ <- createDisk()
+      da <- acquire(Held)
+      // da learns the block is absent, then another owner takes the disk and creates it
+      _ <- da.read(BlockSize, Sector)
+      b <- acquire(Held)
+      _ <- b.write(BlockSize, x, fua = false)
+      _ <- b.flush()
+      _ <- da.write(BlockSize, y, fua = false)
+      err <- da.flush().failed
+      r <- b.read(BlockSize, Sector)
+    yield
+      err should be (VDiskError.Fenced)
+      da.state should be (DiskState.Fenced)
+      da.stats.adoptedBlocks should be (0L)
+      r should be (x)
+
+  atest("an unmap whose map transaction actually committed is recognized"):
+    val x = pattern(BlockSize, 82)
+    for
+      _ <- createDisk()
+      da <- acquire(Held)
+      _ <- da.write(BlockSize, x, fua = false)
+      _ <- da.flush()
+      ptr = da.blockPointer(1).get
+      _ = da.failNextCommitAfterSuccess = true
+      _ <- da.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      _ <- da.flush()
+      gone <- client.readMetadata(ptr).failed
+      b <- acquire()
+      mapped <- b.lookupBlock(1)
+      r <- b.read(BlockSize, BlockSize)
+    yield
+      da.failNextCommitAfterSuccess should be (false)
+      da.state should be (DiskState.Serving)
+      gone shouldBe an [org.aspen_ddp.aspen.client.InvalidObject]
+      mapped should be (None)
+      r should be (new Array[Byte](BlockSize))
+
+  atest("a replacing map transaction that actually committed adopts the new object"):
+    val x = pattern(BlockSize, 83)
+    val y = pattern(Sector, 84)
+    val z = pattern(Sector, 85)
+    val w = pattern(Sector, 86)
+    val model = new Array[Byte](BlockSize)
+    applyTo(model, Sector, y)
+    applyTo(model, 2 * Sector, z)
+    val gates = Gates(2)
+    for
+      _ <- createDisk()
+      da <- acquire(Held)
+      _ <- da.write(BlockSize, x, fua = false)
+      _ <- da.flush()
+      old = da.blockPointer(1).get
+      // A map transaction creating block 2 is held, so block 1's deletion waits and its next write joins it
+      _ <- da.read(2 * BlockSize, Sector)
+      _ = da.commitGate = gates.gate
+      _ <- da.write(2 * BlockSize, w, fua = false)
+      creating = da.flush()
+      _ <- gates.started(0).future
+      _ <- da.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      _ <- da.write(BlockSize + Sector, y, fua = false)
+      replaced = da.flush()
+      _ = gates.release(0).success(())
+      // The replacing transaction is the next one. It commits and reports failure
+      _ <- gates.started(1).future
+      _ = da.failNextCommitAfterSuccess = true
+      _ = gates.release(1).success(())
+      _ <- creating
+      _ <- replaced
+      adopted = da.stats.adoptedBlocks
+      _ <- da.write(BlockSize + 2 * Sector, z, fua = false)
+      _ <- da.flush()
+      gone <- client.readMetadata(old).failed
+      own <- da.read(BlockSize, BlockSize)
+      b <- acquire()
+      r <- b.read(BlockSize, BlockSize)
+    yield
+      da.failNextCommitAfterSuccess should be (false)
+      da.state should be (DiskState.Serving)
+      adopted should be (1L)
+      gone shouldBe an [org.aspen_ddp.aspen.client.InvalidObject]
+      own should be (model)
+      r should be (model)
+
   atest("a foreign write to a block object fails the disk"):
     val x = pattern(BlockSize, 10)
     for

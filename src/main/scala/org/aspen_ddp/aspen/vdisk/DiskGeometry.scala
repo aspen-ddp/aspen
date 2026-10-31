@@ -14,7 +14,7 @@ final case class DiskGeometry(size: Long, logicalBlockSize: Int, blockObjectSize
   /** Number of block objects needed to cover the disk */
   def blockCount: Long = (size + blockObjectSize - 1) / blockObjectSize
 
-  def validate(offset: Long, length: Int): Option[VDiskError] =
+  def validate(offset: Long, length: Long): Option[VDiskError] =
     if offset < 0 || length < 0 || offset % logicalBlockSize != 0 || length % logicalBlockSize != 0 then
       val what = if offset < 0 || offset % logicalBlockSize != 0 then s"offset $offset" else s"length $length"
       Some(VDiskError.InvalidRequest(s"$what is not aligned to $logicalBlockSize"))
@@ -35,11 +35,13 @@ final case class DiskGeometry(size: Long, logicalBlockSize: Int, blockObjectSize
       done += len
     builder.result()
 
-  /** Indices of the blocks entirely contained within the byte range,  */
+  /** Indices of the blocks entirely contained within the byte range. A short last block, when the size is not a
+    * multiple of blockObjectSize, is contained in a range reaching the end of the disk
+    */
   def blocksFullyCovered(offset: Long, length: Long): List[Long] =
     val end = offset + length
     val first = (offset + blockObjectSize - 1) / blockObjectSize
-    val last = end / blockObjectSize // exclusive
+    val last = if end >= size then blockCount else end / blockObjectSize // exclusive
     (first until last).toList
 
 object DiskGeometry:

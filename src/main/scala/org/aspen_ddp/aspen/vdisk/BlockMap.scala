@@ -42,9 +42,15 @@ final class BlockMap(tree: DataObjectTKVL):
         known(index) = r
       r
 
-  def prepare(inserts: List[(Long, DataObjectPointer)], deletes: List[Long])(using Transaction): Future[Unit] =
+  /** Stages the changes in the transaction. An insert requires the index to be absent, a replace overwrites its
+    * entry
+    */
+  def prepare(inserts: List[(Long, DataObjectPointer)],
+              replaces: List[(Long, DataObjectPointer)],
+              deletes: List[Long])(using Transaction): Future[Unit] =
     tree.prepareUpdates(
-      inserts.map((index, ptr) => TKVLInsert(Key(index), Value(ptr.toArray), requireDoesNotExist = true)),
+      inserts.map((index, ptr) => TKVLInsert(Key(index), Value(ptr.toArray), requireDoesNotExist = true)) ++
+        replaces.map((index, ptr) => TKVLInsert(Key(index), Value(ptr.toArray))),
       deletes.map(Key(_)))
 
   /** Records the effect of a committed `prepare` */

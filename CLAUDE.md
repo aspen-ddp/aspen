@@ -46,6 +46,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     out older ones
   - Write-back: WRITE completes from memory; durable at FLUSH/FUA. Block objects are the largest multiple of the
     logical block size <= the allocator's `maxObjectSize`
+  - `vdisk-server` serves disks to tcmu-runner's `handler_aspen.so` (`native/tcmu-aspen`) over a Unix socket;
+    `LockableBlockDevice` is the frontend seam
 - **Information Dispersal Algorithm (IDA)**:
   - Defines the replication/erasure-coding strategy used to provide robustness against data loss
   - Currently Replication, ReedSolomon and RandomAccessReedSolomon are supported

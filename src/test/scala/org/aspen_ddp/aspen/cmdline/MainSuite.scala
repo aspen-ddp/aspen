@@ -283,6 +283,18 @@ class MainSuite extends AnyFunSuite with Matchers:
     parseCmd("create-disk", "d", "1G", "--pool", "p", "--group", "g") shouldBe None
     parseCmd("create-disk", "d", "1G") shouldBe None
 
+  test("vdisk-server parses --socket and --network-cache-dir"):
+    val parsed = parseCmd("vdisk-server", "--socket", "/tmp/x/v.sock", "--network-cache-dir", "/tmp/nc")
+      .getOrElse(fail("vdisk-server did not parse"))
+    parsed.mode shouldBe "vdisk-server"
+    parsed.vdiskSocket shouldBe os.Path("/tmp/x/v.sock")
+    parsed.networkCacheDir shouldBe Some(os.Path("/tmp/nc"))
+
+  test("vdisk-server defaults the socket to /run/aspen/vdisk.sock"):
+    val parsed = parseCmd("vdisk-server").getOrElse(fail("vdisk-server did not parse"))
+    parsed.vdiskSocket shouldBe os.Path("/run/aspen/vdisk.sock")
+    parsed.networkCacheDir shouldBe None
+
   test("create-metadata-pool takes create-pool's positional arguments but not --metadata-group"):
     val parsed = parseCmd("create-metadata-pool", (poolArgs :+ "4096")*)
       .getOrElse(fail("create-metadata-pool did not parse"))

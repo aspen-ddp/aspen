@@ -823,6 +823,19 @@ the logical block size (4096 by default). The disk's objects are allocated from 
 allocation group, which must have a maximum object size. Disks can only grow. `delete-disk` removes the disk and
 all of its data.
 
+### Serving virtual disks
+`vdisk-server` is a daemon that serves disks to tcmu-runner's `handler_aspen.so` over a Unix socket, so they can
+be exported as iSCSI LUNs:
+
+```
+aspen vdisk-server [--socket <path>] [--network-cache-dir <dir>] <client-config> [--bootstrap-host ...]
+```
+
+`--socket` defaults to `/run/aspen/vdisk.sock`; its parent directory is created if missing and the socket is
+mode 0600. Startup fails if another daemon already holds the socket. `--network-cache-dir` persists network
+lookups across restarts and must not be shared with another process. See `docs/vdisk-tcmu-setup.md` for the
+full tcmu-runner and iSCSI setup.
+
 ## Where To Go From Here
 The AmoebaFS implementation is a good source for examples of how to use Aspen as are portions of the
 Aspen codebase itself. Aspen is a self-hosting system and is implemented in terms of itself. All the

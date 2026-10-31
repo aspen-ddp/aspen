@@ -29,7 +29,8 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
-import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskInfo, VDiskError}
+import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
+import org.aspen_ddp.aspen.vdisk.bridge.BridgeServer
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, FsifConfig, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
@@ -138,6 +139,7 @@ object Main {
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
                   networkCacheDir:Option[os.Path]=None,
+                  vdiskSocket:os.Path=os.Path("/run/aspen/vdisk.sock"),
                   loadJars:Option[String]=None,
                   outputClientConfig:Option[os.Path]=None)
 
@@ -445,6 +447,21 @@ object Main {
       arg[String]("<filesystem-name>").text("Name of the filesystem to serve. It must already exist; create one with create-filesystem").
         action( (x, c) => c.copy(fsName=x)).
         validate( x => if (x.nonEmpty) success else failure("Filesystem name must not be empty"))
+    )
+
+  private def vdiskServerArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      clientConfigArg(p),
+      bootstrapHostOption(p),
+
+      p.opt[os.Path]("socket").valueName("<path>").
+        text("Unix socket on which to serve disks to tcmu-runner (default /run/aspen/vdisk.sock)").
+        action((x, c) => c.copy(vdiskSocket = x)),
+
+      p.opt[os.Path]("network-cache-dir").valueName("<dir>").
+        text("Directory in which to cache network lookups across restarts. It must not be shared by two processes").
+        action((x, c) => c.copy(networkCacheDir = Some(x)))
     )
 
   private def createPoolArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -848,6 +865,7 @@ object Main {
     Command("create-device-set", "Creates a new storage device set", createDeviceSetArgs),
     Command("create-allocation-group", "Creates a new allocation group", createAllocationGroupArgs),
     Command("create-filesystem", "Creates a new AmoebaFS filesystem", createFilesystemArgs),
+    Command("vdisk-server", "Serves virtual disks to tcmu-runner over a Unix socket", vdiskServerArgs),
     Command("create-disk", "Creates a new virtual disk", createDiskArgs),
     Command("list-disks", "Lists all virtual disks", configOnlyArgs),
     Command("grow-disk", "Grows a virtual disk", growDiskArgs),
@@ -991,6 +1009,7 @@ object Main {
                                           cfg.outputClientConfig.getOrElse(os.pwd / ClientConfig.configFilename))
             case "host" => run_host(cfg.hostDirectory, cfg.loadJars)
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
+            case "vdisk-server" => run_vdisk_server(session, cfg.vdiskSocket, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
             case "create-pool" =>
@@ -1413,6 +1432,32 @@ object Main {
       _ <- tx.commit()
     yield
       ()
+  }
+
+  def run_vdisk_server(session: ClientSession, socket: os.Path, onetworkCacheDir: Option[os.Path] = None): Int = {
+    configureLogging()
+
+    val (client, network, radicle) = createAspenClient(session, onetworkCacheDir)
+
+    network.startIoThread(client)
+
+    os.makeDir.all(socket / os.up)
+
+    val server = BridgeServer(socket, DiskHandle.open(client, _))
+
+    try
+      server.start()
+    catch
+      case err: Throwable =>
+        println(s"Error: ${err.getMessage}")
+        return 1
+
+    println(s"Serving virtual disks on $socket")
+
+    // Runs indefinitely, like amoebafs: blocking the main thread keeps the process alive.
+    Thread.currentThread.join()
+
+    0 // unreachable
   }
 
   def run_amoebafs(session: ClientSession, fsName: String, onetworkCacheDir: Option[os.Path] = None): Int = {

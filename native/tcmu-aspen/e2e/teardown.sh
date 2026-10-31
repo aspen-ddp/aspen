@@ -8,7 +8,7 @@ IQN="${IQN:-iqn.2026-10.org.aspen-ddp:${DISK}}"
 
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
-if iscsiadm -m session 2>/dev/null | grep -q "$IQN"; then
+if iscsiadm -m session 2>/dev/null | grep "$IQN" >/dev/null; then
   iscsiadm -m node -T "$IQN" -p 127.0.0.1 --logout
 fi
 iscsiadm -m node -T "$IQN" -p 127.0.0.1 -o delete >/dev/null 2>&1 || true

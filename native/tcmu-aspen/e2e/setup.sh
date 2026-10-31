@@ -34,7 +34,7 @@ fi
 targetcli saveconfig
 
 iscsiadm -m discovery -t st -p 127.0.0.1 >/dev/null
-if ! iscsiadm -m session 2>/dev/null | grep -q "$IQN"; then
+if ! iscsiadm -m session 2>/dev/null | grep "$IQN" >/dev/null; then
   iscsiadm -m node -T "$IQN" -p 127.0.0.1 --login
 fi
 echo "logged in to $IQN; find the disk with lsblk"

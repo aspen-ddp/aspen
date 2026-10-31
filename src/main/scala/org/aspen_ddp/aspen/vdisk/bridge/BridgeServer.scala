@@ -34,13 +34,15 @@ final class BridgeServer(socketPath: os.Path, openDisk: String => Future[Lockabl
   /** File key of the socket this server published, so stop() unlinks only its own */
   private var ownKey: Object = null
 
-  /** Binds the socket. A leftover socket file nobody listens on is replaced. If a connect to it succeeds, fails
-    * with IllegalStateException("socket in use: <path>")
+  /** Binds the socket. The parent directory must already exist and pass [[BridgeServer.checkSocketDir]]. A leftover
+    * socket file nobody listens on is replaced. If a connect to it succeeds, fails with
+    * IllegalStateException("socket in use: <path>")
     */
   def start(): Unit = synchronized:
     if listener != null then
       throw new IllegalStateException(s"socket in use: $socketPath")
     checkLength(socketPath)
+    BridgeServer.checkSocketDir(socketPath / os.up)
     checkExisting()
     // Bind inside a private 0700 directory, restrict the socket to 0600, then hard-link it into place, so there is
     // never a moment when another user can connect, and a socket that appeared meanwhile is never replaced
@@ -144,3 +146,27 @@ final class BridgeServer(socketPath: os.Path, openDisk: String => Future[Lockabl
     catch
       case _: ConnectException => Files.deleteIfExists(socketPath.toNIO)
       case e: IOException => throw new IllegalStateException(s"cannot probe $socketPath: $e", e)
+
+object BridgeServer:
+
+  /** Creates the socket's parent directory 0700 if it is missing (missing ancestors too), then checks it */
+  def prepareSocketDir(socketPath: os.Path): Unit =
+    val dir = socketPath / os.up
+    if !os.exists(dir, followLinks = false) then
+      os.makeDir.all(dir, "rwx------")
+    checkSocketDir(dir)
+
+  /** Fails with IllegalStateException unless `dir` is a directory owned by this process's user that neither its
+    * group nor others can write, so no other user can plant or replace a socket in it
+    */
+  def checkSocketDir(dir: os.Path): Unit =
+    if !os.isDir(dir) then
+      throw new IllegalStateException(s"socket directory $dir does not exist or is not a directory")
+    val owner = Files.getAttribute(dir.toNIO, "unix:uid").asInstanceOf[Integer].intValue.toLong
+    val me = new com.sun.security.auth.module.UnixSystem().getUid
+    if owner != me then
+      throw new IllegalStateException(s"socket directory $dir is owned by uid $owner, not by this user (uid $me)")
+    val mode = Files.getAttribute(dir.toNIO, "unix:mode").asInstanceOf[Integer].intValue
+    if (mode & 0x12) != 0 then
+      throw new IllegalStateException(
+        f"socket directory $dir is writable by its group or others (mode ${mode & 0xFFF}%o); make it 0700 or 0755")

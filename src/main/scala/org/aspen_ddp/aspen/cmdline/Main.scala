@@ -1437,20 +1437,26 @@ object Main {
   def run_vdisk_server(session: ClientSession, socket: os.Path, onetworkCacheDir: Option[os.Path] = None): Int = {
     configureLogging()
 
+    def report(err: Throwable): Int =
+      println(s"Error: ${Option(err.getMessage).getOrElse(err.toString)}")
+      1
+
+    // Checked before the client starts, so a bad socket directory fails fast
+    try
+      BridgeServer.prepareSocketDir(socket)
+    catch
+      case err: Throwable => return report(err)
+
     val (client, network, radicle) = createAspenClient(session, onetworkCacheDir)
 
     network.startIoThread(client)
-
-    os.makeDir.all(socket / os.up)
 
     val server = BridgeServer(socket, DiskHandle.open(client, _))
 
     try
       server.start()
     catch
-      case err: Throwable =>
-        println(s"Error: ${err.getMessage}")
-        return 1
+      case err: Throwable => return report(err)
 
     println(s"Serving virtual disks on $socket")
 

@@ -537,7 +537,7 @@ class BridgeServerSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     while parent.toString.length < 100 do
       val room = 100 - parent.toString.length - 1
       parent = parent / ("d" * math.max(1, math.min(room, 30)))
-    os.makeDir.all(parent)
+    os.makeDir.all(parent, "rwx------")
     parent.toString.length should be (100)
     val path = parent / "x"
     val server = new BridgeServer(path, _ => Future.successful(new FakeDevice()))
@@ -553,5 +553,45 @@ class BridgeServerSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val server = new BridgeServer(dir / "nope" / "s.sock", _ => Future.successful(new FakeDevice()))
     try
       intercept[Exception](server.start())
+    finally
+      os.remove.all(dir)
+
+  test("prepareSocketDir creates a missing parent 0700 and start then succeeds"):
+    val dir = os.temp.dir(prefix = "vdb")
+    val path = dir / "run" / "s.sock"
+    val server = new BridgeServer(path, _ => Future.successful(new FakeDevice()))
+    try
+      BridgeServer.prepareSocketDir(path)
+      os.perms(dir / "run").toString() should be ("rwx------")
+      server.start()
+      val c = opened(path)
+      c.close()
+    finally
+      server.stop()
+      os.remove.all(dir)
+
+  test("a parent directory writable by group or others makes start and prepareSocketDir fail"):
+    val dir = os.temp.dir(prefix = "vdb")
+    try
+      for perms <- List("rwxrwxrwx", "rwxrwx---", "rwx----wx") do
+        os.perms.set(dir, perms)
+        val path = dir / "s.sock"
+        val server = new BridgeServer(path, _ => Future.successful(new FakeDevice()))
+        val e = intercept[IllegalStateException](server.start())
+        e.getMessage should include ("writable by its group or others")
+        intercept[IllegalStateException](BridgeServer.prepareSocketDir(path))
+        os.list(dir) should be (Seq.empty)
+      os.perms.set(dir, "rwxr-xr-x")
+      BridgeServer.checkSocketDir(dir)
+    finally
+      os.perms.set(dir, "rwx------")
+      os.remove.all(dir)
+
+  test("a parent that is not a directory makes checkSocketDir fail"):
+    val dir = os.temp.dir(prefix = "vdb")
+    try
+      os.write(dir / "f", "x")
+      val e = intercept[IllegalStateException](BridgeServer.checkSocketDir(dir / "f"))
+      e.getMessage should include ("not a directory")
     finally
       os.remove.all(dir)

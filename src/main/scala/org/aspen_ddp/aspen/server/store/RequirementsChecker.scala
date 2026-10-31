@@ -16,8 +16,13 @@ object RequirementsChecker extends Logging {
 
   /**
     * @param maxSliceSize The store's effective slice size limit. None disables the size check. See checkSliceSize.
-    * @param applying True for the re-check of a committed transaction, which takes no new locks. The exclusive
-    *                 preference window only refuses new SharedRevisionLocks, so it is not enforced then.
+    * @param applying True for the re-check of a committed transaction, which takes no new locks. Locks exist to
+    *                 serialize commit votes. The transaction's outcome is already decided, so locks held by other
+    *                 transactions (and the exclusive preference window) are not enforced then: only whether this
+    *                 store's state satisfies the requirements. A lock holder whose requirements conflict with this
+    *                 transaction's can no longer commit, so enforcing its lock would only turn this store's part of
+    *                 a committed update into a missed update.
+    * @param nanoTime Clock for the exclusive preference window
     * @return Tuple of object specific errors and a list of non-object errors
     */
   def check(transactionId: TransactionId,
@@ -26,14 +31,16 @@ object RequirementsChecker extends Logging {
             objects: Map[ObjectId, ObjectState],
             objectUpdates: Map[ObjectId, DataBuffer],
             maxSliceSize: Option[Long] = None,
-            applying: Boolean = false):
+            applying: Boolean = false,
+            nanoTime: () => Long = () => System.nanoTime()):
   (Map[ObjectId, RequirementError], List[RequirementError]) = {
 
     def checkExclusiveLock(oid: ObjectId, os: ObjectState): Unit =
-      os.lockedToTransaction.foreach { lockedTxId =>
-        if lockedTxId != transactionId then
-          throw ObjectErr(oid, TransactionCollision(lockedTxId))
-      }
+      if !applying then
+        os.lockedToTransaction.foreach { lockedTxId =>
+          if lockedTxId != transactionId then
+            throw ObjectErr(oid, TransactionCollision(lockedTxId))
+        }
 
     /** State for every object requirement except SharedRevisionLock. Held shared locks block it and open the
       * exclusive preference window so that new shared lockers back off until this transaction can get in.
@@ -43,10 +50,11 @@ object RequirementsChecker extends Logging {
         case None => throw ObjectErr(oid, MissingObject())
         case Some(os) =>
           checkExclusiveLock(oid, os)
-          os.sharedLocks.find(_ != transactionId).foreach { sharedTxId =>
-            os.exclusiveWaitUntil = System.nanoTime() + SharedRevisionLock.ExclusivePreferenceWindow.toNanos
-            throw ObjectErr(oid, TransactionCollision(sharedTxId))
-          }
+          if !applying then
+            os.sharedLocks.find(_ != transactionId).foreach { sharedTxId =>
+              os.exclusiveWaitUntil = nanoTime() + SharedRevisionLock.ExclusivePreferenceWindow.toNanos
+              throw ObjectErr(oid, TransactionCollision(sharedTxId))
+            }
           os
 
     def getSharedState(oid: ObjectId): ObjectState =
@@ -54,7 +62,7 @@ object RequirementsChecker extends Logging {
         case None => throw ObjectErr(oid, MissingObject())
         case Some(os) =>
           checkExclusiveLock(oid, os)
-          if !applying && os.exclusiveWaitUntil != 0 && System.nanoTime() - os.exclusiveWaitUntil < 0 then
+          if !applying && os.exclusiveWaitUntil != 0 && nanoTime() - os.exclusiveWaitUntil < 0 then
             // The waiting exclusive transaction is not tracked, so the collision names this one. It is never a
             // completed transaction, which keeps the driver from treating the collision as a stale race.
             throw ObjectErr(oid, TransactionCollision(transactionId))
@@ -97,7 +105,7 @@ object RequirementsChecker extends Logging {
           case r: KeyValueUpdate =>
             val state = getState(r.objectPointer.id)
             checkKVRequirements(state, transactionId, r.requiredRevision,
-              txTimestamp, r.contentLock, r.requirements)
+              txTimestamp, r.contentLock, r.requirements, ignoreLocks = applying)
 
             if (!objectUpdates.contains(r.objectPointer.id))
               throw ObjectErr(r.objectPointer.id, MissingObjectUpdate())
@@ -189,7 +197,8 @@ object RequirementsChecker extends Logging {
                           requiredRevision: Option[ObjectRevision],
                           txTimestamp: HLCTimestamp,
                           contentLock: Option[FullContentLock],
-                          keyRequirements: List[KeyValueUpdate.KeyRequirement]): Unit = {
+                          keyRequirements: List[KeyValueUpdate.KeyRequirement],
+                          ignoreLocks: Boolean = false): Unit = {
 
     requiredRevision.foreach { rev =>
       if (rev != state.metadata.revision)
@@ -199,17 +208,20 @@ object RequirementsChecker extends Logging {
         throw ObjectErr(state.objectId, ObjectTimestampError())
     }
 
+    /** Other transactions' lock, if any. None when locks are ignored */
+    def otherLock(lock: Option[TransactionId]): Option[TransactionId] =
+      if ignoreLocks then None else lock.filter(_ != transactionId)
+
+    def checkContentLock(kvs: KVObjectState): Unit =
+      otherLock(kvs.contentLocked).foreach { lockedTransactionId =>
+        throw ObjectErr(state.objectId, TransactionCollision(lockedTransactionId))
+      }
+
     def checkLock(vs: ValueState, kvs: KVObjectState): Unit = {
-      vs.lockedToTransaction.foreach { lockedTransactionId =>
-        if (lockedTransactionId != transactionId)
-          throw ObjectErr(state.objectId, TransactionCollision(lockedTransactionId))
+      otherLock(vs.lockedToTransaction).foreach { lockedTransactionId =>
+        throw ObjectErr(state.objectId, TransactionCollision(lockedTransactionId))
       }
-      kvs.contentLocked match {
-        case None =>
-        case Some(lockedTransactionId) =>
-          if (lockedTransactionId != transactionId)
-            throw ObjectErr(state.objectId, TransactionCollision(lockedTransactionId))
-      }
+      checkContentLock(kvs)
     }
 
 
@@ -225,12 +237,16 @@ object RequirementsChecker extends Logging {
           if (expected != actual)
             throw ObjectErr(state.objectId, ContentMismatch())
 
+          // An empty object has no values to check, so the content lock is checked directly too
+          checkContentLock(kvs)
           kvs.content.valuesIterator.foreach(checkLock(_, kvs))
         }
 
         // Check for object revision lock and read-only locks
-        if (requiredRevision.nonEmpty && kvs.rangeLocks.nonEmpty)
-          throw ObjectErr(state.objectId, TransactionCollision(kvs.rangeLocks.head))
+        if (requiredRevision.nonEmpty && !ignoreLocks)
+          kvs.rangeLocks.find(_ != transactionId).foreach { lockedTransactionId =>
+            throw ObjectErr(state.objectId, TransactionCollision(lockedTransactionId))
+          }
 
         for (req <- keyRequirements) {
           req match {
@@ -265,13 +281,13 @@ object RequirementsChecker extends Logging {
 
             case r: KeyValueUpdate.MayExist => kvs.content.get(r.key) match {
               case None =>
-                if (kvs.noExistenceLocks.contains(r.key))
+                if (otherLock(kvs.noExistenceLocks.get(r.key)).nonEmpty)
                   throw ObjectErr(state.objectId, KeyExistenceError())
               case Some(vs) => checkLock(vs, kvs)
             }
 
             case r: KeyValueUpdate.DoesNotExist => kvs.content.get(r.key) match {
-              case None => kvs.noExistenceLocks.get(r.key).foreach { txid =>
+              case None => otherLock(kvs.noExistenceLocks.get(r.key)).foreach { txid =>
                 throw ObjectErr(state.objectId, TransactionCollision(txid))
               }
               case Some(_) => throw ObjectErr(state.objectId, KeyExistenceError())

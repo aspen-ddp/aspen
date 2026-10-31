@@ -28,7 +28,8 @@ class SharedRevisionLockIntegrationSuite extends IntegrationTestSuite:
       objects <- Future.sequence((1 to 8).map(i => allocate(i, Array[Byte](0))))
       fenceState <- client.read(fence)
       states <- Future.sequence(objects.map(client.read(_)))
-      // Every transaction is started before any completes, so the shared locks are held concurrently
+      // Every transaction is started before any completes. TestNetwork delivers synchronously and runs each commit to
+      // completion, so this checks that shared lockers all commit, not that their locks overlap (FrontendSuite does)
       _ <- Future.sequence(states.zipWithIndex.map { (state, i) =>
         val tx = client.newTransaction()
         tx.sharedLockRevision(fence, fenceState.revision)

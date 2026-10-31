@@ -53,6 +53,7 @@ class Tx( trs: TransactionRecoveryState,
   private var committed: Boolean = false
   private var committing: Boolean = false
   private var locked: Boolean = false
+  private var outcomeKnown: Boolean = false
   private var lastProposer: StoreId = StoreId(txd.primaryObject.poolId, txd.designatedLeaderUID)
   private var objectCommitErrors: List[ObjectId] = Nil
 
@@ -65,6 +66,21 @@ class Tx( trs: TransactionRecoveryState,
   def lastEventTime: Long = lastEvent
 
   def durationSinceLastEvent: Duration = Duration(System.nanoTime() - lastEvent, NANOSECONDS)
+
+  /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
+    * on conflicting transactions in the meantime. Locks have no purpose once the outcome is known, including the
+    * resolved status of a Tx recovered from the CRL.
+    */
+  private def lock(): Unit =
+    if !locked && !outcomeKnown && status == TransactionStatus.Unresolved &&
+      disposition == TransactionDisposition.VoteCommit then
+      locked = true
+      RequirementsLocker.lock(transactionId, requirements, objects)
+
+  /** The transaction is known to be resolved, though this Tx has not been told the outcome: its prepare arrived
+    * after the resolution did. Its vote cannot affect the outcome, so it takes no locks.
+    */
+  def outcomeDecided(): Unit = outcomeKnown = true
 
   private def unlock(): Unit = if (locked) {
     locked = false
@@ -134,6 +150,8 @@ class Tx( trs: TransactionRecoveryState,
       m.foreach(t => logger.trace(s"Tx ${txd.transactionId}. Object: ${t._1.uuid}. Requirement Error: ${t._2}"))
       l.foreach(e => logger.trace(s"Tx ${txd.transactionId}. Requirement Error: ${e}"))
     }
+
+    lock()
 
     // Case Resolution Complete
     oresolution.foreach { resolution =>

@@ -3,12 +3,13 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxCommitted, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionDescription, TransactionDisposition, TransactionId}
+import org.aspen_ddp.aspen.common.paxos.PersistentState
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, RefcountUpdate, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
@@ -355,5 +356,197 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val (_, _, disposition) = crossPoolPrepare(new ObjectRevision(new UUID(0, 10)))
 
     disposition shouldBe TransactionDisposition.VoteAbort
+  }
+
+  // ---- Requirement locks held between a commit vote and resolution ----
+
+  val txid3 = TransactionId(new UUID(0, 11))
+  val fenceOid = ObjectId(new UUID(0, 12))
+  val fencePtr = DataObjectPointer(fenceOid, poolId, Array[Byte]())
+
+  def lockTxd(txid: TransactionId, reqs: List[TransactionRequirement]): TransactionDescription =
+    mktxd().copy(transactionId = txid, requirements = reqs)
+
+  def overwrite(ptr: ObjectPointer): DataUpdate = DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)
+
+  /** Sends a prepare for the transaction and returns this store's TxPrepareResponse */
+  def prepare(frontend: Frontend, net: TestNet, txd: TransactionDescription): TxPrepareResponse =
+    val updates = txd.requirements.collect { case r: DataUpdate => ObjectUpdate(r.objectPointer.id, DataBuffer(Array[Byte](1))) }
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(objectUpdates = updates))
+    net.txMessage() match
+      case Some(r: TxPrepareResponse) => r
+      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+
+  def resolve(frontend: Frontend, net: TestNet, txid: TransactionId, committed: Boolean): Unit =
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid, committed))
+    net.txMessage()
+
+  def lockFixture(): (Frontend, MapBackend, TestNet) =
+    val (frontend, backend, _, net) = mkFrontendWithNet()
+    for oid <- List(oid1, fenceOid) do
+      val os = mkObjectState(oid)
+      backend.bootstrapAllocate(oid, os.objectType, os.metadata, os.data)
+    (frontend, backend, net)
+
+  test("a second transaction requiring the same revision votes abort while the first holds its vote") {
+    val (frontend, _, net) = lockFixture()
+
+    val r1 = prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+    r1.disposition shouldBe TransactionDisposition.VoteCommit
+
+    val r2 = prepare(frontend, net, lockTxd(txid2, List(overwrite(op1))))
+    r2.disposition shouldBe TransactionDisposition.VoteAbort
+    r2.collisions shouldBe List(txid1)
+  }
+
+  test("locks are released when the first transaction resolves aborted") {
+    val (frontend, _, net) = lockFixture()
+
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
+
+    resolve(frontend, net, txid1, committed = false)
+
+    prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a SharedRevisionLock holder blocks an overwrite until it resolves") {
+    val (frontend, backend, net) = lockFixture()
+
+    val a = lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0), overwrite(op1)))
+    prepare(frontend, net, a).disposition shouldBe TransactionDisposition.VoteCommit
+
+    val b = prepare(frontend, net, lockTxd(txid2, List(overwrite(fencePtr))))
+    b.disposition shouldBe TransactionDisposition.VoteAbort
+    b.collisions shouldBe List(txid1)
+
+    resolve(frontend, net, txid1, committed = true)
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid1)
+    backend.get(fenceOid).get.metadata.revision shouldBe rev0
+
+    prepare(frontend, net, lockTxd(txid3, List(overwrite(fencePtr)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+  }
+
+  test("two SharedRevisionLock holders both vote commit") {
+    val (frontend, _, net) = lockFixture()
+
+    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(SharedRevisionLock(fencePtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+  }
+
+  test("a transaction that votes abort takes no locks") {
+    val (frontend, _, net) = lockFixture()
+
+    // Fails on its revision, so it must not lock op1
+    val stale = DataUpdate(op1, new ObjectRevision(new UUID(0, 10)), DataUpdateOperation.Overwrite)
+    prepare(frontend, net, lockTxd(txid1, List(stale))).disposition shouldBe TransactionDisposition.VoteAbort
+
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  /** A Frontend that recovers txid1 (an overwrite of op1 that voted commit) from its CRL with the given status */
+  def recoveredFrontend(status: TransactionStatus.Value): (Frontend, TestNet) =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    // Cached so the recovered transaction's object loads during Frontend construction
+    cache.insert(os)
+
+    val txd = lockTxd(txid1, List(overwrite(op1)))
+    val trs = TransactionRecoveryState(storeId, txd.serialize(), List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))),
+      TransactionDisposition.VoteCommit, status, PersistentState.initial)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(trs)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    (frontend, net)
+
+  test("a transaction recovered from the CRL already resolved takes no locks") {
+    val (frontend, net) = recoveredFrontend(TransactionStatus.Aborted)
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a transaction recovered from the CRL with a commit vote holds its locks") {
+    val (frontend, net) = recoveredFrontend(TransactionStatus.Unresolved)
+
+    val r2 = prepare(frontend, net, lockTxd(txid2, List(overwrite(op1))))
+    r2.disposition shouldBe TransactionDisposition.VoteAbort
+    r2.collisions shouldBe List(txid1)
+
+    resolve(frontend, net, txid1, committed = false)
+    prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a committed transaction is applied while another transaction holds a lock on its object") {
+    val (frontend, backend, net) = lockFixture()
+
+    // txid1 locks op1. txid2 collides here but is committed by the votes of other stores
+    prepare(frontend, net, lockTxd(txid1, List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))))
+      .disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid2, committed = true))
+    net.txMessage() match
+      case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+      case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+    backend.get(oid1).get.metadata.revision shouldBe ObjectRevision(txid2)
+
+    // txid1's lock survives txid2's commit and is released by its own resolution
+    prepare(frontend, net, lockTxd(txid3, List(RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 2)))))
+      .collisions shouldBe List(txid1)
+    resolve(frontend, net, txid1, committed = true)
+    backend.get(oid1).get.metadata.refcount shouldBe ObjectRefcount(2, 2)
+  }
+
+  test("a prepare arriving after its transaction was finalized starts no transaction and takes no locks") {
+    val (frontend, _, net) = lockFixture()
+    val txd = lockTxd(txid1, List(overwrite(op1)))
+
+    // Aborted by the other stores and finalized before this store saw its prepare
+    prepare(frontend, net, txd).disposition shouldBe TransactionDisposition.VoteCommit
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false))
+    frontend.transactions.contains(txid1) shouldBe false
+
+    // A retransmitted prepare
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    frontend.transactions.contains(txid1) shouldBe false
+
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a prepare arriving after a TxFinalized for a transaction this store never saw starts no transaction") {
+    val (frontend, _, net) = lockFixture()
+    val txd = lockTxd(txid1, List(overwrite(op1)))
+
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false))
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    frontend.transactions.contains(txid1) shouldBe false
+
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a prepare arriving after its transaction resolved aborted takes no locks") {
+    val (frontend, _, net) = lockFixture()
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("a prepare arriving after its transaction resolved committed takes no locks") {
+    val (frontend, _, net) = lockFixture()
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
   }
 }

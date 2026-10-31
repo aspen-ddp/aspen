@@ -46,6 +46,9 @@ case class RevisionLock(
   * transactions that modify or exclusively lock the object. An exclusive requirement that collides with held shared
   * locks opens an ExclusivePreferenceWindow during which new shared locks are refused, so a writer cannot be starved
   * by a continuous stream of shared lockers.
+  *
+  * Any exclusive collision opens the window, even one from a writer that aborts and never retries, so shared lockers
+  * may abort with TransactionCollision for up to ExclusivePreferenceWindow after such a collision.
   */
 case class SharedRevisionLock(
                                objectPointer: ObjectPointer,

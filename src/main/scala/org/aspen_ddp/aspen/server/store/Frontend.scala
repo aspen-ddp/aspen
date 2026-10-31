@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
-import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitState, Completion, Read}
@@ -69,9 +69,17 @@ class Frontend(val storeId: StoreId,
     case m: TxPrepare => receivePrepare(m)
     case m: TxAccept => transactions.get(m.transactionId).foreach(tx => tx.receiveAccept(m))
     case m: TxResolved =>
-      transactions.get(m.transactionId).foreach(tx => tx.receiveResolved(m))
+      transactions.get(m.transactionId) match
+        case Some(tx) => tx.receiveResolved(m)
+        // Remembered for a prepare that arrives after this. See receivePrepare
+        case None =>
+          if !statusCache.getStatus(m.transactionId).exists(_.finalized) then
+            statusCache.updateStatus(m.transactionId, statusOf(m.committed))
     case m: TxFinalized =>
-      transactions.get(m.transactionId).foreach(tx => tx.receiveFinalized(m))
+      transactions.get(m.transactionId) match
+        case Some(tx) => tx.receiveFinalized(m)
+        // Remembered for a prepare that arrives after this. See receivePrepare
+        case None => statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = true)
       transactions -= m.transactionId
     case m: TxHeartbeat => transactions.get(m.transactionId).foreach(tx => tx.receiveHeartbeat(m))
     case m: TxStatusRequest => transactions.get(m.transactionId).foreach(tx => tx.receiveStatusRequest(m))
@@ -82,15 +90,31 @@ class Frontend(val storeId: StoreId,
     case Some(tx) =>
       logger.trace(s"**** EXISTING TX: ${m.txd.transactionId}. $tx")
       tx.receivePrepare(m)
+    // A prepare can arrive after the transaction's resolution (or finalization) did, as when this store was slow or the
+    // client's prepare is a retransmission. Started afresh, the Tx would never learn the outcome it missed: a commit vote
+    // would hold its requirement locks until finalization, which may itself wait on transactions those locks block, or
+    // indefinitely once nothing drives the finalized transaction. Store has already answered a finalized one from the
+    // status cache, so it is ignored. A resolved one takes no locks; it still learns its outcome from TxFinalized.
+    case None if statusCache.getStatus(m.txd.transactionId).exists(_.finalized) =>
+      logger.trace(s"**** IGNORING PREPARE FOR FINALIZED TX: ${m.txd.transactionId}")
+
     case None =>
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")
+      val known = statusCache.getStatus(m.txd.transactionId).filter(_.status != TransactionStatus.Unresolved)
       val trs = TransactionRecoveryState.initial(m.to, m.txd, m.objectUpdates)
       val pointers = m.txd.allHostedObjects(m.to)
       val tx = new Tx(trs, m.txd, this, net, crl, statusCache, m.preTxRebuilds, pointers)
       transactions += (m.txd.transactionId -> tx)
       tx.receivePrepare(m)
+      known.foreach { entry =>
+        tx.outcomeDecided()
+        statusCache.updateStatus(m.txd.transactionId, entry.status) // The new Tx recorded itself as Unresolved
+      }
       pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
   }
+
+  private def statusOf(committed: Boolean): TransactionStatus.Value =
+    if committed then TransactionStatus.Committed else TransactionStatus.Aborted
 
   def backendOperationComplete(completion: Completion): Unit = completion match {
     case r: Read => backendReadComplete(r.objectId, r.result)

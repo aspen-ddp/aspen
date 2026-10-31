@@ -243,29 +243,69 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(errs.isEmpty)
   }
 
-  /** Locks tx1 shared, then checks a tx2 DataUpdate on the same object */
+  /** Fixed clock for the exclusive preference window, so no test depends on wall-clock timing */
+  private val now = 1000000L
+  private val window = SharedRevisionLock.ExclusivePreferenceWindow.toNanos
+
+  /** Locks tx1 shared, then checks a tx2 DataUpdate on the same object at time `now` */
   private def collideWithSharedLock(objects: Map[ObjectId, ObjectState]): Map[ObjectId, RequirementError] =
     RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
     val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now,
-      List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects, Map(oid1 -> DataBuffer.Empty))
+      List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects, Map(oid1 -> DataBuffer.Empty),
+      nanoTime = () => now)
     assert(errs.isEmpty)
     oerrs
+
+  private def checkSharedAt(objects: Map[ObjectId, ObjectState], time: Long) =
+    RequirementsChecker.check(tx3, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)), objects, Map(),
+      nanoTime = () => time)
 
   test("DataUpdate collides with a held SharedRevisionLock") {
     val objects = sharedLockFixture()
     val oerrs = collideWithSharedLock(objects)
     assert(oerrs == Map(oid1 -> TransactionCollision(tx1)))
-    assert(objects(oid1).exclusiveWaitUntil > System.nanoTime())
+    assert(objects(oid1).exclusiveWaitUntil == now + window)
   }
 
   test("SharedRevisionLock refused during the exclusive preference window") {
     val objects = sharedLockFixture()
     collideWithSharedLock(objects)
-    val (oerrs, errs) = RequirementsChecker.check(tx3, HLCTimestamp.now, List(SharedRevisionLock(p1, rev1)),
-      objects, Map())
+    val (oerrs, errs) = checkSharedAt(objects, now + window - 1)
     assert(oerrs.keySet == Set(oid1))
     assert(oerrs(oid1).isInstanceOf[TransactionCollision])
     assert(errs.isEmpty)
+  }
+
+  test("SharedRevisionLock accepted once the exclusive preference window closes") {
+    val objects = sharedLockFixture()
+    collideWithSharedLock(objects)
+    val (oerrs, errs) = checkSharedAt(objects, now + window)
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+  }
+
+  test("a committed transaction's re-check ignores locks held by other transactions") {
+    val objects = sharedLockFixture()
+    RequirementsLocker.lock(tx1, List(SharedRevisionLock(p1, rev1)), objects)
+    objects(oid1).lockedToTransaction = Some(tx3)
+    val reqs = List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite))
+    val updates = Map(oid1 -> DataBuffer.Empty)
+
+    RequirementsChecker.check(tx2, HLCTimestamp.now, reqs, objects, updates)._1.keySet shouldBe Set(oid1)
+    objects(oid1).exclusiveWaitUntil = 0
+
+    val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, reqs, objects, updates, applying = true)
+    assert(oerrs.isEmpty)
+    assert(errs.isEmpty)
+    // Applying takes no locks, so it does not hold off shared lockers either
+    assert(objects(oid1).exclusiveWaitUntil == 0)
+  }
+
+  test("unlock releases only locks held by the unlocking transaction") {
+    val objects = sharedLockFixture()
+    objects(oid1).lockedToTransaction = Some(tx2)
+    RequirementsLocker.unlock(tx1, List(DataUpdate(p1, rev1, DataUpdateOperation.Overwrite)), objects)
+    assert(objects(oid1).lockedToTransaction == Some(tx2))
   }
 
   test("a committing SharedRevisionLock is applied during the exclusive preference window") {
@@ -1055,4 +1095,38 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     assert(kv._2.isEmpty)
   }
 
+
+  private def emptyKVObject(): Map[ObjectId, ObjectState] =
+    val o = new ObjectState(oid1, Metadata(rev1, ref1, ts1), ObjectType.KeyValue, DataBuffer(new Array[Byte](0)))
+    o.kvState = Some(new KVObjectState)
+    Map(o.objectId -> o)
+
+  test("a transaction's own KV locks do not collide with its re-check") {
+    val objects = emptyKVObject()
+    val k = Key(Array[Byte](1))
+    val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.DoesNotExist(k),
+      KeyValueUpdate.WithinRange(k, ByteArrayKeyOrdering)))
+    val updates = Map(oid1 -> DataBuffer.Empty)
+
+    RequirementsLocker.lock(tx1, List(req), objects)
+
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates) shouldBe (Map(), Nil)
+    RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)._1 shouldBe
+      Map(oid1 -> TransactionCollision(tx1))
+
+    RequirementsLocker.unlock(tx1, List(req), objects)
+    RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates) shouldBe (Map(), Nil)
+  }
+
+  test("a full content lock on an empty object collides with another transaction's content lock") {
+    val objects = emptyKVObject()
+    val req = KeyValueUpdate(kp1, None, Some(FullContentLock(Nil)), Nil)
+    val updates = Map(oid1 -> DataBuffer.Empty)
+
+    RequirementsLocker.lock(tx1, List(req), objects)
+
+    RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)._1 shouldBe
+      Map(oid1 -> TransactionCollision(tx1))
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates) shouldBe (Map(), Nil)
+  }
 }

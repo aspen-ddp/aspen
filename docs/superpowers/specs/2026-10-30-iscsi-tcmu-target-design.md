@@ -64,11 +64,12 @@ but departs from it where noted, most importantly by not processing requests one
   therefore accepts objects of exactly 5,120,000 bytes, and no FSIF change is needed. The 500 KiB per-slice data
   size can be changed later. Smaller segments enlarge the stores' in-memory index, and 500 KiB is the chosen
   balance.
-- Block objects are DataObjects of exactly `blockObjectSize` = the allocator's `maxObjectSize` (5,120,000 bytes
+- Block objects are DataObjects of `blockObjectSize` = the largest multiple of the logical block size that is at
+  most the allocator's `maxObjectSize` (row rounding makes `maxObjectSize` slightly larger; 5,120,000 bytes
   = 1250 x 4 KiB here). Disk byte offset `o` lives in block object `o / blockObjectSize` at offset
   `o % blockObjectSize`. `blockObjectSize` is recorded per disk at creation and never changes. Any allocator is
-  accepted (5,120,000 is just this setup's value), but creation fails unless its `maxObjectSize` is a multiple of
-  the disk's logical block size (designer's call).
+  accepted (5,120,000 is just this setup's value); creation fails only if that rounds below one logical block
+  (designer's call).
 - The block-index -> `DataObjectPointer` map is a `DataObjectTKVL` (integer keys). This fits its single-writer
   intent. Block objects are allocated from an `ObjectAllocator` over the FSIF pool or group.
 - Small reads and writes use the RandomAccessReedSolomon byte-range operations (`readRange`/`readRanges`,
@@ -83,19 +84,17 @@ but departs from it where noted, most importantly by not processing requests one
 
 ### Single-writer fencing (agreed)
 
-- Each disk has a descriptor (a KeyValue object) that holds an owner epoch and the owner's identity.
-- Every transaction that modifies the disk's data or map carries a `RevisionLock`
-  (`Transaction.lockRevision`) on the descriptor at the revision the owner observed when it took ownership. A lock
-  is a requirement, not a write, so concurrent data transactions don't modify the descriptor.
+- Each disk has a fence (a DataObject) that holds an owner epoch and the owner's identity.
+- Every transaction that modifies the disk's data or map carries a new `SharedRevisionLock`
+  (`Transaction.sharedLockRevision`) on the fence at the revision the owner observed when it took ownership. The
+  existing `RevisionLock` is exclusive in the store, so concurrent commits would collide; any number of
+  transactions may hold the shared lock at once, while any write to the fence collides with it. A best-effort
+  in-memory writer-preference window in the store keeps a takeover from being starved.
 - Taking ownership is one transaction that rewrites the descriptor with a new epoch and owner. From then on, every
   in-flight or later commit by the previous owner fails its requirement and aborts.
 - A daemon serves I/O for a disk only after its takeover transaction has committed. When one of its commits fails
   the epoch requirement, it has been fenced. It must fail every outstanding and later I/O for that disk, drop its
   caches, and report the ALUA state as standby/unavailable.
-- **Builder must verify:** that many concurrent transactions each holding a `RevisionLock` on the same descriptor
-  revision do not collide with one another in the store's locking. If they do, add a non-exclusive
-  revision-check requirement (the requirement hierarchy is designed to be extended) rather than serializing
-  commits.
 
 ### Failover
 
@@ -190,8 +189,10 @@ test is structural: the design must not add delay.
 - **Daemon crash:** crash-only. On restart (or on another daemon), ownership is retaken by the takeover
   transaction and the disk is served from Aspen state. Nothing local needs recovering.
 - **Fenced:** fail all I/O for that disk and report the ALUA state as non-active (see Fencing).
-- **Unexpected revision mismatch on a block object or map node:** under single-writer this means a bug or a
-  fencing failure. Stop serving the disk with a hard error. Don't re-read and retry.
+- **Unexpected revision mismatch on a block object:** under single-writer this means a bug or a fencing failure.
+  Stop serving the disk with a hard error. Map transactions are different: TKVL finalization actions rewrite map
+  nodes in their own transactions, so an unfenced map-transaction abort is retried (`requireDoesNotExist` makes
+  a retry of an already-committed attempt fail with `KeyAlreadyExists`, whose pointer is then adopted).
 - **Aspen unavailable or slow:** Aspen's own retry handles it. The daemon doesn't time out requests itself, so
   stalls are bounded by the storage, not by the design.
 - **Commit failed for some other reason, outcome unknown (designer's call):** don't guess. Before the object's next

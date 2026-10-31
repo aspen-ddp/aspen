@@ -32,10 +32,13 @@ class BridgeServerSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
   private val Geometry = DiskGeometry(Size, Block, 65536)
 
   /** Every call returns a Promise the test controls, unless `auto` is set, in which case calls complete at once */
-  private final class FakeDevice(var auto: Boolean = true, val geometry: DiskGeometry = Geometry)
+  private final class FakeDevice(var auto: Boolean = true, geo: DiskGeometry = Geometry)
       extends LockableBlockDevice:
 
     final case class Call[A](name: String, args: List[Any], promise: Promise[A])
+
+    @volatile var geometryFails = false
+    def geometry: DiskGeometry = if geometryFails then throw new RuntimeException("no geometry") else geo
 
     val calls = new LinkedBlockingQueue[Call[?]]()
     val log = ListBuffer[(String, List[Any])]()
@@ -431,3 +434,62 @@ class BridgeServerSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       // The first server is unharmed
       val c = opened(path)
       c.close()
+
+  test("the socket file is mode 0600"):
+    withDevice(new FakeDevice()): (path, _) =>
+      os.perms(path).toString() should be ("rw-------")
+      // The private bind directory is gone
+      os.list(path / os.up).map(_.last) should be (Seq("s.sock"))
+
+  test("stop racing a pending OPEN closes the device that arrives later"):
+    val dev = new FakeDevice()
+    val gate = Promise[LockableBlockDevice]()
+    val asked = new CountDownLatch(1)
+    withServer(_ => { asked.countDown(); gate.future }): (path, server) =>
+      val c = new TestBridgeClient(path)
+      try
+        c.open("d", Size, Block)
+        asked.await(5, TimeUnit.SECONDS) should be (true)
+        server.stop()
+        gate.success(dev)
+        dev.closed.await(5, TimeUnit.SECONDS) should be (true)
+        dev.closes.get should be (1)
+      finally
+        c.close()
+
+  test("an OPEN completion that throws closes the device and replies Internal"):
+    val dev = new FakeDevice()
+    dev.geometryFails = true
+    withDevice(dev): (path, _) =>
+      val c = new TestBridgeClient(path)
+      try
+        await(c.open("d", Size, Block)).status should be (Statuses.Internal)
+        dev.closed.await(5, TimeUnit.SECONDS) should be (true)
+        dev.closes.get should be (1)
+        c.call(Ops.Flush).status should be (Statuses.ProtocolError)
+      finally
+        c.close()
+
+  test("a result that cannot be encoded replies Internal"):
+    val dev = new FakeDevice(auto = false)
+    withDevice(dev): (path, _) =>
+      val c = opened(path)
+      try
+        val f = c.request(Ops.Read, c.nextId(), offset = 0, length = 4)
+        dev.next[Array[Byte]]().promise.success(null)
+        await(f).status should be (Statuses.Internal)
+        dev.auto = true
+        c.call(Ops.Flush).status should be (Statuses.Ok)
+      finally
+        c.close()
+
+  test("a regular file at the path makes start fail and survives"):
+    val dir = os.temp.dir(prefix = "vdb")
+    val path = dir / "s.sock"
+    os.write(path, "precious")
+    val server = new BridgeServer(path, _ => Future.successful(new FakeDevice()))
+    try
+      intercept[IllegalStateException](server.start())
+      os.read(path) should be ("precious")
+    finally
+      os.remove.all(dir)

@@ -11,6 +11,7 @@ import org.aspen_ddp.aspen.vdisk.LockableBlockDevice
 import scribe.Logging
 
 import java.io.IOException
+import java.net.ConnectException
 import java.net.{StandardProtocolFamily, UnixDomainSocketAddress}
 import java.nio.channels.SocketChannel
 import java.util.concurrent.TimeUnit
@@ -29,12 +30,12 @@ final class BridgeServer(socketPath: os.Path, openDisk: String => Future[Lockabl
   def start(): Unit = synchronized:
     if listener != null then
       throw new IllegalStateException(s"socket in use: $socketPath")
-    if os.exists(socketPath, followLinks = false) then
-      if connects() then
-        throw new IllegalStateException(s"socket in use: $socketPath")
-      os.remove(socketPath)
+    checkExisting()
     val g = new MultiThreadIoEventLoopGroup(2, DaemonThreads.factory("aspen-vdisk-bridge"),
       EpollIoHandler.newFactory())
+    // Bind inside a private 0700 directory, restrict the socket to 0600, then rename it into place, so there is
+    // never a moment when another user can connect
+    val tmpDir = os.temp.dir(dir = socketPath / os.up, prefix = ".vdb-bind", perms = "rwx------")
     try
       val bootstrap = new ServerBootstrap()
         .group(g)
@@ -43,12 +44,19 @@ final class BridgeServer(socketPath: os.Path, openDisk: String => Future[Lockabl
           override def initChannel(ch: EpollDomainSocketChannel): Unit =
             sessions.add(ch)
             ch.pipeline().addLast(new FrameDecoder, new BridgeSession(openDisk)))
-      listener = bootstrap.bind(new DomainSocketAddress(socketPath.toString)).sync().channel()
+      listener = bootstrap.bind(new DomainSocketAddress((tmpDir / "s").toString)).sync().channel()
+      os.perms.set(tmpDir / "s", "rw-------")
+      os.move(tmpDir / "s", socketPath, replaceExisting = true)
       group = g
     catch
       case t: Throwable =>
+        if listener != null then
+          listener.close().awaitUninterruptibly()
+          listener = null
         g.shutdownGracefully(0, 0, TimeUnit.SECONDS)
         throw t
+    finally
+      os.remove.all(tmpDir)
 
   /** Closes the listener and every session; their devices are closed crash-only */
   def stop(): Unit =
@@ -61,14 +69,23 @@ final class BridgeServer(socketPath: os.Path, openDisk: String => Future[Lockabl
       l.close().awaitUninterruptibly()
       sessions.close().awaitUninterruptibly()
       g.shutdownGracefully(0, 5, TimeUnit.SECONDS).awaitUninterruptibly()
+      os.remove(socketPath)
 
-  private def connects(): Boolean =
-    try
-      val ch = SocketChannel.open(StandardProtocolFamily.UNIX)
+  /** A leftover socket nobody listens on (connection refused) is removed. Anything else already at the path, or
+    * any other probe failure, fails the start and leaves the path untouched
+    */
+  private def checkExisting(): Unit =
+    if os.exists(socketPath, followLinks = false) then
+      if os.isFile(socketPath, followLinks = false) || os.isDir(socketPath, followLinks = false) ||
+         os.isLink(socketPath) then
+        throw new IllegalStateException(s"not a socket: $socketPath")
       try
-        ch.connect(UnixDomainSocketAddress.of(socketPath.toNIO))
-        true
-      finally
-        ch.close()
-    catch
-      case _: IOException => false
+        val ch = SocketChannel.open(StandardProtocolFamily.UNIX)
+        try
+          ch.connect(UnixDomainSocketAddress.of(socketPath.toNIO))
+        finally
+          ch.close()
+        throw new IllegalStateException(s"socket in use: $socketPath")
+      catch
+        case _: ConnectException => os.remove(socketPath)
+        case e: IOException => throw new IllegalStateException(s"cannot probe $socketPath: $e", e)

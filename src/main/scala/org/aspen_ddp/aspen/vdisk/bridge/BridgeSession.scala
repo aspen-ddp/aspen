@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.vdisk.*
 import scribe.Logging
 
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.RejectedExecutionException
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
@@ -63,7 +64,16 @@ final class BridgeSession(openDisk: String => Future[LockableBlockDevice]) exten
         case Failure(t) => Future.failed(t)
       val executor = ctx.executor()
       // Back onto the event loop, which owns the session state
-      fut.onComplete(result => executor.execute(() => openCompleted(ctx, req, result)))(parasitic)
+      fut.onComplete { result =>
+        try
+          executor.execute(() => openCompleted(ctx, req, result))
+        catch
+          case _: RejectedExecutionException =>
+            // The event loop is gone (server stopped), so nothing can be reported; do not leak the device
+            result match
+              case Success(dev) => dev.close()
+              case Failure(_) => ()
+      }(parasitic)
 
   private def openCompleted(ctx: ChannelHandlerContext, req: Request, result: Try[LockableBlockDevice]): Unit =
     result match
@@ -71,22 +81,31 @@ final class BridgeSession(openDisk: String => Future[LockableBlockDevice]) exten
         state = State.NotOpened
         replyError(ctx, req.op, req.requestId, t)
       case Success(dev) =>
-        val g = dev.geometry
-        if !ctx.channel().isActive then
-          dev.close()
-        else if g.size != req.offset || g.logicalBlockSize != req.length then
-          dev.close()
-          state = State.NotOpened
-          respondError(ctx, req.op, req.requestId, Status.SizeMismatch,
-            s"disk is ${g.size} bytes with ${g.logicalBlockSize} byte blocks, client reported " +
-              s"${req.offset} bytes with ${req.length} byte blocks")
-        else
-          device = Some(dev)
-          state = State.Opened
-          val payload = Unpooled.buffer(8)
-          payload.writeInt(g.blockObjectSize)
-          payload.writeInt(g.logicalBlockSize)
-          respond(ctx, req.op, req.requestId, Status.Ok, payload)
+        try
+          val g = dev.geometry
+          if !ctx.channel().isActive then
+            dev.close()
+          else if g.size != req.offset || g.logicalBlockSize != req.length then
+            dev.close()
+            state = State.NotOpened
+            respondError(ctx, req.op, req.requestId, Status.SizeMismatch,
+              s"disk is ${g.size} bytes with ${g.logicalBlockSize} byte blocks, client reported " +
+                s"${req.offset} bytes with ${req.length} byte blocks")
+          else
+            device = Some(dev)
+            state = State.Opened
+            val payload = Unpooled.buffer(8)
+            payload.writeInt(g.blockObjectSize)
+            payload.writeInt(g.logicalBlockSize)
+            respond(ctx, req.op, req.requestId, Status.Ok, payload)
+        catch
+          case t: Throwable =>
+            logger.error(s"Bridge OPEN completion failed: $t")
+            device = None
+            state = State.NotOpened
+            try dev.close()
+            catch case c: Throwable => logger.error(s"Closing the device failed: $c")
+            respondError(ctx, req.op, req.requestId, Status.Internal, t.toString)
 
   private def handleIo(ctx: ChannelHandlerContext, req: Request, dev: LockableBlockDevice): Unit =
     val payloadLen = req.payload.readableBytes()
@@ -98,7 +117,10 @@ final class BridgeSession(openDisk: String => Future[LockableBlockDevice]) exten
         case Success(x) => x
         case Failure(t) => Future.failed(t)
       fut.onComplete {
-        case Success(a) => respond(ctx, req.op, req.requestId, Status.Ok, toPayload(a))
+        case Success(a) =>
+          Try(toPayload(a)) match
+            case Success(payload) => respond(ctx, req.op, req.requestId, Status.Ok, payload)
+            case Failure(t) => replyError(ctx, req.op, req.requestId, t)
         case Failure(t) => replyError(ctx, req.op, req.requestId, t)
       }(parasitic)
 

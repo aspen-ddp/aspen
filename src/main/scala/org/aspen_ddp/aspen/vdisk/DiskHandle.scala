@@ -23,6 +23,10 @@ final class DiskHandle private (client: AspenClient,
   /** Geometry to report while there is no owned disk */
   private var lastGeometry: DiskGeometry = loaded
   private var takeover: Option[Future[Unit]] = None
+  /** Set for the whole of a `release`, so an `acquire` arriving meanwhile waits for it instead of seeing a disk
+    * that is about to be closed
+    */
+  private var releasing: Option[Future[Unit]] = None
   /** Bumped by `close()` so that a takeover in flight when it ran discards its disk */
   private var generation = 0L
 
@@ -55,6 +59,11 @@ final class DiskHandle private (client: AspenClient,
       d.grow(newSize)
 
   def acquire(): Future[Unit] =
+    synchronized(releasing) match
+      case Some(r) => r.recover { case _ => () }.flatMap(_ => acquire())
+      case None => acquireNow()
+
+  private def acquireNow(): Future[Unit] =
     // Decided under the monitor; the Futures and the old disk's close run after it is released
     val (result, start) = synchronized:
       takeover match
@@ -85,17 +94,29 @@ final class DiskHandle private (client: AspenClient,
     result
 
   def release(): Future[Unit] =
-    val pending = synchronized(takeover)
-    // A failed takeover leaves nothing to wait for; release then closes whatever is held
-    val settled = pending.map(_.recover { case _ => () }).getOrElse(Future.unit)
-    settled.flatMap: _ =>
-      synchronized(disk) match
-        case None => Future.unit
-        case Some(d) =>
-          val flushed = if d.state == DiskState.Serving then d.flush() else Future.unit
-          flushed.transform: r =>
-            drop(d)
-            r
+    val (result, start) = synchronized:
+      releasing match
+        case Some(f) => (f, None)
+        case None =>
+          val p = Promise[Unit]()
+          releasing = Some(p.future)
+          (p.future, Some(p))
+    start.foreach: p =>
+      // A failed takeover leaves nothing to wait for; release then closes whatever is held
+      val settled = synchronized(takeover).map(_.recover { case _ => () }).getOrElse(Future.unit)
+      p.completeWith:
+        settled.flatMap: _ =>
+          synchronized(disk) match
+            case None => Future.unit
+            case Some(d) =>
+              val flushed = if d.state == DiskState.Serving then d.flush() else Future.unit
+              flushed.transform: r =>
+                drop(d)
+                r
+        .transform: r =>
+          synchronized { releasing = None }
+          r
+    result
 
   /** Crash-only: closes the owned disk without flushing */
   def close(): Unit =

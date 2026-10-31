@@ -130,6 +130,50 @@ class DiskHandleSuite extends IntegrationTestSuite:
       h1.lockState should be (LockState.Unlocked)
       r should be (data)
 
+  atest("acquire during an in-flight release waits for it, then takes over"):
+    val data = pattern(4096, 9)
+    for
+      info <- createDisk()
+      h <- open(Held)
+      _ <- h.acquire()
+      _ <- h.write(0, data, fua = false)
+      rel = h.release()
+      acq = h.acquire()
+      _ <- rel
+      _ <- acq
+      r <- h.read(0, 4096)
+      e <- epoch(info)
+    yield
+      h.lockState should be (LockState.Locked)
+      r should be (data)
+      e should be (2L)
+
+  atest("release during an in-flight acquire waits for it, then releases"):
+    for
+      info <- createDisk()
+      h <- open()
+      acq = h.acquire()
+      rel = h.release()
+      _ <- acq
+      _ <- rel
+      e <- epoch(info)
+    yield
+      h.lockState should be (LockState.Unlocked)
+      e should be (1L)
+
+  atest("a failed takeover leaves the handle retryable"):
+    for
+      _ <- createDisk()
+      h <- open()
+      _ <- DiskCatalog.delete(client, "d")
+      r <- h.acquire().failed
+      _ = h.lockState should be (LockState.Unlocked)
+      _ <- createDisk()
+      _ <- h.acquire()
+    yield
+      r should be (VDiskError.DiskNotFound("d"))
+      h.lockState should be (LockState.Locked)
+
   atest("close does not flush"):
     val a = pattern(4096, 6)
     val b = pattern(4096, 7)

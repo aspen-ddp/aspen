@@ -36,4 +36,7 @@ vdisk: before the ALUA failover work, verify that readRanges always returns the 
 object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
 
 MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
-both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one.
+both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one. Also, verify
+that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where
+two simultaneous transactions attempt to blind-insert the same key. If locks are not taken, the order of applications
+could corrupt the key/value pair and make it non recoverable.

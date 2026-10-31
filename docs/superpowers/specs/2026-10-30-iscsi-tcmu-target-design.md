@@ -176,8 +176,10 @@ These are the core of the design. The rule is that no request waits on something
 - **Map lookups:** the block-index -> pointer map is authoritative in memory for the owner (single writer), filled
   lazily from the TKVL. No lookup should hit the network twice.
 - **UNMAP:** ranges covering whole block objects delete them (refcount 0) and remove their map entries, batched
-  (`deferAllocationRelease` where useful). Partial-object UNMAP is ignored. The device does not advertise that
-  unmapped blocks read back as zero (LBPRZ = 0).
+  (`deferAllocationRelease` where useful). Partial-object UNMAP writes zeros to the covered bytes, since
+  tcmu-runner 1.5.4 always advertises LBPRZ = 1 when unmap is enabled and Linux then issues WRITE ZEROES as
+  WRITE SAME with UNMAP, which tcmu turns into an unmap call. Unmapped ranges therefore always read back as zero.
+  Ranges of a block that has no object and no dirty data need no zeroing.
 
 Sanity bounds from the user, for ordinary conditions on the test setup: individual writes complete well under
 100 ms, and a FLUSH with a full dirty cache behind it completes within a couple of seconds. These aren't hard

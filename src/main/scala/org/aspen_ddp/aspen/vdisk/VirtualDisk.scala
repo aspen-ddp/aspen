@@ -2,11 +2,10 @@ package org.aspen_ddp.aspen.vdisk
 
 import java.util.{Arrays, UUID}
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectRangeState, InvalidObject, ObjectAllocator, RangedWriteState,
-  StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectRangeState, ObjectAllocator, StopRetrying}
 import org.aspen_ddp.aspen.client.tkvl.KVObjectRootManager
-import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyAlreadyExists, ObjectRevision}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
+import org.aspen_ddp.aspen.vdisk.BlockCommitter.{DataCommit, DataInput}
 import org.aspen_ddp.aspen.vdisk.VDiskError.*
 
 import scala.collection.mutable
@@ -303,35 +302,6 @@ final class VirtualDisk private (val client: AspenClient,
     if !st.dirty.isEmpty then
       dirtied(b, st, urgent = false)
 
-  // ---- Commit-failure resolution ----
-
-  /** Runs `attempt` under the client's backoff until it succeeds. Only `RetryCommit` retries: anything else, a
-    * synchronous throw included, ends the loop with the error that stops the disk
-    */
-  private def commitLoop(context: String, attempt: () => Future[Unit])(onFailure: VDiskError => Unit): Unit =
-    val guarded = () => Future.delegate(attempt()).recoverWith:
-      case RetryCommit => Future.failed(RetryCommit)
-      case e => Future.failed(stopWith(e))
-    client.retryStrategy.retryUntilSuccessful(guarded()).onComplete:
-      case Success(_) => ()
-      case Failure(e) => onFailure(asError(e, context))
-
-  /** Turns any failure but StopRetrying into RetryCommit */
-  private def retryOn[A](f: Future[A]): Future[A] = f.recoverWith:
-    case e: StopRetrying => Future.failed(e)
-    case _ => Future.failed(RetryCommit)
-
-  /** Fails with StopRetrying(the stop error) once the disk has stopped, so no new transaction is started */
-  private def checkServing(): Unit = synchronized(stopped).foreach(err => throw StopRetrying(err))
-
-  /** Turns a successful commit into a failure when the test hook asks for it */
-  private def injectFailure[A](result: A): Future[A] =
-    val inject = synchronized:
-      val f = failNextCommitAfterSuccess
-      failNextCommitAfterSuccess = false
-      f
-    if inject then Future.failed(InjectedFailure) else Future.successful(result)
-
   /** Succeeds while this owner still holds the fence. Once another owner has taken it, the disk stops and this fails
     * with StopRetrying(Fenced). A failed read of the fence fails with that read's error
     */
@@ -343,6 +313,15 @@ final class VirtualDisk private (val client: AspenClient,
       else
         Future.unit
 
+  /** Forgets a revision learned from a read, and what was cached at it, so the block learns it again. Under the
+    * monitor
+    */
+  private def forgetRevision(b: Long, st: BlockState): Unit =
+    st.revision = None
+    st.length = None
+    st.revisionLearned = false
+    cleanCache.invalidate(b)
+
   // ---- Data transactions ----
 
   private def startDataTx(b: Long, st: BlockState)(using Deferred): Unit =
@@ -350,7 +329,7 @@ final class VirtualDisk private (val client: AspenClient,
     st.inFlight = Some(st.dirty.snapshot)
     dataTxRunning += 1
     counters = counters.copy(maxConcurrentDataTx = math.max(counters.maxConcurrentDataTx, dataTxRunning))
-    launch(commitBlock(b, st))
+    launch(committer.commitBlock(b, st))
 
   /** What an attempt commits and the block state it is built on. Under the monitor */
   private def dataInput(b: Long, st: BlockState): DataInput =
@@ -358,68 +337,6 @@ final class VirtualDisk private (val client: AspenClient,
     st.inFlight = Some(snap)
     DataInput(st.pointer.get, st.revision, st.length, cleanPieces(b), snap,
       learned = st.revision.isEmpty || st.revisionLearned)
-
-  /** Commits the block's dirty data. A transaction that was sent and failed is resolved before the next one is
-    * built: the block's revision shows whether it committed
-    */
-  private def commitBlock(b: Long, st: BlockState): Unit =
-    // Attempts run one after another, each starting once the previous one's future has completed
-    var unresolved: Option[SentData] = None
-
-    def attempt(): Future[Unit] =
-      val resolved = unresolved match
-        case Some(sent) => resolveData(b, st, sent)
-        case None => Future.successful(false)
-      resolved.flatMap: done =>
-        unresolved = None
-        if done then
-          Future.unit
-        else
-          checkServing()
-          val input = synchronized(dataInput(b, st))
-          @volatile var sent: Option[DataCommit] = None
-          runDataTx(input, c => sent = Some(c)).transformWith:
-            case Success(c) =>
-              locked(dataCommitted(b, st, input.snap, c))
-              Future.unit
-            case Failure(e) =>
-              sent match
-                case Some(c) =>
-                  unresolved = Some(SentData(input, c))
-                  Future.failed(RetryCommit)
-                case None => Future.failed(stopWith(e))
-
-    commitLoop(s"commit of block $b", () => attempt()): err =>
-      locked:
-        dataTxRunning -= 1
-        stop(err)
-
-  /** Whether the sent transaction committed, from the block's current revision. One that didn't, against a
-    * revision learned from a read, makes the block learn its revision again. Anything else stops the disk
-    */
-  private def resolveData(b: Long, st: BlockState, sent: SentData): Future[Boolean] =
-    retryOn(fenceHeld()).flatMap: _ =>
-      client.readRange(sent.input.ptr, 0, Some(0)).transform:
-        case Success(s) =>
-          if s.revision == sent.commit.revision then
-            locked:
-              counters = counters.copy(recoveredCommits = counters.recoveredCommits + 1)
-              dataCommitted(b, st, sent.input.snap, sent.commit)
-            Success(true)
-          else if s.revision == sent.commit.base then
-            Success(false)
-          else if sent.input.learned then
-            synchronized:
-              st.revision = None
-              st.length = None
-              st.revisionLearned = false
-              cleanCache.invalidate(b)
-            Success(false)
-          else
-            Failure(StopRetrying(DiskFailed(s"block $b is at revision ${s.revision}, neither the committed " +
-              s"${sent.commit.base} nor ${sent.commit.revision} of the failed transaction")))
-        case Failure(e: InvalidObject) => Failure(StopRetrying(DiskFailed(s"block $b's object is gone: $e")))
-        case Failure(_) => Failure(RetryCommit)
 
   /** The block's commit of `snap` succeeded, which ends its commit loop */
   private def dataCommitted(b: Long, st: BlockState, snap: SegmentSnapshot, c: DataCommit)(using Deferred): Unit =
@@ -445,51 +362,6 @@ final class VirtualDisk private (val client: AspenClient,
       awaitingData.remove(b)
       blocks.get(b).foreach(st => kick(b, st))
 
-  /** Commits `snap` to a mapped block. Dirty data covering the whole block replaces it; anything else is a ranged
-    * write, whose pre-image comes from the clean cache when it holds every byte written, and otherwise from a read.
-    * The clean cache may have evicted the block, or hold only part of it. `onSent` gets the transaction's result
-    * as the transaction is sent, before its outcome is known
-    */
-  private def runDataTx(input: DataInput, onSent: DataCommit => Unit): Future[DataCommit] =
-    commitGate().flatMap: _ =>
-      checkServing()
-      val DataInput(ptr, revision, length, clean, snap, _) = input
-      val blockSize = currentGeometry.blockObjectSize
-      val result =
-        if covers(snap.pieces, 0, blockSize) then
-          val content = new Array[Byte](blockSize)
-          snap.overlay(content, 0)
-          val frevision = revision match
-            case Some(r) => Future.successful(r)
-            case None => client.readMetadata(ptr).map(_.revision)
-          frevision.flatMap: r =>
-            client.transact: tx =>
-              tx.sharedLockRevision(info.fencePointer, fenceRevision)
-              tx.overwrite(ptr, r, DataBuffer(content))
-              val c = DataCommit(tx.revision, blockSize, overwrote = true, base = r)
-              onSent(c)
-              Future.successful(c)
-        else
-          val writes = snap.writes
-          val fstate = (revision, length) match
-            case (Some(r), Some(len)) if writes.forall(w => covers(clean, w.offset, math.min(w.end, len).toInt)) =>
-              val needed = clean.filter: (o, bytes) =>
-                o + bytes.length <= len && writes.exists(w => o < w.end && w.offset < o + bytes.length)
-              Future.successful(RangedWriteState.fromRanges(ptr, r, len, needed.toList))
-            case _ =>
-              synchronized:
-                counters = counters.copy(preImageReads = counters.preImageReads + 1)
-              client.readRangedWriteState(ptr, writes)
-          fstate.flatMap: state =>
-            client.transact: tx =>
-              tx.sharedLockRevision(info.fencePointer, fenceRevision)
-              tx.rangedWrites(state, writes, zeroFill = true)
-              val c = DataCommit(tx.revision, math.max(state.length, snap.end), overwrote = false,
-                base = state.revision)
-              onSent(c)
-              Future.successful(c)
-      result.flatMap(injectFailure)
-
   // ---- Map transactions ----
 
   /** Starts a map transaction for the waiting blocks, in index order, unless one is already running */
@@ -513,75 +385,7 @@ final class VirtualDisk private (val client: AspenClient,
         awaitingMap.remove(b)
         st.inFlight = Some(snap)
       mapTxRunning = true
-      launch(commitMap(chosen.map((b, st, _) => (b, st))))
-
-  /** Creates the batch's blocks. After a sent attempt fails, the fence is checked before the next. An attempt
-    * finding a block already in the map (a failed attempt that did commit) adopts that block's object and leaves it
-    * to a data transaction
-    */
-  private def commitMap(batch: List[(Long, BlockState)]): Unit =
-    // Attempts run one after another, each starting once the previous one's future has completed
-    var remaining = batch
-    var checkFence = false
-
-    def adopt(index: Long): Future[Unit] =
-      val adopted = blockMap.refresh(index).flatMap:
-        case None => Future.failed(StopRetrying(DiskFailed(s"block $index was found in the map, then not")))
-        case Some(ptr) =>
-          client.readRange(ptr, 0, Some(0)).transform:
-            case Failure(e: InvalidObject) => Failure(StopRetrying(DiskFailed(s"block $index's object is gone: $e")))
-            case r => r.map(s => (ptr, s))
-      retryOn(adopted).map: (ptr, s) =>
-        locked:
-          remaining.find(_._1 == index) match
-            case None => throw StopRetrying(DiskFailed(s"map transaction found block $index, which it does not add"))
-            case Some((_, st)) =>
-              remaining = remaining.filterNot(_._1 == index)
-              if stopped.isEmpty then
-                counters = counters.copy(adoptedBlocks = counters.adoptedBlocks + 1)
-                st.pointer = Some(ptr)
-                st.revision = Some(s.revision)
-                st.length = s.objectLength
-                st.revisionLearned = true
-                cleanCache.invalidate(index)
-                st.inFlight = None
-                kick(index, st)
-              if remaining.isEmpty then
-                mapDone()
-
-    def attempt(): Future[Unit] =
-      val fenceChecked = if checkFence then retryOn(fenceHeld()) else Future.unit
-      fenceChecked.flatMap: _ =>
-        checkFence = false
-        checkServing()
-        val inputs = synchronized:
-          remaining.map: (b, st) =>
-            val snap = st.dirty.snapshot
-            st.inFlight = Some(snap)
-            (b, st, snap)
-        // The initial content runs to the end of the dirty data, with zeros in the gaps. The rest of the block is
-        // beyond the object's end and reads as zeros without being stored
-        val contents = inputs.map: (b, _, snap) =>
-          val content = new Array[Byte](snap.end)
-          snap.overlay(content, 0)
-          (b, content)
-        @volatile var sent = false
-        runMapTx(contents, () => sent = true).transformWith:
-          case Success((inserts, revision)) =>
-            locked(mapCommitted(inputs, contents, inserts, revision))
-            Future.unit
-          case Failure(e: KeyAlreadyExists) if !sent =>
-            adopt(e.key.longValue).flatMap: _ =>
-              if synchronized(remaining.isEmpty) then Future.unit else Future.failed(RetryCommit)
-          case Failure(_) if sent =>
-            checkFence = true
-            Future.failed(RetryCommit)
-          case Failure(e) => Future.failed(stopWith(e))
-
-    commitLoop("map transaction", () => attempt()): err =>
-      locked:
-        mapTxRunning = false
-        stop(err)
+      launch(committer.commitMap(chosen.map((b, st, _) => (b, st))))
 
   /** The map transaction has nothing left to do. Under the monitor */
   private def mapDone(): Unit =
@@ -605,27 +409,62 @@ final class VirtualDisk private (val client: AspenClient,
         committed(b, st, snap)
     mapDone()
 
-  private def runMapTx(contents: List[(Long, Array[Byte])], onSent: () => Unit)
-      : Future[(List[(Long, DataObjectPointer)], ObjectRevision)] = commitGate().flatMap: _ =>
-    checkServing()
-    val result = client.transact: tx =>
-      given Transaction = tx
-      tx.sharedLockRevision(info.fencePointer, fenceRevision)
+  /** A failed map attempt did create the block, so its object is adopted and its dirty data goes through a data
+    * transaction
+    */
+  private def adopted(index: Long, st: BlockState, ptr: DataObjectPointer, s: DataObjectRangeState)
+                     (using Deferred): Unit =
+    if stopped.isEmpty then
+      counters = counters.copy(adoptedBlocks = counters.adoptedBlocks + 1)
+      st.pointer = Some(ptr)
+      st.revision = Some(s.revision)
+      st.length = s.objectLength
+      st.revisionLearned = true
+      cleanCache.invalidate(index)
+      st.inFlight = None
+      kick(index, st)
 
-      // One at a time: allocation strategies may keep per-transaction state
-      def allocate(rest: List[(Long, Array[Byte])],
-                   acc: List[(Long, DataObjectPointer)]): Future[List[(Long, DataObjectPointer)]] = rest match
-        case Nil => Future.successful(acc.reverse)
-        case (b, content) :: tail =>
-          allocator.allocateDataObject(DataBuffer(content)).flatMap(ptr => allocate(tail, (b, ptr) :: acc))
+  private object host extends BlockCommitter.Host:
+    def checkServing(): Unit = synchronized(stopped).foreach(err => throw StopRetrying(err))
+    def fenceHeld(): Future[Unit] = VirtualDisk.this.fenceHeld()
+    def commitGate(): Future[Unit] = VirtualDisk.this.commitGate()
+    def takeInjectedFailure(): Boolean = VirtualDisk.this.synchronized:
+      val f = failNextCommitAfterSuccess
+      failNextCommitAfterSuccess = false
+      f
+    def blockObjectSize: Int = currentGeometry.blockObjectSize
+    def preImageRead(): Unit = VirtualDisk.this.synchronized:
+      counters = counters.copy(preImageReads = counters.preImageReads + 1)
+    def dataInput(b: Long, st: BlockState): DataInput = VirtualDisk.this.synchronized(VirtualDisk.this.dataInput(b, st))
+    def dataCommitted(b: Long, st: BlockState, snap: SegmentSnapshot, c: DataCommit, recovered: Boolean): Unit =
+      locked:
+        if recovered then
+          counters = counters.copy(recoveredCommits = counters.recoveredCommits + 1)
+        VirtualDisk.this.dataCommitted(b, st, snap, c)
+    def forgetRevision(b: Long, st: BlockState): Unit = VirtualDisk.this.synchronized:
+      VirtualDisk.this.forgetRevision(b, st)
+    def dataFailed(err: VDiskError): Unit = locked:
+      dataTxRunning -= 1
+      stop(err)
+    def mapInputs(batch: List[(Long, BlockState)]): List[(Long, BlockState, SegmentSnapshot)] =
+      VirtualDisk.this.synchronized:
+        batch.map: (b, st) =>
+          val snap = st.dirty.snapshot
+          st.inFlight = Some(snap)
+          (b, st, snap)
+    def mapCommitted(inputs: List[(Long, BlockState, SegmentSnapshot)],
+                     contents: List[(Long, Array[Byte])],
+                     inserts: List[(Long, DataObjectPointer)],
+                     revision: ObjectRevision): Unit = locked(VirtualDisk.this.mapCommitted(inputs, contents, inserts,
+      revision))
+    def adopted(index: Long, st: BlockState, ptr: DataObjectPointer, s: DataObjectRangeState): Unit =
+      locked(VirtualDisk.this.adopted(index, st, ptr, s))
+    def mapDone(): Unit = locked(VirtualDisk.this.mapDone())
+    def mapFailed(err: VDiskError): Unit = locked:
+      mapTxRunning = false
+      stop(err)
 
-      for
-        inserts <- allocate(contents, Nil)
-        _ <- blockMap.prepare(inserts, Nil)
-      yield
-        onSent()
-        (inserts, tx.revision)
-    result.flatMap(injectFailure)
+  private val committer = BlockCommitter(client, info, fenceRevision, blockMap, allocator, host)
 
   // ---- Reads ----
 
@@ -733,10 +572,7 @@ final class VirtualDisk private (val client: AspenClient,
                   else if current.exists(_ != fetchRevision) && st.revisionLearned && st.inFlight.isEmpty then
                     // The learned revision may have come from a lagging store. Only this owner's commits are
                     // authoritative, so forget it and what was cached at it, and learn the block again
-                    st.revision = None
-                    st.length = None
-                    st.revisionLearned = false
-                    cleanCache.invalidate(b)
+                    forgetRevision(b, st)
                   // A commit completed during the fetch is covered by the overlay or newer than the read
                   Right(revision.exists(_ != fetchRevision) && !current.contains(fetchRevision))
             outcome match
@@ -765,38 +601,6 @@ object VirtualDisk:
                                         adoptedBlocks: Long)
 
   private[vdisk] type RangeReader = (DataObjectPointer, List[(Int, Int)]) => Future[List[DataObjectRangeState]]
-
-  /** A committed data transaction: the revision it created and the one it replaced */
-  private final case class DataCommit(revision: ObjectRevision, length: Int, overwrote: Boolean, base: ObjectRevision)
-
-  /** What a data transaction attempt commits and the block state it is built on. `learned` is true when the
-    * revision was not set by one of this owner's commits
-    */
-  private final case class DataInput(ptr: DataObjectPointer,
-                                     revision: Option[ObjectRevision],
-                                     length: Option[Int],
-                                     clean: Vector[(Int, Array[Byte])],
-                                     snap: SegmentSnapshot,
-                                     learned: Boolean)
-
-  /** A data transaction that was sent and reported failure, so its outcome is unknown */
-  private final case class SentData(input: DataInput, commit: DataCommit)
-
-  /** Retries a commit loop with backoff */
-  private object RetryCommit extends Exception("retry the commit"):
-    override def fillInStackTrace(): Throwable = this
-
-  private object InjectedFailure extends Exception("injected commit failure"):
-    override def fillInStackTrace(): Throwable = this
-
-  private def stopWith(e: Throwable): StopRetrying = e match
-    case s: StopRetrying => s
-    case other => StopRetrying(other)
-
-  private def asError(e: Throwable, context: String): VDiskError = e match
-    case err: VDiskError => err
-    case StopRetrying(reason) => asError(reason, context)
-    case other => DiskFailed(s"$context failed: $other")
 
   /** A fetch returned another revision than the block's known one */
   private object StaleFetch extends Exception("fetch returned a revision other than the known one"):
@@ -827,7 +631,7 @@ object VirtualDisk:
       result += ((pos, to))
     result.toList
 
-  private def covers(pieces: Seq[(Int, Array[Byte])], from: Int, to: Int): Boolean = gaps(from, to, pieces).isEmpty
+  private[vdisk] def covers(pieces: Seq[(Int, Array[Byte])], from: Int, to: Int): Boolean = gaps(from, to, pieces).isEmpty
 
   /** The segment's bytes: zeros, then `base` (non-overlapping committed content), then the overlay on top */
   private def assemble(seg: BlockSegment, base: Seq[(Int, Array[Byte])], overlay: SegmentSnapshot): Array[Byte] =

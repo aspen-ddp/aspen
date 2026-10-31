@@ -103,6 +103,10 @@ final class VirtualDisk private (val client: AspenClient,
     * hold commits in flight and to see them start
     */
   @volatile private[vdisk] var commitGate: () => Future[Unit] = () => Future.unit
+  /** Called as each data or map commit attempt starts, before it resolves anything. Tests use it to hold a retry */
+  @volatile private[vdisk] var attemptGate: () => Future[Unit] = () => Future.unit
+  /** Called before a map attempt looks up the object a deletion removes. Tests use it to hold a batch */
+  @volatile private[vdisk] var deleteLookupGate: () => Future[Unit] = () => Future.unit
   /** Called by each read that needs I/O, once its overlay is taken. Tests use it to hold a read */
   @volatile private[vdisk] var readGate: () => Future[Unit] = () => Future.unit
   /** Makes the next successful data or map transaction report a failure, as a commit whose outcome was lost would */
@@ -211,7 +215,9 @@ final class VirtualDisk private (val client: AspenClient,
         stopped match
           case Some(err) => Future.failed(err)
           case None =>
-            ranges.foreach((offset, length) => geom.blocksFullyCovered(offset, length).foreach(unmapBlock))
+            // The size as of now: after a grow since validation, an old short last block is no longer whole
+            val current = currentGeometry
+            ranges.foreach((offset, length) => current.blocksFullyCovered(offset, length).foreach(unmapBlock))
             releaseThrottled()
             Future.unit
 
@@ -592,10 +598,20 @@ final class VirtualDisk private (val client: AspenClient,
         if !st.dirty.isEmpty then
           dirtied(e.index, st, urgent = false)
 
+  /** A create superseded by an unmap leaves its batch. Under the monitor */
+  private def supersede(e: MapEntry)(using Deferred): Unit =
+    e.st.inFlight = None
+    if stopped.isEmpty then
+      requeueDelete(e)
+      if !e.st.dirty.isEmpty then
+        dirtied(e.index, e.st, urgent = false)
+
   private object host extends BlockCommitter.Host:
     def checkServing(): Unit = synchronized(stopped).foreach(err => throw StopRetrying(err))
     def fenceHeld(): Future[Unit] = VirtualDisk.this.fenceHeld()
     def commitGate(): Future[Unit] = VirtualDisk.this.commitGate()
+    def attemptGate(): Future[Unit] = VirtualDisk.this.attemptGate()
+    def deleteLookupGate(): Future[Unit] = VirtualDisk.this.deleteLookupGate()
     def takeInjectedFailure(): Boolean = VirtualDisk.this.synchronized:
       val f = failNextCommitAfterSuccess
       failNextCommitAfterSuccess = false
@@ -618,18 +634,19 @@ final class VirtualDisk private (val client: AspenClient,
       stop(err)
     def dropSuperseded(batch: List[MapEntry]): List[MapEntry] = locked:
       val (superseded, kept) = batch.partition(e => e.create && e.st.unmaps != e.epoch)
-      superseded.foreach: e =>
-        e.st.inFlight = None
-        if stopped.isEmpty then
-          requeueDelete(e)
-          if !e.st.dirty.isEmpty then
-            dirtied(e.index, e.st, urgent = false)
+      superseded.foreach(supersede)
       kept
-    def mapInputs(creates: List[MapEntry]): List[SegmentSnapshot] = VirtualDisk.this.synchronized:
+    def mapInputs(creates: List[MapEntry]): List[Option[SegmentSnapshot]] = locked:
+      // The epoch is checked as the snapshot is taken, so a snapshot only ever holds writes from before any unmap
+      // that supersedes it, and its commit can never complete a later write
       creates.map: e =>
-        val snap = e.st.dirty.snapshot
-        e.st.inFlight = Some(snap)
-        snap
+        if e.st.unmaps != e.epoch then
+          supersede(e)
+          None
+        else
+          val snap = e.st.dirty.snapshot
+          e.st.inFlight = Some(snap)
+          Some(snap)
     def mapCommitted(result: MapResult): Unit = locked(VirtualDisk.this.mapCommitted(result))
     def adopted(e: MapEntry, ptr: DataObjectPointer, s: DataObjectRangeState): Unit =
       locked(VirtualDisk.this.adopted(e, ptr, s))

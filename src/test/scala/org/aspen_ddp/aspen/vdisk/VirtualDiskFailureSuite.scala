@@ -68,6 +68,18 @@ class VirtualDiskFailureSuite extends IntegrationTestSuite:
       else
         Future.unit
 
+  /** A gate that holds only its call number `held` (from 0) until `release` completes, reporting when it is reached */
+  private final class HoldCall(held: Int):
+    val started: Promise[Unit] = Promise[Unit]()
+    val release: Promise[Unit] = Promise[Unit]()
+    private val calls = new java.util.concurrent.atomic.AtomicInteger(0)
+    val gate: () => Future[Unit] = () =>
+      if calls.getAndIncrement() == held then
+        started.success(())
+        release.future
+      else
+        Future.unit
+
   // ---- Fencing ----
 
   atest("a takeover fences the old owner"):
@@ -261,6 +273,116 @@ class VirtualDiskFailureSuite extends IntegrationTestSuite:
       da.failNextCommitAfterSuccess should be (false)
       da.state should be (DiskState.Serving)
       adopted should be (1L)
+      gone shouldBe an [org.aspen_ddp.aspen.client.InvalidObject]
+      own should be (model)
+      r should be (model)
+
+  // ---- UNMAP during commits ----
+
+  atest("a write after unmapping a block of a running map batch is kept"):
+    val x = pattern(BlockSize, 90)
+    val first = pattern(Sector, 91)
+    val w = pattern(Sector, 92)
+    val z = pattern(Sector, 93)
+    val model = new Array[Byte](BlockSize)
+    applyTo(model, 2 * Sector, w)
+    val creating = HoldCall(0)
+    val lookup = HoldCall(0)
+    for
+      _ <- createDisk()
+      da <- acquire(Held)
+      _ <- da.write(BlockSize, x, fua = false)
+      _ <- da.flush()
+      _ <- da.read(2 * BlockSize, 2 * BlockSize)
+      // A map transaction creating block 3 is held, so block 1's deletion and block 2's creation form the next batch
+      _ = da.commitGate = creating.gate
+      _ <- da.write(3 * BlockSize, z, fua = false)
+      created = da.flush()
+      _ <- creating.started.future
+      _ <- da.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      _ <- da.write(2 * BlockSize, first, fua = false)
+      flushed = da.flush()
+      // That batch is held while it looks up block 1's object, after its creates have passed the unmap check
+      _ = da.deleteLookupGate = lookup.gate
+      _ = creating.release.success(())
+      _ <- lookup.started.future
+      _ <- da.unmap(List((2L * BlockSize, BlockSize.toLong)))
+      _ <- da.write(2 * BlockSize + 2 * Sector, w, fua = false)
+      _ = lookup.release.success(())
+      _ <- created
+      _ <- flushed
+      _ <- da.flush()
+      own <- da.read(2 * BlockSize, BlockSize)
+      b <- acquire()
+      r <- b.read(2 * BlockSize, BlockSize)
+    yield
+      da.state should be (DiskState.Serving)
+      own should be (model)
+      r should be (model)
+
+  atest("an unmap between a map attempt of unknown outcome and its retry deletes what it created"):
+    val x = pattern(BlockSize, 94)
+    val y = pattern(Sector, 95)
+    val model = new Array[Byte](BlockSize)
+    applyTo(model, Sector, y)
+    // Call 0 is the first attempt, which commits and reports failure; call 1 is its retry
+    val retry = HoldCall(1)
+    for
+      _ <- createDisk()
+      da <- acquire(Held)
+      _ <- da.read(BlockSize, Sector)
+      _ = da.attemptGate = retry.gate
+      _ = da.failNextCommitAfterSuccess = true
+      _ <- da.write(BlockSize, x, fua = false)
+      flushed = da.flush()
+      _ <- retry.started.future
+      _ <- da.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      _ <- da.write(BlockSize + Sector, y, fua = false)
+      _ = retry.release.success(())
+      _ <- flushed
+      _ <- da.flush()
+      own <- da.read(BlockSize, BlockSize)
+      b <- acquire()
+      r <- b.read(BlockSize, BlockSize)
+    yield
+      da.failNextCommitAfterSuccess should be (false)
+      da.state should be (DiskState.Serving)
+      // The object the first attempt created was replaced, so it is not leaked
+      da.stats.deletedObjects should be (1L)
+      own should be (model)
+      r should be (model)
+
+  atest("an unmap between a data attempt of unknown outcome and its retry ends the commit"):
+    val x = pattern(BlockSize, 96)
+    val y = pattern(Sector, 97)
+    val z = pattern(Sector, 98)
+    val model = new Array[Byte](BlockSize)
+    applyTo(model, 2 * Sector, z)
+    val retry = HoldCall(1)
+    for
+      _ <- createDisk()
+      da <- acquire(Held)
+      _ <- da.write(BlockSize, x, fua = false)
+      _ <- da.flush()
+      ptr = da.blockPointer(1).get
+      _ = da.attemptGate = retry.gate
+      _ = da.failNextCommitAfterSuccess = true
+      _ <- da.write(BlockSize + Sector, y, fua = false)
+      flushed = da.flush()
+      _ <- retry.started.future
+      _ <- da.unmap(List((BlockSize.toLong, BlockSize.toLong)))
+      _ <- da.write(BlockSize + 2 * Sector, z, fua = false)
+      _ = retry.release.success(())
+      _ <- flushed
+      _ <- da.flush()
+      gone <- client.readMetadata(ptr).failed
+      own <- da.read(BlockSize, BlockSize)
+      b <- acquire()
+      r <- b.read(BlockSize, BlockSize)
+    yield
+      da.failNextCommitAfterSuccess should be (false)
+      da.state should be (DiskState.Serving)
+      da.stats.recoveredCommits should be (0L)
       gone shouldBe an [org.aspen_ddp.aspen.client.InvalidObject]
       own should be (model)
       r should be (model)

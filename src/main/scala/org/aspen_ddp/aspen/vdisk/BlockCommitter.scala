@@ -59,7 +59,7 @@ private[vdisk] final class BlockCommitter(client: AspenClient,
     // Attempts run one after another, each starting once the previous one's future has completed
     var unresolved: Option[SentData] = None
 
-    def attempt(): Future[Unit] =
+    def attempt(): Future[Unit] = host.attemptGate().flatMap: _ =>
       val resolved = unresolved match
         case Some(sent) if !host.superseded(st, epoch) => resolveData(b, st, sent)
         case _ => Future.successful(false)
@@ -190,7 +190,8 @@ private[vdisk] final class BlockCommitter(client: AspenClient,
     def findOld(e: MapEntry): Future[Option[(DataObjectPointer, Option[ObjectRefcount])]] = e.delete match
       case None => Future.successful(None)
       case Some(pd) =>
-        val mapped = if pd.refresh then blockMap.refresh(e.index) else blockMap.lookup(e.index)
+        val mapped = host.deleteLookupGate().flatMap: _ =>
+          if pd.refresh then blockMap.refresh(e.index) else blockMap.lookup(e.index)
         retryOn(mapped).flatMap:
           case None => Future.successful(None)
           case Some(ptr) =>
@@ -214,7 +215,7 @@ private[vdisk] final class BlockCommitter(client: AspenClient,
             host.mapEntryDone(e)
           Future.unit
 
-    def attempt(): Future[Unit] =
+    def attempt(): Future[Unit] = host.attemptGate().flatMap: _ =>
       val fenceChecked = if checkFence then retryOn(host.fenceHeld()) else Future.unit
       fenceChecked.flatMap: _ =>
         checkFence = false
@@ -232,18 +233,23 @@ private[vdisk] final class BlockCommitter(client: AspenClient,
           empty.foreach: (e, _) =>
             leave(e)
             host.mapEntryDone(e)
-          if work.isEmpty then
+          val creates = work.filter(_._1.create)
+          val snaps = host.mapInputs(creates.map(_._1))
+          // The initial content runs to the end of the dirty data, with zeros in the gaps. The rest of the block is
+          // beyond the object's end and reads as zeros without being stored
+          val planned = creates.lazyZip(snaps).flatMap: (entry, osnap) =>
+            osnap match
+              case None =>
+                leave(entry._1)
+                None
+              case Some(snap) =>
+                val content = new Array[Byte](snap.end)
+                snap.overlay(content, 0)
+                Some(PlannedCreate(entry._1, snap, content, entry._2))
+          val deletes = work.collect { case (e, Some(old)) if !e.create => (e, old) }
+          if planned.isEmpty && deletes.isEmpty then
             Future.unit
           else
-            val creates = work.filter(_._1.create)
-            val snaps = host.mapInputs(creates.map(_._1))
-            // The initial content runs to the end of the dirty data, with zeros in the gaps. The rest of the block is
-            // beyond the object's end and reads as zeros without being stored
-            val planned = creates.lazyZip(snaps).map: (entry, snap) =>
-              val content = new Array[Byte](snap.end)
-              snap.overlay(content, 0)
-              PlannedCreate(entry._1, snap, content, entry._2)
-            val deletes = work.collect { case (e, Some(old)) if !e.create => (e, old) }
             @volatile var sent = false
             val onSent = () =>
               sent = true
@@ -309,6 +315,9 @@ private[vdisk] object BlockCommitter:
     /** Succeeds while the owner still holds the fence; see `VirtualDisk.fenceHeld` */
     def fenceHeld(): Future[Unit]
     def commitGate(): Future[Unit]
+    /** Test hooks: see `VirtualDisk.attemptGate` and `deleteLookupGate` */
+    def attemptGate(): Future[Unit]
+    def deleteLookupGate(): Future[Unit]
     /** Whether the test hook asks for this successful commit to report failure. Clears the hook */
     def takeInjectedFailure(): Boolean
     def blockObjectSize: Int
@@ -329,8 +338,10 @@ private[vdisk] object BlockCommitter:
 
     /** The batch without its creates superseded by an unmap, whose deletions go back to the disk */
     def dropSuperseded(batch: List[MapEntry]): List[MapEntry]
-    /** The current dirty snapshot of each created block, which also becomes its in-flight snapshot */
-    def mapInputs(creates: List[MapEntry]): List[SegmentSnapshot]
+    /** The current dirty snapshot of each created block, which also becomes its in-flight snapshot. None for a create
+      * superseded by an unmap, which leaves the batch as `dropSuperseded` describes
+      */
+    def mapInputs(creates: List[MapEntry]): List[Option[SegmentSnapshot]]
     def mapCommitted(result: MapResult): Unit
     /** A failed attempt did create the block: it now has `ptr`, at the revision and length of `s` */
     def adopted(e: MapEntry, ptr: DataObjectPointer, s: DataObjectRangeState): Unit

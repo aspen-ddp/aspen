@@ -19,3 +19,6 @@ DataObject TKVL test suite sometimes reports hung tests during full test runs th
 apparently not flaky, it suggests that these tests may be taking an inordinately long time to complete. Investigate
 to see if these tests are slower than they should be and where the hung transactions are occurring. Determine if
 this is purely a test issue that can be fixed or if there may be an underlying system issue that needs to be addressed.
+
+Verify that RevisionLock transaction requirement is exclusive. If so, rename to ExclusiveRevisionLock to make this
+explicit.

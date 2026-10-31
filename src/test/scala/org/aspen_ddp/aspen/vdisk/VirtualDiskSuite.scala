@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
 
-import java.util.UUID
+import java.util.{Arrays, UUID}
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.{Future, Promise}
 import scala.concurrent.duration.*
@@ -529,8 +529,73 @@ class VirtualDiskSuite extends IntegrationTestSuite:
       mapped should be (None)
       r should be (new Array[Byte](BlockSize))
 
-  atest("partial unmap is ignored"):
+  atest("partial unmap reads back zeros"):
+    val data = pattern(BlockSize, 31)
+    val model = data.clone()
+    Arrays.fill(model, 4096, 8192, 0.toByte)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, data, fua = false)
+      _ <- d1.unmap(List((4096L, 4096L)))
+      own <- d1.read(0, BlockSize)
+    yield
+      own should be (model)
+
+  atest("partial unmap survives reacquire after flush"):
+    val data = pattern(BlockSize, 37)
+    val model = data.clone()
+    Arrays.fill(model, 4096, 8192, 0.toByte)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, data, fua = false)
+      _ <- d1.unmap(List((4096L, 4096L)))
+      _ <- d1.flush()
+      _ = d1.close()
+      d2 <- acquire()
+      r <- d2.read(0, BlockSize)
+    yield
+      r should be (model)
+
+  atest("unmap of a whole block plus partial neighbours"):
+    val data = pattern(3 * BlockSize, 38)
+    val model = data.clone()
+    Arrays.fill(model, 8192, 40960, 0.toByte)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, data, fua = false)
+      _ <- d1.flush()
+      _ <- d1.unmap(List((8192L, 32768L)))
+      own <- d1.read(0, 3 * BlockSize)
+      _ <- d1.flush()
+      d2 <- acquire()
+      mapped1 <- d2.lookupBlock(1)
+      r <- d2.read(0, 3 * BlockSize)
+    yield
+      own should be (model)
+      d1.blockPointer(1) should be (None)
+      d1.stats.deletedObjects should be (1L)
+      mapped1 should be (None)
+      r should be (model)
+
+  atest("partial unmap of an untouched block makes no transaction"):
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.unmap(List((4096L, 4096L)))
+      _ <- d1.flush()
+      r <- d1.read(0, BlockSize)
+    yield
+      d1.stats.mapTxCount should be (0L)
+      d1.stats.rangedTxCount should be (0L)
+      r should be (new Array[Byte](BlockSize))
+
+  atest("partial unmaps that only together cover a block zero it and keep its object"):
     val data = pattern(2 * BlockSize, 31)
+    val model = data.clone()
+    Arrays.fill(model, 4096, 2 * BlockSize, 0.toByte)
     for
       _ <- createDisk()
       d1 <- acquire(Held)
@@ -544,11 +609,57 @@ class VirtualDiskSuite extends IntegrationTestSuite:
       mapped1 <- d2.lookupBlock(1)
       r <- d2.read(0, 2 * BlockSize)
     yield
-      own should be (data)
+      own should be (model)
       d1.stats.deletedObjects should be (0L)
       mapped0 should not be (None)
       mapped1 should not be (None)
-      r should be (data)
+      r should be (model)
+
+  atest("partial unmap of a block a new owner has not looked up zeroes it"):
+    val data = pattern(BlockSize, 39)
+    val model = data.clone()
+    Arrays.fill(model, 4096, 8192, 0.toByte)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, data, fua = false)
+      _ <- d1.flush()
+      d2 <- acquire(Held)
+      _ <- d2.unmap(List((4096L, 4096L)))
+      own <- d2.read(0, BlockSize)
+      _ <- d2.flush()
+      d3 <- acquire()
+      r <- d3.read(0, BlockSize)
+    yield
+      own should be (model)
+      r should be (model)
+
+  atest("partial unmap during an in-flight data commit zeroes the block after it"):
+    val x = pattern(BlockSize, 40)
+    val model = x.clone()
+    Arrays.fill(model, 0, 8192, 0.toByte)
+    val started = Promise[Unit]()
+    val gate = Promise[Unit]()
+    for
+      _ <- createDisk()
+      d1 <- acquire(Eager)
+      _ <- d1.write(BlockSize, x, fua = false)
+      _ <- d1.flush()
+      _ = d1.commitGate = () =>
+        started.trySuccess(())
+        gate.future
+      _ <- d1.write(BlockSize, pattern(4096, 41), fua = false)
+      _ <- started.future
+      _ <- d1.unmap(List((BlockSize.toLong, 8192L)))
+      own <- d1.read(BlockSize, BlockSize)
+      flushed = d1.flush()
+      _ = gate.success(())
+      _ <- flushed
+      d2 <- acquire()
+      r <- d2.read(BlockSize, BlockSize)
+    yield
+      own should be (model)
+      r should be (model)
 
   atest("write, unmap, write before flush keeps the second write"):
     val x = pattern(BlockSize, 32)

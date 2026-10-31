@@ -20,7 +20,7 @@ trait BlockDevice:
   /** Completes once every write that completed before the call is committed */
   def flush(): Future[Unit]
 
-  /** Each range is (offset, length) */
+  /** Each range is (offset, length). Unmapped bytes read back as zero. */
   def unmap(ranges: List[(Long, Long)]): Future[Unit]
 
   def grow(newSize: Long): Future[Unit]

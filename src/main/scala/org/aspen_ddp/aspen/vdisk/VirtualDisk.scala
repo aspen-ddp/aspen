@@ -36,11 +36,12 @@ import scala.util.{Failure, Success}
   * is retried, adopting the object of any block that an earlier attempt did add. Once the disk is no longer
   * `Serving`, every pending and later request fails with the stop error, and no transaction is started.
   *
-  * UNMAP drops a block's dirty data and makes it read as zeros at once. Its object, if it has one, and its map entry
-  * are deleted by a later map transaction, once any commit in flight on the block has ended: a data commit the unmap
-  * supersedes is not retried, and an object a superseded map attempt created is deleted too. A block written again
-  * first gets a new object in the same transaction that deletes the old one. FLUSH waits for the deletions, and so
-  * does a FUA or FLUSH that was waiting on a write the unmap dropped.
+  * UNMAP drops the dirty data of each block it covers entirely and makes it read as zeros at once. Its object, if it
+  * has one, and its map entry are deleted by a later map transaction, once any commit in flight on the block has
+  * ended: a data commit the unmap supersedes is not retried, and an object a superseded map attempt created is deleted
+  * too. A block written again first gets a new object in the same transaction that deletes the old one. FLUSH waits
+  * for the deletions, and so does a FUA or FLUSH that was waiting on a write the unmap dropped. A piece of a block
+  * that UNMAP covers only in part is zeroed by an ordinary dirty write, unless the block already reads as zeros.
   *
   * Writes wait only while the dirty total is at `dirtyHardLimit`, until writeback brings it below.
   */
@@ -162,28 +163,12 @@ final class VirtualDisk private (val client: AspenClient,
             val seq = nextSeq
             val segs = geom.segments(offset, data.length)
             val waits = segs.map: seg =>
-              val st = block(seg.blockIndex)
               // put copies the bytes, so a single segment can hand over the caller's array
               val bytes =
                 if segs.size == 1 then data
                 else Arrays.copyOfRange(data, seg.offsetInRequest, seg.offsetInRequest + seg.length)
-              if st.inFlight.nonEmpty then
-                counters = counters.copy(writesDuringCommit = counters.writesDuringCommit + 1)
-              val before = st.dirty.bytes
-              st.dirty.put(seg.offsetInBlock, bytes, seq)
-              dirtyTotal += st.dirty.bytes - before
-              val wait = if fua then st.awaitCommitted(seq) else Future.unit
-              dirtied(seg.blockIndex, st, urgent = fua)
-              wait
-            val throttle =
-              if dirtyTotal >= config.dirtyHardLimit then
-                val p = Promise[Unit]()
-                throttled += p
-                // Writeback has to make room now, so no block waits out its coalescing window
-                blocks.foreach((b, st) => if st.timer.nonEmpty then kick(b, st))
-                p.future
-              else
-                Future.unit
+              putDirty(seg.blockIndex, block(seg.blockIndex), seg.offsetInBlock, bytes, seq, fua)
+            val throttle = throttleWrite()
             if fua then Future.sequence(waits).flatMap(_ => throttle) else throttle
 
   def flush(): Future[Unit] = locked:
@@ -205,22 +190,32 @@ final class VirtualDisk private (val client: AspenClient,
           all.onComplete(_ => synchronized { pendingFlushes -= 1 })
           all
 
-  /** Completes at once. Each block the ranges cover entirely reads as zeros from now on, and its object is deleted
-    * by a later map transaction, which FLUSH waits for. Parts of blocks are left alone
+  /** Every covered byte reads as zero once this completes. Each block the ranges cover entirely is unmapped: its
+    * object is deleted by a later map transaction, which FLUSH waits for. Each other covered piece is zeroed by a
+    * write, as a non-FUA `write` would, unless its block holds nothing that could read as non-zero. Blocks with such
+    * a piece whose map entry is not yet known are looked up first, and everything is then applied in one monitor
+    * section
     */
   def unmap(ranges: List[(Long, Long)]): Future[Unit] =
     val geom = currentGeometry
     ranges.view.flatMap((offset, length) => geom.validate(offset, length)).headOption match
       case Some(err) => Future.failed(err)
-      case None => locked:
-        stopped match
-          case Some(err) => Future.failed(err)
-          case None =>
-            // The size as of now: after a grow since validation, an old short last block is no longer whole
-            val current = currentGeometry
-            ranges.foreach((offset, length) => current.blocksFullyCovered(offset, length).foreach(unmapBlock))
-            releaseThrottled()
-            Future.unit
+      case None =>
+        val toLookUp = synchronized:
+          if stopped.isEmpty then
+            val whole = fullyCovered(geom, ranges).toSet
+            partialPieces(geom, ranges).map(_.blockIndex).distinct.filter(b => !whole.contains(b))
+              .map(b => (b, block(b))).filter((_, st) => !st.lookedUp)
+          else
+            Nil
+        if toLookUp.isEmpty then
+          locked(applyUnmap(ranges))
+        else
+          Future.sequence(toLookUp.map((b, st) => Future.delegate(ensureLookedUp(b, st)))).transformWith:
+            case Success(_) => locked(applyUnmap(ranges))
+            case Failure(e) => locked:
+              fail(s"map lookup for unmap failed: $e")
+              Future.failed(stopped.get)
 
   /** Commits the new size to the disk's config, then serves it. Requests in progress are unaffected */
   def grow(newSize: Long): Future[Unit] =
@@ -368,12 +363,77 @@ final class VirtualDisk private (val client: AspenClient,
     if !st.dirty.isEmpty then
       dirtied(b, st, urgent = false)
 
+  /** Adds a write's piece to the block's dirty data. With `fua`, completes once it is committed. Under the monitor */
+  private def putDirty(b: Long, st: BlockState, offsetInBlock: Int, bytes: Array[Byte], seq: Long, fua: Boolean)
+                      (using Deferred): Future[Unit] =
+    if st.inFlight.nonEmpty then
+      counters = counters.copy(writesDuringCommit = counters.writesDuringCommit + 1)
+    val before = st.dirty.bytes
+    st.dirty.put(offsetInBlock, bytes, seq)
+    dirtyTotal += st.dirty.bytes - before
+    val wait = if fua then st.awaitCommitted(seq) else Future.unit
+    dirtied(b, st, urgent = fua)
+    wait
+
+  /** Completes once the dirty total is below `dirtyHardLimit`. Under the monitor */
+  private def throttleWrite()(using Deferred): Future[Unit] =
+    if dirtyTotal >= config.dirtyHardLimit then
+      val p = Promise[Unit]()
+      throttled += p
+      // Writeback has to make room now, so no block waits out its coalescing window
+      blocks.foreach((b, st) => if st.timer.nonEmpty then kick(b, st))
+      p.future
+    else
+      Future.unit
+
   private def releaseThrottled()(using Deferred): Unit =
     if throttled.nonEmpty && dirtyTotal < config.dirtyHardLimit then
       throttled.foreach(p => later(p.trySuccess(())))
       throttled.clear()
 
   // ---- UNMAP ----
+
+  /** Unmaps the whole blocks and zeroes the other pieces. Under the monitor */
+  private def applyUnmap(ranges: List[(Long, Long)])(using Deferred): Future[Unit] =
+    stopped match
+      case Some(err) => Future.failed(err)
+      case None =>
+        // The size as of now: after a grow since validation, an old short last block is no longer whole
+        val current = currentGeometry
+        val whole = fullyCovered(current, ranges)
+        whole.foreach(unmapBlock)
+        val wholeSet = whole.toSet
+        nextSeq += 1
+        val seq = nextSeq
+        // A block with no object, no dirty data and no commit that could create one already reads as zeros. One
+        // whose map entry is still unknown is zeroed all the same
+        val zeroed = partialPieces(current, ranges).filter: seg =>
+          val st = block(seg.blockIndex)
+          !wholeSet.contains(seg.blockIndex) &&
+            !(st.lookedUp && st.pointer.isEmpty && st.dirty.isEmpty && st.inFlight.isEmpty)
+        zeroed.foreach: seg =>
+          putDirty(seg.blockIndex, block(seg.blockIndex), seg.offsetInBlock, new Array[Byte](seg.length), seq,
+            fua = false)
+        releaseThrottled()
+        if zeroed.nonEmpty then throttleWrite() else Future.unit
+
+  /** Every block entirely covered by one of the ranges, each once */
+  private def fullyCovered(geom: DiskGeometry, ranges: List[(Long, Long)]): List[Long] =
+    ranges.flatMap((offset, length) => geom.blocksFullyCovered(offset, length)).distinct
+
+  /** The first and last segments of each range. Every segment between them covers its block entirely */
+  private def partialPieces(geom: DiskGeometry, ranges: List[(Long, Long)]): List[BlockSegment] =
+    val bos = geom.blockObjectSize
+    ranges.flatMap: (offset, length) =>
+      if length == 0 then
+        Nil
+      else
+        val end = offset + length
+        val headEnd = math.min(end, (offset / bos + 1) * bos)
+        val tailStart = math.max(headEnd, (end - 1) / bos * bos)
+        val head = geom.segments(offset, (headEnd - offset).toInt)
+        val tail = if tailStart < end then geom.segments(tailStart, (end - tailStart).toInt) else Nil
+        head ++ tail
 
   /** Drops the block's dirty data and makes it read as zeros. Unless it is known to have no object, the next map
     * transaction that can deletes the one in the map, waiting for a commit in flight on the block to end first. Its

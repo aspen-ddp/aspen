@@ -4,8 +4,21 @@ import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.server.store.RequirementsChecker.ObjectErr
+import scribe.Logging
 
-object RequirementsLocker {
+object RequirementsLocker extends Logging {
+
+  /** Takes the object's exclusive lock. A passing check means no other transaction holds it, and single-writer
+    * guarantees such as the vdisk fence depend on that, so finding one is logged as an error. The lock is still
+    * taken
+    */
+  private def lockExclusive(state: ObjectState, transactionId: TransactionId): Unit = {
+    state.lockedToTransaction.foreach { other =>
+      if (other != transactionId)
+        logger.error(s"Transaction $transactionId takes the exclusive lock on object ${state.objectId} held by $other")
+    }
+    state.lockedToTransaction = Some(transactionId)
+  }
 
   /** Locks all objects hosted by this store to the transaction. This method may be
     * called ONLY after a call to RequirementsChecker.check returns ZERO errors
@@ -27,21 +40,21 @@ object RequirementsLocker {
         req match {
           case r: LocalTimeRequirement =>
 
-          case r: DataUpdate => getState(r.objectPointer.id).lockedToTransaction = Some(transactionId)
+          case r: DataUpdate => lockExclusive(getState(r.objectPointer.id), transactionId)
 
           case r: KeyValueUpdate =>
             lockKV(getState(r.objectPointer.id), transactionId, r.requiredRevision, r.contentLock, r.requirements)
 
-          case r: RefcountUpdate => getState(r.objectPointer.id).lockedToTransaction = Some(transactionId)
+          case r: RefcountUpdate => lockExclusive(getState(r.objectPointer.id), transactionId)
 
-          case r: VersionBump => getState(r.objectPointer.id).lockedToTransaction = Some(transactionId)
+          case r: VersionBump => lockExclusive(getState(r.objectPointer.id), transactionId)
 
-          case r: RevisionLock => getState(r.objectPointer.id).lockedToTransaction = Some(transactionId)
+          case r: RevisionLock => lockExclusive(getState(r.objectPointer.id), transactionId)
 
           case r: SharedRevisionLock => getState(r.objectPointer.id).sharedLocks += transactionId
         }
       } catch {
-        case e: Throwable => println(s"UNEXPECTED ERROR IN TX Lock: $e")
+        case e: Throwable => logger.error(s"Unexpected error in transaction lock of $transactionId: $e")
       }
     }
   }
@@ -52,7 +65,7 @@ object RequirementsLocker {
              contentLock: Option[FullContentLock],
              keyRequirements: List[KeyValueUpdate.KeyRequirement]): Unit = {
 
-    requiredRevision.foreach { rev => state.lockedToTransaction = Some(transactionId) }
+    requiredRevision.foreach { _ => lockExclusive(state, transactionId) }
 
     state.kvState match {
       case None => throw ObjectErr(state.objectId, ObjectTypeError())
@@ -143,7 +156,7 @@ object RequirementsLocker {
           case r: SharedRevisionLock => getState(r.objectPointer.id).sharedLocks -= transactionId
         }
       } catch {
-        case e: Throwable => println(s"UNEXPECTED ERROR IN TX Lock: $e")
+        case e: Throwable => logger.error(s"Unexpected error in transaction lock of $transactionId: $e")
       }
     }
   }

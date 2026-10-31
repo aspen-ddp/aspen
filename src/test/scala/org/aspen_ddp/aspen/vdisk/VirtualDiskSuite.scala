@@ -144,10 +144,10 @@ class VirtualDiskSuite extends IntegrationTestSuite:
         d.write(offset, data, fua = false)
     def held(d: VirtualDisk, seedBase: Int): (List[Future[Unit]], Long) =
       val gate = Promise[Unit]()
-      d.commitGate = gate.future
+      d.commitGate = () => gate.future
       val writes = burst(d, seedBase)
       val during = d.stats.writesDuringCommit
-      d.commitGate = Future.unit
+      d.commitGate = () => Future.unit
       gate.success(())
       (writes, during)
     for
@@ -411,9 +411,14 @@ class VirtualDiskSuite extends IntegrationTestSuite:
       _ <- d1.flush()
       d2 <- acquire(Held)
       gate = Promise[Unit]()
-      _ = d2.commitGate = gate.future
+      started = Promise[Unit]()
+      _ = d2.commitGate = () =>
+        started.trySuccess(())
+        gate.future
       _ <- d2.write(0, v2, fua = false)
       flushed = d2.flush()
+      // The block's lookup runs first, so wait for the data transaction itself to be in flight
+      _ <- started.future
       // The commit is in flight and the revision is unknown, so what the read fetched has nothing to be checked against
       _ = d2.rangeReader = staleOnce(pattern(BlockSize, 98))
       _ <- d2.read(4096, 4096)
@@ -453,6 +458,34 @@ class VirtualDiskSuite extends IntegrationTestSuite:
       r should be (v1.slice(4096, 8192))
       d2.fetchCount should be (1L)
       d2.cleanBytes(0) should be (4096L)
+
+  atest("a wrongly learned revision is corrected by a later fetch"):
+    val v1 = pattern(BlockSize, 27)
+    val v2 = pattern(4096, 28)
+    val model = v1.clone()
+    applyTo(model, 4096, v2)
+    for
+      _ <- createDisk()
+      d1 <- acquire(Held)
+      _ <- d1.write(0, v1, fua = false)
+      _ <- d1.flush()
+      // A new owner's first fetch comes from a store lagging at an older revision, and every later one is current
+      d2 <- acquire(Held)
+      _ = d2.rangeReader = staleOnce(pattern(BlockSize, 97))
+      _ <- d2.read(4096, 4096)
+      // The current revision differs from the learned one, so the block is relearned and its clean entry dropped
+      r1 <- d2.read(8192, 4096)
+      r2 <- d2.read(4096, 4096)
+      fetches = d2.fetchCount
+      _ <- d2.write(4096, v2, fua = false)
+      _ <- d2.flush()
+      d3 <- acquire()
+      r <- d3.read(0, BlockSize)
+    yield
+      r1 should be (v1.slice(8192, 12288))
+      r2 should be (v1.slice(4096, 8192))
+      fetches should be (4L)
+      r should be (model)
 
   atest("a fenced owner's read of an uncached range fails with Fenced"):
     val v1 = pattern(BlockSize, 25)

@@ -75,8 +75,10 @@ final class VirtualDisk private (val client: AspenClient,
   private[vdisk] def dropClean(index: Long): Unit = synchronized(cleanCache.invalidate(index))
   /** Performs every read fetch. Tests replace it to simulate a store serving an older revision */
   @volatile private[vdisk] var rangeReader: RangeReader = (ptr, ranges) => client.readRanges(ptr, ranges)
-  /** Map and data transactions start once it completes. Tests use it to hold commits in flight */
-  @volatile private[vdisk] var commitGate: Future[Unit] = Future.unit
+  /** Called as each map or data transaction starts, which proceeds once the result completes. Tests use it to
+    * hold commits in flight and to see them start
+    */
+  @volatile private[vdisk] var commitGate: () => Future[Unit] = () => Future.unit
 
   // ---- BlockDevice ----
 
@@ -304,6 +306,7 @@ final class VirtualDisk private (val client: AspenClient,
                   cleanCache.invalidate(b)
                 st.revision = Some(newRevision)
                 st.length = Some(newLength)
+                st.revisionLearned = false
                 snap.pieces.foreach((o, bytes) => cleanCache.merge(b, o, bytes))
                 committed(b, st, snap)
               case Failure(e) => fail(s"commit of block $b failed: $e")
@@ -323,7 +326,7 @@ final class VirtualDisk private (val client: AspenClient,
                         revision: Option[ObjectRevision],
                         length: Option[Int],
                         clean: Vector[(Int, Array[Byte])],
-                        snap: SegmentSnapshot): Future[DataCommit] = commitGate.flatMap: _ =>
+                        snap: SegmentSnapshot): Future[DataCommit] = commitGate().flatMap: _ =>
     val blockSize = currentGeometry.blockObjectSize
     if covers(snap.pieces, 0, blockSize) then
       val content = new Array[Byte](blockSize)
@@ -397,13 +400,14 @@ final class VirtualDisk private (val client: AspenClient,
                     st.pointer = Some(insert._2)
                     st.revision = Some(revision)
                     st.length = Some(snap.end)
+                    st.revisionLearned = false
                     cleanCache.merge(b, 0, content._2)
                     committed(b, st, snap)
                 case Failure(e) => fail(s"map transaction failed: $e")
               mapKickRequested = true
 
   private def runMapTx(contents: List[(Long, Array[Byte])])
-      : Future[(List[(Long, DataObjectPointer)], ObjectRevision)] = commitGate.flatMap: _ =>
+      : Future[(List[(Long, DataObjectPointer)], ObjectRevision)] = commitGate().flatMap: _ =>
     client.transact: tx =>
       given Transaction = tx
       tx.sharedLockRevision(info.fencePointer, fenceRevision)
@@ -515,9 +519,17 @@ final class VirtualDisk private (val client: AspenClient,
                   if st.generation == generation && cacheable then
                     if current.isEmpty then
                       st.revision = Some(fetchRevision)
+                      st.revisionLearned = true
                     if st.length.isEmpty then
                       st.length = states.flatMap(_.objectLength).headOption
                     fetched.foreach((o, bytes) => cleanCache.merge(b, o, bytes))
+                  else if current.exists(_ != fetchRevision) && st.revisionLearned && st.inFlight.isEmpty then
+                    // The learned revision may have come from a lagging store. Only this owner's commits are
+                    // authoritative, so forget it and what was cached at it, and learn the block again
+                    st.revision = None
+                    st.length = None
+                    st.revisionLearned = false
+                    cleanCache.invalidate(b)
                   // A commit completed during the fetch is covered by the overlay or newer than the read
                   Right(revision.exists(_ != fetchRevision) && !current.contains(fetchRevision))
             outcome match

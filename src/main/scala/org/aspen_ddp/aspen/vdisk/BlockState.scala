@@ -22,6 +22,10 @@ final class BlockState:
     */
   var revision: Option[ObjectRevision] = None
   var length: Option[Int] = None
+  /** True when `revision` (and `length`, which only a commit or the same read sets otherwise) was learned from a
+    * read rather than set by one of this owner's commits. A learned revision is dropped on a mismatching fetch
+    */
+  var revisionLearned: Boolean = false
 
   /** Every uncommitted write. A commit's pieces stay here until it succeeds, so `dirty` alone is the overlay a read
     * applies, and newer writes replace the parts of in-flight pieces they overlap

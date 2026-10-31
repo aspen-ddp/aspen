@@ -35,38 +35,56 @@ object RequirementsChecker extends Logging {
             nanoTime: () => Long = () => System.nanoTime()):
   (Map[ObjectId, RequirementError], List[RequirementError]) = {
 
-    def checkExclusiveLock(oid: ObjectId, os: ObjectState): Unit =
-      if !applying then
-        os.lockedToTransaction.foreach { lockedTxId =>
-          if lockedTxId != transactionId then
-            throw ObjectErr(oid, TransactionCollision(lockedTxId))
-        }
+    def collide(oid: ObjectId, holders: Iterable[TransactionId]): Unit =
+      holders.find(_ != transactionId).foreach { other =>
+        throw ObjectErr(oid, TransactionCollision(other))
+      }
 
-    /** State for every object requirement except SharedRevisionLock. Held shared locks block it and open the
-      * exclusive preference window so that new shared lockers back off until this transaction can get in.
+    /** Object-level locks: lockedToTransaction and a KV object's content lock. Every requirement collides with them */
+    def checkObjectLocks(oid: ObjectId, os: ObjectState): Unit =
+      collide(oid, os.lockedToTransaction)
+      os.kvState.foreach(kvs => collide(oid, kvs.contentLocked))
+
+    /** Locks on parts of a KV object (keys, absent keys, ranges). Requirements on the whole object collide with them */
+    def checkPartLocks(oid: ObjectId, os: ObjectState): Unit =
+      collide(oid, os.lockedWriteTransactions -- os.sharedLocks)
+
+    def loaded(oid: ObjectId): ObjectState =
+      objects.get(oid) match
+        case None => throw ObjectErr(oid, MissingObject())
+        case Some(os) =>
+          if os.reloadRequired then
+            throw ObjectErr(oid, StaleObjectState())
+          os
+
+    /** State for every object requirement except SharedRevisionLock. `wholeObject` requirements also collide with locks
+      * on parts of a KV object, and vice versa, since part-level requirements collide with object-level locks. Held
+      * shared locks block it and open the exclusive preference window so that new shared lockers back off until this
+      * transaction can get in.
       */
-    def getState(oid: ObjectId): ObjectState =
-      objects.get(oid) match
-        case None => throw ObjectErr(oid, MissingObject())
-        case Some(os) =>
-          checkExclusiveLock(oid, os)
-          if !applying then
-            os.sharedLocks.find(_ != transactionId).foreach { sharedTxId =>
-              os.exclusiveWaitUntil = nanoTime() + SharedRevisionLock.ExclusivePreferenceWindow.toNanos
-              throw ObjectErr(oid, TransactionCollision(sharedTxId))
-            }
-          os
+    def getState(oid: ObjectId, wholeObject: Boolean = true): ObjectState =
+      val os = loaded(oid)
+      if !applying then
+        checkObjectLocks(oid, os)
+        os.sharedLocks.find(_ != transactionId).foreach { sharedTxId =>
+          os.exclusiveWaitUntil = nanoTime() + SharedRevisionLock.ExclusivePreferenceWindow.toNanos
+          throw ObjectErr(oid, TransactionCollision(sharedTxId))
+        }
+        if wholeObject then
+          checkPartLocks(oid, os)
+      os
 
+    /** A shared lock excludes every transaction that modifies or exclusively locks the object */
     def getSharedState(oid: ObjectId): ObjectState =
-      objects.get(oid) match
-        case None => throw ObjectErr(oid, MissingObject())
-        case Some(os) =>
-          checkExclusiveLock(oid, os)
-          if !applying && os.exclusiveWaitUntil != 0 && nanoTime() - os.exclusiveWaitUntil < 0 then
-            // The waiting exclusive transaction is not tracked, so the collision names this one. It is never a
-            // completed transaction, which keeps the driver from treating the collision as a stale race.
-            throw ObjectErr(oid, TransactionCollision(transactionId))
-          os
+      val os = loaded(oid)
+      if !applying then
+        checkObjectLocks(oid, os)
+        checkPartLocks(oid, os)
+        if os.exclusiveWaitUntil != 0 && nanoTime() - os.exclusiveWaitUntil < 0 then
+          // The waiting exclusive transaction is not tracked, so the collision names this one. It is never a
+          // completed transaction, which keeps the driver from treating the collision as a stale race.
+          throw ObjectErr(oid, TransactionCollision(transactionId))
+      os
 
     var objectErrors: Map[ObjectId, RequirementError] = Map()
     var nonObjectErrors: List[RequirementError] = Nil
@@ -103,7 +121,10 @@ object RequirementsChecker extends Logging {
             }
 
           case r: KeyValueUpdate =>
-            val state = getState(r.objectPointer.id)
+            // Requirements that lock the whole object, rather than only the keys they name
+            val wholeObject = r.requiredRevision.nonEmpty || r.contentLock.nonEmpty ||
+              r.requirements.exists(_.isInstanceOf[KeyValueUpdate.KeyObjectRevision])
+            val state = getState(r.objectPointer.id, wholeObject)
             checkKVRequirements(state, transactionId, r.requiredRevision,
               txTimestamp, r.contentLock, r.requirements, ignoreLocks = applying)
 
@@ -241,12 +262,6 @@ object RequirementsChecker extends Logging {
           checkContentLock(kvs)
           kvs.content.valuesIterator.foreach(checkLock(_, kvs))
         }
-
-        // Check for object revision lock and read-only locks
-        if (requiredRevision.nonEmpty && !ignoreLocks)
-          kvs.rangeLocks.find(_ != transactionId).foreach { lockedTransactionId =>
-            throw ObjectErr(state.objectId, TransactionCollision(lockedTransactionId))
-          }
 
         for (req <- keyRequirements) {
           req match {

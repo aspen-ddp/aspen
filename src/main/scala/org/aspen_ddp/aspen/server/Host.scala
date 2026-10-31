@@ -63,6 +63,8 @@ object Host:
                                   maxSliceSize: Option[Long], completion: Promise[Unit]) extends Event
   private case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   private case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
+  /** The CRL holds the state loaded from a store's crl_save.log: its transactions can be recovered */
+  private case class StoreCrlLoaded(storeId: StoreId, store: Store, saveFile: os.Path, p: Promise[Unit]) extends Event
   /** An FSIF backend failed-stop (its onFatal). `backend` is set once its constructor returns; it stays empty if the
    *  constructor threw. An FSIF backend is opened off the event thread, so the event can be handled before then:
    *  the backend is not served yet, and LoadStore retires it on seeing it failed. */
@@ -3842,10 +3844,11 @@ class Host(val client: AspenClient,
             trs match
               case None => p.success(())
               case Some(trs) =>
+                // Its transactions are recreated, and its transaction messages handled, once the CRL holds them
+                store.frontend.awaitRecovery()
                 crl.loadStore(backend.storeId, trs).onComplete:
                   case Success(_) =>
-                    os.remove(backend.crlSaveFile)
-                    p.success(())
+                    events.put(StoreCrlLoaded(backend.storeId, store, backend.crlSaveFile, p))
                   case Failure(err) =>
                     // The save file stays, so a restart tries again. Until then the store must
                     // not serve without the state the file holds.
@@ -3859,6 +3862,13 @@ class Host(val client: AspenClient,
 
       case e: FsifOpened =>
         fsifOpened(e)
+
+      case StoreCrlLoaded(storeId, store, saveFile, p) =>
+        // A store closed meanwhile keeps its save file, which its close rewrote, and recovers from it when next loaded
+        if stores.get(storeId).exists(_ eq store) then
+          os.remove(saveFile)
+          store.frontend.recover()
+        p.success(())
 
       case UnloadFailedStore(storeId, store) =>
         if stores.get(storeId).exists(_ eq store) then

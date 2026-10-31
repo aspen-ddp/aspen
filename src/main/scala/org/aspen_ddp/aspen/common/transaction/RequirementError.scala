@@ -23,6 +23,11 @@ case class WithinRangeError() extends  RequirementError
   */
 case class RequirementCheckFailure() extends RequirementError
 
+/** The store's in-memory state of the object was discarded (deleted, or no longer matching the backend) while
+  * transactions held locks on it. Purely local, like RequirementCheckFailure.
+  */
+case class StaleObjectState() extends RequirementError
+
 /** An Append delta does not apply to the store's current slice.
   *
   * Either the payload could not be decoded or its expected slice length or trailer differs from

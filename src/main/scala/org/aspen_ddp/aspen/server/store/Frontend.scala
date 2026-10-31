@@ -45,13 +45,46 @@ class Frontend(val storeId: StoreId,
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
-  crl.getFullRecoveryState(storeId).foreach { trs =>
-    val txd = TransactionDescription.deserialize(trs.serializedTxd)
-    val pointers = txd.allHostedObjects(storeId)
-    val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers)
-    transactions += (txd.transactionId -> tx)
-    pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
-  }
+  /** The state of every object a transaction references (see retain), consulted before the cache.
+    *
+    * Requirement locks live on these states, so every transaction must see the same instance for as long as any
+    * transaction references it, whatever the cache does: a state that is evicted, or dropped because it can no longer
+    * be served, is never replaced by a fresh load while it is referenced. One that can no longer be served is marked
+    * reloadRequired instead, and requirement checks fail on it. It is replaced by a fresh load once no locks remain on
+    * it, or when the last reference to it is released.
+    */
+  private var referenced: Map[ObjectId, ObjectState] = Map()
+
+  /** Transaction messages held while the store's recovery state is still being loaded. See awaitRecovery */
+  private var heldMessages: Option[List[TxMessage]] = None
+
+  recoverTransactions()
+
+  /** Recreates the transactions the CRL holds for this store that are not already known */
+  private def recoverTransactions(): Unit =
+    crl.getFullRecoveryState(storeId).foreach { trs =>
+      val txd = TransactionDescription.deserialize(trs.serializedTxd)
+      if !transactions.contains(txd.transactionId) then
+        val pointers = txd.allHostedObjects(storeId)
+        val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers)
+        transactions += (txd.transactionId -> tx)
+        pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
+    }
+
+  /** The store's CRL state is being loaded after this Frontend was created (from a crl_save.log). Until recover is
+    * called, transaction messages are held: started without their recovery state, transactions would hold no locks
+    * and a prepare would replace the recovered Paxos acceptor state with an initial one.
+    */
+  def awaitRecovery(): Unit =
+    if heldMessages.isEmpty then
+      heldMessages = Some(Nil)
+
+  /** The CRL now holds the store's recovery state: recreates its transactions, then handles the held messages */
+  def recover(): Unit =
+    val held = heldMessages.getOrElse(Nil).reverse
+    heldMessages = None
+    recoverTransactions()
+    held.foreach(receiveTransactionMessage)
 
 
   def close(): Future[Unit] = backend.close()
@@ -60,12 +93,57 @@ class Frontend(val storeId: StoreId,
 
   def commit(os: ObjectState, cs: CommitState, txid: TransactionId): Unit =
     if os.metadata.refcount.count == 0 then
-      objectCache.remove(os.objectId)
+      // Deleted: the state is no longer served, nor checked by transactions that still reference it
+      discard(os.objectId)
     else
       objectCache.insert(os)
     backend.commit(cs, txid)
 
-  def receiveTransactionMessage(msg: TxMessage): Unit = msg match {
+  /** Called when a transaction takes `os` for one of its objects. A state that only this transaction can know, such
+    * as that of an object it allocates, is not shared with others (`shared = false`).
+    */
+  def retain(os: ObjectState, shared: Boolean): Unit =
+    os.transactionReferences += 1
+    if shared then
+      referenced += (os.objectId -> os)
+
+  /** Releases a reference taken by retain */
+  def release(os: ObjectState): Unit =
+    os.transactionReferences -= 1
+    if os.transactionReferences == 0 && referenced.get(os.objectId).exists(_ eq os) then
+      referenced -= os.objectId
+
+  /** Stops serving an object's in-memory state: it was deleted, or it differs from what the backend holds. Later
+    * reads load it from the backend. A state still referenced by transactions is marked reloadRequired rather than
+    * forgotten, so that the locks on it keep being honoured. See referenced.
+    */
+  def discard(objectId: ObjectId): Unit =
+    referenced.get(objectId).foreach(_.reloadRequired = true)
+    objectCache.get(objectId).foreach(_.reloadRequired = true)
+    objectCache.remove(objectId)
+
+  /** The state transactions must use for an object, if one is in memory */
+  private def stateForTransaction(objectId: ObjectId): Option[ObjectState] =
+    referenced.get(objectId) match
+      // Transactions holding locks on a discarded state still reference it. Checks against it fail until they resolve
+      case Some(os) if !os.reloadRequired || os.lockedWriteTransactions.nonEmpty => Some(os)
+      case Some(_) =>
+        referenced -= objectId
+        cachedState(objectId)
+      case None => cachedState(objectId)
+
+  /** An in-memory state that may be served */
+  private def servableState(objectId: ObjectId): Option[ObjectState] =
+    referenced.get(objectId).filter(!_.reloadRequired).orElse(cachedState(objectId))
+
+  private def cachedState(objectId: ObjectId): Option[ObjectState] =
+    objectCache.get(objectId).filter(!_.reloadRequired)
+
+  def receiveTransactionMessage(msg: TxMessage): Unit = heldMessages match
+    case Some(held) => heldMessages = Some(msg :: held)
+    case None => handleTransactionMessage(msg)
+
+  private def handleTransactionMessage(msg: TxMessage): Unit = msg match {
     case m: TxPrepare => receivePrepare(m)
     case m: TxAccept => transactions.get(m.transactionId).foreach(tx => tx.receiveAccept(m))
     case m: TxResolved =>
@@ -77,7 +155,9 @@ class Frontend(val storeId: StoreId,
             statusCache.updateStatus(m.transactionId, statusOf(m.committed))
     case m: TxFinalized =>
       transactions.get(m.transactionId) match
-        case Some(tx) => tx.receiveFinalized(m)
+        case Some(tx) =>
+          tx.receiveFinalized(m)
+          tx.releaseObjects() // Already done unless some of its objects had not loaded
         // Remembered for a prepare that arrives after this. See receivePrepare
         case None => statusCache.updateStatus(m.transactionId, statusOf(m.committed), finalized = true)
       transactions -= m.transactionId
@@ -123,7 +203,7 @@ class Frontend(val storeId: StoreId,
       // serve it: reads would return state the store does not hold, and readObjectForRepair would see a repair as
       // already applied. Evicting a newer cached state too only costs a backend read.
       if c.result.isRight then
-        objectCache.remove(c.objectId)
+        discard(c.objectId)
       transactions.get(c.transactionId).foreach { tx =>
         tx.commitComplete(c.objectId, c.result)
       }
@@ -132,7 +212,7 @@ class Frontend(val storeId: StoreId,
   def readObjectForNetwork(clientId: ClientId, readUUID: UUID, pointer: ObjectPointer, readType: ReadType): Unit = {
     val objectId = pointer.id
 
-    objectCache.get(objectId) match
+    servableState(objectId) match
       case Some(os) =>
         logger.trace(s"Reading Cached object for read $readUUID. Revision ${os.metadata.revision}")
         val cs = ReadResponse.CurrentState(os.metadata.revision, os.metadata.refcount, os.metadata.timestamp,
@@ -157,7 +237,7 @@ class Frontend(val storeId: StoreId,
 
   def readObjectForOpportunisticRebuild(op: OpportunisticRebuild): Unit = {
     val objectId = op.pointer.id
-    objectCache.get(objectId) match {
+    servableState(objectId) match {
       case Some(os) => opportunisticRebuild(op, os)
       case None =>
         if op.pointer.poolId == storeId.poolId then
@@ -174,7 +254,7 @@ class Frontend(val storeId: StoreId,
 
   def readObjectForRepair(current: ClientObjectState, completion: Promise[Unit]): Unit = {
     val objectId = current.pointer.id
-    objectCache.get(objectId) match {
+    servableState(objectId) match {
       case Some(os) => repair(current, completion, os)
       case None =>
         if current.pointer.poolId == storeId.poolId then
@@ -199,7 +279,7 @@ class Frontend(val storeId: StoreId,
                             storePointer: Array[Byte],
                             completion: Promise[Unit]): Unit =
     logger.trace(s"Repairing missed deletion of object $objectId")
-    objectCache.remove(objectId)
+    discard(objectId)
     backend.repairDelete(objectId, storePointer, completion)
 
   private def readObjectForTransaction(transaction: Tx, pointer: ObjectPointer): Unit =
@@ -220,7 +300,7 @@ class Frontend(val storeId: StoreId,
 
       transaction.objectLoaded(os)
     else
-      objectCache.get(objectId) match
+      stateForTransaction(objectId) match
         case Some(os) =>
           logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
           transaction.objectLoaded(os)
@@ -272,8 +352,12 @@ class Frontend(val storeId: StoreId,
                           result: Either[ReadState, ReadError.Value]): Unit = {
     result match {
       case Left(rs) =>
-        val os = new ObjectState(objectId, rs.metadata, rs.objectType, rs.data)
-        objectCache.insert(os)
+        // A state still referenced by transactions is never replaced. See referenced
+        val loaded = new ObjectState(objectId, rs.metadata, rs.objectType, rs.data)
+        val inUse = referenced.get(objectId).filter(!_.reloadRequired)
+        if inUse.isEmpty then
+          objectCache.insert(loaded)
+        val os = inUse.getOrElse(loaded)
 
         pendingReads.get(objectId).foreach { lpr =>
           lpr.foreach {
@@ -287,7 +371,7 @@ class Frontend(val storeId: StoreId,
 
             case tr: TransactionRead =>
               logger.trace(s"Completed read for transaction ${tr.transactionId}. Object: ${os.objectId}")
-              transactions.get(tr.transactionId).foreach { tx => tx.objectLoaded(os) }
+              transactions.get(tr.transactionId).foreach { tx => tx.objectLoaded(stateForTransaction(objectId).getOrElse(os)) }
 
             case OpportuneRebuild(op) =>
               logger.trace(s"Completed read for OpportuneRebuild. Object: ${os.objectId}")

@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.paxos.PersistentState
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, RefcountUpdate, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
@@ -370,8 +370,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
   def overwrite(ptr: ObjectPointer): DataUpdate = DataUpdate(ptr, rev0, DataUpdateOperation.Overwrite)
 
   /** Sends a prepare for the transaction and returns this store's TxPrepareResponse */
-  def prepare(frontend: Frontend, net: TestNet, txd: TransactionDescription): TxPrepareResponse =
-    val updates = txd.requirements.collect { case r: DataUpdate => ObjectUpdate(r.objectPointer.id, DataBuffer(Array[Byte](1))) }
+  def prepare(frontend: Frontend, net: TestNet, txd: TransactionDescription,
+              kvUpdate: DataBuffer = DataBuffer(Array[Byte]())): TxPrepareResponse =
+    val updates = txd.requirements.collect {
+      case r: DataUpdate => ObjectUpdate(r.objectPointer.id, DataBuffer(Array[Byte](1)))
+      case r: KeyValueUpdate => ObjectUpdate(r.objectPointer.id, kvUpdate)
+    }
     frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(objectUpdates = updates))
     net.txMessage() match
       case Some(r: TxPrepareResponse) => r
@@ -383,9 +387,31 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   def lockFixture(): (Frontend, MapBackend, TestNet) =
     val (frontend, backend, _, net) = mkFrontendWithNet()
+    populate(backend)
+    (frontend, backend, net)
+
+  /** op1 and the fence as data objects, kvPtr as a KeyValue object holding keys 1 to 3 */
+  def populate(backend: MapBackend): Unit =
     for oid <- List(oid1, fenceOid) do
       val os = mkObjectState(oid)
       backend.bootstrapAllocate(oid, os.objectType, os.metadata, os.data)
+    val kv = mkKVObjectState()
+    backend.bootstrapAllocate(oid2, kv.objectType, kv.metadata, kv.data)
+
+  /** A Frontend whose backend reports every commit as failed */
+  def failingCommitFixture(): (Frontend, MapBackend, TestNet) =
+    var handler: Option[CompletionHandler] = None
+    val backend = new MapBackend(storeId):
+      override def setCompletionHandler(h: CompletionHandler): Unit =
+        handler = Some(h)
+        super.setCompletionHandler(h)
+      override def commit(state: CommitState, transactionId: TransactionId): Unit =
+        handler.foreach(_.complete(Commit(storeId, state.objectId, transactionId, Right(CommitError.IOFailure))))
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), net, new TestCrl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
     (frontend, backend, net)
 
   test("a second transaction requiring the same revision votes abort while the first holds its vote") {
@@ -548,5 +574,106 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
 
     prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  // ---- Locks survive the discard of a referenced object state ----
+
+  def keyRevision(n: Int): KeyValueUpdate =
+    KeyValueUpdate(kvPtr, None, None, List(KeyValueUpdate.KeyRevision(k(n), rev0)))
+
+  /** 0x20 is not a KeyValueOperation code, so applying this update throws partway through */
+  val corruptKVUpdate: DataBuffer = DataBuffer(Array[Byte](0x20, 0x00))
+
+  test("an update that fails partway through does not drop another transaction's key lock") {
+    val (frontend, _, net) = lockFixture()
+
+    prepare(frontend, net, lockTxd(txid1, List(keyRevision(1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    prepare(frontend, net, lockTxd(txid2, List(keyRevision(2))), corruptKVUpdate).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid2, committed = true)
+
+    val r = prepare(frontend, net, lockTxd(txid3, List(keyRevision(1))))
+    r.disposition shouldBe TransactionDisposition.VoteAbort
+  }
+
+  test("a failed backend commit does not drop another transaction's shared lock") {
+    val (frontend, _, net) = failingCommitFixture()
+
+    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    // Collides here, but is committed by the other stores' votes. Its backend commit fails
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(fencePtr)))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid2, committed = true)
+
+    // The backend still holds rev0, but the shared lock must still be honoured
+    prepare(frontend, net, lockTxd(txid3, List(overwrite(fencePtr)))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+
+    // Once the holder resolves, the discarded state is reloaded from the backend
+    resolve(frontend, net, txid1, committed = false)
+    prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 13)), List(overwrite(fencePtr)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+  }
+
+  test("deleting an object does not drop another transaction's shared lock on it") {
+    val (frontend, _, net) = lockFixture()
+
+    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(fencePtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    val delete = RefcountUpdate(fencePtr, ObjectRefcount(1, 1), ObjectRefcount(2, 0))
+    prepare(frontend, net, lockTxd(txid2, List(delete))).disposition shouldBe TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid2, committed = true)
+
+    prepare(frontend, net, lockTxd(txid3, List(overwrite(fencePtr)))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+  }
+
+  test("locks are honoured by a store without an object cache") {
+    val backend = new MapBackend(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, ObjectCache.NoCache, net, new TestCrl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    populate(backend)
+
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    val r = prepare(frontend, net, lockTxd(txid2, List(overwrite(op1))))
+    r.disposition shouldBe TransactionDisposition.VoteAbort
+    r.collisions shouldBe List(txid1)
+
+    resolve(frontend, net, txid1, committed = false)
+    prepare(frontend, net, lockTxd(txid3, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+  }
+
+  test("transaction messages received while awaiting recovery are handled after the recovered transactions") {
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    populate(backend)
+    var recoverable: List[TransactionRecoveryState] = Nil
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = recoverable
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    frontend.awaitRecovery()
+
+    frontend.receiveTransactionMessage(mkPrepare(lockTxd(txid2, List(overwrite(op1))), fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    frontend.transactions shouldBe empty
+    net.txMessage() shouldBe None
+
+    // The CRL now holds txid1, a commit vote on op1, as loading a crl_save.log leaves it
+    recoverable = List(TransactionRecoveryState(storeId, lockTxd(txid1, List(overwrite(op1))).serialize(),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), TransactionDisposition.VoteCommit,
+      TransactionStatus.Unresolved, PersistentState.initial))
+    frontend.recover()
+
+    frontend.transactions.keySet shouldBe Set(txid1, txid2)
+    net.txMessage() match
+      case Some(r: TxPrepareResponse) =>
+        r.transactionId shouldBe txid2
+        r.disposition shouldBe TransactionDisposition.VoteAbort
+        r.collisions shouldBe List(txid1)
+      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
   }
 }

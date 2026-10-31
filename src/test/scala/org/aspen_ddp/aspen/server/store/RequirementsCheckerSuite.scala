@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, DataObjectPointer, Delete, Insert, Key, KeyValueOperation, KeyValueObjectPointer, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{FullContentLock, KeyRevision}
-import org.aspen_ddp.aspen.common.transaction.{ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
+import org.aspen_ddp.aspen.common.transaction.{StaleObjectState, TransactionRequirement, ContentMismatch, DataUpdate, DataUpdateOperation, KeyExistenceError, KeyValueUpdate, LocalTimeError, LocalTimeRequirement, MissingObjectUpdate, RefcountMismatch, RefcountUpdate, RequirementCheckFailure, RequirementError, RevisionLock, RevisionMismatch, SharedRevisionLock, SliceSizeExceeded, TransactionCollision, TransactionId, AppendMismatch, VersionBump, WithinRangeError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -643,6 +643,8 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     var content: HashMap[Key, ValueState] = new HashMap
 
     content += (k1 -> new ValueState(Value(Array[Byte]()), rev1, ts1, None))
+    // tx2 holds k2's lock. A required object revision locks the whole object, so it collides with that lock for any
+    // other transaction: the checks below that are about something else run as tx2
     content += (k2 -> new ValueState(Value(Array[Byte]()), rev1, ts1, Some(tx2)))
 
     val kvos = new KVObjectState
@@ -689,7 +691,8 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       val lst = List(KeyRevision(k1, rev2), KeyRevision(k2, rev1))
       val req = KeyValueUpdate(kp1, Some(rev1), Some(FullContentLock(lst)), List())
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      // Checked as tx2, which holds k2's lock: for any other transaction the lock collision is reported first
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> ContentMismatch())
@@ -701,7 +704,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       val lst = List(KeyRevision(k1, rev1))
       val req = KeyValueUpdate(kp1, Some(rev1), Some(FullContentLock(lst)), List())
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> ContentMismatch())
@@ -713,7 +716,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       val lst = List(KeyRevision(k1, rev2), KeyRevision(k2, rev1), KeyRevision(k3, rev1))
       val req = KeyValueUpdate(kp1, Some(rev1), Some(FullContentLock(lst)), List())
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> ContentMismatch())
@@ -724,7 +727,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.KeyRevision(k1, rev1)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -733,7 +736,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.KeyRevision(k1, rev2)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> RevisionMismatch())
@@ -757,7 +760,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.Exists(k1)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -766,7 +769,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.MayExist(k1)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -775,7 +778,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.MayExist(k4)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -784,7 +787,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.DoesNotExist(k1)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> KeyExistenceError())
@@ -795,7 +798,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.DoesNotExist(k4)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -815,7 +818,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.TimestampEquals(k1, ts1)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -833,7 +836,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.TimestampGreaterThan(k1, ts2)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -842,7 +845,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     {
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k2, ByteArrayKeyOrdering)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -852,7 +855,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       kvos.min = Some(k1)
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k2, ByteArrayKeyOrdering)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -863,7 +866,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       kvos.max = Some(k3)
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k2, ByteArrayKeyOrdering)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -875,7 +878,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       kvos.max = Some(k3)
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k2, ByteArrayKeyOrdering)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       assert(oerrs.isEmpty)
       assert(errs.isEmpty)
@@ -887,7 +890,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       kvos.min = Some(k3)
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k2, ByteArrayKeyOrdering)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> WithinRangeError())
@@ -901,7 +904,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       kvos.max = Some(k4)
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k1, ByteArrayKeyOrdering)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> WithinRangeError())
@@ -916,7 +919,7 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
       kvos.max = Some(k3)
       val req = KeyValueUpdate(kp1, Some(rev1), None, List(KeyValueUpdate.WithinRange(k4, ByteArrayKeyOrdering)))
 
-      val (oerrs, errs) = RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates)
+      val (oerrs, errs) = RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)
 
       var expected: HashMap[ObjectId, RequirementError] = new HashMap
       expected += (o.objectId -> WithinRangeError())
@@ -1128,5 +1131,68 @@ class RequirementsCheckerSuite extends AnyFunSuite with Matchers {
     RequirementsChecker.check(tx2, HLCTimestamp.now, List(req), objects, updates)._1 shouldBe
       Map(oid1 -> TransactionCollision(tx1))
     RequirementsChecker.check(tx1, HLCTimestamp.now, List(req), objects, updates) shouldBe (Map(), Nil)
+  }
+
+  // ---- Object-level requirements and key-level locks collide in both arrival orders ----
+
+  private val kk1 = Key(Array[Byte](1))
+  private val kk9 = Key(Array[Byte](9))
+
+  /** A KeyValue object at rev1 holding kk1 at rev1 */
+  private def kvObjectWithKey(): Map[ObjectId, ObjectState] =
+    val objects = emptyKVObject()
+    objects(oid1).kvState.get.content += (kk1 -> new ValueState(Value(Array[Byte]()), rev1, ts1, None))
+    objects
+
+  private val keyLevel = KeyValueUpdate(kp1, None, None, List(KeyRevision(kk1, rev1)))
+  private val absentKey = KeyValueUpdate(kp1, None, None, List(KeyValueUpdate.DoesNotExist(kk9)))
+  private val objectRevision = KeyValueUpdate(kp1, Some(rev1), None, Nil)
+  private val keyObjectRevision = KeyValueUpdate(kp1, None, None, List(KeyValueUpdate.KeyObjectRevision(kk9, rev1)))
+  private val contentLock = KeyValueUpdate(kp1, None, Some(FullContentLock(List(KeyRevision(kk1, rev1)))), Nil)
+  private val refcount = RefcountUpdate(kp1, ref1, ref2)
+  private val versionBump = VersionBump(kp1, rev1)
+  private val revisionLock = RevisionLock(kp1, rev1)
+  private val shared = SharedRevisionLock(kp1, rev1)
+
+  /** tx1 locks `first`, then tx2 is checked with `second`. Returns tx2's errors */
+  private def lockThenCheck(first: TransactionRequirement, second: TransactionRequirement) =
+    val objects = kvObjectWithKey()
+    val updates = Map(oid1 -> DataBuffer.Empty)
+    RequirementsChecker.check(tx1, HLCTimestamp.now, List(first), objects, updates, nanoTime = () => 0L) shouldBe
+      (Map(), Nil)
+    RequirementsLocker.lock(tx1, List(first), objects)
+    RequirementsChecker.check(tx2, HLCTimestamp.now, List(second), objects, updates, nanoTime = () => 0L)._1
+
+  private val conflicting: List[(String, TransactionRequirement, TransactionRequirement)] = List(
+    ("a required object revision", objectRevision, keyLevel),
+    ("a required object revision", objectRevision, absentKey),
+    ("a key's object revision requirement", keyObjectRevision, keyLevel),
+    ("a full content lock", contentLock, keyLevel),
+    ("a full content lock", contentLock, absentKey),
+    ("a refcount update", refcount, keyLevel),
+    ("a version bump", versionBump, keyLevel),
+    ("a revision lock", revisionLock, absentKey),
+    ("a SharedRevisionLock", shared, keyLevel),
+    ("a SharedRevisionLock", shared, absentKey))
+
+  for ((name, objectLevel, keyReq), i) <- conflicting.zipWithIndex do
+    test(s"$name and a held key lock collide in both arrival orders ($i)") {
+      lockThenCheck(objectLevel, keyReq) shouldBe Map(oid1 -> TransactionCollision(tx1))
+      lockThenCheck(keyReq, objectLevel) shouldBe Map(oid1 -> TransactionCollision(tx1))
+    }
+
+  test("key-level requirements on different keys do not collide") {
+    lockThenCheck(keyLevel, absentKey) shouldBe Map()
+    lockThenCheck(absentKey, keyLevel) shouldBe Map()
+  }
+
+  test("a stale object state fails every check, also when applying") {
+    val objects = kvObjectWithKey()
+    objects(oid1).reloadRequired = true
+    for applying <- List(false, true) do
+      RequirementsChecker.check(tx1, HLCTimestamp.now, List(keyLevel), objects, Map(oid1 -> DataBuffer.Empty),
+        applying = applying)._1 shouldBe Map(oid1 -> StaleObjectState())
+      RequirementsChecker.check(tx1, HLCTimestamp.now, List(shared), objects, Map(), applying = applying)._1 shouldBe
+        Map(oid1 -> StaleObjectState())
   }
 }

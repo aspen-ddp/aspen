@@ -17,6 +17,12 @@ class ObjectState(val objectId: ObjectId,
 
   var lockedToTransaction: Option[TransactionId] = None
 
+  /** This in-memory state is no longer served: the object was deleted, or its state may differ from the backend's.
+    * Requirement checks fail on it. It is kept only while transactions that hold locks on it reference it. See
+    * Frontend.referenced
+    */
+  var reloadRequired: Boolean = false
+
   /** Transactions holding a SharedRevisionLock on this object */
   var sharedLocks: Set[TransactionId] = Set()
 

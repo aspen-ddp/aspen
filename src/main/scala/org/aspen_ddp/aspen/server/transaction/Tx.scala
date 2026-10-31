@@ -94,7 +94,8 @@ class Tx( trs: TransactionRecoveryState,
   def objectLoaded(os: ObjectState): Unit = {
     objects += (os.objectId -> os)
 
-    os.transactionReferences += 1 // Ensure this object stays in memory while the transaction is in progress
+    // Ensures every transaction uses this state, and keeps it in memory, while this transaction is in progress
+    frontend.retain(os, shared = !txd.allocatingObjects.contains(os.objectId))
 
     pendingObjectLoads -= 1
 
@@ -119,7 +120,7 @@ class Tx( trs: TransactionRecoveryState,
     // Apply pre-transaction rebuilds
     preTxRebuilds.foreach { r =>
       objects.get(r.objectId).foreach { os =>
-        if (os.metadata.revision == r.requiredMetadata.revision) {
+        if (os.metadata.revision == r.requiredMetadata.revision && !os.reloadRequired) {
           os.metadata = r.requiredMetadata
           os.data = r.data
           val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data)
@@ -189,7 +190,7 @@ class Tx( trs: TransactionRecoveryState,
     // version from the backing store rather than serving the corruption.
     result.failed.foreach { objectId =>
       logger.error(s"Tx $transactionId. Discarding cached state of object $objectId after a failed update")
-      frontend.objectCache.remove(objectId)
+      frontend.discard(objectId)
     }
 
     val uncommittable = result.uncommittable
@@ -233,12 +234,18 @@ class Tx( trs: TransactionRecoveryState,
 
     unlock() // Ensure we've unlocked the objects now that result of the Tx is known
 
-    // No need to force the objects referenced by this transaction to stay in memory.
-    // Release the reference locking them into the cache
-    objects.valuesIterator.foreach { os =>
-      os.transactionReferences -= 1
-    }
+    releaseObjects()
   }
+
+  private var objectsReleased = false
+
+  /** Releases this transaction's references to its objects. Also called by Frontend when it forgets a transaction
+    * whose objects have not all loaded, which therefore never reached resolvedAndAllObjectsLoaded.
+    */
+  def releaseObjects(): Unit = if !objectsReleased then
+    objectsReleased = true
+    unlock()
+    objects.valuesIterator.foreach(frontend.release)
 
   private def resolved(committed: Boolean): Unit = if (oresolution.isEmpty) {
     oresolution = Some(committed)

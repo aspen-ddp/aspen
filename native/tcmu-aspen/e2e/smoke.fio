@@ -1,0 +1,27 @@
+; Run with: fio smoke.fio --directory=/mnt/vd1
+[global]
+ioengine=libaio
+direct=1
+runtime=60
+time_based=1
+group_reporting=1
+
+[randrw-verify]
+rw=randrw
+rwmixread=50
+bs=4k
+size=512m
+iodepth=8
+filename=randrw.dat
+verify=crc32c
+verify_backlog=1024
+fsync=32
+
+[seqwrite]
+stonewall
+rw=write
+bs=1m
+size=1g
+iodepth=4
+filename=seqwrite.dat
+fsync=32

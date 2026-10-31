@@ -116,7 +116,15 @@ class Tx( trs: TransactionRecoveryState,
       onAllObjectsLoaded()
   }
 
-  private def onAllObjectsLoaded(): Unit = {
+  private def onAllObjectsLoaded(): Unit =
+    if recovered then
+      // Frontend orders the recovered transactions' completions. See Frontend.recoveredTransactionLoaded
+      frontend.recoveredTransactionLoaded(this, hasVote = disposition != TransactionDisposition.Undetermined)
+    else
+      completeLoad()
+
+  /** Runs once all objects have loaded (or failed to). Called by Frontend for a recovered transaction */
+  def completeLoad(): Unit = {
     logger.trace(s"AllObjectsLoaded for tx ${transactionId}. Have delayedPrepare: ${delayedPrepare.nonEmpty}")
 
     // Apply pre-transaction rebuilds
@@ -160,9 +168,6 @@ class Tx( trs: TransactionRecoveryState,
         net.sendTransactionMessage(r)
       )
     }
-
-    if recovered then
-      frontend.recoveredTransactionLoaded(transactionId)
   }
 
   private def determineDisposition(): Unit = {

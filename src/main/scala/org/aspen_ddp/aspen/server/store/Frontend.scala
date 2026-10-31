@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, OpportunisticRebuild, ReadResponse, TxAccept, TxFinalized, TxHeartbeat, TxMessage, TxPrepare, TxResolved, TxStatusRequest}
 import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
-import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionId, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitState, Completion, Read}
@@ -61,10 +61,15 @@ class Frontend(val storeId: StoreId,
   /** The store's CRL state is still being loaded (from a crl_save.log). See awaitRecovery */
   private var awaitingCrl: Boolean = false
 
-  /** Recovered transactions whose objects have not all loaded yet */
-  private var recoveringTransactions: Set[TransactionId] = Set()
+  /** Recovered transactions whose objects have not all loaded yet, and whether each has a persisted vote */
+  private var recoveringTransactions: Map[TransactionId, Boolean] = Map()
 
-  private def holding: Boolean = awaitingCrl || recoveringTransactions.nonEmpty
+  /** Recovered transactions without a persisted vote that have loaded their objects, waiting to decide it. See
+    * recoveredTransactionLoaded
+    */
+  private var undecidedRecovered: List[Tx] = Nil
+
+  private def holding: Boolean = awaitingCrl || recoveringTransactions.nonEmpty || undecidedRecovered.nonEmpty
 
   recoverTransactions()
 
@@ -75,21 +80,37 @@ class Frontend(val storeId: StoreId,
     * take conflicting locks.
     */
   private def recoverTransactions(): Unit =
-    crl.getFullRecoveryState(storeId).foreach { trs =>
+    // Every recovered transaction is registered before any of their reads starts: one that loads synchronously (its
+    // objects cached, or all allocated) must not find the others missing and release the held messages early
+    val recovered = crl.getFullRecoveryState(storeId).flatMap { trs =>
       val txd = TransactionDescription.deserialize(trs.serializedTxd)
-      if !transactions.contains(txd.transactionId) then
+      if transactions.contains(txd.transactionId) then
+        None
+      else
         val pointers = txd.allHostedObjects(storeId)
         val tx = new Tx(trs, txd, this, net, crl, statusCache, Nil, pointers, recovered = true)
         transactions += (txd.transactionId -> tx)
         // A transaction with no objects here never loads any
         if pointers.nonEmpty then
-          recoveringTransactions += txd.transactionId
-        pointers.foreach(ptr => readObjectForTransaction(tx, ptr))
+          recoveringTransactions += (txd.transactionId -> (trs.disposition != TransactionDisposition.Undetermined))
+        Some((tx, pointers))
     }
+    recovered.foreach((tx, pointers) => pointers.foreach(ptr => readObjectForTransaction(tx, ptr)))
 
-  /** A recovered transaction has loaded (or failed to load) all its objects */
-  def recoveredTransactionLoaded(transactionId: TransactionId): Unit =
-    recoveringTransactions -= transactionId
+  /** A recovered transaction has loaded (or failed to load) all its objects. One with a persisted vote completes its
+    * load at once, taking the locks of a commit vote. One without decides its vote only once every recovered
+    * transaction with a persisted vote has done so: deciding earlier, it could take locks that conflict with theirs.
+    */
+  def recoveredTransactionLoaded(tx: Tx, hasVote: Boolean): Unit =
+    recoveringTransactions -= tx.transactionId
+    if hasVote then
+      tx.completeLoad()
+    else
+      undecidedRecovered = undecidedRecovered :+ tx
+    if !recoveringTransactions.valuesIterator.contains(true) then
+      val undecided = undecidedRecovered
+      undecidedRecovered = Nil
+      undecided.foreach(_.completeLoad())
     releaseHeldMessages()
 
   /** The store's CRL state is being loaded after this Frontend was created (from a crl_save.log). Until recover is

@@ -783,4 +783,78 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     frontend.transactions.contains(txid2) shouldBe true
     responseFor(net, txid2).disposition shouldBe TransactionDisposition.VoteAbort
   }
+
+  def recoveryState(txid: TransactionId, reqs: List[TransactionRequirement],
+                    disposition: TransactionDisposition.Value): TransactionRecoveryState =
+    TransactionRecoveryState(storeId, lockTxd(txid, reqs).serialize(),
+      List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))), disposition, TransactionStatus.Unresolved,
+      PersistentState.initial)
+
+  test("held messages wait for every recovered transaction, not just the first to load") {
+    val backend = new DeferredReadBackend
+    populate(backend)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    // The fence is cached, so the first recovered transaction loads synchronously, inside recover
+    val fence = mkObjectState(fenceOid)
+    cache.insert(fence)
+    var recoverable: List[TransactionRecoveryState] = Nil
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = recoverable
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    frontend.awaitRecovery()
+
+    // A retransmitted prepare of the second recovered transaction, and one that conflicts with it
+    sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
+    sendPrepare(frontend, lockTxd(txid3, List(overwrite(op1))))
+    recoverable = List(
+      recoveryState(txid1, List(SharedRevisionLock(fencePtr, rev0)), TransactionDisposition.VoteCommit),
+      recoveryState(txid2, List(overwrite(op1)), TransactionDisposition.VoteCommit))
+    frontend.recover()
+    backend.deliver()
+    backend.deliver()
+
+    frontend.transactions(txid2).recovered shouldBe true
+    val r = responseFor(net, txid3)
+    r.disposition shouldBe TransactionDisposition.VoteAbort
+    r.collisions shouldBe List(txid2)
+  }
+
+  test("a recovered transaction with no persisted vote decides only after recovered votes have locked") {
+    val backend = new DeferredReadBackend
+    populate(backend)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = List(
+        recoveryState(txid1, List(overwrite(op1)), TransactionDisposition.VoteCommit),
+        recoveryState(txid2, List(overwrite(op1)), TransactionDisposition.Undetermined))
+    val net = new TestNet
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    // The shared read of op1 is dispatched to the newest waiter, the undetermined transaction, first
+    backend.deliver()
+
+    sendPrepare(frontend, lockTxd(txid2, List(overwrite(op1))))
+    val r = responseFor(net, txid2)
+    r.disposition shouldBe TransactionDisposition.VoteAbort
+    r.collisions shouldBe List(txid1)
+    cache.get(oid1).flatMap(_.lockedToTransaction) shouldBe Some(txid1)
+  }
+
+  test("a recovered commit vote whose object failed to load reports no locking error") {
+    val out = new java.io.ByteArrayOutputStream
+    Console.withOut(out) {
+      val backend = new DeferredReadBackend // op1 is never allocated, so its read fails
+      val crl = new TestCrl:
+        override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+          List(recoveryState(txid1, List(overwrite(op1)), TransactionDisposition.VoteCommit))
+      val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet,
+        crl, new TransactionStatusCache())
+      backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+      backend.deliver()
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
+    }
+    out.toString should not include "UNEXPECTED"
+  }
 }

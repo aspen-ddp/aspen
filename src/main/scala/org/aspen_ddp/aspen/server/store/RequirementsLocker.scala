@@ -21,7 +21,8 @@ object RequirementsLocker {
       }
     }
 
-    for (req <- requirements) {
+    // A recovered commit vote is kept even when an object failed to load: there is nothing to lock on it
+    for (req <- requirements if isLoaded(req, objects)) {
       try {
         req match {
           case r: LocalTimeRequirement =>
@@ -96,6 +97,10 @@ object RequirementsLocker {
     }
   }
 
+  private def isLoaded(req: TransactionRequirement, objects: Map[ObjectId, ObjectState]): Boolean = req match
+    case r: TransactionObjectRequirement => objects.contains(r.objectPointer.id)
+    case _ => true
+
   private def release(os: ObjectState, transactionId: TransactionId): Unit =
     if os.lockedToTransaction.contains(transactionId) then
       os.lockedToTransaction = None
@@ -119,7 +124,7 @@ object RequirementsLocker {
       }
     }
 
-    for (req <- requirements) {
+    for (req <- requirements if isLoaded(req, objects)) {
       try {
         req match {
           case r: LocalTimeRequirement =>

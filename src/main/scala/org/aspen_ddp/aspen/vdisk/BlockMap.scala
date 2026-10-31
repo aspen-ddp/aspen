@@ -6,6 +6,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, Value}
 
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.util.control.NonFatal
 
 /** The disk's block index -> block object map. The owner is the map's only writer, so every entry it has looked up
   * or committed, absence included, stays valid in memory and no index is looked up over the network twice.
@@ -52,7 +53,10 @@ final class BlockMap(tree: DataObjectTKVL):
     deletes.foreach(index => known(index) = None)
 
   private def fetch(index: Long): Future[Option[DataObjectPointer]] =
-    val f = tree.get(Key(index)).map(_.map(v => DataObjectPointer(v.bytes)))
+    // A synchronous throw becomes a failed lookup, so the onComplete below still clears the placeholder
+    val f =
+      try tree.get(Key(index)).map(_.map(v => DataObjectPointer(v.bytes)))
+      catch case NonFatal(e) => Future.failed(e)
     f.onComplete: r =>
       synchronized:
         pending.remove(index)

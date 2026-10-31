@@ -2,7 +2,8 @@ package org.aspen_ddp.aspen.vdisk
 
 import java.util.{Arrays, UUID}
 
-import org.aspen_ddp.aspen.client.{AspenClient, DataObjectRangeState, ObjectAllocator, RangedWriteState, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, DataObjectRangeState, ObjectAllocator, RangedWriteState, StopRetrying,
+  Transaction}
 import org.aspen_ddp.aspen.client.tkvl.KVObjectRootManager
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
@@ -293,10 +294,14 @@ final class VirtualDisk private (val client: AspenClient,
           dataTxRunning -= 1
           if stopped.isEmpty then
             r match
-              case Success(DataCommit(newRevision, newLength, overwrote)) =>
+              case Success(DataCommit(newRevision, newLength, overwrote, base)) =>
                 counters =
                   if overwrote then counters.copy(overwriteTxCount = counters.overwriteTxCount + 1)
                   else counters.copy(rangedTxCount = counters.rangedTxCount + 1)
+                // Clean bytes are only known to be at the revision the commit replaced when that is the revision
+                // they were held at
+                if !st.revision.contains(base) then
+                  cleanCache.invalidate(b)
                 st.revision = Some(newRevision)
                 st.length = Some(newLength)
                 snap.pieces.foreach((o, bytes) => cleanCache.merge(b, o, bytes))
@@ -330,7 +335,7 @@ final class VirtualDisk private (val client: AspenClient,
         client.transact: tx =>
           tx.sharedLockRevision(info.fencePointer, fenceRevision)
           tx.overwrite(ptr, r, DataBuffer(content))
-          Future.successful(DataCommit(tx.revision, blockSize, overwrote = true))
+          Future.successful(DataCommit(tx.revision, blockSize, overwrote = true, base = r))
     else
       val writes = snap.writes
       val fstate = (revision, length) match
@@ -346,7 +351,8 @@ final class VirtualDisk private (val client: AspenClient,
         client.transact: tx =>
           tx.sharedLockRevision(info.fencePointer, fenceRevision)
           tx.rangedWrites(state, writes, zeroFill = true)
-          Future.successful(DataCommit(tx.revision, math.max(state.length, snap.end), overwrote = false))
+          Future.successful(DataCommit(tx.revision, math.max(state.length, snap.end), overwrote = false,
+            base = state.revision))
 
   // ---- Map transactions ----
 
@@ -443,10 +449,33 @@ final class VirtualDisk private (val client: AspenClient,
       case Right((st, overlay)) =>
         ensureLookedUp(seg.blockIndex, st).flatMap(_ => fetchSegment(seg, st, overlay, fetchEnd))
 
+  /** Fetches what the segment needs. A fetch at another revision than the known one is retried with the client's
+    * backoff, unless the fence shows that another owner has taken the disk: the read then fails with `Fenced` and
+    * the disk stops
+    */
   private def fetchSegment(seg: BlockSegment,
                            st: BlockState,
                            overlay: SegmentSnapshot,
                            fetchEnd: Int): Future[Array[Byte]] =
+    client.retryStrategy.retryUntilSuccessful:
+      fetchOnce(seg, st, overlay, fetchEnd).recoverWith:
+        case StaleFetch => checkFence()
+        case e: StopRetrying => Future.failed(e)
+        case e => Future.failed(StopRetrying(e))
+
+  /** Fails with StaleFetch to retry, or with StopRetrying(Fenced) once another owner holds the fence */
+  private def checkFence(): Future[Nothing] =
+    client.read(info.fencePointer).transform:
+      case Success(fence) if fence.revision != fenceRevision =>
+        locked(stop(Fenced))
+        Failure(StopRetrying(Fenced))
+      case Success(_) => Failure(StaleFetch)
+      case Failure(e) => Failure(StopRetrying(e))
+
+  private def fetchOnce(seg: BlockSegment,
+                        st: BlockState,
+                        overlay: SegmentSnapshot,
+                        fetchEnd: Int): Future[Array[Byte]] =
     val b = seg.blockIndex
     val from = seg.offsetInBlock
     val to = from + seg.length
@@ -477,8 +506,13 @@ final class VirtualDisk private (val client: AspenClient,
                 case None =>
                   val current = st.revision
                   // The owner is the only writer, so a known revision is authoritative. Bytes from any other
-                  // revision (a store still serving an older state) are neither cached nor returned
-                  if st.generation == generation && current.forall(_ == fetchRevision) then
+                  // revision (a store still serving an older state) are neither cached nor returned. An unknown
+                  // revision is learned only while no commit is in flight, since that commit's pre-image may be at
+                  // another revision
+                  val cacheable = current match
+                    case Some(r) => r == fetchRevision
+                    case None => st.inFlight.isEmpty
+                  if st.generation == generation && cacheable then
                     if current.isEmpty then
                       st.revision = Some(fetchRevision)
                     if st.length.isEmpty then
@@ -487,8 +521,8 @@ final class VirtualDisk private (val client: AspenClient,
                   // A commit completed during the fetch is covered by the overlay or newer than the read
                   Right(revision.exists(_ != fetchRevision) && !current.contains(fetchRevision))
             outcome match
-              case Left(err) => Future.failed(err)
-              case Right(true) => fetchSegment(seg, st, overlay, fetchEnd)
+              case Left(err) => Future.failed(StopRetrying(err))
+              case Right(true) => Future.failed(StaleFetch)
               case Right(false) => Future.successful(assemble(seg, clean ++ fetched, overlay))
 
 object VirtualDisk:
@@ -503,7 +537,12 @@ object VirtualDisk:
 
   private[vdisk] type RangeReader = (DataObjectPointer, List[(Int, Int)]) => Future[List[DataObjectRangeState]]
 
-  private final case class DataCommit(revision: ObjectRevision, length: Int, overwrote: Boolean)
+  /** A committed data transaction: the revision it created and the one it replaced */
+  private final case class DataCommit(revision: ObjectRevision, length: Int, overwrote: Boolean, base: ObjectRevision)
+
+  /** A fetch returned another revision than the block's known one */
+  private object StaleFetch extends Exception("fetch returned a revision other than the known one"):
+    override def fillInStackTrace(): Throwable = this
 
   /** Loads the disk and takes ownership of it, fencing any previous owner */
   def acquire(client: AspenClient, name: String, config: VDiskConfig = VDiskConfig()): Future[VirtualDisk] =

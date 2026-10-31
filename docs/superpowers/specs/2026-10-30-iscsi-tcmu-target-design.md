@@ -1,7 +1,7 @@
 # Design: iSCSI target via TCMU (Aspen virtual disks)
 
 **Date:** 2026-10-30
-**Status:** Draft
+**Status:** Approved
 
 ## Intent
 
@@ -228,8 +228,9 @@ test is structural: the design must not add delay.
   against tcmu-runner's headers, outside sbt).
 - The exact frame format, cache sizes and defaults, the coalescing window, the readahead heuristic, and the
   ranged-vs-whole-object threshold.
-- The RandomAccessReedSolomon `cellSize` for the pool. Measure, and lean toward a value that keeps an aligned
-  4 KiB access on few stores, such as 4096.
+- The implementation must work with any RandomAccessReedSolomon `cellSize`. As part of the project, measure
+  representative workloads (small random reads and writes, sequential I/O) across several cell sizes, and record
+  a data-backed recommendation for the pool's `cellSize` in the docs.
 - Any small client API additions needed, for example building the next `RangedWriteState` from known bytes after
   a commit without re-reading.
 - Phasing. A sensible order is: Aspen-side block device and tests, then the socket bridge and C plugin, then CLI,

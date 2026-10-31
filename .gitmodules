@@ -1,3 +1,6 @@
 [submodule "submodules/JavaReedSolomon"]
 	path = submodules/JavaReedSolomon
 	url = https://github.com/Backblaze/JavaReedSolomon.git
+[submodule "submodules/tcmu-runner"]
+	path = submodules/tcmu-runner
+	url = https://github.com/open-iscsi/tcmu-runner.git

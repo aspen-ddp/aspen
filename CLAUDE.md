@@ -38,6 +38,14 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     `create-pool --metadata-group`, `create-allocation-group --metadata` build on it
   - `MissedUpdateFinalizationAction` disables missed-update tracking on an ErrorTree write only when the transaction
     references the pool the entry is about (in practice the bootstrap pool)
+- **VDisks** (`vdisk` package):
+  - A virtual block device on Aspen. `DiskCatalog` names disks in registry namespace `vdisk`; CLI `create-disk`,
+    `list-disks`, `grow-disk`, `delete-disk`
+  - Per disk: a KV config object (geometry plus a `DataObjectTKVL` block map) and a DataObject fence. The owner takes
+    ownership by overwriting the fence and every commit carries a `SharedRevisionLock` on it, so a newer owner fences
+    out older ones
+  - Write-back: WRITE completes from memory; durable at FLUSH/FUA. Block objects are the largest multiple of the
+    logical block size <= the allocator's `maxObjectSize`
 - **Information Dispersal Algorithm (IDA)**:
   - Defines the replication/erasure-coding strategy used to provide robustness against data loss
   - Currently Replication, ReedSolomon and RandomAccessReedSolomon are supported
@@ -162,6 +170,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     round-trips and optimize data flow. The details are only important when working on transaction message
     handling.
   - The CRL is used to store the persistent state required by the Paxos protocol
+  - Stores hold requirement locks from a commit vote until the transaction resolves. `SharedRevisionLock` is a
+    non-exclusive requirement on an object's revision: many transactions may hold it, but it collides with any write
+    to that object
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:

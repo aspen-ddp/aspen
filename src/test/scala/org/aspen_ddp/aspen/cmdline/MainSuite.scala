@@ -20,6 +20,10 @@ import org.aspen_ddp.aspen.server.{BootstrapHttpServer, HostConfig, StorageDevic
 import org.aspen_ddp.aspen.server.store.backend.{FsifConfig, RocksDBConfig}
 import org.yaml.snakeyaml.parser.ParserException
 
+import org.aspen_ddp.aspen.client.PoolObjectAllocatorId
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId}
+import org.aspen_ddp.aspen.vdisk.{DiskGeometry, DiskInfo}
+
 import java.util.UUID
 import java.util.concurrent.TimeoutException
 import scala.collection.mutable
@@ -66,6 +70,29 @@ class MainSuite extends AnyFunSuite with Matchers:
     Main.formatBytes(1649267441664L) shouldBe "1.5 TiB"
     // 10 * 1024^4
     Main.formatBytes(10995116277760L) shouldBe "10.0 TiB"
+
+  test("parseByteSize accepts plain counts and binary suffixes"):
+    Main.parseByteSize("100G") shouldBe Right(107374182400L)
+    Main.parseByteSize("4096") shouldBe Right(4096L)
+    Main.parseByteSize("2k") shouldBe Right(2048L)
+    Main.parseByteSize("1T") shouldBe Right(1099511627776L)
+
+  test("parseByteSize rejects fractions, negatives, junk and overflow"):
+    Main.parseByteSize("1.5G").isLeft shouldBe true
+    Main.parseByteSize("-1").isLeft shouldBe true
+    Main.parseByteSize("").isLeft shouldBe true
+    Main.parseByteSize("G").isLeft shouldBe true
+    Main.parseByteSize("9999999999T").isLeft shouldBe true
+
+  test("formatDiskInfo renders one line for a disk"):
+    val id = UUID.fromString("3f1ca5f7-74be-405d-aa48-739fc23651a4")
+    val pool = PoolId(new UUID(2, 0))
+    val info = DiskInfo("disk1", id,
+      new KeyValueObjectPointer(ObjectId(new UUID(1, 1)), pool, new Array[Byte](40)),
+      new DataObjectPointer(ObjectId(new UUID(1, 2)), pool, new Array[Byte](40)),
+      DiskGeometry(107374182400L, 4096, 65536),
+      PoolObjectAllocatorId(pool))
+    Main.formatDiskInfo(info) shouldBe s"disk1  100.0 GiB  block 4096  object 65536  $id"
 
   test("resolveRef parses a UUID string and dispatches to byUuid"):
     val u = UUID.fromString("3f1ca5f7-74be-405d-aa48-739fc23651a4")

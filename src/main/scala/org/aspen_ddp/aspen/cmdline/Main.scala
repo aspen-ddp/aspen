@@ -29,6 +29,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
+import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskInfo, VDiskError}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, FsifConfig, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
@@ -129,6 +130,9 @@ object Main {
                   newGroupLevel:Int=0,
                   entityRef:String="",
                   fsName:String="",
+                  diskName:String="",
+                  diskSize:Long=0L,
+                  diskBlockSize:Int=4096,
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
                   networkCacheDir:Option[os.Path]=None,
@@ -575,6 +579,49 @@ object Main {
         action((x, c) => c.copy(poolName = x)),
     )
 
+  private def sizeArg(p: ArgParser, name: String, text: String): OptionDef[?, Args] =
+    import p.*
+    arg[String](name).text(text).
+      validate(x => parseByteSize(x).fold(failure, _ => success)).
+      action((x, c) => c.copy(diskSize = parseByteSize(x).getOrElse(0L)))
+
+  private def diskNameArg(p: ArgParser, text: String): OptionDef[?, Args] =
+    import p.*
+    arg[String]("<disk-name>").text(text).
+      action((x, c) => c.copy(diskName = x)).
+      validate(x => if x.nonEmpty then success else failure("Disk name must not be empty"))
+
+  private def createDiskArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      clientConfigArg(p),
+      bootstrapHostOption(p),
+      diskNameArg(p, "Name of the new virtual disk"),
+      arg[String]("<pool-name>").text("Name of the storage pool to allocate the disk's objects in").
+        action((x, c) => c.copy(poolName = x)),
+      sizeArg(p, "<size>", "Disk size in bytes, with an optional K, M, G or T binary suffix"),
+      opt[Int]("block-size").text("Logical block size, 512 or 4096 (default 4096)").
+        validate(x => if x == 512 || x == 4096 then success else failure("Block size must be 512 or 4096")).
+        action((x, c) => c.copy(diskBlockSize = x)),
+    )
+
+  private def growDiskArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      clientConfigArg(p),
+      bootstrapHostOption(p),
+      diskNameArg(p, "Name of the virtual disk to grow"),
+      sizeArg(p, "<new-size>", "New disk size in bytes, with an optional K, M, G or T binary suffix"),
+    )
+
+  private def deleteDiskArgs(p: ArgParser): List[OptionDef[?, Args]] =
+    import p.*
+    List(
+      clientConfigArg(p),
+      bootstrapHostOption(p),
+      diskNameArg(p, "Name of the virtual disk to delete"),
+    )
+
   private def addPoolToGroupArgs(p: ArgParser): List[OptionDef[?, Args]] =
     import p.*
     List(
@@ -796,6 +843,10 @@ object Main {
     Command("create-device-set", "Creates a new storage device set", createDeviceSetArgs),
     Command("create-allocation-group", "Creates a new allocation group", createAllocationGroupArgs),
     Command("create-filesystem", "Creates a new AmoebaFS filesystem", createFilesystemArgs),
+    Command("create-disk", "Creates a new virtual disk", createDiskArgs),
+    Command("list-disks", "Lists all virtual disks", configOnlyArgs),
+    Command("grow-disk", "Grows a virtual disk", growDiskArgs),
+    Command("delete-disk", "Deletes a virtual disk and all of its data", deleteDiskArgs),
     Command("add-pool-to-group", "Adds a storage pool to an allocation group", addPoolToGroupArgs),
     Command("add-group-to-group", "Nests one allocation group inside another", addGroupToGroupArgs),
     Command("move-device-to-set", "Moves a storage device into a different level-0 device set", moveDeviceToSetArgs),
@@ -951,6 +1002,10 @@ object Main {
               create_allocation_group(session, cfg.newGroupName, cfg.newGroupLevel, cfg.maxSliceSize, policy, ida,
                                       cfg.newGroupMetadata)
             case "create-filesystem" => create_filesystem(session, cfg.fsName, cfg.poolName)
+            case "create-disk" => create_disk(session, cfg.diskName, cfg.poolName, cfg.diskSize, cfg.diskBlockSize)
+            case "list-disks" => list_disks(session)
+            case "grow-disk" => grow_disk(session, cfg.diskName, cfg.diskSize)
+            case "delete-disk" => delete_disk(session, cfg.diskName)
             case "add-pool-to-group" => add_pool_to_group(session, cfg.poolName, cfg.newGroupName)
             case "add-group-to-group" => add_group_to_group(session, cfg.srcGroupName, cfg.newGroupName)
             case "move-device-to-set" => move_device_to_set(session, cfg.deviceId, cfg.deviceSetName)
@@ -1217,6 +1272,67 @@ object Main {
         println("******************************************")
       case Failure(err) => reportError(err)
   }
+
+  /** Translates the known disk failures into messages; None for anything else */
+  private def diskErrorMessage(cause: Throwable): Option[String] = cause match
+    case VDiskError.DiskAlreadyExists(n) => Some(s"a disk named '$n' already exists")
+    case VDiskError.DiskNotFound(n) => Some(s"disk '$n' not found")
+    case VDiskError.InvalidGeometry(reason) => Some(reason)
+    case _ => None
+
+  def create_disk(session: ClientSession, diskName: String, poolName: String, size: Long, blockSize: Int): Int =
+    configureLogging()
+    val (client, network, _) = createAspenClient(session)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    val f = for
+      poolId <- client.getStoragePoolId(poolName)
+      pool <- client.getStoragePool(poolId)
+      info <- DiskCatalog.create(client, diskName, new PoolObjectAllocator(client, pool), size, blockSize)
+    yield info
+
+    awaitAndReport(f):
+      case Success(info) => println(s"Created disk ${formatDiskInfo(info)}")
+      // getStoragePoolId throws this when the name is not registered.
+      case Failure(_: NoSuchElementException) => println(s"Error: storage pool '$poolName' not found")
+      case Failure(err) =>
+        println(s"Error: ${diskErrorMessage(err).getOrElse(s"creating disk failed: ${err.getMessage}")}")
+
+  def list_disks(session: ClientSession): Int =
+    configureLogging()
+    val (client, network, _) = createAspenClient(session)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    awaitAndReport(DiskCatalog.list(client)):
+      case Success(disks) =>
+        if disks.isEmpty then println("No Disks found")
+        else disks.foreach(d => println(formatDiskInfo(d)))
+      case Failure(err) => println(s"Error listing disks: ${err.getMessage}")
+
+  def grow_disk(session: ClientSession, diskName: String, newSize: Long): Int =
+    configureLogging()
+    val (client, network, _) = createAspenClient(session)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    awaitAndReport(DiskCatalog.grow(client, diskName, newSize)):
+      case Success(info) => println(s"Grew disk ${formatDiskInfo(info)}")
+      case Failure(err) =>
+        println(s"Error: ${diskErrorMessage(err).getOrElse(s"growing disk failed: ${err.getMessage}")}")
+
+  def delete_disk(session: ClientSession, diskName: String): Int =
+    configureLogging()
+    val (client, network, _) = createAspenClient(session)
+    network.startIoThread(client)
+    given ExecutionContext = client.clientContext
+
+    // Deleting walks every block of the disk, which can take far longer than the other commands
+    awaitAndReport(DiskCatalog.delete(client, diskName), Duration(1, HOURS)):
+      case Success(_) => println(s"Deleted disk '$diskName'")
+      case Failure(err) =>
+        println(s"Error: ${diskErrorMessage(err).getOrElse(s"deleting disk failed: ${err.getMessage}")}")
 
   /** OBSOLETE: not reachable from the CLI. Retained for reference; needs rework. */
   def run_debug_code(session: ClientSession): Unit = {
@@ -2398,6 +2514,27 @@ object Main {
     val a = address.toLowerCase
     a == "localhost" || a.startsWith("127.") || a == "::1" || a == "[::1]" ||
       a == "0.0.0.0" || a == "[::]"
+
+  /** Parse a byte count with an optional K, M, G or T binary suffix */
+  private[cmdline] def parseByteSize(s: String): Either[String, Long] =
+    val t = s.trim
+    val (digits, shift) = t.lastOption.map(_.toUpper) match
+      case Some('K') => (t.init, 10)
+      case Some('M') => (t.init, 20)
+      case Some('G') => (t.init, 30)
+      case Some('T') => (t.init, 40)
+      case _ => (t, 0)
+    if digits.isEmpty || !digits.forall(_.isDigit) then
+      Left(s"Invalid size '$s': expected a byte count with an optional K, M, G or T suffix")
+    else
+      Try(digits.toLong).toOption.filter(n => n <= (Long.MaxValue >> shift)).map(_ << shift) match
+        case Some(v) => Right(v)
+        case None => Left(s"Size '$s' is too large")
+
+  /** One line describing a disk */
+  private[cmdline] def formatDiskInfo(d: DiskInfo): String =
+    val g = d.geometry
+    s"${d.name}  ${formatBytes(g.size)}  block ${g.logicalBlockSize}  object ${g.blockObjectSize}  ${d.diskId}"
 
   /** Format a byte count using binary units (powers of 1024). Sub-KiB values are
    *  rendered as whole bytes; larger values use one decimal place and the largest

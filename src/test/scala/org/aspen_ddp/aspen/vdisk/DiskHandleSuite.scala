@@ -206,6 +206,23 @@ class DiskHandleSuite extends IntegrationTestSuite:
       h.geometry.size should be (131072L)
       bad shouldBe a [VDiskError.InvalidGeometry]
 
+  atest("grow to a size already committed through DiskCatalog adopts it"):
+    for
+      _ <- createDisk()
+      h <- open()
+      _ <- h.acquire()
+      _ <- DiskCatalog.grow(client, "d", 131072)
+      before = h.geometry.size
+      _ <- h.grow(131072)
+      _ <- h.write(131072 - 4096, pattern(4096, 9), fua = true)
+      shrink <- h.grow(98304).failed
+      info <- DiskCatalog.load(client, "d")
+    yield
+      before should be (DiskSize.toLong)
+      h.geometry.size should be (131072L)
+      shrink shouldBe a [VDiskError.InvalidGeometry]
+      info.geometry.size should be (131072L)
+
   atest("open of a missing disk fails DiskNotFound"):
     for
       r <- DiskHandle.open(client, "nope").failed

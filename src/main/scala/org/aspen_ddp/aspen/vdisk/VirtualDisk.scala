@@ -194,7 +194,8 @@ final class VirtualDisk private (val client: AspenClient,
     * object is deleted by a later map transaction, which FLUSH waits for. Each other covered piece is zeroed by a
     * write, as a non-FUA `write` would, unless its block holds nothing that could read as non-zero. Blocks with such
     * a piece whose map entry is not yet known are looked up first, and everything is then applied in one monitor
-    * section
+    * section. Such an unmap therefore takes effect only after that lookup, so a write that overlaps it in time may be
+    * applied before it; SCSI does not order overlapping commands, so either outcome is allowed.
     */
   def unmap(ranges: List[(Long, Long)]): Future[Unit] =
     val geom = currentGeometry
@@ -217,7 +218,11 @@ final class VirtualDisk private (val client: AspenClient,
               fail(s"map lookup for unmap failed: $e")
               Future.failed(stopped.get)
 
-  /** Commits the new size to the disk's config, then serves it. Requests in progress are unaffected */
+  /** Commits the new size to the disk's config, then serves it. The config is re-read first: when its size already
+    * equals `newSize` (a grow committed earlier whose reply was lost, or one done through `DiskCatalog.grow`), that
+    * size is adopted without a commit. A stored size larger than `newSize` fails with `InvalidGeometry`. Requests in
+    * progress are unaffected
+    */
   def grow(newSize: Long): Future[Unit] =
     synchronized(stopped) match
       case Some(err) => Future.failed(err)

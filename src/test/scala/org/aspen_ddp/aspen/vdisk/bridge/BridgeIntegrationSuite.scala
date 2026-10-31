@@ -130,3 +130,23 @@ class BridgeIntegrationSuite extends IntegrationTestSuite:
     yield
       r.status should be (Statuses.Ok)
       info.geometry.size should be (DiskSize * 2)
+
+  atest("RESIZE to a size already committed in Aspen succeeds and serves it"):
+    val data = pattern(4096, 5)
+    for
+      _ <- createDisk()
+      path = startServer()
+      c <- session(path)
+      // A grow that committed without the session seeing a reply (or one done with the grow-disk CLI)
+      _ <- DiskCatalog.grow(client, "d", DiskSize * 2)
+      r <- c.request(Ops.Resize, c.nextId(), offset = DiskSize * 2)
+      w <- c.write(DiskSize * 2 - 4096, data)
+      rd <- c.read(DiskSize * 2 - 4096, data.length)
+      again <- c.request(Ops.Resize, c.nextId(), offset = DiskSize * 2)
+      shrink <- c.request(Ops.Resize, c.nextId(), offset = DiskSize)
+      info <- DiskCatalog.load(client, "d")
+    yield
+      List(r, w, rd, again).map(_.status) should be (List.fill(4)(Statuses.Ok))
+      rd.payload.toList should be (data.toList)
+      shrink.status should be (Statuses.InvalidRequest)
+      info.geometry.size should be (DiskSize * 2)

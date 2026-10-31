@@ -77,20 +77,20 @@ class DiskCatalogSuite extends IntegrationTestSuite:
       disks.map(_.name) should be (List("a", "b", "c"))
       disks.map(_.geometry.size) should be (List(8192L, 65536L, 16384L))
 
-  atest("grow raises size and refuses shrink"):
+  atest("grow raises size, is idempotent and refuses shrink"):
     for
       alloc <- allocator()
       _ <- DiskCatalog.create(client, "d1", alloc, 65536)
       grown <- DiskCatalog.grow(client, "d1", 131072)
       loaded <- DiskCatalog.load(client, "d1")
-      same <- DiskCatalog.grow(client, "d1", 131072).failed
+      same <- DiskCatalog.grow(client, "d1", 131072)
       shrink <- DiskCatalog.grow(client, "d1", 65536).failed
       unaligned <- DiskCatalog.grow(client, "d1", 131072 + 1).failed
       after <- DiskCatalog.load(client, "d1")
     yield
       grown.geometry.size should be (131072L)
       loaded.geometry should be (DiskGeometry(131072, 4096, 16384))
-      same shouldBe a [VDiskError.InvalidGeometry]
+      same.geometry should be (DiskGeometry(131072, 4096, 16384))
       shrink shouldBe a [VDiskError.InvalidGeometry]
       unaligned shouldBe a [VDiskError.InvalidGeometry]
       after.geometry.size should be (131072L)

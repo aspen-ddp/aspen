@@ -112,28 +112,39 @@ object DiskCatalog:
         load(client, name).map(Some(_)).recover { case _: DiskNotFound => None }
       ).map(_.flatten.sortBy(_.name))
 
-  /** Raises the disk size. Fails with `InvalidGeometry` unless `newSize` is larger than the current size and
-    * aligned to the logical block size.
+  /** Raises the disk size to `newSize`, which must be aligned to the logical block size. Idempotent: a disk whose
+    * stored size already equals `newSize` is returned as it is, so a grow whose reply was lost (or one already done
+    * through another path) can be repeated. A stored size larger than `newSize` fails with `InvalidGeometry`, since
+    * disks never shrink. The stored size is re-read on every attempt, so an attempt that committed despite reporting
+    * a failure is recognized by the retry.
     */
   def grow(client: AspenClient, name: String, newSize: Long): Future[DiskInfo] =
     given ExecutionContext = client.clientContext
 
     load(client, name).flatMap: info =>
+      val grown = info.copy(geometry = info.geometry.copy(size = newSize))
       client.transactUntilSuccessful { tx =>
         stopOnMissing(name, client.read(info.configPointer, s"Growing virtual disk $name")).map: state =>
           val sizeState = state.contents.getOrElse(DiskConfig.SizeKey,
             throw StopRetrying(DiskFailed(s"config of $name has no size")))
           val current = DiskConfig.decodeLong(sizeState.value.bytes)
-          if newSize <= current then
-            throw StopRetrying(InvalidGeometry(s"new size $newSize does not exceed current size $current"))
+          if newSize == current then
+            throw StopRetrying(AlreadyAtSize)
+          if newSize < current then
+            throw StopRetrying(InvalidGeometry(s"new size $newSize is smaller than the current size $current"))
           if !isAligned(newSize, info.geometry.logicalBlockSize) then
             throw StopRetrying(InvalidGeometry(
               s"new size $newSize is not a multiple of ${info.geometry.logicalBlockSize}"))
           tx.update(info.configPointer, None, None,
             KeyValueUpdate.KeyRevision(DiskConfig.SizeKey, sizeState.revision) :: Nil,
             Insert(DiskConfig.SizeKey, DiskConfig.encodeLong(newSize)) :: Nil)
-          info.copy(geometry = info.geometry.copy(size = newSize))
-      }
+          grown
+      }.recover:
+        case AlreadyAtSize => grown
+
+  /** Ends a grow attempt that finds the size already committed; never escapes `grow` */
+  private object AlreadyAtSize extends Exception("disk already has the requested size"):
+    override def fillInStackTrace(): Throwable = this
 
   /** Makes `owner` the disk's owner, fencing the previous one. Returns the new state and the revision at which it
     * committed.

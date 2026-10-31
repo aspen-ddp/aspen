@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.vdisk.VDiskError.*
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success}
+import scala.util.control.NonFatal
 
 /** A [[LockableBlockDevice]] over a named disk. Opening loads the disk without owning it; `acquire` takes
   * ownership through [[VirtualDisk.acquire]]. A disk that has been fenced or has failed stays in place, reporting
@@ -52,7 +53,8 @@ final class DiskHandle private (client: AspenClient,
   def unmap(ranges: List[(Long, Long)]): Future[Unit] = owned(_.unmap(ranges))
 
   def grow(newSize: Long): Future[Unit] = owned: d =>
-    // A repeated RESIZE to the current size is not an error
+    // A repeated RESIZE to the size this owner serves is not an error. Any other size goes through VirtualDisk.grow,
+    // which re-reads the config and adopts a size that was committed without this owner seeing the reply
     if newSize == d.geometry.size && d.state == DiskState.Serving then
       Future.unit
     else
@@ -78,8 +80,14 @@ final class DiskHandle private (client: AspenClient,
       case Left(r) => r.recover { case _ => () }.flatMap(_ => acquire())
       case Right((result, start)) =>
         start.foreach: (p, old, gen) =>
-          old.foreach(_.close())
-          VirtualDisk.acquire(client, name, config).onComplete: r =>
+          // A synchronous throw must still complete p and clear takeover, or every later acquire and release hangs
+          val acquired =
+            try
+              old.foreach(_.close())
+              VirtualDisk.acquire(client, name, config)
+            catch
+              case NonFatal(e) => Future.failed(e)
+          acquired.onComplete: r =>
             val discarded = synchronized:
               takeover = None
               r match

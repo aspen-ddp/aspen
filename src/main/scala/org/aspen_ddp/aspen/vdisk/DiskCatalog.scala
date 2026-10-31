@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.vdisk
 
 import java.util.UUID
 
-import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, ObjectAllocator, ObjectAllocatorId, StopRetrying, Transaction}
+import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, TransactionAborted, ObjectAllocator, ObjectAllocatorId, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList, TreeKind}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
@@ -195,6 +195,12 @@ object DiskCatalog:
         // Block deletions carry delete's own fence revision, so a newer owner cannot add blocks that then leak
         _ <- tree.deleteTree(Some((_, v) =>
           deleteBlock(client, info, ObjectPointer(v.bytes).asInstanceOf[DataObjectPointer], fenceRevision)))
+          .recoverWith:
+            // The tree walk's own transactions are not retried. If they lost to a concurrent delete the fence has
+            // moved on, which is reported as Fenced so that delete starts over. Anything else is a real failure.
+            case e: TransactionAborted =>
+              client.read(info.fencePointer).flatMap: fence =>
+                if fence.revision != fenceRevision then Future.failed(Fenced) else Future.failed(e)
         _ <- deleteConfigAndFence(info)
       yield
         ()
@@ -225,22 +231,36 @@ object DiskCatalog:
               given Transaction = tx
               tree.prepareUpdates(Nil, List(key))
 
-    for
-      diskId <- client.getRegisteredId(DiskConfig.RegistryNamespace, name).recoverWith:
-        case _: NoSuchElementException => Future.failed(DiskNotFound(name))
-      oconfig <- client.getRegisteredKeyValueObject(diskId).map(Some(_)).recover:
-        case _: NoSuchElementException => None
-      oinfo <- oconfig match
-        case None => Future.successful(None)
-        case Some(config) => loadConfig(client, name, diskId, config).map(Some(_)).recover:
-          case _: DiskNotFound => None  // config already deleted
-      _ <- oinfo match
-        case Some(info) => deleteContents(info).recover:
-          // Config, fence or a map node vanished under us: another delete finished the job
-          case _: DiskNotFound | _: InvalidObject => ()
-        case None => Future.unit
-      // Object registration first: until the name is removed, a re-run still finds the disk to finish
-      _ <- removeKey(Radicle.ObjectRegistryKey, Key(diskId))
-      _ <- removeKey(Radicle.NamespacedRegistryKey, NamespacedUUIDRegistry.makeKey(DiskConfig.RegistryNamespace, name))
-    yield
-      ()
+    // Only a vanished config proves another delete finished the job. Any other failure (a missing map node,
+    // a missing fence under a live config) must leave the registrations so that delete can be re-run.
+    def configGone(info: DiskInfo): Future[Boolean] =
+      client.read(info.configPointer).map(_ => false).recover { case _: InvalidObject => true }
+
+    def attempt(restarted: Boolean): Future[Unit] =
+      val run = for
+        diskId <- client.getRegisteredId(DiskConfig.RegistryNamespace, name).recoverWith:
+          case _: NoSuchElementException => Future.failed(DiskNotFound(name))
+        oconfig <- client.getRegisteredKeyValueObject(diskId).map(Some(_)).recover:
+          case _: NoSuchElementException => None
+        oinfo <- oconfig match
+          case None => Future.successful(None)
+          case Some(config) => loadConfig(client, name, diskId, config).map(Some(_)).recover:
+            case _: DiskNotFound => None  // config already deleted
+        _ <- oinfo match
+          case Some(info) => deleteContents(info).recoverWith:
+            case e @ (_: DiskNotFound | _: InvalidObject) =>
+              configGone(info).flatMap: gone =>
+                if gone then Future.unit else Future.failed(e)
+          case None => Future.unit
+        // Object registration first: until the name is removed, a re-run still finds the disk to finish
+        _ <- removeKey(Radicle.ObjectRegistryKey, Key(diskId))
+        _ <- removeKey(Radicle.NamespacedRegistryKey,
+          NamespacedUUIDRegistry.makeKey(DiskConfig.RegistryNamespace, name))
+      yield
+        ()
+      run.recoverWith:
+        // A concurrent delete took ownership after ours. Start over: it ends once the disk is gone.
+        case Fenced => attempt(restarted = true)
+        case _: DiskNotFound if restarted => Future.unit
+
+    attempt(restarted = false)

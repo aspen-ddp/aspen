@@ -231,3 +231,44 @@ class DiskCatalogSuite extends IntegrationTestSuite:
     yield
       r should be (VDiskError.Fenced)
       still.pointer should be (ptr)
+
+  atest("delete fails and keeps the registrations when the config still exists but the fence is gone"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      fence <- client.read(info.fencePointer)
+      _ <- client.transactUntilSuccessful: tx =>
+        tx.setRefcount(fence.pointer, fence.refcount, fence.refcount.update(0))
+        Future.unit
+      r <- DiskCatalog.delete(client, "d1").failed
+      ids <- client.listRegisteredIds("vdisk")
+      obj <- client.getRegisteredKeyValueObject(info.diskId)
+      config <- client.read(info.configPointer)
+    yield
+      r shouldBe a [VDiskError]
+      ids.map(_._1) should be (List("d1"))
+      config.pointer should be (obj)
+
+  atest("two concurrent deletes of a disk with blocks both finish"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      tree <- KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer).getDataObjectTree()
+      blocks <- Future.sequence((0 until 3).toList.map: i =>
+        client.transactUntilSuccessful: tx =>
+          given Transaction = tx
+          for
+            ptr <- alloc.allocateDataObject(DataBuffer(new Array[Byte](16)))
+            _ <- tree.set(Key(i.toLong), Value(ptr.toArray))
+          yield ptr)
+      rs <- Future.sequence(List(DiskCatalog.delete(client, "d1"), DiskCatalog.delete(client, "d1"))
+        .map(_.map(_ => None).recover { case e: VDiskError.DiskNotFound => Some(e) }))
+      r <- DiskCatalog.load(client, "d1").failed
+      ids <- client.listRegisteredIds("vdisk")
+      reads <- Future.sequence(blocks.map(b => client.read(b).failed))
+    yield
+      rs.count(_.isEmpty) should be >= 1
+      r should be (VDiskError.DiskNotFound("d1"))
+      ids should be (Nil)
+      reads.foreach(_ shouldBe a [org.aspen_ddp.aspen.client.InvalidObject])
+      succeed

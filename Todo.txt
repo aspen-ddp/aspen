@@ -22,3 +22,18 @@ this is purely a test issue that can be fixed or if there may be an underlying s
 
 Verify that RevisionLock transaction requirement is exclusive. If so, rename to ExclusiveRevisionLock to make this
 explicit.
+
+QuicConnectionSuite "a burst from many threads schedules few drains" is flaky under load (observed 1 failure in 14
+full test runs: 930 not < 800). The assertion depends on thread scheduling. Flaky tests are not permitted: make the
+test deterministic or change what it measures.
+
+"Hung Test" prints now also appear occasionally in TKVLBatchSuite and AppendIntegrationSuite since stores began
+holding requirement locks. They come from finalization actions waiting ~2.5-3.2 s on lock contention and retry
+backoff; the tests pass. Investigate together with the DataObject TKVL item above: determine whether the backoff is
+too conservative or whether finalization actions collide more than they should.
+
+vdisk: before the ALUA failover work, verify that readRanges always returns the newest committed revision of an
+object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
+
+MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
+both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one.

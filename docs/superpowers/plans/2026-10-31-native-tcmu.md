@@ -17,7 +17,7 @@ D-Bus service for targetcli.
 Kernel-facing pieces sit behind small traits, so nearly everything is tested without root against a fake kernel
 that plays the kernel's side of the ring on an `Arena`-allocated segment.
 
-**Tech Stack:** Scala 3.7.3, JDK 25 FFM (`java.lang.foreign`), dbus-java 5.x (core plus native Unix-socket
+**Tech Stack:** Scala 3.7.3 (all code, including the SCSI layer; Java only as the FFM API), JDK 25 FFM (`java.lang.foreign`), dbus-java 5.x (core plus native Unix-socket
 transport), scribe, os-lib, ScalaTest.
 
 **Spec:** `docs/superpowers/specs/2026-10-31-native-tcmu-design.md`. Read it first. For any kernel or SCSI detail
@@ -641,9 +641,11 @@ The fake reclaims data-area space only after completion, as the kernel does.
     2. `Cfgstring.parse`, else `-EINVAL`
     3. Read size, block size and max sectors from configfs
     4. `openDisk(name)`: `DiskNotFound` gives `-ENOENT`
-    5. Geometry: the block size must equal the disk's (`-EINVAL`), and the kernel size must be ≤ the Aspen size
-       (`-EINVAL`, message "targetcli size X exceeds Aspen disk size Y")
+    5. Geometry: the block size must equal the disk's (`-EINVAL`)
     6. `acquire()`
+    6a. If the kernel size is larger than the Aspen size: log at warn "growing Aspen disk <name> from Y to X to
+        match the targetcli size", then `device.grow(kernelSize)`. `InvalidGeometry`/`InvalidRequest` gives
+        `-EINVAL`, and any other failure `-EIO`. Serving starts only after the grow commits.
     7. If `reopen`, `control.resetRing()`
     8. `openRing`, `Ring.open` (`Left` → `-EINVAL`)
     9. Build `DeviceSettings` (`blockObjectSize` from the disk geometry, `wwn` from `unitSerial` or the disk name),
@@ -664,7 +666,9 @@ The fake reclaims data-area space only after completion, as the kernel does.
     device saw `acquire` before `read`
   - "added with reopen resets the ring before serving"
   - "unknown disk is -ENOENT and nothing is left open"
-  - "kernel size larger than the Aspen size is -EINVAL and the device is closed"
+  - "kernel size larger than the Aspen size grows the disk before serving": the fake device saw `acquire`, then
+    `grow(16 MiB)`, then the first `read`; a warn line names both sizes; READ CAPACITY reports 16 MiB
+  - "a failed grow on add is -EIO and the device is closed"
   - "kernel size smaller than the Aspen size serves the kernel size": READ CAPACITY reports the kernel size
   - "block size mismatch is -EINVAL"
   - "the old @socket cfgstring is -EINVAL"
@@ -747,6 +751,8 @@ The fake reclaims data-area space only after completion, as the kernel does.
   - "grow before targetcli resize still opens": `DiskCatalog.grow` to 16 MiB, with configfs reporting 8 MiB;
     `added` succeeds and READ CAPACITY reports 8 MiB. Then reconfig `Size(16 MiB)` gives a unit attention, then
     READ CAPACITY reports 16 MiB.
+  - "add with a larger targetcli size grows the Aspen disk": configfs reports 16 MiB for an 8 MiB disk. After
+    `added`, `DiskCatalog.load` reports 16 MiB, and a write at 12 MiB reads back.
   - "a fenced owner returns NOT READY 0x040B": a second handle acquires; a WRITE then FLUSH on the first returns
     the fenced sense
 - [ ] **Step 2: Run** `sbt 'testOnly *TcmuIntegrationSuite'`. Expected: all pass. A failure is a bug in Tasks 2–9:

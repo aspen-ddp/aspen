@@ -15,7 +15,7 @@ protocol kept in step on both sides, and connection-loss and reopen behavior spl
 
 This project removes all of that. `vdisk-server` drives the kernel's TCMU interface directly from the JVM, using
 Java's Foreign Function & Memory API (final in JDK 22; the project runs on JDK 25). The SCSI emulation that
-tcmu-runner did for us moves into Java. `LockableBlockDevice` was designed as the seam for exactly this frontend,
+tcmu-runner did for us moves into Scala. `LockableBlockDevice` was designed as the seam for exactly this frontend,
 so the engine (`VirtualDisk`, `DiskHandle`, `DiskCatalog`) should need few or no changes.
 
 Use the tcmu-runner source in `submodules/tcmu-runner` (v1.5.3-10, effectively 1.5.4) as the reference for correct
@@ -114,7 +114,12 @@ The builder takes exact layouts and sequences from tcmu-runner's `libtcmu.c`, `l
 - **Geometry (fixes the grow-then-reopen dead end in `Todo.txt`):** the kernel's logical block size must equal the
   disk's. The kernel's size may be **less than or equal to** the Aspen size: a disk grown with `aspen grow-disk`
   but not yet resized in targetcli still opens. The frontend serves the kernel's size (READ CAPACITY, range checks)
-  until a reconfig changes it. A kernel size larger than the Aspen size fails the add, with a logged reason.
+  until a reconfig changes it.
+- **Grow on add (decided):** a kernel size larger than the Aspen size is treated as a grow, the same as a targetcli
+  resize. After `acquire`, the add calls `DiskHandle.grow` to the kernel size, and reports success only once that
+  grow has committed. It logs at warn with both sizes, so an accidental grow (a targetcli size typo) is easy to
+  spot; grow cannot be undone. Only size gets this treatment: a block size mismatch or an unknown disk still fails
+  the add.
 - **Device removed** = `release` (flush, then close), then unmap and close the UIO device.
 - **Reconfig, size** = `DiskHandle.grow` to the new size, committed before replying. Then serve the new size and
   raise the CAPACITY DATA HAS CHANGED unit attention (as `TCMUR_UA_DEV_SIZE_CHANGED` does). Reconfig of the write
@@ -123,7 +128,7 @@ The builder takes exact layouts and sequences from tcmu-runner's `libtcmu.c`, `l
 
 ### SCSI emulation
 
-Implement in Java, matching tcmu-runner's `tcmur_cmd_handler.c` and `scsi.c` behavior for a handler like ours:
+Implement in Scala, matching tcmu-runner's `tcmur_cmd_handler.c` and `scsi.c` behavior for a handler like ours:
 
 - READ and WRITE (6/10/12/16), with FUA honored on writes (`cdb[1] & 0x08` on WRITE 10/12/16 → `fua = true`)
 - SYNCHRONIZE CACHE (10/16) → `flush`

@@ -91,8 +91,8 @@ class Configfs(core: os.Path = os.root / "sys" / "kernel" / "config" / "target" 
       None
     else
       val text = readText(p, "a unit serial").trim
-      // The kernel prints "T10 VPD Unit Serial Number: <serial>"
-      val serial = text.substring(text.lastIndexOf(':') + 1).trim
+      // The kernel prints "T10 VPD Unit Serial Number: <serial>"; the serial itself may contain ':'
+      val serial = text.substring(text.indexOf(':') + 1).trim
       Option.when(serial.nonEmpty)(serial)
 
   def action(hba: String, device: String, name: String, value: Int): Unit =

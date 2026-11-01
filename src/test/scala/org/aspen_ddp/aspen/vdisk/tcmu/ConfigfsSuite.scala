@@ -93,6 +93,12 @@ class ConfigfsSuite extends AnyFunSuite with Matchers:
     val e = intercept[Exception](t.configfs.hwMaxSectors("30", "vd1"))
     e.getMessage should include ((d / "attrib" / "hw_max_sectors").toString)
 
+  test("a unit serial containing ':' is kept whole"):
+    val t = Tree()
+    val d = t.configfsDev()
+    os.write.over(d / "wwn" / "vpd_unit_serial", "T10 VPD Unit Serial Number: naa:6001:abc\n")
+    t.configfs.unitSerial("30", "vd1") should be (Some("naa:6001:abc"))
+
   test("missing unit serial is None"):
     val t = Tree()
     val d = t.configfsDev()

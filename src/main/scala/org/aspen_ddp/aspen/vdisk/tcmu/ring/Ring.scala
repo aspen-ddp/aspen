@@ -58,11 +58,12 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
       val cdbOff = map.get(JAVA_LONG_UNALIGNED, e + ReqCdbOff)
       sb ++= s" iov_cnt=$iovCnt iov_bidi_cnt=${u32(e + ReqIovBidiCnt)} iov_dif_cnt=${u32(e + ReqIovDifCnt)}"
       sb ++= s" cdb_off=$cdbOff cdb="
-      if cdbOff >= 0 && cdbOff < mapSize then
-        val n = math.min(16L, mapSize - cdbOff).toInt
+      // Only within the entry: the rest of the map may hold unallocated data-area pages, which fault
+      if cdbOff >= e && cdbOff < e + len then
+        val n = math.min(16L, e + len - cdbOff).toInt
         sb ++= hex(map.asSlice(cdbOff, n).toArray(JAVA_BYTE))
       else
-        sb ++= "(outside map)"
+        sb ++= "(outside the entry)"
       val shown = math.min(iovCnt, math.min(MaxDumpIovecs.toLong, (len - ReqIov) / IovecSize))
       val iovs = (0L until shown).map: i =>
         val at = e + ReqIov + IovecSize * i
@@ -134,24 +135,28 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
     val dif = u32(e + ReqIovDifCnt)
     val cdbOff = map.get(JAVA_LONG_UNALIGNED, e + ReqCdbOff)
     val dataStart = g.cmdrOff + g.cmdrSize
+    val entryEnd = e + len
     if bidi != 0 then
       Left(s"iov_bidi_cnt=$bidi is not supported")
     else if dif != 0 then
       Left(s"iov_dif_cnt=$dif is not supported")
     else if ReqIov + IovecSize * iovCnt > len then
       Left(s"iov_cnt=$iovCnt needs ${ReqIov + IovecSize * iovCnt} bytes but the entry length is $len")
-    else if cdbOff < 0 || cdbOff >= mapSize then
-      Left(s"cdb_off=$cdbOff is outside the map of $mapSize bytes")
+    // The kernel always places the CDB inside the entry. Anywhere else in the map may be a data-area page the
+    // kernel has not allocated, and touching one faults.
+    else if cdbOff < e || cdbOff >= entryEnd then
+      Left(s"cdb_off=$cdbOff is outside the entry [$e, $entryEnd)")
     else
       val opcode = u8(cdbOff)
+      // `cdbLength` reads byte 7 only for a variable-length CDB (0x7f)
       val cdbLen =
-        if opcode == 0x7f && cdbOff + 8 > mapSize then None
+        if opcode == 0x7f && cdbOff + 8 > entryEnd then None
         else cdbLength(opcode, u8(cdbOff + 7))
       cdbLen match
         case None =>
           Left(s"cdb_off=$cdbOff opcode 0x${opcode.toHexString} has no supported CDB length")
-        case Some(n) if cdbOff + n > mapSize =>
-          Left(s"cdb_off=$cdbOff with a $n-byte CDB runs past the map of $mapSize bytes")
+        case Some(n) if cdbOff + n > entryEnd =>
+          Left(s"cdb_off=$cdbOff with a $n-byte CDB runs past the entry end $entryEnd")
         case Some(n) =>
           val iovecs = (0L until iovCnt).map: i =>
             val at = e + ReqIov + IovecSize * i

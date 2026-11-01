@@ -152,6 +152,36 @@ class RingSuite extends AnyFunSuite with Matchers:
         case List(RingItem.Malformed(`id`, reason, _, true)) => reason should include ("cdb_off")
         case other => fail(s"expected Malformed, got $other")
 
+  test("a CDB in the data area, or running past its entry, is Malformed and its dump reads nothing outside it"):
+    // The data area may hold pages the kernel never allocated: only the entry itself may be read. Each ring is
+    // fresh, so the entry lands at the start of the command ring.
+    def submitWith(fake: FakeKernel)(edit: (java.nio.ByteBuffer, Int) => Long): Int =
+      val id = fake.allocId()
+      val bytes = fake.commandEntry(id, read10(0, 1), Seq((fake.dataOff.toLong, 512L)))
+      val bb = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.nativeOrder())
+      bb.putLong(ReqCdbOff, edit(bb, bytes.length))
+      fake.submitRaw(bytes)
+      id
+    def expectMalformed(ring: Ring, id: Int, text: String, dumped: String): Unit =
+      ring.nextItems() match
+        case List(RingItem.Malformed(`id`, reason, dump, true)) =>
+          reason should include (text)
+          dump should include (dumped)
+        case other => fail(s"expected Malformed, got $other")
+    withRing(): (fake, ring) =>
+      val id = submitWith(fake)((_, _) => fake.dataOff.toLong)
+      expectMalformed(ring, id, "outside the entry", "cdb=(outside the entry)")
+    withRing(): (fake, ring) =>
+      // Just past the entry's end: inside the command ring, but not this entry
+      val id = submitWith(fake)((_, len) => fake.cmdrOff.toLong + len)
+      expectMalformed(ring, id, "outside the entry", "cdb=(outside the entry)")
+    withRing(): (fake, ring) =>
+      // A READ 10 opcode in the entry's last 8 bytes: its 10-byte CDB runs past the entry
+      val id = submitWith(fake): (bb, len) =>
+        bb.put(len - 8, 0x28.toByte)
+        fake.cmdrOff.toLong + len - 8
+      expectMalformed(ring, id, "runs past the entry end", "cdb=28")
+
   test("a TMR count larger than the entry is Malformed"):
     withRing(): (fake, ring) =>
       val buf = java.nio.ByteBuffer.allocate(40).order(java.nio.ByteOrder.nativeOrder())

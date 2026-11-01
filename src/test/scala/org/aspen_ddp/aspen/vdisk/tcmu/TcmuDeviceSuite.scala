@@ -55,7 +55,11 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
       val context: RecordingContext,
       val device: TcmuDevice)
 
-  private def withDevice(auto: Boolean = true, handler: Option[ScsiHandler] = None)(f: Fixture => Unit): Unit =
+  private def withDevice(
+      auto: Boolean = true,
+      handler: Option[ScsiHandler] = None,
+      channel: FakeKernel => KernelChannel = _.channel,
+      park: Long => Unit = _ => fail("unexpected backoff"))(f: Fixture => Unit): Unit =
     val kernel = FakeKernel()
     val dev = FakeBlockDevice(auto = auto)
     val control = Control(kernel)
@@ -65,7 +69,7 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
     val context = RecordingContext()
     val ring = Ring.open(kernel.segment).fold(e => fail(e), identity)
     val commands = handler.getOrElse(ScsiCommands(dev, settings)(using ExecutionContext.global))
-    val device = TcmuDevice("vd1", ring, kernel.channel, control, commands, failures, context)
+    val device = TcmuDevice("vd1", ring, channel(kernel), control, commands, failures, context, park)
     device.start()
     try
       f(Fixture(kernel, dev, control, sink, clock, failures, context, device))
@@ -272,18 +276,56 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
       eventually("the warn")(fx.sink.at(Level.Warn).exists(_.contains("after stop")))
       fx.kernel.channel.kicks should be (0)
 
+  test("completion failure after stop reports without touching the ring"):
+    val held = scala.concurrent.Promise[(ScsiResult, Array[Byte])]()
+    val handled = scala.concurrent.Promise[Unit]()
+    val h = stub: (_, _, _) =>
+      handled.success(())
+      held.future
+    withDevice(handler = Some(h)): fx =>
+      fx.kernel.submit(read10(0, 1), readLen = Bs)
+      Await.result(handled.future, 5.seconds)
+      fx.device.stop()
+      fx.kernel.close()
+      held.failure(RuntimeException("late"))
+      eventually("the warn")(fx.sink.at(Level.Warn).exists(_.contains("after stop")))
+      val errors = fx.sink.at(Level.Error)
+      errors.filter(_.contains("command-error")) match
+        case List(e) => e should include ("(device stopped)")
+        case other => fail(s"expected one command-error, got $other")
+      errors.filter(_.contains("dump failed")) should be (empty)
+
+  test("a failing channel backs off, doubling to 1 s, and recovers"):
+    val parks = ConcurrentLinkedQueue[Long]()
+    val failuresLeft = AtomicInteger(13)
+    def flaky(k: FakeKernel): KernelChannel = new KernelChannel:
+      def await(): Unit =
+        if failuresLeft.getAndDecrement() > 0 then throw IllegalStateException("EIO")
+        k.channel.await()
+      def kick(): Unit = k.channel.kick()
+      def close(): Unit = k.channel.close()
+    withDevice(channel = flaky, park = n => parks.add(n): Unit): fx =>
+      val id = fx.kernel.submit(read10(0, 1), readLen = Bs)
+      val List(c) = completions(fx.kernel, 1): @unchecked
+      c.cmdId should be (id)
+      val ms = 1.millis.toNanos
+      parks.asScala.toList should be ((0 until 10).map(i => ms << i).toList ++ List.fill(3)(1.second.toNanos))
+      fx.failures.counts("channel-error") should be (13L)
+
   test("stop wakes a blocked loop"):
     withDevice(): fx =>
+      eventually("the loop to block")(fx.kernel.channel.waiter.exists(_.getState == Thread.State.WAITING))
       val start = System.nanoTime()
       Await.result(Future(fx.device.stop())(using ExecutionContext.global), 1.second)
       (System.nanoTime() - start) should be < 1.second.toNanos
 
   // ---- UioChannel, over a pipe standing in for the UIO fd ----
 
-  private def withPipe(f: (UioChannel, Int) => Unit): Unit =
+  private def withPipe(f: (UioChannel, Int, scala.concurrent.Promise[Unit]) => Unit): Unit =
     val (r, w) = Libc.pipe()
-    val ch = UioChannel(r)
-    try f(ch, w)
+    val polling = scala.concurrent.Promise[Unit]()
+    val ch = UioChannel(r, () => polling.trySuccess(()): Unit)
+    try f(ch, w, polling)
     finally
       ch.close()
       Libc.close(w)
@@ -297,21 +339,19 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
     finally arena.close()
 
   test("UioChannel await returns on a notification"):
-    withPipe: (ch, w) =>
+    withPipe: (ch, w, _) =>
       writeInt(w)
       ch.await()
 
   test("UioChannel close wakes a blocked await, and await after close throws"):
-    withPipe: (ch, _) =>
-      val entered = scala.concurrent.Promise[Unit]()
+    withPipe: (ch, _, polling) =>
       val waiting = Future {
-        entered.success(())
         try
           ch.await()
           None
         catch case e: InterruptedException => Some(e)
       }(using ExecutionContext.global)
-      Await.result(entered.future, 1.second)
+      Await.result(polling.future, 1.second)
       ch.close()
       Await.result(waiting, 1.second) shouldBe defined
       intercept[InterruptedException](ch.await())

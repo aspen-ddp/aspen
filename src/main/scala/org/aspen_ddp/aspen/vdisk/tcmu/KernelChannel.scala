@@ -23,9 +23,10 @@ trait RingControl:
   *
   * Closing an fd does not wake a thread blocked reading it, so `await` polls the UIO fd together with a wake-up
   * pipe that `close` writes to. The fds are released by whichever of `close` and a running `await` finishes last,
-  * so no call ever uses an fd number that has been closed and possibly reused.
+  * so no call ever uses an fd number that has been closed and possibly reused. `beforePoll` is a test hook, run
+  * once the channel has committed to polling.
   */
-final class UioChannel(fd: Int) extends KernelChannel:
+final class UioChannel(fd: Int, beforePoll: () => Unit = () => ()) extends KernelChannel:
   private val (wakeRead, wakeWrite) = Libc.pipe()
   // Guarded by this
   private var closed = false
@@ -52,6 +53,7 @@ final class UioChannel(fd: Int) extends KernelChannel:
       if closed then throw closedError
       awaiting = true
     try
+      beforePoll()
       val revents = Libc.poll(Seq(fd -> Linux.POLLIN, wakeRead -> Linux.POLLIN), -1)
       if revents(1) == 0 && revents(0) != 0 then
         withBuffer(4)(Libc.read(fd, _)): Unit

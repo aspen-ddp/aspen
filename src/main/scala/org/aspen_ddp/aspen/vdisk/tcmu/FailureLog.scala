@@ -67,7 +67,8 @@ final class FailureLog(
 
 object FailureLog:
   val toScribe: (Level, String) => Unit = (level, message) =>
-    if level == Level.Error then scribe.error(message)
-    else if level == Level.Warn then scribe.warn(message)
-    else if level == Level.Info then scribe.info(message)
-    else scribe.debug(message)
+    level match
+      case Level.Error => scribe.error(message)
+      case Level.Warn => scribe.warn(message)
+      case Level.Info => scribe.info(message)
+      case _ => scribe.debug(message)

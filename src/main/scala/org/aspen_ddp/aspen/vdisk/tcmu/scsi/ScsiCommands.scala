@@ -8,7 +8,10 @@ import scala.concurrent.{ExecutionContext, Future, Promise}
 import org.aspen_ddp.aspen.vdisk.{LockableBlockDevice, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.DeviceSettings
 
-/** What a TCMU device needs to run one command: never fails, every error becomes a CHECK CONDITION. */
+/** What a TCMU device needs to run one command: never fails, every error becomes a CHECK CONDITION.
+  * `dataOut` must be called, if at all, synchronously within `handle`: the data area belongs to the command only
+  * until it is completed, and a TCMU device rejects a gather after a ring reset or `stop`.
+  */
 trait ScsiHandler:
   def handle(cdb: Array[Byte], dataOut: () => Array[Byte], dataInCapacity: Long): Future[(ScsiResult, Array[Byte])]
 

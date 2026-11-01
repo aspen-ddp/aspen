@@ -4,7 +4,8 @@ import org.aspen_ddp.aspen.vdisk.tcmu.ring.{Iovec, Ring, RingCorrupt, RingItem}
 import org.aspen_ddp.aspen.vdisk.tcmu.scsi.{Cdb, ScsiHandler, ScsiResult, Sense}
 
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.locks.ReentrantReadWriteLock
+import java.util.concurrent.locks.{LockSupport, ReentrantReadWriteLock}
+import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.{Failure, Success, Try}
 
@@ -19,6 +20,9 @@ import scala.util.{Failure, Success, Try}
   *  - once `stop` returns, nothing touches the ring segment, so the caller may unmap it.
   *
   * `stop` closes `channel`. It must not be called from a completion callback, which holds the read lock.
+  *
+  * When `channel.await` fails (say, the UIO device went away), the loop waits `park(nanos)` before trying again,
+  * doubling from 1 ms to at most 1 s and resetting on the next successful await. `stop` unparks it.
   */
 final class TcmuDevice(
     name: String,
@@ -27,7 +31,10 @@ final class TcmuDevice(
     control: RingControl,
     commands: ScsiHandler,
     failures: FailureLog,
-    completionContext: ExecutionContext = ExecutionContext.parasitic):
+    completionContext: ExecutionContext = ExecutionContext.parasitic,
+    park: Long => Unit = nanos => LockSupport.parkNanos(nanos)):
+
+  import TcmuDevice.*
 
   private val lock = ReentrantReadWriteLock()
   /** Written under the write lock, read under either lock. */
@@ -54,6 +61,7 @@ final class TcmuDevice(
       thread
     channel.close()
     t.foreach: th =>
+      LockSupport.unpark(th)
       if th ne Thread.currentThread() then th.join()
     locked(lock.writeLock):
       stopped = true
@@ -65,17 +73,32 @@ final class TcmuDevice(
 
   private def fatal(e: Throwable): Boolean = e.isInstanceOf[VirtualMachineError]
 
-  private def mailbox: String = ring.mailboxDump
+  /** The ring state for a report, without touching the segment once the device has stopped. */
+  private def mailbox: String = locked(lock.readLock):
+    if stopped then "(device stopped)" else ring.mailboxDump
 
   private def loop(): Unit =
     var go = true
+    var backoff = 0L
     while go && running do
-      try
-        channel.await()
-        if running then serve()
-      catch
-        case _: InterruptedException => go = false
-        case e: Throwable if !fatal(e) => failures.report("loop-error", e.toString, mailbox)
+      val notified =
+        try
+          channel.await()
+          backoff = 0L
+          true
+        catch
+          case e: InterruptedException =>
+            if running then scribe.warn(s"$name: serving loop interrupted while running: $e")
+            go = false
+            false
+          case e: Throwable if !fatal(e) =>
+            failures.report("channel-error", e.toString, mailbox)
+            backoff = if backoff == 0L then MinBackoff else math.min(backoff * 2, MaxBackoff)
+            if running then park(backoff)
+            false
+      if notified && running then
+        try serve()
+        catch case e: Throwable if !fatal(e) => failures.report("loop-error", e.toString, mailbox)
 
   private def serve(): Unit =
     if !resyncPending || resync() then
@@ -132,12 +155,13 @@ final class TcmuDevice(
     val start = System.nanoTime()
     val capacity = ring.dataLength(c.iovecs)
     val result =
-      try commands.handle(c.cdb, () => gather(c.iovecs, capacity), capacity)
+      try commands.handle(c.cdb, () => gather(c.iovecs, capacity, gen), capacity)
       catch case e: Throwable if !fatal(e) => Future.failed(e)
     result.onComplete(r => completed(c, gen, start, capacity, r))(using completionContext)
 
-  private def gather(iovecs: Vector[Iovec], capacity: Long): Array[Byte] = locked(lock.readLock):
+  private def gather(iovecs: Vector[Iovec], capacity: Long, gen: Long): Array[Byte] = locked(lock.readLock):
     if stopped then throw IllegalStateException(s"$name is stopped")
+    if gen != generation then throw IllegalStateException(s"$name: the ring was reset since the command was consumed")
     ring.gather(iovecs, math.min(capacity, Int.MaxValue.toLong).toInt)
 
   private def cdbHex(cdb: Array[Byte]): String = cdb.map(b => f"${b & 0xff}%02x").mkString
@@ -188,6 +212,11 @@ final class TcmuDevice(
               val h = Sense.HardwareError
               ring.complete(cmdId, h.status, h.sense, None)
         if ok then
-          channel.kick()
+          try channel.kick()
+          catch case e: Throwable if !fatal(e) => failures.report("kick-error", s"cmd_id=$cmdId: $e", mailbox)
         else
           failures.report("stale-completion", s"cmd_id=$cmdId is not outstanding", mailbox)
+
+object TcmuDevice:
+  private val MinBackoff = 1.millis.toNanos
+  private val MaxBackoff = 1.second.toNanos

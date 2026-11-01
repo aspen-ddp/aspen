@@ -9,15 +9,17 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable
 
-/** A completed command as the kernel would see it. `data` is the command's data area contents after completion. */
 /** The kernel's notification channel: `await` blocks until `signal` (called by every `submit*`), `kick` counts. */
 final class FakeChannel extends KernelChannel:
   private val permits = Semaphore(0)
   private val kickCount = AtomicInteger()
   @volatile private var closed = false
+  /** The thread most recently in `await`, so a test can wait for it to block. */
+  @volatile var waiter: Option[Thread] = None
 
   def await(): Unit =
     if closed then throw InterruptedException("channel closed")
+    waiter = Some(Thread.currentThread())
     permits.acquire()
     if closed then throw InterruptedException("channel closed")
 
@@ -32,6 +34,7 @@ final class FakeChannel extends KernelChannel:
     closed = true
     permits.release()
 
+/** A completed command as the kernel would see it. `data` is the command's data area contents after completion. */
 final case class FakeCompletion(cmdId: Int, status: Int, sense: Array[Byte], readLen: Option[Int], data: Array[Byte])
 
 /** Plays the kernel's side of a TCMU command ring on an Arena-allocated segment.

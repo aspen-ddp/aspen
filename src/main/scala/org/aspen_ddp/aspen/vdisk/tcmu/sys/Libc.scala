@@ -27,6 +27,7 @@ object Linux:
   val EINVAL = 22
   val EBUSY = 16
   val ENODEV = 19
+  val EOPNOTSUPP = 95
   val POLLIN = 1
 
 /** Thin Foreign Function & Memory binding to the handful of libc calls the TCMU frontend needs. */

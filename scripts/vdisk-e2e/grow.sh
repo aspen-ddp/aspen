@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Grows the served disk to NEW_SIZE and the ext4 filesystem on it. Run as root after setup.sh.
 #
-# MODE=resize (default): write the new size to the backstore's configfs attrib/dev_size. The kernel sends
-#   vdisk-server a reconfig, which grows the Aspen disk. With ASPEN_FIRST=1, `aspen grow-disk` grows the Aspen disk
-#   first, and the reconfig then adopts the committed size. (targetcli has no resize command for user backstores.)
+# MODE=resize (default): set the backstore's dev_size attribute (targetcli `set attribute dev_size=`, or the
+#   configfs attrib/dev_size file if targetcli refuses). The kernel sends vdisk-server a reconfig, which grows the
+#   Aspen disk. With ASPEN_FIRST=1, `aspen grow-disk` grows the Aspen disk first, and the reconfig then adopts the
+#   committed size. (targetcli has no resize command for user backstores.)
 # MODE=readd: log out, delete the backstore and create it again with size NEW_SIZE. The add finds the targetcli
 #   size larger than the Aspen disk and grows the disk to match (grow on add).
 #
@@ -30,8 +31,12 @@ case $MODE in
       [[ -n $CLIENT_CONFIG ]] || die "set CLIENT_CONFIG"
       "$ASPEN" grow-disk "$CLIENT_CONFIG" "$DISK" "$NEW_SIZE"
     fi
-    dir="$(backstore_dir)" || die "no configfs directory for backstore $DISK"
-    echo "$bytes" > "$dir/attrib/dev_size"
+    if ! targetcli "/backstores/user:aspen/$DISK" set attribute "dev_size=$bytes"; then
+      echo "targetcli refused dev_size; writing configfs attrib/dev_size" >&2
+      dir="$(backstore_dir)" || die "no configfs directory for backstore $DISK"
+      echo "$bytes" > "$dir/attrib/dev_size"
+    fi
+    targetcli saveconfig
     iscsiadm -m node -T "$IQN" -p 127.0.0.1 --rescan >/dev/null
     ;;
   readd)

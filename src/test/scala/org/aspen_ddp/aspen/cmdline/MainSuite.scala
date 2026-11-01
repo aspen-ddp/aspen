@@ -305,14 +305,15 @@ class MainSuite extends AnyFunSuite with Matchers:
   /** Runs the loop on this thread over `steps`; it ends when they run out (an InterruptedException is fatal). */
   private def runLoop(steps: List[() => List[Either[String, TcmuEvent]]],
                       onEvent: TcmuEvent => Future[Int] = _ => Future.successful(0),
-                      reply: (TcmuEvent, Int) => Unit = (_, _) => ()): List[Long] =
+                      reply: (TcmuEvent, Int) => Unit = (_, _) => (),
+                      log: scribe.Logger = scribe.Logger.root): List[Long] =
     val remaining = mutable.Queue.from(steps)
     val pauses = mutable.ListBuffer[Long]()
     val receive = () =>
       if remaining.isEmpty then throw InterruptedException("done") else remaining.dequeue()()
     // parasitic: each reply is sent on the thread that completes the event's Future
     an[InterruptedException] should be thrownBy
-      Main.tcmuEventLoop(receive, onEvent, reply, ms => pauses += ms)(using scala.concurrent.ExecutionContext.parasitic)
+      Main.tcmuEventLoop(receive, onEvent, reply, ms => pauses += ms, log)(using scala.concurrent.ExecutionContext.parasitic)
     pauses.toList
 
   test("tcmuEventLoop replies to each event with its onEvent status and drops parse failures"):
@@ -346,6 +347,23 @@ class MainSuite extends AnyFunSuite with Matchers:
         replies.add(e)
         if e == added then throw SysError("send", Linux.EIO, "I/O error"))
     replies.toArray.toList shouldBe List(added, removed)
+
+  test("tcmuEventLoop logs the first receive failure of a run, every 100th, and the recovery"):
+    val lines = java.util.concurrent.ConcurrentLinkedQueue[(scribe.Level, String)]()
+    // Its own orphan logger: replacing the root logger would race other suites doing the same
+    val log = scribe.Logger().orphan().withHandler(minimumLevel = Some(scribe.Level.Info), writer =
+      new scribe.writer.Writer:
+        def write(r: scribe.LogRecord, output: scribe.output.LogOutput, format: scribe.output.format.OutputFormat): Unit =
+          lines.add((r.level, output.plainText)): Unit
+    )
+    val failing = () => throw SysError("recv", 105, "No buffer space available")
+    val ok = () => List.empty[Either[String, TcmuEvent]]
+    runLoop(List.fill(250)(failing) ++ List(ok, failing), log = log)
+    val got = lines.toArray(Array.empty[(scribe.Level, String)]).toList
+    got.map(_._1) shouldBe List(scribe.Level.Error, scribe.Level.Error, scribe.Level.Error, scribe.Level.Warn,
+      scribe.Level.Error)
+    got(1)._2 should include ("100 consecutive")
+    got(3)._2 should include ("250")
 
   test("tcmuEventLoop backs off on receive failures, doubling to 1 s, and resets after a success"):
     val failing = () => throw SysError("recv", 105, "No buffer space available")

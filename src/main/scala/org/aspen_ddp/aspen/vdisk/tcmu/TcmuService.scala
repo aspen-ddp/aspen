@@ -54,8 +54,9 @@ final class LinuxTcmuKernel(val configfs: Configfs = Configfs()) extends TcmuKer
         catch case NonFatal(c) => e.addSuppressed(c)
         throw e
 
-/** @param acquireTimeout a device add that has not acquired its disk within this time replies `-ETIMEDOUT` and is
-  *                       torn down. The kernel blocks targetcli meanwhile, and the timeout bounds it.
+/** @param acquireTimeout bounds each of a device add's open of its disk and its acquire: an add that has not
+  *                       finished either within this time replies `-ETIMEDOUT` and is torn down. The kernel blocks
+  *                       targetcli meanwhile, and the timeout bounds it.
   */
 final case class TcmuServiceConfig(acquireTimeout: FiniteDuration = 60.seconds)
 
@@ -71,9 +72,9 @@ final class TcmuService(kernel: TcmuKernel,
                         openDisk: String => Future[LockableBlockDevice],
                         config: TcmuServiceConfig = TcmuServiceConfig())(using ExecutionContext):
   import TcmuService.*
-  import Linux.{EEXIST, EINVAL, EIO, ENODEV, ENOENT, ETIMEDOUT}
+  import Linux.{EINVAL, EIO, ENODEV, ENOENT, ETIMEDOUT}
 
-  private final class Served(val disk: String, val name: String, val device: LockableBlockDevice,
+  private final class Served(val uio: UioName, val disk: String, val name: String, val device: LockableBlockDevice,
                              val commands: ScsiCommands, val tcmu: TcmuDevice, val unmap: () => Unit)
 
   /** What a device add has opened so far, for its failure log and teardown. */
@@ -180,25 +181,28 @@ final class TcmuService(kernel: TcmuKernel,
   private def add(minor: Int, reopen: Boolean): Future[Unit] =
     val a = Adding(minor)
     val result =
-      Future(readKernel(a))
-        .flatMap: k =>
+      Future(readKernel(a)).flatMap:
+        case None => Future.unit
+        case Some(k) =>
           a.step = "open disk"
-          mapped(openDisk(a.disk)) { case _: VDiskError.DiskNotFound => ENOENT }.map(d => (k, d))
-        .flatMap: (k, d) =>
-          a.device = Some(d)
-          a.step = "check geometry"
-          val geometry = d.geometry
-          checkGeometry(k, geometry)
-          a.step = "acquire"
-          mapped(withTimeout(d.acquire()))(PartialFunction.empty).flatMap: _ =>
-            if k.size > geometry.size then
-              a.step = "grow"
-              scribe.warn(s"tcmu: ${a.where}: growing Aspen disk ${a.disk} from ${geometry.size} to ${k.size} " +
-                "to match the targetcli size")
-              growDisk(d, k.size)
-            else
-              Future.unit
-          .map(_ => serve(a, k, d, geometry, reopen))
+          // A disk that opens only after the timeout is closed when it does
+          mapped(withTimeout("opened", attempt(openDisk(a.disk)), late = _.close())) {
+            case _: VDiskError.DiskNotFound => ENOENT
+          }.flatMap: d =>
+            a.device = Some(d)
+            a.step = "check geometry"
+            val geometry = d.geometry
+            checkGeometry(k, geometry)
+            a.step = "acquire"
+            mapped(withTimeout("acquired", d.acquire()))(PartialFunction.empty).flatMap: _ =>
+              if k.size > geometry.size then
+                a.step = "grow"
+                scribe.warn(s"tcmu: ${a.where}: growing Aspen disk ${a.disk} from ${geometry.size} to ${k.size} " +
+                  "to match the targetcli size")
+                growDisk(d, k.size)
+              else
+                Future.unit
+            .map(_ => serve(a, k, d, geometry, reopen))
     result.recoverWith:
       case NonFatal(e) =>
         val error = asLifecycle(e)
@@ -206,15 +210,21 @@ final class TcmuService(kernel: TcmuKernel,
         teardown(a)
         Future.failed(error)
 
-  /** Steps 1 to 3 of an add: the UIO name, the cfgstring and the configfs attributes. */
-  private def readKernel(a: Adding): KernelView =
-    if synchronized(served.contains(a.minor)) then
-      throw LifecycleError(EEXIST, s"uio${a.minor} is already served")
+  /** Steps 1 to 3 of an add: the UIO name, the cfgstring and the configfs attributes. None when the minor is
+    * already served under the same UIO name: the startup scan found a device whose ADDED event came after it.
+    */
+  private def readKernel(a: Adding): Option[KernelView] =
     val parsed =
       try kernel.configfs.uioName(a.minor)
       catch case NonFatal(e) => throw LifecycleError(ENODEV, e.getMessage)
     val uio = parsed.fold(reason => throw LifecycleError(ENODEV, reason), identity)
     a.name = uio.device
+    synchronized(served.get(a.minor)) match
+      case Some(s) if s.uio == uio =>
+        scribe.info(s"tcmu: uio${a.minor} (${uio.device}) is already served; nothing to do")
+        return None
+      case Some(s) => dropStale(a.minor, s, uio)
+      case None => ()
     if uio.subtype != Subtype then
       throw LifecycleError(ENODEV, s"subtype is ${uio.subtype}, not $Subtype")
     a.step = "parse cfgstring"
@@ -222,9 +232,20 @@ final class TcmuService(kernel: TcmuKernel,
     a.step = "read configfs"
     val c = kernel.configfs
     try
-      KernelView(uio, c.size(uio.hba, uio.device), c.hwBlockSize(uio.hba, uio.device),
-        c.hwMaxSectors(uio.hba, uio.device), c.mapSize(a.minor), c.unitSerial(uio.hba, uio.device))
+      Some(KernelView(uio, c.size(uio.hba, uio.device), c.hwBlockSize(uio.hba, uio.device),
+        c.hwMaxSectors(uio.hba, uio.device), c.mapSize(a.minor), c.unitSerial(uio.hba, uio.device)))
     catch case NonFatal(e) => throw LifecycleError(EIO, e.getMessage)
+
+  /** The kernel reused a served minor for another device: it unregistered the old one without a remove, which it
+    * does when an add's reply was not 0. Crash-only: stop serving, close the disk (its lock is not released), unmap.
+    */
+  private def dropStale(minor: Int, s: Served, now: UioName): Unit =
+    val where = s"device ${s.name} (uio$minor, disk ${s.disk})"
+    scribe.warn(s"tcmu: uio$minor is now ${now.device} (${now.cfgstring}); dropping the stale $where")
+    synchronized(served.remove(minor)): Unit
+    logged(where, "stop serving")(s.tcmu.stop())
+    logged(where, "close disk")(s.device.close())
+    logged(where, "unmap")(s.unmap())
 
   private def checkGeometry(k: KernelView, g: DiskGeometry): Unit =
     if k.blockSize != g.logicalBlockSize then
@@ -258,7 +279,7 @@ final class TcmuService(kernel: TcmuKernel,
     a.tcmu = Some(tcmu)
     tcmu.start()
     synchronized:
-      served(a.minor) = Served(a.disk, k.uio.device, device, commands, tcmu, unmap)
+      served(a.minor) = Served(k.uio, a.disk, k.uio.device, device, commands, tcmu, unmap)
     scribe.info(s"tcmu: serving ${a.where}: ${k.size} bytes, block size ${k.blockSize}")
 
   /** Crash-only: stop serving, unmap, close the disk. */
@@ -271,14 +292,18 @@ final class TcmuService(kernel: TcmuKernel,
     try body
     catch case NonFatal(e) => scribe.error(s"tcmu: $where: $what failed: $e")
 
-  private def withTimeout[T](f: Future[T]): Future[T] =
+  /** `f`, failed with ETIMEDOUT ("not <what> within ...") if it has not completed within `acquireTimeout`. A
+    * success that arrives after the timeout is passed to `late`.
+    */
+  private def withTimeout[T](what: String, f: Future[T], late: T => Unit = (_: T) => ()): Future[T] =
     val p = Promise[T]()
     val timeout = config.acquireTimeout
-    val task = timer.schedule((() => p.tryFailure(LifecycleError(ETIMEDOUT, s"not acquired within $timeout"))): Runnable,
+    val task = timer.schedule((() => p.tryFailure(LifecycleError(ETIMEDOUT, s"not $what within $timeout"))): Runnable,
       timeout.toNanos, TimeUnit.NANOSECONDS)
     f.onComplete: r =>
       task.cancel(false)
-      p.tryComplete(r)
+      if !p.tryComplete(r) then
+        r.foreach(v => logged(s"a late result ($what)", "clean up")(late(v)))
     p.future
 
   /** Runs `op` once every earlier operation on `minor` has completed. */

@@ -1469,7 +1469,11 @@ object Main {
     scribe.info(s"tcmu: startup scan done; serving ${served.size} existing device(s): ${served.mkString(", ")}")
 
     Thread.ofPlatform().name("tcmu-netlink").daemon(true).start: () =>
-      tcmuEventLoop(() => netlink.receive(), service.onEvent, netlink.reply)
+      try tcmuEventLoop(() => netlink.receive(), service.onEvent, netlink.reply)
+      catch
+        case t: Throwable =>
+          scribe.error(s"tcmu: the netlink thread died; device add, remove and reconfig are no longer served: $t")
+          throw t
 
     println("Serving virtual disks through TCMU")
 
@@ -1483,30 +1487,40 @@ object Main {
     *
     * Each event is handed to `onEvent` and its status is replied when the Future completes, so a slow add does not
     * hold up other events. A failed `onEvent` replies `-EIO`. A `receive` failure (e.g. ENOBUFS when the kernel's
-    * multicast queue overflowed) is logged and retried after `pause`ing 1 ms, doubling to 1 s while it keeps failing.
+    * multicast queue overflowed) is retried after `pause`ing 1 ms, doubling to 1 s while it keeps failing. The first
+    * failure of a run and every 100th after it are logged, and so is the recovery.
     */
   private[cmdline] def tcmuEventLoop(receive: () => List[Either[String, TcmuEvent]],
                                      onEvent: TcmuEvent => Future[Int],
                                      reply: (TcmuEvent, Int) => Unit,
-                                     pause: Long => Unit = Thread.sleep)(using ExecutionContext): Nothing =
+                                     pause: Long => Unit = Thread.sleep,
+                                     log: scribe.Logger = scribe.Logger.root)(using ExecutionContext): Nothing =
     def send(event: TcmuEvent, status: Int): Unit =
       try reply(event, status)
-      catch case NonFatal(e) => scribe.error(s"tcmu: replying $status to $event failed: $e")
+      catch case NonFatal(e) => log.error(s"tcmu: replying $status to $event failed: $e")
 
     var backoffMs = 0L
+    var failures = 0L
     while true do
       val received =
         try Some(receive())
         catch
           case NonFatal(e) =>
+            failures += 1
             backoffMs = if backoffMs == 0 then 1 else (backoffMs * 2).min(1000)
-            scribe.error(s"tcmu: netlink receive failed (retrying in $backoffMs ms): $e")
+            if failures == 1 then
+              log.error(s"tcmu: netlink receive failed (retrying with backoff): $e")
+            else if failures % 100 == 0 then
+              log.error(s"tcmu: netlink receive still failing after $failures consecutive failures: $e")
             pause(backoffMs)
             None
       received.foreach: messages =>
+        if failures > 0 then
+          log.warn(s"tcmu: netlink receive recovered after $failures failure(s)")
         backoffMs = 0
+        failures = 0
         messages.foreach:
-          case Left(reason) => scribe.warn(s"tcmu: dropped an unparseable netlink message: $reason")
+          case Left(reason) => log.warn(s"tcmu: dropped an unparseable netlink message: $reason")
           case Right(event) =>
             val status =
               try onEvent(event)
@@ -1514,7 +1528,7 @@ object Main {
             status.onComplete:
               case Success(s) => send(event, s)
               case Failure(e) =>
-                scribe.error(s"tcmu: $event failed: $e")
+                log.error(s"tcmu: $event failed: $e")
                 send(event, -Linux.EIO)
     throw IllegalStateException("unreachable")
 

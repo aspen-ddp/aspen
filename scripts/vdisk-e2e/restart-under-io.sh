@@ -21,6 +21,8 @@ echo "cmd_time_out is $(cat "$dir/attrib/cmd_time_out") s"
 
 fio "$E2E_DIR/restart.fio" --directory="$MOUNT" &
 fio_pid=$!
+# A failure below must not leave fio running against the disk
+trap 'kill "$fio_pid" 2>/dev/null || true' EXIT
 sleep "$DELAY"
 kill -0 "$fio_pid" 2>/dev/null || die "fio finished within ${DELAY}s, before the restart; lower DELAY"
 
@@ -31,6 +33,7 @@ echo "vdisk-server was down for $((SECONDS - started)) s"
 check_dbus
 
 wait "$fio_pid" || die "fio failed across the restart"
-findmnt -no OPTIONS "$MOUNT" | tr ',' '\n' | grep -qx rw || die "$MOUNT is no longer mounted read-write"
+trap - EXIT
+grep -qx rw <<<"$(findmnt -no OPTIONS "$MOUNT" | tr ',' '\n')" || die "$MOUNT is no longer mounted read-write"
 rm -f "$MOUNT/restart.dat"
 echo "I/O resumed across the vdisk-server restart"

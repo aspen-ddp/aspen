@@ -361,13 +361,61 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       grow.succeed()
       status(reconfig) should be (0)
 
-  test("duplicate added is -EEXIST"):
+  test("a second added for the same uio device replies 0 and changes nothing"):
     withService(): fx =>
-      fx.disk("vd1")
+      val dev = fx.disk("vd1")
       fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
       await(fx.service.onEvent(TcmuEvent.Added("aspen/vd1", 3, 1))) should be (0)
-      await(fx.service.onEvent(TcmuEvent.Added("aspen/vd1", 3, 1))) should be (-Linux.EEXIST)
+      await(fx.service.onEvent(TcmuEvent.Added("aspen/vd1", 3, 1))) should be (0)
       fx.service.devices should be (Map(3 -> "vd1"))
+      fx.kernel.events.count(_ == "openRing 3") should be (1)
+      dev.names.count(_ == "acquire") should be (1)
+      dev.closes should be (0)
+      readServed(fx, 3, dev)
+
+  test("a device created during the startup scan is added once: the scan's add, then its event replies 0"):
+    withService(): fx =>
+      val dev = fx.disk("vd1")
+      // The kernel registers uio3 before multicasting ADDED, so the scan finds it and the event is handled after
+      fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
+      await(fx.service.startupScan())
+      await(fx.service.onEvent(TcmuEvent.Added("aspen/vd1", 3, 1))) should be (0)
+      fx.service.devices should be (Map(3 -> "vd1"))
+      fx.kernel.events.count(_ == "openRing 3") should be (1)
+      readServed(fx, 3, dev)
+
+  test("an added for a served minor under a different uio name replaces the stale entry"):
+    withService(): fx =>
+      val old = fx.disk("vd1")
+      val oldRing = fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
+      status(fx.service.added(3, reopen = false)) should be (0)
+      // The kernel unregistered dev1 without a remove (a failed add reply) and reused the minor for dev2
+      val dev = fx.disk("vd2")
+      fx.kernel.addDevice(3, "dev2", "aspen/vd2", 8 * Mi)
+      val lines = warnings:
+        await(fx.service.onEvent(TcmuEvent.Added("aspen/vd2", 3, 2))) should be (0)
+      lines.exists(l => l.contains("stale") && l.contains("dev1")) should be (true)
+      fx.service.devices should be (Map(3 -> "vd2"))
+      old.closes should be (1)
+      old.names should not contain ("release")
+      oldRing.segment.scope().isAlive should be (false)
+      readServed(fx, 3, dev)
+
+  test("an open that never completes times out and leaves nothing open"):
+    val kernel = FakeTcmuKernel()
+    val late = scala.concurrent.Promise[LockableBlockDevice]()
+    val service = TcmuService(kernel, _ => late.future, TcmuServiceConfig(acquireTimeout = 200.millis))
+    try
+      kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
+      status(service.added(3, reopen = false)) should be (-Linux.ETIMEDOUT)
+      service.devices should be (empty)
+      kernel.wasOpened(3) should be (false)
+      // A disk that opens after the timeout is closed, not leaked
+      val dev = FakeBlockDevice()
+      late.success(dev)
+      eventually("the late disk closed")(dev.closes == 1)
+      dev.names should be (empty)
+    finally kernel.cleanup()
 
   test("startup scan adds every aspen device and survives one failure"):
     withService(): fx =>

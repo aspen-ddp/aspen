@@ -12,12 +12,16 @@ set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
-INITIATOR_IQN="${INITIATOR_IQN:-$(sed -n 's/^InitiatorName=//p' /etc/iscsi/initiatorname.iscsi)}"
 MKFS="${MKFS:-0}"
 SMOKE="${SMOKE:-1}"
 
 require_root
-[[ -n "$INITIATOR_IQN" ]] || die "set INITIATOR_IQN"
+INITIATOR_FILE=/etc/iscsi/initiatorname.iscsi
+if [[ -z ${INITIATOR_IQN:-} ]]; then
+  [[ -r $INITIATOR_FILE ]] || die "$INITIATOR_FILE not found (is open-iscsi installed?); or set INITIATOR_IQN"
+  INITIATOR_IQN="$(sed -n 's/^InitiatorName=//p' "$INITIATOR_FILE")"
+  [[ -n $INITIATOR_IQN ]] || die "no InitiatorName= in $INITIATOR_FILE; set INITIATOR_IQN"
+fi
 refuse_tcmu_runner
 
 modprobe target_core_user

@@ -41,7 +41,9 @@ refuse_tcmu_runner() {
 SERVER_PATTERN='org\.aspen_ddp\.aspen\.cmdline\.Main vdisk-server'
 
 server_pid() {
-  pgrep -f "$SERVER_PATTERN" | head -n 1 | grep .
+  local pids
+  pids="$(pgrep -f "$SERVER_PATTERN")" || return 1
+  echo "${pids%%$'\n'*}"
 }
 
 # Starts vdisk-server in the background and waits until it serves (its startup scan has finished)
@@ -61,7 +63,7 @@ start_server() {
   # The launcher, which exits with the JVM
   pid=$!
   deadline=$((SECONDS + START_TIMEOUT))
-  until tail -n "+$((lines + 1))" "$LOG" | grep -q "Serving virtual disks through TCMU"; do
+  until grep -q "Serving virtual disks through TCMU" <<<"$(tail -n "+$((lines + 1))" "$LOG")"; do
     if ! kill -0 "$pid" 2>/dev/null; then
       tail -n "+$((lines + 1))" "$LOG" >&2
       die "vdisk-server exited during startup; see $LOG"
@@ -74,10 +76,12 @@ start_server() {
 
 # Crash-only: there is no clean shutdown, so stopping is kill -9
 kill_server() {
-  local pid
+  local pid deadline
   if pid="$(server_pid)"; then
     pkill -9 -f "$SERVER_PATTERN"
+    deadline=$((SECONDS + 10))
     while server_pid >/dev/null; do
+      ((SECONDS < deadline)) || die "vdisk-server (pid $pid) did not exit within 10s of kill -9"
       sleep 0.1
     done
     echo "killed vdisk-server (pid $pid)"
@@ -91,7 +95,7 @@ check_dbus() {
     die "busctl introspect $BUS_NAME $HANDLER_PATH failed"
   grep -q "CheckConfig" <<<"$intro" || die "$HANDLER_PATH has no CheckConfig method:"$'\n'"$intro"
   grep -q "ConfigDesc" <<<"$intro" || die "$HANDLER_PATH has no ConfigDesc property:"$'\n'"$intro"
-  targetcli ls /backstores | grep -q "user:aspen" || die "targetcli ls /backstores does not show user:aspen"
+  grep -q "user:aspen" <<<"$(targetcli ls /backstores)" || die "targetcli ls /backstores does not show user:aspen"
   echo "D-Bus: $BUS_NAME exports $HANDLER_PATH and targetcli shows user:aspen"
 }
 
@@ -118,13 +122,13 @@ wait_for_device() {
 
 login() {
   iscsiadm -m discovery -t st -p 127.0.0.1 >/dev/null
-  if ! iscsiadm -m session 2>/dev/null | grep -q "$IQN"; then
+  if ! grep -q "$IQN" <<<"$(iscsiadm -m session 2>/dev/null)"; then
     iscsiadm -m node -T "$IQN" -p 127.0.0.1 --login
   fi
 }
 
 logout() {
-  if iscsiadm -m session 2>/dev/null | grep -q "$IQN"; then
+  if grep -q "$IQN" <<<"$(iscsiadm -m session 2>/dev/null)"; then
     iscsiadm -m node -T "$IQN" -p 127.0.0.1 --logout
   fi
 }

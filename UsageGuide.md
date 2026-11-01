@@ -824,17 +824,18 @@ allocation group, which must have a maximum object size. Disks can only grow. `d
 all of its data.
 
 ### Serving virtual disks
-`vdisk-server` is a daemon that serves disks to tcmu-runner's `handler_aspen.so` over a Unix socket, so they can
-be exported as iSCSI LUNs:
+`vdisk-server` is a daemon that serves disks to the Linux kernel's TCMU target (LIO's `user:aspen` backstore), so
+they can be exported as iSCSI LUNs. It replaces tcmu-runner, which must be stopped, and must run as root:
 
 ```
-aspen vdisk-server [--socket <path>] [--network-cache-dir <dir>] <client-config> [--bootstrap-host ...]
+sudo aspen vdisk-server <client-config> [--network-cache-dir <dir>] [--bootstrap-host ...]
 ```
 
-`--socket` defaults to `/run/aspen/vdisk.sock`; its parent directory is created if missing and the socket is
-mode 0600. Startup fails if another daemon already holds the socket. `--network-cache-dir` persists network
-lookups across restarts and must not be shared with another process. See `docs/vdisk-tcmu-setup.md` for the
-full tcmu-runner and iSCSI setup.
+It owns the `org.kernel.TCMUService1` D-Bus name (install `deploy/dbus/org.kernel.TCMUService1.conf` in
+`/etc/dbus-1/system.d/`), so targetcli can create backstores with
+`targetcli /backstores/user:aspen create name=<name> size=<size> cfgstring=<disk>`. `--network-cache-dir` persists
+network lookups across restarts and must not be shared with another process. See `docs/vdisk-tcmu-setup.md` for the
+full setup.
 
 ## Where To Go From Here
 The AmoebaFS implementation is a good source for examples of how to use Aspen as are portions of the

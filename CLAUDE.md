@@ -46,7 +46,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     out older ones
   - Write-back: WRITE completes from memory; durable at FLUSH/FUA. Block objects are the largest multiple of the
     logical block size <= the allocator's `maxObjectSize`
-  - `vdisk-server` serves disks to tcmu-runner's `handler_aspen.so` (`native/tcmu-aspen`) over a Unix socket;
+  - `vdisk-server` drives the kernel's TCMU interface directly through FFM (`vdisk.tcmu`: netlink, configfs, the
+    `/dev/uioN` ring, SCSI emulation in `vdisk.tcmu.scsi`) and owns `org.kernel.TCMUService1` on the system D-Bus so
+    targetcli sees `user:aspen`. It runs as root and refuses to start while tcmu-runner holds that name.
     `LockableBlockDevice` is the frontend seam
 - **Information Dispersal Algorithm (IDA)**:
   - Defines the replication/erasure-coding strategy used to provide robustness against data loss

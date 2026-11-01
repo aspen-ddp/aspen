@@ -48,25 +48,48 @@ object Cdb:
       v = (v << 8) | (cdb(offset + i) & 0xffL)
     v
 
-  def lba(cdb: Array[Byte]): Long =
-    length(cdb(0)) match
-      case Some(6) => be(cdb, 1, 3) & 0x1FFFFFL
-      case Some(10) | Some(12) => be(cdb, 2, 4)
-      case Some(16) => be(cdb, 2, 8)
-      case _ => throw new IllegalArgumentException(f"unsupported CDB opcode 0x${cdb(0) & 0xff}%02x")
+  private val dataOps = Set(
+    Op.Read6, Op.Read10, Op.Read12, Op.Read16,
+    Op.Write6, Op.Write10, Op.Write12, Op.Write16,
+    Op.WriteSame10, Op.WriteSame16, Op.WriteVerify10, Op.WriteVerify16,
+    Op.SyncCache10, Op.SyncCache16, Op.CompareAndWrite)
 
+  /** Returns the opcode, after checking that the array holds a whole CDB */
+  private def checked(cdb: Array[Byte]): Int =
+    if cdb.isEmpty then
+      throw new IllegalArgumentException("empty CDB")
+    val op = cdb(0) & 0xff
+    length(cdb(0)).foreach: len =>
+      if cdb.length < len then
+        throw new IllegalArgumentException(f"CDB for opcode 0x$op%02x is ${cdb.length} bytes, needs $len")
+    op
+
+  private def dataOp(cdb: Array[Byte]): Int =
+    val op = checked(cdb)
+    if !dataOps.contains(op) then
+      throw new IllegalArgumentException(f"opcode 0x$op%02x has no LBA/transfer length fields")
+    op
+
+  def lba(cdb: Array[Byte]): Long =
+    dataOp(cdb) match
+      case Op.Read6 | Op.Write6 => be(cdb, 1, 3) & 0x1FFFFFL
+      case Op.Read10 | Op.Write10 | Op.WriteSame10 | Op.WriteVerify10 | Op.SyncCache10 |
+           Op.Read12 | Op.Write12 => be(cdb, 2, 4)
+      case _ => be(cdb, 2, 8)
+
+  /** Number of logical blocks; 0 in a 6-byte CDB means 256 */
   def transferLength(cdb: Array[Byte]): Long =
-    length(cdb(0)) match
-      case Some(6) =>
+    dataOp(cdb) match
+      case Op.Read6 | Op.Write6 =>
         val n = cdb(4) & 0xff
         if n == 0 then 256L else n.toLong
-      case Some(10) => be(cdb, 7, 2)
-      case Some(12) => be(cdb, 6, 4)
-      case Some(16) => be(cdb, 10, 4)
-      case _ => throw new IllegalArgumentException(f"unsupported CDB opcode 0x${cdb(0) & 0xff}%02x")
+      case Op.Read10 | Op.Write10 | Op.WriteSame10 | Op.WriteVerify10 | Op.SyncCache10 => be(cdb, 7, 2)
+      case Op.Read12 | Op.Write12 => be(cdb, 6, 4)
+      case Op.CompareAndWrite => cdb(13) & 0xffL
+      case _ => be(cdb, 10, 4)
 
   /** Force Unit Access; meaningful only for WRITE 10/12/16 and WRITE AND VERIFY */
   def fua(cdb: Array[Byte]): Boolean =
-    (cdb(0) & 0xff) match
+    checked(cdb) match
       case Op.Write10 | Op.Write12 | Op.Write16 | Op.WriteVerify10 | Op.WriteVerify16 => (cdb(1) & 0x08) != 0
       case _ => false

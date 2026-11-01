@@ -63,3 +63,56 @@ class CdbSuite extends AnyFunSuite with Matchers:
     cdb(1) = 0xFF.toByte
     cdb(2) = 0x12; cdb(3) = 0x34
     Cdb.lba(cdb) should be (0x1F1234L)
+
+  private def cdbOf(op: Int, n: Int): Array[Byte] =
+    val c = new Array[Byte](n)
+    c(0) = op.toByte
+    c
+
+  test("COMPARE AND WRITE count is byte 13 only"):
+    val c = cdbOf(Op.CompareAndWrite, 16)
+    for i <- 2 until 10 do c(i) = (i - 1).toByte
+    c(10) = 0x7F; c(11) = 0x7F; c(12) = 0x7F; c(13) = 3
+    Cdb.lba(c) should be (0x0102030405060708L)
+    Cdb.transferLength(c) should be (3L)
+
+  test("SYNCHRONIZE CACHE 16 and WRITE SAME decode"):
+    val c = cdbOf(Op.SyncCache16, 16)
+    c(9) = 9; c(13) = 4
+    Cdb.lba(c) should be (9L)
+    Cdb.transferLength(c) should be (4L)
+    val ws = cdbOf(Op.WriteSame10, 10)
+    ws(5) = 6; ws(8) = 2
+    Cdb.lba(ws) should be (6L)
+    Cdb.transferLength(ws) should be (2L)
+
+  test("opcodes without LBA or length fields are rejected"):
+    for op <- Seq(Op.Unmap, Op.ReadCapacity10, Op.ModeSense10, Op.MaintenanceIn, Op.ServiceActionIn16) do
+      val c = cdbOf(op, 16)
+      an [IllegalArgumentException] should be thrownBy Cdb.lba(c)
+      an [IllegalArgumentException] should be thrownBy Cdb.transferLength(c)
+
+  test("empty and truncated CDBs are rejected"):
+    val empty = Array.empty[Byte]
+    an [IllegalArgumentException] should be thrownBy Cdb.lba(empty)
+    an [IllegalArgumentException] should be thrownBy Cdb.transferLength(empty)
+    an [IllegalArgumentException] should be thrownBy Cdb.fua(empty)
+    val short = cdbOf(Op.Write16, 10)
+    an [IllegalArgumentException] should be thrownBy Cdb.lba(short)
+    an [IllegalArgumentException] should be thrownBy Cdb.transferLength(short)
+    an [IllegalArgumentException] should be thrownBy Cdb.fua(short)
+
+  test("FUA across write opcodes"):
+    for (op, n) <- Seq((Op.Write12, 12), (Op.Write16, 16), (Op.WriteVerify10, 10)) do
+      val c = cdbOf(op, n)
+      c(1) = 0x08
+      Cdb.fua(c) should be (true)
+      c(1) = 0x00
+      Cdb.fua(c) should be (false)
+    val w6 = cdbOf(Op.Write6, 6)
+    w6(1) = 0x08
+    Cdb.fua(w6) should be (false)
+    val w16 = cdbOf(Op.Write16, 16)
+    w16(1) = 0xF7.toByte
+    Cdb.fua(w16) should be (false)
+

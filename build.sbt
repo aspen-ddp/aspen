@@ -42,6 +42,9 @@ lazy val root = (project in file(".")).
                                                                                        classifier "osx-aarch_64",
       // Linux only: QuicNet falls back to NIO without it
       "io.netty"                         %  "netty-transport-native-epoll" % "4.2.19.Final" classifier "linux-x86_64",
+      // vdisk-server's org.kernel.TCMUService1 D-Bus service (targetcli)
+      "com.github.hypfvieh"              %  "dbus-java-core"          % "5.2.2",
+      "com.github.hypfvieh"              %  "dbus-java-transport-native-unixsocket" % "5.2.2",
     ),
 
     // Include the Backblaze Java source files during compilation

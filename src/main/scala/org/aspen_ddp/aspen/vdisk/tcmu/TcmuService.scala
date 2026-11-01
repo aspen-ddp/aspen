@@ -4,6 +4,7 @@ import org.aspen_ddp.aspen.vdisk.{DiskGeometry, LockableBlockDevice, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.ring.Ring
 import org.aspen_ddp.aspen.vdisk.tcmu.scsi.ScsiCommands
 import org.aspen_ddp.aspen.vdisk.tcmu.sys.{Libc, Linux}
+import scribe.Level
 
 import java.lang.foreign.{Arena, MemorySegment}
 import java.util.concurrent.atomic.AtomicBoolean
@@ -54,9 +55,11 @@ final class LinuxTcmuKernel(val configfs: Configfs = Configfs()) extends TcmuKer
         catch case NonFatal(c) => e.addSuppressed(c)
         throw e
 
-/** @param acquireTimeout bounds each of a device add's open of its disk and its acquire: an add that has not
-  *                       finished either within this time replies `-ETIMEDOUT` and is torn down. The kernel blocks
-  *                       targetcli meanwhile, and the timeout bounds it.
+/** @param acquireTimeout bounds every disk operation a lifecycle event waits for, since the kernel blocks targetcli
+  *                       until it gets the reply: an add's open, acquire and grow (an add that has not finished one
+  *                       within this time replies `-ETIMEDOUT` and is torn down), a reconfig's grow (`-ETIMEDOUT`;
+  *                       the device keeps serving its old size) and a remove's release (the disk is then closed
+  *                       crash-only and the remove replies 0).
   */
 final case class TcmuServiceConfig(acquireTimeout: FiniteDuration = 60.seconds)
 
@@ -67,15 +70,20 @@ final case class TcmuServiceConfig(acquireTimeout: FiniteDuration = 60.seconds)
   * closed crash-only and the ring is unmapped.
   *
   * Statuses are `0` or `-errno`, as the kernel expects in the netlink reply.
+  *
+  * `log` is the sink for every line this service and the devices it serves log, scribe by default.
   */
 final class TcmuService(kernel: TcmuKernel,
                         openDisk: String => Future[LockableBlockDevice],
-                        config: TcmuServiceConfig = TcmuServiceConfig())(using ExecutionContext):
+                        config: TcmuServiceConfig = TcmuServiceConfig(),
+                        log: (Level, String) => Unit = FailureLog.toScribe)(using ExecutionContext):
   import TcmuService.*
   import Linux.{EINVAL, EIO, ENODEV, ENOENT, ETIMEDOUT}
 
-  private final class Served(val uio: UioName, val disk: String, val name: String, val device: LockableBlockDevice,
-                             val commands: ScsiCommands, val tcmu: TcmuDevice, val unmap: () => Unit)
+  private final class Served(val minor: Int, val uio: UioName, val disk: String, val name: String,
+                             val device: LockableBlockDevice, val commands: ScsiCommands, val tcmu: TcmuDevice,
+                             val unmap: () => Unit):
+    def label: String = TcmuService.label(name, minor, disk)
 
   /** What a device add has opened so far, for its failure log and teardown. */
   private final class Adding(val minor: Int):
@@ -85,7 +93,7 @@ final class TcmuService(kernel: TcmuKernel,
     @volatile var device: Option[LockableBlockDevice] = None
     @volatile var unmap: Option[() => Unit] = None
     @volatile var tcmu: Option[TcmuDevice] = None
-    def where: String = s"device $name (uio$minor, disk $disk)"
+    def where: String = s"device ${label(name, minor, disk)}"
 
   private final case class KernelView(uio: UioName, size: Long, blockSize: Int, maxSectors: Int, mapSize: Long,
                                       serial: Option[String])
@@ -108,7 +116,7 @@ final class TcmuService(kernel: TcmuKernel,
     result.map(_ => 0).recover:
       case LifecycleError(errno, _) => -errno
       case NonFatal(e) =>
-        scribe.error(s"tcmu: $event failed: $e")
+        log(Level.Error, s"tcmu: $event failed: $e")
         -EIO
 
   /** Adds every `aspen` UIO device already present, with `reopen`. One failure does not stop the others. */
@@ -116,38 +124,44 @@ final class TcmuService(kernel: TcmuKernel,
     Future(kernel.configfs.scanUio()).flatMap: found =>
       val adds = found.flatMap: (minor, uio) =>
         if uio.subtype != Subtype then
-          scribe.debug(s"tcmu: startup scan: uio$minor has subtype ${uio.subtype}; not ours")
+          log(Level.Debug, s"tcmu: startup scan: uio$minor has subtype ${uio.subtype}; not ours")
           None
         else
           Some(added(minor, reopen = true).recover:
-            case NonFatal(e) => scribe.warn(s"tcmu: startup scan: uio$minor (${uio.device}) not served: $e"))
+            case NonFatal(e) => log(Level.Warn, s"tcmu: startup scan: uio$minor (${uio.device}) not served: $e"))
       Future.sequence(adds).map(_ => ())
 
   def added(minor: Int, reopen: Boolean): Future[Unit] = serialized(minor)(add(minor, reopen))
 
-  /** Stops serving, releases the disk, then unmaps. Always succeeds: the kernel removes the device regardless. */
+  /** Stops serving, releases the disk, then unmaps. Always succeeds: the kernel removes the device regardless. A
+    * release that has not finished within `acquireTimeout` is abandoned and the disk closed crash-only (its lock is
+    * not released).
+    */
   def removed(minor: Int): Future[Unit] = serialized(minor):
     synchronized(served.remove(minor)) match
       case None =>
-        scribe.warn(s"tcmu: remove of uio$minor: no such device")
+        log(Level.Warn, s"tcmu: remove of uio$minor: no such device")
         Future.unit
       case Some(s) =>
-        val where = s"device ${s.name} (uio$minor, disk ${s.disk})"
+        val where = s"device ${s.label}"
         Future(logged(where, "stop serving")(s.tcmu.stop()))
           .flatMap: _ =>
-            attempt(s.device.release()).recover:
-              case NonFatal(e) => scribe.error(s"tcmu: removing $where: release failed: $e")
+            withTimeout("released", attempt(s.device.release())).recover:
+              case LifecycleError(ETIMEDOUT, message) =>
+                log(Level.Error, s"tcmu: removing $where: release failed: $message; closing the disk crash-only")
+                logged(where, "close disk")(s.device.close())
+              case NonFatal(e) => log(Level.Error, s"tcmu: removing $where: release failed: $e")
           .map: _ =>
             logged(where, "unmap")(s.unmap())
-            scribe.info(s"tcmu: removed $where")
+            log(Level.Info, s"tcmu: removed $where")
 
   def reconfig(minor: Int, change: ReconfigChange): Future[Unit] = serialized(minor):
     synchronized(served.get(minor)) match
       case None =>
-        scribe.error(s"tcmu: reconfig of uio$minor ($change): no such device")
+        log(Level.Error, s"tcmu: reconfig of uio$minor ($change): no such device")
         Future.failed(LifecycleError(ENODEV, s"uio$minor is not served"))
       case Some(s) =>
-        val where = s"device ${s.name} (uio$minor, disk ${s.disk})"
+        val where = s"device ${s.label}"
         val result = change match
           case ReconfigChange.Size(n) => resize(s, n)
           case ReconfigChange.Config(_) => Future.failed(LifecycleError(EINVAL, "changing the cfgstring is not supported"))
@@ -157,7 +171,7 @@ final class TcmuService(kernel: TcmuKernel,
         result.recoverWith:
           case NonFatal(e) =>
             val error = asLifecycle(e)
-            scribe.error(s"tcmu: reconfig of $where ($change) failed: errno ${error.errno}: ${error.message}")
+            log(Level.Error, s"tcmu: reconfig of $where ($change) failed: errno ${error.errno}: ${error.message}")
             Future.failed(error)
 
   private def resize(s: Served, n: Long): Future[Unit] =
@@ -172,11 +186,13 @@ final class TcmuService(kernel: TcmuKernel,
       val grown = if n > s.device.geometry.size then growDisk(s.device, n) else Future.unit
       grown.map: _ =>
         s.commands.resized(n)
-        scribe.info(s"tcmu: device ${s.name} (disk ${s.disk}) resized from ${current.size} to $n")
+        log(Level.Info, s"tcmu: device ${s.label} resized from ${current.size} to $n")
 
+  /** Grows the Aspen disk, within `acquireTimeout` */
   private def growDisk(device: LockableBlockDevice, size: Long): Future[Unit] =
-    mapped(device.grow(size)):
+    withTimeout("grown", mapped(device.grow(size)) {
       case _: VDiskError.InvalidGeometry | _: VDiskError.InvalidRequest => EINVAL
+    })
 
   private def add(minor: Int, reopen: Boolean): Future[Unit] =
     val a = Adding(minor)
@@ -195,9 +211,11 @@ final class TcmuService(kernel: TcmuKernel,
             checkGeometry(k, geometry)
             a.step = "acquire"
             mapped(withTimeout("acquired", d.acquire()))(PartialFunction.empty).flatMap: _ =>
-              if k.size > geometry.size then
+              // The size as of the acquire: a concurrent grow-disk may have changed it since the open
+              val size = d.geometry.size
+              if k.size > size then
                 a.step = "grow"
-                scribe.warn(s"tcmu: ${a.where}: growing Aspen disk ${a.disk} from ${geometry.size} to ${k.size} " +
+                log(Level.Warn, s"tcmu: ${a.where}: growing Aspen disk ${a.disk} from $size to ${k.size} " +
                   "to match the targetcli size")
                 growDisk(d, k.size)
               else
@@ -206,7 +224,7 @@ final class TcmuService(kernel: TcmuKernel,
     result.recoverWith:
       case NonFatal(e) =>
         val error = asLifecycle(e)
-        scribe.error(s"tcmu: adding ${a.where} failed at ${a.step}: errno ${error.errno}: ${error.message}")
+        log(Level.Error, s"tcmu: adding ${a.where} failed at ${a.step}: errno ${error.errno}: ${error.message}")
         teardown(a)
         Future.failed(error)
 
@@ -221,7 +239,7 @@ final class TcmuService(kernel: TcmuKernel,
     a.name = uio.device
     synchronized(served.get(a.minor)) match
       case Some(s) if s.uio == uio =>
-        scribe.info(s"tcmu: uio${a.minor} (${uio.device}) is already served; nothing to do")
+        log(Level.Info, s"tcmu: uio${a.minor} (${uio.device}) is already served; nothing to do")
         return None
       case Some(s) => dropStale(a.minor, s, uio)
       case None => ()
@@ -240,8 +258,8 @@ final class TcmuService(kernel: TcmuKernel,
     * does when an add's reply was not 0. Crash-only: stop serving, close the disk (its lock is not released), unmap.
     */
   private def dropStale(minor: Int, s: Served, now: UioName): Unit =
-    val where = s"device ${s.name} (uio$minor, disk ${s.disk})"
-    scribe.warn(s"tcmu: uio$minor is now ${now.device} (${now.cfgstring}); dropping the stale $where")
+    val where = s"device ${s.label}"
+    log(Level.Warn, s"tcmu: uio$minor is now ${now.device} (${now.cfgstring}); dropping the stale $where")
     synchronized(served.remove(minor)): Unit
     logged(where, "stop serving")(s.tcmu.stop())
     logged(where, "close disk")(s.device.close())
@@ -264,7 +282,7 @@ final class TcmuService(kernel: TcmuKernel,
       a.step = "reset ring"
       // As libtcmu: a failed reset is logged and the device is opened anyway
       try control.resetRing()
-      catch case NonFatal(e) => scribe.warn(s"tcmu: ${a.where}: Could not reset ring: $e")
+      catch case NonFatal(e) => log(Level.Warn, s"tcmu: ${a.where}: Could not reset ring: $e")
     a.step = "open ring"
     val (segment, channel, unmap) =
       try kernel.openRing(a.minor, k.mapSize)
@@ -274,13 +292,15 @@ final class TcmuService(kernel: TcmuKernel,
     a.step = "start serving"
     val settings = DeviceSettings(k.size, k.blockSize, k.maxSectors, geometry.blockObjectSize, k.uio.device,
       k.serial.getOrElse(a.disk))
-    val commands = ScsiCommands(device, settings)
-    val tcmu = TcmuDevice(k.uio.device, ring, channel, control, commands, FailureLog(k.uio.device))
+    // Every report names the device, its UIO minor and its disk
+    val failures = FailureLog(label(k.uio.device, a.minor, a.disk), log = log)
+    val commands = ScsiCommands(device, settings, failures)
+    val tcmu = TcmuDevice(k.uio.device, ring, channel, control, commands, failures)
     a.tcmu = Some(tcmu)
     tcmu.start()
     synchronized:
-      served(a.minor) = Served(k.uio, a.disk, k.uio.device, device, commands, tcmu, unmap)
-    scribe.info(s"tcmu: serving ${a.where}: ${k.size} bytes, block size ${k.blockSize}")
+      served(a.minor) = Served(a.minor, k.uio, a.disk, k.uio.device, device, commands, tcmu, unmap)
+    log(Level.Info, s"tcmu: serving ${a.where}: ${k.size} bytes, block size ${k.blockSize}")
 
   /** Crash-only: stop serving, unmap, close the disk. */
   private def teardown(a: Adding): Unit =
@@ -290,7 +310,7 @@ final class TcmuService(kernel: TcmuKernel,
 
   private def logged(where: String, what: String)(body: => Unit): Unit =
     try body
-    catch case NonFatal(e) => scribe.error(s"tcmu: $where: $what failed: $e")
+    catch case NonFatal(e) => log(Level.Error, s"tcmu: $where: $what failed: $e")
 
   /** `f`, failed with ETIMEDOUT ("not <what> within ...") if it has not completed within `acquireTimeout`. A
     * success that arrives after the timeout is passed to `late`.
@@ -321,6 +341,9 @@ final class TcmuService(kernel: TcmuKernel,
     p.future
 
 object TcmuService:
+  /** `device (uioN, disk D)`: how every log line names a device */
+  def label(device: String, minor: Int, disk: String): String = s"$device (uio$minor, disk $disk)"
+
   /** The UIO subtype of devices this service serves: the handler name in `targetcli /backstores/user:aspen` */
   val Subtype = "aspen"
 

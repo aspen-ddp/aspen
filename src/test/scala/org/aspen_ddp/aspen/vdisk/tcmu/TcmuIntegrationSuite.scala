@@ -238,10 +238,12 @@ class TcmuIntegrationSuite extends IntegrationTestSuite:
     withDevice(kernelSize = 2 * DiskSize): fx =>
       for
         info <- DiskCatalog.load(client, "d")
+        capacity <- readCapacity(fx.ring)
         w <- run(fx.ring, write10(lba, 1), data)
         r <- run(fx.ring, read10(lba, 1), readLen = Bs)
       yield
         info.geometry.size should be (2 * DiskSize)
+        capacity should be (16 * Mi)
         good(w)
         good(r)
         r.data.toList should be (data.toList)

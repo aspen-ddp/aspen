@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.vdisk.tcmu.scsi.ScsiStatus
 import org.aspen_ddp.aspen.vdisk.tcmu.sys.{Linux, SysError}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
+import scribe.Level
 
 import java.lang.foreign.ValueLayout.JAVA_SHORT
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -24,8 +25,16 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
   private val Bs = 4096
   private val Mi = 1024L * 1024
 
+  /** A log sink that records every line, from any thread */
+  private final class Sink extends ((Level, String) => Unit):
+    private val lines = ConcurrentLinkedQueue[(Level, String)]()
+    def apply(level: Level, message: String): Unit = lines.add((level, message)): Unit
+    /** Lines at warn or above */
+    def warnings: List[String] = lines.asScala.toList.filter(_._1.value >= Level.Warn.value).map(_._2)
+    def at(level: Level): List[String] = lines.asScala.toList.filter(_._1 == level).map(_._2)
+
   private final class Fixture(val kernel: FakeTcmuKernel, val service: TcmuService,
-                              val disks: TrieMap[String, FakeBlockDevice]):
+                              val disks: TrieMap[String, FakeBlockDevice], val log: Sink):
     def disk(name: String, auto: Boolean = true,
              geo: DiskGeometry = DiskGeometry(8 * Mi, Bs, 16384)): FakeBlockDevice =
       val d = FakeBlockDevice(geo, auto)
@@ -39,8 +48,9 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       disks.get(name) match
         case Some(d) => Future.successful(d)
         case None => Future.failed(VDiskError.DiskNotFound(name))
-    val service = TcmuService(kernel, open, config)
-    try f(Fixture(kernel, service, disks))
+    val log = Sink()
+    val service = TcmuService(kernel, open, config, log)
+    try f(Fixture(kernel, service, disks, log))
     finally
       for d <- disks.values do d.auto = true
       for minor <- service.devices.keys do Try(Await.result(service.removed(minor), 5.seconds))
@@ -76,16 +86,6 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
     val blockLen = b.getInt(4)
     (lastLba + 1) * blockLen
 
-  /** Captures warn lines, from any thread, while `body` runs. */
-  private def warnings(body: => Unit): List[String] =
-    val lines = ConcurrentLinkedQueue[String]()
-    val handler = scribe.handler.LogHandler(scribe.Level.Warn): r =>
-      lines.add(r.logOutput.plainText): Unit
-    scribe.Logger.root.withHandler(handler).replace()
-    try body
-    finally scribe.Logger.root.withoutHandler(handler).replace()
-    lines.asScala.toList
-
   private def readServed(fx: Fixture, minor: Int, dev: FakeBlockDevice): Unit =
     val k = fx.kernel.kernel(minor)
     k.submit(read10(1, 1), readLen = Bs)
@@ -118,9 +118,8 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       val dev = fx.disk("vd1")
       fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
       os.remove(fx.kernel.core / "user_1" / "dev1" / "action" / "reset_ring")
-      val lines = warnings:
-        status(fx.service.added(3, reopen = true)) should be (0)
-      lines.exists(l => l.contains("Could not reset ring") && l.contains("dev1")) should be (true)
+      status(fx.service.added(3, reopen = true)) should be (0)
+      fx.log.warnings.exists(l => l.contains("Could not reset ring") && l.contains("dev1")) should be (true)
       readServed(fx, 3, dev)
 
   test("unknown disk is -ENOENT and nothing is left open"):
@@ -140,10 +139,9 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
     withService(): fx =>
       val dev = fx.disk("vdgrow")
       fx.kernel.addDevice(3, "dev1", "aspen/vdgrow", 16 * Mi)
-      val lines = warnings:
-        status(fx.service.added(3, reopen = false)) should be (0)
-      lines.exists(l => l.contains(s"growing Aspen disk vdgrow from ${8 * Mi} to ${16 * Mi} to match the " +
-        "targetcli size")) should be (true)
+      status(fx.service.added(3, reopen = false)) should be (0)
+      fx.log.warnings.exists(l => l.contains(s"growing Aspen disk vdgrow from ${8 * Mi} to ${16 * Mi} to match " +
+        "the targetcli size")) should be (true)
       readServed(fx, 3, dev)
       dev.logged.take(3) should be (List(("acquire", Nil), ("grow", List(16 * Mi)), ("read", List(Bs.toLong, Bs))))
       readCapacity(fx.kernel.kernel(3)) should be (16 * Mi)
@@ -179,6 +177,33 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       fx.kernel.addDevice(3, "dev1", "aspen/vd1", 16 * Mi)
       status(fx.service.added(3, reopen = false)) should be (-Linux.EINVAL)
       dev.closes should be (1)
+
+  test("a grow on add that never completes times out and the device is closed"):
+    withService(TcmuServiceConfig(acquireTimeout = 200.millis)): fx =>
+      val dev = fx.disk("vd1", auto = false)
+      fx.kernel.addDevice(3, "dev1", "aspen/vd1", 16 * Mi)
+      val f = fx.service.added(3, reopen = false)
+      await(dev.call(0)).succeed()
+      await(dev.call(1)).name should be ("grow")
+      status(f) should be (-Linux.ETIMEDOUT)
+      dev.closes should be (1)
+      fx.kernel.wasOpened(3) should be (false)
+      fx.service.devices should be (empty)
+
+  test("the grow decision on add uses the size after the acquire"):
+    withService(): fx =>
+      val dev = fx.disk("vd1", auto = false)
+      fx.kernel.addDevice(3, "dev1", "aspen/vd1", 16 * Mi)
+      val f = fx.service.added(3, reopen = false)
+      val acquire = await(dev.call(0))
+      // A grow-disk elsewhere commits while the acquire is in flight
+      dev.geo = dev.geo.copy(size = 16 * Mi)
+      dev.auto = true
+      acquire.succeed()
+      status(f) should be (0)
+      dev.names should not contain ("grow")
+      fx.log.warnings.filter(_.contains("growing")) should be (empty)
+      readCapacity(fx.kernel.kernel(3)) should be (16 * Mi)
 
   test("kernel size smaller than the Aspen size serves the kernel size"):
     withService(): fx =>
@@ -266,6 +291,22 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       await(fx.service.onEvent(TcmuEvent.Removed("aspen/vd1", 3, 1))) should be (0)
       fx.kernel.isMapped(3) should be (false)
 
+  test("a release that never completes times out: removed closes the disk and replies 0"):
+    withService(TcmuServiceConfig(acquireTimeout = 200.millis)): fx =>
+      val dev = fx.disk("vd1", auto = false)
+      fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
+      val add = fx.service.added(3, reopen = false)
+      await(dev.call(0)).succeed()
+      status(add) should be (0)
+      val remove = fx.service.onEvent(TcmuEvent.Removed("aspen/vd1", 3, 1))
+      await(dev.call(1)).name should be ("release")
+      await(remove) should be (0)
+      dev.closes should be (1)
+      fx.kernel.isMapped(3) should be (false)
+      fx.service.devices should be (empty)
+      fx.log.at(Level.Error).exists(l => l.contains("not released within") && l.contains("crash-only") &&
+        l.contains("dev1 (uio3, disk vd1)")) should be (true)
+
   test("removed during added waits for the add and leaves nothing open"):
     withService(): fx =>
       val dev = fx.disk("vd1", auto = false)
@@ -342,6 +383,19 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       status(fx.service.added(3, reopen = false)) should be (0)
       status(fx.service.reconfig(3, ReconfigChange.Size(16 * Mi))) should be (-Linux.EIO)
 
+  test("a reconfig grow that never completes times out and the device keeps its size"):
+    withService(TcmuServiceConfig(acquireTimeout = 200.millis)): fx =>
+      val dev = fx.disk("vd1")
+      val k = fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
+      status(fx.service.added(3, reopen = false)) should be (0)
+      dev.auto = false
+      val f = fx.service.reconfig(3, ReconfigChange.Size(16 * Mi))
+      await(dev.call(1)).name should be ("grow")
+      status(f) should be (-Linux.ETIMEDOUT)
+      dev.auto = true
+      fx.service.devices should be (Map(3 -> "vd1"))
+      readCapacity(k) should be (8 * Mi)
+
   test("reconfig for an unknown minor is -ENODEV"):
     withService(): fx =>
       status(fx.service.reconfig(9, ReconfigChange.Size(16 * Mi))) should be (-Linux.ENODEV)
@@ -392,9 +446,8 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       // The kernel unregistered dev1 without a remove (a failed add reply) and reused the minor for dev2
       val dev = fx.disk("vd2")
       fx.kernel.addDevice(3, "dev2", "aspen/vd2", 8 * Mi)
-      val lines = warnings:
-        await(fx.service.onEvent(TcmuEvent.Added("aspen/vd2", 3, 2))) should be (0)
-      lines.exists(l => l.contains("stale") && l.contains("dev1")) should be (true)
+      await(fx.service.onEvent(TcmuEvent.Added("aspen/vd2", 3, 2))) should be (0)
+      fx.log.warnings.exists(l => l.contains("stale") && l.contains("dev1")) should be (true)
       fx.service.devices should be (Map(3 -> "vd2"))
       old.closes should be (1)
       old.names should not contain ("release")
@@ -440,6 +493,18 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       val c = completion(k)
       c.status should be (ScsiStatus.Good)
       String(c.data, java.nio.charset.StandardCharsets.US_ASCII) should include ("serial-42")
+
+  test("a served device's failure reports name the device, its UIO minor and its disk"):
+    withService(): fx =>
+      fx.disk("vd1")
+      val k = fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi)
+      status(fx.service.added(3, reopen = false)) should be (0)
+      // An iovec pointing into the command ring: a malformed entry
+      k.submitRaw(k.commandEntry(k.allocId(), read10(0, 1), Seq((k.cmdrOff.toLong, Bs.toLong))))
+      completion(k).status should be (ScsiStatus.CheckCondition)
+      val reports = fx.log.at(Level.Error).filter(_.contains("malformed-entry"))
+      reports.size should be (1)
+      reports.head should startWith ("dev1 (uio3, disk vd1): malformed-entry")
 
   test("LinuxTcmuKernel maps the uio device shared and the closer unmaps once"):
     val root = os.temp.dir(prefix = "linux-tcmu")

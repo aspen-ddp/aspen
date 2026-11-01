@@ -154,7 +154,8 @@ delete the Aspen disk (`aspen delete-disk <client-config> vd1`) or the D-Bus pol
   step and errno, for example `tcmu: adding device vd1 (uio0, disk vd1) failed at check geometry: errno 22:
   configfs block size 512 does not match the disk's 4096` (the backstore was created without
   `control=hw_block_size=4096`). errno 2 (`ENOENT`) means the disk does not exist; 110 (`ETIMEDOUT`) means Aspen did
-  not open or hand over the disk within 60 s.
+  not open, hand over or grow the disk within 60 s. A remove whose release takes longer than 60 s closes the disk
+  without releasing it and still succeeds.
 * **`targetcli ls /backstores` has no `user:aspen`.** vdisk-server is not running, or the D-Bus policy is not
   installed (vdisk-server then fails to start with the D-Bus error).
 * **vdisk-server will not start.** "already owned on the system bus": tcmu-runner (or another vdisk-server) is
@@ -162,4 +163,5 @@ delete the Aspen disk (`aspen delete-disk <client-config> vd1`) or the D-Bus pol
 * **`dmesg`** shows kernel iSCSI/SCSI errors, ext4 errors, and TCMU timeouts.
 * **A command fails with sense data and the log shows a ring dump** (`malformed-entry`, `ring-corrupt`,
   `command-error` and so on). That command failed and the device kept serving. Repeats of the same kind within a minute
-  are only counted, then summarized in one warning line; the first, full line has the details.
+  are only counted, then summarized in one warning line; the first, full line has the details and, for an unexpected
+  exception (`command-error`), its stack trace. Every line names the device, its UIO minor and its disk.

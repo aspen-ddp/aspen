@@ -25,6 +25,10 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
   /** cmdId -> number of consumed, uncompleted CMD entries carrying it. Guarded by `this`. */
   private val outstanding = mutable.HashMap[Int, Int]()
   private var outstandingCount = 0
+  /** The last `cmd_tail` this ring wrote, or adopted at open/resync. A mailbox `cmd_tail` that differs means the
+    * kernel reset the ring under us, so `complete` writes nothing until `resync`. Guarded by `this`.
+    */
+  private var expectedTail: Long = initial.tail
 
   private def u8(off: Long): Int = map.get(JAVA_BYTE, off) & 0xff
   private def u16(off: Long): Int = map.get(JAVA_SHORT, off) & 0xffff
@@ -103,12 +107,14 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
           ids += cmdId
           items += (decodeCmd(g, e, len, cmdId) match
             case Right(cmd) => cmd
-            case Left(reason) => RingItem.Malformed(cmdId, s"entry at $pos: $reason", entryDump(g, pos, true)))
+            case Left(reason) =>
+              RingItem.Malformed(cmdId, s"entry at $pos: $reason", entryDump(g, pos, true), completable = true))
         case OpTmr =>
           val cnt = if len < TmrCmdIds then -1L else u32(e + TmrCmdCnt)
           if cnt < 0 || TmrCmdIds + 2 * cnt > len then
             items += RingItem.Malformed(u16(e + EntCmdId),
-              s"TMR entry at $pos: cmd_cnt=$cnt does not fit in length $len", entryDump(g, pos, false))
+              s"TMR entry at $pos: cmd_cnt=$cnt does not fit in length $len", entryDump(g, pos, false),
+              completable = false)
           else
             val cmdIds = (0L until cnt).map(i => u16(e + TmrCmdIds + 2 * i)).toVector
             items += RingItem.Tmr(u8(e + TmrType), cmdIds)
@@ -158,7 +164,8 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
                 s"[$dataStart, $mapSize)")
 
   /** Completes `cmdId`. Returns false, writing nothing, when it is not outstanding (a double completion, or a
-    * command consumed before a `resync`) or the ring no longer holds an entry for it.
+    * command consumed before a `resync`), when the mailbox `cmd_tail` is not the one this ring last wrote (the
+    * kernel reset the ring and `resync` has not run yet), or the ring no longer holds an entry for it.
     */
   def complete(cmdId: Int, status: Int, sense: Array[Byte], readLen: Option[Int]): Boolean = synchronized:
     outstanding.get(cmdId) match
@@ -167,22 +174,24 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
         val g = geometry
         val limit = consumeTail
         var tail = acquire(MbCmdTail)
+        val reset = tail != expectedTail
         def lenAt(t: Long): Long = u32(g.cmdrOff + t + EntLenOp) & ~OpMask.toLong
         def opAt(t: Long): Long = u32(g.cmdrOff + t + EntLenOp) & OpMask
         def usable(t: Long): Boolean = t < g.cmdrSize && t % Align == 0 && t != limit && lenAt(t) >= HdrSize &&
           t + lenAt(t) <= g.cmdrSize
         while usable(tail) && opAt(tail) != OpCmd do
           tail = (tail + lenAt(tail)) % g.cmdrSize
-        if !usable(tail) || lenAt(tail) < RspSize then
+        if reset || !usable(tail) || lenAt(tail) < RspSize then
           false
         else
           val e = g.cmdrOff + tail
           map.set(JAVA_SHORT, e + EntCmdId, cmdId.toShort)
           map.set(JAVA_BYTE, e + RspScsiStatus, status.toByte)
-          if sense.nonEmpty then
-            val n = math.min(sense.length, SenseSize)
-            MemorySegment.copy(sense, 0, map, JAVA_BYTE, e + RspSense, n)
-            map.asSlice(e + RspSense + n, (SenseSize - n).toLong).fill(0)
+          // Always the whole area: the slot may hold another command's request bytes, which the kernel would
+          // copy out as sense on CHECK CONDITION.
+          val n = math.min(sense.length, SenseSize)
+          MemorySegment.copy(sense, 0, map, JAVA_BYTE, e + RspSense, n)
+          map.asSlice(e + RspSense + n, (SenseSize - n).toLong).fill(0)
           val uflags = u8(e + EntUFlags)
           readLen match
             case Some(n) if (g.flags & FlagReadLen) != 0 =>
@@ -190,7 +199,8 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
               map.set(JAVA_BYTE, e + EntUFlags, (uflags | UFlagReadLen).toByte)
             case _ =>
               map.set(JAVA_BYTE, e + EntUFlags, (uflags & ~UFlagReadLen).toByte)
-          intHandle.setRelease(map, MbCmdTail.toLong, ((tail + lenAt(tail)) % g.cmdrSize).toInt): Unit
+          expectedTail = (tail + lenAt(tail)) % g.cmdrSize
+          intHandle.setRelease(map, MbCmdTail.toLong, expectedTail.toInt): Unit
           if count == 1 then outstanding.remove(cmdId) else outstanding(cmdId) = count - 1
           outstandingCount -= 1
           true
@@ -198,10 +208,18 @@ final class Ring private (map: MemorySegment, initial: Ring.Geometry):
   /** After the kernel resets the ring: revalidates the mailbox, restarts consumption at its `cmd_tail` and forgets
     * every outstanding command (the kernel retries them).
     */
-  def resync(): Either[String, Unit] = synchronized:
+  def resync(): Either[String, Unit] = resync(() => ())
+
+  /** Runs `reset` (which makes the kernel reset the ring) and then resyncs, all under the completion lock, so no
+    * stale completion can land in between. The `cmd_tail` check in `complete` cannot see a reset when the tail
+    * was already 0, so this is the safe way to reset.
+    */
+  def resync(reset: () => Unit): Either[String, Unit] = synchronized:
+    reset()
     validate(map).map: g =>
       geometry = g
       consumeTail = g.tail
+      expectedTail = g.tail
       outstanding.clear()
       outstandingCount = 0
 

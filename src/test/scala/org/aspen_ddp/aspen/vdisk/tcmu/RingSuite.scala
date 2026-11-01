@@ -102,7 +102,7 @@ class RingSuite extends AnyFunSuite with Matchers:
       val id = fake.allocId()
       fake.submitRaw(fake.commandEntry(id, read10(0, 1), Seq((0L, 512L))))
       ring.nextItems() match
-        case List(RingItem.Malformed(mid, reason, dump)) =>
+        case List(RingItem.Malformed(mid, reason, dump, true)) =>
           mid should be (id)
           reason should include ("iovec")
           dump should include (s"cmd_id=$id")
@@ -123,7 +123,7 @@ class RingSuite extends AnyFunSuite with Matchers:
       val b = fake.allocId()
       fake.submitRaw(fake.commandEntry(b, read10(0, 1), iov, difCnt = 1))
       ring.nextItems() match
-        case List(RingItem.Malformed(`a`, ra, _), RingItem.Malformed(`b`, rb, _)) =>
+        case List(RingItem.Malformed(`a`, ra, _, true), RingItem.Malformed(`b`, rb, _, true)) =>
           ra should include ("iov_bidi_cnt")
           rb should include ("iov_dif_cnt")
         case other => fail(s"expected two Malformed, got $other")
@@ -138,7 +138,7 @@ class RingSuite extends AnyFunSuite with Matchers:
       java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.nativeOrder()).putInt(ReqIovCnt, 1000)
       fake.submitRaw(bytes)
       ring.nextItems() match
-        case List(RingItem.Malformed(`id`, reason, _)) => reason should include ("iov_cnt")
+        case List(RingItem.Malformed(`id`, reason, _, true)) => reason should include ("iov_cnt")
         case other => fail(s"expected Malformed, got $other")
 
   test("a CDB outside the map is Malformed"):
@@ -149,7 +149,7 @@ class RingSuite extends AnyFunSuite with Matchers:
         .putLong(ReqCdbOff, fake.segment.byteSize() - 4)
       fake.submitRaw(bytes)
       ring.nextItems() match
-        case List(RingItem.Malformed(`id`, reason, _)) => reason should include ("cdb_off")
+        case List(RingItem.Malformed(`id`, reason, _, true)) => reason should include ("cdb_off")
         case other => fail(s"expected Malformed, got $other")
 
   test("a TMR count larger than the entry is Malformed"):
@@ -159,7 +159,7 @@ class RingSuite extends AnyFunSuite with Matchers:
       buf.putInt(TmrCmdCnt, 5)
       fake.submitRaw(buf.array())
       ring.nextItems() match
-        case List(RingItem.Malformed(_, reason, _)) => reason should include ("cmd_cnt")
+        case List(RingItem.Malformed(_, reason, _, false)) => reason should include ("cmd_cnt")
         case other => fail(s"expected Malformed, got $other")
       ring.inFlight should be (0)
 
@@ -277,3 +277,63 @@ class RingSuite extends AnyFunSuite with Matchers:
       val done = fake.completions().map(_.cmdId)
       done.sorted should be (ids.sorted)
       fake.mailboxTail should be (fake.mailboxHead)
+
+  test("a completion after a kernel reset but before resync writes nothing"):
+    withRing(): (fake, ring) =>
+      // A completed warm-up command moves cmd_tail off 0, so the kernel's reset to 0 is visible.
+      val warm = fake.submit(read10(9, 1), readLen = 512)
+      val old = fake.submit(read10(0, 1), readLen = 512)
+      ring.nextItems().size should be (2)
+      ring.complete(warm, 0, Array.empty, None) should be (true)
+      fake.completions().map(_.cmdId) should be (List(warm))
+      fake.mailboxTail should not be (0)
+      fake.resetRing()
+      val id = fake.submit(read10(1, 1), readLen = 512)
+      val before = fake.segment.toArray(JAVA_BYTE)
+      ring.complete(old, 0, Array.empty, Some(512)) should be (false)
+      fake.segment.toArray(JAVA_BYTE).sameElements(before) should be (true)
+      ring.resync() should be (Right(()))
+      val cmd = onlyCommand(ring.nextItems())
+      cmd.cmdId should be (id)
+      val data = pattern(512, 5)
+      ring.scatter(cmd.iovecs, data) should be (512)
+      ring.complete(id, 0, Array.empty, Some(512)) should be (true)
+      val List(c) = fake.completions(): @unchecked
+      c.cmdId should be (id)
+      c.data.toList should be (data.toList)
+
+  test("an empty sense clears the whole sense area"):
+    withRing(): (fake, ring) =>
+      // 20 iovecs fill the slot's sense area (offsets 16-111) with request bytes.
+      val id = fake.submit(read10(0, 1), readLen = 2000, iovSplit = 100)
+      val cmd = onlyCommand(ring.nextItems())
+      cmd.iovecs.size should be (20)
+      val e = fake.cmdrOff.toLong
+      fake.segment.asSlice(e + RspSense, SenseSize).toArray(JAVA_BYTE).exists(_ != 0) should be (true)
+      ring.complete(id, 2, Array.empty, None) should be (true)
+      val List(c) = fake.completions(): @unchecked
+      c.status should be (2)
+      c.sense.toList should be (List.fill(SenseSize)(0.toByte))
+
+  test("resync with a reset callback holds completions off until the ring is resynced"):
+    withRing(): (fake, ring) =>
+      // cmd_tail is 0 before and after this reset, so only the lock keeps the old completion out.
+      val old = fake.submit(read10(0, 1), readLen = 512)
+      ring.nextItems().size should be (1)
+      val result = java.util.concurrent.CompletableFuture[Boolean]()
+      var completer: Thread = null
+      var newId = 0
+      ring.resync: () =>
+        fake.resetRing()
+        newId = fake.submit(read10(1, 1), readLen = 512)
+        completer = Thread.ofPlatform().start(() => result.complete(ring.complete(old, 0, Array.empty, None)))
+        val deadline = System.nanoTime() + 5_000_000_000L
+        while completer.getState != Thread.State.BLOCKED && System.nanoTime() < deadline do Thread.onSpinWait()
+        completer.getState should be (Thread.State.BLOCKED)
+      .fold(e => fail(e), identity)
+      completer.join()
+      result.get() should be (false)
+      val cmd = onlyCommand(ring.nextItems())
+      cmd.cmdId should be (newId)
+      ring.complete(newId, 0, Array.empty, None) should be (true)
+      fake.completions().map(_.cmdId) should be (List(newId))

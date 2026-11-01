@@ -29,5 +29,6 @@ class CfgstringSuite extends AnyFunSuite with Matchers:
   test("an @ after the semicolon is not part of the disk name"):
     Cfgstring.parse("aspen/vd1;x@y") should be (Right("vd1"))
 
-  test("ConfigDesc describes the format"):
-    Cfgstring.ConfigDesc should include ("aspen/<disk>")
+  test("ConfigDesc describes what a targetcli user types"):
+    Cfgstring.ConfigDesc should startWith ("<disk>: ")
+    Cfgstring.ConfigDesc should include ("targetcli adds the aspen/ prefix")

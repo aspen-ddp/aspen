@@ -91,7 +91,7 @@ src/test/scala/org/aspen_ddp/aspen/vdisk/tcmu/
   ConfigfsSuite, CfgstringSuite, TcmuServiceSuite, TcmuDbusServiceSuite, TcmuIntegrationSuite
 native/tcmu-aspen/  → deleted (e2e scripts move to scripts/vdisk-e2e/)
 src/main/scala/org/aspen_ddp/aspen/vdisk/bridge/ and its tests → deleted
-dist/dbus/org.kernel.TCMUService1.conf   D-Bus policy file
+deploy/dbus/org.kernel.TCMUService1.conf D-Bus policy file
 ```
 
 ---
@@ -691,7 +691,7 @@ The fake reclaims data-area space only after completion, as the kernel does.
 - Modify: `build.sbt`. Add `"com.github.hypfvieh" % "dbus-java-core" % <latest 5.x>` and
   `"com.github.hypfvieh" % "dbus-java-transport-native-unixsocket" % <same>`. Pick a release at least two weeks
   old and check that it resolves.
-- Create: `vdisk/tcmu/dbus/TcmuDbusService.scala`, `dist/dbus/org.kernel.TCMUService1.conf`
+- Create: `vdisk/tcmu/dbus/TcmuDbusService.scala`, `deploy/dbus/org.kernel.TCMUService1.conf`
 - Test: `TcmuDbusServiceSuite.scala`
 
 **Interfaces:**

@@ -20,7 +20,9 @@ final class HandlerLogic(diskExists: String => Future[Boolean]):
 
   val configDesc: String = Cfgstring.ConfigDesc
 
-  /** targetcli passes the full cfgstring, `aspen/<disk>`. */
+  /** targetcli passes the full cfgstring, `aspen/<disk>`. Blocks the calling (dbus-java dispatch) thread for up to
+    * `timeout` while Aspen is asked whether the disk exists.
+    */
   def checkConfig(cfg: String, timeout: FiniteDuration = 10.seconds): (Boolean, String) =
     Cfgstring.parse(cfg) match
       case Left(reason) => (false, reason)
@@ -31,21 +33,22 @@ final class HandlerLogic(diskExists: String => Future[Boolean]):
           else
             (false, s"disk $disk not found")
         catch
-          case NonFatal(e) => (false, s"could not reach Aspen: ${e.getMessage}")
+          case NonFatal(e) => (false, s"could not reach Aspen: ${Option(e.getMessage).getOrElse(e.toString)}")
 
   def changeMedium(name: String, size: Long, cfg: String): (Int, String) =
     (-Linux.EOPNOTSUPP, "ChangeMedium is not supported by vdisk-server")
 
 object HandlerLogic:
   /** Disk existence as recorded in the `DiskCatalog`. */
-  def diskExistsIn(client: AspenClient): String => Future[Boolean] = name =>
-    given ExecutionContext = client.clientContext
-    DiskCatalog.load(client, name).map(_ => true).recover { case _: DiskNotFound => false }
+  def diskExistsIn(client: AspenClient): String => Future[Boolean] =
+    diskExistsVia(DiskCatalog.load(client, _))(using client.clientContext)
+
+  /** True when `load` succeeds, false when it fails with `DiskNotFound`; any other failure is passed on. */
+  def diskExistsVia(load: String => Future[Any])(using ExecutionContext): String => Future[Boolean] = name =>
+    load(name).map(_ => true).recover { case _: DiskNotFound => false }
 
 /** The `org.kernel.TCMUService1` service tcmu-runner provides, so that targetcli can create user backstores. */
-final class TcmuDbusService private (conn: DBusConnection,
-                                     handler: TcmuDbusService.HandlerObject,
-                                     manager: TcmuDbusService.ManagerObject):
+final class TcmuDbusService private (conn: DBusConnection):
   def close(): Unit = conn.close()
 
 object TcmuDbusService:
@@ -57,6 +60,7 @@ object TcmuDbusService:
   final class HandlerObject(logic: HandlerLogic) extends TcmuService1:
     override def getObjectPath: String = HandlerPath
 
+    // Runs on a dbus-java dispatch thread, which HandlerLogic.checkConfig blocks for up to its timeout.
     override def CheckConfig(configstr: String): TcmuService1.Reply[java.lang.Boolean, String] =
       val (ok, message) = logic.checkConfig(configstr)
       if !ok then
@@ -79,7 +83,8 @@ object TcmuDbusService:
 
   /** Connects to the system bus, exports the objects and takes the name, failing if another process owns it. */
   def start(logic: HandlerLogic): TcmuDbusService =
-    val conn = DBusConnectionBuilder.forSystemBus().withShared(false).build()
+    // Strong export references: the connection keeps the exported objects alive.
+    val conn = DBusConnectionBuilder.forSystemBus().withShared(false).withExportWeakReferences(false).build()
     try
       val handler = HandlerObject(logic)
       val manager = ManagerObject(handler)
@@ -91,7 +96,7 @@ object TcmuDbusService:
       if reply != DBus.DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER && reply != DBus.DBUS_REQUEST_NAME_REPLY_ALREADY_OWNER then
         throw IllegalStateException(s"$BusName is already owned on the system bus (is tcmu-runner running?)")
       scribe.info(s"Serving $BusName on the system bus")
-      TcmuDbusService(conn, handler, manager)
+      TcmuDbusService(conn)
     catch
       case NonFatal(e) =>
         try conn.close() catch case NonFatal(_) => ()

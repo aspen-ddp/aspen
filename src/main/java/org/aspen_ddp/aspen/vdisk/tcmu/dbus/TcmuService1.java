@@ -16,7 +16,7 @@ import org.freedesktop.dbus.types.UInt64;
 @DBusInterfaceName("org.kernel.TCMUService1")
 public interface TcmuService1 extends DBusInterface {
 
-    /** Two out arguments. */
+    /** Two out arguments. dbus-java 5.2.2's Introspect lists a generic Tuple's out args twice; the wire reply is right. */
     final class Reply<A, B> extends Tuple {
         @Position(0)
         public final A first;

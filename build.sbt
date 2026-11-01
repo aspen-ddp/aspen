@@ -26,7 +26,7 @@ lazy val root = (project in file(".")).
       "com.github.luben"                 %  "zstd-jni"                % "1.5.6-4",
       "com.github.scopt"                 %% "scopt"                   % "4.1.0",
       "com.outr"                         %% "scribe"                  % "3.19.0",
-      "com.outr"                         %% "scribe-slf4j"            % "3.19.0",
+      "com.outr"                         %% "scribe-slf4j2"           % "3.19.0",
       "org.dcache"                       %  "nfs4j-core"              % "0.24.0",
       "org.yaml"                         %  "snakeyaml"               % "1.25",
       "io.scalecube"                     %  "scalecube-cluster"       % "2.7.12",

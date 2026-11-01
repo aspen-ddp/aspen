@@ -4,7 +4,9 @@ package org.aspen_ddp.aspen.vdisk.tcmu
 object Cfgstring:
   private val Prefix = "aspen/"
 
-  val ConfigDesc: String = "aspen/<disk>: <disk> is the name of an Aspen virtual disk (aspen list-disks)"
+  /** The help targetcli prints for `cfgstring=`. targetcli prepends `aspen/` itself, so users type only the disk. */
+  val ConfigDesc: String =
+    "<disk>: the name of an Aspen virtual disk (see `aspen list-disks`); targetcli adds the aspen/ prefix"
 
   /** The disk name. Anything from the first `;` is dropped. */
   def parse(cfg: String): Either[String, String] =

@@ -30,7 +30,9 @@ import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
 import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
-import org.aspen_ddp.aspen.vdisk.bridge.BridgeServer
+import org.aspen_ddp.aspen.vdisk.tcmu.{LinuxTcmuKernel, TcmuEvent, TcmuNetlink, TcmuService}
+import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
+import org.aspen_ddp.aspen.vdisk.tcmu.sys.{Libc, Linux}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, FsifConfig, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
@@ -60,6 +62,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.{DAYS, Duration, HOURS, MILLISECONDS, MINUTES, SECONDS}
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 import scala.language.implicitConversions
 
 
@@ -139,7 +142,6 @@ object Main {
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
                   networkCacheDir:Option[os.Path]=None,
-                  vdiskSocket:os.Path=os.Path("/run/aspen/vdisk.sock"),
                   loadJars:Option[String]=None,
                   outputClientConfig:Option[os.Path]=None)
 
@@ -454,10 +456,6 @@ object Main {
     List(
       clientConfigArg(p),
       bootstrapHostOption(p),
-
-      p.opt[os.Path]("socket").valueName("<path>").
-        text("Unix socket on which to serve disks to tcmu-runner (default /run/aspen/vdisk.sock)").
-        action((x, c) => c.copy(vdiskSocket = x)),
 
       p.opt[os.Path]("network-cache-dir").valueName("<dir>").
         text("Directory in which to cache network lookups across restarts. It must not be shared by two processes").
@@ -865,7 +863,7 @@ object Main {
     Command("create-device-set", "Creates a new storage device set", createDeviceSetArgs),
     Command("create-allocation-group", "Creates a new allocation group", createAllocationGroupArgs),
     Command("create-filesystem", "Creates a new AmoebaFS filesystem", createFilesystemArgs),
-    Command("vdisk-server", "Serves virtual disks to tcmu-runner over a Unix socket", vdiskServerArgs),
+    Command("vdisk-server", "Serves virtual disks to the Linux kernel's TCMU target (requires root)", vdiskServerArgs),
     Command("create-disk", "Creates a new virtual disk", createDiskArgs),
     Command("list-disks", "Lists all virtual disks", configOnlyArgs),
     Command("grow-disk", "Grows a virtual disk", growDiskArgs),
@@ -1009,7 +1007,7 @@ object Main {
                                           cfg.outputClientConfig.getOrElse(os.pwd / ClientConfig.configFilename))
             case "host" => run_host(cfg.hostDirectory, cfg.loadJars)
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
-            case "vdisk-server" => run_vdisk_server(session, cfg.vdiskSocket, cfg.networkCacheDir)
+            case "vdisk-server" => run_vdisk_server(session, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
             case "create-pool" =>
@@ -1434,37 +1432,91 @@ object Main {
       ()
   }
 
-  def run_vdisk_server(session: ClientSession, socket: os.Path, onetworkCacheDir: Option[os.Path] = None): Int = {
+  def run_vdisk_server(session: ClientSession, onetworkCacheDir: Option[os.Path] = None): Int = {
+    if Libc.geteuid() != 0 then
+      println("Error: vdisk-server must run as root")
+      return 1
+
     configureLogging()
 
     def report(err: Throwable): Int =
       println(s"Error: ${Option(err.getMessage).getOrElse(err.toString)}")
       1
 
-    // Checked before the client starts, so a bad socket directory fails fast
-    try
-      BridgeServer.prepareSocketDir(socket)
-    catch
-      case err: Throwable => return report(err)
-
     val (client, network, radicle) = createAspenClient(session, onetworkCacheDir)
 
     network.startIoThread(client)
 
-    val server = BridgeServer(socket, DiskHandle.open(client, _))
+    val netlink =
+      try TcmuNetlink.open()
+      catch case NonFatal(err) => return report(err)
 
-    try
-      server.start()
-    catch
-      case err: Throwable => return report(err)
+    // Held for the life of the process; the connection keeps the exported objects alive
+    val dbus =
+      try TcmuDbusService.start(HandlerLogic(HandlerLogic.diskExistsIn(client)))
+      catch
+        case NonFatal(err) =>
+          try netlink.close() catch case NonFatal(_) => ()
+          return report(err)
 
-    println(s"Serving virtual disks on $socket")
+    val service = TcmuService(LinuxTcmuKernel(), DiskHandle.open(client, _))
+
+    // startupScan logs each device it could not serve
+    Await.ready(service.startupScan(), Duration.Inf).value.foreach:
+      case Failure(err) => scribe.error(s"tcmu: startup scan failed: $err")
+      case Success(_) => ()
+    val served = service.devices.toList.sortBy(_._1).map((minor, disk) => s"uio$minor (disk $disk)")
+    scribe.info(s"tcmu: startup scan done; serving ${served.size} existing device(s): ${served.mkString(", ")}")
+
+    Thread.ofPlatform().name("tcmu-netlink").daemon(true).start: () =>
+      tcmuEventLoop(() => netlink.receive(), service.onEvent, netlink.reply)
+
+    println("Serving virtual disks through TCMU")
 
     // Runs indefinitely, like amoebafs: blocking the main thread keeps the process alive.
     Thread.currentThread.join()
 
     0 // unreachable
   }
+
+  /** The vdisk-server netlink loop: never returns, except by a fatal exception from one of its arguments.
+    *
+    * Each event is handed to `onEvent` and its status is replied when the Future completes, so a slow add does not
+    * hold up other events. A failed `onEvent` replies `-EIO`. A `receive` failure (e.g. ENOBUFS when the kernel's
+    * multicast queue overflowed) is logged and retried after `pause`ing 1 ms, doubling to 1 s while it keeps failing.
+    */
+  private[cmdline] def tcmuEventLoop(receive: () => List[Either[String, TcmuEvent]],
+                                     onEvent: TcmuEvent => Future[Int],
+                                     reply: (TcmuEvent, Int) => Unit,
+                                     pause: Long => Unit = Thread.sleep)(using ExecutionContext): Nothing =
+    def send(event: TcmuEvent, status: Int): Unit =
+      try reply(event, status)
+      catch case NonFatal(e) => scribe.error(s"tcmu: replying $status to $event failed: $e")
+
+    var backoffMs = 0L
+    while true do
+      val received =
+        try Some(receive())
+        catch
+          case NonFatal(e) =>
+            backoffMs = if backoffMs == 0 then 1 else (backoffMs * 2).min(1000)
+            scribe.error(s"tcmu: netlink receive failed (retrying in $backoffMs ms): $e")
+            pause(backoffMs)
+            None
+      received.foreach: messages =>
+        backoffMs = 0
+        messages.foreach:
+          case Left(reason) => scribe.warn(s"tcmu: dropped an unparseable netlink message: $reason")
+          case Right(event) =>
+            val status =
+              try onEvent(event)
+              catch case NonFatal(e) => Future.failed(e)
+            status.onComplete:
+              case Success(s) => send(event, s)
+              case Failure(e) =>
+                scribe.error(s"tcmu: $event failed: $e")
+                send(event, -Linux.EIO)
+    throw IllegalStateException("unreachable")
 
   def run_amoebafs(session: ClientSession, fsName: String, onetworkCacheDir: Option[os.Path] = None): Int = {
     configureLogging()

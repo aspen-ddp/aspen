@@ -1,0 +1,18 @@
+; The I/O that restart-under-io.sh keeps running across a vdisk-server kill -9 and restart.
+; sync=1 makes every completed write durable (each is followed by a cache flush), so the data the restart's
+; lost write cache held was never acknowledged and the verify must pass.
+; Run with: fio restart.fio --directory=/mnt/vd1
+[global]
+ioengine=libaio
+direct=1
+sync=1
+group_reporting=1
+
+[randwrite-verify]
+rw=randwrite
+bs=64k
+size=512m
+iodepth=4
+filename=restart.dat
+verify=crc32c
+verify_backlog=256

@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.vdisk
 
 import scala.concurrent.Future
 
-/** The block-device interface a frontend (the tcmu-runner bridge, or later a direct TCMU ring driver) serves.
+/** The block-device interface a frontend (the native TCMU frontend in `vdisk.tcmu`) serves.
   * Requests may be outstanding together and may complete in any order. Failures are reported as [[VDiskError]]s,
   * which the frontend translates to SCSI status.
   *

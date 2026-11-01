@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Serves an existing Aspen disk over iSCSI through vdisk-server's native TCMU frontend, then formats, mounts and
+# runs the fio smoke job against it. Run as root. Idempotent: steps already done are skipped, and an existing
+# filesystem is kept unless MKFS=1.
+#
+# Variables (see common.sh for defaults): CLIENT_CONFIG (required), DISK, SIZE (must equal the disk's Aspen size, or
+# be larger to grow the disk on add), BLOCK_SIZE (the disk's logical block size), CONTROL (the target_core_user
+# control string), IQN, INITIATOR_IQN, MOUNT, ASPEN (the aspen launcher), NETWORK_CACHE_DIR, LOG, MKFS, SMOKE (0
+# skips fio).
+set -euo pipefail
+
+# shellcheck source=common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
+INITIATOR_IQN="${INITIATOR_IQN:-$(sed -n 's/^InitiatorName=//p' /etc/iscsi/initiatorname.iscsi)}"
+MKFS="${MKFS:-0}"
+SMOKE="${SMOKE:-1}"
+
+require_root
+[[ -n "$INITIATOR_IQN" ]] || die "set INITIATOR_IQN"
+refuse_tcmu_runner
+
+modprobe target_core_user
+modprobe iscsi_target_mod
+
+# The bus policy that lets root own org.kernel.TCMUService1 and targetcli call it
+install -m 0644 "$REPO/deploy/dbus/org.kernel.TCMUService1.conf" /etc/dbus-1/system.d/
+busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
+
+start_server
+check_dbus
+
+create_backstore "$SIZE"
+if ! targetcli "/iscsi/$IQN" ls >/dev/null 2>&1; then
+  targetcli /iscsi create "$IQN"
+fi
+TPG="/iscsi/$IQN/tpg1"
+if ! targetcli "$TPG/luns/lun0" ls >/dev/null 2>&1; then
+  targetcli "$TPG/luns" create "/backstores/user:aspen/$DISK"
+fi
+if ! targetcli "$TPG/acls/$INITIATOR_IQN" ls >/dev/null 2>&1; then
+  targetcli "$TPG/acls" create "$INITIATOR_IQN"
+fi
+if ! targetcli "$TPG/portals/127.0.0.1:3260" ls >/dev/null 2>&1; then
+  # the default 0.0.0.0:3260 portal, if present, would conflict
+  targetcli "$TPG/portals/0.0.0.0:3260" delete >/dev/null 2>&1 || true
+  targetcli "$TPG/portals" create 127.0.0.1
+fi
+targetcli saveconfig
+
+login
+dev="$(wait_for_device)"
+echo "logged in to $IQN: $dev"
+
+if [[ $MKFS == 1 || -z "$(blkid -o value -s TYPE "$dev" || true)" ]]; then
+  mkfs.ext4 -F "$dev"
+fi
+mkdir -p "$MOUNT"
+if ! mountpoint -q "$MOUNT"; then
+  mount "$dev" "$MOUNT"
+fi
+echo "mounted $dev on $MOUNT"
+
+if [[ $SMOKE == 1 ]]; then
+  fio "$E2E_DIR/smoke.fio" --directory="$MOUNT"
+fi

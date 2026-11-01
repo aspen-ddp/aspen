@@ -23,6 +23,8 @@ import org.yaml.snakeyaml.parser.ParserException
 import org.aspen_ddp.aspen.client.PoolObjectAllocatorId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, KeyValueObjectPointer, ObjectId}
 import org.aspen_ddp.aspen.vdisk.{DiskGeometry, DiskInfo}
+import org.aspen_ddp.aspen.vdisk.tcmu.TcmuEvent
+import org.aspen_ddp.aspen.vdisk.tcmu.sys.{Linux, SysError}
 
 import java.util.UUID
 import java.util.concurrent.TimeoutException
@@ -283,17 +285,73 @@ class MainSuite extends AnyFunSuite with Matchers:
     parseCmd("create-disk", "d", "1G", "--pool", "p", "--group", "g") shouldBe None
     parseCmd("create-disk", "d", "1G") shouldBe None
 
-  test("vdisk-server parses --socket and --network-cache-dir"):
-    val parsed = parseCmd("vdisk-server", "--socket", "/tmp/x/v.sock", "--network-cache-dir", "/tmp/nc")
+  test("vdisk-server parses --network-cache-dir and no longer takes --socket"):
+    val parsed = parseCmd("vdisk-server", "--network-cache-dir", "/tmp/nc")
       .getOrElse(fail("vdisk-server did not parse"))
     parsed.mode shouldBe "vdisk-server"
-    parsed.vdiskSocket shouldBe os.Path("/tmp/x/v.sock")
     parsed.networkCacheDir shouldBe Some(os.Path("/tmp/nc"))
+    parseCmd("vdisk-server").getOrElse(fail("vdisk-server did not parse")).networkCacheDir shouldBe None
+    parseCmd("vdisk-server", "--socket", "/tmp/x/v.sock") shouldBe None
 
-  test("vdisk-server defaults the socket to /run/aspen/vdisk.sock"):
-    val parsed = parseCmd("vdisk-server").getOrElse(fail("vdisk-server did not parse"))
-    parsed.vdiskSocket shouldBe os.Path("/run/aspen/vdisk.sock")
-    parsed.networkCacheDir shouldBe None
+  test("vdisk-server is described as serving the kernel's TCMU target"):
+    Main.Commands.find(_.name == "vdisk-server").map(_.description) shouldBe
+      Some("Serves virtual disks to the Linux kernel's TCMU target (requires root)")
+
+  //--- vdisk-server netlink loop -----------------------------------------------------------
+
+  private val added = TcmuEvent.Added("aspen/d", 3, 7)
+  private val removed = TcmuEvent.Removed("aspen/d", 3, 8)
+
+  /** Runs the loop on this thread over `steps`; it ends when they run out (an InterruptedException is fatal). */
+  private def runLoop(steps: List[() => List[Either[String, TcmuEvent]]],
+                      onEvent: TcmuEvent => Future[Int] = _ => Future.successful(0),
+                      reply: (TcmuEvent, Int) => Unit = (_, _) => ()): List[Long] =
+    val remaining = mutable.Queue.from(steps)
+    val pauses = mutable.ListBuffer[Long]()
+    val receive = () =>
+      if remaining.isEmpty then throw InterruptedException("done") else remaining.dequeue()()
+    // parasitic: each reply is sent on the thread that completes the event's Future
+    an[InterruptedException] should be thrownBy
+      Main.tcmuEventLoop(receive, onEvent, reply, ms => pauses += ms)(using scala.concurrent.ExecutionContext.parasitic)
+    pauses.toList
+
+  test("tcmuEventLoop replies to each event with its onEvent status and drops parse failures"):
+    val replies = java.util.concurrent.ConcurrentLinkedQueue[(TcmuEvent, Int)]()
+    val slow = scala.concurrent.Promise[Int]()
+    runLoop(List(() => List(Left("garbled"), Right(added)), () => List(Right(removed))),
+      onEvent = {
+        case `added` => slow.future
+        case _ => Future.successful(-2)
+      },
+      reply = (e, s) => replies.add((e, s)))
+    // The slow add does not hold up the remove
+    replies.toArray.toList shouldBe List((removed, -2))
+    slow.success(0)
+    replies.toArray.toList shouldBe List((removed, -2), (added, 0))
+
+  test("tcmuEventLoop replies -EIO when onEvent fails or throws"):
+    val replies = java.util.concurrent.ConcurrentLinkedQueue[(TcmuEvent, Int)]()
+    runLoop(List(() => List(Right(added), Right(removed))),
+      onEvent = {
+        case `added` => Future.failed(RuntimeException("boom"))
+        case _ => throw RuntimeException("thrown")
+      },
+      reply = (e, s) => replies.add((e, s)))
+    replies.toArray.toList shouldBe List((added, -Linux.EIO), (removed, -Linux.EIO))
+
+  test("tcmuEventLoop keeps going when a reply fails"):
+    val replies = java.util.concurrent.ConcurrentLinkedQueue[TcmuEvent]()
+    runLoop(List(() => List(Right(added)), () => List(Right(removed))),
+      reply = (e, _) =>
+        replies.add(e)
+        if e == added then throw SysError("send", Linux.EIO, "I/O error"))
+    replies.toArray.toList shouldBe List(added, removed)
+
+  test("tcmuEventLoop backs off on receive failures, doubling to 1 s, and resets after a success"):
+    val failing = () => throw SysError("recv", 105, "No buffer space available")
+    val ok = () => List.empty[Either[String, TcmuEvent]]
+    runLoop(List.fill(12)(failing) ++ List(ok, failing, failing)) shouldBe
+      List(1L, 2L, 4L, 8L, 16L, 32L, 64L, 128L, 256L, 512L, 1000L, 1000L, 1L, 2L)
 
   test("create-metadata-pool takes create-pool's positional arguments but not --metadata-group"):
     val parsed = parseCmd("create-metadata-pool", (poolArgs :+ "4096")*)

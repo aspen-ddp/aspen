@@ -13,6 +13,7 @@ class ConfigfsSuite extends AnyFunSuite with Matchers:
     "Status: ACTIVATED  Max Data Area: 8MB  Config: aspen/vd1  Size: 8388608  MaxDataAreaMB: 8  " +
       "DataPagesPerBlk: 1\n"
 
+  // Note: the seeded files below model configfs, where every attribute file pre-exists.
   private class Tree:
     val root = os.temp.dir()
     val core = root / "core"
@@ -101,6 +102,7 @@ class ConfigfsSuite extends AnyFunSuite with Matchers:
   test("action writes the value to action/<name>"):
     val t = Tree()
     val d = t.configfsDev()
+    os.write(d / "action" / "block_dev", "")
     t.configfs.action("30", "vd1", "block_dev", 1)
     os.read(d / "action" / "block_dev").trim should be ("1")
 
@@ -181,3 +183,30 @@ class ConfigfsSuite extends AnyFunSuite with Matchers:
     t.configfs.scanUio().sortBy(_._1) should be (List(
       (0, UioName("30", "vd1", "aspen", "vd1")),
       (2, UioName("31", "vd2", "aspen", "vd2"))))
+
+  test("scanUio skips a device whose name cannot be read"):
+    val t = Tree()
+    t.uioDev(0, "tcm-user/30/vd1/aspen/vd1")
+    t.uioDev(1, "tcm-user/31/vd2/aspen/vd2")
+    os.remove(t.uio / "uio1" / "name")
+    os.makeDir(t.uio / "uio1" / "name") // a directory where the name file is expected
+    t.configfs.scanUio() should be (List((0, UioName("30", "vd1", "aspen", "vd1"))))
+
+  test("the default writeFile to a missing attribute throws NoSuchFileException and creates nothing"):
+    val t = Tree()
+    val d = t.devDir() / "action"
+    os.makeDir.all(d)
+    intercept[java.nio.file.NoSuchFileException](t.configfs.action("30", "vd1", "block_dev", 1))
+    os.exists(d / "block_dev") should be (false)
+    // and resetRing therefore skips instead of failing
+    t.configfs.control("30", "vd1").resetRing()
+    os.list(d) should be (Nil)
+
+  test("hardware attributes outside 1..Int.MaxValue are rejected naming path and value"):
+    val t = Tree()
+    val d = t.configfsDev()
+    for bad <- List("0", "-4", "4294967296") do
+      os.write.over(d / "attrib" / "hw_block_size", bad + "\n")
+      val e = intercept[Exception](t.configfs.hwBlockSize("30", "vd1"))
+      e.getMessage should include ((d / "attrib" / "hw_block_size").toString)
+      e.getMessage should include (bad)

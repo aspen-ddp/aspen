@@ -1,6 +1,8 @@
 package org.aspen_ddp.aspen.vdisk.tcmu
 
 import java.nio.file.NoSuchFileException
+import scala.util.Try
+import scala.util.control.NonFatal
 
 /** The name the kernel gives a TCMU device's UIO node: `tcm-user/<hba>/<device>/<subtype>/<cfgstring>`.
   *
@@ -35,7 +37,11 @@ class Configfs(core: os.Path = os.root / "sys" / "kernel" / "config" / "target" 
 
   /** Overridden by tests to record or fail writes. */
   protected def writeFile(path: os.Path, value: String): Unit =
-    os.write.over(path, value)
+    // java.nio: os-lib's writes always create or truncate, and configfs attributes must be opened WRITE only
+    // (as libtcmu's open(O_WRONLY) does), so a missing attribute is NoSuchFileException.
+    val out = java.nio.file.Files.newOutputStream(path.toNIO, java.nio.file.StandardOpenOption.WRITE)
+    try out.write(value.getBytes(java.nio.charset.StandardCharsets.US_ASCII))
+    finally out.close()
 
   private def readText(path: os.Path, expected: String): String =
     try os.read(path)
@@ -49,13 +55,19 @@ class Configfs(core: os.Path = os.root / "sys" / "kernel" / "config" / "target" 
     catch case _: NumberFormatException =>
       throw new java.io.IOException(s"cannot parse $path (expected $expected): '$text'")
 
+  private def positiveInt(p: os.Path): Int =
+    val v = readLong(p, 10, "an integer from 1 to 2147483647")
+    if v < 1 || v > Int.MaxValue then
+      throw new java.io.IOException(s"bad value in $p (expected an integer from 1 to ${Int.MaxValue}): $v")
+    v.toInt
+
   def hwBlockSize(hba: String, device: String): Int =
     val p = devDir(hba, device) / "attrib" / "hw_block_size"
-    readLong(p, 10, "a decimal integer").toInt
+    positiveInt(p)
 
   def hwMaxSectors(hba: String, device: String): Int =
     val p = devDir(hba, device) / "attrib" / "hw_max_sectors"
-    readLong(p, 10, "a decimal integer").toInt
+    positiveInt(p)
 
   /** The `Size:` field of `info`, found as `tcmu_cfgfs_dev_get_info_u64` does: " Size: " then an unsigned integer. */
   def size(hba: String, device: String): Long =
@@ -104,11 +116,11 @@ class Configfs(core: os.Path = os.root / "sys" / "kernel" / "config" / "target" 
         if blocked then
           var failure: Throwable = null
           try action(hba, device, "reset_ring", 1)
-          catch case t: Throwable =>
+          catch case NonFatal(t) =>
             scribe.error(s"reset_ring failed for $hba/$device", t)
             failure = t
           try action(hba, device, "block_dev", 0)
-          catch case t: Throwable =>
+          catch case NonFatal(t) =>
             if failure == null then
               failure = t
             else
@@ -135,6 +147,11 @@ class Configfs(core: os.Path = os.root / "sys" / "kernel" / "config" / "target" 
         val n = p.last
         if n.startsWith("uio") && n.drop(3).nonEmpty && n.drop(3).forall(_.isDigit) && os.isFile(p / "name") then
           val minor = n.drop(3).toInt
-          uioName(minor).toOption.map(minor -> _)
+          Try(uioName(minor)).fold(
+            { e =>
+              scribe.warn(s"skipping $n: ${e.getMessage}")
+              None
+            },
+            _.toOption.map(minor -> _))
         else
           None

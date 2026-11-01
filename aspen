@@ -116,7 +116,7 @@ fi
 # working from here.
 cd "$invocation_dir" || exit 1
 
-"$JAVA_BIN" -cp "$CLASSPATH" org.aspen_ddp.aspen.cmdline.Main "$@"
+"$JAVA_BIN" --enable-native-access=ALL-UNNAMED -cp "$CLASSPATH" org.aspen_ddp.aspen.cmdline.Main "$@"
 
 rc=$?
 

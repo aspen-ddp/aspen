@@ -39,11 +39,12 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
     def reportFailure(t: Throwable): Unit = escaped.add(t): Unit
 
   private final class Control(kernel: FakeKernel) extends RingControl:
+    /** Counted once the reset has been applied, so a test that sees it may submit without racing the reset */
     val resets = AtomicInteger()
     @volatile var onReset: () => Unit = () => kernel.resetRing()
     def resetRing(): Unit =
-      resets.incrementAndGet()
       onReset()
+      resets.incrementAndGet(): Unit
 
   private final class Fixture(
       val kernel: FakeKernel,
@@ -93,6 +94,12 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
     got
 
   private def senseKey(c: FakeCompletion): Int = c.sense(2) & 0x0f
+
+  /** Waits until the device has finished `n` successful ring resets: its warn is logged after the resync returns,
+    * so a command submitted after this cannot be erased by the reset.
+    */
+  private def resetDone(fx: Fixture, n: Int): Unit =
+    eventually(s"ring reset $n")(fx.sink.at(Level.Warn).count(_.contains("ring reset; the kernel retries")) == n)
 
   private def expected(offset: Long, length: Int): List[Byte] =
     List.tabulate(length)(i => ((offset + i) % 251).toByte)
@@ -196,8 +203,8 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
     withDevice(): fx =>
       fx.kernel.setCmdHead(3)
       fx.kernel.channel.signal()
-      eventually("a ring reset")(fx.control.resets.get == 1)
-      eventually("the report")(fx.failures.counts.get("ring-corrupt").contains(1L))
+      resetDone(fx, 1)
+      fx.failures.counts.get("ring-corrupt") should be (Some(1L))
       val id = fx.kernel.submit(read10(1, 1), readLen = Bs)
       val List(c) = completions(fx.kernel, 1): @unchecked
       c.cmdId should be (id)
@@ -211,9 +218,9 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
       val held = Await.result(fx.dev.call(0), 5.seconds)
       fx.kernel.setCmdHead(3)
       fx.kernel.channel.signal()
-      eventually("a ring reset")(fx.control.resets.get == 1)
+      resetDone(fx, 1)
       held.succeed(expected(0, Bs).toArray)
-      eventually("the warn")(fx.sink.at(Level.Warn).exists(_.contains("ring reset")))
+      eventually("the warn")(fx.sink.at(Level.Warn).exists(_.contains("completed after a ring reset")))
       fx.failures.counts.get("stale-completion") should be (None)
       fx.kernel.completions() should be (empty)
       val id = fx.kernel.submit(read10(1, 1), readLen = Bs)
@@ -232,7 +239,8 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
       eventually("the resync failure")(fx.failures.counts.get("resync-failed").contains(1L))
       fx.control.onReset = () => fx.kernel.resetRing()
       fx.kernel.channel.signal()
-      eventually("a second reset")(fx.control.resets.get == 2)
+      resetDone(fx, 1)
+      fx.control.resets.get should be (2)
       val id = fx.kernel.submit(read10(0, 1), readLen = Bs)
       val List(c) = completions(fx.kernel, 1): @unchecked
       c.cmdId should be (id)
@@ -265,6 +273,29 @@ class TcmuDeviceSuite extends AnyFunSuite with Matchers:
       senseKey(got(ids(1))) should be (4)
       got(ids(2)).status should be (ScsiStatus.Good)
       fx.failures.counts("command-error") should be (2L)
+      // The first report names the command, the ring state and the stack trace
+      val List(report) = fx.sink.at(Level.Error).filter(_.contains("command-error")): @unchecked
+      report should include (s"cmd_id=${ids(0)} cdb=28")
+      report should include ("cmd_head=")
+      report should include ("java.lang.LinkageError: sync")
+      report should include ("\tat ")
+
+  test("stop logs the count of a burst that was still being suppressed"):
+    withDevice(): fx =>
+      for _ <- 1 to 3 do fx.kernel.submitRaw(badIovecEntry(fx.kernel))
+      completions(fx.kernel, 3)
+      fx.sink.at(Level.Warn).filter(_.contains("malformed-entry")) should be (empty)
+      fx.device.stop()
+      fx.sink.at(Level.Warn).filter(_.contains("2 more malformed-entry since")).size should be (1)
+
+  test("a ScsiCommands failure that is not a disk error is reported and completed with HARDWARE ERROR"):
+    withDevice(): fx =>
+      fx.dev.throws = Map("read" -> RuntimeException("bug"))
+      val id = fx.kernel.submit(read10(0, 1), readLen = Bs)
+      val List(c) = completions(fx.kernel, 1): @unchecked
+      c.cmdId should be (id)
+      senseKey(c) should be (4)
+      fx.failures.counts("command-error") should be (1L)
 
   test("completion after stop is dropped"):
     withDevice(auto = false): fx =>

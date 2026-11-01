@@ -326,32 +326,93 @@ class ScsiCommandsSuite extends AsyncFunSuite with Matchers:
       expectSense(readFail, Sense.ReadError)
       expectSense(writeFail, Sense.WriteError)
 
-  test("a synchronous throw from the device becomes HARDWARE ERROR"):
+  /** The failure of `f`, which must fail */
+  private def failure(f: Future[?]): Future[Throwable] =
+    f.transform:
+      case scala.util.Failure(e) => scala.util.Success(e)
+      case scala.util.Success(v) => scala.util.Failure(new AssertionError(s"expected a failure, got $v"))
+
+  test("a synchronous throw from the device fails the command"):
     val (dev, cmds) = fixture()
     dev.throws = Map("read" -> new RuntimeException("boom"), "flush" -> new IllegalStateException("bang"))
     for
-      (r1, d1) <- run(cmds, read10(0, 1), capacity = Bs)
-      (r2, _) <- run(cmds, syncCache10)
+      e1 <- failure(run(cmds, read10(0, 1), capacity = Bs))
+      e2 <- failure(run(cmds, syncCache10))
     yield
-      expectSense(r1, Sense.HardwareError)
-      d1 should be (empty)
-      expectSense(r2, Sense.HardwareError)
+      e1.getMessage should be ("boom")
+      e2.getMessage should be ("bang")
 
-  test("a non-NonFatal throw or failure from the device becomes HARDWARE ERROR"):
+  test("a non-NonFatal throw or failure from the device fails the command"):
     val (dev, cmds) = fixture()
     dev.throws = Map("read" -> new LinkageError("sync"))
     dev.failures = Map("flush" -> new InterruptedException("async"))
     for
-      (r1, _) <- run(cmds, read10(0, 1), capacity = Bs)
-      (r2, _) <- run(cmds, syncCache10)
+      e1 <- failure(run(cmds, read10(0, 1), capacity = Bs))
+      e2 <- failure(run(cmds, syncCache10))
     yield
-      expectSense(r1, Sense.HardwareError)
-      expectSense(r2, Sense.HardwareError)
+      // A Future boxes an Error or InterruptedException in an ExecutionException
+      e1.getCause shouldBe a [LinkageError]
+      e2.getCause shouldBe an [InterruptedException]
 
-  test("a dataOut that throws becomes HARDWARE ERROR"):
+  test("a dataOut that throws fails the command"):
     val (_, cmds) = fixture()
-    cmds.handle(write10(0, 1), () => throw new RuntimeException("gather"), 0).map: (r, _) =>
-      expectSense(r, Sense.HardwareError)
+    failure(cmds.handle(write10(0, 1), () => throw new RuntimeException("gather"), 0)).map: e =>
+      e.getMessage should be ("gather")
+
+  test("a device read of the wrong length fails the command"):
+    val (dev, cmds) = fixture()
+    dev.readData = (_, n) => new Array[Byte](n - 1)
+    failure(run(cmds, read10(0, 1), capacity = Bs)).map: e =>
+      e.getMessage should include ("expected 4096")
+
+  test("repeated disk errors and bad requests are logged once each, then counted"):
+    val lines = java.util.concurrent.ConcurrentLinkedQueue[(scribe.Level, String)]()
+    val failures = FailureLog("vd1", log = (l, m) => lines.add((l, m)): Unit)
+    val dev = new FakeBlockDevice()
+    val cmds = new ScsiCommands(dev, settings, failures)
+    dev.failures = Map("read" -> VDiskError.DiskFailed("x"))
+    for
+      (r1, _) <- run(cmds, read10(0, 1), capacity = Bs)
+      (r2, _) <- run(cmds, read10(0, 1), capacity = Bs)
+      (r3, _) <- run(cmds, write10(0, 1), pattern(Bs - 1, 0))
+      (r4, _) <- run(cmds, write10(0, 1), pattern(Bs - 1, 0))
+    yield
+      expectSense(r1, Sense.ReadError)
+      expectSense(r2, Sense.ReadError)
+      expectSense(r3, Sense.InvalidFieldInCdb)
+      expectSense(r4, Sense.InvalidFieldInCdb)
+      failures.counts should be (Map("disk-error" -> 2L, "bad-request" -> 2L))
+      import scala.jdk.CollectionConverters.*
+      val logged = lines.asScala.toList
+      logged.size should be (2)
+      logged.map(_._1) should be (List(scribe.Level.Error, scribe.Level.Warn))
+      logged.head._2 should include ("disk failed: x")
+      logged.head._2 should include ("cdb=28")
+      logged(1)._2 should include ("data-out length 4095")
+
+  test("a COMPARE AND WRITE whose read fails releases its range"):
+    val (dev, cmds) = fixture()
+    dev.failures = Map("read" -> VDiskError.DiskFailed("x"))
+    for
+      (r1, _) <- run(cmds, caw(5, 1), new Array[Byte](2 * Bs))
+      (r2, _) <- run(cmds, write10(5, 1), pattern(Bs, 1))
+    yield
+      expectSense(r1, Sense.ReadError)
+      good(r2)
+      dev.names should be (List("read", "write"))
+
+  test("a COMPARE AND WRITE whose write throws releases its range"):
+    val (dev, cmds) = fixture()
+    val current = dev.readData(5L * Bs, Bs)
+    dev.throws = Map("write" -> new RuntimeException("boom"))
+    for
+      e <- failure(run(cmds, caw(5, 1), current ++ pattern(Bs, 2)))
+      _ = dev.throws = Map.empty
+      (r2, _) <- run(cmds, write10(5, 1), pattern(Bs, 1))
+    yield
+      e.getMessage should be ("boom")
+      good(r2)
+      dev.names should be (List("read", "write"))
 
   test("capacity change unit attention is reported once"):
     val (_, cmds) = fixture()

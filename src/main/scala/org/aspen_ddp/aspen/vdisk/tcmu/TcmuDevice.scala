@@ -23,6 +23,10 @@ import scala.util.{Failure, Success, Try}
   *
   * When `channel.await` fails (say, the UIO device went away), the loop waits `park(nanos)` before trying again,
   * doubling from 1 ms to at most 1 s and resetting on the next successful await. `stop` unparks it.
+  *
+  * `name` labels the thread, and `failures` (which carries the full device label) receives every report. A command
+  * whose Future fails is reported with its CDB, iovecs, the ring state and the stack trace, and completed with
+  * HARDWARE ERROR.
   */
 final class TcmuDevice(
     name: String,
@@ -52,7 +56,11 @@ final class TcmuDevice(
   def start(): Unit = synchronized:
     require(thread.isEmpty, s"$name: already started")
     running = true
-    thread = Some(Thread.ofPlatform().name(s"tcmu-$name").daemon(true).start(() => loop()))
+    // A VirtualMachineError (an InternalError from a fault, say) is not caught by the loop: log it, naming the device
+    val handler: Thread.UncaughtExceptionHandler = (t, e) =>
+      scribe.error(s"tcmu: ${t.getName}: the serving thread died; the device is no longer served: $e", e)
+    thread = Some(Thread.ofPlatform().name(s"tcmu-$name").daemon(true).uncaughtExceptionHandler(handler)
+      .start(() => loop()))
 
   /** Stops the loop, waits for its thread, then marks the device stopped: later completions are dropped. */
   def stop(): Unit =
@@ -65,6 +73,7 @@ final class TcmuDevice(
       if th ne Thread.currentThread() then th.join()
     locked(lock.writeLock):
       stopped = true
+    failures.flush()
 
   private def locked[T](l: java.util.concurrent.locks.Lock)(body: => T): T =
     l.lock()
@@ -92,13 +101,13 @@ final class TcmuDevice(
             go = false
             false
           case e: Throwable if !fatal(e) =>
-            failures.report("channel-error", e.toString, mailbox)
+            failures.report("channel-error", e.toString, mailbox, Some(e))
             backoff = if backoff == 0L then MinBackoff else math.min(backoff * 2, MaxBackoff)
             if running then park(backoff)
             false
       if notified && running then
         try serve()
-        catch case e: Throwable if !fatal(e) => failures.report("loop-error", e.toString, mailbox)
+        catch case e: Throwable if !fatal(e) => failures.report("loop-error", e.toString, mailbox, Some(e))
 
   private def serve(): Unit =
     if !resyncPending || resync() then
@@ -116,7 +125,7 @@ final class TcmuDevice(
           case e: Throwable if !fatal(e) =>
             // A Command is handed to its Future before anything that can throw, so only a Malformed one can
             // still be uncompleted here.
-            failures.report("dispatch-error", s"$item: $e", mailbox)
+            failures.report("dispatch-error", s"$item: $e", mailbox, Some(e))
             item match
               case RingItem.Malformed(cmdId, _, _, true) =>
                 finish(cmdId, generation, Sense.HardwareError, Array.emptyByteArray, Vector.empty)
@@ -133,7 +142,7 @@ final class TcmuDevice(
     result match
       case Right(()) =>
         resyncPending = false
-        scribe.warn(s"$name: ring reset; the kernel retries outstanding commands")
+        failures.warn("ring reset; the kernel retries outstanding commands")
         true
       case Left(reason) =>
         resyncPending = true
@@ -148,7 +157,7 @@ final class TcmuDevice(
         if completable then
           finish(cmdId, generation, Sense.HardwareError, Array.emptyByteArray, Vector.empty)
       case RingItem.Tmr(tmrType, cmdIds) =>
-        scribe.info(s"$name: TMR type $tmrType for cmd_ids ${cmdIds.mkString(",")}; no action taken")
+        scribe.debug(s"$name: TMR type $tmrType for cmd_ids ${cmdIds.mkString(",")}; no action taken")
 
   private def command(c: RingItem.Command): Unit =
     val gen = generation
@@ -180,11 +189,12 @@ final class TcmuDevice(
           (Sense.HardwareError, Array.emptyByteArray)
         case Success(rd) => rd
         case Failure(e) =>
-          failures.report("command-error", s"${describe(c)} failed: $e", mailbox)
+          failures.report("command-error", s"${describe(c)} failed: $e", mailbox, Some(e))
           (Sense.HardwareError, Array.emptyByteArray)
       finish(c.cmdId, gen, result, data, c.iovecs)
       scribe.debug(trace(c, start, result))
-    catch case e: Throwable if !fatal(e) => failures.report("completion-error", s"${describe(c)}: $e", mailbox)
+    catch
+      case e: Throwable if !fatal(e) => failures.report("completion-error", s"${describe(c)}: $e", mailbox, Some(e))
 
   private def trace(c: RingItem.Command, start: Long, r: ScsiResult): String =
     val op = c.cdb(0) & 0xff
@@ -208,12 +218,13 @@ final class TcmuDevice(
             ring.complete(cmdId, result.status, result.sense, result.readLen)
           catch
             case e: Throwable if !fatal(e) =>
-              failures.report("completion-error", s"cmd_id=$cmdId: $e", mailbox)
+              failures.report("completion-error", s"cmd_id=$cmdId: $e", mailbox, Some(e))
               val h = Sense.HardwareError
               ring.complete(cmdId, h.status, h.sense, None)
         if ok then
           try channel.kick()
-          catch case e: Throwable if !fatal(e) => failures.report("kick-error", s"cmd_id=$cmdId: $e", mailbox)
+          catch
+            case e: Throwable if !fatal(e) => failures.report("kick-error", s"cmd_id=$cmdId: $e", mailbox, Some(e))
         else
           failures.report("stale-completion", s"cmd_id=$cmdId is not outstanding", mailbox)
 

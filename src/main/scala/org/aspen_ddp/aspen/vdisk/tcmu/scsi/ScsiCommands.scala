@@ -6,11 +6,14 @@ import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 import org.aspen_ddp.aspen.vdisk.{LockableBlockDevice, VDiskError}
-import org.aspen_ddp.aspen.vdisk.tcmu.DeviceSettings
+import org.aspen_ddp.aspen.vdisk.tcmu.{DeviceSettings, FailureLog}
+import scribe.Level
 
-/** What a TCMU device needs to run one command: never fails, every error becomes a CHECK CONDITION.
-  * `dataOut` must be called, if at all, synchronously within `handle`: the data area belongs to the command only
-  * until it is completed, and a TCMU device rejects a gather after a ring reset or `stop`.
+/** What a TCMU device needs to run one command. Expected errors (a bad request, a disk error) become a CHECK
+  * CONDITION; an unexpected one fails the Future, and the TCMU device reports it with the ring state and completes
+  * the command with HARDWARE ERROR. `dataOut` must be called, if at all, synchronously within `handle`: the data
+  * area belongs to the command only until it is completed, and a TCMU device rejects a gather after a ring reset or
+  * `stop`.
   */
 trait ScsiHandler:
   def handle(cdb: Array[Byte], dataOut: () => Array[Byte], dataInCapacity: Long): Future[(ScsiResult, Array[Byte])]
@@ -25,9 +28,17 @@ trait ScsiHandler:
   * flushes instead of reading back; WRITE SAME with the UNMAP bit unmaps only an aligned range whose block is all
   * zero (tcmu-runner also unmaps a non-zero block); COMPARE AND WRITE honors FUA; FORMAT UNIT unmaps the device,
   * which reads back as zeros as tcmu-runner's zero-fill does, without the FORMAT IN PROGRESS state.
+  *
+  * A [[VDiskError]] maps to sense through [[ErrorMap]]; any other failure, synchronous or not, fails the returned
+  * Future. Repeated per-command problems (disk errors, payload lengths that disagree with the CDB) go to `failures`,
+  * which logs the first of each kind and counts the rest.
   */
-final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(using ExecutionContext)
-    extends ScsiHandler:
+final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings, failures: FailureLog)(
+    using ExecutionContext) extends ScsiHandler:
+
+  /** Reports to a FailureLog of its own, labeled with the device name */
+  def this(device: LockableBlockDevice, initial: DeviceSettings)(using ec: ExecutionContext) =
+    this(device, initial, FailureLog(initial.deviceName))
 
   private type Response = (ScsiResult, Array[Byte])
 
@@ -48,21 +59,32 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
     current = current.copy(size = newSize)
     capacityChanged.set(true)
 
-  /** Never fails: every error, synchronous or not, becomes a CHECK CONDITION */
+  /** A VDiskError becomes a CHECK CONDITION. Any other error, synchronous or not, fails the returned Future. */
   def handle(cdb: Array[Byte], dataOut: () => Array[Byte], dataInCapacity: Long): Future[Response] =
     val result =
       try dispatch(cdb, dataOut, dataInCapacity)
       catch case e: Throwable if !e.isInstanceOf[VirtualMachineError] => Future.failed(e)
     result.recover:
-      case e: Throwable if !e.isInstanceOf[VirtualMachineError] =>
+      case e: VDiskError =>
         val op = if cdb.isEmpty then -1 else cdb(0) & 0xff
-        val line = f"${current.deviceName}: SCSI opcode 0x$op%02x failed: $e"
-        e match
-          // Expected while fenced or for a bad request: one per command would flood the log
-          case VDiskError.Fenced | VDiskError.NotOwner | _: VDiskError.OutOfRange | _: VDiskError.InvalidRequest =>
-            scribe.debug(line)
-          case _ => scribe.warn(line)
-        (ErrorMap.result(e, isWrite(op)), Array.emptyByteArray)
+        (diskError(cdb, f"SCSI opcode 0x$op%02x", e, isWrite(op)), Array.emptyByteArray)
+
+  /** The sense for a VDiskError, logged at debug when expected (fenced, a bad request: one per command would flood
+    * the log) and otherwise reported to `failures`.
+    */
+  private def diskError(cdb: Array[Byte], what: String, e: VDiskError, write: Boolean): ScsiResult =
+    val line = s"$what failed: $e"
+    e match
+      case VDiskError.Fenced | VDiskError.NotOwner | _: VDiskError.OutOfRange | _: VDiskError.InvalidRequest =>
+        scribe.debug(s"${current.deviceName}: $line")
+      case _ => failures.report("disk-error", line, s"cdb=${hex(cdb)}")
+    ErrorMap.result(e, write)
+
+  private def hex(bytes: Array[Byte]): String = bytes.map(b => f"${b & 0xff}%02x").mkString
+
+  /** An initiator request that is rejected with sense: logged at warn the first time, then counted */
+  private def badRequest(cdb: Array[Byte], message: String): Unit =
+    failures.report("bad-request", message, s"cdb=${hex(cdb)}", level = Level.Warn)
 
   private def isWrite(op: Int): Boolean =
     op match
@@ -126,10 +148,10 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
     lba >= 0 && blocks <= n && lba <= n - blocks
 
   /** check_iovec_length */
-  private def lengthMatches(s: DeviceSettings, what: String, actual: Long, blocks: Long): Boolean =
+  private def lengthMatches(cdb: Array[Byte], s: DeviceSettings, what: String, actual: Long, blocks: Long): Boolean =
     val expected = blocks * s.blockSize
     if actual != expected then
-      scribe.warn(s"${s.deviceName}: $what length $actual does not match $blocks blocks of ${s.blockSize} bytes")
+      badRequest(cdb, s"$what length $actual does not match $blocks blocks of ${s.blockSize} bytes")
     actual == expected
 
   private def be(a: Array[Byte], offset: Int, len: Int): Long =
@@ -144,7 +166,7 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
     val lba = Cdb.lba(cdb)
     val blocks = Cdb.transferLength(cdb)
     val bytes = blocks * s.blockSize
-    if !lengthMatches(s, "data-in", dataInCapacity, blocks) || bytes > Int.MaxValue then
+    if !lengthMatches(cdb, s, "data-in", dataInCapacity, blocks) || bytes > Int.MaxValue then
       done(Sense.InvalidFieldInCdb)
     else if !inRange(s, lba, blocks) then
       done(Sense.LbaOutOfRange)
@@ -152,18 +174,15 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
       Future.successful((ScsiResult.good(0), Array.emptyByteArray))
     else
       device.read(lba * s.blockSize, bytes.toInt).map: data =>
-        if data.length != bytes then
-          scribe.error(s"${s.deviceName}: device read returned ${data.length} bytes, expected $bytes")
-          (Sense.HardwareError, Array.emptyByteArray)
-        else
-          (ScsiResult.good(data.length), data)
+        checkReadLength(data, bytes)
+        (ScsiResult.good(data.length), data)
 
   private def write(cdb: Array[Byte], s: DeviceSettings, dataOut: () => Array[Byte], verify: Boolean)
       : Future[Response] =
     val lba = Cdb.lba(cdb)
     val blocks = Cdb.transferLength(cdb)
     val data = dataOut()
-    if !lengthMatches(s, "data-out", data.length, blocks) then
+    if !lengthMatches(cdb, s, "data-out", data.length, blocks) then
       done(Sense.InvalidFieldInCdb)
     else if !inRange(s, lba, blocks) then
       done(Sense.LbaOutOfRange)
@@ -193,16 +212,17 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
     else
       val par = dataOut()
       if par.length < listLen then
-        scribe.warn(s"${s.deviceName}: UNMAP parameter list is ${par.length} bytes, PARAMETER LIST LENGTH $listLen")
+        badRequest(cdb, s"UNMAP parameter list is ${par.length} bytes, PARAMETER LIST LENGTH $listLen")
         done(Sense.ParamListLength)
       else
-        unmapDescriptors(s, par, listLen)
+        unmapDescriptors(cdb, s, par, listLen)
 
-  private def unmapDescriptors(s: DeviceSettings, par: Array[Byte], listLen: Int): Future[Response] =
+  private def unmapDescriptors(cdb: Array[Byte], s: DeviceSettings, par: Array[Byte], listLen: Int)
+      : Future[Response] =
     // A trailing incomplete descriptor is ignored, as tcmu-runner does
     val bddl = be(par, 2, 2).toInt & ~0xF
     if bddl > listLen - 8 then
-      scribe.warn(s"${s.deviceName}: UNMAP descriptor data length $bddl exceeds PARAMETER LIST LENGTH $listLen")
+      badRequest(cdb, s"UNMAP descriptor data length $bddl exceeds PARAMETER LIST LENGTH $listLen")
       done(Sense.ParamListLength)
     else if bddl == 0 then
       done(ScsiResult.Good)
@@ -229,7 +249,7 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
     val blocks = Cdb.transferLength(cdb)
     val block = dataOut()
     if block.length != s.blockSize then
-      scribe.warn(s"${s.deviceName}: WRITE SAME data-out is ${block.length} bytes, not one ${s.blockSize} byte block")
+      badRequest(cdb, s"WRITE SAME data-out is ${block.length} bytes, not one ${s.blockSize} byte block")
       done(Sense.InvalidFieldInCdb)
     else if blocks == 0 then
       done(Sense.InvalidFieldInCdb) // WSNZ is set
@@ -271,7 +291,7 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
       done(Sense.InvalidFieldInCdb)
     else
       val data = dataOut()
-      if !lengthMatches(s, "COMPARE AND WRITE data-out", data.length, blocks * 2) then
+      if !lengthMatches(cdb, s, "COMPARE AND WRITE data-out", data.length, blocks * 2) then
         done(Sense.InvalidFieldInCdb)
       else if !inRange(s, lba, blocks) then
         done(Sense.LbaOutOfRange)
@@ -281,18 +301,21 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
         val fua = (cdb(1) & 0x08) != 0
         locked(List((offset, half.toLong)), caw = true):
           device.read(offset, half).transformWith:
-            case scala.util.Failure(e) =>
-              scribe.warn(s"${s.deviceName}: COMPARE AND WRITE read failed: $e")
-              Future.successful(ErrorMap.result(e, isWrite = false))
+            case scala.util.Failure(e: VDiskError) =>
+              // A read error, not the write error `handle` would map it to
+              Future.successful(diskError(cdb, "COMPARE AND WRITE read", e, write = false))
+            case scala.util.Failure(e) => Future.failed(e)
             case scala.util.Success(currentData) =>
-              if currentData.length != half then
-                scribe.error(s"${s.deviceName}: device read returned ${currentData.length} bytes, expected $half")
-                Future.successful(Sense.HardwareError)
-              else
-                (0 until half).find(i => currentData(i) != data(i)) match
-                  case Some(i) => Future.successful(Sense.Miscompare(i))
-                  case None => device.write(offset, data.drop(half), fua).map(_ => ScsiResult.Good)
+              checkReadLength(currentData, half)
+              (0 until half).find(i => currentData(i) != data(i)) match
+                case Some(i) => Future.successful(Sense.Miscompare(i))
+                case None => device.write(offset, data.drop(half), fua).map(_ => ScsiResult.Good)
         .map(r => (r, Array.emptyByteArray))
+
+  /** A device read of the wrong length is a bug below us: fail the command, which reports it with the ring state */
+  private def checkReadLength(data: Array[Byte], expected: Long): Unit =
+    if data.length != expected then
+      throw IllegalStateException(s"device read returned ${data.length} bytes, expected $expected")
 
   // ---- FORMAT UNIT ----
 

@@ -23,11 +23,14 @@ object Linux:
   val NETLINK_ADD_MEMBERSHIP = 1
   val EINTR = 4
   val ENOENT = 2
+  val EIO = 5
+  val EEXIST = 17
   val EAGAIN = 11
   val EINVAL = 22
   val EBUSY = 16
   val ENODEV = 19
   val EOPNOTSUPP = 95
+  val ETIMEDOUT = 110
   val POLLIN = 1
 
 /** Thin Foreign Function & Memory binding to the handful of libc calls the TCMU frontend needs. */

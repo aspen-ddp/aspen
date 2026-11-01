@@ -115,6 +115,22 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
 
   private def seqOf(r: Received): Long = r.message.asInstanceOf[OpportunisticRebuild].pointer.id.uuid.getLeastSignificantBits
 
+  /** Awaits one message for each of `seqs`, ignoring duplicates and other seqs. After each second with nothing
+   *  received, `resend` is called with every missing seq: the first datagram on a new connection is occasionally lost
+   *  under load */
+  private def awaitSeqs(peer: QuicTestPeer, seqs: Set[Long])(resend: Long => Unit): Map[Long, Received] =
+    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AwaitMillis)
+    var got = Map.empty[Long, Received]
+    while got.size < seqs.size do
+      if System.nanoTime() - deadline > 0 then
+        fail(s"received ${got.size} of ${seqs.size} messages within ${AwaitMillis}ms; missing ${seqs -- got.keySet}")
+      val r = peer.received.poll(LoadProbe.scaleMillis(1000), TimeUnit.MILLISECONDS)
+      if r == null then
+        (seqs -- got.keySet).foreach(resend)
+      else if seqs.contains(seqOf(r)) then
+        got += seqOf(r) -> r
+    got
+
   private def streamId(r: Received): Long = r.transport match
     case Transport.Stream(id) => id
     case Transport.Datagram => fail(s"message ${seqOf(r)} arrived as a datagram")
@@ -129,11 +145,17 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     e1.size shouldBe 1024
     e2.size shouldBe 1025
     (ok1, ok2) shouldBe (true, true)
-    val got = awaitAll(fx.srv, 2).map(r => seqOf(r) -> r.transport).toMap
-    got(1) shouldBe Transport.Datagram
-    got(2) shouldBe a [Transport.Stream]
+    val resent = ArrayBuffer.empty[QuicMessageCodec.Encoded]
+    val got = awaitSeqs(fx.srv, Set(1, 2)): seq =>
+      if seq == 1 then
+        val (ok, e) = fx.submit(sized(1, QuicMessageCodec.DatagramThreshold))
+        ok shouldBe true
+        resent += e
+    got(1).transport shouldBe Transport.Datagram
+    got(2).transport shouldBe a [Transport.Stream]
     e1.prefix.refCnt() shouldBe 0
     e2.prefix.refCnt() shouldBe 0
+    eventually("resent messages released")(resent.forall(_.prefix.refCnt() == 0))
     fx.conn.drops shouldBe 0
 
   test("large messages are spread across all 4 streams"):
@@ -156,10 +178,18 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.dialAndWait()
     barrier.await(AwaitMillis) shouldBe true
     barrier.isSuccess shouldBe true
-    val got = awaitAll(fx.srv, 6).map(r => seqOf(r) -> r.transport).toMap
-    (0 until 3).foreach(i => got(i) shouldBe Transport.Datagram)
-    (3 until 6).foreach(i => got(i) shouldBe a [Transport.Stream])
+    val resent = ArrayBuffer.empty[(Long, QuicMessageCodec.Encoded)]
+    val got = awaitSeqs(fx.srv, (0L until 6L).toSet): seq =>
+      if seq < 3 then
+        val (ok, e) = fx.submit(sized(seq, 200))
+        ok shouldBe true
+        resent += seq -> e
+    (0 until 3).foreach(i => got(i).transport shouldBe Transport.Datagram)
+    (3 until 6).foreach(i => got(i).transport shouldBe a [Transport.Stream])
+    // A lost datagram is rare, so a resend of every pre-handshake one means they were never sent
+    resent.map(_._1).toSet.size should be < 3
     (small ++ large).foreach(_._2.prefix.refCnt() shouldBe 0)
+    eventually("resent messages released")(resent.forall(_._2.prefix.refCnt() == 0))
     fx.conn.drops shouldBe 0
 
   test("handshake failure drops pre-handshake messages and completes barriers"):

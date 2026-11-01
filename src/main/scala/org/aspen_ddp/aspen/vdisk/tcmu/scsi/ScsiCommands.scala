@@ -4,10 +4,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.control.NonFatal
 
-import org.aspen_ddp.aspen.vdisk.LockableBlockDevice
+import org.aspen_ddp.aspen.vdisk.{LockableBlockDevice, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.DeviceSettings
+
+/** What a TCMU device needs to run one command: never fails, every error becomes a CHECK CONDITION. */
+trait ScsiHandler:
+  def handle(cdb: Array[Byte], dataOut: () => Array[Byte], dataInCapacity: Long): Future[(ScsiResult, Array[Byte])]
 
 /** Executes SCSI commands against a [[LockableBlockDevice]], following tcmu-runner's `tcmur_cmd_handler.c`.
   * Non-data commands go to [[Emulation]]. Ranges are checked against the kernel's view of the device (`settings`),
@@ -20,7 +23,8 @@ import org.aspen_ddp.aspen.vdisk.tcmu.DeviceSettings
   * zero (tcmu-runner also unmaps a non-zero block); COMPARE AND WRITE honors FUA; FORMAT UNIT unmaps the device,
   * which reads back as zeros as tcmu-runner's zero-fill does, without the FORMAT IN PROGRESS state.
   */
-final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(using ExecutionContext):
+final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(using ExecutionContext)
+    extends ScsiHandler:
 
   private type Response = (ScsiResult, Array[Byte])
 
@@ -29,6 +33,7 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
   private val MaxUnmapBlockDescCount = 4            // VPD_MAX_UNMAP_BLOCK_DESC_COUNT
   private val MaxCawLength = 1                      // MAX_CAW_LENGTH
   private val ReportLuns = 0xA0
+  private val MaxWriteSameChunk = 1024L * 1024
 
   @volatile private var current = initial
   private val capacityChanged = new AtomicBoolean(false)
@@ -44,11 +49,16 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
   def handle(cdb: Array[Byte], dataOut: () => Array[Byte], dataInCapacity: Long): Future[Response] =
     val result =
       try dispatch(cdb, dataOut, dataInCapacity)
-      catch case NonFatal(e) => Future.failed(e)
+      catch case e: Throwable if !e.isInstanceOf[VirtualMachineError] => Future.failed(e)
     result.recover:
-      case NonFatal(e) =>
+      case e: Throwable if !e.isInstanceOf[VirtualMachineError] =>
         val op = if cdb.isEmpty then -1 else cdb(0) & 0xff
-        scribe.warn(f"${current.deviceName}: SCSI opcode 0x$op%02x failed: $e")
+        val line = f"${current.deviceName}: SCSI opcode 0x$op%02x failed: $e"
+        e match
+          // Expected while fenced or for a bad request: one per command would flood the log
+          case VDiskError.Fenced | VDiskError.NotOwner | _: VDiskError.OutOfRange | _: VDiskError.InvalidRequest =>
+            scribe.debug(line)
+          case _ => scribe.warn(line)
         (ErrorMap.result(e, isWrite(op)), Array.emptyByteArray)
 
   private def isWrite(op: Int): Boolean =
@@ -232,7 +242,9 @@ final class ScsiCommands(device: LockableBlockDevice, initial: DeviceSettings)(u
         if unmapIt then
           device.unmap(List(range))
         else
-          val chunkBlocks = math.max(1L, math.min(s.maxSectors.toLong, blocks)).toInt
+          // At most 1 MiB, so the chunk array cannot overflow an Int
+          val maxChunk = math.min(s.maxSectors.toLong, math.max(1L, MaxWriteSameChunk / s.blockSize))
+          val chunkBlocks = math.max(1L, math.min(maxChunk, blocks)).toInt
           val chunk = Array.concat(Seq.fill(chunkBlocks)(block)*)
           def from(next: Long): Future[Unit] =
             if next == blocks then

@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.vdisk.tcmu.sys
 
-import java.lang.foreign.ValueLayout.{ADDRESS, JAVA_INT, JAVA_LONG}
+import java.lang.foreign.ValueLayout.{ADDRESS, JAVA_INT, JAVA_LONG, JAVA_SHORT}
 import java.lang.foreign.{Arena, FunctionDescriptor, Linker, MemoryLayout, MemorySegment}
 import java.lang.invoke.MethodHandle
 import java.util.function.Consumer
@@ -27,6 +27,7 @@ object Linux:
   val EINVAL = 22
   val EBUSY = 16
   val ENODEV = 19
+  val POLLIN = 1
 
 /** Thin Foreign Function & Memory binding to the handful of libc calls the TCMU frontend needs. */
 object Libc:
@@ -57,6 +58,7 @@ object Libc:
     FunctionDescriptor.of(JAVA_LONG, JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT), captureOpt)
   private lazy val recvH = fn("recv",
     FunctionDescriptor.of(JAVA_LONG, JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT), captureOpt)
+  private lazy val pollH = fn("poll", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT), captureOpt)
   private lazy val pipeH = fn("pipe", FunctionDescriptor.of(JAVA_INT, ADDRESS), captureOpt)
   private lazy val geteuidH = fn("geteuid", FunctionDescriptor.of(JAVA_INT))
   private lazy val strerrorH = fn("strerror", FunctionDescriptor.of(ADDRESS, JAVA_INT))
@@ -137,6 +139,20 @@ object Libc:
 
   def recv(fd: Int, buf: MemorySegment): Long =
     retrying("recv")(state => recvH.invokeExact(state, fd, buf, buf.byteSize(), 0): Long)
+
+  /** Waits for events on `(fd, events)` pairs; returns each fd's `revents`. EINTR restarts the whole timeout. */
+  def poll(fds: Seq[(Int, Int)], timeoutMs: Int): Seq[Int] =
+    withState: (arena, state) =>
+      val pfds = arena.allocate(8L * fds.size, 8)
+      for ((fd, events), i) <- fds.zipWithIndex do
+        pfds.set(JAVA_INT, 8L * i, fd)
+        pfds.set(JAVA_SHORT, 8L * i + 4, events.toShort)
+        pfds.set(JAVA_SHORT, 8L * i + 6, 0.toShort)
+      var rc = pollH.invokeExact(state, pfds, fds.size.toLong, timeoutMs): Int
+      while rc == -1 && errnoOf(state) == EINTR do
+        rc = pollH.invokeExact(state, pfds, fds.size.toLong, timeoutMs): Int
+      checkInt("poll", state, rc)
+      fds.indices.map(i => pfds.get(JAVA_SHORT, 8L * i + 6) & 0xffff)
 
   def geteuid(): Int =
     geteuidH.invokeExact(): Int

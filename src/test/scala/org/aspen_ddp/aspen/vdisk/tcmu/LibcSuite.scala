@@ -30,6 +30,18 @@ class LibcSuite extends AnyFunSuite with Matchers:
       Libc.close(r)
       Libc.close(w)
 
+  test("poll reports a readable pipe"):
+    val (r, w) = Libc.pipe()
+    val arena = Arena.ofConfined()
+    try
+      Libc.poll(Seq(r -> Linux.POLLIN), 0).toList should be (List(0))
+      Libc.write(w, arena.allocate(1)) should be (1L)
+      Libc.poll(Seq(r -> Linux.POLLIN), -1).toList should be (List(Linux.POLLIN))
+    finally
+      arena.close()
+      Libc.close(r)
+      Libc.close(w)
+
   test("mmapShared maps a file and the closed arena makes access throw"):
     val f = os.temp(Array.fill[Byte](4096)(0))
     try

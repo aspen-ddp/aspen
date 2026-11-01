@@ -5,9 +5,33 @@ import org.aspen_ddp.aspen.vdisk.tcmu.ring.RingLayout.*
 import java.lang.foreign.{Arena, MemorySegment}
 import java.lang.foreign.ValueLayout.{JAVA_BYTE, JAVA_INT, JAVA_LONG_UNALIGNED, JAVA_SHORT}
 import java.lang.invoke.VarHandle
+import java.util.concurrent.Semaphore
+import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable
 
 /** A completed command as the kernel would see it. `data` is the command's data area contents after completion. */
+/** The kernel's notification channel: `await` blocks until `signal` (called by every `submit*`), `kick` counts. */
+final class FakeChannel extends KernelChannel:
+  private val permits = Semaphore(0)
+  private val kickCount = AtomicInteger()
+  @volatile private var closed = false
+
+  def await(): Unit =
+    if closed then throw InterruptedException("channel closed")
+    permits.acquire()
+    if closed then throw InterruptedException("channel closed")
+
+  def kick(): Unit = kickCount.incrementAndGet(): Unit
+
+  def kicks: Int = kickCount.get
+
+  /** Wakes `await` as a kernel notification does. */
+  def signal(): Unit = permits.release()
+
+  def close(): Unit =
+    closed = true
+    permits.release()
+
 final case class FakeCompletion(cmdId: Int, status: Int, sense: Array[Byte], readLen: Option[Int], data: Array[Byte])
 
 /** Plays the kernel's side of a TCMU command ring on an Arena-allocated segment.
@@ -24,6 +48,7 @@ class FakeKernel(val cmdrSize: Int = 4096,
   val cmdrOff: Int = 128
   val dataOff: Int = cmdrOff + cmdrSize
   val segment: MemorySegment = arena.allocate((dataOff + dataSize).toLong, 4096)
+  val channel: FakeChannel = FakeChannel()
 
   private val intHandle: VarHandle = JAVA_INT.varHandle()
 
@@ -126,10 +151,14 @@ class FakeKernel(val cmdrSize: Int = 4096,
     val iovecs = (0 until size by iovSplit).map: o =>
       ((dataOff + dataAt + o).toLong, math.min(iovSplit, size - o).toLong)
     placeEntry(commandEntry(id, cdb, iovecs))
+    channel.signal()
     id
 
   /** Writes a hand-built entry at the head (after a PAD if it would cross the ring end). Returns its ring offset. */
-  def submitRaw(bytes: Array[Byte]): Int = synchronized(placeEntry(bytes))
+  def submitRaw(bytes: Array[Byte]): Int = synchronized:
+    val at = placeEntry(bytes)
+    channel.signal()
+    at
 
   def submitTmr(tpe: Int, ids: Seq[Int]): Unit = synchronized:
     val len = align8(TmrCmdIds + 2 * ids.size)
@@ -139,6 +168,7 @@ class FakeKernel(val cmdrSize: Int = 4096,
     buf.putInt(TmrCmdCnt, ids.size)
     for (id, i) <- ids.zipWithIndex do buf.putShort(TmrCmdIds + 2 * i, id.toShort)
     placeEntry(buf.array())
+    channel.signal()
 
   /** Every CMD entry completed since the last call, walking from the last-seen tail to `cmd_tail`. */
   def completions(): List[FakeCompletion] = synchronized:

@@ -212,6 +212,14 @@ class ScsiCommandsSuite extends AsyncFunSuite with Matchers:
       dev.logged.map(c => (c._2(0), c._2(1).asInstanceOf[List[Byte]].length)) should be (List(
         (0L, 2 * Bs), (2L * Bs, 2 * Bs), (4L * Bs, Bs)))
 
+  test("WRITE SAME chunks are at most 1 MiB"):
+    val (dev, cmds) = fixture()
+    val p = pattern(Bs, 3)
+    run(cmds, writeSame16(0, 300, unmap = false), p).map: (r, _) =>
+      good(r)
+      dev.logged.map(c => (c._2(0), c._2(1).asInstanceOf[List[Byte]].length)) should be (List(
+        (0L, 256 * Bs), (256L * Bs, 44 * Bs)))
+
   test("WRITE SAME rejects a zero count, a bad payload and an out-of-range block"):
     val (dev, cmds) = fixture()
     for
@@ -327,6 +335,17 @@ class ScsiCommandsSuite extends AsyncFunSuite with Matchers:
     yield
       expectSense(r1, Sense.HardwareError)
       d1 should be (empty)
+      expectSense(r2, Sense.HardwareError)
+
+  test("a non-NonFatal throw or failure from the device becomes HARDWARE ERROR"):
+    val (dev, cmds) = fixture()
+    dev.throws = Map("read" -> new LinkageError("sync"))
+    dev.failures = Map("flush" -> new InterruptedException("async"))
+    for
+      (r1, _) <- run(cmds, read10(0, 1), capacity = Bs)
+      (r2, _) <- run(cmds, syncCache10)
+    yield
+      expectSense(r1, Sense.HardwareError)
       expectSense(r2, Sense.HardwareError)
 
   test("a dataOut that throws becomes HARDWARE ERROR"):

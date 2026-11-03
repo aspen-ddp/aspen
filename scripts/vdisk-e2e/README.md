@@ -10,8 +10,8 @@ Root-only checks of `aspen vdisk-server` through the kernel: LIO, the TCMU user 
 * `targetcli` (targetcli-fb), `open-iscsi`, `fio`, `busctl` and `numfmt`.
 * tcmu-runner stopped and disabled (`systemctl disable --now tcmu-runner`). vdisk-server replaces it, and the scripts
   refuse to run while it is active.
-* A running Aspen system, a client config, and an existing disk (`aspen create-disk <client-config> vd1 10G --pool
-  <pool>`).
+* A running Aspen system, a client config, and an existing disk (`aspen create-disk <client-config> vd1 10G --group
+  <group>`).
 * The `aspen` launcher's classpath cache: run `./aspen --help` once as yourself first, so that root does not invoke
   sbt. Under `sudo`, pass `JAVA_HOME` if java is not on root's PATH.
 

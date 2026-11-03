@@ -22,16 +22,24 @@ targetcli-fb sources, and the non-root tests. Items marked *verify on first run*
   `org.kernel.TCMUService1` and the TCMU devices, so they cannot run on the same host. `vdisk-server` refuses to start
   while the name is owned.
 * A running Aspen system and a client config (`aspen-client-config.yaml`).
-* A storage pool with a maximum object size. For example, with an existing device set `<devset>`:
+* An allocation group with a maximum slice size, holding one or more storage pools. A disk's objects are spread
+  across the group's pools, so it can grow larger than any one pool. For example, with an existing device set
+  `<devset>`:
 
-      aspen create-pool <client-config> vdisk-pool random-access-reed-solomon 16 10 12 <devset> \
+      aspen create-pool <client-config> vdisk-pool-1 random-access-reed-solomon 16 10 12 <devset> \
           --backend fsif --max-object-size 5120000 --segment-count <n>
+      aspen show-pool <client-config> vdisk-pool-1        # note its "Max Slice Size"
+      aspen create-allocation-group <client-config> vdisk-group 0 random-access-reed-solomon 16 10 12 \
+          --max-slice-size <pool's max slice size>
+      aspen add-pool-to-group <client-config> vdisk-pool-1 vdisk-group
 
-  (The client config file is the first argument of every command that talks to a running system. `create-pool` also
-  requires `--segment-count`, the objects each store can hold.)
+  The group's IDA must match its pools', and its `--max-slice-size` must be no larger than any member's: it is a
+  floor every member meets. Add more pools the same way as the disk grows. (The client config file is the first
+  argument of every command that talks to a running system. `create-pool` also requires `--segment-count`, the
+  objects each store can hold.)
 
 ## 1. Create the disk
-    aspen create-disk <client-config> vd1 10G --pool vdisk-pool
+    aspen create-disk <client-config> vd1 10G --group vdisk-group
 
 The size must be a multiple of the logical block size (4096 by default; `--block-size 512` is available).
 `aspen list-disks <client-config>` shows it. The kernel's TCMU device must use the same block size, which step 4 sets

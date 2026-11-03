@@ -4,7 +4,8 @@ import java.util.UUID
 
 import org.aspen_ddp.aspen.client.{AspenClient, InvalidObject, TransactionAborted, ObjectAllocator, ObjectAllocatorId, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, SinglePoolNodeAllocator, TieredKeyValueList, TreeKind}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, NodeAllocator, Root, SinglePoolNodeAllocator, TieredKeyValueList,
+  TreeKind}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, IntegerKeyOrdering, Key, KeyAlreadyExists,
   KeyValueObjectPointer, ObjectPointer, ObjectRevision, Value}
@@ -56,10 +57,12 @@ object DiskCatalog:
           for
             _ <- client.prepareRegisterId(DiskConfig.RegistryNamespace, name, diskId)
             fence <- allocator.allocateDataObject(DataBuffer(FenceState.Initial.toArray))
-            // Node allocator pool follows the fence object, which the allocator has already placed
-            pool <- client.getStoragePool(fence.poolId)
-            root <- Root.create(client, IntegerKeyOrdering, SinglePoolNodeAllocator.forPool(client, pool), Map(),
-              TreeKind.DataObjects)
+            // The map's nodes come from the disk's allocator too, so neither the map nor the blocks are confined to
+            // one pool of a group
+            nodes = new NodeAllocator(client, List((allocator.allocatorId,
+              NodeAllocator.fittingNodeSize(SinglePoolNodeAllocator.DefaultMaxNodeSize,
+                NodeAllocator.nodeSizeLimit(allocator, TreeKind.DataObjects)))))
+            root <- Root.create(client, IntegerKeyOrdering, nodes, Map(), TreeKind.DataObjects)
             content = Map(
               DiskConfig.SizeKey -> Value(DiskConfig.encodeLong(size)),
               DiskConfig.LogicalBlockSizeKey -> Value(DiskConfig.encodeInt(logicalBlockSize)),

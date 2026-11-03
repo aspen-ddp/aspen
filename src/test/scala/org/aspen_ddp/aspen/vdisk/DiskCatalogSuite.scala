@@ -3,14 +3,15 @@ package org.aspen_ddp.aspen.vdisk
 import java.util.UUID
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
-import org.aspen_ddp.aspen.client.ObjectAllocator
+import org.aspen_ddp.aspen.client.{GroupObjectAllocatorId, ObjectAllocator}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
 import org.aspen_ddp.aspen.common.objects.{Key, Value}
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
+import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
 
 import scala.concurrent.Future
 
@@ -32,6 +33,28 @@ class DiskCatalogSuite extends IntegrationTestSuite:
       created.geometry should be (DiskGeometry(65536, 4096, 16384))
       loaded should be (created)
       loaded.allocatorId should be (alloc.allocatorId)
+
+  atest("a disk created in a group allocates its block map's nodes through the group"):
+    for
+      groupId <- client.createAllocationGroup("disk-group", level = 0, maxSliceSize = testPoolMaxSliceSize,
+        ida = Some(testIda))
+      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId)
+      alloc <- client.getAllocator(GroupObjectAllocatorId(groupId))
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      config <- client.read(info.configPointer)
+      tree <- KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer).getDataObjectTree()
+      ptr <- client.transactUntilSuccessful: tx =>
+        given Transaction = tx
+        for
+          ptr <- alloc.allocateDataObject(DataBuffer(new Array[Byte](16)))
+          _ <- tree.set(Key(0L), Value(ptr.toArray))
+        yield ptr
+      mapped <- tree.get(Key(0L))
+    yield
+      info.allocatorId should be (GroupObjectAllocatorId(groupId))
+      val root = Root(client, config.contents(DiskConfig.MapRootKey).value.bytes)
+      root.nodeAllocator.tiers.map(_._1).toList should be (List(GroupObjectAllocatorId(groupId)))
+      mapped.map(_.bytes.toList) should be (Some(ptr.toArray.toList))
 
   atest("create rejects a duplicate name"):
     for

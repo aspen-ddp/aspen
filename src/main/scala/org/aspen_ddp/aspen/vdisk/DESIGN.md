@@ -141,7 +141,8 @@ disk:
   Only `size` ever changes after creation.
 - **Fence object** (DataObject): a `FenceState(epoch, owner UUID)`.
 - **Block map:** a `DataObjectTKVL`, created empty, keyed by block index with `IntegerKeyOrdering`. Its values are
-  encoded `DataObjectPointer`s.
+  encoded `DataObjectPointer`s. Its nodes, like the blocks, come from the disk's allocator (normally an allocation
+  group), at up to 1 MiB each or the allocator's node size limit when that is smaller.
 
 Block objects are allocated lazily: a block with no map entry reads as zeros (thin provisioning). The block object
 size is the largest multiple of the logical block size that is no larger than the allocator's `maxObjectSize`
@@ -252,8 +253,8 @@ Map transactions run one at a time per disk. `kickMap` batches:
 
 One transaction allocates the new block objects with their initial content (dirty data up to its end, gaps
 zero-filled), inserts or replaces their map entries, and sets the refcount of deleted objects to 0. Inserts use
-`requireDoesNotExist`. When anything is deleted the transaction calls `deferAllocationRelease()`; a disk's blocks
-all come from one allocator, so this stays within FSIF's limit of one pool per transaction.
+`requireDoesNotExist`. When anything is deleted the transaction calls `deferAllocationRelease()`. The deletions may
+span several FSIF pools of the disk's allocation group; FSIF enrolls one release task covering all of them.
 
 **Retries after an unknown outcome** discover what a failed attempt actually did:
 - **`KeyAlreadyExists` on an insert:** the attempt did create the block. The block *adopts* the mapped object

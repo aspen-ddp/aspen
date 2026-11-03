@@ -1,27 +1,36 @@
 TODO
 ====
 
-Add an iscsi server application similar to amoebafs. The goal is to implement block devices on top of Aspen that
-are exported via the iscsi protocol with "good" performance. TCMU seems to be a good balance between performance and
-implementation simplicity. A high-level design description of how this might be achieved is
-captured in @features/iscsi-target.txt this should serve as the starting point for how to implement this feature but
-it should not be considered set-in-stone. Alternative solutions may be considered. To implement the backend on top
-of Aspen, a DataObjectTKVL should be used to hold blocks of storage allocated from an ObjectAllocator configured with
-an FSIF IDA. The size of the blocks will be determined by the backend configuration which sets the segment size and
-overall maximum object size. When possible, Small reads and writes should be handled via byte ranges rather than whole
-object reads and writes. Reads typically benefit from pre-fetching which largely comes for free when reading whole
-objects but not all reads benefit from this (such as reading an inode). A balance or heuristic on when a small or
-full read should be done may need to be designed. Similar to AmoebaFS, this should be implemented in terms of a
-root object registered with the system object registry and allow for the creation of multiple virtual disks that
-can be served out over the TCMU interface.
+vdisk (native TCMU frontend) follow-ups:
+- Run the root end-to-end scripts in scripts/vdisk-e2e/ (setup.sh, restart-under-io.sh, grow.sh in both modes,
+  teardown.sh; not yet run, see its README.md and docs/vdisk-tcmu-setup.md). Check dmesg after the first ext4 mount
+  (lazy-init zeroout), confirm hw_block_size=4096 / hw_max_sectors take effect, that `targetcli ... set attribute
+  dev_size=` sends a reconfig, and that a restart under I/O fits within cmd_time_out. Run shellcheck on the scripts.
+- LockState.Fenced is learned only when a commit fails; part 3 (ALUA) needs an active fence check.
+- TMR ring entries are logged and otherwise ignored (no abort of in-flight commands). Revisit with part 3.
+- vdisk tcmu: a timed-out acquire keeps running and can fence a later successful add of the same disk; needs a
+  cancellable acquire in DiskHandle/VirtualDisk.
+
+vdisk: before the ALUA failover work, verify that readRanges always returns the newest committed revision of an
+object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
+
+vdisk: Add ALUA failover support
+
+vdisk: Rename "vdisk" to "amoeba_disk"
+
+Verify that RevisionLock transaction requirement is exclusive. If so, rename to ExclusiveRevisionLock to make this
+explicit.
+
+MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
+both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one. Also, verify
+that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where
+two simultaneous transactions attempt to blind-insert the same key. If locks are not taken, the order of applications
+could corrupt the key/value pair and make it non recoverable.
 
 DataObject TKVL test suite sometimes reports hung tests during full test runs though it still succeeds. Although
 apparently not flaky, it suggests that these tests may be taking an inordinately long time to complete. Investigate
 to see if these tests are slower than they should be and where the hung transactions are occurring. Determine if
 this is purely a test issue that can be fixed or if there may be an underlying system issue that needs to be addressed.
-
-Verify that RevisionLock transaction requirement is exclusive. If so, rename to ExclusiveRevisionLock to make this
-explicit.
 
 QuicConnectionSuite "a burst from many threads schedules few drains" is flaky under load (observed 1 failure in 14
 full test runs: 930 not < 800). The assertion depends on thread scheduling. Flaky tests are not permitted: make the
@@ -32,23 +41,5 @@ holding requirement locks. They come from finalization actions waiting ~2.5-3.2 
 backoff; the tests pass. Investigate together with the DataObject TKVL item above: determine whether the backoff is
 too conservative or whether finalization actions collide more than they should.
 
-vdisk: before the ALUA failover work, verify that readRanges always returns the newest committed revision of an
-object (not a stale one from lagging stores). "Flushed data survives a takeover" depends on it.
 
-MayExist on a key that does not exist takes no requirement lock, so two concurrent inserts of the same absent key can
-both be voted to commit. Pre-existing; decide whether an absent key should be locked like a present one. Also, verify
-that inserts with no requirement lock the modification of that key to the transaction. We must prevent the case where
-two simultaneous transactions attempt to blind-insert the same key. If locks are not taken, the order of applications
-could corrupt the key/value pair and make it non recoverable.
 
-vdisk tcmu bridge (part 2) follow-ups:
-- Run the root end-to-end setup in docs/vdisk-tcmu-setup.md (not yet run). Check dmesg after the first ext4 mount
-  (lazy-init zeroout), confirm hw_block_size=4096 / hw_max_sectors take effect, and test vdisk-server restart under a
-  mounted filesystem.
-- After `aspen grow-disk`, a tcmu reopen before the targetcli resize fails forever (OPEN SizeMismatch, reconfig -EBUSY
-  while closed). Either let OPEN accept a reported size smaller than Aspen's or document recreating the backstore.
-- handler_aspen.c: aspen_reconfig (netlink thread) reads the device private pointer without synchronising with
-  aspen_close (recovery thread); a resize racing a reopen could use freed state.
-- LockState.Fenced is learned only when a commit fails; part 3's get_lock_state needs an active fence check.
-- tcmu-runner 1.5.4 reports DPOFUA=0, so Linux never sends FUA writes (it emulates them with WRITE + SYNCHRONIZE CACHE).
-  Account for this in the part-4 measurements.

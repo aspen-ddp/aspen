@@ -163,6 +163,8 @@ class TransactionImpl(val client: AspenClient,
 
   def allocationReleaseDeferred: Boolean = synchronized { releaseDeferred }
 
+  def deletedObjects: List[ObjectPointer] = bldr.deletedObjects
+
   def attachment[T <: AnyRef](key: AnyRef)(init: => T): T = synchronized {
     attachments.getOrElseUpdate(key, init).asInstanceOf[T]
   }
@@ -229,6 +231,8 @@ class TransactionImpl(val client: AspenClient,
         "strategy's commit hook")
 
     private[aspen] def allocationReleaseDeferred: Boolean = TransactionImpl.this.allocationReleaseDeferred
+
+    private[aspen] def deletedObjects: List[ObjectPointer] = TransactionImpl.this.deletedObjects
 
     private[aspen] def attachment[T <: AnyRef](key: AnyRef)(init: => T): T = TransactionImpl.this.attachment(key)(init)
 

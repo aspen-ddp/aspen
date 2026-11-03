@@ -24,9 +24,9 @@ import scala.util.Random
   * touches, so a concurrent change to one of those segments, or a view older than a deleted object's allocation,
   * aborts the transaction.
   *
-  * A transaction that called `deferAllocationRelease()` leaves its deletions' bits set and instead enrolls a system
-  * FsifReleaseIndicesTask that clears them later. The task exists iff the delete commits, so no index leaks or is
-  * freed twice, but the indices stay unavailable until it runs.
+  * A transaction that called `deferAllocationRelease()` leaves its deletions' bits set and instead enrolls one system
+  * FsifReleaseIndicesTask, covering every FSIF pool it deletes from, that clears them later. The task exists iff the
+  * delete commits, so no index leaks or is freed twice, but the indices stay unavailable until it runs.
   */
 object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory with RegisteredTypeFactory:
   override val typeUUID: UUID = UUID.fromString("c3a8e5d1-4b7f-4f29-8e06-91d2b7a4f35c")
@@ -60,11 +60,11 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
         val (indexCount, bitmap) = decodeConfig(bytes)
         new Strategy(client, indexCount, bitmap)
 
-  /** Transaction attachment key, shared by every Strategy instance, naming the one FSIF pool whose deferred release
-    * the transaction enrolled
-    */
+  /** Transaction attachment key, shared by every Strategy instance, for the transaction's one deferred release */
   private object DeferredReleaseKey
-  private final class DeferredReleasePool(val poolId: PoolId)
+
+  /** The deferred indices of each FSIF pool, as enrolled in the transaction's one FsifReleaseIndicesTask */
+  private final class DeferredRelease(val covered: Future[Map[PoolId, Set[Int]]])
 
   /** One transaction's view of one pool's bitmap. Guarded by its own monitor. */
   private final class TxState:
@@ -135,19 +135,32 @@ object FsifIndexAllocationStrategy extends StoragePoolAllocationStrategy.Factory
       // The indices are taken here so a bad pointer fails the transaction even when its release is deferred
       Future(deleted.map(p => FsifIndexBitmap.indexOf(p.storePointer, indexCount))).flatMap: deletedIndices =>
         if deferRelease && deletedIndices.nonEmpty then
-          // Each enrollment updates the shared system task registry, which a transaction may update only once
-          val enrolled = t.attachment(DeferredReleaseKey)(new DeferredReleasePool(poolId)).poolId
-          if enrolled != poolId then
-            Future.failed(new IllegalArgumentException(
-              "deferAllocationRelease supports deferred deletions in only one FSIF pool per transaction; " +
-              s"got $enrolled and $poolId"))
-          else
-            for
-              _ <- updateBits(poolId, allocated, Nil)
-              _ <- FsifReleaseIndicesTask.prepare(client, poolId, deletedIndices)
-            yield ()
+          // The first FSIF hook enrolls one task for every FSIF pool: each enrollment updates the shared system task
+          // registry, which a transaction may update only once
+          val release = t.attachment(DeferredReleaseKey)(new DeferredRelease(enrollRelease()))
+          release.covered.flatMap: covered =>
+            if covered.get(poolId).contains(deletedIndices.toSet) then
+              updateBits(poolId, allocated, Nil)
+            else
+              Future.failed(new IllegalStateException(s"FSIF pool $poolId: transaction ${t.id.uuid} gained " +
+                s"deferred deletions after its release task was enrolled (covered: ${covered.get(poolId)}, " +
+                s"deleted: ${deletedIndices.sorted})"))
         else
           updateBits(poolId, allocated, deletedIndices)
+
+    /** Enrolls one FsifReleaseIndicesTask for the deletions of every FSIF pool the transaction deletes from and
+      * returns the indices it covers, by pool. Runs outside the transaction's monitor.
+      */
+    private def enrollRelease()(using t: Transaction): Future[Map[PoolId, Set[Int]]] =
+      Future.unit.flatMap: _ =>
+        Future.sequence(t.deletedObjects.groupBy(_.poolId).toList.map: (pid, ptrs) =>
+          client.getStoragePool(pid).map: pool =>
+            pool.allocationStrategy match
+              case s: Strategy => Some(pid -> ptrs.map(p => FsifIndexBitmap.indexOf(p.storePointer, s.indexCount)))
+              case _ => None)
+        .flatMap: entries =>
+          val release = entries.flatten.toMap
+          FsifReleaseIndicesTask.prepare(client, release).map(_ => release.map((pid, is) => pid -> is.toSet))
 
     /** Clears the bits of `indices` in one guarded update to the bitmap within the transaction. Used by
       * FsifReleaseIndicesTask.

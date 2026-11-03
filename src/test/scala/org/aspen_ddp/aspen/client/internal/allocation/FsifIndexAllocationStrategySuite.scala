@@ -420,31 +420,61 @@ class FsifIndexAllocationStrategySuite extends IntegrationTestSuite:
       tasks.size should be(1)
       afterTask should be(Set())
 
-  atest("deferred deletions in two FSIF pools in one transaction fail it with IllegalArgumentException"):
+  atest("deferred deletions in two FSIF pools enroll one task that clears both"):
     for
-      (poolA, allocatorA, bitmapA) <- install(16)
-      (poolB, allocatorB, bitmapB) <- install(16)
+      (_, allocatorA, bitmapA) <- install(16)
+      (_, allocatorB, bitmapB) <- install(16)
       a <- allocateOne(allocatorA)
+      a2 <- allocateOne(allocatorA)
       b <- allocateOne(allocatorB)
       before <- systemTasks()
       metaA <- client.readMetadata(a)
+      metaA2 <- client.readMetadata(a2)
       metaB <- client.readMetadata(b)
       tx = client.newTransaction()
       _ = tx.setRefcount(a, metaA.refcount, metaA.refcount.decrement())
       _ = tx.setRefcount(b, metaB.refcount, metaB.refcount.decrement())
+      _ = tx.setRefcount(a2, metaA2.refcount, metaA2.refcount.decrement())
       _ = tx.deferAllocationRelease()
-      failure <- tx.commit().failed
+      _ <- tx.commit()
       _ <- waitForTransactionsToComplete()
-      after <- systemTasks()
-      bitsA <- setBits(bitmapA)
-      bitsB <- setBits(bitmapB)
+      afterDeleteA <- setBits(bitmapA)
+      afterDeleteB <- setBits(bitmapB)
+      all <- systemTasks()
+      tasks <- releaseTasks()
+      _ <- runTask(tasks.head)
+      afterTaskA <- setBits(bitmapA)
+      afterTaskB <- setBits(bitmapB)
     yield
-      failure shouldBe an[IllegalArgumentException]
-      failure.getMessage should include(poolA.toString)
-      failure.getMessage should include(poolB.toString)
-      after.size should be(before.size)
-      bitsA should be(Set(indexOf(a)))
-      bitsB should be(Set(indexOf(b)))
+      afterDeleteA should be(Set(indexOf(a), indexOf(a2)))
+      afterDeleteB should be(Set(indexOf(b)))
+      all.size should be(before.size + 1)
+      tasks.size should be(1)
+      afterTaskA should be(Set())
+      afterTaskB should be(Set())
+
+  atest("a deferred release task covers only the FSIF pools the transaction deletes from"):
+    for
+      (_, allocator, bitmap) <- install(16)
+      o <- allocateOne(allocator)
+      radiclePool <- client.getStoragePool(Radicle.poolId)
+      other <- allocateOne(new PoolObjectAllocator(client, radiclePool))
+      meta <- client.readMetadata(o)
+      otherMeta <- client.readMetadata(other)
+      tx = client.newTransaction()
+      _ = tx.setRefcount(o, meta.refcount, meta.refcount.decrement())
+      _ = tx.setRefcount(other, otherMeta.refcount, otherMeta.refcount.decrement())
+      _ = tx.deferAllocationRelease()
+      _ <- tx.commit()
+      _ <- waitForTransactionsToComplete()
+      otherAfter <- client.readMetadataOptional(other)
+      tasks <- releaseTasks()
+      _ <- runTask(tasks.head)
+      afterTask <- setBits(bitmap)
+    yield
+      otherAfter shouldBe None
+      tasks.size should be(1)
+      afterTask should be(Set())
 
   private def readPoolState(poolId: PoolId): Future[KeyValueObjectState] =
     client.getStoragePoolPointer(poolId).flatMap(client.read(_))

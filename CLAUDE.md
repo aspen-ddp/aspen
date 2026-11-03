@@ -159,7 +159,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   segments located by a 4-byte storePointer, with a journal and checkpointed index). FSIF freezes writes on ENOSPC
   and keeps serving reads. FSIF pools use `FsifIndexAllocationStrategy` (a per-pool bitmap KeyValue object in
   the metadata group; bits set/cleared in the transaction, or by a system DurableTask after
-  `Transaction.deferAllocationRelease()`, which allows one FSIF pool per transaction). Metadata pools can't use FSIF.
+  `Transaction.deferAllocationRelease()`: one task per transaction, covering all its FSIF pools). Metadata pools
+  can't use FSIF.
 
 ## Subsystem Details
 

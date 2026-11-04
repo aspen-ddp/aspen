@@ -6,10 +6,10 @@ import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.{GroupObjectAllocatorId, ObjectAllocator}
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.client.Transaction
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, Root, TieredKeyValueList}
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, LruTierCache, Root, TierCache, TieredKeyValueList}
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.client.registries.NamespacedUUIDRegistry
-import org.aspen_ddp.aspen.common.objects.{Key, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, Value}
 import org.aspen_ddp.aspen.common.ida.{IDA, RandomAccessReedSolomon}
 import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
 
@@ -55,6 +55,33 @@ class DiskCatalogSuite extends IntegrationTestSuite:
       val root = Root(client, config.contents(DiskConfig.MapRootKey).value.bytes)
       root.nodeAllocator.tiers.map(_._1).toList should be (List(GroupObjectAllocatorId(groupId)))
       mapped.map(_.bytes.toList) should be (Some(ptr.toArray.toList))
+
+  atest("a block map whose tree caches any root still finds another writer's entry on refresh"):
+    for
+      alloc <- allocator()
+      info <- DiskCatalog.create(client, "d1", alloc, 65536)
+      cached <- KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer,
+        LruTierCache(TierCache.DefaultNodesPerTier, anyRoot = true)).getDataObjectTree()
+      map = BlockMap(cached)
+      before <- map.lookup(0L)
+      // The empty root is now cached. Another writer maps block 1.
+      other <- KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer).getDataObjectTree()
+      ptr <- client.transactUntilSuccessful: tx =>
+        given Transaction = tx
+        for
+          ptr <- alloc.allocateDataObject(DataBuffer(new Array[Byte](16)))
+          _ <- other.set(Key(1L), Value(ptr.toArray))
+        yield ptr
+      _ <- waitForTransactionsToComplete()
+      stale <- map.lookup(1L)
+      refreshed <- map.refresh(1L)
+      held <- map.lookup(1L)
+    yield
+      before should be (None)
+      // Served from the cached root: only the map's own writes are expected to show without a refresh
+      stale should be (None)
+      refreshed should be (Some(ptr))
+      held should be (Some(ptr))
 
   atest("create rejects a duplicate name"):
     for

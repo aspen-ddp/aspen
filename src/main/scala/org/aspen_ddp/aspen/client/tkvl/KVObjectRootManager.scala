@@ -46,7 +46,7 @@ class KVObjectRootManager(val client: AspenClient,
                   case Failure(err) =>
                     // Tree has been deleted but the root has not yet been updated
                     // Return an empty tree root
-                    p.success(RootState(root.copy(tier=0, orootObject=None), v.revision, None))
+                    p.success(RootState(root.copy(tier=0, orootObject=None), v.revision, None, cacheable = false))
                     
                   case Success(node) =>
                     p.success(RootState(root, v.revision, Some(node)))
@@ -112,7 +112,7 @@ class KVObjectRootManager(val client: AspenClient,
     }
 
     for {
-      RootState(root, rootRevision, onode) <- getRData(fresh = true)
+      RootState(root, rootRevision, onode, _) <- getRData(fresh = true)
 
       // Check for a race condition where multiple concurrent attempts to
       // create the initial node might clash with each other. Done before the

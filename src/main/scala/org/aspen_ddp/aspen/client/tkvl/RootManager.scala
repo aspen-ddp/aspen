@@ -59,10 +59,12 @@ object RootManager:
     cached match
       case Some(rs) => Future.successful(rs)
       case None =>
-        val generation = cache.generation
-        read.map: rs =>
-          cache.putRoot(rs, generation)
-          rs
+        def fill(): Future[RootState] =
+          val generation = cache.generation
+          read.map: rs =>
+            cache.putRoot(rs, generation)
+            rs
+        if fresh then fill() else cache.missRead(() => fill())
 
   /** Runs `update`, a `createInitialNode` write of `host`, the object holding the tree's root. The transaction
     * rejects it if it already updates `host`, as when an earlier update of the same transaction already created the

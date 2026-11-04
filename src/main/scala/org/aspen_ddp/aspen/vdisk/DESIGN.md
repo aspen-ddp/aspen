@@ -142,7 +142,11 @@ disk:
 - **Fence object** (DataObject): a `FenceState(epoch, owner UUID)`.
 - **Block map:** a `DataObjectTKVL`, created empty, keyed by block index with `IntegerKeyOrdering`. Its values are
   encoded `DataObjectPointer`s. Its nodes, like the blocks, come from the disk's allocator (normally an allocation
-  group), at up to 1 MiB each or the allocator's node size limit when that is smaller.
+  group), at up to 1 MiB each or the allocator's node size limit when that is smaller. The owner opens it with an
+  `anyRoot` tier cache: it is the map's only writer and `BlockMap` remembers every entry it looked up or committed,
+  so a cached root (even an empty or tier-0 one) can serve lookups, and concurrent lookups share one root read
+  instead of each reading the config object from every store. `BlockMap.refresh`, used after an ambiguous map
+  commit, clears that cache first.
 
 Block objects are allocated lazily: a block with no map entry reads as zeros (thin provisioning). The block object
 size is the largest multiple of the logical block size that is no larger than the allocator's `maxObjectSize`

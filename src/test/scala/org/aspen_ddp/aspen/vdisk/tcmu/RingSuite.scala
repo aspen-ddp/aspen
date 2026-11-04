@@ -22,6 +22,15 @@ class RingSuite extends AnyFunSuite with Matchers:
     case List(c: RingItem.Command) => c
     case other => fail(s"expected one Command, got $other")
 
+  test("the layout matches the kernel's target_core_user.h"):
+    // offsetof() values from compiling against /usr/include/linux/target_core_user.h. The fake kernel writes entries
+    // with these same constants, so only this test ties them to the real ABI.
+    List(MbVersion, MbFlags, MbCmdrOff, MbCmdrSize, MbCmdHead, MbCmdTail) should be (List(0, 2, 4, 8, 12, 64))
+    List(EntLenOp, EntCmdId, EntKFlags, EntUFlags, HdrSize) should be (List(0, 4, 6, 7, 8))
+    List(ReqIovCnt, ReqIovBidiCnt, ReqIovDifCnt, ReqCdbOff, ReqIov) should be (List(8, 12, 16, 24, 48))
+    List(RspScsiStatus, RspReadLen, RspSense) should be (List(8, 12, 16))
+    List(TmrType, TmrCmdCnt, TmrCmdIds) should be (List(8, 12, 32))
+
   test("open rejects version 1, a missing OOOC flag, and a command ring past the map"):
     val v1 = FakeKernel()
     try

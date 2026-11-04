@@ -20,12 +20,12 @@ object RingLayout:
   val EntUFlags = 7     // u8
   val HdrSize = 8
 
-  // struct tcmu_cmd_entry req
+  // struct tcmu_cmd_entry req. The entry is packed, but its anonymous req struct is not: cdb_off is 8-byte aligned.
   val ReqIovCnt = 8     // u32
   val ReqIovBidiCnt = 12 // u32
   val ReqIovDifCnt = 16 // u32
-  val ReqCdbOff = 20    // u64, unaligned
-  val ReqIov = 44       // struct iovec[], unaligned
+  val ReqCdbOff = 24    // u64
+  val ReqIov = 48       // struct iovec[]
   val IovecSize = 16    // u64 base, u64 len
 
   // struct tcmu_cmd_entry rsp

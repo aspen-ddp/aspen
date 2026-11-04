@@ -358,6 +358,32 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     disposition shouldBe TransactionDisposition.VoteAbort
   }
 
+  test("a client prepare's data reaches a transaction a driver's prepare started without it") {
+    // The client's prepare can be lost or delayed while the driver's data-less prepare arrives. The store must not
+    // keep the abort vote it gave for the missing data, nor commit without the data it later receives.
+    val (frontend, backend, _, net) = mkFrontendWithNet()
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    val txd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
+
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+    net.txMessage() match
+      case Some(r: TxPrepareResponse) => r.disposition shouldBe TransactionDisposition.VoteAbort
+      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+
+    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](7))))))
+    net.txMessage() match
+      case Some(r: TxPrepareResponse) => r.disposition shouldBe TransactionDisposition.VoteCommit
+      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+
+    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+    net.txMessage() match
+      case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+      case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
   // ---- Requirement locks held between a commit vote and resolution ----
 
   val txid3 = TransactionId(new UUID(0, 11))

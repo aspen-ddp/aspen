@@ -29,7 +29,8 @@ class Tx( trs: TransactionRecoveryState,
 
   private val storeId = trs.storeId
   private val serializedTxd = trs.serializedTxd
-  private val objectUpdates = trs.objectUpdates
+  // A driver's prepare carries no object data, so a Tx it started gets the data from a later client prepare
+  private var objectUpdates = trs.objectUpdates
   private val pointersById: Map[ObjectId, ObjectPointer] = objectPointers.iterator.map(p => p.id -> p).toMap
 
   // Only the requirements of objects this store hosts, plus non-object requirements. Other pools' stores vote on
@@ -278,9 +279,27 @@ class Tx( trs: TransactionRecoveryState,
       resolvedAndAllObjectsLoaded(committed)
   }
 
+  /** Adopts the object data of a prepare that has some this Tx lacks: the first prepare to arrive may have been a
+    * driver's, which carries none, while the client's was lost or delayed. A vote made without the data was abort
+    * (MissingObjectUpdate), so it is recomputed while the outcome is unknown. A recovered Tx keeps its persisted vote,
+    * which may already have been counted, but still gets the data to commit.
+    */
+  private def adoptObjectUpdates(m: TxPrepare): Unit =
+    val have = objectUpdates.iterator.map(_.objectId).toSet
+    val added = m.objectUpdates.filterNot(ou => have.contains(ou.objectId))
+    if added.nonEmpty && !committing && !committed then
+      objectUpdates = objectUpdates ++ added
+      if allObjectsLoaded && !recovered && !outcomeKnown && oresolution.isEmpty then
+        unlock()
+        collisions = Nil
+        determineDisposition()
+        lock()
+
   def receivePrepare(m: TxPrepare): Unit = {
     logger.trace(s"*** Got Prepare: ${m.transactionId}")
     lastProposer = m.from
+
+    adoptObjectUpdates(m)
 
     // The client re-sends its prepares until it learns the outcome, whether or not any driver is
     // making progress. Counting them as activity would keep a transaction whose designated leader

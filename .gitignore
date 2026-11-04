@@ -39,9 +39,6 @@ Prompt.txt
 .claude
 CLAUDE.local.md
 
-# Demo generated files
-demo/bootstrap
-demo/node_a
-demo/node_b
-demo/node_c
+# Local testing
+local/
 

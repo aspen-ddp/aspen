@@ -169,12 +169,32 @@ object Main {
       ohost.foreach(_.receiveHostMessage(msg))
   }
 
-  def configureLogging(): Unit =
-    val logFormat = formatter"$dateFull $classNameSimple.$methodName:$line $messages$mdc"
-    scribe.Logger.root
+  /** One line per record, the same on the terminal and in a log file. */
+  val logFormat: scribe.format.Formatter = formatter"$dateFull $classNameSimple.$methodName:$line $messages$mdc"
+
+  /** Logs to the terminal and, when `logFile` is given, also appends to that file. */
+  def configureLogging(logFile: Option[os.Path] = None): Unit =
+    val terminal = scribe.Logger.root
       .clearHandlers()
       .withHandler(formatter = logFormat, minimumLevel = Some(scribe.Level.Trace))
+    logFile.fold(terminal)(f => terminal.withHandler(formatter = logFormat, writer = LogFileWriter(f),
+        minimumLevel = Some(scribe.Level.Trace)))
       .replace()
+
+  /** Appends each record's plain text (no terminal colors) to `file`, creating it and its directory if needed.
+   *  Every record is flushed: a crash-only host is stopped with kill -9, which would lose anything buffered.
+   */
+  final class LogFileWriter(file: os.Path) extends scribe.writer.Writer:
+    os.makeDir.all(file / os.up)
+    private val out = java.io.PrintWriter(java.io.OutputStreamWriter(
+      java.io.FileOutputStream(file.toIO, true), java.nio.charset.StandardCharsets.UTF_8))
+
+    def write(record: scribe.LogRecord, output: scribe.output.LogOutput,
+              outputFormat: scribe.output.format.OutputFormat): Unit = synchronized:
+      out.println(output.plainText)
+      out.flush()
+
+    override def dispose(): Unit = synchronized(out.close())
 
   /** Awaits `f` and then runs `report` on the calling thread.
    *
@@ -853,7 +873,7 @@ object Main {
     // re-enabled. run_debug_code is retained for reference but is not reachable.
     //Command("debug", "Runs debugging code", configOnlyArgs),
 
-    Command("host", "Starts an Aspen Storage Host", hostArgs),
+    Command("host", "Starts an Aspen Storage Host, logging to the terminal and <host-directory>/logs/host.log", hostArgs),
     Command("amoebafs", "Launches an AmoebaFS NFS server", amoebafsArgs),
     Command("create-pool", "Creates a new storage pool", createPoolArgs),
     Command("create-metadata-pool", "Creates a new storage pool that holds other pools' metadata", createMetadataPoolArgs),
@@ -1596,9 +1616,12 @@ object Main {
                               (stopAction: () => Unit):
     def stop(): Unit = stopAction()
 
+  /** Where the `host` command appends its log, as well as printing it. */
+  def hostLogFile(hostDir: os.Path): os.Path = hostDir / "logs" / "host.log"
+
   /** Starts the `host` command: blocks forever once the host is running. */
   def run_host(hostDir: os.Path, loadJars: Option[String]): Int = {
-    configureLogging()
+    configureLogging(Some(hostLogFile(hostDir)))
 
     val h = startHost(hostDir, loadJars)
 

@@ -345,6 +345,26 @@ class MainSuite extends AnyFunSuite with Matchers:
         if e == added then throw SysError("send", Linux.EIO, "I/O error"))
     replies.toArray.toList shouldBe List(added, removed)
 
+  test("the host log goes to <host-dir>/logs/host.log as plain text, appended across restarts"):
+    withTempDir("host-log"): dir =>
+      val file = Main.hostLogFile(dir)
+      file shouldBe dir / "logs" / "host.log"
+      def logTo(msg: String): Unit =
+        val writer = Main.LogFileWriter(file)
+        // Its own orphan logger: replacing the root logger would race other suites doing the same
+        val log = scribe.Logger().orphan().withHandler(formatter = Main.logFormat, writer = writer,
+          minimumLevel = Some(scribe.Level.Info))
+        log.info(msg)
+        log.debug("below the minimum level")
+        writer.dispose()
+      logTo("first run")
+      logTo("second run")
+      val lines = os.read.lines(file)
+      lines.size shouldBe 2
+      lines(0) should include ("first run")
+      lines(1) should include ("second run")
+      os.read(file) should not include ("\u001b[")
+
   test("tcmuEventLoop logs the first receive failure of a run, every 100th, and the recovery"):
     val lines = java.util.concurrent.ConcurrentLinkedQueue[(scribe.Level, String)]()
     // Its own orphan logger: replacing the root logger would race other suites doing the same

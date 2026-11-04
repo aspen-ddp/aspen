@@ -183,6 +183,9 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private val idleTimeout: Duration = config.idleTimeout.getOrElse(heartbeatPeriod * 3)
 
+  /** Shared by every connection, inbound and outbound. See QuicConfig. */
+  private val sendBudget = new SendBudget(config.sendBudgetBytes)
+
   private val useEpoll: Boolean = Epoll.isAvailable
 
   private val datagramChannelClass: Class[? <: Channel] =
@@ -343,7 +346,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     override def isSharable: Boolean = true
 
     override def initChannel(ch: QuicChannel): Unit =
-      val conn = new QuicConnection(ch.eventLoop(), config, inboundClosed)
+      val conn = new QuicConnection(ch.eventLoop(), config, inboundClosed, sendBudget = sendBudget)
       liveConnections.add(conn)
       inboundConnections.add(conn)
       // The peer's datagram-extension event fires before channelActive, so pipelineHandler goes in now
@@ -840,7 +843,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         result = cur
       else
         val parent = clientChannels(Math.floorMod(nextDialIndex.getAndIncrement(), clientChannels.length))
-        val conn = new QuicConnection(parent.eventLoop(), config, c => outboundClosed(entry, c), c => outboundActive(entry, c))
+        val conn = new QuicConnection(parent.eventLoop(), config, c => outboundClosed(entry, c), c => outboundActive(entry, c),
+          sendBudget)
         if entry.connection.compareAndSet(cur, conn) then
           liveConnections.add(conn)
           try

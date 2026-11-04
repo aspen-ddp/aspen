@@ -82,13 +82,13 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
       (conn.submit(enc), enc)
 
   private def fixture(config: QuicConfig = QuicConfig(), stall: Boolean = false,
-                      clientCreds: TlsCredentials = creds()): Fixture =
+                      clientCreds: TlsCredentials = creds(), budget: SendBudget = null): Fixture =
     val srv = QuicTestPeer.server(QuicTls.serverContext(creds()), config, stallStreams = stall)
     peers += srv
     val cli = QuicTestPeer.client(QuicTls.clientContext(clientCreds), config)
     peers += cli
     val closedCalls = new ConcurrentLinkedQueue[QuicConnection]()
-    val conn = new QuicConnection(cli.channel.eventLoop(), config, c => closedCalls.add(c))
+    val conn = new QuicConnection(cli.channel.eventLoop(), config, c => closedCalls.add(c), sendBudget = budget)
     connections += conn
     Fixture(srv, cli, conn, closedCalls)
 
@@ -182,7 +182,8 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("handoff over budget drops on the caller thread"):
     // Accepted while the queued bytes are below the budget: 512K + 512K reaches it exactly, so the third is dropped.
     // One stream, so the per-message charge cap (the stream high-water mark) is the whole budget.
-    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024, streamsPerConnection = 1))
+    val fx = fixture(QuicConfig(connectionCeilingBytes = 1024 * 1024, connectionFloorBytes = 0,
+      streamsPerConnection = 1))
     fx.dialAndWait()
     blockLoop(fx.loop)
     val subs = (0 until 3).map(i => fx.submit(sized(i, 512 * 1024)))
@@ -194,7 +195,8 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
 
   test("handoff below budget accepts a message that overshoots it"):
     // 512K queued is below the 1 MiB budget, so a 4 MiB message is accepted; the queue then exceeds the budget
-    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024, streamsPerConnection = 1))
+    val fx = fixture(QuicConfig(connectionCeilingBytes = 1024 * 1024, connectionFloorBytes = 0,
+      streamsPerConnection = 1))
     fx.dialAndWait()
     blockLoop(fx.loop)
     val first = fx.submit(sized(0, 512 * 1024))
@@ -211,7 +213,7 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
   test("each message counts at most one stream's high-water mark against the handoff budget"):
     // 1 MiB over 4 streams: 256K high water. Four 512K messages are charged 256K each and fill the budget, one per
     // stream; the fifth is dropped.
-    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024))
+    val fx = fixture(QuicConfig(connectionCeilingBytes = 1024 * 1024, connectionFloorBytes = 0))
     fx.dialAndWait()
     blockLoop(fx.loop)
     val subs = (0 until 5).map(i => fx.submit(sized(i, 512 * 1024)))
@@ -224,7 +226,8 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.conn.drops shouldBe 1
 
   test("pre-handshake queue accepts while below budget"):
-    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024, streamsPerConnection = 1))
+    val fx = fixture(QuicConfig(preHandshakeBytes = 1024 * 1024, connectionCeilingBytes = 1024 * 1024,
+      streamsPerConnection = 1))
     // One at a time, so each reaches the pre-handshake queue before the next is submitted
     val subs = Seq(sized(0, 512 * 1024), sized(1, 4 * 1024 * 1024), sized(2, 512 * 1024)).zipWithIndex.map:
       (m, i) =>
@@ -239,7 +242,7 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     subs.foreach(_._2.prefix.refCnt() shouldBe 0)
 
   test("message larger than budget is accepted when queue is empty"):
-    val fx = fixture(QuicConfig(connectionBudgetBytes = 1024 * 1024))
+    val fx = fixture(QuicConfig(connectionCeilingBytes = 1024 * 1024, connectionFloorBytes = 0))
     fx.dialAndWait()
     val msg = sized(7, 4 * 1024 * 1024)
     val (ok, enc) = fx.submit(msg)
@@ -252,9 +255,72 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     enc.prefix.refCnt() shouldBe 0
     fx.conn.drops shouldBe 0
 
+  test("an exhausted shared budget limits a connection to its floor"):
+    // The rest of the host has used the whole shared budget. Below its 512K floor the connection still queues; at
+    // the floor it drops, and once the budget has room again it queues up to its ceiling.
+    val budget = new SendBudget(1024 * 1024)
+    budget.add(1024 * 1024)
+    val fx = fixture(QuicConfig(connectionFloorBytes = 512 * 1024, streamsPerConnection = 1), budget = budget)
+    fx.dialAndWait()
+    blockLoop(fx.loop)
+    val subs = (0 until 3).map(i => fx.submit(sized(i, 256 * 1024)))
+    subs.map(_._1) shouldBe Seq(true, true, false)
+    budget.add(-1024 * 1024)
+    fx.submit(sized(3, 256 * 1024))._1 shouldBe true
+    cleanups.foreach(f => f())
+    awaitAll(fx.srv, 3).map(seqOf).toSet shouldBe Set(0L, 1L, 3L)
+    eventually("the budget to be returned")(budget.usedBytes == 0)
+
+  test("connections share one budget: a stalled one leaves the rest their floors"):
+    // The stalled connection fills the shared budget up to its ceiling, then drops. The other still sends a
+    // floor's worth, which it gets back as its writes complete.
+    val budget = new SendBudget(2 * 1024 * 1024)
+    val config = QuicConfig(initialMaxStreamDataUnidirectional = 64 * 1024, connectionCeilingBytes = 4 * 1024 * 1024,
+      connectionFloorBytes = 512 * 1024)
+    val stalled = fixture(config, stall = true, budget = budget)
+    stalled.dialAndWait()
+    (0 until 200).foreach(i => stalled.submit(sized(i, 64 * 1024)))
+    eventually("the stalled connection to fill the budget")(!budget.hasRoom)
+    stalled.conn.drops should be > 0L
+    stalled.conn.pendingStreamBytes should be <= (config.connectionCeilingBytes + 64 * 1024)
+
+    val other = fixture(config, budget = budget)
+    other.dialAndWait()
+    (1000 until 1004).foreach(i => other.submit(sized(i, 64 * 1024))._1 shouldBe true)
+    awaitAll(other.srv, 4).map(seqOf).toSet shouldBe (1000L until 1004L).toSet
+
+    stalled.srv.unstallStreams()
+    eventually("the budget to be returned")(budget.usedBytes == 0)
+
+  test("the pre-handshake queue takes nothing from the shared budget"):
+    val budget = new SendBudget(64 * 1024 * 1024)
+    val fx = fixture(QuicConfig(preHandshakeBytes = 256 * 1024), budget = budget)
+    val subs = (0 until 8).map(i => fx.submit(sized(i, 64 * 1024)))
+    subs.map(_._1).forall(identity) shouldBe true
+    eventually("drain")(fx.conn.drainedItems == 8)
+    budget.usedBytes shouldBe 0
+    fx.conn.drops shouldBe 4 // 4 x 64K reach the 256K bound
+    fx.dialAndWait()
+    awaitAll(fx.srv, 4).map(seqOf).toSet shouldBe Set(0L, 1L, 2L, 3L)
+
+  test("a burst of datagram-sized messages continues on a stream"):
+    // A 16-entry quiche queue: after 8 recent datagrams the rest of the burst goes on a stream, where it is reliable
+    val fx = fixture(QuicConfig(datagramQueueLength = 16))
+    fx.dialAndWait()
+    blockLoop(fx.loop)
+    val n = 100
+    (0 until n).foreach(i => fx.submit(sized(i, 200))._1 shouldBe true)
+    cleanups.foreach(f => f())
+    def onStream: Set[Long] = fx.srv.received.asScala.filter(_.transport != Transport.Datagram).map(seqOf).toSet
+    // The first 8 go as datagrams. If the loop drains the burst in several runs, a few later ones may too.
+    eventually("the burst's stream messages")(onStream.size >= n - 16)
+    onStream.exists(_ < 8) shouldBe false
+    fx.conn.drops shouldBe 0
+
   test("stalled peer causes drops, not queueing, and recovers"):
     // 4 streams x (256 KiB flow-control window + 512 KiB high water + one message) is far below 200 x 64 KiB
-    val config = QuicConfig(initialMaxStreamDataUnidirectional = 256 * 1024, connectionBudgetBytes = 2 * 1024 * 1024)
+    val config = QuicConfig(initialMaxStreamDataUnidirectional = 256 * 1024, connectionCeilingBytes = 2 * 1024 * 1024,
+      connectionFloorBytes = 0)
     val fx = fixture(config, stall = true)
     fx.dialAndWait()
     val msgSize = 64 * 1024
@@ -262,8 +328,10 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     val callerDrops = subs.count(!_._1)
     val barrier = fx.conn.postBarrier()
     eventually("drain to finish")(fx.conn.drainedItems == 201 - callerDrops)
-    fx.conn.drops should be > callerDrops.toLong // some were dropped on the loop for lack of a writable stream
-    val high = config.connectionBudgetBytes / config.streamsPerConnection
+    // Dropped on the caller thread once pending bytes reach the ceiling, or on the loop for lack of a writable stream:
+    // which one depends on timing
+    fx.conn.drops should be > 0L
+    val high = config.connectionCeilingBytes / config.streamsPerConnection
     fx.conn.maxPendingStreamBytes should be <= (high + msgSize)
     barrier.isDone shouldBe false // stuck writes on stalled streams are still in flight
 

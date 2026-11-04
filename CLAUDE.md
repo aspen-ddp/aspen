@@ -140,8 +140,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - The Network Layer is designed to be pluggable via `common.network.NetworkPlugin`. QUIC is the only plugin:
   - QUIC (`implementations/quic`, Netty 4.2): Mutual TLS on every connection, datagrams for
     encoded messages of 1024 bytes or less, a small round-robin pool of streams for larger ones, and messages
-    dropped (never queued) when a connection's buffers are full. Payloads are not copied on send and are
-    copied exactly once on receive.
+    dropped (never queued) when over budget. Payloads are not copied on send and are copied exactly once on receive.
+  - Send buffering (`QuicConfig`): one host-wide `SendBudget` (256 MiB) shared by all connections; a connection may
+    queue below its floor (256 KiB) always, or below its ceiling (64 MiB) while the shared budget has room. The
+    pre-handshake queue has its own bound (16 MiB) outside the shared budget. A datagram burst (about half of
+    quiche's queue since recent flushes) sends datagram-sized messages on a stream: a full quiche queue drops silently
 - A pluggable `NetworkCache` persists store->host and host->endpoint mappings, scoped to the system id.
   - `NoCache` for the CLI; RocksDB for hosts (`<host-root>/cache/network`) and `amoebafs --network-cache-dir`
   - MetadataManager seeds from it at startup, trusts entries immediately, and writes every change back

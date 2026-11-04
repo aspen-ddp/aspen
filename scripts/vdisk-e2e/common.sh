@@ -46,10 +46,40 @@ server_pid() {
   echo "${pids%%$'\n'*}"
 }
 
-# Starts vdisk-server in the background and waits until it serves (its startup scan has finished)
+# The client config a running vdisk-server was started with: the argument after "vdisk-server" on its command line
+server_config() {
+  local args i
+  mapfile -d '' args <"/proc/$1/cmdline"
+  for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+    if [[ ${args[i]} == vdisk-server ]]; then
+      echo "${args[i + 1]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# vdisk-server reads its client config only at startup, so one started before the config was rewritten (say by
+# bootstrapping a new system) still talks to the old system and every Aspen request times out
+check_running_server() {
+  local pid=$1 config started
+  config="$(server_config "$pid")" || die "cannot find the client config on vdisk-server's (pid $pid) command line"
+  if [[ -n $CLIENT_CONFIG && "$(realpath -m "$CLIENT_CONFIG")" != "$(realpath -m "$config")" ]]; then
+    die "vdisk-server (pid $pid) runs with client config $config, not $CLIENT_CONFIG; kill it first (teardown.sh)"
+  fi
+  [[ -f $config ]] || die "vdisk-server (pid $pid) client config $config no longer exists; kill it first (teardown.sh)"
+  started=$((EPOCHSECONDS - $(ps -o etimes= -p "$pid")))
+  if (($(stat -c %Y "$config") > started)); then
+    die "$config changed after vdisk-server (pid $pid) started, so it still uses the old one; kill it first (teardown.sh)"
+  fi
+}
+
+# Starts vdisk-server in the background and waits until it serves (its startup scan has finished).
+# A running server is reused only if it was started with CLIENT_CONFIG (when set) and that file is unchanged since.
 start_server() {
   local pid lines deadline
   if pid="$(server_pid)"; then
+    check_running_server "$pid"
     echo "vdisk-server already running (pid $pid)"
     return 0
   fi

@@ -46,8 +46,15 @@ if ! targetcli "$TPG/acls/$INITIATOR_IQN" ls >/dev/null 2>&1; then
   targetcli "$TPG/acls" create "$INITIATOR_IQN"
 fi
 if ! targetcli "$TPG/portals/127.0.0.1:3260" ls >/dev/null 2>&1; then
-  # the default 0.0.0.0:3260 portal, if present, would conflict
-  targetcli "$TPG/portals/0.0.0.0:3260" delete >/dev/null 2>&1 || true
+  # The default portal targetcli adds (0.0.0.0:3260, or [::0]:3260 on newer versions) listens on every address, so it
+  # conflicts. configfs names portals <ip>:<port>, with IPv6 addresses in brackets.
+  for np in "/sys/kernel/config/target/iscsi/$IQN/tpgt_1/np/"*; do
+    [[ -e $np ]] || continue
+    portal="$(basename "$np")"
+    ip="${portal%:*}"
+    ip="${ip#[}"
+    targetcli "$TPG/portals" delete "${ip%]}" "${portal##*:}"
+  done
   targetcli "$TPG/portals" create 127.0.0.1
 fi
 targetcli saveconfig

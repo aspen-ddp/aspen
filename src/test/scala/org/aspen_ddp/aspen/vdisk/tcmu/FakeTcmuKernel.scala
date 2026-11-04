@@ -40,7 +40,7 @@ final class FakeTcmuKernel extends TcmuKernel:
 
   /** Creates the configfs, sysfs and kernel-ring state of one TCMU device. */
   def addDevice(minor: Int, device: String, cfgstring: String, size: Long, blockSize: Int = 4096,
-                maxSectors: Int = 1024, subtype: String = "aspen", hba: String = "1",
+                maxSectors: Int = 1024, hba: String = "1",
                 serial: Option[String] = None): FakeKernel =
     val d = core / s"user_$hba" / device
     os.makeDir.all(d / "attrib")
@@ -54,7 +54,7 @@ final class FakeTcmuKernel extends TcmuKernel:
     val k = FakeKernel()
     val u = uio / s"uio$minor"
     os.makeDir.all(u / "maps" / "map0")
-    os.write.over(u / "name", s"tcm-user/$hba/$device/$subtype/$cfgstring\n")
+    os.write.over(u / "name", s"tcm-user/$hba/$device/$cfgstring\n")
     os.write.over(u / "maps" / "map0" / "size", s"0x${k.segment.byteSize().toHexString}\n")
     kernels(minor) = k
     dirs(d) = minor

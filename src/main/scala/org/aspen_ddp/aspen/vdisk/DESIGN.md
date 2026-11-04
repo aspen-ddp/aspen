@@ -95,7 +95,7 @@ The main thing to understand is that **the disk is a write-back cache with a sin
 | `ring/Ring.scala` | Decoder/encoder for one mapped ring: `open` (validate the mailbox), `nextItems`, `complete`, `resync`, `gather`/`scatter` of the data area, `mailboxDump`. |
 | `KernelChannel.scala` | `KernelChannel` (await/kick/close), `RingControl` (resetRing), and `UioChannel`, the UIO fd plus a wake-up pipe. |
 | `Netlink.scala` | `TcmuGenl` (the TCM-USER family's commands and attributes), `TcmuEvent` and `ReconfigChange`, `GenlCodec` (pure encode/decode), and `TcmuNetlink` (the socket: open, receive, reply). |
-| `Configfs.scala` | `UioName` (parses `tcm-user/<hba>/<device>/<subtype>/<cfgstring>`) and `Configfs`: configfs `attrib/hw_block_size`, `attrib/hw_max_sectors`, `info` (`Size:`), `wwn/vpd_unit_serial`, `action/block_dev` and `action/reset_ring`; sysfs `/sys/class/uio` (name, map size, scan). |
+| `Configfs.scala` | `UioName` (parses `tcm-user/<hba>/<device>/<cfgstring>`) and `Configfs`: configfs `attrib/hw_block_size`, `attrib/hw_max_sectors`, `info` (`Size:`), `wwn/vpd_unit_serial`, `action/block_dev` and `action/reset_ring`; sysfs `/sys/class/uio` (name, map size, scan). |
 | `Cfgstring.scala` | Parses `aspen/<disk>[;...]` and holds `ConfigDesc`, the help targetcli prints. |
 | `DeviceSettings.scala` | What SCSI emulation needs about one device: kernel size, block size, `hw_max_sectors`, block object size, device name, unit serial. |
 | `TcmuDevice.scala` | Serves one device: the `tcmu-<device>` loop, dispatch, completion, ring reset/resync, per-command trace. |
@@ -417,7 +417,8 @@ every reply. An unparseable message is logged at warn and dropped. A `receive` f
 a multicast overflow) is retried after 1 ms, doubling to 1 s, and reset on the next success; the first failure of
 a run, every 100th, and the recovery are logged.
 
-**The UIO name** (`/sys/class/uio/uioN/name`, `UioName.parse`) is `tcm-user/<hba>/<device>/<subtype>/<cfgstring>`.
+**The UIO name** (`/sys/class/uio/uioN/name`, `UioName.parse`) is `tcm-user/<hba>/<device>/<cfgstring>`, where the
+cfgstring is the device's `dev_config`, `<subtype>/<config>` (`aspen/<disk>`): the same string `CheckConfig` gets.
 Only subtype `aspen` (`TcmuService.Subtype`) is served. The configfs directory is
 `/sys/kernel/config/target/core/user_<hba>/<device>/`.
 

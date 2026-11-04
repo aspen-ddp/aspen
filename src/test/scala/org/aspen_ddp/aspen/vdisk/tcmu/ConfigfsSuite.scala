@@ -144,20 +144,22 @@ class ConfigfsSuite extends AnyFunSuite with Matchers:
     os.read(d / "action" / "reset_ring").trim should be ("1")
 
   test("uio name with slashes in cfgstring parses"):
-    UioName.parse("tcm-user/30/vd1/aspen/my/disk") should be (
-      Right(UioName("30", "vd1", "aspen", "my/disk")))
-    UioName.parse("tcm-user/30/vd1/aspen/vd1") should be (Right(UioName("30", "vd1", "aspen", "vd1")))
+    UioName.parse("tcm-user/30/vd1/aspen/my/disk") should be (Right(UioName("30", "vd1", "aspen/my/disk")))
+    val n = UioName.parse("tcm-user/30/vd1/aspen/vd1")
+    n should be (Right(UioName("30", "vd1", "aspen/vd1")))
+    n.map(_.subtype) should be (Right("aspen"))
 
   test("uio name rejects malformed strings"):
     UioName.parse("tcm-user/30/vd1").isLeft should be (true)
     UioName.parse("tcm-user/30/vd1/aspen").isLeft should be (true)
+    UioName.parse("tcm-user/30/vd1//vd1").isLeft should be (true)
     UioName.parse("other/30/vd1/aspen/x").isLeft should be (true)
     UioName.parse("").isLeft should be (true)
 
   test("uioName reads the sysfs name file"):
     val t = Tree()
     t.uioDev(3, "tcm-user/30/vd1/aspen/vd1")
-    t.configfs.uioName(3) should be (Right(UioName("30", "vd1", "aspen", "vd1")))
+    t.configfs.uioName(3) should be (Right(UioName("30", "vd1", "aspen/vd1")))
 
   test("uioName of a missing device is an error naming the path"):
     val t = Tree()
@@ -187,8 +189,8 @@ class ConfigfsSuite extends AnyFunSuite with Matchers:
     os.makeDir.all(t.uio / "notuio")
     os.makeDir.all(t.uio / "uio7") // no name file
     t.configfs.scanUio().sortBy(_._1) should be (List(
-      (0, UioName("30", "vd1", "aspen", "vd1")),
-      (2, UioName("31", "vd2", "aspen", "vd2"))))
+      (0, UioName("30", "vd1", "aspen/vd1")),
+      (2, UioName("31", "vd2", "aspen/vd2"))))
 
   test("scanUio skips a device whose name cannot be read"):
     val t = Tree()
@@ -196,7 +198,7 @@ class ConfigfsSuite extends AnyFunSuite with Matchers:
     t.uioDev(1, "tcm-user/31/vd2/aspen/vd2")
     os.remove(t.uio / "uio1" / "name")
     os.makeDir(t.uio / "uio1" / "name") // a directory where the name file is expected
-    t.configfs.scanUio() should be (List((0, UioName("30", "vd1", "aspen", "vd1"))))
+    t.configfs.scanUio() should be (List((0, UioName("30", "vd1", "aspen/vd1"))))
 
   test("the default writeFile to a missing attribute throws NoSuchFileException and creates nothing"):
     val t = Tree()

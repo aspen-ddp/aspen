@@ -132,7 +132,7 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
   test("a non-aspen subtype is -ENODEV"):
     withService(): fx =>
       fx.disk("vd1")
-      fx.kernel.addDevice(3, "dev1", "aspen/vd1", 8 * Mi, subtype = "file")
+      fx.kernel.addDevice(3, "dev1", "file/vd1", 8 * Mi)
       status(fx.service.added(3, reopen = false)) should be (-Linux.ENODEV)
 
   test("kernel size larger than the Aspen size grows the disk before serving"):
@@ -475,7 +475,7 @@ class TcmuServiceSuite extends AnyFunSuite with Matchers:
       val dev = fx.disk("vd0")
       fx.kernel.addDevice(0, "dev0", "aspen/vd0", 8 * Mi)
       fx.kernel.addDevice(1, "dev1", "aspen/missing", 8 * Mi)
-      fx.kernel.addDevice(2, "dev2", "file/x", 8 * Mi, subtype = "file")
+      fx.kernel.addDevice(2, "dev2", "file/x", 8 * Mi)
       await(fx.service.startupScan())
       fx.service.devices should be (Map(0 -> "vd0"))
       fx.kernel.events should contain ("reset_ring 1")

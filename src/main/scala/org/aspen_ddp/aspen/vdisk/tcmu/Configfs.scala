@@ -4,26 +4,28 @@ import java.nio.file.NoSuchFileException
 import scala.util.Try
 import scala.util.control.NonFatal
 
-/** The name the kernel gives a TCMU device's UIO node: `tcm-user/<hba>/<device>/<subtype>/<cfgstring>`.
+/** The name the kernel gives a TCMU device's UIO node: `tcm-user/<hba>/<device>/<cfgstring>`.
   *
-  * `hba` is the part after `tcm-user/`; its configfs directory is `user_<hba>`, as in libtcmu.
+  * `hba` is the part after `tcm-user/`; its configfs directory is `user_<hba>`, as in libtcmu. The cfgstring is the
+  * device's `dev_config`, `<subtype>/<handler config>` (targetcli writes `aspen/<disk>`), as in tcmu-runner.
   */
-final case class UioName(hba: String, device: String, subtype: String, cfgstring: String)
+final case class UioName(hba: String, device: String, cfgstring: String):
+  def subtype: String = cfgstring.takeWhile(_ != '/')
 
 object UioName:
   val Prefix = "tcm-user"
 
   def parse(s: String): Either[String, UioName] =
-    // The cfgstring is everything after the fourth '/' and may contain '/' itself.
-    val parts = s.split("/", 5)
-    if parts.length != 5 then
-      Left(s"invalid uio name '$s': expected tcm-user/<hba>/<device>/<subtype>/<cfgstring>")
+    // The cfgstring is everything after the third '/' and may contain '/' itself.
+    val parts = s.split("/", 4)
+    if parts.length != 4 then
+      Left(s"invalid uio name '$s': expected tcm-user/<hba>/<device>/<subtype>/<config>")
     else if parts(0) != Prefix then
       Left(s"invalid uio name '$s': does not start with tcm-user/")
-    else if parts(1).isEmpty || parts(2).isEmpty || parts(3).isEmpty then
+    else if parts(1).isEmpty || parts(2).isEmpty || !parts(3).contains('/') || parts(3).startsWith("/") then
       Left(s"invalid uio name '$s': empty hba, device or subtype")
     else
-      Right(UioName(parts(1), parts(2), parts(3), parts(4)))
+      Right(UioName(parts(1), parts(2), parts(3)))
 
 /** Reads and writes the configfs (target core) and sysfs (UIO class) files of TCMU devices.
   *

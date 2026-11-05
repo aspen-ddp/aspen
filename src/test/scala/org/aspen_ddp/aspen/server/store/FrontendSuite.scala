@@ -599,6 +599,76 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     r2.collisions shouldBe List(txid1)
   }
 
+  /** An overwrite of op1 built on `holder`'s commit: it requires the revision `holder` writes */
+  def overwriteAfter(holder: TransactionId): DataUpdate =
+    DataUpdate(op1, ObjectRevision(holder), DataUpdateOperation.Overwrite)
+
+  /** Sends a client prepare carrying data for every DataUpdate, without expecting an answer */
+  def sendPrepare(frontend: Frontend, txd: TransactionDescription, proposalId: Option[ProposalId] = None): Unit =
+    val updates = txd.requirements.collect { case r: DataUpdate => ObjectUpdate(r.objectPointer.id, DataBuffer(Array[Byte](1))) }
+    val m = mkPrepare(txd, fromClient = true)
+    frontend.receiveTransactionMessage(m.copy(objectUpdates = updates, proposalId = proposalId.getOrElse(m.proposalId)))
+
+  def prepareResponses(net: TestNet, txid: TransactionId): List[TxPrepareResponse] =
+    net.sentTx.collect { case r: TxPrepareResponse if r.transactionId == txid => r }
+
+  test("a transaction built on a lock holder's commit waits for it, then votes commit") {
+    val (frontend, _, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    prepareResponses(net, txid2) shouldBe empty
+
+    resolve(frontend, net, txid1, committed = true)
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteCommit)
+    frontend.transactions(txid2).holdsLocks shouldBe true
+  }
+
+  test("a waiting transaction votes abort when the lock holder aborts") {
+    val (frontend, _, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+
+    resolve(frontend, net, txid1, committed = false)
+    prepareResponses(net, txid2).map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+  }
+
+  test("a wait for a lock holder ends with an abort vote after CollisionWait") {
+    val (frontend, _, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+    sendPrepare(frontend, lockTxd(txid2, List(overwriteAfter(txid1))))
+    val tx2 = frontend.transactions(txid2)
+    val start = System.nanoTime()
+
+    tx2.checkCollisionWait(start)
+    prepareResponses(net, txid2) shouldBe empty
+
+    tx2.checkCollisionWait(start + Tx.CollisionWait.toNanos)
+    val r = prepareResponses(net, txid2)
+    r.map(_.disposition) shouldBe List(TransactionDisposition.VoteAbort)
+    r.head.collisions shouldBe List(txid1)
+
+    // The holder's release later changes nothing: the vote stands
+    resolve(frontend, net, txid1, committed = true)
+    prepareResponses(net, txid2).size shouldBe 1
+  }
+
+  test("prepares that arrive during a wait are answered when it ends, the latest proposal included") {
+    val (frontend, _, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+    val txd2 = lockTxd(txid2, List(overwriteAfter(txid1)))
+    val first = mkPrepare(txd2, fromClient = true).proposalId
+    val retry = ProposalId(first.number + 1, first.peer)
+    sendPrepare(frontend, txd2)
+    sendPrepare(frontend, txd2, Some(retry))
+    prepareResponses(net, txid2) shouldBe empty
+
+    resolve(frontend, net, txid1, committed = true)
+    val r = prepareResponses(net, txid2)
+    r.map(_.proposalId) should contain (retry)
+    r.map(_.disposition).toSet shouldBe Set(TransactionDisposition.VoteCommit)
+  }
+
   test("a transaction holding locks is reported as stuck, at intervals, until it is applied") {
     val (frontend, _, net) = lockFixture()
     prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))

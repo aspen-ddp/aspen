@@ -19,7 +19,21 @@ final class AbortVoteReport(periodNanos: Long, emit: String => Unit):
 
   private val reasons = mutable.TreeMap[String, Totals]()
   private var votes = 0L
+  private val waitOutcomes = mutable.TreeMap[String, Long]()
+  private var waitNanos = 0L
+  private var maxWaitNanos = 0L
   private var periodStart = Long.MinValue
+
+  /** A transaction that waited for a lock holder instead of voting abort, and how the wait ended */
+  def recordCollisionWait(outcome: String, waitedNanos: Long, now: Long = System.nanoTime()): Unit =
+    val text = synchronized:
+      if periodStart == Long.MinValue then
+        periodStart = now
+      waitOutcomes(outcome) = waitOutcomes.getOrElse(outcome, 0L) + 1
+      waitNanos += waitedNanos
+      maxWaitNanos = math.max(maxWaitNanos, waitedNanos)
+      if now - periodStart >= periodNanos then Some(take(now)) else None
+    text.foreach(emit)
 
   /** One abort vote, with each failed requirement and the object it is on (None for a non-object requirement) */
   def record(txid: TransactionId, errors: List[(Option[ObjectId], RequirementError)],
@@ -42,9 +56,19 @@ final class AbortVoteReport(periodNanos: Long, emit: String => Unit):
         .map((o, n) => s"${o.uuid}=$n").mkString(" ")
       val objects = if t.objects.isEmpty then "" else s" on ${t.objects.size} objects (most: $top)"
       s"$reason: ${t.errors} from ${t.transactions.size} transactions$objects"
-    val text = s"Abort votes over ${(now - periodStart) / 1000000}ms: $votes. ${lines.mkString("; ")}"
+    val waits = waitOutcomes.values.sum
+    val waitText =
+      if waits == 0 then ""
+      else
+        val outcomes = waitOutcomes.toList.map((o, n) => s"$o=$n").mkString(", ")
+        s" Collision waits: $waits ($outcomes), average ${waitNanos / waits / 1000000}ms, max ${maxWaitNanos / 1000000}ms"
+    val reasonText = if lines.isEmpty then "" else s" ${lines.mkString("; ")}"
+    val text = s"Abort votes over ${(now - periodStart) / 1000000}ms: $votes.$reasonText$waitText"
     reasons.clear()
     votes = 0
+    waitOutcomes.clear()
+    waitNanos = 0
+    maxWaitNanos = 0
     periodStart = now
     text
 

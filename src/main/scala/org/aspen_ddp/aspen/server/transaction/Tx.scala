@@ -2,10 +2,10 @@ package org.aspen_ddp.aspen.server.transaction
 
 import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
-import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ObjectRevision, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, KeyValueUpdate, ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, KeyValueUpdate, ObjectUpdate, RevisionLock, SharedRevisionLock, VersionBump, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -19,6 +19,11 @@ object Tx {
   /** How long a transaction may go unapplied before its store logs it */
   val StuckReportAfter: FiniteDuration = FiniteDuration(2, SECONDS)
   val StuckReportEvery: FiniteDuration = FiniteDuration(5, SECONDS)
+
+  /** How long a transaction waits for a lock holder it is built on before voting abort. See `Tx.awaitableHolders`.
+    * Checked at the store's heartbeat, so a wait that times out lasts up to one heartbeat (1 s) longer
+    */
+  val CollisionWait: FiniteDuration = FiniteDuration(500, MILLISECONDS)
 
   /** How long after a transaction started its client's prepare may first reach a store before the store logs it */
   val LateClientPrepareAfter: FiniteDuration = FiniteDuration(500, MILLISECONDS)
@@ -73,6 +78,13 @@ class Tx( trs: TransactionRecoveryState,
   private var lastProposer: StoreId = StoreId(txd.primaryObject.poolId, txd.designatedLeaderUID)
   private var objectCommitErrors: List[ObjectId] = Nil
 
+  // Waiting out a collision instead of voting abort: see awaitableHolders
+  private var waitingOn: Set[TransactionId] = Set()
+  private var collisionWaitStart: Long = 0L // when the first wait began, or 0
+  private var collisionWaitExpired = false
+  private var collisionWaitReported = false
+  private var pendingCollisionPrepare: Option[TxPrepare] = None
+
   statusCache.updateStatus(transactionId, status)
 
   private def allObjectsLoaded: Boolean = pendingObjectLoads == 0
@@ -120,7 +132,7 @@ class Tx( trs: TransactionRecoveryState,
     s"Age: ${age}ms. Idle: ${idle}ms. Vote: $disposition. Resolution: $oresolution. Finalized: $ofinalized. " +
       s"Locked: $locked. CommitHeld: $commitHeld. Committing: $committing. Committed: $committed. " +
       s"PendingLoads: $pendingObjectLoads. PendingCommits: $pendingObjectCommits. ClientPrepared: $clientPrepared. " +
-      s"Recovered: $recovered. Last proposer: $lastProposer. Object revisions: $revisions"
+      s"Recovered: $recovered. Waiting on: $waitingOn. Last proposer: $lastProposer. Object revisions: $revisions"
 
   private var lastStuckReport: Option[Long] = None
 
@@ -167,6 +179,68 @@ class Tx( trs: TransactionRecoveryState,
     * after the resolution did. Its vote cannot affect the outcome, so it takes no locks.
     */
   def outcomeDecided(): Unit = outcomeKnown = true
+
+  /** Whether this transaction holds requirement locks on this store's objects */
+  def holdsLocks: Boolean = locked
+
+  private def waitingForCollision: Boolean = waitingOn.nonEmpty
+
+  /** The lock holders this transaction may wait for instead of voting abort: every failed requirement is a collision
+    * with a holder that this transaction is built on, one whose revision of the object it requires, and each holder
+    * still holds its locks here. That is a single writer's next transaction on an object arriving before this store
+    * learned the outcome of the previous one: the holder's commit, which the writer has already seen, makes the
+    * requirement pass. A collision with any other transaction is a real conflict and votes abort at once.
+    *
+    * Waiting gives no vote, which Paxos allows, and holds no locks, so waits cannot form a cycle. The wait ends when
+    * the holders release their locks (Frontend.locksReleased), or after `Tx.CollisionWait`.
+    */
+  private def awaitableHolders(objectErrors: Map[ObjectId, RequirementError],
+                               nonObjectErrors: List[RequirementError]): Option[Set[TransactionId]] =
+    if recovered || collisionWaitExpired || nonObjectErrors.nonEmpty || objectErrors.isEmpty then
+      None
+    else
+      val holders = objectErrors.toList.map:
+        case (oid, TransactionCollision(holder)) if buildsOn(oid, holder) && frontend.holdsLocks(holder) => Some(holder)
+        case _ => None
+      if holders.forall(_.isDefined) then Some(holders.flatten.toSet) else None
+
+  /** Whether one of this transaction's requirements on `oid` requires the revision that `holder` writes */
+  private def buildsOn(oid: ObjectId, holder: TransactionId): Boolean =
+    val rev = ObjectRevision(holder)
+    requirements.exists:
+      case r: DataUpdate => r.objectPointer.id == oid && r.requiredRevision == rev
+      case r: VersionBump => r.objectPointer.id == oid && r.requiredRevision == rev
+      case r: RevisionLock => r.objectPointer.id == oid && r.requiredRevision == rev
+      case r: SharedRevisionLock => r.objectPointer.id == oid && r.requiredRevision == rev
+      case r: KeyValueUpdate => r.objectPointer.id == oid && r.requiredRevision.contains(rev)
+      case _ => false
+
+  /** `holder`, which this transaction waits for, has released its locks: it has applied its commit or aborted */
+  def collisionHolderReleased(holder: TransactionId): Unit =
+    if waitingOn.contains(holder) then
+      waitingOn -= holder
+      if waitingOn.isEmpty then
+        endCollisionWait()
+
+  /** Store heartbeat: a wait that has lasted `Tx.CollisionWait` ends, and the transaction votes as it would have */
+  def checkCollisionWait(now: Long = System.nanoTime()): Unit =
+    if waitingForCollision && now - collisionWaitStart >= Tx.CollisionWait.toNanos then
+      collisionWaitExpired = true
+      waitingOn = Set()
+      endCollisionWait()
+
+  /** Decides the vote now that the holders are gone, unless another holder takes their place, and answers the
+    * prepares that arrived meanwhile
+    */
+  private def endCollisionWait(): Unit =
+    if allObjectsLoaded && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined then
+      determineDisposition()
+      lock()
+    if !waitingForCollision then
+      sendDelayedPrepare()
+      pendingCollisionPrepare.foreach: m =>
+        pendingCollisionPrepare = None
+        answerPrepare(m)
 
   private def unlock(): Unit = if (locked) {
     locked = false
@@ -239,8 +313,13 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     // Case received prepare before the objects are loaded. This will always be true for the first prepare
-    // message as the receivePrepare() method is called immediately after transaction creation.
+    // message as the receivePrepare() method is called immediately after transaction creation. A transaction waiting
+    // out a collision answers when the wait ends
+    if !waitingForCollision then
+      sendDelayedPrepare()
+  }
 
+  private def sendDelayedPrepare(): Unit = {
     delayedPrepare.foreach { response =>
       logger.trace(s"AllObjectsLoaded. Saving to CRL before sending PrepareResponse for tx ${transactionId}")
       val r = response.copy(disposition=disposition, collisions=collisions)
@@ -260,6 +339,19 @@ class Tx( trs: TransactionRecoveryState,
     val (m, l) = RequirementsChecker.check(transactionId, txd.startTimestamp, requirements, objects, ou,
       frontend.maxSliceSize)
 
+    awaitableHolders(m, l) match
+      case Some(holders) =>
+        if collisionWaitStart == 0L then
+          collisionWaitStart = System.nanoTime()
+        waitingOn = holders
+        holders.foreach(frontend.awaitLocksReleased(_, this))
+        logger.trace(s"Tx $transactionId waits for lock holders $holders before voting")
+      case None =>
+        waitingOn = Set()
+        decideDisposition(m, l)
+  }
+
+  private def decideDisposition(m: Map[ObjectId, RequirementError], l: List[RequirementError]): Unit = {
     // Find all objects with transaction collisions for inclusion into the response message
     m.foreach { t => t._2 match {
       case TransactionCollision(txid) =>
@@ -275,6 +367,14 @@ class Tx( trs: TransactionRecoveryState,
       l.foreach(e => logger.trace(s"Tx ${txd.transactionId}. Requirement Error: ${e}"))
       AbortVoteReport.report.record(transactionId, m.toList.map((o, e) => Some(o) -> e) ++ l.map(None -> _))
     }
+
+    if collisionWaitStart != 0L && !collisionWaitReported then
+      collisionWaitReported = true
+      val outcome =
+        if collisionWaitExpired then "timed out"
+        else if disposition == TransactionDisposition.VoteCommit then "commit vote"
+        else "abort vote"
+      AbortVoteReport.report.recordCollisionWait(outcome, System.nanoTime() - collisionWaitStart)
   }
 
   private def doCommit(): Unit = if (!committed && !committing && allObjectsLoaded) {
@@ -358,9 +458,15 @@ class Tx( trs: TransactionRecoveryState,
     objectsReleased = true
     unlock()
     objects.valuesIterator.foreach(frontend.release)
+    // After the commit was applied: a waiter built on it now finds the revision it requires
+    frontend.locksReleased(transactionId)
 
   private def resolved(committed: Boolean): Unit = if (oresolution.isEmpty) {
     oresolution = Some(committed)
+
+    // The vote no longer matters
+    waitingOn = Set()
+    pendingCollisionPrepare = None
 
     status = if (committed)
       TransactionStatus.Committed
@@ -408,6 +514,13 @@ class Tx( trs: TransactionRecoveryState,
 
     releaseHeldCommit()
 
+    answerPrepare(m)
+  }
+
+  /** Answers a prepare, unless the vote is withheld: while object data is missing, or while waiting out a collision,
+    * whose end answers the latest such prepare
+    */
+  private def answerPrepare(m: TxPrepare): Unit = {
     if awaitingData then
       logger.trace(s"Withholding the vote on ${m.transactionId} until its object data arrives")
     else
@@ -416,24 +529,31 @@ class Tx( trs: TransactionRecoveryState,
         determineDisposition()
         lock()
 
-      val result = acceptor.receivePrepare(Prepare(m.proposalId)) match {
-        case Right(p) => Right(TxPrepareResponse.Promise(p.lastAccepted))
-        case Left(n) => Left(TxPrepareResponse.Nack(n.promisedProposalId))
-      }
-
-      val txr = TxPrepareResponse(m.from, storeId, transactionId, result, m.proposalId, disposition, collisions)
-      logger.trace(s"*** PrepareResponse: ${m.transactionId}, Disposition:$disposition. All Objects Loaded: $allObjectsLoaded")
-
-      if allObjectsLoaded then
-        val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-          disposition, status, acceptor.persistentState)
-        crl.save(txd.transactionId, state, () =>
-          logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
-          net.sendTransactionMessage(txr)
-        )
+      if waitingForCollision then
+        pendingCollisionPrepare = Some(m)
       else
-        logger.trace(s"Not all objects loaded. Delaying PrepareResponse: ${m.transactionId}")
-        delayedPrepare = Some(txr)
+        respondToPrepare(m)
+  }
+
+  private def respondToPrepare(m: TxPrepare): Unit = {
+    val result = acceptor.receivePrepare(Prepare(m.proposalId)) match {
+      case Right(p) => Right(TxPrepareResponse.Promise(p.lastAccepted))
+      case Left(n) => Left(TxPrepareResponse.Nack(n.promisedProposalId))
+    }
+
+    val txr = TxPrepareResponse(m.from, storeId, transactionId, result, m.proposalId, disposition, collisions)
+    logger.trace(s"*** PrepareResponse: ${m.transactionId}, Disposition:$disposition. All Objects Loaded: $allObjectsLoaded")
+
+    if allObjectsLoaded then
+      val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
+        disposition, status, acceptor.persistentState)
+      crl.save(txd.transactionId, state, () =>
+        logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
+        net.sendTransactionMessage(txr)
+      )
+    else
+      logger.trace(s"Not all objects loaded. Delaying PrepareResponse: ${m.transactionId}")
+      delayedPrepare = Some(txr)
   }
 
   def receiveAccept(m: TxAccept): Unit = {

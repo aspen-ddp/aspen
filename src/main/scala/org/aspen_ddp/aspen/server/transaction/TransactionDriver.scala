@@ -236,8 +236,9 @@ abstract class TransactionDriver(
         return
 
       // A collision is an ordinary abort vote, even when the colliding transaction has since completed. A store's
-      // disposition is fixed when it first evaluates the prepare, so re-sending the prepare would only return the
-      // same collision. The client retries the aborted transaction instead.
+      // disposition is fixed once given, so re-sending the prepare would only return the same collision. The client
+      // retries the aborted transaction instead. A store withholds the vote instead while the collision is with a
+      // transaction this one is built on (see Tx.awaitableHolders), so such collisions rarely reach here.
 
       msg.response match {
         case Left(nack) =>

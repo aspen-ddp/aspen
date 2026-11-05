@@ -32,6 +32,15 @@ class AbortVoteReportSuite extends AnyFunSuite with Matchers:
     text should include("LocalTimeError: 1 from 1 transactions;")
   }
 
+  test("collision waits are counted by how they ended") {
+    val (r, reports) = report()
+    r.recordCollisionWait("commit vote", 20 * ms, now = 0)
+    r.recordCollisionWait("commit vote", 40 * ms, now = 10 * ms)
+    r.recordCollisionWait("timed out", 600 * ms, now = 1000 * ms)
+    reports().head should include("Abort votes over 1000ms: 0. Collision waits: 3 (commit vote=2, timed out=1), " +
+      "average 220ms, max 600ms")
+  }
+
   test("the next report starts empty") {
     val (r, reports) = report()
     r.record(tx1, List(Some(o1) -> RevisionMismatch()), now = 0)

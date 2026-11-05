@@ -50,6 +50,19 @@ class Frontend(val storeId: StoreId,
 
   var transactions: Map[TransactionId, Tx] = Map()
 
+  /** Transactions waiting for a lock holder, by holder. See Tx.awaitableHolders */
+  private val collisionWaiters = scala.collection.mutable.HashMap[TransactionId, List[Tx]]()
+
+  def holdsLocks(txid: TransactionId): Boolean = transactions.get(txid).exists(_.holdsLocks)
+
+  def awaitLocksReleased(holder: TransactionId, waiter: Tx): Unit =
+    val others = collisionWaiters.getOrElse(holder, Nil).filterNot(_ eq waiter)
+    collisionWaiters(holder) = waiter :: others
+
+  /** `holder` released its locks, so the transactions waiting for it decide their votes */
+  def locksReleased(holder: TransactionId): Unit =
+    collisionWaiters.remove(holder).foreach(_.foreach(_.collisionHolderReleased(holder)))
+
   /** When each outstanding backend commit began, to time it as the store sees it: BackendTiming */
   private val commitStarts = scala.collection.mutable.HashMap[(ObjectId, TransactionId), Long]()
   private val commitStage = s"store commit (${backend.getClass.getSimpleName})"

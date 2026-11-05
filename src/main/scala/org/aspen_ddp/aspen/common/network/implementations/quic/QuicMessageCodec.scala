@@ -166,7 +166,15 @@ object QuicMessageCodec:
 
     case m => (m, ByteBuffer.allocate(0), NoSections)
 
-  /** `streamOnly`: see `Encoded` */
+  /** Whether `msg` must go on a stream whatever its size: a prepare carrying a store's object data. A lost datagram is
+    * never resent, and the client stops resending its prepares once enough stores have committed, so a store whose
+    * data was lost could not apply the transaction and would stay behind on its objects until repaired.
+    */
+  private[quic] def mustArrive(msg: Message): Boolean = msg match
+    case m: TxPrepare => m.objectUpdates.nonEmpty
+    case _ => false
+
+  /** `streamOnly`: see `Encoded`. Implied for messages that `mustArrive` */
   def encode(msg: Message, alloc: ByteBufAllocator, streamOnly: Boolean = false,
              toHost: Option[HostId] = None): Encoded =
     val (headerMsg, aux, sections) = split(msg)
@@ -183,7 +191,7 @@ object QuicMessageCodec:
       prefix.writeBytes(aux.duplicate())
       prefix.writeInt(sections.length)
       sections.foreach(s => prefix.writeInt(s.size))
-      new Encoded(prefix, sections, streamOnly)
+      new Encoded(prefix, sections, streamOnly || mustArrive(msg))
     catch
       case t: Throwable =>
         prefix.release()

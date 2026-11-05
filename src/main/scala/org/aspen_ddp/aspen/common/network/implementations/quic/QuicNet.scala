@@ -2,7 +2,7 @@ package org.aspen_ddp.aspen.common.network.implementations.quic
 
 import io.netty.bootstrap.Bootstrap
 import io.netty.buffer.{ByteBuf, PooledByteBufAllocator, Unpooled}
-import io.netty.channel.{Channel, ChannelFuture, ChannelHandler, ChannelHandlerContext, ChannelInboundHandlerAdapter,
+import io.netty.channel.{Channel, ChannelFuture, ChannelOption, ChannelHandler, ChannelHandlerContext, ChannelInboundHandlerAdapter,
   ChannelInitializer, EventLoop, IoHandlerFactory, MultiThreadIoEventLoopGroup}
 import io.netty.channel.epoll.{Epoll, EpollDatagramChannel, EpollIoHandler}
 import io.netty.channel.nio.NioIoHandler
@@ -364,12 +364,33 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private def bind(loop: EventLoop, handler: ChannelHandler, address: InetSocketAddress, reusePort: Boolean): Channel =
     val b = new Bootstrap().group(loop).channel(datagramChannelClass).handler(handler)
+      .option(ChannelOption.SO_RCVBUF, Integer.valueOf(config.udpSocketBufferBytes))
+      .option(ChannelOption.SO_SNDBUF, Integer.valueOf(config.udpSocketBufferBytes))
     if reusePort then
       // SO_REUSEPORT is declared on UnixChannelOption; EpollChannelOption only inherits it
       b.option(UnixChannelOption.SO_REUSEPORT, java.lang.Boolean.TRUE)
     val ch = b.bind(address).sync().channel()
     boundChannels.add(ch)
+    checkSocketBuffers(ch)
     ch
+
+  private val socketBufferWarned = new java.util.concurrent.atomic.AtomicBoolean(false)
+
+  /** Warns once if the OS granted less than `udpSocketBufferBytes`. Linux reports twice the size it applied. */
+  private def checkSocketBuffers(ch: Channel): Unit =
+    val (rcv, snd) = socketBufferSizes(ch)
+    val wanted = config.udpSocketBufferBytes
+    if (rcv < wanted || snd < wanted) && socketBufferWarned.compareAndSet(false, true) then
+      logger.warn(s"QUIC UDP socket buffers are smaller than the $wanted bytes requested: receive $rcv, send $snd " +
+        "(Linux reports twice the size applied). Packets the receive buffer can't hold are lost. On Linux, raise " +
+        "net.core.rmem_max and net.core.wmem_max")
+
+  private def socketBufferSizes(ch: Channel): (Int, Int) =
+    (ch.config().getOption(ChannelOption.SO_RCVBUF).intValue, ch.config().getOption(ChannelOption.SO_SNDBUF).intValue)
+
+  /** The (receive, send) buffer sizes the OS reports for each bound UDP socket */
+  private[quic] def socketBufferSizesForTests: List[(Int, Int)] =
+    boundChannels.toArray(new Array[Channel](0)).toList.map(socketBufferSizes)
 
   /** Fails unless `port` can be bound without `SO_REUSEPORT`, i.e. no other socket holds it. The server channels
     * bind with `SO_REUSEPORT`, which would otherwise let a second process silently share a host's data port.

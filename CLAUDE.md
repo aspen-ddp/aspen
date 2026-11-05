@@ -139,8 +139,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - Aspen uses a Crash-Only architecture. By intentional design, there is no clean shutdown process.
 - The Network Layer is designed to be pluggable via `common.network.NetworkPlugin`. QUIC is the only plugin:
   - QUIC (`implementations/quic`, Netty 4.2): Mutual TLS on every connection, datagrams for
-    encoded messages of 1024 bytes or less, a small round-robin pool of streams for larger ones, and messages
-    dropped (never queued) when over budget. Payloads are not copied on send and are copied exactly once on receive.
+    encoded messages of 1024 bytes or less (except a TxPrepare carrying object data, which a lost datagram would leave
+    a store unable to apply), a small round-robin pool of streams for larger ones, and messages
+    dropped (never queued) when over budget. UDP sockets request 16 MiB buffers; a smaller OS grant is logged. Payloads are not copied on send and are copied exactly once on receive.
   - Send buffering (`QuicConfig`): one host-wide `SendBudget` (a quarter of the heap, at least 256 MiB) shared by all
     connections; a connection may queue below its floor (256 KiB) always, or below its ceiling (a quarter of that
     budget, at least 64 MiB) while the shared budget has room. A stream whose writes wait over 500 ms is logged. The

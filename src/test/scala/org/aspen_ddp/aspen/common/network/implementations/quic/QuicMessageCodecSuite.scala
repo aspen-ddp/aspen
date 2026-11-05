@@ -151,6 +151,15 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
     decoded.objectUpdates.map(_.objectId) shouldBe updates.map(_.objectId)
     decoded.preTxRebuilds.map(_.requiredMetadata) shouldBe rebuilds.map(_.requiredMetadata)
 
+  test("a prepare carrying object data goes on a stream however small, one without data may be a datagram"):
+    val small = QuicMessageCodec.encode(prepare(List(ObjectUpdate(ObjectId(uuid(7)), DataBuffer(bytes(30)))), Nil), alloc)
+    val empty = QuicMessageCodec.encode(prepare(Nil, Nil), alloc)
+    small.size should be <= QuicMessageCodec.DatagramThreshold.toLong
+    small.isDatagram shouldBe false
+    empty.isDatagram shouldBe true
+    small.release()
+    empty.release()
+
   test("payload slices with non-zero position encode only their visible bytes"):
     val arr = bytes(40)
     val slice = DataBuffer(arr).slice(5, 10)

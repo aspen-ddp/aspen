@@ -4,6 +4,7 @@ import io.netty.buffer.PooledByteBufAllocator
 import io.netty.util.ResourceLeakDetector
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
+import org.aspen_ddp.aspen.common.network.implementations.quic.gossip.GossipConfig
 import org.aspen_ddp.aspen.common.metadata.HostId
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.*
@@ -68,6 +69,16 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     net.metadataManager.peekHostEntry(hostId).getOrElse(fail(s"no host entry for $hostId"))
 
   // ---------------------------------------------------------------------------------------------------------------
+
+  test("UDP sockets get the configured buffer size, or the most the OS allows"):
+    val wanted = 1024 * 1024
+    val c = fx.client(QuicConfig(gossip = GossipConfig.ForTests, udpSocketBufferBytes = wanted))
+    def max(name: String) = os.read(os.root / "proc" / "sys" / "net" / "core" / name).trim.toInt
+    val sizes = c.net.socketBufferSizesForTests
+    sizes should not be empty
+    sizes.foreach: (rcv, snd) =>
+      rcv should be >= math.min(wanted, max("rmem_max"))
+      snd should be >= math.min(wanted, max("wmem_max"))
 
   test("client request reaches the host owning the store"):
     val c = fx.client()

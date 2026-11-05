@@ -31,6 +31,10 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   * @param datagramQueueLength   quiche's datagram send and receive queue lengths. Once a connection has written about
   *                              half that many datagrams in the last ~10 ms, datagram-sized messages go on a stream
   *                              instead: a full quiche queue drops datagrams silently
+  * @param udpSocketBufferBytes  receive and send buffer size requested for each UDP socket. The OS default (208 KiB on
+  *                              Linux) overflows under bursts of large messages, and every packet it drops is lost
+  *                              data or a QUIC retransmission that slows the whole connection. Linux grants at most
+  *                              `net.core.rmem_max` / `net.core.wmem_max`, and a smaller grant is logged
   * @param idleTimeout           QUIC max idle timeout. None means `heartbeatPeriod * 3`, resolved by the plugin
   * @param gossip                scalecube timings for host membership, and gossip relaying to clients
   * @param peerQueryDelay        how long dials to a host reported online must have been failing before its peers are
@@ -63,6 +67,7 @@ final case class QuicConfig(
   idleTimeout: Option[Duration] = None,
   handshakeTimeout: Duration = Duration(5, SECONDS),
   datagramQueueLength: Int = 1024,
+  udpSocketBufferBytes: Int = 16 * 1024 * 1024,
   initialMaxData: Long = 64L * 1024 * 1024,
   initialMaxStreamDataUnidirectional: Long = 16L * 1024 * 1024,
   initialMaxStreamsUnidirectional: Long = 64,

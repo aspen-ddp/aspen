@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.client.Transaction
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUpdate
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, ObjectId, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -14,7 +15,7 @@ import org.aspen_ddp.aspen.server.store.backend.RocksDBConfig
 
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 /** Tests for MissedUpdateFinalizationAction's storePointer persistence.
   *
@@ -200,25 +201,125 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
       enabled <- trackingAfterErrorWrite(poolId)
     yield enabled shouldBe true
 
-  /** Runs markMissedUpdate itself for a store of `poolId` and returns whether the transaction it
-    * committed still tracks missed updates, which pins limitTracking to after the errorTree write.
+  private def missed(store: StoreId, objectId: ObjectId = ObjectId(UUID.randomUUID()),
+                     timestamp: HLCTimestamp = missedTimestamp,
+                     storePointer: Array[Byte] = Array[Byte](1)): MissedUpdate =
+    MissedUpdate(store, objectId, timestamp, storePointer)
+
+  /** A marker whose write transactions wait for `release` if one is given, counting them and whether they track */
+  private class ObservedMarker(release: Option[Future[Unit]] = None, maxEntries: Int = 256)
+    extends MissedUpdateMarker(client, maxEntries):
+    @volatile var commits = 0
+    @volatile var tracking: Option[Boolean] = None
+    val firstCommit: Promise[Unit] = Promise()
+
+    override private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] =
+      commits += 1
+      tracking = Some(tx.missedUpdateTrackingEnabled)
+      firstCommit.trySuccess(())
+      release.getOrElse(Future.unit).flatMap(_ => super.commitErrorTreeTransaction(tx))
+
+  /** Writes an entry for a store of `poolId` and returns whether the transaction that committed it
+    * still tracks missed updates, which pins limitTracking to after the errorTree write.
     */
-  private def trackingAfterMarkMissedUpdate(poolId: PoolId): Future[Boolean] =
-    val ptr = pointerWith(Array[Byte](1))
-    var tracking: Option[Boolean] = None
-    val fa = new MissedUpdateFinalizationAction(client, txdFor(ptr)):
-      override private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] =
-        tracking = Some(tx.missedUpdateTrackingEnabled)
-        super.commitErrorTreeTransaction(tx)
-    fa.markMissedUpdate(StoreId(poolId, 0.toByte), ptr.id, Array[Byte](1)).map: _ =>
-      tracking.get
+  private def trackingAfterMark(poolId: PoolId): Future[Boolean] =
+    val marker = new ObservedMarker
+    marker.mark(List(missed(StoreId(poolId, 0.toByte)))).map(_ => marker.tracking.get)
 
-  atest("markMissedUpdate disables tracking for a bootstrap pool entry"):
-    trackingAfterMarkMissedUpdate(Radicle.poolId).map(_ shouldBe false)
+  atest("a mark disables tracking for a bootstrap pool entry"):
+    trackingAfterMark(Radicle.poolId).map(_ shouldBe false)
 
-  atest("markMissedUpdate keeps tracking for an ordinary pool entry"):
+  atest("a mark keeps tracking for an ordinary pool entry"):
     for
       poolId <- client.createNewStoragePool("mark-pool", Replication(1, 1), None, RocksDBConfig(),
                                             StorageDeviceSetId.BootstrapStorageDeviceSetId, 0L)
-      enabled <- trackingAfterMarkMissedUpdate(poolId)
+      enabled <- trackingAfterMark(poolId)
     yield enabled shouldBe true
+
+  atest("all of a transaction's entries are written in one transaction"):
+    val marker = new ObservedMarker
+    val objects = List.fill(2)(ObjectId(UUID.randomUUID()))
+    val stores = List(net.storeId0, net.storeId1, net.storeId2)
+
+    for
+      _ <- marker.mark(for s <- stores; o <- objects yield missed(s, o))
+      pool <- client.getStoragePool(Radicle.poolId)
+      entries <- Future.sequence(for s <- stores; o <- objects yield pool.errorTree.get(buildErrorKey(s, o)))
+    yield
+      marker.commits shouldBe 1
+      entries.forall(_.isDefined) shouldBe true
+
+  atest("entries arriving during a write wait for one later write"):
+    val release = Promise[Unit]()
+    val marker = new ObservedMarker(Some(release.future))
+    val first = missed(net.storeId0)
+    val second = missed(net.storeId1)
+    val third = missed(net.storeId2)
+
+    val firstWritten = marker.mark(List(first))
+
+    for
+      _ <- marker.firstCommit.future
+      laterWritten = List(marker.mark(List(second)), marker.mark(List(third)))
+      queuedDuringWrite = marker.queued
+      commitsDuringWrite = marker.commits
+      _ = release.success(())
+      _ <- firstWritten
+      _ <- Future.sequence(laterWritten)
+      pool <- client.getStoragePool(Radicle.poolId)
+      entries <- Future.sequence(List(first, second, third).map(u => pool.errorTree.get(buildErrorKey(u.store, u.objectId))))
+    yield
+      queuedDuringWrite shouldBe 2
+      commitsDuringWrite shouldBe 1
+      marker.commits shouldBe 2
+      marker.queued shouldBe 0
+      entries.forall(_.isDefined) shouldBe true
+
+  atest("waiting entries for the same store and object keep the newest miss, in either order"):
+    val release = Promise[Unit]()
+    val marker = new ObservedMarker(Some(release.future))
+    val older = HLCTimestamp(1000L << 16)
+    val newer = HLCTimestamp(2000L << 16)
+    val rising = ObjectId(UUID.randomUUID())
+    val falling = ObjectId(UUID.randomUUID())
+
+    val blocker = marker.mark(List(missed(net.storeId1)))
+
+    for
+      _ <- marker.firstCommit.future
+      written = List(marker.mark(List(missed(net.storeId0, rising, older))),
+                     marker.mark(List(missed(net.storeId0, rising, newer, Array[Byte](7)))),
+                     marker.mark(List(missed(net.storeId0, falling, newer, Array[Byte](7)))),
+                     marker.mark(List(missed(net.storeId0, falling, older))))
+      queuedDuringWrite = marker.queued
+      _ = release.success(())
+      _ <- blocker
+      _ <- Future.sequence(written)
+      pool <- client.getStoragePool(Radicle.poolId)
+      risingEntry <- pool.errorTree.get(buildErrorKey(net.storeId0, rising))
+      fallingEntry <- pool.errorTree.get(buildErrorKey(net.storeId0, falling))
+    yield
+      queuedDuringWrite shouldBe 2
+      decodeErrorValue(risingEntry.get.value) shouldBe ((newer, Seq[Byte](7)))
+      decodeErrorValue(fallingEntry.get.value) shouldBe ((newer, Seq[Byte](7)))
+
+  atest("a backlog larger than a batch takes several writes"):
+    val marker = new ObservedMarker(maxEntries = 2)
+    val updates = List.fill(5)(missed(net.storeId0))
+
+    for
+      _ <- marker.mark(updates)
+      pool <- client.getStoragePool(Radicle.poolId)
+      entries <- Future.sequence(updates.map(u => pool.errorTree.get(buildErrorKey(u.store, u.objectId))))
+    yield
+      marker.commits shouldBe 3
+      entries.forall(_.isDefined) shouldBe true
+
+  atest("an action with no marks to write completes"):
+    val ptr = pointerWith(Array[Byte](1))
+    val txd = txdFor(ptr)
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.updateCommitErrors(txd.allDataStores.map(_ -> Nil).toMap)
+    fa.markMissedUpdates()
+
+    fa.complete.map(_ => succeed)

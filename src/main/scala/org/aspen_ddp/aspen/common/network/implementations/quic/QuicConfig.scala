@@ -14,12 +14,17 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   * else is dropped. So a small network gets large bursts, a host with thousands of connections stays within the
   * shared budget plus their floors, and a stalled peer holds at most its ceiling.
   *
+  * The defaults scale with the JVM's heap, since queued messages hold their payloads in memory. Objects of 10 MiB and
+  * more are ordinary, and one such object is sent as a message per store, so a connection must be able to hold many of
+  * them. A queue is only useful while it drains in time: at 100 MiB/s, 1 GiB of queue is 10 s of delay.
+  *
   * @param sendBudgetBytes       host-wide send budget shared by all of a `QuicNet`'s connections
   * @param connectionFloorBytes  usage below which a connection may always queue, whatever the shared budget
   * @param connectionCeilingBytes most a connection may use: its handoff is admitted only below it, and each stream's
   *                              high-water mark is `connectionCeilingBytes / streamsPerConnection` (each may overshoot
-  *                              by one message). `initialMaxData` should be at least this, or the peer's flow control
-  *                              throttles bursts the budget would allow
+  *                              by one message). This queue is separate from the flow control windows
+  *                              (`initialMaxData`, `initialMaxStreamDataUnidirectional`), which bound what is on its way
+  *                              to the peer: what doesn't fit in them waits here until the peer reads
   * @param preHandshakeBytes     bound for messages held until a connection's handshake completes, room for the burst
   *                              that often opens a connection. It takes nothing from the shared budget, so sends to a
   *                              host that cannot be reached hold at most this, until the handshake times out
@@ -39,12 +44,21 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   * @param knownWrongRetryAfter  how long a known-wrong host entry stays marked before the next send re-dials it; the
   *                              TLS check or a `WrongHost` reply marks it again if its address is still wrong
   */
+object QuicConfig:
+  private val MiB = 1024L * 1024
+
+  /** A quarter of the heap, and at least 256 MiB */
+  def defaultSendBudget(maxHeapBytes: Long): Long = math.max(256 * MiB, maxHeapBytes / 4)
+
+  /** A quarter of the default send budget, and at least 64 MiB */
+  def defaultConnectionCeiling(maxHeapBytes: Long): Long = math.max(64 * MiB, defaultSendBudget(maxHeapBytes) / 4)
+
 final case class QuicConfig(
   eventLoopThreads: Int = math.min(Runtime.getRuntime.availableProcessors, 4),
   streamsPerConnection: Int = 4,
-  sendBudgetBytes: Long = 256L * 1024 * 1024,
+  sendBudgetBytes: Long = QuicConfig.defaultSendBudget(Runtime.getRuntime.maxMemory),
   connectionFloorBytes: Long = 256L * 1024,
-  connectionCeilingBytes: Long = 64L * 1024 * 1024,
+  connectionCeilingBytes: Long = QuicConfig.defaultConnectionCeiling(Runtime.getRuntime.maxMemory),
   preHandshakeBytes: Long = 16L * 1024 * 1024,
   idleTimeout: Option[Duration] = None,
   handshakeTimeout: Duration = Duration(5, SECONDS),

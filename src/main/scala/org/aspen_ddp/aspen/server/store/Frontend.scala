@@ -238,6 +238,11 @@ class Frontend(val storeId: StoreId,
     // status cache, so it is ignored. A resolved one takes no locks; it still learns its outcome from TxFinalized.
     case None if statusCache.getStatus(m.txd.transactionId).exists(_.finalized) =>
       logger.trace(s"**** IGNORING PREPARE FOR FINALIZED TX: ${m.txd.transactionId}")
+      // Either a retransmission or this store's data arriving too late to be used
+      if m.fromClient && m.objectUpdates.nonEmpty then
+        val age = (HLCTimestamp.now - m.txd.startTimestamp).toMillis
+        logger.warn(s"Client prepare with data for Tx ${m.txd.transactionId} on store ${m.to} arrived after finalization, " +
+          s"${age}ms after the transaction started")
 
     case None =>
       logger.trace(s"**** CREATING NEW TX: ${m.txd.transactionId}")

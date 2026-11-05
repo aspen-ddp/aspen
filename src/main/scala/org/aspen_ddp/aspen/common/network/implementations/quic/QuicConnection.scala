@@ -69,7 +69,8 @@ final class QuicConnection(val loop: EventLoop,
   private val preHandshake = new java.util.ArrayDeque[AnyRef]()
   private var preHandshakeBytes = 0L
   private var maxDatagramLength = -1 // -1: the peer has not announced datagram support
-  private val slots = Array.fill(nStreams)(new Slot)
+  private val slots = Array.tabulate(nStreams)(new Slot(_))
+  private val delayReport = new StreamDelayReport(nStreams, StreamDelayReport.PeriodNanos, StreamDelayReport.ReportAtNanos)
   private var cursor = 0
   private val inFlight = new java.util.HashSet[ChannelFuture]()
   private val waitingBarriers = new java.util.HashSet[Promise[Void]]()
@@ -442,7 +443,7 @@ final class QuicConnection(val loop: EventLoop,
   private def usable(idx: Int): Slot =
     var slot = slots(idx)
     if slot.stream != null && !slot.stream.isOpen then
-      slot = new Slot // closed or reset: replace lazily
+      slot = new Slot(idx) // closed or reset: replace lazily
       slots(idx) = slot
     if slot.stream == null then
       if slot.opening == null then
@@ -463,19 +464,23 @@ final class QuicConnection(val loop: EventLoop,
       slot.pending += size
       pendingTotal += size
       pool.add(size)
+      delayReport.written(slot.index, slot.pending)
     if f.isDone then
-      writeDone(f, slot, size)
+      writeDone(f, slot, size, 0)
     else
+      val started = System.nanoTime()
       inFlight.add(f)
       f.addListener: (_: ChannelFuture) =>
         inFlight.remove(f)
-        writeDone(f, slot, size)
+        writeDone(f, slot, size, System.nanoTime() - started)
 
-  private def writeDone(f: ChannelFuture, slot: Slot, size: Long): Unit =
+  private def writeDone(f: ChannelFuture, slot: Slot, size: Long, delayNanos: Long): Unit =
     if slot != null then
       slot.pending -= size
       pendingTotal -= size
       pool.add(-size)
+      delayReport.completed(slot.index, delayNanos, System.nanoTime())
+        .foreach(text => logger.warn(s"QUIC connection $remoteName: $text"))
     if !f.isSuccess then
       // Netty releases the message of a failed write
       countDrop(s"write failed: ${f.cause()}")
@@ -520,7 +525,7 @@ object QuicConnection:
   private final class Barrier(val promise: Promise[Void])
 
   /** One stream of the pool. Loop-owned. */
-  private final class Slot:
+  private final class Slot(val index: Int):
     var opening: NFuture[QuicStreamChannel] = null
     var stream: QuicStreamChannel = null
     var pending: Long = 0

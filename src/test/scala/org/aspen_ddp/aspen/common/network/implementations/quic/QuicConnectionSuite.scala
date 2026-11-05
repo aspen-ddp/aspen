@@ -209,6 +209,15 @@ class QuicConnectionSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     subs.foreach(_._2.prefix.refCnt() shouldBe 0)
     fx.srv.received.isEmpty shouldBe true
 
+  test("a burst larger than the flow control windows is queued and delivered"):
+    val window = 256L * 1024
+    val fx = fixture(QuicConfig(initialMaxData = window * 4, initialMaxStreamDataUnidirectional = window,
+      connectionCeilingBytes = 64L * 1024 * 1024))
+    fx.dialAndWait()
+    (0 until 16).foreach(i => fx.submit(sized(i, 512 * 1024))._1 shouldBe true)
+    awaitAll(fx.srv, 16).map(seqOf).toSet shouldBe (0L until 16L).toSet
+    fx.conn.drops shouldBe 0
+
   test("handoff over budget drops on the caller thread"):
     // Accepted while the queued bytes are below the budget: 512K + 512K reaches it exactly, so the third is dropped.
     // One stream, so the per-message charge cap (the stream high-water mark) is the whole budget.

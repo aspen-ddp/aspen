@@ -616,6 +616,16 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     tx.reportIfStuck(late + 2 * Tx.StuckReportEvery.toNanos) shouldBe false
   }
 
+  test("a client prepare is reported only when it reaches the store late") {
+    val (frontend, _, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+    val tx = frontend.transactions(txid1)
+    val after = Tx.LateClientPrepareAfter.toMillis
+
+    tx.reportLateClientPrepare(after - 1) shouldBe false
+    tx.reportLateClientPrepare(after) shouldBe true
+  }
+
   test("locks are released when the first transaction resolves aborted") {
     val (frontend, _, net) = lockFixture()
 

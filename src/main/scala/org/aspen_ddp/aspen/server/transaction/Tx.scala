@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server.transaction
 
+import org.aspen_ddp.aspen.common.HLCTimestamp
 import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitted, TxFinalized, TxHeartbeat, TxPrepare, TxPrepareResponse, TxResolved, TxStatusRequest, TxStatusResponse}
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
@@ -18,6 +19,9 @@ object Tx {
   /** How long a transaction may go unapplied before its store logs it */
   val StuckReportAfter: FiniteDuration = FiniteDuration(2, SECONDS)
   val StuckReportEvery: FiniteDuration = FiniteDuration(5, SECONDS)
+
+  /** How long after a transaction started its client's prepare may first reach a store before the store logs it */
+  val LateClientPrepareAfter: FiniteDuration = FiniteDuration(500, MILLISECONDS)
 }
 
 class Tx( trs: TransactionRecoveryState,
@@ -137,6 +141,17 @@ class Tx( trs: TransactionRecoveryState,
     val now = System.nanoTime()
     if locked && oresolution.isEmpty && now - startNanos >= Tx.StuckReportAfter.toNanos then
       logger.warn(s"Late $message from $from for Tx $transactionId on store $storeId. ${stateSummary(now)}")
+
+  /** Logs a client's prepare reaching this store long after the transaction started. That prepare carries the store's
+    * object data, so a late one can leave the store unable to vote or apply, behind on the object until it is repaired.
+    * Returns whether it logged.
+    */
+  private[aspen] def reportLateClientPrepare(ageMillis: Long): Boolean =
+    val late = ageMillis >= Tx.LateClientPrepareAfter.toMillis
+    if late then
+      logger.warn(s"Late client prepare for Tx $transactionId on store $storeId, ${ageMillis}ms after the transaction " +
+        s"started. ${stateSummary(System.nanoTime())}")
+    late
 
   /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
     * on conflicting transactions in the meantime. Locks have no purpose once the outcome is known, including the
@@ -372,6 +387,8 @@ class Tx( trs: TransactionRecoveryState,
     lastProposer = m.from
 
     if m.fromClient then
+      if !clientPrepared then
+        reportLateClientPrepare((HLCTimestamp.now - txd.startTimestamp).toMillis)
       clientPrepared = true
 
     adoptObjectUpdates(m)

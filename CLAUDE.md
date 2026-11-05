@@ -141,8 +141,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - QUIC (`implementations/quic`, Netty 4.2): Mutual TLS on every connection, datagrams for
     encoded messages of 1024 bytes or less, a small round-robin pool of streams for larger ones, and messages
     dropped (never queued) when over budget. Payloads are not copied on send and are copied exactly once on receive.
-  - Send buffering (`QuicConfig`): one host-wide `SendBudget` (256 MiB) shared by all connections; a connection may
-    queue below its floor (256 KiB) always, or below its ceiling (64 MiB) while the shared budget has room. The
+  - Send buffering (`QuicConfig`): one host-wide `SendBudget` (a quarter of the heap, at least 256 MiB) shared by all
+    connections; a connection may queue below its floor (256 KiB) always, or below its ceiling (a quarter of that
+    budget, at least 64 MiB) while the shared budget has room. A stream whose writes wait over 500 ms is logged. The
     pre-handshake queue has its own bound (16 MiB) outside the shared budget. A datagram burst (about half of
     quiche's queue since recent flushes) sends datagram-sized messages on a stream: a full quiche queue drops silently
 - A pluggable `NetworkCache` persists store->host and host->endpoint mappings, scoped to the system id.

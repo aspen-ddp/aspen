@@ -5,7 +5,7 @@ import org.aspen_ddp.aspen.client.{CorruptedObject, DataObjectState, InvalidObje
 import org.aspen_ddp.aspen.common.network.{ClientId, ReadResponse}
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.ida.Replication
-import org.aspen_ddp.aspen.client.{KeyValueObjectState, MetadataObjectState, ObjectCache, ObjectState}
+import org.aspen_ddp.aspen.client.{KeyValueObjectState, MetadataObjectState, ObjectCache, ObjectState, TransactionStatusCache}
 import org.aspen_ddp.aspen.client.internal.OpportunisticRebuildManager
 import org.aspen_ddp.aspen.client.internal.network.Messenger
 import org.aspen_ddp.aspen.common.network.{ClientRequest, HostMessage, OpportunisticRebuild, Read, TxMessage}
@@ -329,6 +329,60 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
 
     out.toString shouldBe ""
     Future.successful(succeed)
+  }
+
+  // A read racing a commit: a store replies with the old revision and a lock of a transaction not yet known to have
+  // committed. Without an immediate re-read the read waits for the next full resend (2 s for vdisk-server)
+  val lockTx = TransactionId(new UUID(0, 9))
+  val lockTxRev = ObjectRevision(lockTx)
+
+  def reads(m: RecordingClient, store: StoreId): Int =
+    m.requests.count { case rd: Read => rd.toStore == store; case _ => false }
+
+  def stale(ts: HLCTimestamp) = Right(ReadResponse.CurrentState(rev, ref, ts, 5, Some(odata), Set(lockTx)))
+  def current(ts: HLCTimestamp) = Right(ReadResponse.CurrentState(lockTxRev, ref, ts, 5, Some(odata), Set()))
+
+  test("a store holding the lock of the revision another store returned is re-read at once") {
+    val m = new RecordingClient
+    val r = mkReader(m)
+    val ts = HLCTimestamp.now
+    val oldTs = HLCTimestamp(ts.asLong - 1000)
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, stale(oldTs)))
+    reads(m, ds0) shouldBe 0
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, current(ts)))
+    // Stores only apply committed transactions, so ds1's revision shows the lock holder committed
+    reads(m, ds0) shouldBe 1
+    r.readResult.isCompleted shouldBe false
+
+    r.receiveReadResponse(ReadResponse(client, ds2, readUUID, ts, Left(ReadError.ObjectNotFound)))
+    reads(m, ds0) shouldBe 1 // One re-read per stale reply
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, current(ts)))
+    Await.result(r.readResult, awaitDuration).revision shouldBe lockTxRev
+  }
+
+  test("a store holding a lock is re-read at the next reply once its transaction is known to have committed") {
+    val m = new RecordingClient:
+      override val txStatusCache: TransactionStatusCache = new TransactionStatusCache()
+    val r = mkReader(m)
+    val ts = HLCTimestamp.now
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, stale(ts)))
+    m.txStatusCache.transactionCommitted(lockTx)
+    reads(m, ds0) shouldBe 0
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, Left(ReadError.ObjectNotFound)))
+    reads(m, ds0) shouldBe 1
+  }
+
+  test("a store holding the lock of an undecided transaction is not re-read") {
+    val m = new RecordingClient
+    val r = mkReader(m)
+    val ts = HLCTimestamp.now
+
+    r.receiveReadResponse(ReadResponse(client, ds0, readUUID, ts, stale(ts)))
+    r.receiveReadResponse(ReadResponse(client, ds1, readUUID, ts, Left(ReadError.ObjectNotFound)))
+    m.requests shouldBe Nil
   }
 
   test("a lock summary reports every lock's count but only a few of their ids") {

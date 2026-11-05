@@ -50,6 +50,32 @@ abstract class BaseReadDriver(
   private var committedLockRereads = 0
   private var committedLockStoresReported: Set[StoreId] = Set()
 
+  /** Stores whose last reply went to the object reader holding locks of transactions not then known to have
+    * committed. A read racing a commit gets such replies, and the reply showing the commit may be the next one */
+  private var undecidedLockStores: Map[StoreId, Set[TransactionId]] = Map()
+
+  /** Known from the transaction status cache, or from another store having applied it: stores apply only committed
+    * transactions. A store's own revision is not counted, so a reply cannot cause its own re-read */
+  private def holdsKnownCommittedLock(store: StoreId, locks: Set[TransactionId]): Boolean =
+    if locks.isEmpty then
+      false
+    else
+      val othersApplied = lastResponses.iterator.collect:
+        case (s, Right(cs)) if s != store => cs.revision.lastUpdateTxUUID
+      .toSet
+      locks.exists: txid =>
+        othersApplied.contains(txid.uuid) || client.txStatusCache.getTransactionResolution(txid).exists(_._1)
+
+  /** Re-reads, once per reply, every store whose locks have since been learned to belong to committed transactions.
+    * Its reply is stale, and it was the only reply that store will send before the next full resend */
+  private def rereadStoresWithNewlyCommittedLocks(): Unit =
+    val ready = undecidedLockStores.collect:
+      case (store, locks) if holdsKnownCommittedLock(store, locks) => store
+    ready.foreach: store =>
+      undecidedLockStores -= store
+      committedLockRereads += 1
+      sendReadRequest(store)
+
   private def elapsedMillis: Long = (System.nanoTime() - startNanos) / 1000000
 
   /** The last reply of each store: revision, timestamp and write locks, or the error */
@@ -120,14 +146,11 @@ abstract class BaseReadDriver(
 
     lastResponses += response.fromStore -> response.result
 
+    undecidedLockStores -= response.fromStore
+
     val hasLocksForKnownCommittedTransactions = response.result match {
       case Left(_) => false
-      case Right(cs) => ! cs.lockedWriteTransactions.forall { txuuid =>
-        client.txStatusCache.getTransactionResolution(txuuid) match {
-          case None => true
-          case Some((result, _)) => !result
-        }
-      }
+      case Right(cs) => holdsKnownCommittedLock(response.fromStore, cs.lockedWriteTransactions)
     }
 
     val isUnknownStoreResponse = response.result match
@@ -151,6 +174,10 @@ abstract class BaseReadDriver(
       sendReadRequest(response.fromStore)
     }
     else {
+      response.result.foreach: cs =>
+        if cs.lockedWriteTransactions.nonEmpty then
+          undecidedLockStores += response.fromStore -> cs.lockedWriteTransactions
+
       objectReader.receiveReadResponse(response).foreach { e =>
         if (!promise.isCompleted) {
           val result = e match {
@@ -216,6 +243,8 @@ abstract class BaseReadDriver(
         }
       }
     }
+    if !promise.isCompleted && undecidedLockStores.nonEmpty then
+      rereadStoresWithNewlyCommittedLocks()
     objectReader.receivedResponsesFromAllStores
   }
 

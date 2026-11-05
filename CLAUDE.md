@@ -191,6 +191,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
     TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
     if the data beat the finalizer's `errorTimeout`
+  - A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` gets a driver, which
+    learns the outcome from the stores' status caches, so `Host.txStatusCacheDuration` must outlast that timeout
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:

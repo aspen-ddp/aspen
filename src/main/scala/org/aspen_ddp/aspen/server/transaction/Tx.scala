@@ -408,8 +408,8 @@ class Tx( trs: TransactionRecoveryState,
     resolved(m.committed)
     ofinalized = Some(m.committed)
     releaseHeldCommit()
-    if (m.committed)
-      crl.deleteTransaction(storeId, transactionId)
+    // Whatever the outcome: a prepare after an abort, or from a recovery driver, may have saved this Tx again
+    crl.deleteTransaction(storeId, transactionId)
     statusCache.updateStatus(transactionId, status, finalized = true)
   }
 

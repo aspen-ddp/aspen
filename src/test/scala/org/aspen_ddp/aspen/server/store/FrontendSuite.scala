@@ -496,6 +496,34 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.get(oid1).get.metadata.revision shouldBe rev0
   }
 
+  test("finalization deletes the CRL entry of a committed transaction, whichever outcome a recovery driver reports") {
+    withDataless(): (frontend, _, _, crl) =>
+      val txd = dataUpdateTxd
+      val recoveryDriver = StoreId(poolId, 2)
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      val p = mkPrepare(txd, fromClient = false)
+      frontend.receiveTransactionMessage(p.copy(from = recoveryDriver, proposalId = ProposalId(p.proposalId.number + 1, 2.toByte)))
+      crl.txSaved shouldBe true
+      crl.txDel shouldBe false
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = false))
+      crl.txDel shouldBe true
+      frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("finalization deletes the CRL entry a prepare saved after an abort") {
+    withDataless(): (frontend, _, _, crl) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
+      crl.txDel = false
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false))
+      crl.txDel shouldBe true
+  }
+
   test("an abort does not wait for data") {
     withDataless(): (frontend, _, net, crl) =>
       frontend.receiveTransactionMessage(mkPrepare(dataUpdateTxd, fromClient = false))

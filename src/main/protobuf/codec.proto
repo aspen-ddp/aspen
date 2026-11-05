@@ -345,10 +345,11 @@ message ReadResponse {
   uint64 timestamp = 6;
   uint64 read_time = 7;
   uint32 size_on_store = 8;
-  bool have_data = 9;
+  bool have_data = 9; // A current state rather than readError
   bytes object_data = 10;
   bytes locked_write_transactions = 11; // Sequence of UUIDs
   ObjectReadError readError = 12;
+  bool has_object_data = 13; // object_data is present, possibly empty
 }
 
 message OpportunisticRebuild {

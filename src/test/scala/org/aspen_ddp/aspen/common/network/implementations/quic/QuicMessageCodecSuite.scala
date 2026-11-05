@@ -214,10 +214,12 @@ class QuicMessageCodecSuite extends AnyFunSuite with Matchers with BeforeAndAfte
       val result = streamRoundTrip(enc)
       result.map(_.msg) shouldBe Right(m)
 
-  test("ReadResponse with Some(empty) data decodes as None"):
+  test("ReadResponse with Some(empty) data stays distinct from None"):
+    // A ByteRanges read wholly past a slice's end returns empty data. Read as None it would count as a store
+    // without data, and the read could never be restored
     val enc = QuicMessageCodec.encode(readResponse(Some(DataBuffer.Empty)), alloc)
     val result = streamRoundTrip(enc)
-    result.map(_.msg) shouldBe Right(readResponse(None))
+    result.map(_.msg) shouldBe Right(readResponse(Some(DataBuffer.Empty)))
 
   test("send path does not copy payloads"):
     val arr = bytes(2000)

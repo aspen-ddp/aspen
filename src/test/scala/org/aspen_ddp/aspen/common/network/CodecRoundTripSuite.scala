@@ -452,6 +452,10 @@ class CodecRoundTripSuite extends AnyFunSuite with Matchers:
     decodedNoData.result.toOption.get.objectData shouldBe None
     decodedNoData.result.toOption.get.lockedWriteTransactions shouldBe empty
 
+    val emptyDataResp = ReadResponse(ClientId(uuid(1)), storeId(2), uuid(3), HLCTimestamp(1000L),
+      Right(ReadResponse.CurrentState(rev(4), ObjectRefcount(1, 5), HLCTimestamp(2000L), 0, Some(DataBuffer()), Set.empty)))
+    Codec.decode(Codec.encode(emptyDataResp)).result.toOption.get.objectData.map(_.size) shouldBe Some(0)
+
   test("OpportunisticRebuild round-trip"):
     val original = OpportunisticRebuild(
       storeId(1), ClientId(uuid(2)), dataPtr(3), rev(4),

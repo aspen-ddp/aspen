@@ -817,6 +817,7 @@ object Codec extends Logging:
           refcount = Some(encode(r.refcount)),
           sizeOnStore = r.sizeOnStore,
           timestamp = r.timestamp.asLong,
+          hasObjectData = r.objectData.isDefined,
           objectData = r.objectData.map(data => ByteString.copyFrom(data.asReadOnlyBuffer())).getOrElse(ByteString.EMPTY),
           lockedWriteTransactions = ByteString.copyFrom(arr)
         )
@@ -833,10 +834,8 @@ object Codec extends Logging:
       val refcount = decode(m.refcount.get)
       val timestamp = HLCTimestamp(m.timestamp)
       val sizeOnStore = m.sizeOnStore
-      val data = if m.objectData.size == 0 then
-        None
-      else
-        Some(DataBuffer(m.objectData.toByteArray))
+      // Empty data is not missing data: a ByteRanges read wholly past the end of a slice returns empty data
+      val data = if m.hasObjectData then Some(DataBuffer(m.objectData.toByteArray)) else None
 
       var lockedTx = List[TransactionId]()
 

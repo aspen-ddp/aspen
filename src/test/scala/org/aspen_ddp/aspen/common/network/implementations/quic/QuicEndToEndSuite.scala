@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.cmdline.Main
 import org.aspen_ddp.aspen.common.{DataBuffer, Radicle}
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.network.NetworkPlugin
-import org.aspen_ddp.aspen.common.objects.{Insert, Key}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
@@ -107,60 +107,69 @@ class QuicEndToEndSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
       case _ => ()
 
   /** Allocates a DataObject holding `size` bytes, inserting its pointer into the Radicle in the same transaction, then
-    * reads both back
+    * reads both back and runs `check` on the object
     */
-  private def roundTrip(size: Int): Unit = withSystem: client =>
-    given ExecutionContext = client.clientContext
+  private def roundTrip(size: Int)(check: (AspenClient, DataObjectPointer) => Unit = (_, _) => ()): Unit =
+    withSystem: client =>
+      given ExecutionContext = client.clientContext
 
-    val data = new Array[Byte](size)
-    new Random(size).nextBytes(data)
+      val data = new Array[Byte](size)
+      new Random(size).nextBytes(data)
 
-    val start = System.nanoTime()
-    @volatile var committed = 0L
-    // The host updates the Radicle too, so a commit can collide with it and abort. Each attempt allocates the whole
-    // object again, so the retries are few, and each uses a key of its own in case an earlier one did commit.
-    def attempt(n: Int): Future[(Key, org.aspen_ddp.aspen.common.objects.DataObjectPointer)] =
-      val key = Key(UUID.randomUUID())
-      client.transact: tx =>
-        given Transaction = tx
-        for
-          pool <- client.getStoragePool(Radicle.poolId)
-          dp <- pool.allocator.allocateDataObject(DataBuffer(data))
-        yield
-          tx.update(Radicle.pointer, None, None,
-                    List(KeyValueUpdate.DoesNotExist(key)),
-                    List(Insert(key, dp.toArray)))
-          (key, dp)
-      .map: r =>
-        committed = System.nanoTime()
-        r
-      .recoverWith:
-        case _: org.aspen_ddp.aspen.client.TransactionAborted if n < 5 => attempt(n + 1)
-    val f = attempt(1)
+      val start = System.nanoTime()
+      @volatile var committed = 0L
+      // The host updates the Radicle too, so a commit can collide with it and abort. Each attempt allocates the whole
+      // object again, so the retries are few, and each uses a key of its own in case an earlier one did commit.
+      def attempt(n: Int): Future[(Key, DataObjectPointer)] =
+        val key = Key(UUID.randomUUID())
+        client.transact: tx =>
+          given Transaction = tx
+          for
+            pool <- client.getStoragePool(Radicle.poolId)
+            dp <- pool.allocator.allocateDataObject(DataBuffer(data))
+          yield
+            tx.update(Radicle.pointer, None, None,
+                      List(KeyValueUpdate.DoesNotExist(key)),
+                      List(Insert(key, dp.toArray)))
+            (key, dp)
+        .map: r =>
+          committed = System.nanoTime()
+          r
+        .recoverWith:
+          case _: org.aspen_ddp.aspen.client.TransactionAborted if n < 5 => attempt(n + 1)
+      val f = attempt(1)
 
-    val (key, dp) = Await.result(f, Timeout)
-    // Commit returns once the outcome is decided, so a read right after it can reach stores that have yet to apply it:
-    // the new object is then not found, and the Radicle lacks the key. Read again until both are seen.
-    val deadline = System.nanoTime() + Timeout.toNanos
-    def readUntil[T](what: String)(read: => Future[T])(done: T => Boolean): T =
-      def tryRead(): Either[Throwable, T] =
-        try Right(Await.result(read, Timeout)) catch case e: Exception => Left(e)
-      var last = tryRead()
-      while !last.exists(done) && System.nanoTime() < deadline do
-        Thread.sleep(10)
-        last = tryRead()
-      last.fold(e => throw e, identity)
-    val kvos = readUntil("the Radicle")(client.read(Radicle.pointer))(_.contents.contains(key))
-    val dos = readUntil("the data object")(client.read(dp))(_ => true)
-    val end = System.nanoTime()
-    info(s"commit ${(committed - start) / 1000000} ms, reads ${(end - committed) / 1000000} ms")
+      val (key, dp) = Await.result(f, Timeout)
+      // Commit returns once the outcome is decided, so a read right after it can reach stores that have yet to apply it:
+      // the new object is then not found, and the Radicle lacks the key. Read again until both are seen.
+      val deadline = System.nanoTime() + Timeout.toNanos
+      def readUntil[T](what: String)(read: => Future[T])(done: T => Boolean): T =
+        def tryRead(): Either[Throwable, T] =
+          try Right(Await.result(read, Timeout)) catch case e: Exception => Left(e)
+        var last = tryRead()
+        while !last.exists(done) && System.nanoTime() < deadline do
+          Thread.sleep(10)
+          last = tryRead()
+        last.fold(e => throw e, identity)
+      val kvos = readUntil("the Radicle")(client.read(Radicle.pointer))(_.contents.contains(key))
+      val dos = readUntil("the data object")(client.read(dp))(_ => true)
+      val end = System.nanoTime()
+      info(s"commit ${(committed - start) / 1000000} ms, reads ${(end - committed) / 1000000} ms")
 
-    kvos.contents.get(key).map(_.value.bytes.toSeq) shouldBe Some(dp.toArray.toSeq)
-    dos.data.size shouldBe size
-    java.util.Arrays.equals(dos.data.getByteArray, data) shouldBe true
+      kvos.contents.get(key).map(_.value.bytes.toSeq) shouldBe Some(dp.toArray.toSeq)
+      dos.data.size shouldBe size
+      java.util.Arrays.equals(dos.data.getByteArray, data) shouldBe true
+      check(client, dp)
 
   test("end-to-end transaction over QUIC"):
-    roundTrip(1024 * 1024)
+    roundTrip(1024 * 1024)()
 
   test("end-to-end over QUIC with a 32 MiB object"):
-    roundTrip(32 * 1024 * 1024)
+    roundTrip(32 * 1024 * 1024)()
+
+  // Each store then returns empty data, which must reach the client as data: as no data, below the restore threshold,
+  // these reads would be retried until the object grew
+  test("an empty object and a range past an object's end read as empty over QUIC"):
+    roundTrip(0): (client, dp) =>
+      Await.result(client.readRange(dp, 4096, Some(4096)), Timeout).data.size shouldBe 0
+      Await.result(client.readRanges(dp, List((0, 512), (8192, 512))), Timeout).map(_.data.size) shouldBe List(0, 0)

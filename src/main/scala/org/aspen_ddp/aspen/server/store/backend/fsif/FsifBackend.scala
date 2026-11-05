@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.common.objects.{Metadata, ObjectId, ObjectPointer, Ob
 import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.server.DurableFiles
-import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitError, CommitState, CompletionHandler, Read,
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitError, CommitState, CompletionHandler, Read,
   UpdateForm}
 
 /** A store backend that keeps every object slice in a fixed-size segment of one flat `data` file, located through an
@@ -368,8 +368,8 @@ class FsifBackend(val storeId: StoreId,
   override def commit(state: CommitState, transactionId: TransactionId): Unit =
     val id = state.objectId
     post(admitted(appendBound(state.data.size)): release =>
-      update(state, repairing = false, r => handler.foreach(_.complete(Commit(storeId, id, transactionId, r))),
-        release))
+      update(state, repairing = false,
+        timed("fsif commit", r => handler.foreach(_.complete(Commit(storeId, id, transactionId, r)))), release))
 
   override def repair(state: CommitState, complete: Promise[Unit]): Unit =
     post(admitted(appendBound(state.data.size)): release =>
@@ -726,12 +726,19 @@ class FsifBackend(val storeId: StoreId,
       try onFatal(t)
       catch case NonFatal(e) => logger.error(s"FSIF store $storeId: onFatal threw $e")
 
+  /** `reply`, recording the time from now until it's called */
+  private def timed(stage: String, reply: Reply): Reply =
+    val start = System.nanoTime()
+    r =>
+      BackendTiming.report.record(stage, System.nanoTime() - start)
+      reply(r)
+
   /** Backpressure: a successful reply of a commit that arrived while unapplied Delta bytes exceeded
     * `tuning.unappliedBound` waits until they no longer do
     */
   private def ack(reply: Reply, wasThrottled: Boolean): Unit =
     if wasThrottled && unappliedBytes > tuning.unappliedBound then
-      throttled += reply
+      throttled += timed("fsif backpressure", reply)
     else
       reply(Left(()))
 
@@ -952,7 +959,9 @@ class FsifBackend(val storeId: StoreId,
           dataForceInFlight = true
           try
             io.execute(new IoTask(waiters.head._1, () => {
+              val forceStart = System.nanoTime()
               val r = Try(dataFile.force())
+              BackendTiming.report.record("fsif data force", System.nanoTime() - forceStart)
               post(dataForceDone(id, waiters, r))
             }))
           catch
@@ -1288,9 +1297,9 @@ class FsifBackend(val storeId: StoreId,
       val header = SegmentHeader.forSlice(state.objectType, id, x, state.metadata, state.data)
       val bytes = state.data.getByteArray
       if state.form == UpdateForm.Full && bytes.length > tuning.cowThreshold then
-        copyOnWrite(x, id, header, bytes, reply)
+        copyOnWrite(x, id, header, bytes, timed("fsif copy-on-write", reply))
       else
-        journaled(x, id, header, bytes, state.form, reply)
+        journaled(x, id, header, bytes, state.form, timed("fsif journaled", reply))
 
   private def journaled(x: Int, id: ObjectId, header: SegmentHeader, bytes: Array[Byte], form: UpdateForm,
                         reply: Reply): Unit =

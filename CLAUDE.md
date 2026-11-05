@@ -160,6 +160,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - `aspen host --load-jars=<version>` loads user RegisteredTypeFactory lists from every jar in `<host-dir>/jars/<version>/`
   (may be a symlink, e.g. `latest`) via `UserJarLoader`: one URLClassLoader, parent-first, `AspenTypeProvider` classes
   found with ServiceLoader. Duplicate UUIDs (including against built-ins) fail startup naming both classes and jars
+- `BackendTiming` logs each host's write stages about once a second while writes happen: the store's view of a commit,
+  RocksDB's pool wait and write, and FSIF's io wait, journal write and force, data force, copy-on-write and backpressure
 - DataStores are pluggable: RocksDB, in-memory Map, and FSIF (`server.store.backend.fsif`, a flat file of fixed-size
   segments located by a 4-byte storePointer, with a journal and checkpointed index). FSIF freezes writes on ENOSPC
   and keeps serving reads. FSIF pools use `FsifIndexAllocationStrategy` (a per-pool bitmap KeyValue object in
@@ -191,7 +193,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
     TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
     if the data beat the finalizer's `errorTimeout` (2 s)
-  - A store that misses `errorTimeout` is marked in its pool's ErrorTree for every object it hosts. A client's
+  - A store that misses `errorTimeout` is marked in its pool's ErrorTree for every object it hosts that the transaction
+    changes (a lock changes nothing, so there is nothing to repair and the object's timestamp would not catch up). A client's
     `MissedUpdateMarker` writes one batch per pool at a time and merges waiting entries by key, so a slow spell makes
     batches larger rather than adding colliding writes
   - A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` gets a driver, which

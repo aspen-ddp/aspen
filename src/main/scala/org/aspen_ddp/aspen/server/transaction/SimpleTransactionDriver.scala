@@ -59,7 +59,8 @@ class SimpleTransactionDriver(executionContext: ExecutionContext,
 
       if resolved then
         logger.trace(s"*** Sending TxResolved for transaction ${txd.transactionId}")
-        txd.allDataStores.filter(!knownResolved.contains(_)).map(toStore => TxResolved(toStore, storeId, txd.transactionId, resolvedValue))
+        messenger.sendTransactionMessages(txd.allDataStores.filter(!knownResolved.contains(_)).toList
+          .map(toStore => TxResolved(toStore, storeId, txd.transactionId, resolvedValue)))
       else
         proposer.currentAcceptMessage() match
           case Some(_) =>

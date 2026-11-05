@@ -90,6 +90,20 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
 
   import TransactionDriverSuite._
 
+  test("A driver sends heartbeats only once it has outlived a heartbeat period") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val messenger = new TMessenger()
+    val driver = new TTD(ds0, messenger, mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+    messenger.messages = Nil
+
+    driver.heartbeat()
+    assert(messenger.messages.isEmpty)
+
+    driver.heartbeat()
+    assert(messenger.messages.size == txd.allDataStores.size)
+    assert(messenger.messages.forall(_.isInstanceOf[org.aspen_ddp.aspen.common.network.TxHeartbeat]))
+  }
+
   test("Simple PrepareResponse Handling") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val prep = mkprep(1, 0, 0, txd)

@@ -1711,7 +1711,7 @@ object Main {
     networkBridge.oclient = Some(client)
 
     val txFinalizerFactory = new RegisteredTransactionFinalizerFactory(client)
-    val txHeartbeatPeriod = Duration(5, SECONDS)
+    val txHeartbeatPeriod = Duration(1, SECONDS)
     val txRetryDelay = Duration(100, MILLISECONDS) //
     val txRetryCap = Duration(3, SECONDS)
     //val allocHeartbeatPeriod   = Duration(3, SECONDS)

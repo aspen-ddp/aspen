@@ -109,6 +109,7 @@ abstract class TransactionDriver(
   private var clientResolved: Option[TransactionResolved] = None
   private var clientFinalized: Option[TransactionFinalized] = None
   private var txMessages: Option[List[TxMessage]] = None
+  private var heartbeatDue: Boolean = false
 
   def designatedLeader: Boolean = txd.designatedLeaderUID == storeId.poolIndex
 
@@ -146,11 +147,15 @@ abstract class TransactionDriver(
 
   def shutdown(): Unit = {}
 
+  /** A driver's first tick sends no TxHeartbeat, so transactions that finish within a heartbeat period send none. The
+    * stores' silence is then at most two periods, well inside `Host.txHeartbeatTimeout`.
+    */
   def heartbeat(): Unit = {
     if (finalized)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, resolvedValue)))
-    else
+    else if (heartbeatDue)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxHeartbeat(toStoreId, storeId, txd.transactionId)))
+    heartbeatDue = true
   }
 
   // Must be called outside a syncrhonized block. Doing so avoids a race condition within the unit test

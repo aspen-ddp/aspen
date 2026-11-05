@@ -192,7 +192,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
     if the data beat the finalizer's `errorTimeout`
   - A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` gets a driver, which
-    learns the outcome from the stores' status caches, so `Host.txStatusCacheDuration` must outlast that timeout
+    learns the outcome from the stores' status caches, so `Host.txStatusCacheDuration` must outlast that timeout. At high volume the cache is costly (about 175 bytes
+    per transaction, capped at `DefaultMaxEntries`), so these stay short: 5 s and 7 s with the host's 1 s heartbeat
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:

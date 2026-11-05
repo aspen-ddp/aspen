@@ -31,6 +31,8 @@ modprobe iscsi_target_mod
 install -m 0644 "$REPO/deploy/dbus/org.kernel.TCMUService1.conf" /etc/dbus-1/system.d/
 busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig
 
+rm -f /var/log/aspen-vdisk-server.log
+
 start_server
 check_dbus
 

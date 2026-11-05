@@ -26,6 +26,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   private val completionPromise: Promise[Unit] = Promise()
 
+  // Never marked: a store that misses a lock has nothing to repair, and since the lock doesn't change the object, its
+  // timestamp would not reach this transaction's until some later write, so the entry could not be cleared before then.
+  // A store whose lock failed because its copy is behind was marked by the transaction that wrote the newer copy.
+  private lazy val lockOnly: Set[ObjectId] = txd.lockOnlyObjects
+
   logger.debug(s"Created MissedUpdateFinalizationAction for Tx ${txd.transactionId}")
 
   def complete: Future[Unit] = completionPromise.future
@@ -33,7 +38,7 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = synchronized {
     this.commitErrors = commitErrors
 
-    if txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.nonEmpty) then
+    if txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.exists(!lockOnly.contains(_))) then
       logger.trace(s"All stores responded to commit of tx ${txd.transactionId} without error. No MissedUpdates.")
       markTask.foreach(_.cancel())
       if (!completionPromise.isCompleted)
@@ -61,12 +66,13 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     val errors = txd.allDataStores.foldLeft(List[MissedUpdate]()) { (l, storeId) =>
       commitErrors.get(storeId) match
         case None =>
-          txd.allHostedObjects(storeId).map(ptr => MissedUpdate(storeId, ptr.id, txd.startTimestamp, ptr.storePointer)) ++ l
+          txd.allHostedObjects(storeId).filterNot(ptr => lockOnly.contains(ptr.id))
+            .map(ptr => MissedUpdate(storeId, ptr.id, txd.startTimestamp, ptr.storePointer)) ++ l
         case Some(lst) =>
           // Note: this case is not reachable today (ids in commitErrors come from RequirementsChecker,
           // which only reports r.objectPointer.id from this same txd's requirements), but we handle it
           // defensively by looking up pointers from allReferencedObjectsSet, falling back to EmptyArray.
-          lst.map { objectId =>
+          lst.filterNot(lockOnly.contains).map { objectId =>
             val storePointer = idToPointer.get(objectId).map(_.storePointer).getOrElse(ObjectPointer.EmptyArray)
             MissedUpdate(storeId, objectId, txd.startTimestamp, storePointer)
           } ++ l

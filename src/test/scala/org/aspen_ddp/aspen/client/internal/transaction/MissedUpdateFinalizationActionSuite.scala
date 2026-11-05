@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.Missed
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, ObjectId, ObjectPointer, ObjectRevision, Value}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, RevisionLock, SharedRevisionLock, TransactionDescription, TransactionId}
 
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceSetId
@@ -314,6 +314,60 @@ class MissedUpdateFinalizationActionSuite extends IntegrationTestSuite:
     yield
       marker.commits shouldBe 3
       entries.forall(_.isDefined) shouldBe true
+
+  private def revision = ObjectRevision(TransactionId(UUID.randomUUID()))
+
+  /** Which of these stores have an entry for the object */
+  private def markedStores(ptr: ObjectPointer, stores: List[StoreId]): Future[List[StoreId]] =
+    for
+      pool <- client.getStoragePool(Radicle.poolId)
+      found <- Future.sequence(stores.map(s => pool.errorTree.get(buildErrorKey(s, ptr.id)).map(e => (s, e.isDefined))))
+    yield found.collect { case (s, true) => s }
+
+  /** An update of `updated` that holds locks on `shared` and `exclusive`, and on `updated` too */
+  private def txdWithLocks(updated: ObjectPointer, shared: ObjectPointer, exclusive: ObjectPointer) =
+    txdFor(updated).copy(requirements =
+      List(DataUpdate(updated, revision, DataUpdateOperation.Overwrite),
+           SharedRevisionLock(updated, revision), SharedRevisionLock(shared, revision), RevisionLock(exclusive, revision)))
+
+  test("only objects locked and never changed by a transaction are lock-only"):
+    val List(updated, shared, exclusive) = List.fill(3)(pointerWith(Array[Byte]()))
+    txdWithLocks(updated, shared, exclusive).lockOnlyObjects shouldBe Set(shared.id, exclusive.id)
+
+  atest("a store that never replied is not marked for objects the transaction only locks"):
+    val List(updated, shared, exclusive) = List.fill(3)(pointerWith(Array[Byte]()))
+    val fa = new MissedUpdateFinalizationAction(client, txdWithLocks(updated, shared, exclusive))
+    fa.markMissedUpdates()
+    val stores = List(net.storeId0, net.storeId1, net.storeId2)
+    for
+      _ <- fa.complete
+      marked <- markedStores(updated, stores)
+      markedShared <- markedStores(shared, stores)
+      markedExclusive <- markedStores(exclusive, stores)
+    yield
+      marked shouldBe stores
+      markedShared shouldBe Nil
+      markedExclusive shouldBe Nil
+
+  atest("a commit error on an object the transaction only locks is not marked"):
+    val List(updated, shared, exclusive) = List.fill(3)(pointerWith(Array[Byte]()))
+    val fa = new MissedUpdateFinalizationAction(client, txdWithLocks(updated, shared, exclusive))
+    fa.updateCommitErrors(Map(net.storeId2 -> List(shared.id, exclusive.id)))
+    fa.markMissedUpdates()
+    for
+      _ <- fa.complete
+      markedShared <- markedStores(shared, List(net.storeId2))
+      markedExclusive <- markedStores(exclusive, List(net.storeId2))
+    yield
+      markedShared shouldBe Nil
+      markedExclusive shouldBe Nil
+
+  test("commit errors only on objects the transaction only locks need no marks"):
+    val List(updated, shared, exclusive) = List.fill(3)(pointerWith(Array[Byte]()))
+    val txd = txdWithLocks(updated, shared, exclusive)
+    val fa = new MissedUpdateFinalizationAction(client, txd)
+    fa.updateCommitErrors(txd.allDataStores.map(_ -> List(shared.id)).toMap)
+    fa.complete.isCompleted shouldBe true
 
   atest("an action with no marks to write completes"):
     val ptr = pointerWith(Array[Byte](1))

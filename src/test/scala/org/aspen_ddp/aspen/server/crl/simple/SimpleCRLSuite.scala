@@ -616,6 +616,28 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
+  test("A dead CRL thread is reported") {
+    val died = new LinkedBlockingQueue[Throwable]()
+    val i = SimpleCRL(tdir, 3, 8192, t => died.put(t))
+
+    // An entry larger than a whole stream cannot be written
+    val tooBig = ObjectUpdate(ou1.objectId, DataBuffer(new Array[Byte](8192)))
+    i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(tooBig)), () => ())
+
+    assert(died.poll(10, TimeUnit.SECONDS).isInstanceOf[IllegalArgumentException])
+  }
+
+  test("A dead CRL writer thread is reported") {
+    val died = new LinkedBlockingQueue[Throwable]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024, t => died.put(t))
+    val err = new RuntimeException("completion handler failed")
+
+    // Completion handlers run on the writer thread
+    i.crl.save(transactionId, trsValidTxd, () => throw err)
+
+    assert(died.poll(10, TimeUnit.SECONDS) eq err)
+  }
+
   test("Recovery preserves latest paxos state after multiple saves") {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
 

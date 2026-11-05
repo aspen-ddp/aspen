@@ -345,6 +345,21 @@ class MainSuite extends AnyFunSuite with Matchers:
         if e == added then throw SysError("send", Linux.EIO, "I/O error"))
     replies.toArray.toList shouldBe List(added, removed)
 
+  test("an uncaught exception reaches the host log"):
+    withTempDir("host-log-uncaught"): dir =>
+      val file = Main.hostLogFile(dir)
+      val writer = Main.LogFileWriter(file)
+      val log = scribe.Logger().orphan().withHandler(formatter = Main.logFormat, writer = writer,
+        minimumLevel = Some(scribe.Level.Info))
+      val thread = new Thread("doomed-thread"):
+        override def run(): Unit = throw RuntimeException("thread failure")
+      thread.setUncaughtExceptionHandler(Main.logUncaughtExceptions(log))
+      thread.start()
+      thread.join()
+      writer.dispose()
+      os.read(file) should include ("doomed-thread")
+      os.read(file) should include ("thread failure")
+
   test("the host log goes to <host-dir>/logs/host.log as plain text, appended across restarts"):
     withTempDir("host-log"): dir =>
       val file = Main.hostLogFile(dir)

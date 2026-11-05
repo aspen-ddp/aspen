@@ -196,6 +196,10 @@ object Main {
 
     override def dispose(): Unit = synchronized(out.close())
 
+  /** Logs an exception that would otherwise reach only stderr, and so not the host log. */
+  def logUncaughtExceptions(log: scribe.Logger): Thread.UncaughtExceptionHandler =
+    (thread, err) => log.error(s"Uncaught exception on thread ${thread.getName}", err)
+
   /** Awaits `f` and then runs `report` on the calling thread.
    *
    * Reporting on this thread rather than in an onComplete callback matters because all of
@@ -1622,8 +1626,10 @@ object Main {
   /** Starts the `host` command: blocks forever once the host is running. */
   def run_host(hostDir: os.Path, loadJars: Option[String]): Int = {
     configureLogging(Some(hostLogFile(hostDir)))
+    Thread.setDefaultUncaughtExceptionHandler(logUncaughtExceptions(scribe.Logger.root))
 
-    val h = startHost(hostDir, loadJars)
+    // Crash-only: halt, since without its CRL the host could serve reads but never finish a transaction
+    val h = startHost(hostDir, loadJars, _ => Runtime.getRuntime.halt(1))
 
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO
     // thread is what keeps the process alive; the IO thread itself is a daemon thread.
@@ -1640,8 +1646,12 @@ object Main {
    *
    *  `loadJars` names the version directory under `<host-dir>/jars` whose user type factories the
    *  host's client is given. They are loaded before anything else is started so a bad jar fails fast.
+   *
+   *  `onCrlThreadDeath` is called if a CRL thread dies. An in-process caller must not halt its JVM.
    */
-  def startHost(hostDir: os.Path, loadJars: Option[String] = None): RunningHost = {
+  def startHost(hostDir: os.Path,
+                loadJars: Option[String] = None,
+                onCrlThreadDeath: Throwable => Unit = _ => ()): RunningHost = {
 
     val userTypeFactories = loadJars.map(UserJarLoader.load(hostDir, _)).getOrElse(Nil)
 
@@ -1676,7 +1686,7 @@ object Main {
       case b: HostConfig.SimpleCRL =>
         val crlRoot = hostDir / "crl"
         os.makeDir.all(crlRoot)
-        SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024)
+        SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024, onCrlThreadDeath)
     }
 
     // Remembers the CRL the Host creates so RunningHost.stop can shut down its threads.

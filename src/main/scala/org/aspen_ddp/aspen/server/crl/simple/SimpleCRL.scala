@@ -37,13 +37,20 @@ object SimpleCRL:
 
   case class Factory(streamsDir: os.Path,
                      numStreams: Int,
-                     maxSizeInBytes: Long) extends CrashRecoveryLogFactory:
+                     maxSizeInBytes: Long,
+                     onThreadDeath: Throwable => Unit = _ => ()) extends CrashRecoveryLogFactory:
     def createCRL(): CrashRecoveryLog =
-      SimpleCRL(streamsDir, numStreams, maxSizeInBytes).crl
+      SimpleCRL(streamsDir, numStreams, maxSizeInBytes, onThreadDeath).crl
 
 
 
-  def apply(streamsDir: os.Path, numStreams: Int, maxSizeInBytes: Long): InitialCRLState =
+  /** @param onThreadDeath called if a CRL thread dies. No transaction can make progress after that: stores vote only
+    *                      once a save completes, so a host should stop rather than hang.
+    */
+  def apply(streamsDir: os.Path,
+            numStreams: Int,
+            maxSizeInBytes: Long,
+            onThreadDeath: Throwable => Unit = _ => ()): InitialCRLState =
     val files: List[(StreamId, os.Path)] = (0 until numStreams).map(i =>
       (StreamId(i), streamsDir / s"$i.crl")
     ).toList
@@ -54,19 +61,21 @@ object SimpleCRL:
       new SimpleCRL(
         maxSizeInBytes,
         files,
-        r),
+        r,
+        onThreadDeath),
       r.trsList)
 
 
 class SimpleCRL private (val maxSizeInBytes: Long,
                          files: List[(StreamId, os.Path)],
-                         r: Recovery.Result) extends CrashRecoveryLog with Logging:
+                         r: Recovery.Result,
+                         onThreadDeath: Throwable => Unit) extends CrashRecoveryLog with Logging:
 
   import SimpleCRL._
 
   val numStreams: Int = files.size
 
-  private val writer = StreamWriter(maxSizeInBytes, files)
+  private val writer = StreamWriter(maxSizeInBytes, files, onThreadDeath)
   private var currentStream: Int = r.activeStreamId.number
   private var currentLogEntry: LogEntry = new LogEntry(r.initialPreviousEntryLocation,
     r.initialNextEntrySerialNumber, r.initialOldestEntryNeeded)
@@ -99,7 +108,11 @@ class SimpleCRL private (val maxSizeInBytes: Long,
   initializing = false
 
   private val ioThread = new Thread {
-    override def run(): Unit = crlThread()
+    override def run(): Unit =
+      try crlThread()
+      catch case t: Throwable =>
+        logger.error("CRL thread died", t)
+        onThreadDeath(t)
   }
   ioThread.start()
 

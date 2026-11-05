@@ -80,6 +80,35 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
       rcv should be >= math.min(wanted, max("rmem_max"))
       snd should be >= math.min(wanted, max("wmem_max"))
 
+  test("UDP sockets merge received packets and send with don't-fragment"):
+    assume(io.netty.channel.epoll.Epoll.isAvailable, "UDP offload and don't-fragment need epoll")
+    val c = fx.client()
+    for net <- List(fx.a.net, c.net) do
+      net.groForTests should not be empty
+      net.groForTests.foreach(_ shouldBe true)
+      net.dontFragmentForTests.foreach: options =>
+        options.head shouldBe Some(QuicNet.PmtuDiscProbe) // IPv4, set on IPv6 sockets too for mapped addresses
+        options(1).foreach(_ shouldBe QuicNet.PmtuDiscProbe)
+
+  test("path MTU discovery raises packets to maxUdpPayloadBytes on loopback"):
+    assume(io.netty.channel.epoll.Epoll.isAvailable, "path MTU discovery needs epoll")
+    val entry = entryFor(fx.a.net, fx.hostIdB)
+    val conn = fx.a.net.connectionFor(entry)
+    eventually("connection active")(conn.isActive)
+    fx.a.net.sendToHost(entry, rebuild(fx.storesB.head, 4 * 1024 * 1024, 0))
+    await(fx.b.handler.clientRequests, 1, 30000)
+    eventually("path MTU discovered", 5000):
+      conn.attachedChannel.collectPathStats(0).get(5, TimeUnit.SECONDS).pmtu == fx.config.maxUdpPayloadBytes
+
+  test("16 MiB arrives intact without UDP offload"):
+    val c = fx.client(QuicConfig(gossip = GossipConfig.ForTests, udpOffload = false))
+    c.net.groForTests.foreach(_ shouldBe false)
+    val m = rebuild(fx.storesB.head, 16 * 1024 * 1024, 7)
+    val entry = entryFor(c.net, fx.hostIdB)
+    c.net.sendToHost(entry, m)
+    val got = await(fx.b.handler.clientRequests, 1, 30000).head.message.asInstanceOf[OpportunisticRebuild]
+    java.util.Arrays.equals(got.data.getByteArray, m.data.getByteArray) shouldBe true
+
   test("client request reaches the host owning the store"):
     val c = fx.client()
     val reqB = read(fx.storesB.head, c.net.clientId)

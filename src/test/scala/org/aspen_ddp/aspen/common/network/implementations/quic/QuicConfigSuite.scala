@@ -16,3 +16,15 @@ class QuicConfigSuite extends AnyFunSuite with Matchers:
     QuicConfig.defaultSendBudget(GiB) shouldBe 256 * MiB
     QuicConfig.defaultConnectionCeiling(GiB) shouldBe 64 * MiB
   }
+
+  test("a GSO send stays within the kernel's 64 segments and 64 KiB") {
+    QuicConfig().gsoSegments shouldBe 44
+    QuicConfig(maxUdpPayloadBytes = 1200).gsoSegments shouldBe 54
+    QuicConfig(maxUdpPayloadBytes = 9000).gsoSegments shouldBe 7
+    QuicConfig(maxUdpPayloadBytes = 65000).gsoSegments shouldBe 1
+  }
+
+  test("payload sizes below QUIC's minimum or above one GSO send are refused") {
+    an[IllegalArgumentException] should be thrownBy QuicConfig(maxUdpPayloadBytes = 1199)
+    an[IllegalArgumentException] should be thrownBy QuicConfig(maxUdpPayloadBytes = 65001)
+  }

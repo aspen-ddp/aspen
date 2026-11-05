@@ -3,13 +3,14 @@ package org.aspen_ddp.aspen.common.network.implementations.quic
 import io.netty.bootstrap.Bootstrap
 import io.netty.buffer.{ByteBuf, PooledByteBufAllocator, Unpooled}
 import io.netty.channel.{Channel, ChannelFuture, ChannelOption, ChannelHandler, ChannelHandlerContext, ChannelInboundHandlerAdapter,
-  ChannelInitializer, EventLoop, IoHandlerFactory, MultiThreadIoEventLoopGroup}
-import io.netty.channel.epoll.{Epoll, EpollDatagramChannel, EpollIoHandler}
+  ChannelInitializer, EventLoop, FixedRecvByteBufAllocator, IoHandlerFactory, MultiThreadIoEventLoopGroup}
+import io.netty.channel.epoll.{Epoll, EpollChannelOption, EpollDatagramChannel, EpollIoHandler}
 import io.netty.channel.nio.NioIoHandler
 import io.netty.channel.socket.nio.NioDatagramChannel
-import io.netty.channel.unix.UnixChannelOption
-import io.netty.handler.codec.quic.{QuicChannel, QuicClientCodecBuilder, QuicCodecDispatcher, QuicConnectionIdGenerator,
-  QuicServerCodecBuilder, QuicSslContext, QuicStreamChannel}
+import io.netty.channel.unix.{IntegerUnixChannelOption, UnixChannelOption}
+import io.netty.handler.codec.quic.{EpollQuicUtils, QuicChannel, QuicChannelOption, QuicClientCodecBuilder,
+  QuicCodecDispatcher, QuicConnectionIdGenerator, QuicServerCodecBuilder, QuicSslContext, QuicStreamChannel,
+  SegmentedDatagramPacketAllocator}
 import io.netty.util.{AttributeKey, NetUtil}
 import io.netty.util.concurrent.Future as NFuture
 import org.aspen_ddp.aspen.client.AspenClient
@@ -42,6 +43,17 @@ object QuicNet:
   private val ConnectionKey: AttributeKey[QuicConnection] = AttributeKey.valueOf("aspen-quic-connection")
 
   private val CloseAwaitMillis: Long = 5000
+
+  /** One recvmmsg slot: the most a GRO read can merge */
+  private val GroSlotBytes: Int = 65535
+
+  /** recvmmsg slots per read */
+  private val GroSlotsPerRead: Int = 8
+
+  // Linux socket options (linux/in.h, linux/in6.h): don't-fragment, without the kernel's own path MTU limit
+  private val IpMtuDiscover = new IntegerUnixChannelOption("IP_MTU_DISCOVER", 0, 10)
+  private val Ipv6MtuDiscover = new IntegerUnixChannelOption("IPV6_MTU_DISCOVER", 41, 23)
+  private[quic] val PmtuDiscProbe: Int = 3
 
   private val FlushPollMillis: Long = 25
 
@@ -190,6 +202,14 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   private val datagramChannelClass: Class[? <: Channel] =
     if useEpoll then classOf[EpollDatagramChannel] else classOf[NioDatagramChannel]
+
+  /** Set on every QuicChannel so quiche's packets go out in GSO batches; None without epoll or `udpOffload` */
+  private val gsoAllocator: Option[SegmentedDatagramPacketAllocator] =
+    Option.when(useEpoll && config.udpOffload)(EpollQuicUtils.newSegmentedAllocator(config.gsoSegments))
+      .filter(_ ne SegmentedDatagramPacketAllocator.NONE)
+
+  /** Path MTU discovery needs don't-fragment on the sockets, which only epoll can set */
+  private val discoverPmtu: Boolean = useEpoll
 
   private val group: MultiThreadIoEventLoopGroup =
     val factory: IoHandlerFactory = if useEpoll then EpollIoHandler.newFactory() else NioIoHandler.newFactory()
@@ -354,10 +374,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   // ---- Datagram channels ---------------------------------------------------------------------------------------
 
   private def serverCodecBuilder(ssl: QuicSslContext): QuicServerCodecBuilder =
-    config.applyTo(new QuicServerCodecBuilder(), idleTimeout)
+    val b = config.applyTo(new QuicServerCodecBuilder(), idleTimeout, discoverPmtu)
       .sslContext(ssl)
       .handler(inboundConnectionInitializer)
       .streamHandler(inboundStreamInitializer)
+    gsoAllocator.foreach(a => b.option(QuicChannelOption.SEGMENTED_DATAGRAM_PACKET_ALLOCATOR, a))
+    b
 
   private def bind(loop: EventLoop, handler: ChannelHandler, address: InetSocketAddress, reusePort: Boolean): Channel =
     val b = new Bootstrap().group(loop).channel(datagramChannelClass).handler(handler)
@@ -366,9 +388,17 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     if reusePort then
       // SO_REUSEPORT is declared on UnixChannelOption; EpollChannelOption only inherits it
       b.option(UnixChannelOption.SO_REUSEPORT, java.lang.Boolean.TRUE)
+    if useEpoll && config.udpOffload then
+      // GRO hands over up to 64 KiB of merged packets per read, so each recvmmsg slot must hold that much
+      b.option(EpollChannelOption.UDP_GRO, java.lang.Boolean.TRUE)
+        .option(EpollChannelOption.MAX_DATAGRAM_PAYLOAD_SIZE, Integer.valueOf(QuicNet.GroSlotBytes))
+        .option(ChannelOption.RECVBUF_ALLOCATOR,
+          new FixedRecvByteBufAllocator(QuicNet.GroSlotBytes * QuicNet.GroSlotsPerRead))
     val ch = b.bind(address).sync().channel()
     boundChannels.add(ch)
     checkSocketBuffers(ch)
+    if discoverPmtu then
+      setDontFragment(ch)
     ch
 
   private val socketBufferWarned = new java.util.concurrent.atomic.AtomicBoolean(false)
@@ -381,6 +411,34 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
       logger.warn(s"QUIC UDP socket buffers are smaller than the $wanted bytes requested: receive $rcv, send $snd " +
         "(Linux reports twice the size applied). Packets the receive buffer can't hold are lost. On Linux, raise " +
         "net.core.rmem_max and net.core.wmem_max")
+
+  /** Sets don't-fragment for IPv4 (and IPv4-mapped) sends, and for IPv6 on an IPv6 socket. PROBE rather than DO: the
+    * kernel neither fragments nor refuses a send larger than the path MTU it has cached, so quiche's probes decide.
+    */
+  private def setDontFragment(ch: Channel): Unit =
+    val options = QuicNet.IpMtuDiscover :: (
+      if ch.localAddress().asInstanceOf[InetSocketAddress].getAddress.isInstanceOf[java.net.Inet6Address] then
+        List(QuicNet.Ipv6MtuDiscover)
+      else Nil)
+    options.foreach: opt =>
+      val set =
+        try ch.config().setOption(opt, Integer.valueOf(QuicNet.PmtuDiscProbe))
+        catch case e: Exception => false
+      if !set then
+        logger.error(s"QUIC could not set ${opt.name()} on its UDP socket: path MTU probes larger than the path " +
+          "will be fragmented rather than lost")
+
+  /** The value of each don't-fragment option on each bound UDP socket, None where the socket refuses it */
+  private[quic] def dontFragmentForTests: List[List[Option[Int]]] =
+    boundChannels.toArray(new Array[Channel](0)).toList.map: ch =>
+      List(QuicNet.IpMtuDiscover, QuicNet.Ipv6MtuDiscover).map: opt =>
+        try Option(ch.config().getOption(opt)).map(_.intValue)
+        catch case _: Exception => None
+
+  /** Whether each bound UDP socket has GRO on */
+  private[quic] def groForTests: List[Boolean] =
+    boundChannels.toArray(new Array[Channel](0)).toList.map: ch =>
+      useEpoll && ch.config().getOption(EpollChannelOption.UDP_GRO).booleanValue
 
   private def socketBufferSizes(ch: Channel): (Int, Int) =
     (ch.config().getOption(ChannelOption.SO_RCVBUF).intValue, ch.config().getOption(ChannelOption.SO_SNDBUF).intValue)
@@ -409,7 +467,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
     ohost.foreach((_, port) => probeDataPort(port))
     val clientSsl = QuicTls.clientContext(tls)
     val clients = loops.map: loop =>
-      val codec = config.applyTo(new QuicClientCodecBuilder(), idleTimeout).sslContext(clientSsl).build()
+      val codec = config.applyTo(new QuicClientCodecBuilder(), idleTimeout, discoverPmtu).sslContext(clientSsl).build()
       bind(loop, codec, new InetSocketAddress(0), reusePort = false)
     val servers = ohost match
       case None => Array.empty[Channel]
@@ -922,11 +980,12 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private def connect(entry: QuicHostEntry, conn: QuicConnection, parent: Channel, address: InetSocketAddress): Unit =
     val handler = new ConnectionHandler(conn, inbound = false)
     try
-      val f = QuicChannel.newBootstrap(parent)
+      val bootstrap = QuicChannel.newBootstrap(parent)
         .handler(handler)
         .streamHandler(inboundStreamInitializer)
         .remoteAddress(address)
-        .connect()
+      gsoAllocator.foreach(a => bootstrap.option(QuicChannelOption.SEGMENTED_DATAGRAM_PACKET_ALLOCATOR, a))
+      val f = bootstrap.connect()
       val onTimeout: Runnable = () =>
         if !f.isDone then
           if handler.channel != null then

@@ -34,6 +34,12 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   *                              Linux) overflows under bursts of large messages, and every packet it drops is lost
   *                              data or a QUIC retransmission that slows the whole connection. Linux grants at most
   *                              `net.core.rmem_max` / `net.core.wmem_max`, and a smaller grant is logged
+  * @param udpOffload            with epoll, hand the kernel runs of packets to send as one buffer it splits (UDP GSO)
+  *                              and take received packets in batches it merges (UDP GRO, read with `recvmmsg`). Moving
+  *                              packets one system call at a time took nearly half of a busy connection's loop thread
+  * @param maxUdpPayloadBytes    largest UDP payload sent, found by path MTU discovery (epoll only, with don't-fragment
+  *                              set, so a probe larger than the path is lost rather than fragmented). Packets start at
+  *                              QUIC's 1200. The default fits a 1500-byte Ethernet MTU over IPv6
   * @param idleTimeout           QUIC max idle timeout. None means `heartbeatPeriod * 3`, resolved by the plugin
   * @param gossip                scalecube timings for host membership, and gossip relaying to clients
   * @param peerQueryDelay        how long dials to a host reported online must have been failing before its peers are
@@ -49,6 +55,9 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   */
 object QuicConfig:
   private val MiB = 1024L * 1024
+
+  /** The most UDP payload one GSO send may carry, below the 64 KiB IP limit with room for IPv6 and UDP headers */
+  val MaxGsoBytes: Int = 65000
 
   /** A quarter of the heap, and at least 256 MiB */
   def defaultSendBudget(maxHeapBytes: Long): Long = math.max(256 * MiB, maxHeapBytes / 4)
@@ -67,6 +76,8 @@ final case class QuicConfig(
   handshakeTimeout: Duration = Duration(5, SECONDS),
   datagramQueueLength: Int = 16,
   udpSocketBufferBytes: Int = 16 * 1024 * 1024,
+  udpOffload: Boolean = true,
+  maxUdpPayloadBytes: Int = 1452,
   initialMaxData: Long = 64L * 1024 * 1024,
   initialMaxStreamDataUnidirectional: Long = 16L * 1024 * 1024,
   initialMaxStreamsUnidirectional: Long = 64,
@@ -78,8 +89,19 @@ final case class QuicConfig(
   wrongHostReplyInterval: Duration = Duration(1, SECONDS),
   knownWrongRetryAfter: Duration = Duration(10, MINUTES)):
 
-  /** Applies the transport settings shared by the server and client codecs so both are configured identically */
-  def applyTo[B <: QuicCodecBuilder[B]](b: B, idle: Duration): B =
+  require(maxUdpPayloadBytes >= 1200 && maxUdpPayloadBytes <= QuicConfig.MaxGsoBytes,
+    s"maxUdpPayloadBytes must be from 1200 to ${QuicConfig.MaxGsoBytes}: $maxUdpPayloadBytes")
+
+  /** Packets per GSO send: the kernel takes at most 64 segments and 64 KiB in one */
+  def gsoSegments: Int = math.min(64, QuicConfig.MaxGsoBytes / maxUdpPayloadBytes)
+
+  /** Applies the transport settings shared by the server and client codecs so both are configured identically.
+    * `discoverPmtu` only where don't-fragment is set on the sockets: without it a large probe is fragmented, gets
+    * through, and every packet after it is fragmented too.
+    */
+  def applyTo[B <: QuicCodecBuilder[B]](b: B, idle: Duration, discoverPmtu: Boolean = false): B =
+    if discoverPmtu then
+      b.maxSendUdpPayloadSize(maxUdpPayloadBytes).discoverPmtu(true)
     b.maxIdleTimeout(idle.toMillis, TimeUnit.MILLISECONDS)
       .initialMaxData(initialMaxData)
       .initialMaxStreamDataUnidirectional(initialMaxStreamDataUnidirectional)

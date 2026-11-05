@@ -14,6 +14,12 @@ import scribe.Logging
 import scala.concurrent.duration._
 
 
+object Tx {
+  /** How long a transaction may go unapplied before its store logs it */
+  val StuckReportAfter: FiniteDuration = FiniteDuration(2, SECONDS)
+  val StuckReportEvery: FiniteDuration = FiniteDuration(5, SECONDS)
+}
+
 class Tx( trs: TransactionRecoveryState,
           val txd: TransactionDescription,
           private val frontend: Frontend,
@@ -101,6 +107,36 @@ class Tx( trs: TransactionRecoveryState,
   def lastEventTime: Long = lastEvent
 
   def durationSinceLastEvent: Duration = Duration(System.nanoTime() - lastEvent, NANOSECONDS)
+
+  private def stateSummary(now: Long): String =
+    val age = Duration(now - startNanos, NANOSECONDS).toMillis
+    val idle = Duration(now - lastEvent, NANOSECONDS).toMillis
+    val revisions = objects.valuesIterator.map(os => s"${os.objectId.uuid}=${os.metadata.revision.lastUpdateTxUUID}")
+      .mkString(",")
+    s"Age: ${age}ms. Idle: ${idle}ms. Vote: $disposition. Resolution: $oresolution. Finalized: $ofinalized. " +
+      s"Locked: $locked. CommitHeld: $commitHeld. Committing: $committing. Committed: $committed. " +
+      s"PendingLoads: $pendingObjectLoads. PendingCommits: $pendingObjectCommits. ClientPrepared: $clientPrepared. " +
+      s"Recovered: $recovered. Last proposer: $lastProposer. Object revisions: $revisions"
+
+  private var lastStuckReport: Option[Long] = None
+
+  /** Logs a transaction whose store has not applied it long after it started: it holds its locks, has a held commit,
+    * or is waiting on the backend. Repeats every `Tx.StuckReportEvery`. Returns whether it logged.
+    */
+  def reportIfStuck(now: Long = System.nanoTime()): Boolean =
+    val stuck = locked || commitHeld || (committing && !committed)
+    val due = stuck && now - startNanos >= Tx.StuckReportAfter.toNanos &&
+      lastStuckReport.forall(last => now - last >= Tx.StuckReportEvery.toNanos)
+    if due then
+      lastStuckReport = Some(now)
+      logger.warn(s"Stuck Tx $transactionId on store $storeId. ${stateSummary(now)}")
+    due
+
+  /** Logs the outcome reaching a store that held the transaction's locks for a long time, naming who told it */
+  private def reportLateOutcome(message: String, from: StoreId): Unit =
+    val now = System.nanoTime()
+    if locked && oresolution.isEmpty && now - startNanos >= Tx.StuckReportAfter.toNanos then
+      logger.warn(s"Late $message from $from for Tx $transactionId on store $storeId. ${stateSummary(now)}")
 
   /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
     * on conflicting transactions in the meantime. Locks have no purpose once the outcome is known, including the
@@ -244,8 +280,9 @@ class Tx( trs: TransactionRecoveryState,
     }
 
     result.skippedReasons.foreach { (objectId, reason) =>
+      val current = objects.get(objectId).map(_.metadata.revision.lastUpdateTxUUID)
       logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
-        s"Vote: $disposition. Client prepare seen: $clientPrepared")
+        s"Vote: $disposition. Client prepare seen: $clientPrepared. Revision on store: $current")
     }
 
     val uncommittable = result.uncommittable
@@ -399,11 +436,13 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   def receiveResolved(m: TxResolved): Unit = {
+    reportLateOutcome("TxResolved", m.from)
     updateLastEvent()
     resolved(m.committed)
   }
 
   def receiveFinalized(m: TxFinalized): Unit = if (ofinalized.isEmpty) {
+    reportLateOutcome("TxFinalized", m.from)
     updateLastEvent()
     resolved(m.committed)
     ofinalized = Some(m.committed)

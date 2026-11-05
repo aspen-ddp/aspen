@@ -330,4 +330,18 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     out.toString shouldBe ""
     Future.successful(succeed)
   }
+
+  test("a lock summary reports every lock's count but only a few of their ids") {
+    val few = Set.fill(BaseReadDriver.MaxLocksReported)(TransactionId(UUID.randomUUID()))
+    val many = Set.fill(5000)(TransactionId(UUID.randomUUID()))
+
+    BaseReadDriver.lockSummary(Set()) shouldBe "0[]"
+    few.foreach(id => BaseReadDriver.lockSummary(few) should include(id.uuid.toString))
+
+    val summary = BaseReadDriver.lockSummary(many)
+    summary should startWith("5000[")
+    summary should endWith(",...]")
+    summary.length should be < 200
+    Future.successful(succeed)
+  }
 }

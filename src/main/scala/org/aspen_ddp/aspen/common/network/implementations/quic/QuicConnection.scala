@@ -15,7 +15,7 @@ import scala.util.control.NonFatal
 /** The send side of one QUIC connection: a lock-free handoff from caller threads to the connection's event loop,
   * a bounded pre-handshake queue, datagram writes, and a round-robin pool of unidirectional streams.
   *
-  * Nothing is ever queued to avoid a drop. A message is dropped (released, counted in `drops`, logged at debug
+  * Nothing is ever queued to avoid a drop. A message is dropped (released, counted in `drops`, logged as a warning
   * with rate limiting) when the connection's send budget (see `QuicConfig`, shared with the other connections
   * through `sendBudget`) or the pre-handshake bound is exceeded, when no stream is writable, when the peer cannot
   * take the datagram, when its write fails, or when the connection closes before it is written. During a burst of
@@ -225,7 +225,7 @@ final class QuicConnection(val loop: EventLoop,
     val last = lastDropLog.get()
     if now - last >= DropLogIntervalNanos && lastDropLog.compareAndSet(last, now) then
       val n = dropsSinceLog.getAndSet(0)
-      logger.debug(s"QUIC connection ${remoteName}: dropped $n message(s) since last report (latest: $reason)")
+      logger.warn(s"QUIC connection ${remoteName}: dropped $n message(s) since last report (latest: $reason)")
 
   private def remoteName: String =
     val ch = channel

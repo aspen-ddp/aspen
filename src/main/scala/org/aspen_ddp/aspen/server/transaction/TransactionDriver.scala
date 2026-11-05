@@ -11,7 +11,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger
 import scribe.Logging
 
-import scala.concurrent.duration.{Duration, SECONDS}
+import scala.concurrent.duration.{Duration, NANOSECONDS, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.boundary, boundary.break
 
@@ -147,10 +147,42 @@ abstract class TransactionDriver(
 
   def shutdown(): Unit = {}
 
+  private val startNanos: Long = System.nanoTime()
+  private var lastStuckReport: Option[Long] = None
+
+  /** Logs a driver that has not finalized long after it started, with the stores it has yet to hear from. Repeats
+    * every `Tx.StuckReportEvery`. Returns whether it logged.
+    */
+  def reportIfStuck(now: Long = System.nanoTime()): Boolean = synchronized {
+    val due = !finalized && now - startNanos >= Tx.StuckReportAfter.toNanos &&
+      lastStuckReport.forall(last => now - last >= Tx.StuckReportEvery.toNanos)
+    if (due) {
+      lastStuckReport = Some(now)
+      val unresolvedStores = allDataStores.filterNot(knownResolved.contains).map(_.poolIndex).mkString(",")
+      val votes = peerDispositions.values.groupBy(identity).map((d, l) => s"$d=${l.size}").mkString(",")
+      logger.warn(s"Stuck driver of Tx ${txd.transactionId} on store $storeId. " +
+        s"Age: ${Duration(now - startNanos, NANOSECONDS).toMillis}ms. Resolved: $resolved. Value: $resolvedValue. " +
+        s"Votes: $votes. Accepted: ${acceptedPeers.size}. Stores not known resolved: $unresolvedStores. " +
+        s"Finalizer: ${finalizer.map(_.debugStatus)}")
+    }
+    due
+  }
+
+  /** Records messages for the next sendMessages. Nothing else sends what this replaces, so it must not be unsent */
+  private def queueTxMessages(messages: List[TxMessage]): Unit = {
+    txMessages.foreach { unsent =>
+      logger.warn(s"Tx ${txd.transactionId} on store $storeId: ${unsent.size} unsent " +
+        s"${unsent.headOption.map(_.getClass.getSimpleName)} replaced by " +
+        s"${messages.headOption.map(_.getClass.getSimpleName)}")
+    }
+    txMessages = Some(messages)
+  }
+
   /** A driver's first tick sends no TxHeartbeat, so transactions that finish within a heartbeat period send none. The
     * stores' silence is then at most two periods, well inside `Host.txHeartbeatTimeout`.
     */
   def heartbeat(): Unit = {
+    reportIfStuck()
     if (finalized)
       messenger.sendTransactionMessages(allDataStores.map(toStoreId => TxFinalized(toStoreId, storeId, txd.transactionId, resolvedValue)))
     else if (heartbeatDue)
@@ -354,7 +386,7 @@ abstract class TransactionDriver(
 
         logger.trace(s"Sending TxFinalized(${txd.transactionId}) to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")
 
-        txMessages = Some(messages)
+        queueTxMessages(messages)
 
         shutdown() // release retry resources
 
@@ -463,7 +495,7 @@ abstract class TransactionDriver(
 
         //logger.trace(s"Sending TxResolved(${txd.transactionId}) committed = $committed to ${messages.head.to.poolId}:(${messages.map(_.to.poolIndex)})")
 
-        txMessages = Some(messages)
+        queueTxMessages(messages)
 
         clientResolved = txd.originatingClient.map { clientId =>
           logger.trace(s"Sending TxResolved(${txd.transactionId}) committed = $committed to originating client $clientId")

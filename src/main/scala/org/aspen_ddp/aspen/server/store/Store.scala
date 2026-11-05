@@ -46,6 +46,7 @@ class Store(val storageDeviceId: StorageDeviceId,
       td.heartbeat()
     }
     frontend.transactions.values.foreach { tx =>
+      tx.reportIfStuck()
       if (tx.durationSinceLastEvent > txHeartbeatTimeout && !transactionDrivers.contains(tx.transactionId))
         driveTransaction(tx.txd)
     }

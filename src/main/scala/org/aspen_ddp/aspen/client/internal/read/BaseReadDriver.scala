@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.common.transaction.TransactionId
 import scribe.{Level, Logging}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
@@ -43,6 +44,29 @@ abstract class BaseReadDriver(
   }
 
   protected var retryCount = 0
+
+  private val startNanos = System.nanoTime()
+  private var lastResponses: Map[StoreId, Either[ReadError.Value, ReadResponse.CurrentState]] = Map()
+  private var committedLockRereads = 0
+  private var committedLockStoresReported: Set[StoreId] = Set()
+
+  private def elapsedMillis: Long = (System.nanoTime() - startNanos) / 1000000
+
+  /** The last reply of each store: revision, timestamp and write locks, or the error */
+  private def responseSummary: String =
+    lastResponses.toList.sortBy(_._1.poolIndex).map {
+      case (store, Left(err)) => s"${store.poolIndex}: $err"
+      case (store, Right(cs)) =>
+        s"${store.poolIndex}: ${cs.revision.lastUpdateTxUUID}@${cs.timestamp} " +
+          s"locks=${BaseReadDriver.lockSummary(cs.lockedWriteTransactions)}"
+    }.mkString("; ")
+
+  /** A slow read: every store's last reply shows what the result was chosen from */
+  private def reportIfSlow(outcome: String): Unit =
+    if elapsedMillis >= BaseReadDriver.SlowReadMillis then
+      logger.warn(s"Read UUID $readUUID of object ${objectPointer.id} took ${elapsedMillis}ms and $outcome. " +
+        s"Retries: $retryCount. Re-reads for locks of committed transactions: $committedLockRereads. " +
+        s"Last replies: $responseSummary")
 
   private var rebuildsSent: Set[StoreId] = Set()
 
@@ -94,6 +118,8 @@ abstract class BaseReadDriver(
   def receiveReadResponse(response:ReadResponse): Boolean = synchronized {
     logger.trace(s"Read UUID $readUUID: Received read response from store ${response.fromStore}")
 
+    lastResponses += response.fromStore -> response.result
+
     val hasLocksForKnownCommittedTransactions = response.result match {
       case Left(_) => false
       case Right(cs) => ! cs.lockedWriteTransactions.forall { txuuid =>
@@ -116,6 +142,12 @@ abstract class BaseReadDriver(
     if (isUnknownStoreResponse || hasLocksForKnownCommittedTransactions) {
       // We know for certain that the response from this store has out-of-date information. Transactions _should_
       // resolve quickly so we'll immediately reread from the store
+      if hasLocksForKnownCommittedTransactions then
+        committedLockRereads += 1
+        if elapsedMillis >= BaseReadDriver.SlowReadMillis && !committedLockStoresReported.contains(response.fromStore) then
+          committedLockStoresReported += response.fromStore
+          logger.warn(s"Read UUID $readUUID of object ${objectPointer.id}: store ${response.fromStore} still holds a " +
+            s"lock of a committed transaction after ${elapsedMillis}ms. Replies so far: $responseSummary")
       sendReadRequest(response.fromStore)
     }
     else {
@@ -143,6 +175,7 @@ abstract class BaseReadDriver(
           result match {
             case Left(err) =>
               logger.info(s"Read UUID $readUUID: Failed to read object ${objectPointer.id}. Reason: $err")
+              reportIfSlow(s"failed: $err")
               promise.failure(err)
               onComplete()
 
@@ -154,6 +187,7 @@ abstract class BaseReadDriver(
                 case kvos: KeyValueObjectState => logger.info(s"Read UUID $readUUID: Successfully read KeyValueObject ${objectPointer.id} Rev ${kvos.revision} Ref ${kvos.refcount} Num Entries ${kvos.contents.size}")
                 case mos: MetadataObjectState => logger.info(s"Read UUID $readUUID: Successfully read MetadataObject ${objectPointer.id} Rev ${mos.revision} Ref ${mos.refcount}")
               }
+              reportIfSlow(s"returned revision ${obj.revision.lastUpdateTxUUID}")
               promise.success(obj)
               onComplete()
           }
@@ -189,6 +223,19 @@ abstract class BaseReadDriver(
 }
 
 object BaseReadDriver:
+
+  /** Reads slower than this are logged with every store's last reply */
+  val SlowReadMillis: Long = 2000
+
+  /** An object under load can hold thousands of locks, and every client thread waits while a line is written */
+  val MaxLocksReported: Int = 3
+
+  private[read] def lockSummary(locks: Set[TransactionId]): String =
+    val shown = locks.iterator.take(MaxLocksReported).map(_.uuid).mkString(",")
+    if locks.size > MaxLocksReported then
+      s"${locks.size}[$shown,...]"
+    else
+      s"${locks.size}[$shown]"
 
   def noErrorRecoveryReadDriver(
                                  client: ReadDriverClient,

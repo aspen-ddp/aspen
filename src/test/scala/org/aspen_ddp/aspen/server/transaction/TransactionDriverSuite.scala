@@ -104,6 +104,19 @@ class TransactionDriverSuite extends AnyFunSuite with Matchers {
     assert(messenger.messages.forall(_.isInstanceOf[org.aspen_ddp.aspen.common.network.TxHeartbeat]))
   }
 
+  test("A driver that has not finalized is reported as stuck, at intervals") {
+    val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
+    val driver = new TTD(ds0, new TMessenger(), mkprep(1, 0, 0, txd), new TFinalizer(), _ => ())
+    val start = System.nanoTime()
+
+    assert(!driver.reportIfStuck(start))
+
+    val late = start + Tx.StuckReportAfter.toNanos + 1000000000L
+    assert(driver.reportIfStuck(late))
+    assert(!driver.reportIfStuck(late + 1))
+    assert(driver.reportIfStuck(late + Tx.StuckReportEvery.toNanos))
+  }
+
   test("Simple PrepareResponse Handling") {
     val txd = mktxd(simpleObj, DataUpdate(simpleObj, rev, DataUpdateOperation.Overwrite) :: Nil)
     val prep = mkprep(1, 0, 0, txd)

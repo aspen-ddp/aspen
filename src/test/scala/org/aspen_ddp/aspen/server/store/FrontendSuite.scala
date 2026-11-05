@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryStat
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
-import org.aspen_ddp.aspen.server.transaction.TransactionStatusCache
+import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -597,6 +597,23 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val r2 = prepare(frontend, net, lockTxd(txid2, List(overwrite(op1))))
     r2.disposition shouldBe TransactionDisposition.VoteAbort
     r2.collisions shouldBe List(txid1)
+  }
+
+  test("a transaction holding locks is reported as stuck, at intervals, until it is applied") {
+    val (frontend, _, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+    val tx = frontend.transactions(txid1)
+    val start = System.nanoTime()
+
+    tx.reportIfStuck(start) shouldBe false
+
+    val late = start + Tx.StuckReportAfter.toNanos + 1000000000L
+    tx.reportIfStuck(late) shouldBe true
+    tx.reportIfStuck(late + 1) shouldBe false
+    tx.reportIfStuck(late + Tx.StuckReportEvery.toNanos) shouldBe true
+
+    resolve(frontend, net, txid1, committed = true)
+    tx.reportIfStuck(late + 2 * Tx.StuckReportEvery.toNanos) shouldBe false
   }
 
   test("locks are released when the first transaction resolves aborted") {

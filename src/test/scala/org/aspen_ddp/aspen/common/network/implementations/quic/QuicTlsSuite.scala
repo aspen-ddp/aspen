@@ -114,10 +114,8 @@ class QuicTlsSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with
     srv.awaitHandshake() shouldBe QuicTestPeer.HandshakeOutcome.Succeeded
 
     val small = HostHeartbeat(HostId(UUID.randomUUID()))
-    QuicTestPeer.sendDatagram(ch, small)
-    val d = srv.awaitReceived()
-    d.message shouldBe small
-    d.transport shouldBe QuicTestPeer.Transport.Datagram
+    QuicTestPeer.sendStream(ch, small)
+    srv.awaitReceived().message shouldBe small
 
     val payload = Array.tabulate[Byte](64 * 1024)(i => (i * 31).toByte)
     val big = QuicNetFixture.rebuildOf(StoreId(PoolId.BootstrapPoolId, 0), payload)
@@ -179,7 +177,7 @@ class QuicTlsSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll with
     srv.awaitHandshake() shouldBe QuicTestPeer.HandshakeOutcome.Succeeded
     val msgs = chans.map: ch =>
       val m = HostHeartbeat(HostId(UUID.randomUUID()))
-      QuicTestPeer.sendDatagram(ch, m)
+      QuicTestPeer.sendStream(ch, m)
       m
     Set(srv.awaitReceived().message, srv.awaitReceived().message) shouldBe msgs.toSet
 

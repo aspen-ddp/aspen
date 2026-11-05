@@ -240,7 +240,6 @@ class QuicNetRoutingSuite extends AnyFunSuite with Matchers with BeforeAndAfterA
     fx.a.net.outboundConnectionCount shouldBe 1
 
   test("many threads sending concurrently lose nothing under budget"):
-    // Stream-sized only: datagrams are unreliable by design, so "nothing lost" cannot be asserted for them
     val nThreads = 8
     val perThread = 200
     val start = new CountDownLatch(1)

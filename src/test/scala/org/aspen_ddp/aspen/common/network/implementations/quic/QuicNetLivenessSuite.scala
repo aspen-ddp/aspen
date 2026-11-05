@@ -400,12 +400,12 @@ class QuicNetLivenessSuite extends AnyFunSuite with Matchers with BeforeAndAfter
     c.net.clientMessenger.sendClientRequest(req)
     await(fx.a.handler.clientRequests, 1)
     val totalBefore = fx.a.handler.total
-    val undecodableBefore = fx.a.net.undecodableDatagrams
+    val unexpectedBefore = fx.a.net.unexpectedDatagrams
     // Quiet for several keepalive intervals (idleTimeout / 2 = 300ms)
     eventually("A receives keepalives from the quiet client", LoadProbe.scaleMillis(3000)):
       fx.a.net.keepalivesReceived >= 3
     fx.a.handler.total shouldBe totalBefore
-    fx.a.net.undecodableDatagrams shouldBe undecodableBefore
+    fx.a.net.unexpectedDatagrams shouldBe unexpectedBefore
     c.net.connectionCount shouldBe 1
 
   test("no buffer leaks were reported"):

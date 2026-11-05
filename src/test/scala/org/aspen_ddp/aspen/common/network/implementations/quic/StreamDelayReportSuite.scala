@@ -8,7 +8,7 @@ class StreamDelayReportSuite extends AnyFunSuite with Matchers:
   private val mib = 1024L * 1024
 
   private def report() =
-    val r = new StreamDelayReport(2, 1000 * ms, 500 * ms)
+    val r = new StreamDelayReport(Vector("stream 0", "small-message stream"), 1000 * ms, 500 * ms)
     r.completed(0, 0, System.nanoTime() + 2000 * ms) // Starts a period at about `now`, with nothing to report
     r
 
@@ -30,7 +30,7 @@ class StreamDelayReportSuite extends AnyFunSuite with Matchers:
 
     val text = r.completed(1, 4 * ms, now + 3000 * ms).get
     text should include("stream 0: 1200ms, 40 MiB queued, 2 writes")
-    text should include("stream 1: 4ms, 1 MiB queued, 1 writes")
+    text should include("small-message stream: 4ms, 1 MiB queued, 1 writes")
   }
 
   test("the next period starts empty") {

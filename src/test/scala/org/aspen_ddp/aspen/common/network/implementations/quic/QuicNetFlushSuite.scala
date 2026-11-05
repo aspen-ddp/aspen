@@ -56,7 +56,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
 
   private def read(to: StoreId, from: ClientId): Read = Read(to, from, UUID.randomUUID(), ptr, FullObject())
 
-  /** Stream-sized */
+  /** Larger than a small message */
   private def rebuildData(to: StoreId): OpportunisticRebuild = rebuild(to, 4096)
 
   private def checkDevice(to: HostId, from: ClientId): CheckStorageDevice =
@@ -66,20 +66,6 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
 
   private def callable[T](body: => T): Callable[T] = new Callable[T]:
     def call(): T = body
-
-  /** Takes the first delivery from `q`, calling `resend` whenever one second goes by without it. Datagrams are
-    * unreliable, and under load the first one on a new connection is occasionally lost. `resend` must send the same
-    * message again.
-    */
-  private def awaitOrResend[M](q: java.util.concurrent.LinkedBlockingQueue[Delivery[M]])(resend: => Unit): Delivery[M] =
-    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AwaitMillis)
-    var d: Delivery[M] = null
-    while d == null do
-      if System.nanoTime() - deadline > 0 then
-        throw new AssertionError(s"no message received within ${AwaitMillis}ms")
-      d = q.poll(LoadProbe.scaleMillis(1000), TimeUnit.MILLISECONDS)
-      if d == null then resend
-    d
 
   private def flushOnThread(net: QuicNet, timeout: Duration): CompletableFuture[Boolean] =
     val f = new CompletableFuture[Boolean]()
@@ -95,12 +81,6 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
 
   test("flush returns true after previously sent messages are accepted"):
     val c = fx.client()
-    // The counts below need every datagram delivered, and the first one on a new connection is occasionally lost under
-    // load. Stream-sized messages are reliable, so connect to both hosts with those first.
-    c.net.clientMessenger.sendClientRequest(rebuildData(fx.storesA.head))
-    c.net.clientMessenger.sendClientRequest(rebuildData(fx.storesB.head))
-    await(fx.a.handler.clientRequests, 1)
-    await(fx.b.handler.clientRequests, 1)
     (0 until 25).foreach: i =>
       val store = if i % 2 == 0 then fx.storesA(i % 2) else fx.storesB(i % 2)
       c.net.clientMessenger.sendClientRequest(read(store, c.net.clientId))
@@ -119,7 +99,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val req = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)
     c.net.awaitPendingMessagesSent(LoadProbe.scale(Duration(5, SECONDS))) shouldBe true
-    awaitOrResend(fx.a.handler.clientRequests)(c.net.clientMessenger.sendClientRequest(req)).message shouldBe req
+    await(fx.a.handler.clientRequests, 1).head.message shouldBe req
 
   test("flush covers messages parked on a metadata lookup"):
     val c = fx.client()
@@ -146,7 +126,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     lookups.lookupPromise(hostId).success(HostState(hostId, "flush_host", "127.0.0.1", port, 0, 0, Set()))
 
     flushed.get(LoadProbe.scaleMillis(5000), TimeUnit.MILLISECONDS) shouldBe true
-    awaitOrResend(target.handler.clientRequests)(c.net.clientMessenger.sendClientRequest(req)).message shouldBe req
+    await(target.handler.clientRequests, 1).head.message shouldBe req
 
   test("flush returns false for unreachable host"):
     val c = fx.client()
@@ -215,14 +195,14 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val c = fx.client()
     val req = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(req)
-    awaitOrResend(fx.a.handler.clientRequests)(c.net.clientMessenger.sendClientRequest(req)).message shouldBe req
+    await(fx.a.handler.clientRequests, 1).head.message shouldBe req
 
   test("flush does not wait for messages sent after it was called"):
     val c = fx.client()
     // Connect first, so the sender's messages are written rather than held for the handshake
     val first = read(fx.storesB.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(first)
-    awaitOrResend(fx.b.handler.clientRequests)(c.net.clientMessenger.sendClientRequest(first))
+    await(fx.b.handler.clientRequests, 1).head
 
     val running = new AtomicBoolean(true)
     val sent = new AtomicLong(0)
@@ -246,7 +226,6 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
   test("send, flush, shutdown delivers"):
     (0 until 20).foreach: i =>
       val c = fx.client(cfg = QuicConfig(eventLoopThreads = 1))
-      // Stream-sized: a datagram can be lost, and this test is about what shutdown does to accepted messages
       val m = rebuildData(fx.storesA.head)
       c.net.clientMessenger.sendClientRequest(m)
       withClue(s"iteration $i: "):
@@ -261,7 +240,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val c = fx.client()
     val first = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(first)
-    awaitOrResend(fx.a.handler.clientRequests)(c.net.clientMessenger.sendClientRequest(first))
+    await(fx.a.handler.clientRequests, 1).head
     c.net.shutdown(Duration.Zero)
 
     noException should be thrownBy:
@@ -281,7 +260,7 @@ class QuicNetFlushSuite extends AnyFunSuite with Matchers with BeforeAndAfterAll
     val c = fx.client()
     val first = read(fx.storesA.head, c.net.clientId)
     c.net.clientMessenger.sendClientRequest(first)
-    awaitOrResend(fx.a.handler.clientRequests)(c.net.clientMessenger.sendClientRequest(first))
+    await(fx.a.handler.clientRequests, 1).head
     // Other suites may run QuicNets in this JVM at the same time, so this net's own loop threads are checked
     val threads = c.net.eventLoopsForTests.map(l => l.submit(callable(Thread.currentThread())).get(5, TimeUnit.SECONDS))
     threads should not be empty

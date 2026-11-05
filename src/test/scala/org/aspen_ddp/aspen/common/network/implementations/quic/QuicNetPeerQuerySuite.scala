@@ -197,17 +197,17 @@ class QuicNetPeerQuerySuite extends AnyFunSuite with Matchers with BeforeAndAfte
     // The message can reach C through a relay before the answer to the client's own query is applied
     eventually("the client's entry for C is repaired", WaitMillis)(cl.net.metadataManager.hostTimestamp(hostIdC) == Some(ts(2)))
 
-  test("queries go out as datagrams"):
+  test("queries and answers are small messages"):
     val alloc = PooledByteBufAllocator.DEFAULT
     val target = HostId(UUID.randomUUID())
     val query = QuicMessageCodec.encode(HostEndpointQuery(target), alloc, toHost = Some(HostId(UUID.randomUUID())))
-    try query.isDatagram shouldBe true
+    try query.isSmall shouldBe true
     finally query.release()
 
     // The largest answer: a maximal DNS name
     val answer = QuicMessageCodec.encode(HostEndpointAnswer(target, Some(HostEndpointChanged(target, "a" * 253,
       65535, 65535, 65535, HLCTimestamp.now))), alloc, toHost = Some(HostId(UUID.randomUUID())))
-    try answer.isDatagram shouldBe true
+    try answer.isSmall shouldBe true
     finally answer.release()
 
   test("an unsolicited answer, or one arriving over an inbound connection, is ignored"):

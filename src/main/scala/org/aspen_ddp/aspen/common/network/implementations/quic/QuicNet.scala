@@ -132,7 +132,7 @@ object QuicNet:
   *
   * Peer endpoint query: a host entry can be stale (the host moved while we were not listening, or a cached address is
   * out of date). When dials to a host's current entry have been failing for `config.peerQueryDelay` and the host is
-  * reported online (by membership, or by our relays in client mode), a small `HostEndpointQuery` datagram goes to
+  * reported online (by membership, or by our relays in client mode), a small `HostEndpointQuery` goes to
   * `config.peerQueryFanout` peers, repeating every `config.peerQueryInterval` until a dial succeeds or the entry is
   * replaced. A peer answers from its `MetadataManager` alone; an answer newer than our entry is applied exactly as
   * `HostEndpointChanged` gossip is. The failure clock is per HostId, starts when a dial to the host's current entry
@@ -282,7 +282,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   private val shutdownStarted = new AtomicBoolean(false)
 
   private val keepaliveCount = new AtomicLong(0)
-  private val undecodableCount = new AtomicLong(0)
+  private val unexpectedDatagramCount = new AtomicLong(0)
 
   /** Scalecube host membership; None in client mode. Started at the end of construction, after its listener is
     * registered (listeners added later get no replay of hosts already online). Its traffic goes out through
@@ -307,7 +307,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         m => dispatch(conn, m),
         reason => logger.warn(s"QUIC stream protocol error from ${remoteOf(ch.parent())}: $reason")))
 
-  /** Per-connection handler on the `QuicChannel` pipeline: datagram receive, and attach for inbound connections */
+  /** Per-connection handler on the `QuicChannel` pipeline: keepalive receive, and attach for inbound connections */
   private final class ConnectionHandler(conn: QuicConnection, inbound: Boolean) extends ChannelInboundHandlerAdapter:
     /** The dialed channel, so a handshake timeout can close it. Loop-owned. */
     var channel: Channel = null
@@ -328,14 +328,11 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
           buf.release()
           keepaliveCount.incrementAndGet()
         case buf: ByteBuf =>
-          val decoded =
-            try QuicMessageCodec.decodeDatagram(buf)
-            finally buf.release()
-          decoded match
-            case Right(m) => dispatch(conn, m)
-            case Left(err) =>
-              undecodableCount.incrementAndGet()
-              logger.warn(s"Undecodable QUIC datagram from ${remoteOf(ctx.channel())}: $err")
+          // Messages always go on streams
+          val size = buf.readableBytes()
+          buf.release()
+          unexpectedDatagramCount.incrementAndGet()
+          logger.warn(s"Discarding an unexpected QUIC datagram of $size bytes from ${remoteOf(ctx.channel())}")
         case other => ctx.fireChannelRead(other)
 
     override def exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable): Unit =
@@ -562,7 +559,7 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
 
   def joinIoThread(): Unit = group.terminationFuture().awaitUninterruptibly()
 
-  /** Blocks the caller until every message submitted before the call has been accepted by QUIC (its datagram or
+  /** Blocks the caller until every message submitted before the call has been accepted by QUIC (its
     * stream write future has completed) or dropped, or until `timeout`. Returns true only if that happened in time.
     *
     * Runs against one deadline:
@@ -694,8 +691,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
   /** Keepalive datagrams received and discarded */
   private[quic] def keepalivesReceived: Long = keepaliveCount.get()
 
-  /** Datagrams that failed to decode */
-  private[quic] def undecodableDatagrams: Long = undecodableCount.get()
+  /** Datagrams received that were not keepalives */
+  private[quic] def unexpectedDatagrams: Long = unexpectedDatagramCount.get()
 
   /** Client mode: our current relay hosts. Blocks until `loops(0)` answers. */
   private[quic] def relaysForTests: Set[HostId] = loops(0).submit(() => relays).get()
@@ -1197,9 +1194,8 @@ class QuicNet(initialBootstrapConfig: BootstrapConfig.Config,
         else
           forward(s.conn, msg)
 
-  /** On a stream, whatever its size: a lost datagram would leave the client unaware until the next retransmit */
   private def forward(conn: QuicConnection, msg: Message): Unit =
-    try conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT, streamOnly = true))
+    try conn.submit(QuicMessageCodec.encode(msg, PooledByteBufAllocator.DEFAULT))
     catch case NonFatal(e) => logger.warn(s"QUIC forward of ${msg.getClass.getSimpleName} to a client failed: $e")
 
   /** Host mode, on `conn`'s loop. Starts or renews `m.fromClient`'s lease. A subscription that is new, or renewed

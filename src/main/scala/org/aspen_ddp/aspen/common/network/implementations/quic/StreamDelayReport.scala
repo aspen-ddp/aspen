@@ -6,10 +6,12 @@ import java.util.concurrent.TimeUnit
   * if any wait was long. A message queued behind a backlog on its stream is delayed however small it is, which other
   * streams' messages are not. Used by one thread.
   *
+  * @param names         what to call each stream in a summary, by index
   * @param periodNanos   the least time between summaries
   * @param reportAtNanos the longest wait that goes unreported
   */
-final class StreamDelayReport(nStreams: Int, periodNanos: Long, reportAtNanos: Long):
+final class StreamDelayReport(names: IndexedSeq[String], periodNanos: Long, reportAtNanos: Long):
+  private val nStreams = names.size
   private val maxDelay = new Array[Long](nStreams)
   private val maxPending = new Array[Long](nStreams)
   private val writes = new Array[Long](nStreams)
@@ -31,7 +33,7 @@ final class StreamDelayReport(nStreams: Int, periodNanos: Long, reportAtNanos: L
           val ms = TimeUnit.NANOSECONDS.toMillis
           val mib = 1024 * 1024
           val streams = (0 until nStreams).map: s =>
-            s"stream $s: ${ms(maxDelay(s))}ms, ${maxPending(s) / mib} MiB queued, ${writes(s)} writes"
+            s"${names(s)}: ${ms(maxDelay(s))}ms, ${maxPending(s) / mib} MiB queued, ${writes(s)} writes"
           Some(s"longest wait for a stream write over ${ms(now - periodStart)}ms. ${streams.mkString("; ")}")
         else
           None

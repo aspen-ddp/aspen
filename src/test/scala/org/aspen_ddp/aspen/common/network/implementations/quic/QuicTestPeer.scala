@@ -24,8 +24,8 @@ import scala.concurrent.duration.{Duration, SECONDS}
   * thread daemon event loop group; `close()` shuts it down.
   *
   * Both kinds record, on every connection they own:
-  *  - `received`: each decoded `Message` with the `Transport` it arrived on. Datagrams are decoded with
-  *    `QuicMessageCodec.decodeDatagram`, inbound streams with one `StreamFrameDecoder` each.
+  *  - `received`: each decoded `Message` with the `Transport` it arrived on, decoded with one `StreamFrameDecoder`
+  *    per inbound stream. Keepalive datagrams are discarded; any other datagram is a protocol error.
   *  - `handshakes`: one `HandshakeOutcome` per connection, from Netty's `SslHandshakeCompletionEvent`.
   *  - `protocolErrors`: decode failures reported by either decoder.
   *  - `connections`: every `QuicChannel` whose handshake succeeded.
@@ -35,7 +35,7 @@ import scala.concurrent.duration.{Duration, SECONDS}
   * `config` overrides any `QuicConfig` setting; `idle` is the QUIC idle timeout used for both codecs
   * (`config.idleTimeout`, else `DefaultIdle`).
   *
-  * Sending helpers (`sendDatagram`, `sendStream`) work on any `QuicChannel`, including ones dialed by other code.
+  * Sending helpers (`sendStream`, `writeFrame`) work on any `QuicChannel`, including ones dialed by other code.
   * Use `bootstrap(remote)` to get a client `QuicChannelBootstrap` preconfigured with this peer's recording handlers,
   * which callers may override with their own `handler`/`streamHandler` before calling `connect()`.
   */
@@ -90,9 +90,8 @@ final class QuicTestPeer private (val isServer: Boolean,
       msg match
         case buf: ByteBuf =>
           try
-            QuicMessageCodec.decodeDatagram(buf) match
-              case Right(r) => received.add(Received(r.msg, Transport.Datagram, r.toHost))
-              case Left(err) => protocolErrors.add(err)
+            if !QuicConnection.isKeepalive(buf) then
+              protocolErrors.add(s"unexpected datagram of ${buf.readableBytes()} bytes")
           finally
             buf.release()
         case other => ctx.fireChannelRead(other)
@@ -168,7 +167,6 @@ object QuicTestPeer:
   val DefaultIdle: Duration = Duration(10, SECONDS)
 
   enum Transport:
-    case Datagram
     case Stream(streamId: Long)
 
   /** `toHost` is the intended destination from the message envelope, if it carried one */
@@ -213,14 +211,6 @@ object QuicTestPeer:
     def stop(): Unit = scribe.Logger.root.withoutHandler(handler).replace()
 
   def watchLeaks(): LeakWatch = new LeakWatch()
-
-  /** Encodes `msg` as one datagram (it must fit `DatagramThreshold`) and writes it to `ch` */
-  def sendDatagram(ch: QuicChannel, msg: Message, toHost: Option[HostId] = None): ChannelFuture =
-    val enc = QuicMessageCodec.encode(msg, ch.alloc(), toHost = toHost)
-    if !enc.isDatagram then
-      enc.release()
-      throw new IllegalArgumentException(s"message of ${enc.size} bytes is too large for a datagram")
-    ch.writeAndFlush(enc.toDatagram(ch.alloc()))
 
   /** Opens a new unidirectional stream on `ch`, waits for it, and writes `msg` as one stream frame */
   def sendStream(ch: QuicChannel, msg: Message): QuicStreamChannel =

@@ -21,16 +21,15 @@ import scala.concurrent.duration.{Duration, MINUTES, SECONDS}
   * @param sendBudgetBytes       host-wide send budget shared by all of a `QuicNet`'s connections
   * @param connectionFloorBytes  usage below which a connection may always queue, whatever the shared budget
   * @param connectionCeilingBytes most a connection may use: its handoff is admitted only below it, and each stream's
-  *                              high-water mark is `connectionCeilingBytes / streamsPerConnection` (each may overshoot
+  *                              high-water mark, the small-message stream's included, is
+  *                              `connectionCeilingBytes / streamsPerConnection` (each may overshoot
   *                              by one message). This queue is separate from the flow control windows
   *                              (`initialMaxData`, `initialMaxStreamDataUnidirectional`), which bound what is on its way
   *                              to the peer: what doesn't fit in them waits here until the peer reads
   * @param preHandshakeBytes     bound for messages held until a connection's handshake completes, room for the burst
   *                              that often opens a connection. It takes nothing from the shared budget, so sends to a
   *                              host that cannot be reached hold at most this, until the handshake times out
-  * @param datagramQueueLength   quiche's datagram send and receive queue lengths. Once a connection has written about
-  *                              half that many datagrams in the last ~10 ms, datagram-sized messages go on a stream
-  *                              instead: a full quiche queue drops datagrams silently
+  * @param datagramQueueLength   quiche's datagram send and receive queue lengths. Only keepalives are datagrams
   * @param udpSocketBufferBytes  receive and send buffer size requested for each UDP socket. The OS default (208 KiB on
   *                              Linux) overflows under bursts of large messages, and every packet it drops is lost
   *                              data or a QUIC retransmission that slows the whole connection. Linux grants at most
@@ -66,7 +65,7 @@ final case class QuicConfig(
   preHandshakeBytes: Long = 16L * 1024 * 1024,
   idleTimeout: Option[Duration] = None,
   handshakeTimeout: Duration = Duration(5, SECONDS),
-  datagramQueueLength: Int = 1024,
+  datagramQueueLength: Int = 16,
   udpSocketBufferBytes: Int = 16 * 1024 * 1024,
   initialMaxData: Long = 64L * 1024 * 1024,
   initialMaxStreamDataUnidirectional: Long = 16L * 1024 * 1024,

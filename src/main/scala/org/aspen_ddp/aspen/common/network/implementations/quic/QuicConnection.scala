@@ -13,19 +13,24 @@ import scala.concurrent.duration.Duration
 import scala.util.control.NonFatal
 
 /** The send side of one QUIC connection: a lock-free handoff from caller threads to the connection's event loop,
-  * a bounded pre-handshake queue, datagram writes, and a round-robin pool of unidirectional streams.
+  * a bounded pre-handshake queue, and unidirectional streams: a round-robin pool for large messages and one stream for
+  * small ones (`Encoded.isSmall`), so that a small message never waits behind large ones. A small message goes on the
+  * pool only when the small-message stream is full.
+  *
+  * Every message goes on a stream, which QUIC retransmits. Datagrams are not: a lost one waits for Aspen's own
+  * retries, seconds later, and loss is not rare even on loopback, where bursts overflow the receive buffer. Only
+  * keepalives, which carry nothing, are datagrams.
   *
   * Nothing is ever queued to avoid a drop. A message is dropped (released, counted in `drops`, logged as a warning
   * with rate limiting) when the connection's send budget (see `QuicConfig`, shared with the other connections
-  * through `sendBudget`) or the pre-handshake bound is exceeded, when no stream is writable, when the peer cannot
-  * take the datagram, when its write fails, or when the connection closes before it is written. During a burst of
-  * datagrams, datagram-sized messages are written to a stream instead, since quiche drops them once its datagram
-  * queue is full and Netty reports those writes as successful.
+  * through `sendBudget`) or the pre-handshake bound is exceeded, when no stream is writable, when its write fails, or
+  * when the connection closes before it is written.
   *
   * All methods except those marked "any thread" must run on `loop`. `loop` must be the event loop of the
   * `QuicChannel` later passed to `attach`.
   *
-  * Datagram support is learned from Netty's `QuicDatagramExtensionEvent`, which `pipelineHandler` records. On an
+  * Datagram support, needed for keepalives, is learned from Netty's `QuicDatagramExtensionEvent`, which
+  * `pipelineHandler` records. On an
   * outbound connection `attach`, called from the connect future, installs it in time: Netty completes the connect
   * promise and then fires the event in the same call. On an inbound connection the event fires before
   * `channelActive`, so the owner must add `pipelineHandler` to the `QuicChannel` pipeline at channel init.
@@ -46,7 +51,6 @@ final class QuicConnection(val loop: EventLoop,
   private val ceiling = config.connectionCeilingBytes
   private val nStreams = config.streamsPerConnection
   private val streamHighWater = math.max(1L, ceiling / nStreams).min(Int.MaxValue.toLong).toInt
-  private val datagramFallbackAt = math.max(1, config.datagramQueueLength / 2).toDouble
   private val streamWaterMark = new WriteBufferWaterMark(streamHighWater / 2, streamHighWater)
 
   // ---- Shared between threads ----------------------------------------------------------------------------------
@@ -68,19 +72,17 @@ final class QuicConnection(val loop: EventLoop,
   @volatile private var activated = false // set after onActive has returned; read by isActive
   private val preHandshake = new java.util.ArrayDeque[AnyRef]()
   private var preHandshakeBytes = 0L
-  private var maxDatagramLength = -1 // -1: the peer has not announced datagram support
-  private val slots = Array.tabulate(nStreams)(new Slot(_))
-  private val delayReport = new StreamDelayReport(nStreams, StreamDelayReport.PeriodNanos, StreamDelayReport.ReportAtNanos)
+  private var maxDatagramLength = -1 // -1: the peer has not announced datagram support, so keepalives can't be sent
+  // The large-message pool, then the small-message stream
+  private val slots = Array.tabulate(nStreams + 1)(new Slot(_))
+  private val smallSlot = nStreams
+  private val delayReport = new StreamDelayReport((0 until nStreams).map(i => s"stream $i") :+ "small-message stream",
+    StreamDelayReport.PeriodNanos, StreamDelayReport.ReportAtNanos)
   private var cursor = 0
   private val inFlight = new java.util.HashSet[ChannelFuture]()
   private val waitingBarriers = new java.util.HashSet[Promise[Void]]()
-  private var datagramsTouched = false
-  // See datagramBurst: datagrams written since the last flush, and those flushed before, decaying since that flush
-  private var unflushedDatagrams = 0
-  private var flushedDatagramLoad = 0.0
-  private var lastDatagramFlushNanos = System.nanoTime()
-  private val touchedStreams = new java.util.ArrayList[QuicStreamChannel](nStreams)
-  private var lastWriteNanos = System.nanoTime() // last outbound datagram or stream write, keepalives included
+  private val touchedStreams = new java.util.ArrayList[QuicStreamChannel](nStreams + 1)
+  private var lastWriteNanos = System.nanoTime() // last outbound stream write or keepalive
   private var keepaliveNanos = 0L // 0: keepalive not started
   private var keepaliveTask: NFuture[?] = null
 
@@ -304,9 +306,8 @@ final class QuicConnection(val loop: EventLoop,
     *
     * Netty QUIC 4.2.19 exposes no way to send a QUIC PING frame (`QuicChannel` has no ping or keep-alive method),
     * so the keepalive is a 1-byte datagram holding `KeepaliveByte` (0). DATAGRAM frames are ack-eliciting, so it
-    * resets both sides' idle timers. A real message datagram is at least 4 bytes (its u32 prefixLen), so a single
-    * 0 byte is never a message (read as a prefixLen it is invalid); the receiver checks `isKeepalive` and discards
-    * it, silently, before decode. It is written directly rather than through `submit`: it is loop-side, carries no
+    * resets both sides' idle timers. Messages never travel as datagrams, so the receiver discards it silently
+    * (`isKeepalive`), and logs any other datagram as unexpected. It is written directly rather than through `submit`: it is loop-side, carries no
     * payload, and must not count against or be dropped by the message budget.
     */
   def startKeepalive(idle: Duration): Unit =
@@ -370,42 +371,18 @@ final class QuicConnection(val loop: EventLoop,
     case b: Barrier => startBarrier(b.promise)
     case enc: Encoded =>
       try
-        if enc.isDatagram && !datagramBurst() then
-          sendDatagram(enc)
-        else
-          sendStream(enc)
+        sendStream(enc)
       catch
         case NonFatal(e) =>
           // The conversions release what they own on failure; release() is a no-op once consumed
           drop(enc, s"write failed: $e")
 
-  private def sendDatagram(enc: Encoded): Unit =
-    if maxDatagramLength < 0 then
-      drop(enc, "peer does not support datagrams")
-    else if enc.size > maxDatagramLength then
-      drop(enc, s"datagram of ${enc.size} bytes exceeds peer maximum $maxDatagramLength")
-    else
-      val ch = channel
-      val f = ch.write(enc.toDatagram(ch.alloc()))
-      lastWriteNanos = System.nanoTime()
-      datagramsTouched = true
-      unflushedDatagrams += 1
-      track(f, null, 0)
-
-  /** Whether this connection has written enough datagrams lately that quiche's datagram queue may be filling: about
-    * half its length. Netty gives no view of that queue, and once it is full the datagrams written are dropped while
-    * their writes succeed. Datagrams reach the queue only at a flush, so every one written since the last flush
-    * counts; those flushed before count less as the queue empties, decaying over DatagramLoadDecayNanos.
-    */
-  private def datagramBurst(): Boolean =
-    flushedLoad(System.nanoTime()) + unflushedDatagrams >= datagramFallbackAt
-
-  private def flushedLoad(now: Long): Double =
-    flushedDatagramLoad * math.exp(-(now - lastDatagramFlushNanos).toDouble / DatagramLoadDecayNanos)
-
   private def sendStream(enc: Encoded): Unit =
     // The per-stream high-water marks (pickStream) hold pending bytes to about the ceiling
-    val slot = if pendingTotal < floor || pool.hasRoom then pickStream() else null
+    val slot =
+      if pendingTotal >= floor && !pool.hasRoom then null
+      else if enc.isSmall then pickSmall()
+      else pickStream()
     if slot == null then
       drop(enc, "no writable stream or send budget exceeded")
     else
@@ -419,7 +396,12 @@ final class QuicConnection(val loop: EventLoop,
       if slot.pending > maxPending then
         maxPending = slot.pending
 
-  /** Round-robin from `cursor`, skipping slots that are opening, closed or not writable.
+  /** The small-message stream, or the pool when it is full */
+  private def pickSmall(): Slot =
+    val s = usable(smallSlot)
+    if s != null && s.pending < streamHighWater then s else pickStream()
+
+  /** The large-message pool, round-robin from `cursor`, skipping slots that are opening, closed or not writable.
     *
     * Writable means fewer than `streamHighWater` bytes are pending on the stream. Netty QUIC stream channels do not
     * use `WRITE_BUFFER_WATER_MARK`: their `isWritable` is quiche's stream capacity, which the congestion window
@@ -460,11 +442,10 @@ final class QuicConnection(val loop: EventLoop,
     if slot.stream != null then slot else null
 
   private def track(f: ChannelFuture, slot: Slot, size: Long): Unit =
-    if slot != null then
-      slot.pending += size
-      pendingTotal += size
-      pool.add(size)
-      delayReport.written(slot.index, slot.pending)
+    slot.pending += size
+    pendingTotal += size
+    pool.add(size)
+    delayReport.written(slot.index, slot.pending)
     if f.isDone then
       writeDone(f, slot, size, 0)
     else
@@ -475,12 +456,11 @@ final class QuicConnection(val loop: EventLoop,
         writeDone(f, slot, size, System.nanoTime() - started)
 
   private def writeDone(f: ChannelFuture, slot: Slot, size: Long, delayNanos: Long): Unit =
-    if slot != null then
-      slot.pending -= size
-      pendingTotal -= size
-      pool.add(-size)
-      delayReport.completed(slot.index, delayNanos, System.nanoTime())
-        .foreach(text => logger.warn(s"QUIC connection $remoteName: $text"))
+    slot.pending -= size
+    pendingTotal -= size
+    pool.add(-size)
+    delayReport.completed(slot.index, delayNanos, System.nanoTime())
+      .foreach(text => logger.warn(s"QUIC connection $remoteName: $text"))
     if !f.isSuccess then
       // Netty releases the message of a failed write
       countDrop(s"write failed: ${f.cause()}")
@@ -500,20 +480,12 @@ final class QuicConnection(val loop: EventLoop,
       snapshot.foreach(_.addListener(listener))
 
   private def flushTouched(): Unit =
-    if datagramsTouched then
-      datagramsTouched = false
-      val now = System.nanoTime()
-      flushedDatagramLoad = flushedLoad(now) + unflushedDatagrams
-      unflushedDatagrams = 0
-      lastDatagramFlushNanos = now
-      channel.flush()
     if !touchedStreams.isEmpty then
       touchedStreams.forEach(_.flush())
       touchedStreams.clear()
 
 object QuicConnection:
   private val DropLogIntervalNanos: Long = TimeUnit.SECONDS.toNanos(1)
-  private val DatagramLoadDecayNanos: Double = TimeUnit.MILLISECONDS.toNanos(10).toDouble
 
   /** The single byte of a keepalive datagram. See `startKeepalive`. */
   val KeepaliveByte: Int = 0

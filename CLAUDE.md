@@ -138,15 +138,16 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
         configurations, etc
 - Aspen uses a Crash-Only architecture. By intentional design, there is no clean shutdown process.
 - The Network Layer is designed to be pluggable via `common.network.NetworkPlugin`. QUIC is the only plugin:
-  - QUIC (`implementations/quic`, Netty 4.2): Mutual TLS on every connection, datagrams for
-    encoded messages of 1024 bytes or less (except a TxPrepare carrying object data, which a lost datagram would leave
-    a store unable to apply), a small round-robin pool of streams for larger ones, and messages
-    dropped (never queued) when over budget. UDP sockets request 16 MiB buffers; a smaller OS grant is logged. Payloads are not copied on send and are copied exactly once on receive.
+  - QUIC (`implementations/quic`, Netty 4.2): Mutual TLS on every connection. Every message goes on a stream, which
+    QUIC retransmits: a lost datagram waited for Aspen's own retries, and bursts overflow receive buffers even on
+    loopback. Only 1-byte keepalives are datagrams. Messages of 1024 encoded bytes or less share one small-message
+    stream (the pool when it is full); larger ones use a round-robin pool of `streamsPerConnection` (4). Messages are
+    dropped (never queued) when over budget. UDP sockets request 16 MiB buffers; a smaller OS grant is logged.
+    Payloads are not copied on send and are copied exactly once on receive.
   - Send buffering (`QuicConfig`): one host-wide `SendBudget` (a quarter of the heap, at least 256 MiB) shared by all
     connections; a connection may queue below its floor (256 KiB) always, or below its ceiling (a quarter of that
     budget, at least 64 MiB) while the shared budget has room. A stream whose writes wait over 500 ms is logged. The
-    pre-handshake queue has its own bound (16 MiB) outside the shared budget. A datagram burst (about half of
-    quiche's queue since recent flushes) sends datagram-sized messages on a stream: a full quiche queue drops silently
+    pre-handshake queue has its own bound (16 MiB) outside the shared budget
 - A pluggable `NetworkCache` persists store->host and host->endpoint mappings, scoped to the system id.
   - `NoCache` for the CLI; RocksDB for hosts (`<host-root>/cache/network`) and `amoebafs --network-cache-dir`
   - MetadataManager seeds from it at startup, trusts entries immediately, and writes every change back
@@ -155,13 +156,14 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   Newer entries replace held ones; entries absent from it and older than its scan start by more than a 10 minute
   drop margin are dropped.
 - QUIC repairs stale host endpoints: after `peerQueryDelay` (2 min) of failed dials to a host reported online,
-  it asks `peerQueryFanout` (3) peers (clients ask their relays) over a datagram. Newer answers replace the entry.
+  it asks `peerQueryFanout` (3) peers (clients ask their relays). Newer answers replace the entry.
 - QUIC envelopes carry the intended HostId. A host receiving one meant for another HostId drops it and replies
   `WrongHost` (rate-limited per connection). A handshake certificate UUID mismatch is treated the same way.
   Either marks the entry known-wrong, drops sends to it, and starts the peer query immediately.
 - `aspen host --load-jars=<version>` loads user RegisteredTypeFactory lists from every jar in `<host-dir>/jars/<version>/`
   (may be a symlink, e.g. `latest`) via `UserJarLoader`: one URLClassLoader, parent-first, `AspenTypeProvider` classes
   found with ServiceLoader. Duplicate UUIDs (including against built-ins) fail startup naming both classes and jars
+- `AbortVoteReport` logs a host's abort votes by failed requirement once a second while they happen
 - `BackendTiming` logs each host's write stages about once a second while writes happen: the store's view of a commit,
   RocksDB's pool wait and write, and FSIF's io wait, journal write and force, data force, copy-on-write and backpressure
 - DataStores are pluggable: RocksDB, in-memory Map, and FSIF (`server.store.backend.fsif`, a flat file of fixed-size

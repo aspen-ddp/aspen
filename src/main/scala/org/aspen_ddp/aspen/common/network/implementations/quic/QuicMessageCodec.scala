@@ -14,22 +14,21 @@ import java.util.UUID
 /** Wire format for the QUIC network plugin (all integers big-endian).
   *
   * {{{
-  * datagram     := prefixLen:u32  prefix  section*
   * stream frame := frameLen:u64   prefixLen:u32  prefix  section*     frameLen = 4 + prefixLen + sum(sectionLen)
   * prefix       := headerLen:u32  header  auxLen:u32  aux  nSections:u32  sectionLen:u32 * nSections
   * }}}
   *
-  * Bulk payloads travel as sections so they are never copied into protobuf on send.
+  * Bulk payloads travel as sections so they are never copied into protobuf on send. Every message goes on a stream:
+  * only keepalives are sent as datagrams (see `QuicConnection`).
   */
 object QuicMessageCodec:
 
-  val DatagramThreshold: Int = 1024
+  /** Messages of at most this many encoded bytes are small: see `Encoded.isSmall` */
+  val SmallMessageBytes: Int = 1024
   val FrameLengthSize: Int = 8
 
-  /** Owns `prefix` (pooled) until converted or released. `sections` are the sender's DataBuffers, never copied.
-    * `streamOnly` sends it on a stream whatever its size, for a small message that must not be silently lost.
-    */
-  final class Encoded(val prefix: ByteBuf, val sections: Array[DataBuffer], val streamOnly: Boolean = false):
+  /** Owns `prefix` (pooled) until converted or released. `sections` are the sender's DataBuffers, never copied. */
+  final class Encoded(val prefix: ByteBuf, val sections: Array[DataBuffer]):
     private var consumed = false
 
     /** 4 + prefix.readableBytes + sum of section sizes */
@@ -41,24 +40,8 @@ object QuicMessageCodec:
         i += 1
       total
 
-    def isDatagram: Boolean = !streamOnly && size <= DatagramThreshold
-
-    /** One pooled buffer holding prefixLen, prefix and the sections (copied). Consumes this. */
-    def toDatagram(alloc: ByteBufAllocator): ByteBuf =
-      require(!consumed, "Encoded already consumed")
-      consumed = true
-      val out = alloc.buffer(Math.toIntExact(size))
-      try
-        out.writeInt(prefix.readableBytes())
-        out.writeBytes(prefix)
-        sections.foreach(s => out.writeBytes(s.asReadOnlyBuffer()))
-        out
-      catch
-        case t: Throwable =>
-          out.release()
-          throw t
-      finally
-        prefix.release()
+    /** Whether it goes on its connection's small-message stream rather than the pool for large ones */
+    def isSmall: Boolean = size <= SmallMessageBytes
 
     /** A composite of [frameLen + prefixLen], prefix and read-only wrappers of the sections. Consumes this. */
     def toStreamFrame(alloc: ByteBufAllocator): CompositeByteBuf =
@@ -166,17 +149,7 @@ object QuicMessageCodec:
 
     case m => (m, ByteBuffer.allocate(0), NoSections)
 
-  /** Whether `msg` must go on a stream whatever its size: a prepare carrying a store's object data. A lost datagram is
-    * never resent, and the client stops resending its prepares once enough stores have committed, so a store whose
-    * data was lost could not apply the transaction and would stay behind on its objects until repaired.
-    */
-  private[quic] def mustArrive(msg: Message): Boolean = msg match
-    case m: TxPrepare => m.objectUpdates.nonEmpty
-    case _ => false
-
-  /** `streamOnly`: see `Encoded`. Implied for messages that `mustArrive` */
-  def encode(msg: Message, alloc: ByteBufAllocator, streamOnly: Boolean = false,
-             toHost: Option[HostId] = None): Encoded =
+  def encode(msg: Message, alloc: ByteBufAllocator, toHost: Option[HostId] = None): Encoded =
     val (headerMsg, aux, sections) = split(msg)
     val header = codec.Message(msg = toMsg(headerMsg), toHost = toHost.map(h => Codec.encodeUUID(h.uuid)))
     val headerLen = header.serializedSize
@@ -191,7 +164,7 @@ object QuicMessageCodec:
       prefix.writeBytes(aux.duplicate())
       prefix.writeInt(sections.length)
       sections.foreach(s => prefix.writeInt(s.size))
-      new Encoded(prefix, sections, streamOnly || mustArrive(msg))
+      new Encoded(prefix, sections)
     catch
       case t: Throwable =>
         prefix.release()
@@ -339,30 +312,3 @@ object QuicMessageCodec:
             PreTransactionOpportunisticRebuild(id, Metadata(aux), sections(nUpdates + i))
           .toList
           Right(Codec.decode(p, updates, rebuilds))
-
-  /** Whole datagram; copies sections into heap DataBuffers. Does not release `buf`. */
-  def decodeDatagram(buf: ByteBuf): Either[String, Received] =
-    try
-      val base = buf.readerIndex()
-      val total = buf.readableBytes()
-      if total < 4 then
-        Left("Datagram too short")
-      else
-        val prefixLen = buf.getInt(base)
-        if prefixLen < 0 || prefixLen > total - 4 then
-          Left(s"Invalid prefix length $prefixLen")
-        else
-          parsePrefix(buf.slice(base + 4, prefixLen)).flatMap: p =>
-            val sectionBytes = p.sectionSizes.foldLeft(0L)(_ + _)
-            if sectionBytes != (total - 4 - prefixLen).toLong then
-              Left(s"Datagram holds ${total - 4 - prefixLen} section bytes but prefix declares $sectionBytes")
-            else
-              var pos = base + 4 + prefixLen
-              val sections = p.sectionSizes.map: n =>
-                val arr = new Array[Byte](n)
-                buf.getBytes(pos, arr)
-                pos += n
-                DataBuffer(arr)
-              assemble(p, sections)
-    catch
-      case t: Throwable => Left(s"Failed to decode datagram: $t")

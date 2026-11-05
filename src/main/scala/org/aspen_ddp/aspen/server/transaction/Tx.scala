@@ -273,6 +273,7 @@ class Tx( trs: TransactionRecoveryState,
     if (disposition == TransactionDisposition.VoteAbort) {
       m.foreach(t => logger.trace(s"Tx ${txd.transactionId}. Object: ${t._1.uuid}. Requirement Error: ${t._2}"))
       l.foreach(e => logger.trace(s"Tx ${txd.transactionId}. Requirement Error: ${e}"))
+      AbortVoteReport.report.record(transactionId, m.toList.map((o, e) => Some(o) -> e) ++ l.map(None -> _))
     }
   }
 

@@ -24,19 +24,13 @@ class QuicNetCacheSuite extends AnyFunSuite with Matchers with BeforeAndAfterEac
     try os.remove.all(cacheDir)
     catch case _: Throwable => ()
 
-  /** Sends a message from `from` to `to` until `receiver` gets it, sending the same message again each second it
-    * does not. Datagrams are unreliable, and under load the first one on a new connection is occasionally lost.
-    */
+  /** Sends a message from `from` to `to` and waits for `receiver` to get it */
   private def deliver(from: Node, to: HostId, receiver: Node): CheckStorageDevice =
     val m = CheckStorageDevice(to, from.net.clientId, StorageDeviceId(UUID.randomUUID()))
-    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(AwaitMillis)
-    var delivered = false
-    while !delivered do
-      if System.nanoTime() - deadline > 0 then
-        throw new AssertionError(s"no message reached host $to within ${AwaitMillis}ms")
-      from.net.clientMessenger.sendHostMessage(m)
-      val d = receiver.handler.hostMessages.poll(LoadProbe.scaleMillis(1000), TimeUnit.MILLISECONDS)
-      delivered = d != null && d.message == m
+    from.net.clientMessenger.sendHostMessage(m)
+    val d = receiver.handler.hostMessages.poll(AwaitMillis, TimeUnit.MILLISECONDS)
+    if d == null || d.message != m then
+      throw new AssertionError(s"the message did not reach host $to within ${AwaitMillis}ms: $d")
     m
 
   test("a host restarted with a warm cache reaches a non-bootstrap host without a lookup"):

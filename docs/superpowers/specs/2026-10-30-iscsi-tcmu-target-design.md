@@ -1,5 +1,7 @@
 # Design: iSCSI target via TCMU (Aspen virtual disks)
 
+> Frontend superseded by `docs/superpowers/specs/2026-10-31-native-tcmu-design.md` (native TCMU, no tcmu-runner).
+
 **Date:** 2026-10-30
 **Status:** Approved
 

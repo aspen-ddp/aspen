@@ -1,5 +1,7 @@
 package org.aspen_ddp.aspen.server.store.backend.fsif
 
+import org.aspen_ddp.aspen.server.store.backend.BackendTiming
+
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
@@ -106,12 +108,19 @@ final class JournalWriter(file: FsifFile, startLength: Long, nextBatch: Long, sa
   private def send(batch: Batch, truncateFirst: Boolean): Unit =
     val pos = durable
     sending = true
+    val submitted = System.nanoTime()
     try io.execute(new FsifBackend.IoTask(FsifBackend.IoKind.Journal, () => {
+      val started = System.nanoTime()
+      BackendTiming.report.record("fsif io wait", started - submitted)
       val result = Try:
         // A retry also clears any tail left by a failed recovery truncate
         if truncateFirst then file.truncate(pos)
         file.write(pos, batch.bytes)
+        val written = System.nanoTime()
         file.force()
+        val forced = System.nanoTime()
+        BackendTiming.report.record("fsif journal write (bytes)", written - started, batch.bytes.length)
+        BackendTiming.report.record("fsif journal force", forced - written)
       if result.isFailure then
         try
           file.truncate(pos)

@@ -29,7 +29,8 @@ object WriterThread:
 
 
 class StreamWriter(val maxSizeInBytes: Long,
-                   files: List[(StreamId, os.Path)]) extends Logging:
+                   files: List[(StreamId, os.Path)],
+                   onThreadDeath: Throwable => Unit = _ => ()) extends Logging:
   
   private val queue = new LinkedBlockingQueue[WriterThread.Command]()
   private val streams = files.map(t =>
@@ -48,7 +49,11 @@ class StreamWriter(val maxSizeInBytes: Long,
   ).toMap
   private var exitLoop = false
   private val writerThread = new Thread {
-    override def run(): Unit = writeThreadLoop()
+    override def run(): Unit =
+      try writeThreadLoop()
+      catch case t: Throwable =>
+        logger.error("CRL writer thread died", t)
+        onThreadDeath(t)
   }
   writerThread.start()
 

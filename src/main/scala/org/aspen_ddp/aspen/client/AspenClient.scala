@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.client
 
 import org.aspen_ddp.aspen.client.internal.pool.SimpleStoragePool
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker
 import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.ida.IDA
@@ -67,6 +68,8 @@ trait AspenClient extends ObjectReader, ReadDriverClient, Logging:
   protected var storagePoolCache: Map[PoolId, StoragePool] = Map.empty
 
   def client: AspenClient = this
+
+  private[aspen] lazy val missedUpdateMarker: MissedUpdateMarker = new MissedUpdateMarker(this)
 
   def shutdown(): Unit = ()
 

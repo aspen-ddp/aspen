@@ -4,7 +4,7 @@ import org.aspen_ddp.aspen.common.network.{TxAccept, TxAcceptResponse, TxCommitt
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, ReadError}
 import org.aspen_ddp.aspen.common.paxos.{Accept, Acceptor, Prepare}
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, KeyValueUpdate, ObjectUpdate, PreTransactionOpportunisticRebuild, RequirementError, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionObjectRequirement, TransactionRequirement, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CommitError, CommitState, UpdateForm}
@@ -13,6 +13,12 @@ import scribe.Logging
 
 import scala.concurrent.duration._
 
+
+object Tx {
+  /** How long a transaction may go unapplied before its store logs it */
+  val StuckReportAfter: FiniteDuration = FiniteDuration(2, SECONDS)
+  val StuckReportEvery: FiniteDuration = FiniteDuration(5, SECONDS)
+}
 
 class Tx( trs: TransactionRecoveryState,
           val txd: TransactionDescription,
@@ -29,7 +35,10 @@ class Tx( trs: TransactionRecoveryState,
 
   private val storeId = trs.storeId
   private val serializedTxd = trs.serializedTxd
-  private val objectUpdates = trs.objectUpdates
+  // A driver's prepare carries no object data, so a Tx it started gets the data from a later client prepare
+  private var objectUpdates = trs.objectUpdates
+  private val startNanos = System.nanoTime()
+  private var clientPrepared = false
   private val pointersById: Map[ObjectId, ObjectPointer] = objectPointers.iterator.map(p => p.id -> p).toMap
 
   // Only the requirements of objects this store hosts, plus non-object requirements. Other pools' stores vote on
@@ -54,6 +63,7 @@ class Tx( trs: TransactionRecoveryState,
   private var saveObjectUpdates: Boolean = true
   private var committed: Boolean = false
   private var committing: Boolean = false
+  private var commitHeld: Boolean = false
   private var locked: Boolean = false
   private var outcomeKnown: Boolean = false
   private var lastProposer: StoreId = StoreId(txd.primaryObject.poolId, txd.designatedLeaderUID)
@@ -63,11 +73,70 @@ class Tx( trs: TransactionRecoveryState,
 
   private def allObjectsLoaded: Boolean = pendingObjectLoads == 0
 
+  private def missingObjectData: Boolean =
+    val have = objectUpdates.iterator.map(_.objectId).toSet
+    requirements.exists:
+      case r: DataUpdate => !have.contains(r.objectPointer.id)
+      case r: KeyValueUpdate => !have.contains(r.objectPointer.id)
+      case _ => false
+
+  /** A driver's small prepare can overtake the client's prepare carrying this store's data, and the missing data would
+    * force an abort vote on a healthy transaction. So the vote is withheld: no reply is always allowed by Paxos, and
+    * the drivers retransmit. The wait ends with the data, with a client's prepare (it is all the data the client will
+    * send), with the outcome (the vote no longer matters), or after `missingDataWait`, which covers a dead client.
+    * Checked only as prepares arrive, since a vote is of use only to a driver that is still asking for it.
+    */
+  private def awaitingData: Boolean =
+    disposition == TransactionDisposition.Undetermined && !recovered && !clientPrepared && !outcomeKnown &&
+      oresolution.isEmpty && missingObjectData && System.nanoTime() - startNanos < frontend.missingDataWait.toNanos
+
+  /** The commit decision can overtake the client's prepare too. Applying now would lose the object update, so the
+    * commit waits, without a TxCommitted, and the driver sees the store's TxCommitted when the data arrives instead of
+    * marking a missed update. The wait ends with the data, with a client's prepare, or with TxFinalized, after which
+    * nothing is waiting on this store and repair restores it. No locks are held: a commit vote requires the data.
+    */
+  private def commitAwaitsData: Boolean = !recovered && !clientPrepared && ofinalized.isEmpty && missingObjectData
+
+  private def releaseHeldCommit(): Unit =
+    if commitHeld && !commitAwaitsData then
+      commitHeld = false
+      resolvedAndAllObjectsLoaded(true)
+
   private def updateLastEvent(): Unit = lastEvent = System.nanoTime()
 
   def lastEventTime: Long = lastEvent
 
   def durationSinceLastEvent: Duration = Duration(System.nanoTime() - lastEvent, NANOSECONDS)
+
+  private def stateSummary(now: Long): String =
+    val age = Duration(now - startNanos, NANOSECONDS).toMillis
+    val idle = Duration(now - lastEvent, NANOSECONDS).toMillis
+    val revisions = objects.valuesIterator.map(os => s"${os.objectId.uuid}=${os.metadata.revision.lastUpdateTxUUID}")
+      .mkString(",")
+    s"Age: ${age}ms. Idle: ${idle}ms. Vote: $disposition. Resolution: $oresolution. Finalized: $ofinalized. " +
+      s"Locked: $locked. CommitHeld: $commitHeld. Committing: $committing. Committed: $committed. " +
+      s"PendingLoads: $pendingObjectLoads. PendingCommits: $pendingObjectCommits. ClientPrepared: $clientPrepared. " +
+      s"Recovered: $recovered. Last proposer: $lastProposer. Object revisions: $revisions"
+
+  private var lastStuckReport: Option[Long] = None
+
+  /** Logs a transaction whose store has not applied it long after it started: it holds its locks, has a held commit,
+    * or is waiting on the backend. Repeats every `Tx.StuckReportEvery`. Returns whether it logged.
+    */
+  def reportIfStuck(now: Long = System.nanoTime()): Boolean =
+    val stuck = locked || commitHeld || (committing && !committed)
+    val due = stuck && now - startNanos >= Tx.StuckReportAfter.toNanos &&
+      lastStuckReport.forall(last => now - last >= Tx.StuckReportEvery.toNanos)
+    if due then
+      lastStuckReport = Some(now)
+      logger.warn(s"Stuck Tx $transactionId on store $storeId. ${stateSummary(now)}")
+    due
+
+  /** Logs the outcome reaching a store that held the transaction's locks for a long time, naming who told it */
+  private def reportLateOutcome(message: String, from: StoreId): Unit =
+    val now = System.nanoTime()
+    if locked && oresolution.isEmpty && now - startNanos >= Tx.StuckReportAfter.toNanos then
+      logger.warn(s"Late $message from $from for Tx $transactionId on store $storeId. ${stateSummary(now)}")
 
   /** Holds the requirement locks from a commit vote until the transaction resolves, so that this store votes abort
     * on conflicting transactions in the meantime. Locks have no purpose once the outcome is known, including the
@@ -144,7 +213,7 @@ class Tx( trs: TransactionRecoveryState,
     // A recovered transaction keeps the vote it persisted: the vote may already have been counted, and recomputing it
     // against state that changed since could contradict it. A recovered commit vote takes its locks again; a recovered
     // abort vote must not become a commit vote that conflicts with a recovered commit vote it collided with.
-    if !(recovered && disposition != TransactionDisposition.Undetermined) then
+    if !(recovered && disposition != TransactionDisposition.Undetermined) && !awaitingData then
       determineDisposition()
 
     lock()
@@ -210,6 +279,12 @@ class Tx( trs: TransactionRecoveryState,
       frontend.discard(objectId)
     }
 
+    result.skippedReasons.foreach { (objectId, reason) =>
+      val current = objects.get(objectId).map(_.metadata.revision.lastUpdateTxUUID)
+      logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
+        s"Vote: $disposition. Client prepare seen: $clientPrepared. Revision on store: $current")
+    }
+
     val uncommittable = result.uncommittable
 
     // Count what is actually committed. uncommittable may name objects this store never
@@ -244,14 +319,18 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   private def resolvedAndAllObjectsLoaded(committed: Boolean): Unit = {
-    if (committed)
-      doCommit()
+    if committed && commitAwaitsData then
+      logger.trace(s"Holding the commit of $transactionId until its object data arrives")
+      commitHeld = true
     else
-      crl.deleteTransaction(storeId, transactionId)
+      if (committed)
+        doCommit()
+      else
+        crl.deleteTransaction(storeId, transactionId)
 
-    unlock() // Ensure we've unlocked the objects now that result of the Tx is known
+      unlock() // Ensure we've unlocked the objects now that result of the Tx is known
 
-    releaseObjects()
+      releaseObjects()
   }
 
   private var objectsReleased = false
@@ -278,9 +357,24 @@ class Tx( trs: TransactionRecoveryState,
       resolvedAndAllObjectsLoaded(committed)
   }
 
+  /** Adopts the object data of a prepare that has some this Tx lacks: the first prepare to arrive may have been a
+    * driver's, which carries none, while the client's was lost or delayed. A vote already given stands, but the data
+    * is still needed to apply a commit decided by the other stores' votes. See commitAwaitsData
+    */
+  private def adoptObjectUpdates(m: TxPrepare): Unit =
+    val have = objectUpdates.iterator.map(_.objectId).toSet
+    val added = m.objectUpdates.filterNot(ou => have.contains(ou.objectId))
+    if added.nonEmpty && !committing && !committed then
+      objectUpdates = objectUpdates ++ added
+
   def receivePrepare(m: TxPrepare): Unit = {
     logger.trace(s"*** Got Prepare: ${m.transactionId}")
     lastProposer = m.from
+
+    if m.fromClient then
+      clientPrepared = true
+
+    adoptObjectUpdates(m)
 
     // The client re-sends its prepares until it learns the outcome, whether or not any driver is
     // making progress. Counting them as activity would keep a transaction whose designated leader
@@ -294,24 +388,34 @@ class Tx( trs: TransactionRecoveryState,
       net.sendTransactionMessage(txc)
     }
 
-    val result = acceptor.receivePrepare(Prepare(m.proposalId)) match {
-      case Right(p) => Right(TxPrepareResponse.Promise(p.lastAccepted))
-      case Left(n) => Left(TxPrepareResponse.Nack(n.promisedProposalId))
-    }
+    releaseHeldCommit()
 
-    val txr = TxPrepareResponse(m.from, storeId, transactionId, result, m.proposalId, disposition, collisions)
-    logger.trace(s"*** PrepareResponse: ${m.transactionId}, Disposition:$disposition. All Objects Loaded: $allObjectsLoaded")
-
-    if allObjectsLoaded then
-      val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
-        disposition, status, acceptor.persistentState)
-      crl.save(txd.transactionId, state, () =>
-        logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
-        net.sendTransactionMessage(txr)
-      )
+    if awaitingData then
+      logger.trace(s"Withholding the vote on ${m.transactionId} until its object data arrives")
     else
-      logger.trace(s"Not all objects loaded. Delaying PrepareResponse: ${m.transactionId}")
-      delayedPrepare = Some(txr)
+      // completeLoad left the vote undecided if the Tx was waiting for data then
+      if allObjectsLoaded && !recovered && oresolution.isEmpty && disposition == TransactionDisposition.Undetermined then
+        determineDisposition()
+        lock()
+
+      val result = acceptor.receivePrepare(Prepare(m.proposalId)) match {
+        case Right(p) => Right(TxPrepareResponse.Promise(p.lastAccepted))
+        case Left(n) => Left(TxPrepareResponse.Nack(n.promisedProposalId))
+      }
+
+      val txr = TxPrepareResponse(m.from, storeId, transactionId, result, m.proposalId, disposition, collisions)
+      logger.trace(s"*** PrepareResponse: ${m.transactionId}, Disposition:$disposition. All Objects Loaded: $allObjectsLoaded")
+
+      if allObjectsLoaded then
+        val state = TransactionRecoveryState(storeId, serializedTxd, trsObjectUpdates,
+          disposition, status, acceptor.persistentState)
+        crl.save(txd.transactionId, state, () =>
+          logger.trace(s"CRL Transaction save complete. Sending PrepareResponse: ${m.transactionId}")
+          net.sendTransactionMessage(txr)
+        )
+      else
+        logger.trace(s"Not all objects loaded. Delaying PrepareResponse: ${m.transactionId}")
+        delayedPrepare = Some(txr)
   }
 
   def receiveAccept(m: TxAccept): Unit = {
@@ -332,16 +436,19 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   def receiveResolved(m: TxResolved): Unit = {
+    reportLateOutcome("TxResolved", m.from)
     updateLastEvent()
     resolved(m.committed)
   }
 
   def receiveFinalized(m: TxFinalized): Unit = if (ofinalized.isEmpty) {
+    reportLateOutcome("TxFinalized", m.from)
     updateLastEvent()
     resolved(m.committed)
     ofinalized = Some(m.committed)
-    if (m.committed)
-      crl.deleteTransaction(storeId, transactionId)
+    releaseHeldCommit()
+    // Whatever the outcome: a prepare after an abort, or from a recovery driver, may have saved this Tx again
+    crl.deleteTransaction(storeId, transactionId)
     statusCache.updateStatus(transactionId, status, finalized = true)
   }
 

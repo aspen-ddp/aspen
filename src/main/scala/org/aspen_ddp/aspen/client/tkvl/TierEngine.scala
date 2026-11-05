@@ -32,9 +32,15 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     *
     * The single retry composes with the MaxJoinRaceRestarts loops in `prepareUpdates` and `deleteFromContainingNode`,
     * so the worst case is bounded but multiplied, and only on paths that are already failing.
+    *
+    * A `write` starts from a fresh root when the cache holds any root (`TierCache.anyRoot`): such a root can lag
+    * this writer's own commits, which a read tolerates but a write's staged node updates would not.
     */
-  private def navigate[A](nav: (TierCache, () => Future[(Int, KeyOrdering, Option[ListNode])]) => Future[A]): Future[A] =
-    Future.delegate(nav(rootManager.cache, () => rootManager.getRootNode())).recoverWith:
+  private def navigate[A](write: Boolean = false)
+                         (nav: (TierCache, () => Future[(Int, KeyOrdering, Option[ListNode])]) => Future[A]): Future[A] =
+    val root = () =>
+      if write && rootManager.cache.anyRoot then rootManager.getFreshRootNode() else rootManager.getRootNode()
+    Future.delegate(nav(rootManager.cache, root)).recoverWith:
       case _: BrokenTree | _: InvalidObject =>
         rootManager.cache.clear()
         nav(NoCache, () => rootManager.getFreshRootNode())
@@ -42,8 +48,8 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
   /** The tier-0 node containing `key`, or None for an empty tree. The descent goes through the cached upper tiers,
     * within the safety net (see `navigate`).
     */
-  private def containingNode(key: Key): Future[Option[ListNode]] =
-    navigate: (cache, getRoot) =>
+  private def containingNode(key: Key, write: Boolean = false): Future[Option[ListNode]] =
+    navigate(write): (cache, getRoot) =>
       getRoot().flatMap: (tier, ordering, oroot) =>
         oroot match
           case None => Future.successful(None)
@@ -209,7 +215,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
     if ops.isEmpty then
       Future.unit
     else
-      navigate((cache, getRoot) => locateTargets(cache, getRoot, 0)).flatMap:
+      navigate(write = true)((cache, getRoot) => locateTargets(cache, getRoot, 0)).flatMap:
         case None => empty()
         case Some(targets) =>
           for
@@ -283,7 +289,7 @@ private[tkvl] class TierEngine(val client: AspenClient, val rootManager: RootMan
   def deleteFromContainingNode(key: Key, del: ListNode => Future[Unit]): Future[Unit] =
 
     def attempt(restarts: Int): Future[Unit] =
-      containingNode(key).flatMap:
+      containingNode(key, write = true).flatMap:
         case None => Future.unit
         case Some(node) =>
           del(node).recoverWith:

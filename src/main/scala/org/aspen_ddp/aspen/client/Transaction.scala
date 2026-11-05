@@ -84,10 +84,9 @@ trait Transaction {
    *  in-transaction (e.g. clearing many bits of a shared allocation index) would risk collisions with concurrent
    *  allocations. A no-op for ordinary pools. Applies to every deletion in the transaction.
    *
-   *  FSIF pools support deferred deletions in only one FSIF pool per transaction: deferred deletions in a second
-   *  FSIF pool fail the transaction with IllegalArgumentException. A deferred FSIF release enrolls a system durable
-   *  task, which updates the shared system task registry, so a transaction that also enrolls a system durable task
-   *  of its own fails the same way.
+   *  A transaction's deferred FSIF deletions, in any number of FSIF pools, enroll one system durable task, which
+   *  updates the shared system task registry, so a transaction that also enrolls a system durable task of its own
+   *  fails with IllegalArgumentException.
    *
    *  These failures, like an FSIF deletion whose storePointer is not a valid index, are permanent: rebuilding the
    *  same transaction fails again. Generic retry loops (`retryUntilSuccessful`, `ExponentialBackoffRetryStrategy`)
@@ -99,6 +98,11 @@ trait Transaction {
 
   /** True if deferAllocationRelease() has been called. Passed to each allocation strategy's prepareCommit */
   private[aspen] def allocationReleaseDeferred: Boolean
+
+  /** Every object the transaction deletes, in every pool, in the order the deletions were added. For allocation
+   *  strategies whose commit hook covers more than its own pool's deletions
+   */
+  private[aspen] def deletedObjects: List[ObjectPointer]
 
   /** Per-transaction state for allocation strategies. Returns the value stored under `key`, first storing `init` if
    *  there is none; `init` runs at most once per key. Synchronized, and usable both before commit() and while the

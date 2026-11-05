@@ -30,7 +30,9 @@ import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
 import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
-import org.aspen_ddp.aspen.vdisk.bridge.BridgeServer
+import org.aspen_ddp.aspen.vdisk.tcmu.{LinuxTcmuKernel, TcmuEvent, TcmuNetlink, TcmuService}
+import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
+import org.aspen_ddp.aspen.vdisk.tcmu.sys.{Libc, Linux}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, FsifConfig, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
@@ -60,6 +62,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.{DAYS, Duration, HOURS, MILLISECONDS, MINUTES, SECONDS}
 import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.util.{Failure, Success, Try}
+import scala.util.control.NonFatal
 import scala.language.implicitConversions
 
 
@@ -134,12 +137,10 @@ object Main {
                   diskName:String="",
                   diskSize:Long=0L,
                   diskBlockSize:Int=4096,
-                  diskPoolName:Option[String]=None,
-                  diskGroupName:Option[String]=None,
+                  diskGroupName:String="",
                   rebalancePeriod:Option[String]=None,
                   rebalancePeriodUnit:Option[String]=None,
                   networkCacheDir:Option[os.Path]=None,
-                  vdiskSocket:os.Path=os.Path("/run/aspen/vdisk.sock"),
                   loadJars:Option[String]=None,
                   outputClientConfig:Option[os.Path]=None)
 
@@ -168,12 +169,36 @@ object Main {
       ohost.foreach(_.receiveHostMessage(msg))
   }
 
-  def configureLogging(): Unit =
-    val logFormat = formatter"$dateFull $classNameSimple.$methodName:$line $messages$mdc"
-    scribe.Logger.root
+  /** One line per record, the same on the terminal and in a log file. */
+  val logFormat: scribe.format.Formatter = formatter"$dateFull $classNameSimple.$methodName:$line $messages$mdc"
+
+  /** Logs to the terminal and, when `logFile` is given, also appends to that file. */
+  def configureLogging(logFile: Option[os.Path] = None): Unit =
+    val terminal = scribe.Logger.root
       .clearHandlers()
       .withHandler(formatter = logFormat, minimumLevel = Some(scribe.Level.Trace))
+    logFile.fold(terminal)(f => terminal.withHandler(formatter = logFormat, writer = LogFileWriter(f),
+        minimumLevel = Some(scribe.Level.Trace)))
       .replace()
+
+  /** Appends each record's plain text (no terminal colors) to `file`, creating it and its directory if needed.
+   *  Every record is flushed: a crash-only host is stopped with kill -9, which would lose anything buffered.
+   */
+  final class LogFileWriter(file: os.Path) extends scribe.writer.Writer:
+    os.makeDir.all(file / os.up)
+    private val out = java.io.PrintWriter(java.io.OutputStreamWriter(
+      java.io.FileOutputStream(file.toIO, true), java.nio.charset.StandardCharsets.UTF_8))
+
+    def write(record: scribe.LogRecord, output: scribe.output.LogOutput,
+              outputFormat: scribe.output.format.OutputFormat): Unit = synchronized:
+      out.println(output.plainText)
+      out.flush()
+
+    override def dispose(): Unit = synchronized(out.close())
+
+  /** Logs an exception that would otherwise reach only stderr, and so not the host log. */
+  def logUncaughtExceptions(log: scribe.Logger): Thread.UncaughtExceptionHandler =
+    (thread, err) => log.error(s"Uncaught exception on thread ${thread.getName}", err)
 
   /** Awaits `f` and then runs `report` on the calling thread.
    *
@@ -455,10 +480,6 @@ object Main {
       clientConfigArg(p),
       bootstrapHostOption(p),
 
-      p.opt[os.Path]("socket").valueName("<path>").
-        text("Unix socket on which to serve disks to tcmu-runner (default /run/aspen/vdisk.sock)").
-        action((x, c) => c.copy(vdiskSocket = x)),
-
       p.opt[os.Path]("network-cache-dir").valueName("<dir>").
         text("Directory in which to cache network lookups across restarts. It must not be shared by two processes").
         action((x, c) => c.copy(networkCacheDir = Some(x)))
@@ -617,11 +638,9 @@ object Main {
       bootstrapHostOption(p),
       diskNameArg(p, "Name of the new virtual disk"),
       sizeArg(p, "<size>", "Disk size in bytes, with an optional K, M, G or T binary suffix"),
-      // checkConfig requires exactly one of --pool and --group
-      opt[String]("pool").valueName("<pool-name>").text("Storage pool to allocate the disk's objects in").
-        action((x, c) => c.copy(diskPoolName = Some(x))),
-      opt[String]("group").valueName("<group-name>").text("Allocation group to allocate the disk's objects in").
-        action((x, c) => c.copy(diskGroupName = Some(x))),
+      opt[String]("group").required().valueName("<group-name>").
+        text("Allocation group to allocate the disk's objects in; it must have a maximum slice size").
+        action((x, c) => c.copy(diskGroupName = x)),
       opt[Int]("block-size").text("Logical block size, 512 or 4096 (default 4096)").
         validate(x => if x == 512 || x == 4096 then success else failure("Block size must be 512 or 4096")).
         action((x, c) => c.copy(diskBlockSize = x)),
@@ -858,14 +877,14 @@ object Main {
     // re-enabled. run_debug_code is retained for reference but is not reachable.
     //Command("debug", "Runs debugging code", configOnlyArgs),
 
-    Command("host", "Starts an Aspen Storage Host", hostArgs),
+    Command("host", "Starts an Aspen Storage Host, logging to the terminal and <host-directory>/logs/host.log", hostArgs),
     Command("amoebafs", "Launches an AmoebaFS NFS server", amoebafsArgs),
     Command("create-pool", "Creates a new storage pool", createPoolArgs),
     Command("create-metadata-pool", "Creates a new storage pool that holds other pools' metadata", createMetadataPoolArgs),
     Command("create-device-set", "Creates a new storage device set", createDeviceSetArgs),
     Command("create-allocation-group", "Creates a new allocation group", createAllocationGroupArgs),
     Command("create-filesystem", "Creates a new AmoebaFS filesystem", createFilesystemArgs),
-    Command("vdisk-server", "Serves virtual disks to tcmu-runner over a Unix socket", vdiskServerArgs),
+    Command("vdisk-server", "Serves virtual disks to the Linux kernel's TCMU target (requires root)", vdiskServerArgs),
     Command("create-disk", "Creates a new virtual disk", createDiskArgs),
     Command("list-disks", "Lists all virtual disks", configOnlyArgs),
     Command("grow-disk", "Grows a virtual disk", growDiskArgs),
@@ -919,8 +938,6 @@ object Main {
         validateGroupIda(c)
       else if c.mode == "create-pool" || c.mode == "create-metadata-pool" then
         validatePoolBackend(c)
-      else if c.mode == "create-disk" && c.diskPoolName.isDefined == c.diskGroupName.isDefined then
-        failure("create-disk requires exactly one of --pool and --group")
       else if c.mode == "system-rebalance-period" then
         // Validated here rather than in the handler so a malformed period is a usage error,
         // reported before any client or network is built.
@@ -1009,7 +1026,7 @@ object Main {
                                           cfg.outputClientConfig.getOrElse(os.pwd / ClientConfig.configFilename))
             case "host" => run_host(cfg.hostDirectory, cfg.loadJars)
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
-            case "vdisk-server" => run_vdisk_server(session, cfg.vdiskSocket, cfg.networkCacheDir)
+            case "vdisk-server" => run_vdisk_server(session, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
             //case "debug" => run_debug_code(session)
             case "create-pool" =>
@@ -1029,7 +1046,7 @@ object Main {
                                       cfg.newGroupMetadata)
             case "create-filesystem" => create_filesystem(session, cfg.fsName, cfg.poolName)
             case "create-disk" =>
-              create_disk(session, cfg.diskName, cfg.diskPoolName, cfg.diskGroupName, cfg.diskSize, cfg.diskBlockSize)
+              create_disk(session, cfg.diskName, cfg.diskGroupName, cfg.diskSize, cfg.diskBlockSize)
             case "list-disks" => list_disks(session)
             case "grow-disk" => grow_disk(session, cfg.diskName, cfg.diskSize)
             case "delete-disk" => delete_disk(session, cfg.diskName)
@@ -1235,7 +1252,9 @@ object Main {
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls, None, onetworkCacheDir))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
-    val initialReadDelay = Duration(10, SECONDS)
+    // A dropped read request or reply costs this long. A retry asks every store again, so it can't be so short that
+    // ordinary reads under load repeat
+    val initialReadDelay = Duration(2, SECONDS)
     val maxReadDelay = Duration(6, SECONDS)
     val txRetransmitDelay = Duration(1, SECONDS)
     val allocationRetransmitDelay = Duration(5, SECONDS)
@@ -1307,11 +1326,10 @@ object Main {
     case VDiskError.InvalidGeometry(reason) => Some(reason)
     case _ => None
 
-  /** Allocates the disk's objects in the named pool or, when no pool is given, the named allocation group */
+  /** Allocates the disk's objects, block map included, in the named allocation group */
   def create_disk(session: ClientSession,
                   diskName: String,
-                  poolName: Option[String],
-                  groupName: Option[String],
+                  groupName: String,
                   size: Long,
                   blockSize: Int): Int =
     configureLogging()
@@ -1319,14 +1337,10 @@ object Main {
     network.startIoThread(client)
     given ExecutionContext = client.clientContext
 
-    val allocator: Future[ObjectAllocator] = poolName match
-      case Some(name) =>
-        client.getStoragePoolId(name).flatMap(client.getStoragePool).map(pool => new PoolObjectAllocator(client, pool))
-      case None =>
-        val name = groupName.getOrElse("")
-        client.getAllocationGroupId(name).recoverWith:
-          case _: NoSuchElementException => Future.failed(GroupNotFound(name))
-        .flatMap(groupId => client.getAllocator(GroupObjectAllocatorId(groupId)))
+    val allocator: Future[ObjectAllocator] =
+      client.getAllocationGroupId(groupName).recoverWith:
+        case _: NoSuchElementException => Future.failed(GroupNotFound(groupName))
+      .flatMap(groupId => client.getAllocator(GroupObjectAllocatorId(groupId)))
 
     val f = for
       alloc <- allocator
@@ -1336,8 +1350,6 @@ object Main {
     awaitAndReport(f):
       case Success(info) => println(s"Created disk ${formatDiskInfo(info)}")
       case Failure(e: GroupNotFound) => println(s"Error: allocation group '${e.name}' not found")
-      // getStoragePoolId throws this when the name is not registered.
-      case Failure(_: NoSuchElementException) => println(s"Error: storage pool '${poolName.getOrElse("")}' not found")
       case Failure(err) =>
         println(s"Error: ${diskErrorMessage(err).getOrElse(s"creating disk failed: ${err.getMessage}")}")
 
@@ -1434,37 +1446,105 @@ object Main {
       ()
   }
 
-  def run_vdisk_server(session: ClientSession, socket: os.Path, onetworkCacheDir: Option[os.Path] = None): Int = {
+  def run_vdisk_server(session: ClientSession, onetworkCacheDir: Option[os.Path] = None): Int = {
+    if Libc.geteuid() != 0 then
+      println("Error: vdisk-server must run as root")
+      return 1
+
     configureLogging()
 
     def report(err: Throwable): Int =
       println(s"Error: ${Option(err.getMessage).getOrElse(err.toString)}")
       1
 
-    // Checked before the client starts, so a bad socket directory fails fast
-    try
-      BridgeServer.prepareSocketDir(socket)
-    catch
-      case err: Throwable => return report(err)
-
     val (client, network, radicle) = createAspenClient(session, onetworkCacheDir)
 
     network.startIoThread(client)
 
-    val server = BridgeServer(socket, DiskHandle.open(client, _))
+    val netlink =
+      try TcmuNetlink.open()
+      catch case NonFatal(err) => return report(err)
 
-    try
-      server.start()
-    catch
-      case err: Throwable => return report(err)
+    // Held for the life of the process; the connection keeps the exported objects alive
+    val dbus =
+      try TcmuDbusService.start(HandlerLogic(HandlerLogic.diskExistsIn(client)))
+      catch
+        case NonFatal(err) =>
+          try netlink.close() catch case NonFatal(_) => ()
+          return report(err)
 
-    println(s"Serving virtual disks on $socket")
+    val service = TcmuService(LinuxTcmuKernel(), DiskHandle.open(client, _))
+
+    // startupScan logs each device it could not serve
+    Await.ready(service.startupScan(), Duration.Inf).value.foreach:
+      case Failure(err) => scribe.error(s"tcmu: startup scan failed: $err")
+      case Success(_) => ()
+    val served = service.devices.toList.sortBy(_._1).map((minor, disk) => s"uio$minor (disk $disk)")
+    scribe.info(s"tcmu: startup scan done; serving ${served.size} existing device(s): ${served.mkString(", ")}")
+
+    Thread.ofPlatform().name("tcmu-netlink").daemon(true).start: () =>
+      try tcmuEventLoop(() => netlink.receive(), service.onEvent, netlink.reply)
+      catch
+        case t: Throwable =>
+          scribe.error(s"tcmu: the netlink thread died; device add, remove and reconfig are no longer served: $t")
+          throw t
+
+    println("Serving virtual disks through TCMU")
 
     // Runs indefinitely, like amoebafs: blocking the main thread keeps the process alive.
     Thread.currentThread.join()
 
     0 // unreachable
   }
+
+  /** The vdisk-server netlink loop: never returns, except by a fatal exception from one of its arguments.
+    *
+    * Each event is handed to `onEvent` and its status is replied when the Future completes, so a slow add does not
+    * hold up other events. A failed `onEvent` replies `-EIO`. A `receive` failure (e.g. ENOBUFS when the kernel's
+    * multicast queue overflowed) is retried after `pause`ing 1 ms, doubling to 1 s while it keeps failing. The first
+    * failure of a run and every 100th after it are logged, and so is the recovery.
+    */
+  private[cmdline] def tcmuEventLoop(receive: () => List[Either[String, TcmuEvent]],
+                                     onEvent: TcmuEvent => Future[Int],
+                                     reply: (TcmuEvent, Int) => Unit,
+                                     pause: Long => Unit = Thread.sleep,
+                                     log: scribe.Logger = scribe.Logger.root)(using ExecutionContext): Nothing =
+    def send(event: TcmuEvent, status: Int): Unit =
+      try reply(event, status)
+      catch case NonFatal(e) => log.error(s"tcmu: replying $status to $event failed: $e")
+
+    var backoffMs = 0L
+    var failures = 0L
+    while true do
+      val received =
+        try Some(receive())
+        catch
+          case NonFatal(e) =>
+            failures += 1
+            backoffMs = if backoffMs == 0 then 1 else (backoffMs * 2).min(1000)
+            if failures == 1 then
+              log.error(s"tcmu: netlink receive failed (retrying with backoff): $e")
+            else if failures % 100 == 0 then
+              log.error(s"tcmu: netlink receive still failing after $failures consecutive failures: $e")
+            pause(backoffMs)
+            None
+      received.foreach: messages =>
+        if failures > 0 then
+          log.warn(s"tcmu: netlink receive recovered after $failures failure(s)")
+        backoffMs = 0
+        failures = 0
+        messages.foreach:
+          case Left(reason) => log.warn(s"tcmu: dropped an unparseable netlink message: $reason")
+          case Right(event) =>
+            val status =
+              try onEvent(event)
+              catch case NonFatal(e) => Future.failed(e)
+            status.onComplete:
+              case Success(s) => send(event, s)
+              case Failure(e) =>
+                log.error(s"tcmu: $event failed: $e")
+                send(event, -Linux.EIO)
+    throw IllegalStateException("unreachable")
 
   def run_amoebafs(session: ClientSession, fsName: String, onetworkCacheDir: Option[os.Path] = None): Int = {
     configureLogging()
@@ -1542,11 +1622,16 @@ object Main {
                               (stopAction: () => Unit):
     def stop(): Unit = stopAction()
 
+  /** Where the `host` command appends its log, as well as printing it. */
+  def hostLogFile(hostDir: os.Path): os.Path = hostDir / "logs" / "host.log"
+
   /** Starts the `host` command: blocks forever once the host is running. */
   def run_host(hostDir: os.Path, loadJars: Option[String]): Int = {
-    configureLogging()
+    configureLogging(Some(hostLogFile(hostDir)))
+    Thread.setDefaultUncaughtExceptionHandler(logUncaughtExceptions(scribe.Logger.root))
 
-    val h = startHost(hostDir, loadJars)
+    // Crash-only: halt, since without its CRL the host could serve reads but never finish a transaction
+    val h = startHost(hostDir, loadJars, _ => Runtime.getRuntime.halt(1))
 
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO
     // thread is what keeps the process alive; the IO thread itself is a daemon thread.
@@ -1563,8 +1648,12 @@ object Main {
    *
    *  `loadJars` names the version directory under `<host-dir>/jars` whose user type factories the
    *  host's client is given. They are loaded before anything else is started so a bad jar fails fast.
+   *
+   *  `onCrlThreadDeath` is called if a CRL thread dies. An in-process caller must not halt its JVM.
    */
-  def startHost(hostDir: os.Path, loadJars: Option[String] = None): RunningHost = {
+  def startHost(hostDir: os.Path,
+                loadJars: Option[String] = None,
+                onCrlThreadDeath: Throwable => Unit = _ => ()): RunningHost = {
 
     val userTypeFactories = loadJars.map(UserJarLoader.load(hostDir, _)).getOrElse(Nil)
 
@@ -1599,7 +1688,7 @@ object Main {
       case b: HostConfig.SimpleCRL =>
         val crlRoot = hostDir / "crl"
         os.makeDir.all(crlRoot)
-        SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024)
+        SimpleCRL.Factory(crlRoot, b.numStreams, b.fileSizeMb * 1024 * 1024, onCrlThreadDeath)
     }
 
     // Remembers the CRL the Host creates so RunningHost.stop can shut down its threads.
@@ -1624,7 +1713,7 @@ object Main {
     networkBridge.oclient = Some(client)
 
     val txFinalizerFactory = new RegisteredTransactionFinalizerFactory(client)
-    val txHeartbeatPeriod = Duration(5, SECONDS)
+    val txHeartbeatPeriod = Duration(1, SECONDS)
     val txRetryDelay = Duration(100, MILLISECONDS) //
     val txRetryCap = Duration(3, SECONDS)
     //val allocHeartbeatPeriod   = Duration(3, SECONDS)

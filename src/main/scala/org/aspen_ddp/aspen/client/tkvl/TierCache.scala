@@ -6,10 +6,12 @@ import com.github.blemale.scaffeine.{Cache, Scaffeine}
 import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectRevision}
 
 import scala.collection.concurrent.TrieMap
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
-/** The root as a root manager reads it: the Root, its hosting object's revision and the root node */
-final case class RootState(root: Root, revision: ObjectRevision, node: Option[ListNode])
+/** The root as a root manager reads it: the Root, its hosting object's revision and the root node. `cacheable` is
+  * false for a stand-in, such as the empty root given when the root node could not be read.
+  */
+final case class RootState(root: Root, revision: ObjectRevision, node: Option[ListNode], cacheable: Boolean = true)
 
 /** Cache of the upper-tier (tier >= 1) nodes of a tree, and of its root. Tier 0 is never cached.
   *
@@ -23,9 +25,17 @@ trait TierCache:
   def generation: Long
 
   /** Ignored if a `clear()` happened since `generation`. Otherwise stores only if `r.node.isDefined &&
-    * r.root.tier >= 1`, and drops the cached root if not.
+    * r.root.tier >= 1` (any cacheable root for an `anyRoot` LruTierCache), and drops the cached root if not.
     */
   def putRoot(r: RootState, generation: Long): Unit
+
+  /** Runs `read` for a root lookup that missed. Only an `anyRoot` LruTierCache shares a read among concurrent misses:
+    * elsewhere a miss must read state at least as new as the lookup.
+    */
+  def missRead(read: () => Future[RootState]): Future[RootState] = read()
+
+  /** True for a cache that holds any root, which may lag its tree's writer: writes then read the root fresh */
+  def anyRoot: Boolean = false
 
   def dropRoot(): Unit
 
@@ -61,12 +71,19 @@ object NoCache extends TierCache:
   def clear(): Unit = ()
   def suspendUntil(f: Future[?]): Unit = ()
 
-/** Keeps the most recently used `nodesPerTier` nodes of each tier >= 1, plus the root */
-final class LruTierCache(nodesPerTier: Int) extends TierCache:
+/** Keeps the most recently used `nodesPerTier` nodes of each tier >= 1, plus the root.
+  *
+  * With `anyRoot` it keeps any root, tier 0 and an empty tree included, and concurrent misses within a generation
+  * share one read. That suits only a tree whose single writer remembers its own changes, such as a vdisk's block map:
+  * the cached root lags that writer's commits and is refreshed only by `clear()` or a fresh read.
+  */
+final class LruTierCache(nodesPerTier: Int, override val anyRoot: Boolean = false) extends TierCache:
   private val tiers = TrieMap.empty[Int, Cache[ObjectId, ListNode]]
   private val rootRef = new AtomicReference[Option[RootState]](None)
   private val clears = new AtomicLong(0)
   private val suspensions = new AtomicInteger(0)
+  // The anyRoot read in flight, and the generation it started in
+  private var sharedRead: Option[(Long, Future[RootState])] = None
 
   // Fills, clear() and the end of a suspension hold this lock, so a fill cannot pass the generation and suspension
   // checks and then land after a clear
@@ -82,10 +99,30 @@ final class LruTierCache(nodesPerTier: Int) extends TierCache:
 
   def putRoot(r: RootState, generation: Long): Unit = fillLock.synchronized:
     if suspensions.get() == 0 && generation == clears.get() then
-      if r.node.isDefined && r.root.tier >= 1 then
+      if r.cacheable && (anyRoot || r.node.isDefined && r.root.tier >= 1) then
         rootRef.set(Some(r))
       else
         dropRoot()
+
+  override def missRead(read: () => Future[RootState]): Future[RootState] =
+    if !anyRoot then
+      read()
+    else
+      val p = Promise[RootState]()
+      val joined = synchronized:
+        val g = clears.get()
+        sharedRead match
+          case Some((`g`, f)) => Some(f)
+          case _ =>
+            sharedRead = Some((g, p.future))
+            None
+      joined.getOrElse:
+        read().onComplete { r =>
+          synchronized:
+            if sharedRead.exists(_._2 eq p.future) then sharedRead = None
+          p.complete(r)
+        }(using ExecutionContext.parasitic)
+        p.future
 
   def dropRoot(): Unit = rootRef.set(None)
 

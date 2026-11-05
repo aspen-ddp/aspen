@@ -2,15 +2,17 @@ package org.aspen_ddp.aspen.client.internal.transaction
 
 import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
-import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, StopRetrying, Transaction, TransactionCreationError, UnknownStoragePool}
+import org.aspen_ddp.aspen.client.{AspenClient, FinalizationAction, FinalizationActionFactory, RegisteredTypeFactory, Transaction}
+import org.aspen_ddp.aspen.client.internal.transaction.MissedUpdateMarker.MissedUpdate
 import org.aspen_ddp.aspen.common.HLCTimestamp
-import org.aspen_ddp.aspen.common.objects.{Key, ObjectId, ObjectPointer, Value}
+import org.aspen_ddp.aspen.common.objects.{ObjectId, ObjectPointer, Value}
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription}
+import org.aspen_ddp.aspen.common.transaction.{FinalizationActionId, SerializedFinalizationAction, TransactionDescription, TransactionId}
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 
-import scala.concurrent.duration.{Duration, MILLISECONDS}
+import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
 class MissedUpdateFinalizationAction(val client: AspenClient,
@@ -24,6 +26,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
 
   private val completionPromise: Promise[Unit] = Promise()
 
+  // Never marked: a store that misses a lock has nothing to repair, and since the lock doesn't change the object, its
+  // timestamp would not reach this transaction's until some later write, so the entry could not be cleared before then.
+  // A store whose lock failed because its copy is behind was marked by the transaction that wrote the newer copy.
+  private lazy val lockOnly: Set[ObjectId] = txd.lockOnlyObjects
+
   logger.debug(s"Created MissedUpdateFinalizationAction for Tx ${txd.transactionId}")
 
   def complete: Future[Unit] = completionPromise.future
@@ -31,10 +38,11 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
   override def updateCommitErrors(commitErrors: Map[StoreId, List[ObjectId]]): Unit = synchronized {
     this.commitErrors = commitErrors
 
-    if txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.nonEmpty) then
+    if txd.allDataStores.size == commitErrors.keysIterator.toSet.size && !commitErrors.valuesIterator.exists(_.exists(!lockOnly.contains(_))) then
       logger.trace(s"All stores responded to commit of tx ${txd.transactionId} without error. No MissedUpdates.")
       markTask.foreach(_.cancel())
       if (!completionPromise.isCompleted)
+        MissedUpdateFinalizationAction.report.recordClean()
         completionPromise.success(())
   }
 
@@ -55,21 +63,24 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     // Build a map from ObjectId to ObjectPointer to recover pointers for ids in commitErrors
     val idToPointer = txd.allReferencedObjectsSet.map(ptr => ptr.id -> ptr).toMap
 
-    val errors = txd.allDataStores.foldLeft(List[(StoreId, ObjectId, Array[Byte])]()) { (l, storeId) =>
+    val errors = txd.allDataStores.foldLeft(List[MissedUpdate]()) { (l, storeId) =>
       commitErrors.get(storeId) match
         case None =>
-          txd.allHostedObjects(storeId).map(ptr => (storeId, ptr.id, ptr.storePointer)) ++ l
+          txd.allHostedObjects(storeId).filterNot(ptr => lockOnly.contains(ptr.id))
+            .map(ptr => MissedUpdate(storeId, ptr.id, txd.startTimestamp, ptr.storePointer)) ++ l
         case Some(lst) =>
           // Note: this case is not reachable today (ids in commitErrors come from RequirementsChecker,
           // which only reports r.objectPointer.id from this same txd's requirements), but we handle it
           // defensively by looking up pointers from allReferencedObjectsSet, falling back to EmptyArray.
-          lst.map { objectId =>
+          lst.filterNot(lockOnly.contains).map { objectId =>
             val storePointer = idToPointer.get(objectId).map(_.storePointer).getOrElse(ObjectPointer.EmptyArray)
-            (storeId, objectId, storePointer)
+            MissedUpdate(storeId, objectId, txd.startTimestamp, storePointer)
           } ++ l
     }
 
-    Future.sequence(errors.map(t => markMissedUpdate(t._1, t._2, t._3))).foreach { _ =>
+    reportMarks(errors.map(_.store))
+
+    client.missedUpdateMarker.mark(errors).foreach { _ =>
       synchronized {
         if (!completionPromise.isCompleted)
           completionPromise.success(())
@@ -77,48 +88,18 @@ class MissedUpdateFinalizationAction(val client: AspenClient,
     }
   }
 
-  // Test seam: lets a test observe the transaction markMissedUpdate is about to commit
-  private[aspen] def commitErrorTreeTransaction(tx: Transaction): Future[Unit] = tx.commit().map(_ => ())
-
-  def markMissedUpdate(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte]): Future[Unit] = {
-    //println(s"Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
-
-    def onFail(err: Throwable): Future[Unit] = { err match {
-      case err: UnknownStoragePool =>
-        // StoragePool must have been deleted
-        throw StopRetrying(err)
-
-      // Always permanent. Other errors stay on the retry path: the error tree deletes entries, so a
-      // join racing the insert's scan can raise a transient InvalidObject.
-      case err: TransactionCreationError => throw StopRetrying(err)
-
-      case _ => Future.unit
-    }}
-
-    val keyBytes = new Array[Byte](17)
-    val bb = ByteBuffer.wrap(keyBytes)
-    bb.order(ByteOrder.BIG_ENDIAN)
-    bb.put(storeId.poolIndex)
-    bb.putLong(objectId.uuid.getMostSignificantBits)
-    bb.putLong(objectId.uuid.getLeastSignificantBits)
-
-    val key = Key(keyBytes)
-
-    client.retryStrategy.retryUntilSuccessful(onFail) {
-      logger.trace(s"Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
-      for {
-        pool <- client.getStoragePool(storeId.poolId)
-        tx = client.newTransaction()
-        _ <- pool.errorTree.set(key,
-               MissedUpdateFinalizationAction.encodeErrorEntry(txd.startTimestamp, storePointer))(using tx)
-        _ = MissedUpdateFinalizationAction.limitTracking(storeId.poolId, tx)
-        _ <- commitErrorTreeTransaction(tx)
-      } yield {
-        logger.trace(s"COMPLETED - Marking missed update for Tx ${txd.transactionId}. Store: ${storeId} Object: $objectId")
-        ()
-      }
-    }
-  }
+  /** Marks are normally trace only, and a burst of them can overwhelm the system, so they're summarized once a second */
+  private def reportMarks(stores: List[StoreId]): Unit =
+    import MissedUpdateFinalizationAction.report
+    if stores.nonEmpty then
+      val noReply = stores.count(!commitErrors.contains(_))
+      val age = (HLCTimestamp.now - txd.startTimestamp).toMillis
+      if report.recordMarks(txd.transactionId, stores, noReply, age) then
+        val task = client.backgroundTaskManager.schedule(MissedUpdateFinalizationAction.reportPeriod) {
+          report.take().foreach(s => logger.warn(s"$s. Entries waiting to be written: ${client.missedUpdateMarker.queued}"))
+        }
+        if task == BackgroundTaskManager.ShutdownTask then
+          report.take()
 }
 
 object MissedUpdateFinalizationAction extends RegisteredTypeFactory with FinalizationActionFactory {
@@ -132,7 +113,67 @@ object MissedUpdateFinalizationAction extends RegisteredTypeFactory with Finaliz
     if tx.referencedPoolIds.contains(entryPool) then
       tx.disableMissedUpdateTracking()
 
-  var errorTimeout = Duration(250, MILLISECONDS)
+  /** How long stores have to report a commit before they're marked as having missed it, which schedules them for repair.
+    * Ordinary load delays a commit by far more than a disk or network hiccup would. The finalizer holds up TxFinalized
+    * meanwhile, so this must stay well below `Host.txHeartbeatTimeout`, when stores start recovering a lost TxFinalized.
+    */
+  var errorTimeout: Duration = Duration(2, SECONDS)
+
+  private val reportPeriod = Duration(1, SECONDS)
+
+  private val report = new MissedUpdateReport
+
+  /** Totals of the missed updates marked since the last report, for a periodic log line */
+  private[aspen] class MissedUpdateReport:
+    private var clean = 0L
+    private var executions = 0L
+    private var transactions: Set[TransactionId] = Set()
+    private var marks = 0L
+    private var noReply = 0L
+    private var perStore: Map[StoreId, Long] = Map()
+    private var totalAge = 0L
+    private var maxAge = 0L
+
+    /** A transaction whose stores all replied in time, so it marked nothing */
+    def recordClean(): Unit = synchronized:
+      clean += 1
+
+    /** Records one execution's marks, one store per mark.
+      *
+      * @param noReplyMarks how many of them are for stores that never replied. The others reported a commit error
+      * @param ageMillis the time since the transaction started
+      * @return true if a report is now due and nothing has arranged for it yet
+      */
+    def recordMarks(txid: TransactionId, stores: List[StoreId], noReplyMarks: Int, ageMillis: Long): Boolean = synchronized:
+      val firstOfReport = executions == 0
+      executions += 1
+      transactions += txid
+      marks += stores.size
+      noReply += noReplyMarks
+      stores.foreach(s => perStore = perStore.updated(s, perStore.getOrElse(s, 0L) + 1))
+      totalAge += ageMillis
+      maxAge = math.max(maxAge, ageMillis)
+      firstOfReport
+
+    /** The report if there's anything to report, and starts the next one */
+    def take(): Option[String] = synchronized:
+      if executions == 0 then
+        None
+      else
+        val stores = perStore.toList.sortBy((store, count) => (-count, store.toString)).map((store, count) => s"$store=$count")
+        val text = s"Missed updates since last report: $marks marks ($noReply with no reply from the store, " +
+          s"${marks - noReply} with a commit error) from ${transactions.size} transactions in $executions executions. " +
+          s"Transactions with no marks: $clean. Time since transaction start: average ${totalAge / executions}ms, " +
+          s"max ${maxAge}ms. Marks per store: ${stores.mkString(" ")}"
+        clean = 0
+        executions = 0
+        transactions = Set()
+        marks = 0
+        noReply = 0
+        perStore = Map()
+        totalAge = 0
+        maxAge = 0
+        Some(text)
 
   /** An errorTree entry's value: the missed transaction's start timestamp, big-endian, then the
     * object's storePointer bytes (possibly empty).

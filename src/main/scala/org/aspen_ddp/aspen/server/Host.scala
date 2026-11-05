@@ -83,6 +83,19 @@ object Host:
   private final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int, scansLeft: Int,
                                      onServed: Option[() => Unit] = None)
 
+  /** How long a store's Tx may sit idle before the store drives it itself. This is how a lost TxFinalized is recovered */
+  def txHeartbeatTimeout(heartbeatPeriod: Duration): Duration = heartbeatPeriod * 5
+
+  /** Outlasts an idle Tx being noticed, one heartbeat after its timeout, so that the driver then started learns the
+    * outcome from the stores' status caches. Without those the stores would treat its prepare as a new transaction
+    * and report a committed one as aborted.
+    */
+  def txStatusCacheDuration(heartbeatPeriod: Duration): FiniteDuration =
+    FiniteDuration((heartbeatPeriod * 7).toNanos, NANOSECONDS)
+
+  /** Each tick is a transaction per running system task, so it is not tied to the transaction heartbeat */
+  val SystemTaskHeartbeatPeriod: Duration = Duration(5, SECONDS)
+
   /** Longest wait between load retries of a store whose device is out of space */
   val SpaceRetryCap: Duration = Duration(5, MINUTES)
 
@@ -97,6 +110,8 @@ object Host:
   private case class Exit() extends Event
   private case class RecoveryEvent() extends Event
   private case class HeartbeatEvent() extends Event
+
+  private case class SystemTaskHeartbeatEvent() extends Event
   private case class CheckAllDevices() extends Event
   private case class ScanDevices() extends Event
   private case class ShutdownMarkerResolved(path: os.Path,
@@ -291,7 +306,7 @@ class Host(val client: AspenClient,
 
   private val ioHandler = new IOHandler(this)
 
-  private val txStatusCache = new TransactionStatusCache()
+  private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod))
 
   private val crl = crlFactory.createCRL()
 
@@ -449,6 +464,10 @@ class Host(val client: AspenClient,
 
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
     events.put(HeartbeatEvent())
+  }
+
+  private val systemTaskHeartbeatTask = backgroundTasks.schedulePeriodic(Host.SystemTaskHeartbeatPeriod) {
+    events.put(SystemTaskHeartbeatEvent())
   }
   
   private val checkStorageDeviceTask = backgroundTasks.schedulePeriodic(checkStorageDevicePeriod) {
@@ -3605,6 +3624,7 @@ class Host(val client: AspenClient,
     pendingStartTask.cancel()
     gossipRetransmitTask.cancel()
     heartbeatTask.cancel()
+    systemTaskHeartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
     usageUpdateTask.foreach(_.cancel())
     repairService.cancel()
@@ -3836,7 +3856,7 @@ class Host(val client: AspenClient,
 
           case Right(trs) =>
             val store = new Store(storageDeviceId, ec, backend, objectCacheFactory(backend.storeId), net, backgroundTasks, crl,
-              txStatusCache,finalizerFactory, txDriverFactory, heartbeatPeriod*8, maxSliceSize)
+              txStatusCache,finalizerFactory, txDriverFactory, Host.txHeartbeatTimeout(heartbeatPeriod), maxSliceSize)
             backend.setCompletionHandler(ioHandler)
             stores += (backend.storeId -> store)
             offlineStores -= backend.storeId
@@ -3889,6 +3909,8 @@ class Host(val client: AspenClient,
       case HeartbeatEvent() =>
         //logger.trace("Main loop got heartbeat event")
         stores.valuesIterator.foreach(_.heartbeat())
+
+      case SystemTaskHeartbeatEvent() =>
         if systemTaskRunnerPromise.isCompleted then
           systemTaskRunnerPromise.future.foreach(_.heartbeat())
 

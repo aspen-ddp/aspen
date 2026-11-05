@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, KeyOrderin
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.scalatest.funsuite.AnyFunSuite
 
-import scala.concurrent.Promise
+import scala.concurrent.{ExecutionContext, Future, Promise}
 
 class TierCacheSuite extends AnyFunSuite:
 
@@ -58,6 +58,46 @@ class TierCacheSuite extends AnyFunSuite:
     assert(c.root.contains(rs))
     c.putRoot(rootState(0, Some(n)), c.generation)
     assert(c.root.isEmpty)
+
+  test("an anyRoot LruTierCache caches tier 0 and empty roots, but not a stand-in"):
+    val c = new LruTierCache(5, anyRoot = true)
+    val tier0 = rootState(0, Some(stub(1)))
+    c.putRoot(tier0, c.generation)
+    assert(c.root.contains(tier0))
+    val empty = rootState(0, None)
+    c.putRoot(empty, c.generation)
+    assert(c.root.contains(empty))
+    c.putRoot(empty.copy(cacheable = false), c.generation)
+    assert(c.root.isEmpty)
+
+  test("concurrent misses of an anyRoot LruTierCache share one read, and a clear starts a new one"):
+    given ExecutionContext = ExecutionContext.parasitic
+    val c = new LruTierCache(5, anyRoot = true)
+    var reads = List.empty[Promise[RootState]]
+    def read(): Future[RootState] =
+      val p = Promise[RootState]()
+      reads = p :: reads
+      p.future
+    val misses = List.fill(100)(RootManager.cachedRead(c, fresh = false)(read()))
+    assert(reads.size == 1)
+    c.clear()
+    val afterClear = RootManager.cachedRead(c, fresh = false)(read())
+    assert(reads.size == 2)
+    val rs = rootState(0, None)
+    reads.foreach(_.success(rs))
+    assert(misses.forall(_.value.exists(_.toOption.contains(rs))))
+    assert(afterClear.value.exists(_.toOption.contains(rs)))
+    // Only the read started after the clear fills the cache
+    assert(c.root.contains(rs))
+    RootManager.cachedRead(c, fresh = false)(read())
+    assert(reads.size == 2)
+
+  test("misses of a default LruTierCache each read"):
+    given ExecutionContext = ExecutionContext.parasitic
+    val c = new LruTierCache(5)
+    var reads = 0
+    List.fill(3)(RootManager.cachedRead(c, fresh = false) { reads += 1; Promise[RootState]().future })
+    assert(reads == 3)
 
   test("LruTierCache does not cache a root without a node"):
     val c = new LruTierCache(5)

@@ -89,8 +89,14 @@ class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext)
   protected def writeBatch(writeOpts: WriteOptions, batch: WriteBatch): Unit =
     db.write(writeOpts, batch)
 
-  private def commit(batch:WriteBatch, promise: Promise[Unit]): Unit = Future {
+  private def commit(batch:WriteBatch, promise: Promise[Unit]): Unit =
+    val submitted = System.nanoTime()
+    Future(commitOnPool(batch, promise, submitted))
+
+  private def commitOnPool(batch:WriteBatch, promise: Promise[Unit], submitted: Long): Unit = {
     val opCount = batch.count()
+    val started = System.nanoTime()
+    BackendTiming.report.record("rocksdb pool wait", started - submitted)
 
     val result = Try {
       val writeOpts = new WriteOptions()
@@ -100,6 +106,7 @@ class BufferedConsistentRocksDB(val dbPath: os.Path)(using ec: ExecutionContext)
         beginOperation()
         try {
           writeBatch(writeOpts, batch)
+          BackendTiming.report.record("rocksdb write (ops)", System.nanoTime() - started, opCount)
         } finally {
           endOperation()
         }

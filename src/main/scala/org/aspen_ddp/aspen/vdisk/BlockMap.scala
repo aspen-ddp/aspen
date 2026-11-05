@@ -34,8 +34,9 @@ final class BlockMap(tree: DataObjectTKVL):
     started.foreach(p => p.completeWith(fetch(index)))
     result
 
-  /** Reads the entry from the tree, bypassing what is held in memory, and holds the result */
+  /** Reads the entry from the tree, bypassing what is held in memory, the tree's cache included, and holds the result */
   def refresh(index: Long): Future[Option[DataObjectPointer]] =
+    tree.rootManager.cache.clear()
     tree.get(Key(index)).map: ov =>
       val r = ov.map(v => DataObjectPointer(v.bytes))
       synchronized:

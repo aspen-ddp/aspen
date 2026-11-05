@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.vdisk
 import java.util.{Arrays, UUID}
 
 import org.aspen_ddp.aspen.client.{AspenClient, DataObjectRangeState, ObjectAllocator, StopRetrying}
-import org.aspen_ddp.aspen.client.tkvl.KVObjectRootManager
+import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, LruTierCache, TierCache}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, ObjectRevision}
 import org.aspen_ddp.aspen.vdisk.BlockCommitter.{DataCommit, DataInput, MapEntry, MapResult, PendingDelete}
 import org.aspen_ddp.aspen.vdisk.VDiskError.*
@@ -884,7 +884,9 @@ object VirtualDisk:
     for
       info <- DiskCatalog.load(client, name)
       (_, fenceRevision) <- DiskCatalog.takeOwnership(client, info, UUID.randomUUID())
-      tree <- KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer).getDataObjectTree()
+      // The owner is the map's only writer and BlockMap remembers its changes, so any root can be cached
+      tree <- KVObjectRootManager(client, DiskConfig.MapRootKey, info.configPointer,
+        LruTierCache(TierCache.DefaultNodesPerTier, anyRoot = true)).getDataObjectTree()
       allocator <- client.getAllocator(info.allocatorId)
     yield
       new VirtualDisk(client, info, fenceRevision, BlockMap(tree), allocator, config)

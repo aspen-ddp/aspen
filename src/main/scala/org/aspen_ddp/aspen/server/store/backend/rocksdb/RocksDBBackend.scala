@@ -277,12 +277,14 @@ class RocksDBBackend(dbPath: os.Path,
 
   override def commit(state: CommitState, transactionId: TransactionId): Unit = {
     chandler.foreach { handler =>
+      val start = System.nanoTime()
       val fcommit = if (state.metadata.refcount.count == 0)
         db.delete(tokey(state.objectId))
       else
         db.put(tokey(state.objectId), encodeDBValue(state.objectType, state.metadata, state.data))
 
       fcommit.foreach { _ =>
+        BackendTiming.report.record("rocksdb commit", System.nanoTime() - start)
         handler.complete(Commit(storeId, state.objectId, transactionId, Left(())))
       }
     }

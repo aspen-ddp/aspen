@@ -15,9 +15,12 @@ import scala.util.control.NonFatal
 /** The send side of one QUIC connection: a lock-free handoff from caller threads to the connection's event loop,
   * a bounded pre-handshake queue, datagram writes, and a round-robin pool of unidirectional streams.
   *
-  * Nothing is ever queued to avoid a drop. A message is dropped (released, counted in `drops`, logged at debug
-  * with rate limiting) when the handoff or pre-handshake budget is exceeded, when no stream is writable, when the
-  * peer cannot take the datagram, when its write fails, or when the connection closes before it is written.
+  * Nothing is ever queued to avoid a drop. A message is dropped (released, counted in `drops`, logged as a warning
+  * with rate limiting) when the connection's send budget (see `QuicConfig`, shared with the other connections
+  * through `sendBudget`) or the pre-handshake bound is exceeded, when no stream is writable, when the peer cannot
+  * take the datagram, when its write fails, or when the connection closes before it is written. During a burst of
+  * datagrams, datagram-sized messages are written to a stream instead, since quiche drops them once its datagram
+  * queue is full and Netty reports those writes as successful.
   *
   * All methods except those marked "any thread" must run on `loop`. `loop` must be the event loop of the
   * `QuicChannel` later passed to `attach`.
@@ -34,12 +37,16 @@ import scala.util.control.NonFatal
 final class QuicConnection(val loop: EventLoop,
                            config: QuicConfig,
                            onClosed: QuicConnection => Unit,
-                           onActive: QuicConnection => Unit = _ => ()) extends Logging:
+                           onActive: QuicConnection => Unit = _ => (),
+                           sendBudget: SendBudget = null) extends Logging:
   import QuicConnection.*
 
-  private val budget = config.connectionBudgetBytes
+  private val pool = if sendBudget != null then sendBudget else new SendBudget(config.sendBudgetBytes)
+  private val floor = config.connectionFloorBytes
+  private val ceiling = config.connectionCeilingBytes
   private val nStreams = config.streamsPerConnection
-  private val streamHighWater = math.max(1L, budget / nStreams).min(Int.MaxValue.toLong).toInt
+  private val streamHighWater = math.max(1L, ceiling / nStreams).min(Int.MaxValue.toLong).toInt
+  private val datagramFallbackAt = math.max(1, config.datagramQueueLength / 2).toDouble
   private val streamWaterMark = new WriteBufferWaterMark(streamHighWater / 2, streamHighWater)
 
   // ---- Shared between threads ----------------------------------------------------------------------------------
@@ -67,6 +74,10 @@ final class QuicConnection(val loop: EventLoop,
   private val inFlight = new java.util.HashSet[ChannelFuture]()
   private val waitingBarriers = new java.util.HashSet[Promise[Void]]()
   private var datagramsTouched = false
+  // See datagramBurst: datagrams written since the last flush, and those flushed before, decaying since that flush
+  private var unflushedDatagrams = 0
+  private var flushedDatagramLoad = 0.0
+  private var lastDatagramFlushNanos = System.nanoTime()
   private val touchedStreams = new java.util.ArrayList[QuicStreamChannel](nStreams)
   private var lastWriteNanos = System.nanoTime() // last outbound datagram or stream write, keepalives included
   private var keepaliveNanos = 0L // 0: keepalive not started
@@ -93,7 +104,7 @@ final class QuicConnection(val loop: EventLoop,
       drop(enc, "connection closed")
       false
     else if !reserve(enc.size) then
-      drop(enc, "handoff budget exceeded")
+      drop(enc, "send budget exceeded")
       false
     else
       handoff.add(enc)
@@ -141,8 +152,8 @@ final class QuicConnection(val loop: EventLoop,
   /** The most bytes ever pending on a single stream, sampled after each stream write */
   private[quic] def maxPendingStreamBytes: Long = maxPending
 
-  /** What a message of `size` bytes counts against the handoff and pre-handshake budgets: its size, capped at the
-    * per-stream high-water mark.
+  /** What a message of `size` bytes counts against the send budget while it is handed off, and against the
+    * pre-handshake bound: its size, capped at the per-stream high-water mark.
     *
     * The cap is there because the loop drains the handoff only when it is next scheduled, so back-to-back submits from
     * one thread see their predecessors still queued. Uncapped, a second message at least as large as the budget would
@@ -152,19 +163,32 @@ final class QuicConnection(val loop: EventLoop,
     */
   private def charge(size: Long): Long = math.min(size, streamHighWater.toLong)
 
-  /** Accepts while the charged bytes queued are below the budget, so they overshoot it by at most one message */
+  /** Whether a connection using `used` bytes may take another message: below its floor, or below its ceiling while
+    * the shared budget has room. The check comes before the charge, so usage overshoots by at most one message.
+    * Any thread.
+    */
+  private def admits(used: Long): Boolean = used < floor || (used < ceiling && pool.hasRoom)
+
+  /** Charges a message to the handoff, and to the shared budget, if the connection admits it */
   private def reserve(size: Long): Boolean =
     val c = charge(size)
     var done = false
     var ok = false
     while !done do
       val cur = queuedBytes.get()
-      if cur >= budget then
+      if !admits(cur + pendingTotal) then
         done = true
       else if queuedBytes.compareAndSet(cur, cur + c) then
+        pool.add(c)
         ok = true
         done = true
     ok
+
+  /** Returns a message's handoff charge. Any thread. */
+  private def unreserve(size: Long): Unit =
+    val c = charge(size)
+    queuedBytes.addAndGet(-c)
+    pool.add(-c)
 
   private def scheduleDrain(): Unit =
     if drainScheduled.compareAndSet(false, true) then
@@ -183,7 +207,7 @@ final class QuicConnection(val loop: EventLoop,
     while item != null do
       item match
         case enc: Encoded =>
-          queuedBytes.addAndGet(-charge(enc.size))
+          unreserve(enc.size)
           drop(enc, "connection closed")
         case b: Barrier => b.promise.trySuccess(null)
       item = handoff.poll()
@@ -191,17 +215,20 @@ final class QuicConnection(val loop: EventLoop,
   /** Any thread */
   private def drop(enc: Encoded, reason: String): Unit =
     enc.release()
-    countDrop(reason)
+    countDrop(reason, enc.size)
 
   /** Any thread */
-  private def countDrop(reason: String): Unit =
+  private def countDrop(reason: String, size: Long = 0): Unit =
     dropCount.incrementAndGet()
     dropsSinceLog.incrementAndGet()
     val now = System.nanoTime()
     val last = lastDropLog.get()
     if now - last >= DropLogIntervalNanos && lastDropLog.compareAndSet(last, now) then
       val n = dropsSinceLog.getAndSet(0)
-      logger.debug(s"QUIC connection ${remoteName}: dropped $n message(s) since last report (latest: $reason)")
+      val mib = 1024 * 1024
+      logger.warn(s"QUIC connection ${remoteName}: dropped $n message(s) since last report (latest: $reason, " +
+        s"$size bytes). Queued on this connection: ${queuedBytes.get() / mib} MiB handed off, ${pendingTotal / mib} MiB " +
+        s"on streams, ceiling ${ceiling / mib} MiB. Host: ${pool.usedBytes / mib} of ${pool.capacity / mib} MiB")
 
   private def remoteName: String =
     val ch = channel
@@ -318,7 +345,7 @@ final class QuicConnection(val loop: EventLoop,
       while item != null do
         n += 1
         item match
-          case enc: Encoded => queuedBytes.addAndGet(-charge(enc.size))
+          case enc: Encoded => unreserve(enc.size)
           case _ => ()
         if active then
           process(item)
@@ -330,8 +357,8 @@ final class QuicConnection(val loop: EventLoop,
 
   private def holdUntilAttached(item: AnyRef): Unit = item match
     case enc: Encoded =>
-      // Same rule and charge as the handoff: accepted while below the budget
-      if preHandshakeBytes >= budget then
+      // Accepted while below its own bound, which takes nothing from the shared budget
+      if preHandshakeBytes >= config.preHandshakeBytes then
         drop(enc, "pre-handshake budget exceeded")
       else
         preHandshakeBytes += charge(enc.size)
@@ -342,7 +369,7 @@ final class QuicConnection(val loop: EventLoop,
     case b: Barrier => startBarrier(b.promise)
     case enc: Encoded =>
       try
-        if enc.isDatagram then
+        if enc.isDatagram && !datagramBurst() then
           sendDatagram(enc)
         else
           sendStream(enc)
@@ -361,12 +388,25 @@ final class QuicConnection(val loop: EventLoop,
       val f = ch.write(enc.toDatagram(ch.alloc()))
       lastWriteNanos = System.nanoTime()
       datagramsTouched = true
+      unflushedDatagrams += 1
       track(f, null, 0)
 
+  /** Whether this connection has written enough datagrams lately that quiche's datagram queue may be filling: about
+    * half its length. Netty gives no view of that queue, and once it is full the datagrams written are dropped while
+    * their writes succeed. Datagrams reach the queue only at a flush, so every one written since the last flush
+    * counts; those flushed before count less as the queue empties, decaying over DatagramLoadDecayNanos.
+    */
+  private def datagramBurst(): Boolean =
+    flushedLoad(System.nanoTime()) + unflushedDatagrams >= datagramFallbackAt
+
+  private def flushedLoad(now: Long): Double =
+    flushedDatagramLoad * math.exp(-(now - lastDatagramFlushNanos).toDouble / DatagramLoadDecayNanos)
+
   private def sendStream(enc: Encoded): Unit =
-    val slot = pickStream()
+    // The per-stream high-water marks (pickStream) hold pending bytes to about the ceiling
+    val slot = if pendingTotal < floor || pool.hasRoom then pickStream() else null
     if slot == null then
-      drop(enc, "no writable stream")
+      drop(enc, "no writable stream or send budget exceeded")
     else
       val s = slot.stream
       val size = enc.size
@@ -422,6 +462,7 @@ final class QuicConnection(val loop: EventLoop,
     if slot != null then
       slot.pending += size
       pendingTotal += size
+      pool.add(size)
     if f.isDone then
       writeDone(f, slot, size)
     else
@@ -434,6 +475,7 @@ final class QuicConnection(val loop: EventLoop,
     if slot != null then
       slot.pending -= size
       pendingTotal -= size
+      pool.add(-size)
     if !f.isSuccess then
       // Netty releases the message of a failed write
       countDrop(s"write failed: ${f.cause()}")
@@ -455,6 +497,10 @@ final class QuicConnection(val loop: EventLoop,
   private def flushTouched(): Unit =
     if datagramsTouched then
       datagramsTouched = false
+      val now = System.nanoTime()
+      flushedDatagramLoad = flushedLoad(now) + unflushedDatagrams
+      unflushedDatagrams = 0
+      lastDatagramFlushNanos = now
       channel.flush()
     if !touchedStreams.isEmpty then
       touchedStreams.forEach(_.flush())
@@ -462,6 +508,7 @@ final class QuicConnection(val loop: EventLoop,
 
 object QuicConnection:
   private val DropLogIntervalNanos: Long = TimeUnit.SECONDS.toNanos(1)
+  private val DatagramLoadDecayNanos: Double = TimeUnit.MILLISECONDS.toNanos(10).toDouble
 
   /** The single byte of a keepalive datagram. See `startKeepalive`. */
   val KeepaliveByte: Int = 0

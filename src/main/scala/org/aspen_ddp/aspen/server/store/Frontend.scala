@@ -8,16 +8,22 @@ import org.aspen_ddp.aspen.common.store.{ReadState, StoreId}
 import org.aspen_ddp.aspen.common.transaction.{RefcountUpdate, TransactionDescription, TransactionDisposition, TransactionId, TransactionStatus}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{Backend, Commit, CommitState, Completion, Read}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendTiming, Commit, CommitState, Completion, Read}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 
+import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{Future, Promise}
 
 
 object Frontend {
+
+  /** How long a store withholds its vote from drivers' prepares while waiting for a client's object data.
+    * Several client retransmissions long, since the only cost of a late abort is a client retry.
+    */
+  val MissingDataWait: Duration = Duration(5, SECONDS)
 
   sealed abstract class ReadKind
 
@@ -37,11 +43,16 @@ class Frontend(val storeId: StoreId,
                val crl: CrashRecoveryLog,
                val statusCache: TransactionStatusCache,
                /** The store's effective slice size limit, enforced by its transactions. None means unlimited. */
-               val maxSliceSize: Option[Long] = None) extends Logging {
+               val maxSliceSize: Option[Long] = None,
+               val missingDataWait: Duration = Frontend.MissingDataWait) extends Logging {
 
   import Frontend._
 
   var transactions: Map[TransactionId, Tx] = Map()
+
+  /** When each outstanding backend commit began, to time it as the store sees it: BackendTiming */
+  private val commitStarts = scala.collection.mutable.HashMap[(ObjectId, TransactionId), Long]()
+  private val commitStage = s"store commit (${backend.getClass.getSimpleName})"
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
@@ -144,6 +155,7 @@ class Frontend(val storeId: StoreId,
       discard(os.objectId)
     else
       objectCache.insert(os)
+    commitStarts((cs.objectId, txid)) = System.nanoTime()
     backend.commit(cs, txid)
 
   /** Called when a transaction takes `os` for one of its objects. A state that only this transaction can know, such
@@ -248,6 +260,8 @@ class Frontend(val storeId: StoreId,
   def backendOperationComplete(completion: Completion): Unit = completion match {
     case r: Read => backendReadComplete(r.objectId, r.result)
     case c: Commit =>
+      commitStarts.remove((c.objectId, c.transactionId)).foreach: start =>
+        BackendTiming.report.record(commitStage, System.nanoTime() - start)
       // commit() cached the new state before the backend stored it. The backend refused it, so the cache must not
       // serve it: reads would return state the store does not hold, and readObjectForRepair would see a repair as
       // already applied. Evicting a newer cached state too only costs a backend read.

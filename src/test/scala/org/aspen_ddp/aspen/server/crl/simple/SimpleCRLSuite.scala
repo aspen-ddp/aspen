@@ -593,6 +593,51 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
+  test("A save with object data the transaction's earlier saves lacked is written and recovered") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+
+    def save(state: TransactionRecoveryState): Unit =
+      val q = new LinkedBlockingQueue[String]()
+      i.crl.save(transactionId, state, () => q.put(""))
+      assert(q.poll(10, TimeUnit.SECONDS) == "", "the CRL did not complete the save")
+
+    save(trsValidTxd.copy(objectUpdates = Nil))
+    save(trsValidTxd)
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.objectUpdates.map(_.objectId) == List(ou1.objectId, ou2.objectId))
+    assert(i2.trsList.head.objectUpdates.map(_.data.getByteArray.toList) ==
+      List(oud1.getByteArray.toList, oud2.getByteArray.toList))
+
+    i2.crl.shutdown()
+  }
+
+  test("A dead CRL thread is reported") {
+    val died = new LinkedBlockingQueue[Throwable]()
+    val i = SimpleCRL(tdir, 3, 8192, t => died.put(t))
+
+    // An entry larger than a whole stream cannot be written
+    val tooBig = ObjectUpdate(ou1.objectId, DataBuffer(new Array[Byte](8192)))
+    i.crl.save(transactionId, trsValidTxd.copy(objectUpdates = List(tooBig)), () => ())
+
+    assert(died.poll(10, TimeUnit.SECONDS).isInstanceOf[IllegalArgumentException])
+  }
+
+  test("A dead CRL writer thread is reported") {
+    val died = new LinkedBlockingQueue[Throwable]()
+    val i = SimpleCRL(tdir, 3, 1024 * 1024, t => died.put(t))
+    val err = new RuntimeException("completion handler failed")
+
+    // Completion handlers run on the writer thread
+    i.crl.save(transactionId, trsValidTxd, () => throw err)
+
+    assert(died.poll(10, TimeUnit.SECONDS) eq err)
+  }
+
   test("Recovery preserves latest paxos state after multiple saves") {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
 

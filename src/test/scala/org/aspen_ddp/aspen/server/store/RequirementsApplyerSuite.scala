@@ -6,7 +6,7 @@ import org.aspen_ddp.aspen.common.ida.{AppendDelta, RandomAccessReedSolomon, Rep
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, KeyValueObjectPointer, KeyValueOperation, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType}
 import org.aspen_ddp.aspen.common.pool.PoolId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, RefcountUpdate, TransactionId}
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, RefcountUpdate, RevisionMismatch, TransactionId}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -97,6 +97,7 @@ class RequirementsApplyerSuite extends AnyFunSuite with Matchers {
     val result = RequirementsApplyer.apply(tx1, HLCTimestamp.now, List(req), objects, updates)
 
     assert(result.skipped == Set(oid1))
+    assert(result.skippedReasons(oid1).isInstanceOf[RevisionMismatch])
     assert(result.failed.isEmpty)
 
     // The object must be left untouched

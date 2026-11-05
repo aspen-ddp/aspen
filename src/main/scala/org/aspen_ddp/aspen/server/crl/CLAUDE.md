@@ -7,3 +7,5 @@
 - Implemented as a series of fixed-size, write-only files that are continually recycled.
 - Functions similar to a circular buffer when the oldest "live" data is copied to the head of the buffer whenever it
   is about to overwrite that live data.
+- Stores vote only after a save completes, so a dead CRL thread stops every transaction while reads keep working.
+  `onThreadDeath` reports it; the `host` command halts the process

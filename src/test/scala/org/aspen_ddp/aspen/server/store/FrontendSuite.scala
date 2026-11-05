@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryStat
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
-import org.aspen_ddp.aspen.server.transaction.TransactionStatusCache
+import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -41,10 +41,13 @@ object FrontendSuite {
 
     var cr: Option[ClientResponse] = None
     var tx: Option[TxMessage] = None
+    var sentTx: List[TxMessage] = Nil
 
     override def sendClientResponse(msg: ClientResponse): Unit = cr = Some(msg)
 
-    override def sendTransactionMessage(msg: TxMessage): Unit = tx = Some(msg)
+    override def sendTransactionMessage(msg: TxMessage): Unit =
+      tx = Some(msg)
+      sentTx = sentTx :+ msg
 
     override def sendTransactionMessages(msg: List[TxMessage]): Unit = Some(msg.head)
 
@@ -358,6 +361,177 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     disposition shouldBe TransactionDisposition.VoteAbort
   }
 
+  // ---- A prepare without the object data the store needs ----
+
+  private def dataUpdateTxd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
+
+  private def withDataless(missingDataWait: Duration = Frontend.MissingDataWait)
+                          (f: (Frontend, MapBackend, TestNet, TestCrl) => Unit): Unit =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val crl = new TestCrl
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, missingDataWait)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    val os = mkObjectState(oid1)
+    backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
+    f(frontend, backend, net, crl)
+
+  private def clientPrepare(txd: TransactionDescription) = mkPrepare(txd, fromClient = true).copy(
+    objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](7)))))
+
+  private def expectVote(net: TestNet, vote: TransactionDisposition.Value): Unit = net.txMessage() match
+    case Some(r: TxPrepareResponse) => r.disposition shouldBe vote
+    case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+
+  test("a driver's prepare that overtakes the client's data gets no vote until the data arrives") {
+    withDataless(): (frontend, backend, net, crl) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false)) // A retransmission
+      net.txMessage() shouldBe None
+      crl.txSaved shouldBe false
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      expectVote(net, TransactionDisposition.VoteCommit)
+      crl.txSaved shouldBe true
+
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      net.txMessage() match
+        case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+        case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  test("a store still waiting for data votes abort once the wait has passed") {
+    withDataless(missingDataWait = Duration.Zero): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(mkPrepare(dataUpdateTxd, fromClient = false))
+      expectVote(net, TransactionDisposition.VoteAbort)
+  }
+
+  test("a vote given without the data stands, but data that arrives later is still committed") {
+    withDataless(missingDataWait = Duration.Zero): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      expectVote(net, TransactionDisposition.VoteAbort)
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      expectVote(net, TransactionDisposition.VoteAbort)
+
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      net.txMessage() match
+        case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+        case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  test("a client's prepare without the data gets an abort vote at once: no more data is coming") {
+    withDataless(): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(mkPrepare(dataUpdateTxd, fromClient = true))
+      expectVote(net, TransactionDisposition.VoteAbort)
+  }
+
+  test("a driver's prepare needing no data from this store gets its vote at once") {
+    withDataless(): (frontend, _, net, _) =>
+      val txd = mktxd().copy(requirements = List(SharedRevisionLock(op1, rev0)))
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      expectVote(net, TransactionDisposition.VoteCommit)
+  }
+
+  private def committedMessages(net: TestNet): List[TxCommitted] = net.sentTx.collect { case c: TxCommitted => c }
+
+  test("a commit that overtakes the client's data is applied when the data arrives and reported to the designated leader") {
+    withDataless(): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      val leader = StoreId(poolId, txd.designatedLeaderUID)
+      val recoveryDriver = StoreId(poolId, 2)
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false).copy(from = recoveryDriver))
+      frontend.receiveTransactionMessage(TxResolved(storeId, recoveryDriver, txid1, committed = true))
+      committedMessages(net) shouldBe Nil
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      val committed = committedMessages(net)
+      committed should not be empty
+      committed.foreach: c =>
+        c.to shouldBe leader
+        c.objectCommitErrors shouldBe Nil
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  test("a resolution ends the wait for a vote, so a driver's later prepare is answered") {
+    withDataless(): (frontend, _, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      net.txMessage() shouldBe None
+
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      net.txMessage() should not be None
+  }
+
+  test("a client's prepare without the data ends a commit's wait: no more data is coming") {
+    withDataless(): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true))
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+  }
+
+  test("finalization ends a commit's wait for data") {
+    withDataless(): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      committedMessages(net) shouldBe Nil
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true))
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+      frontend.transactions.contains(txid1) shouldBe false
+
+      // Too late: repair restores this store
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+  }
+
+  test("finalization deletes the CRL entry of a committed transaction, whichever outcome a recovery driver reports") {
+    withDataless(): (frontend, _, _, crl) =>
+      val txd = dataUpdateTxd
+      val recoveryDriver = StoreId(poolId, 2)
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      val p = mkPrepare(txd, fromClient = false)
+      frontend.receiveTransactionMessage(p.copy(from = recoveryDriver, proposalId = ProposalId(p.proposalId.number + 1, 2.toByte)))
+      crl.txSaved shouldBe true
+      crl.txDel shouldBe false
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, recoveryDriver, txid1, committed = false))
+      crl.txDel shouldBe true
+      frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("finalization deletes the CRL entry a prepare saved after an abort") {
+    withDataless(): (frontend, _, _, crl) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
+      crl.txDel = false
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = false))
+      crl.txDel shouldBe true
+  }
+
+  test("an abort does not wait for data") {
+    withDataless(): (frontend, _, net, crl) =>
+      frontend.receiveTransactionMessage(mkPrepare(dataUpdateTxd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
+      crl.txDel shouldBe true
+      committedMessages(net) shouldBe Nil
+  }
+
   // ---- Requirement locks held between a commit vote and resolution ----
 
   val txid3 = TransactionId(new UUID(0, 11))
@@ -423,6 +597,23 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     val r2 = prepare(frontend, net, lockTxd(txid2, List(overwrite(op1))))
     r2.disposition shouldBe TransactionDisposition.VoteAbort
     r2.collisions shouldBe List(txid1)
+  }
+
+  test("a transaction holding locks is reported as stuck, at intervals, until it is applied") {
+    val (frontend, _, net) = lockFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1))))
+    val tx = frontend.transactions(txid1)
+    val start = System.nanoTime()
+
+    tx.reportIfStuck(start) shouldBe false
+
+    val late = start + Tx.StuckReportAfter.toNanos + 1000000000L
+    tx.reportIfStuck(late) shouldBe true
+    tx.reportIfStuck(late + 1) shouldBe false
+    tx.reportIfStuck(late + Tx.StuckReportEvery.toNanos) shouldBe true
+
+    resolve(frontend, net, txid1, committed = true)
+    tx.reportIfStuck(late + 2 * Tx.StuckReportEvery.toNanos) shouldBe false
   }
 
   test("locks are released when the first transaction resolves aborted") {

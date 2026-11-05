@@ -108,7 +108,7 @@ class SimpleFileRootManager(client: AspenClient,
   override def createInitialNode(contents: Map[Key,Value])(using tx: Transaction): Future[Unit] =
     for
       dos <- client.read(inodePointer)
-      RootState(root, _, onode) <- getRData(fresh = true, Some(dos))
+      RootState(root, _, onode, _) <- getRData(fresh = true, Some(dos))
 
       // Check for a race condition where multiple concurrent attempts to
       // create the initial node might clash with each other. Done before the

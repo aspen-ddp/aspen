@@ -285,7 +285,7 @@ private[vdisk] final class BlockCommitter(client: AspenClient,
 
       val olds = creates.flatMap(_.old) ++ deletes.map(_._2)
       olds.foreach(o => tx.setRefcount(o.ptr, o.refcount, o.refcount.update(0)))
-      // The disk's block objects all come from one allocator, so its deletions stay within one FSIF pool
+      // A disk's blocks may span many FSIF pools of its group; one release task covers them all
       if olds.nonEmpty then
         tx.deferAllocationRelease()
 

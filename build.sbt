@@ -26,7 +26,7 @@ lazy val root = (project in file(".")).
       "com.github.luben"                 %  "zstd-jni"                % "1.5.6-4",
       "com.github.scopt"                 %% "scopt"                   % "4.1.0",
       "com.outr"                         %% "scribe"                  % "3.19.0",
-      "com.outr"                         %% "scribe-slf4j"            % "3.19.0",
+      "com.outr"                         %% "scribe-slf4j2"           % "3.19.0",
       "org.dcache"                       %  "nfs4j-core"              % "0.24.0",
       "org.yaml"                         %  "snakeyaml"               % "1.25",
       "io.scalecube"                     %  "scalecube-cluster"       % "2.7.12",
@@ -42,6 +42,9 @@ lazy val root = (project in file(".")).
                                                                                        classifier "osx-aarch_64",
       // Linux only: QuicNet falls back to NIO without it
       "io.netty"                         %  "netty-transport-native-epoll" % "4.2.19.Final" classifier "linux-x86_64",
+      // vdisk-server's org.kernel.TCMUService1 D-Bus service (targetcli)
+      "com.github.hypfvieh"              %  "dbus-java-core"          % "5.2.2",
+      "com.github.hypfvieh"              %  "dbus-java-transport-native-unixsocket" % "5.2.2",
     ),
 
     // Include the Backblaze Java source files during compilation

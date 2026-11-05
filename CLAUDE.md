@@ -46,7 +46,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     out older ones
   - Write-back: WRITE completes from memory; durable at FLUSH/FUA. Block objects are the largest multiple of the
     logical block size <= the allocator's `maxObjectSize`
-  - `vdisk-server` serves disks to tcmu-runner's `handler_aspen.so` (`native/tcmu-aspen`) over a Unix socket;
+  - `vdisk-server` drives the kernel's TCMU interface directly through FFM (`vdisk.tcmu`: netlink, configfs, the
+    `/dev/uioN` ring, SCSI emulation in `vdisk.tcmu.scsi`) and owns `org.kernel.TCMUService1` on the system D-Bus so
+    targetcli sees `user:aspen`. It runs as root and refuses to start while tcmu-runner holds that name.
     `LockableBlockDevice` is the frontend seam
 - **Information Dispersal Algorithm (IDA)**:
   - Defines the replication/erasure-coding strategy used to provide robustness against data loss
@@ -106,7 +108,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     each node once. `TKVLInsert.requireDoesNotExist` makes allocate-and-insert retry loops safe.
   - Each `RootManager` owns a `TierCache` (default `LruTierCache`: 5 nodes per tier >= 1, plus the root when on
     tier >= 1; `NoCache` for tests and finalization actions). Stale entries cost only reads, except that `splitTree`
-    through another instance can make warm instances return moved entries.
+    through another instance can make warm instances return moved entries. `LruTierCache(anyRoot = true)` also
+    keeps tier-0 and empty roots and shares one read among concurrent root misses; writes then read the root fresh.
+    Only for a single writer that remembers its own changes (a vdisk's `BlockMap`, whose `refresh` clears it)
 - Aspen is designed and implemented largely as a logical system
   - Messages are addressed to logical entities like DataStores rather than physical hosts
   - The last step prior to sending a message is to look up the address of the network endpoint currently
@@ -136,8 +140,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - The Network Layer is designed to be pluggable via `common.network.NetworkPlugin`. QUIC is the only plugin:
   - QUIC (`implementations/quic`, Netty 4.2): Mutual TLS on every connection, datagrams for
     encoded messages of 1024 bytes or less, a small round-robin pool of streams for larger ones, and messages
-    dropped (never queued) when a connection's buffers are full. Payloads are not copied on send and are
-    copied exactly once on receive.
+    dropped (never queued) when over budget. Payloads are not copied on send and are copied exactly once on receive.
+  - Send buffering (`QuicConfig`): one host-wide `SendBudget` (256 MiB) shared by all connections; a connection may
+    queue below its floor (256 KiB) always, or below its ceiling (64 MiB) while the shared budget has room. The
+    pre-handshake queue has its own bound (16 MiB) outside the shared budget. A datagram burst (about half of
+    quiche's queue since recent flushes) sends datagram-sized messages on a stream: a full quiche queue drops silently
 - A pluggable `NetworkCache` persists store->host and host->endpoint mappings, scoped to the system id.
   - `NoCache` for the CLI; RocksDB for hosts (`<host-root>/cache/network`) and `amoebafs --network-cache-dir`
   - MetadataManager seeds from it at startup, trusts entries immediately, and writes every change back
@@ -153,11 +160,14 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - `aspen host --load-jars=<version>` loads user RegisteredTypeFactory lists from every jar in `<host-dir>/jars/<version>/`
   (may be a symlink, e.g. `latest`) via `UserJarLoader`: one URLClassLoader, parent-first, `AspenTypeProvider` classes
   found with ServiceLoader. Duplicate UUIDs (including against built-ins) fail startup naming both classes and jars
+- `BackendTiming` logs each host's write stages about once a second while writes happen: the store's view of a commit,
+  RocksDB's pool wait and write, and FSIF's io wait, journal write and force, data force, copy-on-write and backpressure
 - DataStores are pluggable: RocksDB, in-memory Map, and FSIF (`server.store.backend.fsif`, a flat file of fixed-size
   segments located by a 4-byte storePointer, with a journal and checkpointed index). FSIF freezes writes on ENOSPC
   and keeps serving reads. FSIF pools use `FsifIndexAllocationStrategy` (a per-pool bitmap KeyValue object in
   the metadata group; bits set/cleared in the transaction, or by a system DurableTask after
-  `Transaction.deferAllocationRelease()`, which allows one FSIF pool per transaction). Metadata pools can't use FSIF.
+  `Transaction.deferAllocationRelease()`: one task per transaction, covering all its FSIF pools). Metadata pools
+  can't use FSIF.
 
 ## Subsystem Details
 
@@ -177,6 +187,19 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     to that object
   - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
     missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction
+  - A driver's data-less prepare can overtake the client's prepare carrying a store's data. The store withholds its
+    vote until the data, a client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes:
+    missing data then gets an abort vote. A vote given stands, but later data is still used to apply a commit
+  - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
+    TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
+    if the data beat the finalizer's `errorTimeout` (2 s)
+  - A store that misses `errorTimeout` is marked in its pool's ErrorTree for every object it hosts that the transaction
+    changes (a lock changes nothing, so there is nothing to repair and the object's timestamp would not catch up). A client's
+    `MissedUpdateMarker` writes one batch per pool at a time and merges waiting entries by key, so a slow spell makes
+    batches larger rather than adding colliding writes
+  - A lost TxFinalized is recovered by the store itself: a Tx idle for `Host.txHeartbeatTimeout` gets a driver, which
+    learns the outcome from the stores' status caches, so `Host.txStatusCacheDuration` must outlast that timeout. At high volume the cache is costly (about 175 bytes
+    per transaction, capped at `DefaultMaxEntries`), so these stay short: 5 s and 7 s with the host's 1 s heartbeat
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:

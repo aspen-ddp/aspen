@@ -315,4 +315,33 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     val (m, result) = runStaleStoreReadOf(MetadataOnly(), ptr, refcount = ObjectRefcount(2, 0))
     recoverToSucceededIf[InvalidObject](result)
   }
+
+  test("retrying a read prints nothing and restores nothing while trace logging is off") {
+    val m = ReadDriverClient.NoOp(client)
+    val r = mkReader(m)
+    val cs = ReadResponse.CurrentState(rev, ref, HLCTimestamp.now, 4, Some(odata), Set())
+    r.receiveReadResponse(ReadResponse(BaseReadDriverSuite.client, ds0, readUUID, HLCTimestamp.now, Right(cs)))
+    r.receiveReadResponse(ReadResponse(BaseReadDriverSuite.client, ds1, readUUID, HLCTimestamp.now, Right(cs)))
+
+    val out = new java.io.ByteArrayOutputStream()
+    Console.withOut(out):
+      (0 until 6).foreach(_ => r.begin())
+
+    out.toString shouldBe ""
+    Future.successful(succeed)
+  }
+
+  test("a lock summary reports every lock's count but only a few of their ids") {
+    val few = Set.fill(BaseReadDriver.MaxLocksReported)(TransactionId(UUID.randomUUID()))
+    val many = Set.fill(5000)(TransactionId(UUID.randomUUID()))
+
+    BaseReadDriver.lockSummary(Set()) shouldBe "0[]"
+    few.foreach(id => BaseReadDriver.lockSummary(few) should include(id.uuid.toString))
+
+    val summary = BaseReadDriver.lockSummary(many)
+    summary should startWith("5000[")
+    summary should endWith(",...]")
+    summary.length should be < 200
+    Future.successful(succeed)
+  }
 }

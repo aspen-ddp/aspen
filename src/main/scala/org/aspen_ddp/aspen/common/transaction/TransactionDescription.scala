@@ -81,6 +81,13 @@ final case class TransactionDescription (
 
   def allReferencedObjectsSet: Set[ObjectPointer] = objectRequirements.map(_.objectPointer).toSet
 
+  /** Objects this transaction locks without changing them */
+  def lockOnlyObjects: Set[ObjectId] =
+    val (locks, changes) = objectRequirements.partition:
+      case _: RevisionLock | _: SharedRevisionLock => true
+      case _ => false
+    locks.map(_.objectPointer.id).toSet -- changes.map(_.objectPointer.id)
+
   def primaryObjectDataStores: Set[StoreId] =
     (0 until primaryObjectIDA.width).map(i => StoreId(primaryObject.poolId, i.toByte)).toSet
 

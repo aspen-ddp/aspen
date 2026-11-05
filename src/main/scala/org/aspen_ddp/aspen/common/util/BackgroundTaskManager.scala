@@ -97,22 +97,29 @@ class BackgroundTaskManager(protected val executionContext: ExecutionContext) {
   protected case class RetryWithExponentialBackoff(tryNow: Boolean, initialDelay: Duration, maxDelay: Duration)(fn: => Boolean) extends ScheduledTask {
     private var task: Option[ScheduledTask] = None
     private var backoffDelay = initialDelay
+    private var cancelled = false
 
     if (tryNow)
       Future.unit.map(_ => attempt())
     else
       reschedule(false)
 
-    private def attempt(): Unit = synchronized {
-      if (!fn) reschedule(true)
-    }
+    /** Runs `fn` without this object's lock. `fn` takes its caller's locks, and the caller may hold those while calling
+      * cancel: a read driver does both, so holding the lock here deadlocks the two threads
+      */
+    private def attempt(): Unit =
+      if !synchronized(cancelled) && !fn then
+        reschedule(true)
 
     override def cancel(): Unit = synchronized {
+      cancelled = true
       task.foreach(_.cancel())
       task = None
     }
 
     private def reschedule(backoff: Boolean): Unit = synchronized {
+      if cancelled then return
+
       val thisDelay = if (backoff) {
         backoffDelay = backoffDelay * 2
         if (backoffDelay > maxDelay)

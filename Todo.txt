@@ -1,6 +1,30 @@
 TODO
 ====
 
+Store commit delay (investigating, 2026-11-05): a store sees an FSIF commit take ~67 ms on average, but FSIF itself
+accounts for only ~19 ms of it. Measured in the vdisk fio runs (16-store RS 16/10/12 pool, one host, all 16 stores on
+one disk) from BackendTiming's lines:
+- "store commit (FsifBackend)" runs from Frontend.commit (just before backend.commit) until Frontend
+  .backendOperationComplete sees the Commit completion. "fsif commit" runs from when FSIF's serial executor starts the
+  update (after `post` and `admitted`) until it replies. Neither includes Tx's own work before or after.
+- The unmeasured ~48 ms is therefore some mix of: (1) waiting in FSIF's `serial` executor queue before the update
+  starts, (2) waiting in `admitted` for journal room (no "journal ... is at its hard limit" warnings were logged, so
+  probably not), and (3) the completion's trip back: FSIF hands it to Host.IOHandler, which only enqueues it on
+  `host.events`, a single queue drained by one thread for every store, network message and timer on the host.
+- Strong lead for (3): the thread dumps show one host thread ("pool-3-thread-1", the one running Host's event loop)
+  using ~9 s of CPU per 10 s during randrw and ~3.5-5 s per 10 s during seqwrite, so it is close to saturated and
+  every event, completions included, queues behind it. Host.handleEvent is also `synchronized`.
+- Not the cause: the disk (FSIF journal force ~11 ms, data force ~14 ms, no backpressure), QUIC (no drops, stream waits
+  under 700 ms do not affect this measurement), GC.
+Next steps:
+1. Time the three gaps separately in BackendTiming: commit() call to the serial task starting, the `admitted` wait,
+   and IOHandler.complete to the Commit being handled on the event thread (enqueue timestamp on IOCompletion).
+2. Record the host event queue's depth and per-event-type handling time (count, total, max per second), to see what
+   the event thread spends its time on and how long events wait.
+3. Profile the event thread during randrw (async-profiler or JFR) to find the hot paths in handleEvent.
+4. Depending on the results: make the event loop cheaper, or split it (e.g. one event loop per store, since stores
+   share no transaction state), and remove the host-wide `synchronized` from the hot path.
+
 vdisk (native TCMU frontend) follow-ups:
 - Run the root end-to-end scripts in scripts/vdisk-e2e/ (setup.sh, restart-under-io.sh, grow.sh in both modes,
   teardown.sh; not yet run, see its README.md and docs/vdisk-tcmu-setup.md). Check dmesg after the first ext4 mount

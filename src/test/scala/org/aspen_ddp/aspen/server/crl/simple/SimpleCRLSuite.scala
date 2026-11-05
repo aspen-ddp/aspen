@@ -593,6 +593,29 @@ class SimpleCRLSuite extends FileBasedTests {
     i2.crl.shutdown()
   }
 
+  test("A save with object data the transaction's earlier saves lacked is written and recovered") {
+    val i = SimpleCRL(tdir, 3, 1024 * 1024)
+
+    def save(state: TransactionRecoveryState): Unit =
+      val q = new LinkedBlockingQueue[String]()
+      i.crl.save(transactionId, state, () => q.put(""))
+      assert(q.poll(10, TimeUnit.SECONDS) == "", "the CRL did not complete the save")
+
+    save(trsValidTxd.copy(objectUpdates = Nil))
+    save(trsValidTxd)
+
+    i.crl.shutdown()
+
+    val i2 = SimpleCRL(tdir, 3, 1024 * 1024)
+
+    assert(i2.trsList.length == 1)
+    assert(i2.trsList.head.objectUpdates.map(_.objectId) == List(ou1.objectId, ou2.objectId))
+    assert(i2.trsList.head.objectUpdates.map(_.data.getByteArray.toList) ==
+      List(oud1.getByteArray.toList, oud2.getByteArray.toList))
+
+    i2.crl.shutdown()
+  }
+
   test("Recovery preserves latest paxos state after multiple saves") {
     val i = SimpleCRL(tdir, 3, 1024 * 1024)
 

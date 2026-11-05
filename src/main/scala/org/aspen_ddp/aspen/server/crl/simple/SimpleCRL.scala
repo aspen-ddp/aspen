@@ -219,6 +219,10 @@ class SimpleCRL private (val maxSizeInBytes: Long,
         transactions += (tx.id -> tx)
         tx
 
+    // A Tx started by a driver's data-less prepare saves again once a client's prepare supplies the data
+    if state.objectUpdates.size != tx.state.objectUpdates.size then
+      tx.objectUpdateLocations = None
+
     tx.state = state
 
     logger.trace(s"CRL adding transaction ${tx.id} to log entry ${currentLogEntry.entrySerialNumber}")

@@ -93,8 +93,6 @@ class StoragePoolUsageManager(client: AspenClient) extends Logging:
             if needTask && executor.isDefined then
               UpdateAllocationGroupUsageTask.prepareTask(
                 poolState.poolId.uuid,
-                meanUsage,
-                poolState.maximumStoreSize,
                 poolState.allocationGroups,
                 executor.get
               )(using tx).map(_ => ())

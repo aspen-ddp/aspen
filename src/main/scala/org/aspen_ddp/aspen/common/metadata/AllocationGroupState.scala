@@ -161,11 +161,9 @@ object AllocationGroupState:
     if nags.parentGroups.nonEmpty then
       taskExecutor match
         case Some(exec) =>
-          UpdateAllocationGroupUsageTask.prepareTask(childUUID,
-            nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid), exec).map(_ => ())
+          UpdateAllocationGroupUsageTask.prepareTask(childUUID, nags.parentGroups.map(_.uuid), exec).map(_ => ())
         case None =>
-          UpdateAllocationGroupUsageTask.prepareSystemTask(client, childUUID,
-            nags.currentUsage, nags.maximumSize, nags.parentGroups.map(_.uuid))
+          UpdateAllocationGroupUsageTask.prepareSystemTask(client, childUUID, nags.parentGroups.map(_.uuid))
     else
       Future.unit
 

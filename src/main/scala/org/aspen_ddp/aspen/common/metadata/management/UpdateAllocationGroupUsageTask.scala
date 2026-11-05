@@ -4,7 +4,8 @@ import scribe.Logging
 import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, ReadError, StopRetrying, Transaction}
 import org.aspen_ddp.aspen.common.DataBuffer
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
-import org.aspen_ddp.aspen.common.metadata.AllocationGroupState
+import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, StoragePoolState}
+import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.objects.{Insert, Key, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.{byte2long, byte2uuid, byte2uuids, long2byte, uuid2byte, uuids2byte}
@@ -20,8 +21,6 @@ object UpdateAllocationGroupUsageTask extends DurableTaskFactory:
   val typeUUID: UUID = UUID.fromString("7A3F9B2E-1D4C-4E8A-B5F7-6C9D0E2A8B1F")
 
   private[management] val ChildUUIDKey = Key(1)
-  private[management] val CurrentUsageKey = Key(2)
-  private[management] val MaxSizeKey = Key(3)
   private[management] val AllocationGroupsKey = Key(4)
   private[management] val NextIndexKey = Key(5)
 
@@ -31,53 +30,36 @@ object UpdateAllocationGroupUsageTask extends DurableTaskFactory:
                  state: Map[Key, KeyValueObjectState.ValueState],
                  taskExecutor: TaskExecutor): DurableTask =
     val childUUID = byte2uuid(state(ChildUUIDKey).value.bytes)
-    val currentUsage = byte2long(state(CurrentUsageKey).value.bytes)
-    val maximumSize = byte2long(state(MaxSizeKey).value.bytes)
     val allocationGroups = byte2uuids(state(AllocationGroupsKey).value.bytes)
 
-    new UpdateAllocationGroupUsageTask(pointer, client, childUUID, currentUsage,
-      maximumSize, allocationGroups, taskExecutor)
+    new UpdateAllocationGroupUsageTask(pointer, client, childUUID, allocationGroups, taskExecutor)
 
+  /** Enrolls a task that records the child's usage in each of `allocationGroups`. The task carries no usage: it reads
+    * the child's state when it updates each group, so the transaction that changed that state should enroll it */
   def prepareTask(childUUID: UUID,
-                  currentUsage: Long,
-                  maximumStoreSize: Long,
                   allocationGroups: List[UUID],
                   taskExecutor: TaskExecutor)
                  (using tx: Transaction): Future[Future[Option[AnyRef]]] =
     require(allocationGroups.nonEmpty)
-
-    val istate = List(
-      ChildUUIDKey -> uuid2byte(childUUID),
-      CurrentUsageKey -> long2byte(currentUsage),
-      MaxSizeKey -> long2byte(maximumStoreSize),
-      AllocationGroupsKey -> uuids2byte(allocationGroups),
-      NextIndexKey -> long2byte(0)
-    )
-
-    taskExecutor.prepareTask(UpdateAllocationGroupUsageTask, istate)
+    taskExecutor.prepareTask(UpdateAllocationGroupUsageTask, initialState(childUUID, allocationGroups).toList)
 
   def prepareSystemTask(client: AspenClient,
                         childUUID: UUID,
-                        currentUsage: Long,
-                        maximumStoreSize: Long,
                         allocationGroups: List[UUID])
                        (using tx: Transaction): Future[Unit] =
     require(allocationGroups.nonEmpty)
+    client.prepareSystemDurableTask(typeUUID, initialState(childUUID, allocationGroups))
 
-    client.prepareSystemDurableTask(typeUUID, Map(
-      ChildUUIDKey        -> uuid2byte(childUUID),
-      CurrentUsageKey     -> long2byte(currentUsage),
-      MaxSizeKey          -> long2byte(maximumStoreSize),
-      AllocationGroupsKey -> uuids2byte(allocationGroups),
-      NextIndexKey        -> long2byte(0)))
+  private def initialState(childUUID: UUID, allocationGroups: List[UUID]): Map[Key, Array[Byte]] = Map(
+    ChildUUIDKey        -> uuid2byte(childUUID),
+    AllocationGroupsKey -> uuids2byte(allocationGroups),
+    NextIndexKey        -> long2byte(0))
 
 
 class UpdateAllocationGroupUsageTask(
   val taskPointer: DurableTaskPointer,
   client: AspenClient,
   childUUID: UUID,
-  currentUsage: Long,
-  maximumSize: Long,
   allocationGroups: List[UUID],
   taskExecutor: TaskExecutor
 ) extends DurableTask with Logging:
@@ -125,6 +107,20 @@ class UpdateAllocationGroupUsageTask(
         retryDelay = 16
         updateNextGroup()
 
+  /** The child's member entry as it should be now, from the child's own state */
+  private def readCurrentMember(member: AllocationGroupState.Member): Future[AllocationGroupState.Member] =
+    member.memberType match
+      case AllocationGroupState.MemberType.Pool =>
+        for
+          ptr <- client.getStoragePoolPointer(PoolId(childUUID))
+          kvos <- client.read(ptr)
+        yield AllocationGroupState.Member.forPool(StoragePoolState(kvos))
+      case AllocationGroupState.MemberType.Group =>
+        for
+          ptr <- client.getAllocationGroupPointer(AllocationGroupId(childUUID))
+          dos <- client.read(ptr)
+        yield AllocationGroupState.Member.forGroup(AllocationGroupState(dos))
+
   private def updateNextGroup(): Unit =
     if isStopped then
       failTask(new TaskStopped)
@@ -142,10 +138,17 @@ class UpdateAllocationGroupUsageTask(
           val groupUUID = allocationGroups(nextIndex)
           val groupId = AllocationGroupId(groupUUID)
 
+          // The group is read before the child. A child change after the child read enrolls another task, and
+          // that task's commit comes after this group read, so this task's overwrite collides with it and retries
+          // instead of putting back older usage
           val fFetch = for
             agsPtr <- client.getAllocationGroupPointer(groupId)
             agsDos <- client.read(agsPtr)
-          yield (agsPtr, agsDos)
+            ags = AllocationGroupState(agsDos)
+            current <- ags.members.find(_.uuid == childUUID) match
+              case None => Future.successful(None)
+              case Some(member) => readCurrentMember(member).map(Some(_))
+          yield (agsPtr, agsDos, ags, current)
 
           fFetch.onComplete:
             case Failure(err) => err match
@@ -156,11 +159,13 @@ class UpdateAllocationGroupUsageTask(
               case _ =>
                 scheduleRetry()
 
-            case Success((agsPtr, agsDos)) =>
-              val ags = AllocationGroupState(agsDos)
-
-              ags.members.find(_.uuid == childUUID) match
+            case Success((agsPtr, agsDos, ags, current)) =>
+              current match
                 case None =>
+                  advanceIndex(kvos)
+
+                // Already recorded, typically by a concurrent task for the same change: nothing to write
+                case Some(member) if ags.members.contains(member) =>
                   advanceIndex(kvos)
 
                 case Some(member) =>
@@ -168,9 +173,7 @@ class UpdateAllocationGroupUsageTask(
                   val oldGroupMaxSize = ags.maximumSize
 
                   val updatedMembers = ags.members.map: m =>
-                    if m.uuid == childUUID then
-                      m.copy(currentUsage = currentUsage, maximumSize = maximumSize)
-                    else m
+                    if m.uuid == childUUID then member else m
 
                   val nags = ags.copy(members = updatedMembers)
                   val newGroupUsage = nags.currentUsage
@@ -193,9 +196,7 @@ class UpdateAllocationGroupUsageTask(
                   val fCascade =
                     if needsCascade then
                       UpdateAllocationGroupUsageTask.prepareTask(
-                        groupId.uuid, newGroupUsage, newGroupMaxSize,
-                        nags.parentGroups.map(_.uuid), taskExecutor
-                      ).map(_ => ())
+                        groupId.uuid, nags.parentGroups.map(_.uuid), taskExecutor).map(_ => ())
                     else
                       Future.unit
 

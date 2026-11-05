@@ -2,14 +2,17 @@ package org.aspen_ddp.aspen.common.metadata.management
 
 import org.aspen_ddp.aspen.common.metadata.IDAPolicy
 import org.aspen_ddp.aspen.IntegrationTestSuite
+import org.aspen_ddp.aspen.client.Transaction
 import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
 import org.aspen_ddp.aspen.common.Radicle
 import org.aspen_ddp.aspen.common.allocation_group.AllocationGroupId
 import org.aspen_ddp.aspen.common.metadata.{AllocationGroupState, StoragePoolState}
-import org.aspen_ddp.aspen.common.util.byte2long
+import org.aspen_ddp.aspen.common.objects.Insert
+import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.compute.TaskExecutor
 import org.aspen_ddp.aspen.compute.impl.SimpleTaskExecutor
 
+import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
 class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
@@ -36,107 +39,137 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
       groupDos <- client.read(groupPtr)
     yield AllocationGroupState(groupDos)
 
-  private def readPoolState(): Future[StoragePoolState] =
+  private def readGroupRevision(groupId: AllocationGroupId) =
+    given ExecutionContext = executionContext
+    client.getAllocationGroupPointer(groupId).flatMap(client.read).map(_.revision)
+
+  private def poolMember(ags: AllocationGroupState): AllocationGroupState.Member =
+    ags.members.find(_.uuid == Radicle.poolId.uuid).get
+
+  /** Sets the pool's usage and maximum store size, as StoragePoolUsageManager does */
+  private def setPoolUsage(usage: Long, maxSize: Long)(using tx: Transaction): Future[Unit] =
     given ExecutionContext = executionContext
     for
       poolPtr <- client.getStoragePoolPointer(Radicle.poolId)
       poolKvos <- client.read(poolPtr)
-    yield StoragePoolState(poolKvos)
+    yield
+      val ps = StoragePoolState(poolKvos)
+      tx.update(poolPtr, None, None,
+        List(KeyRevision(StoragePoolState.ConfigKey, poolKvos.contents(StoragePoolState.ConfigKey).revision)),
+        List(Insert(StoragePoolState.ConfigKey, ps.copy(currentUsage = usage, maximumStoreSize = maxSize).encode())))
+
+  private def commitPoolUsage(usage: Long, maxSize: Long): Future[Unit] =
+    given ExecutionContext = executionContext
+    val tx = client.newTransaction()
+    setPoolUsage(usage, maxSize)(using tx).flatMap(_ => tx.commit()).flatMap(_ => waitForTransactionsToComplete())
+
+  /** Enrolls a task for `child` in a transaction that also runs `change`, then waits for the task to finish */
+  private def runTask(executor: TaskExecutor, child: UUID, groups: List[AllocationGroupId])
+                     (change: Transaction ?=> Future[Unit]): Future[Option[AnyRef]] =
+    given ExecutionContext = executionContext
+    val tx = client.newTransaction()
+    given Transaction = tx
+    for
+      _ <- change
+      kvos <- client.read(radicle)
+      taskFuture <- UpdateAllocationGroupUsageTask.prepareTask(child, groups.map(_.uuid), executor)
+      _ = tx.bumpVersion(radicle, kvos.revision)
+      _ <- tx.commit()
+      result <- taskFuture
+      _ <- waitForTransactionsToComplete()
+    yield result
+
+  private def runPoolTask(executor: TaskExecutor, groups: List[AllocationGroupId], usage: Long, maxSize: Long) =
+    runTask(executor, Radicle.poolId.uuid, groups)(setPoolUsage(usage, maxSize))
+
+  private def newGroup(name: String, level: Int = 0): Future[AllocationGroupId] =
+    given ExecutionContext = executionContext
+    client.createAllocationGroup(name, level = level, idaPolicy = IDAPolicy.AllowAll)
+      .flatMap(id => waitForTransactionsToComplete().map(_ => id))
+
+  private def addPool(executor: TaskExecutor, groupId: AllocationGroupId): Future[Unit] =
+    given ExecutionContext = executionContext
+    AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor)).flatMap(_ => waitForTransactionsToComplete())
+
+  // Concurrent tasks for one pool race to rewrite the group. One created before a later pool change can commit last:
+  // it must record the pool's usage as it is then, not as it was when the task was created
+  atest("a task records the pool's current usage, not the usage when it was created"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      groupId <- newGroup("test-group")
+      _ <- addPool(executor, groupId)
+
+      _ <- runPoolTask(executor, List(groupId), 100000L, 200000L)
+      // The pool moves on, and a task enrolled for an earlier change runs only now
+      _ <- commitPoolUsage(105000L, 210000L)
+      _ <- runTask(executor, Radicle.poolId.uuid, List(groupId))(Future.unit)
+
+      ags <- readGroupState(groupId)
+    yield
+      poolMember(ags).currentUsage should be(105000L)
+      poolMember(ags).maximumSize should be(210000L)
+
+  atest("a task leaves the group unchanged when it already records the pool's usage"):
+    given ExecutionContext = executionContext
+    for
+      executor <- setup()
+      groupId <- newGroup("test-group")
+      _ <- addPool(executor, groupId)
+      _ <- runPoolTask(executor, List(groupId), 75000L, 150000L)
+      revisionBefore <- readGroupRevision(groupId)
+
+      result <- runTask(executor, Radicle.poolId.uuid, List(groupId))(Future.unit)
+      revisionAfter <- readGroupRevision(groupId)
+    yield
+      result should be(None)
+      revisionAfter should be(revisionBefore)
 
   atest("updates member usage in single parent group"):
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
-      _ <- waitForTransactionsToComplete()
+      groupId <- newGroup("test-group")
+      _ <- addPool(executor, groupId)
 
       agsBefore <- readGroupState(groupId)
-      memberBefore = agsBefore.members.find(_.uuid == Radicle.poolId.uuid).get
-
-      newUsage = memberBefore.currentUsage + 50000L
-      newMaxSize = memberBefore.maximumSize + 100000L
-
-      kvos <- client.read(radicle)
-      tx = client.newTransaction()
-      taskFuture <- UpdateAllocationGroupUsageTask.prepareTask(
-        Radicle.poolId.uuid, newUsage, newMaxSize,
-        List(groupId.uuid), executor
-      )(using tx)
-      _ = tx.bumpVersion(radicle, kvos.revision)
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-      _ <- taskFuture
+      newUsage = poolMember(agsBefore).currentUsage + 50000L
+      newMaxSize = poolMember(agsBefore).maximumSize + 100000L
+      _ <- runPoolTask(executor, List(groupId), newUsage, newMaxSize)
 
       agsAfter <- readGroupState(groupId)
-      memberAfter = agsAfter.members.find(_.uuid == Radicle.poolId.uuid).get
     yield
-      memberAfter.currentUsage should be(newUsage)
-      memberAfter.maximumSize should be(newMaxSize)
+      poolMember(agsAfter).currentUsage should be(newUsage)
+      poolMember(agsAfter).maximumSize should be(newMaxSize)
 
   atest("updates member usage across multiple parent groups"):
     given ExecutionContext = executionContext
     for
       executor <- setup()
-      groupId1 <- client.createAllocationGroup("group-1", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-      groupId2 <- client.createAllocationGroup("group-2", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
+      groupId1 <- newGroup("group-1")
+      groupId2 <- newGroup("group-2")
+      _ <- addPool(executor, groupId1)
+      _ <- addPool(executor, groupId2)
 
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId1, Some(executor))
-      _ <- waitForTransactionsToComplete()
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId2, Some(executor))
-      _ <- waitForTransactionsToComplete()
-
-      newUsage = 75000L
-      newMaxSize = 200000L
-
-      kvos <- client.read(radicle)
-      tx = client.newTransaction()
-      taskFuture <- UpdateAllocationGroupUsageTask.prepareTask(
-        Radicle.poolId.uuid, newUsage, newMaxSize,
-        List(groupId1.uuid, groupId2.uuid), executor
-      )(using tx)
-      _ = tx.bumpVersion(radicle, kvos.revision)
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-      _ <- taskFuture
+      _ <- runPoolTask(executor, List(groupId1, groupId2), 75000L, 200000L)
 
       ags1 <- readGroupState(groupId1)
       ags2 <- readGroupState(groupId2)
-      member1 = ags1.members.find(_.uuid == Radicle.poolId.uuid).get
-      member2 = ags2.members.find(_.uuid == Radicle.poolId.uuid).get
     yield
-      member1.currentUsage should be(newUsage)
-      member1.maximumSize should be(newMaxSize)
-      member2.currentUsage should be(newUsage)
-      member2.maximumSize should be(newMaxSize)
+      poolMember(ags1).currentUsage should be(75000L)
+      poolMember(ags1).maximumSize should be(200000L)
+      poolMember(ags2).currentUsage should be(75000L)
+      poolMember(ags2).maximumSize should be(200000L)
 
   atest("skips silently when member not found in group"):
     given ExecutionContext = executionContext
-    val unknownChildUUID = java.util.UUID.randomUUID()
     for
       executor <- setup()
-      groupId <- client.createAllocationGroup("test-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, groupId, Some(executor))
-      _ <- waitForTransactionsToComplete()
-
+      groupId <- newGroup("test-group")
+      _ <- addPool(executor, groupId)
       agsBefore <- readGroupState(groupId)
 
-      kvos <- client.read(radicle)
-      tx = client.newTransaction()
-      taskFuture <- UpdateAllocationGroupUsageTask.prepareTask(
-        unknownChildUUID, 99999L, 99999L,
-        List(groupId.uuid), executor
-      )(using tx)
-      _ = tx.bumpVersion(radicle, kvos.revision)
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-      result <- taskFuture
+      result <- runTask(executor, UUID.randomUUID(), List(groupId))(Future.unit)
 
       agsAfter <- readGroupState(groupId)
     yield
@@ -147,128 +180,60 @@ class UpdateAllocationGroupUsageTaskSuite extends IntegrationTestSuite:
     given ExecutionContext = executionContext
     for
       executor <- setup()
-
-      childGroupId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-      parentGroupId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, Some(executor))
-      _ <- waitForTransactionsToComplete()
+      childGroupId <- newGroup("child-group")
+      parentGroupId <- newGroup("parent-group", level = 1)
+      _ <- addPool(executor, childGroupId)
       _ <- AllocationGroupState.addGroup(client, childGroupId, parentGroupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
       childBefore <- readGroupState(childGroupId)
-      poolMember = childBefore.members.find(_.uuid == Radicle.poolId.uuid).get
-
-      newUsage = poolMember.currentUsage + 500000L
-      newMaxSize = poolMember.maximumSize + 1000000L
-
-      kvos <- client.read(radicle)
-      tx = client.newTransaction()
-      taskFuture <- UpdateAllocationGroupUsageTask.prepareTask(
-        Radicle.poolId.uuid, newUsage, newMaxSize,
-        List(childGroupId.uuid), executor
-      )(using tx)
-      _ = tx.bumpVersion(radicle, kvos.revision)
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-      _ <- taskFuture
-      _ <- waitForTransactionsToComplete()
+      newUsage = poolMember(childBefore).currentUsage + 500000L
+      newMaxSize = poolMember(childBefore).maximumSize + 1000000L
+      _ <- runPoolTask(executor, List(childGroupId), newUsage, newMaxSize)
 
       childAfter <- readGroupState(childGroupId)
       parentAfter <- readGroupState(parentGroupId)
-
-      childMember = childAfter.members.find(_.uuid == Radicle.poolId.uuid).get
       parentMember = parentAfter.members.find(_.uuid == childGroupId.uuid).get
     yield
-      childMember.currentUsage should be(newUsage)
-      childMember.maximumSize should be(newMaxSize)
+      poolMember(childAfter).currentUsage should be(newUsage)
+      poolMember(childAfter).maximumSize should be(newMaxSize)
       parentMember.currentUsage should be(childAfter.currentUsage)
       parentMember.maximumSize should be(childAfter.maximumSize)
 
   atest("does not cascade when change is below threshold"):
     given ExecutionContext = executionContext
-    // The cascade threshold is 0.5%. We first establish a large baseline so
-    // that a subsequent +1 change falls below the threshold.
+    // The cascade threshold is 0.5%. A large baseline makes a later +1 change fall below it
     val baselineUsage = 1000000L
     val baselineMaxSize = 2000000L
     for
       executor <- setup()
-
-      childGroupId <- client.createAllocationGroup("child-group", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-      parentGroupId <- client.createAllocationGroup("parent-group", level = 1, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-
-      _ <- AllocationGroupState.addPool(client, Radicle.poolId, childGroupId, Some(executor))
-      _ <- waitForTransactionsToComplete()
+      childGroupId <- newGroup("child-group")
+      parentGroupId <- newGroup("parent-group", level = 1)
+      _ <- addPool(executor, childGroupId)
       _ <- AllocationGroupState.addGroup(client, childGroupId, parentGroupId, Some(executor))
       _ <- waitForTransactionsToComplete()
 
-      // Establish a large baseline usage so that later +1 is below threshold
-      kvos0 <- client.read(radicle)
-      tx0 = client.newTransaction()
-      baselineTaskFuture <- UpdateAllocationGroupUsageTask.prepareTask(
-        Radicle.poolId.uuid, baselineUsage, baselineMaxSize,
-        List(childGroupId.uuid), executor
-      )(using tx0)
-      _ = tx0.bumpVersion(radicle, kvos0.revision)
-      _ <- tx0.commit()
-      _ <- waitForTransactionsToComplete()
-      _ <- baselineTaskFuture
-      _ <- waitForTransactionsToComplete()
-
-      // Now read the parent state after baseline cascade
+      _ <- runPoolTask(executor, List(childGroupId), baselineUsage, baselineMaxSize)
       parentBefore <- readGroupState(parentGroupId)
 
-      // Apply a tiny change (+1) that should be below the 0.5% threshold
-      tinyUsageChange = baselineUsage + 1L
-      tinyMaxSizeChange = baselineMaxSize + 1L
-
-      kvos <- client.read(radicle)
-      tx = client.newTransaction()
-      taskFuture <- UpdateAllocationGroupUsageTask.prepareTask(
-        Radicle.poolId.uuid, tinyUsageChange, tinyMaxSizeChange,
-        List(childGroupId.uuid), executor
-      )(using tx)
-      _ = tx.bumpVersion(radicle, kvos.revision)
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-      _ <- taskFuture
-      _ <- waitForTransactionsToComplete()
+      _ <- runPoolTask(executor, List(childGroupId), baselineUsage + 1L, baselineMaxSize + 1L)
 
       childAfter <- readGroupState(childGroupId)
       parentAfter <- readGroupState(parentGroupId)
-
-      childMember = childAfter.members.find(_.uuid == Radicle.poolId.uuid).get
       parentMemberBefore = parentBefore.members.find(_.uuid == childGroupId.uuid).get
       parentMemberAfter = parentAfter.members.find(_.uuid == childGroupId.uuid).get
     yield
-      childMember.currentUsage should be(tinyUsageChange)
-      childMember.maximumSize should be(tinyMaxSizeChange)
+      poolMember(childAfter).currentUsage should be(baselineUsage + 1L)
+      poolMember(childAfter).maximumSize should be(baselineMaxSize + 1L)
       parentMemberAfter.currentUsage should be(parentMemberBefore.currentUsage)
       parentMemberAfter.maximumSize should be(parentMemberBefore.maximumSize)
 
   atest("task completes when all groups result in skips"):
     given ExecutionContext = executionContext
-    val unknownChildUUID = java.util.UUID.randomUUID()
     for
       executor <- setup()
-      groupId1 <- client.createAllocationGroup("group-1", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-      groupId2 <- client.createAllocationGroup("group-2", level = 0, idaPolicy = IDAPolicy.AllowAll)
-      _ <- waitForTransactionsToComplete()
-
-      kvos <- client.read(radicle)
-      tx = client.newTransaction()
-      taskFuture <- UpdateAllocationGroupUsageTask.prepareTask(
-        unknownChildUUID, 99999L, 99999L,
-        List(groupId1.uuid, groupId2.uuid), executor
-      )(using tx)
-      _ = tx.bumpVersion(radicle, kvos.revision)
-      _ <- tx.commit()
-      _ <- waitForTransactionsToComplete()
-      result <- taskFuture
+      groupId1 <- newGroup("group-1")
+      groupId2 <- newGroup("group-2")
+      result <- runTask(executor, UUID.randomUUID(), List(groupId1, groupId2))(Future.unit)
     yield
       result should be(None)

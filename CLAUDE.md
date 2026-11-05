@@ -60,6 +60,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     consistent revision. They also support ranged writes
     (`Transaction.rangedWrites`): the caller supplies a `RangedWriteState` (from `RangedWriteState.fromObject` or
     `ObjectReader.readRangedWriteState`) and stores receive only sparse XOR deltas of the changed bytes.
+    Stores read deltas through `EncodedAppendDelta`, which parses only the header and region table and XORs
+    straight from the encoded buffer, so checking and applying never copy the delta.
     Replication supports all of them too. Classic ReedSolomon does not: those operations fail with
     `RangeReadNotSupported` / `AppendNotSupported` / `RangeWriteNotSupported`
 - **ObjectPointer**:

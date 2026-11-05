@@ -120,75 +120,163 @@ object AppendDelta:
   //     then regionCount x (<offset:4><length:4>), the region bytes in order, and the tail
   private val HeaderSizeV2: Int = 18
 
-  def decode(db: DataBuffer): AppendDelta =
-    try
-      val bb = ByteBuffer.wrap(db.getByteArray)
-      if bb.remaining < 1 then
-        throw new IllegalArgumentException("Truncated append delta")
-      bb.get() match
-        case 1 => decodeV1(bb)
-        case 2 => decodeV2(bb)
-        case _ => throw new IllegalArgumentException("Unsupported append delta format")
-    catch
-      case e: java.nio.BufferUnderflowException =>
-        throw new IllegalArgumentException("Truncated append delta", e)
+  /** Decodes and copies every region. Stores use `EncodedAppendDelta.parse`, which copies nothing. */
+  def decode(db: DataBuffer): AppendDelta = EncodedAppendDelta.parse(db).toAppendDelta
 
-  private def readTail(bb: ByteBuffer, hasTail: Byte): Option[Array[Byte]] =
-    if hasTail == 1 then
-      val t = new Array[Byte](bb.remaining)
-      bb.get(t)
-      Some(t)
-    else
-      None
 
-  private def decodeV1(bb: ByteBuffer): AppendDelta =
-    if bb.remaining < HeaderSizeV1 - 1 then
-      throw new IllegalArgumentException("Truncated append delta")
-    val expectedSliceLength = bb.getInt()
-    val newSliceLength = bb.getInt()
-    val xorOffset = bb.getInt()
-    val xorLength = bb.getInt()
-    val hasTail = bb.get()
-    val tailLength = bb.getInt()
+/** A validated view of an encoded AppendDelta that leaves the region bytes in the encoded buffer. Parsing reads only
+  * the header and region table, so a store can check a delta at prepare and again at commit without copying it, and
+  * `applyTo` XORs straight from the buffer. Parsing rejects exactly what `AppendDelta.decode` and the AppendDelta
+  * constructor reject, with IllegalArgumentException.
+  */
+final class EncodedAppendDelta private (
+    buf: ByteBuffer, // read-only, index 0 is the first byte of the encoding
+    val expectedSliceLength: Int,
+    val newSliceLength: Int,
+    regionOffsets: Array[Int],
+    regionLengths: Array[Int],
+    regionStarts: Array[Int], // index in buf of each region's bytes
+    tailStart: Int,
+    tailLength: Int, // -1 for no tail
+):
+
+  def regionCount: Int = regionOffsets.length
+
+  /** (offset, length) of each region in the new slice, sorted and non-overlapping */
+  def regionSpans: List[(Int, Int)] = List.tabulate(regionCount)(i => (regionOffsets(i), regionLengths(i)))
+
+  def matches(slice: DataBuffer): Boolean =
+    slice.size == expectedSliceLength && (tailLength < 0 || {
+      val start = slice.size - tailLength
+      var i = 0
+      while i < tailLength && slice.get(start + i) == buf.get(tailStart + i) do
+        i += 1
+      i == tailLength
+    })
+
+  /** The new slice. One copy of the current slice, then each region XORed in 8 bytes at a time */
+  def applyTo(slice: DataBuffer): DataBuffer =
+    require(matches(slice), "Append delta does not match the current slice")
+    val arr = new Array[Byte](newSliceLength)
+    slice.asReadOnlyBuffer().get(arr, 0, slice.size)
+    val out = ByteBuffer.wrap(arr) // big-endian, as is buf, so the longs line up byte for byte
+    var r = 0
+    while r < regionCount do
+      var d = regionOffsets(r)
+      var s = regionStarts(r)
+      val end = d + regionLengths(r)
+      while d + 8 <= end do
+        out.putLong(d, out.getLong(d) ^ buf.getLong(s))
+        d += 8
+        s += 8
+      while d < end do
+        arr(d) = (arr(d) ^ buf.get(s)).toByte
+        d += 1
+        s += 1
+      r += 1
+    DataBuffer(arr)
+
+  def toAppendDelta: AppendDelta =
+    def bytes(start: Int, length: Int): Array[Byte] =
+      val b = new Array[Byte](length)
+      buf.get(start, b)
+      b
+    val regions = List.tabulate(regionCount)(i => XorRegion(regionOffsets(i), bytes(regionStarts(i), regionLengths(i))))
+    AppendDelta(expectedSliceLength, newSliceLength, regions,
+      Option.when(tailLength >= 0)(bytes(tailStart, tailLength)))
+
+
+object EncodedAppendDelta:
+
+  // v1: <version:1><expectedSliceLength:4><newSliceLength:4><xorOffset:4><xorLength:4><hasTail:1><tailLength:4>
+  private val HeaderSizeV1: Int = 22
+  // v2: <version:1><expectedSliceLength:4><newSliceLength:4><regionCount:4><hasTail:1><tailLength:4>
+  //     then regionCount x (<offset:4><length:4>), the region bytes in order, and the tail
+  private val HeaderSizeV2: Int = 18
+
+  private def invalid(msg: String): Nothing = throw new IllegalArgumentException(msg)
+
+  def parse(db: DataBuffer): EncodedAppendDelta =
+    val bb = db.asReadOnlyBuffer().slice()
+    if bb.remaining < 1 then
+      invalid("Truncated append delta")
+    bb.get(0) match
+      case 1 => parseV1(bb)
+      case 2 => parseV2(bb)
+      case _ => invalid("Unsupported append delta format")
+
+  private def parseV1(bb: ByteBuffer): EncodedAppendDelta =
+    if bb.limit() < HeaderSizeV1 then
+      invalid("Truncated append delta")
+    val expectedSliceLength = bb.getInt(1)
+    val newSliceLength = bb.getInt(5)
+    val xorOffset = bb.getInt(9)
+    val xorLength = bb.getInt(13)
+    val hasTail = bb.get(17)
+    val tailLength = bb.getInt(18)
 
     if hasTail != 0 && hasTail != 1 then
-      throw new IllegalArgumentException("Invalid append delta tail flag")
+      invalid("Invalid append delta tail flag")
     if xorLength < 0 || tailLength < 0 || (hasTail == 0 && tailLength != 0) ||
-        xorLength.toLong + tailLength != bb.remaining then
-      throw new IllegalArgumentException("Append delta length mismatch")
+        xorLength.toLong + tailLength != bb.limit() - HeaderSizeV1 then
+      invalid("Append delta length mismatch")
 
-    val xorBytes = new Array[Byte](xorLength)
-    bb.get(xorBytes)
-    AppendDelta(expectedSliceLength, newSliceLength, List(XorRegion(xorOffset, xorBytes)), readTail(bb, hasTail))
+    build(bb, expectedSliceLength, newSliceLength, Array(xorOffset), Array(xorLength), Array(HeaderSizeV1),
+      HeaderSizeV1 + xorLength, if hasTail == 1 then tailLength else -1)
 
-  private def decodeV2(bb: ByteBuffer): AppendDelta =
-    if bb.remaining < HeaderSizeV2 - 1 then
-      throw new IllegalArgumentException("Truncated append delta")
-    val expectedSliceLength = bb.getInt()
-    val newSliceLength = bb.getInt()
-    val count = bb.getInt()
-    val hasTail = bb.get()
-    val tailLength = bb.getInt()
+  private def parseV2(bb: ByteBuffer): EncodedAppendDelta =
+    if bb.limit() < HeaderSizeV2 then
+      invalid("Truncated append delta")
+    val expectedSliceLength = bb.getInt(1)
+    val newSliceLength = bb.getInt(5)
+    val count = bb.getInt(9)
+    val hasTail = bb.get(13)
+    val tailLength = bb.getInt(14)
 
     if hasTail != 0 && hasTail != 1 then
-      throw new IllegalArgumentException("Invalid append delta tail flag")
-    if count < 0 || tailLength < 0 || (hasTail == 0 && tailLength != 0) ||
-        count.toLong * 8 > bb.remaining then
-      throw new IllegalArgumentException("Append delta length mismatch")
+      invalid("Invalid append delta tail flag")
+    val dataStart = HeaderSizeV2.toLong + count.toLong * 8
+    if count < 0 || tailLength < 0 || (hasTail == 0 && tailLength != 0) || dataStart > bb.limit() then
+      invalid("Append delta length mismatch")
 
-    val table = Array.fill(count)((bb.getInt(), bb.getInt()))
-    var total = tailLength.toLong
-    table.foreach { (_, len) =>
-      if len < 0 then
-        throw new IllegalArgumentException("Append delta length mismatch")
-      total += len
-    }
-    if total != bb.remaining then
-      throw new IllegalArgumentException("Append delta length mismatch")
+    val offsets = new Array[Int](count)
+    val lengths = new Array[Int](count)
+    val starts = new Array[Int](count)
+    var pos = dataStart
+    var i = 0
+    while i < count do
+      offsets(i) = bb.getInt(HeaderSizeV2 + i * 8)
+      lengths(i) = bb.getInt(HeaderSizeV2 + i * 8 + 4)
+      if lengths(i) < 0 then
+        invalid("Append delta length mismatch")
+      starts(i) = math.min(pos, Int.MaxValue).toInt
+      pos += lengths(i)
+      i += 1
+    if pos + tailLength != bb.limit() then
+      invalid("Append delta length mismatch")
 
-    val regions = table.toList.map { (off, len) =>
-      val b = new Array[Byte](len)
-      bb.get(b)
-      XorRegion(off, b)
-    }
-    AppendDelta(expectedSliceLength, newSliceLength, regions, readTail(bb, hasTail))
+    build(bb, expectedSliceLength, newSliceLength, offsets, lengths, starts, pos.toInt,
+      if hasTail == 1 then tailLength else -1)
+
+  /** The AppendDelta constructor's checks, on the region table */
+  private def build(bb: ByteBuffer, expectedSliceLength: Int, newSliceLength: Int, offsets: Array[Int],
+                    lengths: Array[Int], starts: Array[Int], tailStart: Int, tailLength: Int): EncodedAppendDelta =
+    if expectedSliceLength < 0 || expectedSliceLength > newSliceLength then
+      invalid(s"Invalid slice lengths: expected $expectedSliceLength, new $newSliceLength")
+    var prevEnd = 0L
+    var i = 0
+    while i < offsets.length do
+      val end = offsets(i).toLong + lengths(i)
+      if offsets(i) < 0 then
+        invalid(s"Invalid region offset ${offsets(i)}")
+      if lengths(i) == 0 then
+        invalid("Empty XOR region")
+      if offsets(i) < prevEnd then
+        invalid(s"XOR region at ${offsets(i)} is unsorted or overlaps a previous region")
+      if end > newSliceLength then
+        invalid(s"XOR region (${offsets(i)} + ${lengths(i)}) extends past the new slice length $newSliceLength")
+      prevEnd = end
+      i += 1
+    if tailLength > expectedSliceLength then
+      invalid("Expected tail is longer than the expected slice")
+    new EncodedAppendDelta(bb, expectedSliceLength, newSliceLength, offsets, lengths, starts, tailStart, tailLength)

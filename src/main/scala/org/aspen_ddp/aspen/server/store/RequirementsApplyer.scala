@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
-import org.aspen_ddp.aspen.common.ida.AppendDelta
+import org.aspen_ddp.aspen.common.ida.EncodedAppendDelta
 import org.aspen_ddp.aspen.common.objects._
 import org.aspen_ddp.aspen.common.transaction._
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
@@ -59,7 +59,7 @@ object RequirementsApplyer extends Logging {
               case DataUpdateOperation.Overwrite => s.data = objectUpdates(ptr.id)
 
               case DataUpdateOperation.Append | DataUpdateOperation.WriteRange =>
-                s.data = AppendDelta.decode(objectUpdates(ptr.id)).applyTo(s.data)
+                s.data = EncodedAppendDelta.parse(objectUpdates(ptr.id)).applyTo(s.data)
             }
 
           case r: KeyValueUpdate =>

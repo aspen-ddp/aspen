@@ -1,6 +1,6 @@
 package org.aspen_ddp.aspen.server.store
 
-import org.aspen_ddp.aspen.common.ida.AppendDelta
+import org.aspen_ddp.aspen.common.ida.EncodedAppendDelta
 import org.aspen_ddp.aspen.common.objects.{KeyValueOperation, ObjectId, ObjectRefcount, ObjectRevision}
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.FullContentLock
 import org.aspen_ddp.aspen.common.transaction._
@@ -104,7 +104,7 @@ object RequirementsChecker extends Logging {
               // A payload that cannot be decoded is a mismatch, not an unexpected failure
               val matches =
                 try
-                  AppendDelta.decode(objectUpdates(r.objectPointer.id)).matches(state.data)
+                  EncodedAppendDelta.parse(objectUpdates(r.objectPointer.id)).matches(state.data)
                 catch
                   case _: IllegalArgumentException => false
               if !matches then
@@ -116,7 +116,7 @@ object RequirementsChecker extends Logging {
                 case DataUpdateOperation.Overwrite => update.size.toLong
                 // The delta matched the current slice above, so applying it yields exactly newSliceLength bytes
                 case DataUpdateOperation.Append | DataUpdateOperation.WriteRange =>
-                  AppendDelta.decode(update).newSliceLength.toLong
+                  EncodedAppendDelta.parse(update).newSliceLength.toLong
               checkSliceSize(r.objectPointer.id, state.data.size.toLong, newSize, limit)
             }
 

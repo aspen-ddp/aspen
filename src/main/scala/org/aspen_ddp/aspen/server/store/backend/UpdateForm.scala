@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server.store.backend
 
 import org.aspen_ddp.aspen.common.DataBuffer
-import org.aspen_ddp.aspen.common.ida.AppendDelta
+import org.aspen_ddp.aspen.common.ida.EncodedAppendDelta
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, RefcountUpdate,
   TransactionRequirement, VersionBump}
@@ -31,7 +31,7 @@ object UpdateForm:
       dataOp match
         case Some(DataUpdateOperation.Append | DataUpdateOperation.WriteRange) =>
           objectUpdates.get(objectId) match
-            case Some(update) => rangesOf(AppendDelta.decode(update))
+            case Some(update) => rangesOf(EncodedAppendDelta.parse(update))
             case None => Full
         case Some(_) => Full
         case None =>
@@ -44,13 +44,13 @@ object UpdateForm:
             case _ => false
           if !isKeyValue && metaOnly then MetadataOnly else Full
 
-  private def rangesOf(delta: AppendDelta): UpdateForm =
+  private def rangesOf(delta: EncodedAppendDelta): UpdateForm =
     val extension =
       if delta.newSliceLength > delta.expectedSliceLength then
         List((delta.expectedSliceLength, delta.newSliceLength - delta.expectedSliceLength))
       else
         Nil
-    val all = (extension ++ delta.regions.map(r => (r.offset, r.bytes.length))).sortBy(_._1)
+    val all = (extension ++ delta.regionSpans).sortBy(_._1)
     val merged = all.foldLeft(List.empty[(Int, Int)]):
       case ((off, len) :: rest, (o, l)) if o <= off + len =>
         (off, math.max(off + len, o + l) - off) :: rest

@@ -203,3 +203,83 @@ class AppendDeltaSuite extends AnyFunSuite with Matchers:
     an [IllegalArgumentException] should be thrownBy AppendDelta(8, 32, List(r(-1, 4)), None)
     AppendDelta(8, 32, List(r(2, 2), r(4, 2)), None).regions.length should be (2)
   }
+
+  // ---- EncodedAppendDelta ----
+
+  /** A version 2 encoding written field by field, so it can hold what the AppendDelta constructor refuses */
+  private def v2Payload(e: Int, n: Int, regions: List[(Int, Array[Byte])], t: Option[Array[Byte]]): DataBuffer =
+    val data = regions.map(_._2.length).sum
+    val enc = ByteBuffer.allocate(18 + regions.length * 8 + data + t.map(_.length).getOrElse(0))
+    enc.put(2.toByte).putInt(e).putInt(n).putInt(regions.length)
+    enc.put(if t.isDefined then 1.toByte else 0.toByte).putInt(t.map(_.length).getOrElse(0))
+    regions.foreach((o, b) => enc.putInt(o).putInt(b.length))
+    regions.foreach((_, b) => enc.put(b))
+    t.foreach(a => enc.put(a))
+    DataBuffer(enc.array())
+
+  /** Random regions of 1 to 40 bytes at unaligned offsets, some past the expected length, with or without a tail */
+  private def randomDelta(rnd: Random): AppendDelta =
+    val expected = rnd.nextInt(200)
+    val grown = expected + (if rnd.nextBoolean() then rnd.nextInt(100) else 0)
+    var at = rnd.nextInt(5)
+    val regions = List.newBuilder[XorRegion]
+    while at < grown do
+      val len = math.min(1 + rnd.nextInt(40), grown - at)
+      regions += XorRegion(at, bytes(len, rnd.nextInt()))
+      at += len + rnd.nextInt(30)
+    val tail = Option.when(expected >= 8 && rnd.nextBoolean())(bytes(8, rnd.nextInt()))
+    AppendDelta(expected, grown, regions.result(), tail)
+
+  test("the encoded view applies exactly what the decoded delta applies") {
+    val rnd = new Random(7)
+    for _ <- 0 until 500 do
+      val d = randomDelta(rnd)
+      val slice = bytes(d.expectedSliceLength, rnd.nextInt())
+      d.expectedTail.foreach(t => System.arraycopy(t, 0, slice, slice.length - t.length, t.length))
+      val view = EncodedAppendDelta.parse(d.encode)
+      view.matches(DataBuffer(slice)) shouldBe true
+      view.applyTo(DataBuffer(slice)).getByteArray.toSeq shouldBe d.applyTo(DataBuffer(slice)).getByteArray.toSeq
+      view.regionSpans shouldBe d.regions.map(r => (r.offset, r.bytes.length))
+      view.toAppendDelta shouldBe d
+  }
+
+  test("the encoded view refuses the slices the decoded delta refuses") {
+    val rnd = new Random(8)
+    for _ <- 0 until 200 do
+      val d = randomDelta(rnd)
+      val view = EncodedAppendDelta.parse(d.encode)
+      val slices = List(bytes(d.expectedSliceLength, 1), bytes(d.expectedSliceLength + 1, 2)) ++
+        Option.when(d.expectedSliceLength > 0)(bytes(d.expectedSliceLength - 1, 3))
+      slices.foreach: s =>
+        view.matches(DataBuffer(s)) shouldBe d.matches(DataBuffer(s))
+        if !d.matches(DataBuffer(s)) then
+          an [IllegalArgumentException] should be thrownBy view.applyTo(DataBuffer(s))
+  }
+
+  test("the encoded view reads an encoding that starts partway into its buffer") {
+    val d = AppendDelta(16, 48,
+      List(XorRegion(3, bytes(21, 1)), XorRegion(40, bytes(8, 2))), Some(bytes(4, 3)))
+    val enc = d.encode.getByteArray
+    val padded = DataBuffer(Array.fill[Byte](5)(99) ++ enc ++ Array.fill[Byte](3)(98)).slice(5, enc.length)
+    val slice = bytes(16, 4)
+    System.arraycopy(d.expectedTail.get, 0, slice, 12, 4)
+    val sliceBuf = DataBuffer(Array.fill[Byte](7)(97) ++ slice).slice(7)
+    EncodedAppendDelta.parse(padded).applyTo(sliceBuf).getByteArray.toSeq shouldBe
+      d.applyTo(DataBuffer(slice)).getByteArray.toSeq
+  }
+
+  test("the encoded view rejects region tables the AppendDelta constructor rejects") {
+    def r(o: Int, n: Int) = (o, Array.fill[Byte](n)(1))
+    val bad = List(
+      v2Payload(8, 32, List(r(4, 8), r(8, 2)), None),  // overlapping
+      v2Payload(8, 32, List(r(10, 2), r(2, 2)), None), // unsorted
+      v2Payload(8, 32, List(r(2, 0)), None),           // empty
+      v2Payload(8, 32, List(r(30, 4)), None),          // past the new length
+      v2Payload(8, 32, List(r(-1, 4)), None),          // negative offset
+      v2Payload(16, 8, List(r(0, 1)), None),           // shrinking slice
+      v2Payload(2, 8, List(r(0, 1)), Some(Array[Byte](1, 2, 3, 4)))) // tail longer than the expected slice
+    bad.foreach: p =>
+      an [IllegalArgumentException] should be thrownBy EncodedAppendDelta.parse(p)
+      an [IllegalArgumentException] should be thrownBy AppendDelta.decode(p)
+    EncodedAppendDelta.parse(v2Payload(8, 32, List(r(2, 2), r(4, 2)), None)).regionCount shouldBe 2
+  }

@@ -14,10 +14,16 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import scribe.Logging
 import org.aspen_ddp.aspen.client.ObjectState as ClientObjectState
 
+import scala.concurrent.duration.{Duration, SECONDS}
 import scala.concurrent.{Future, Promise}
 
 
 object Frontend {
+
+  /** How long a store withholds its vote from drivers' prepares while waiting for a client's object data.
+    * Several client retransmissions long, since the only cost of a late abort is a client retry.
+    */
+  val MissingDataWait: Duration = Duration(5, SECONDS)
 
   sealed abstract class ReadKind
 
@@ -37,7 +43,8 @@ class Frontend(val storeId: StoreId,
                val crl: CrashRecoveryLog,
                val statusCache: TransactionStatusCache,
                /** The store's effective slice size limit, enforced by its transactions. None means unlimited. */
-               val maxSliceSize: Option[Long] = None) extends Logging {
+               val maxSliceSize: Option[Long] = None,
+               val missingDataWait: Duration = Frontend.MissingDataWait) extends Logging {
 
   import Frontend._
 

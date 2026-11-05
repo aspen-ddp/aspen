@@ -358,30 +358,96 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     disposition shouldBe TransactionDisposition.VoteAbort
   }
 
-  test("a client prepare's data reaches a transaction a driver's prepare started without it") {
-    // The client's prepare can be lost or delayed while the driver's data-less prepare arrives. The store must not
-    // keep the abort vote it gave for the missing data, nor commit without the data it later receives.
-    val (frontend, backend, _, net) = mkFrontendWithNet()
+  // ---- A prepare without the object data the store needs ----
+
+  private def dataUpdateTxd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
+
+  private def withDataless(missingDataWait: Duration = Frontend.MissingDataWait)
+                          (f: (Frontend, MapBackend, TestNet, TestCrl) => Unit): Unit =
+    val backend = new MapBackend(storeId)
+    val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
+    val net = new TestNet
+    val crl = new TestCrl
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache(), None, missingDataWait)
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     val os = mkObjectState(oid1)
     backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
-    val txd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
+    f(frontend, backend, net, crl)
 
-    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
-    net.txMessage() match
-      case Some(r: TxPrepareResponse) => r.disposition shouldBe TransactionDisposition.VoteAbort
-      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+  private def clientPrepare(txd: TransactionDescription) = mkPrepare(txd, fromClient = true).copy(
+    objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](7)))))
 
-    frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true).copy(
-      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](7))))))
-    net.txMessage() match
-      case Some(r: TxPrepareResponse) => r.disposition shouldBe TransactionDisposition.VoteCommit
-      case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
+  private def expectVote(net: TestNet, vote: TransactionDisposition.Value): Unit = net.txMessage() match
+    case Some(r: TxPrepareResponse) => r.disposition shouldBe vote
+    case other => throw new AssertionError(s"Expected a TxPrepareResponse, got $other")
 
-    frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
-    net.txMessage() match
-      case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
-      case other => throw new AssertionError(s"Expected TxCommitted, got $other")
-    backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  test("a driver's prepare that overtakes the client's data gets no vote until the data arrives") {
+    withDataless(): (frontend, backend, net, crl) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false)) // A retransmission
+      net.txMessage() shouldBe None
+      crl.txSaved shouldBe false
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      expectVote(net, TransactionDisposition.VoteCommit)
+      crl.txSaved shouldBe true
+
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      net.txMessage() match
+        case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+        case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  test("a store still waiting for data votes abort once the wait has passed") {
+    withDataless(missingDataWait = Duration.Zero): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(mkPrepare(dataUpdateTxd, fromClient = false))
+      expectVote(net, TransactionDisposition.VoteAbort)
+  }
+
+  test("a vote given without the data stands, but data that arrives later is still committed") {
+    withDataless(missingDataWait = Duration.Zero): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      expectVote(net, TransactionDisposition.VoteAbort)
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      expectVote(net, TransactionDisposition.VoteAbort)
+
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      net.txMessage() match
+        case Some(c: TxCommitted) => c.objectCommitErrors shouldBe Nil
+        case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  test("a client's prepare without the data gets an abort vote at once: no more data is coming") {
+    withDataless(): (frontend, _, net, _) =>
+      frontend.receiveTransactionMessage(mkPrepare(dataUpdateTxd, fromClient = true))
+      expectVote(net, TransactionDisposition.VoteAbort)
+  }
+
+  test("a driver's prepare needing no data from this store gets its vote at once") {
+    withDataless(): (frontend, _, net, _) =>
+      val txd = mktxd().copy(requirements = List(SharedRevisionLock(op1, rev0)))
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      expectVote(net, TransactionDisposition.VoteCommit)
+  }
+
+  test("a resolution ends the wait for data") {
+    withDataless(): (frontend, _, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      net.txMessage() shouldBe None
+
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      net.txMessage() match
+        case Some(c: TxCommitted) => c.objectCommitErrors shouldBe List(oid1)
+        case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      net.txMessage() should not be None
   }
 
   // ---- Requirement locks held between a commit vote and resolution ----

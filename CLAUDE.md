@@ -185,6 +185,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
     to that object
   - A prepare that reaches a store after its transaction was finalized is not applied there: the store relies on
     missed-update repair. A collision is an ordinary abort vote, even with an already-completed transaction
+  - A driver's data-less prepare can overtake the client's prepare carrying a store's data. The store withholds its
+    vote until the data, a client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes:
+    missing data then gets an abort vote. A vote given stands, but later data is still used to apply a commit
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:

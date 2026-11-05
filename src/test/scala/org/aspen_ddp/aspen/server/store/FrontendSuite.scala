@@ -41,10 +41,13 @@ object FrontendSuite {
 
     var cr: Option[ClientResponse] = None
     var tx: Option[TxMessage] = None
+    var sentTx: List[TxMessage] = Nil
 
     override def sendClientResponse(msg: ClientResponse): Unit = cr = Some(msg)
 
-    override def sendTransactionMessage(msg: TxMessage): Unit = tx = Some(msg)
+    override def sendTransactionMessage(msg: TxMessage): Unit =
+      tx = Some(msg)
+      sentTx = sentTx :+ msg
 
     override def sendTransactionMessages(msg: List[TxMessage]): Unit = Some(msg.head)
 
@@ -435,19 +438,70 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       expectVote(net, TransactionDisposition.VoteCommit)
   }
 
-  test("a resolution ends the wait for data") {
+  private def committedMessages(net: TestNet): List[TxCommitted] = net.sentTx.collect { case c: TxCommitted => c }
+
+  test("a commit that overtakes the client's data is applied when the data arrives and reported to the designated leader") {
+    withDataless(): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      val leader = StoreId(poolId, txd.designatedLeaderUID)
+      val recoveryDriver = StoreId(poolId, 2)
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false).copy(from = recoveryDriver))
+      frontend.receiveTransactionMessage(TxResolved(storeId, recoveryDriver, txid1, committed = true))
+      committedMessages(net) shouldBe Nil
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      val committed = committedMessages(net)
+      committed should not be empty
+      committed.foreach: c =>
+        c.to shouldBe leader
+        c.objectCommitErrors shouldBe Nil
+      backend.get(oid1).get.data.getByteArray shouldBe Array[Byte](7)
+  }
+
+  test("a resolution ends the wait for a vote, so a driver's later prepare is answered") {
     withDataless(): (frontend, _, net, _) =>
       val txd = dataUpdateTxd
       frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
-      net.txMessage() shouldBe None
-
       frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
-      net.txMessage() match
-        case Some(c: TxCommitted) => c.objectCommitErrors shouldBe List(oid1)
-        case other => throw new AssertionError(s"Expected TxCommitted, got $other")
+      net.txMessage() shouldBe None
 
       frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
       net.txMessage() should not be None
+  }
+
+  test("a client's prepare without the data ends a commit's wait: no more data is coming") {
+    withDataless(): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = true))
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+  }
+
+  test("finalization ends a commit's wait for data") {
+    withDataless(): (frontend, backend, net, _) =>
+      val txd = dataUpdateTxd
+      frontend.receiveTransactionMessage(mkPrepare(txd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
+      committedMessages(net) shouldBe Nil
+
+      frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true))
+      committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+      frontend.transactions.contains(txid1) shouldBe false
+
+      // Too late: repair restores this store
+      frontend.receiveTransactionMessage(clientPrepare(txd))
+      backend.get(oid1).get.metadata.revision shouldBe rev0
+  }
+
+  test("an abort does not wait for data") {
+    withDataless(): (frontend, _, net, crl) =>
+      frontend.receiveTransactionMessage(mkPrepare(dataUpdateTxd, fromClient = false))
+      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
+      crl.txDel shouldBe true
+      committedMessages(net) shouldBe Nil
   }
 
   // ---- Requirement locks held between a commit vote and resolution ----

@@ -17,7 +17,9 @@ object RequirementsApplyer extends Logging {
     *                Their in-memory state is potentially corrupt: it must not be committed and
     *                the caller must discard it rather than serve it to later readers.
     */
-  case class Result(skipped: Set[ObjectId], failed: Set[ObjectId]) {
+  case class Result(skippedReasons: Map[ObjectId, RequirementError], failed: Set[ObjectId]) {
+
+    def skipped: Set[ObjectId] = skippedReasons.keySet
 
     /** Objects that must not be committed by this transaction */
     def uncommittable: Set[ObjectId] = skipped | failed
@@ -31,8 +33,8 @@ object RequirementsApplyer extends Logging {
             maxSliceSize: Option[Long] = None): Result = {
 
     // Get a list of all objects that are unfit for accepting the changes in this transaction
-    val skippedObjects = RequirementsChecker.check(transactionId, timestamp, requirements, objects, objectUpdates,
-      maxSliceSize, applying = true)._1.keySet
+    val skippedReasons = RequirementsChecker.check(transactionId, timestamp, requirements, objects, objectUpdates,
+      maxSliceSize, applying = true)._1
 
     var failedObjects: Set[ObjectId] = Set()
 
@@ -40,7 +42,7 @@ object RequirementsApplyer extends Logging {
     val reqIter = requirements.iterator.filter(r => r.isInstanceOf[TransactionObjectRequirement]).map { r =>
       val tr = r.asInstanceOf[TransactionObjectRequirement]
       (tr.objectPointer, tr)
-    }.filter { t => !skippedObjects.contains(t._1.id) }
+    }.filter { t => !skippedReasons.contains(t._1.id) }
 
     // Note: reqIter is lazy, so failures recorded below are visible to later iterations
     for ((ptr, req) <- reqIter if !failedObjects.contains(ptr.id)) {
@@ -121,6 +123,6 @@ object RequirementsApplyer extends Logging {
       }
     }
 
-    Result(skippedObjects, failedObjects)
+    Result(skippedReasons, failedObjects)
   }
 }

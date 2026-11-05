@@ -57,6 +57,7 @@ class Tx( trs: TransactionRecoveryState,
   private var saveObjectUpdates: Boolean = true
   private var committed: Boolean = false
   private var committing: Boolean = false
+  private var commitHeld: Boolean = false
   private var locked: Boolean = false
   private var outcomeKnown: Boolean = false
   private var lastProposer: StoreId = StoreId(txd.primaryObject.poolId, txd.designatedLeaderUID)
@@ -82,6 +83,18 @@ class Tx( trs: TransactionRecoveryState,
   private def awaitingData: Boolean =
     disposition == TransactionDisposition.Undetermined && !recovered && !clientPrepared && !outcomeKnown &&
       oresolution.isEmpty && missingObjectData && System.nanoTime() - startNanos < frontend.missingDataWait.toNanos
+
+  /** The commit decision can overtake the client's prepare too. Applying now would lose the object update, so the
+    * commit waits, without a TxCommitted, and the driver sees the store's TxCommitted when the data arrives instead of
+    * marking a missed update. The wait ends with the data, with a client's prepare, or with TxFinalized, after which
+    * nothing is waiting on this store and repair restores it. No locks are held: a commit vote requires the data.
+    */
+  private def commitAwaitsData: Boolean = !recovered && !clientPrepared && ofinalized.isEmpty && missingObjectData
+
+  private def releaseHeldCommit(): Unit =
+    if commitHeld && !commitAwaitsData then
+      commitHeld = false
+      resolvedAndAllObjectsLoaded(true)
 
   private def updateLastEvent(): Unit = lastEvent = System.nanoTime()
 
@@ -230,6 +243,11 @@ class Tx( trs: TransactionRecoveryState,
       frontend.discard(objectId)
     }
 
+    result.skippedReasons.foreach { (objectId, reason) =>
+      logger.warn(s"Tx $transactionId. Store $storeId cannot apply the committed update of object $objectId: $reason. " +
+        s"Vote: $disposition. Client prepare seen: $clientPrepared")
+    }
+
     val uncommittable = result.uncommittable
 
     // Count what is actually committed. uncommittable may name objects this store never
@@ -264,14 +282,18 @@ class Tx( trs: TransactionRecoveryState,
   }
 
   private def resolvedAndAllObjectsLoaded(committed: Boolean): Unit = {
-    if (committed)
-      doCommit()
+    if committed && commitAwaitsData then
+      logger.trace(s"Holding the commit of $transactionId until its object data arrives")
+      commitHeld = true
     else
-      crl.deleteTransaction(storeId, transactionId)
+      if (committed)
+        doCommit()
+      else
+        crl.deleteTransaction(storeId, transactionId)
 
-    unlock() // Ensure we've unlocked the objects now that result of the Tx is known
+      unlock() // Ensure we've unlocked the objects now that result of the Tx is known
 
-    releaseObjects()
+      releaseObjects()
   }
 
   private var objectsReleased = false
@@ -300,7 +322,7 @@ class Tx( trs: TransactionRecoveryState,
 
   /** Adopts the object data of a prepare that has some this Tx lacks: the first prepare to arrive may have been a
     * driver's, which carries none, while the client's was lost or delayed. A vote already given stands, but the data
-    * is still needed to apply a commit decided by the other stores' votes.
+    * is still needed to apply a commit decided by the other stores' votes. See commitAwaitsData
     */
   private def adoptObjectUpdates(m: TxPrepare): Unit =
     val have = objectUpdates.iterator.map(_.objectId).toSet
@@ -328,6 +350,8 @@ class Tx( trs: TransactionRecoveryState,
       val txc = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors)
       net.sendTransactionMessage(txc)
     }
+
+    releaseHeldCommit()
 
     if awaitingData then
       logger.trace(s"Withholding the vote on ${m.transactionId} until its object data arrives")
@@ -383,6 +407,7 @@ class Tx( trs: TransactionRecoveryState,
     updateLastEvent()
     resolved(m.committed)
     ofinalized = Some(m.committed)
+    releaseHeldCommit()
     if (m.committed)
       crl.deleteTransaction(storeId, transactionId)
     statusCache.updateStatus(transactionId, status, finalized = true)

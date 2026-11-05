@@ -315,4 +315,19 @@ class BaseReadDriverSuite  extends AsyncFunSuite with Matchers {
     val (m, result) = runStaleStoreReadOf(MetadataOnly(), ptr, refcount = ObjectRefcount(2, 0))
     recoverToSucceededIf[InvalidObject](result)
   }
+
+  test("retrying a read prints nothing and restores nothing while trace logging is off") {
+    val m = ReadDriverClient.NoOp(client)
+    val r = mkReader(m)
+    val cs = ReadResponse.CurrentState(rev, ref, HLCTimestamp.now, 4, Some(odata), Set())
+    r.receiveReadResponse(ReadResponse(BaseReadDriverSuite.client, ds0, readUUID, HLCTimestamp.now, Right(cs)))
+    r.receiveReadResponse(ReadResponse(BaseReadDriverSuite.client, ds1, readUUID, HLCTimestamp.now, Right(cs)))
+
+    val out = new java.io.ByteArrayOutputStream()
+    Console.withOut(out):
+      (0 until 6).foreach(_ => r.begin())
+
+    out.toString shouldBe ""
+    Future.successful(succeed)
+  }
 }

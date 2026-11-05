@@ -7,7 +7,7 @@ import org.aspen_ddp.aspen.common.ida.IDA
 import org.aspen_ddp.aspen.common.network.{OpportunisticRebuild, Read, ReadResponse}
 import org.aspen_ddp.aspen.common.objects.{ByteRanges, DataObjectPointer, FullObject, KeyRange, KeySet, KeyValueObjectPointer, MetadataOnly, ObjectPointer, ReadError, ReadType}
 import org.aspen_ddp.aspen.common.store.StoreId
-import scribe.Logging
+import scribe.{Level, Logging}
 
 import scala.concurrent.{ExecutionContext, Future, Promise}
 
@@ -72,7 +72,8 @@ abstract class BaseReadDriver(
     logger.trace(s"Read UUID $readUUID: sending read requests to all stores for object ${objectPointer.id}. ${(0 until ida.width).map(i => StoreId(objectPointer.poolId, i.toByte)).toList}")
     synchronized {
       retryCount += 1
-      if (retryCount > 3) {
+      // debugLogStatus restores the object and prints every key, so it must not run unless its output is wanted
+      if (retryCount > 3 && logger.includes(Level.Trace)) {
         //logger.debug(s"RESENDING READ REQUESTS for Read UUID $readUUID")
         objectReader.debugLogStatus(s"RESENDING READ REQUESTS for Read UUID $readUUID",
           s => logger.trace(s))

@@ -188,6 +188,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - A driver's data-less prepare can overtake the client's prepare carrying a store's data. The store withholds its
     vote until the data, a client's prepare, or the outcome arrives, or until `Frontend.MissingDataWait` (5 s) passes:
     missing data then gets an abort vote. A vote given stands, but later data is still used to apply a commit
+  - A commit decision can overtake the data too. The store holds the commit until the data, a client's prepare, or
+    TxFinalized arrives, then applies it and sends TxCommitted, so the driver marks no missed update for that store
+    if the data beat the finalizer's `errorTimeout`
   - Every referenced pool's stores receive the prepare and check only the requirements of the objects they host (plus
     non-object requirements). The driver tallies each object's votes from its own pool's stores
 -  Lifecycle:

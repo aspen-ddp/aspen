@@ -215,17 +215,20 @@ final class QuicConnection(val loop: EventLoop,
   /** Any thread */
   private def drop(enc: Encoded, reason: String): Unit =
     enc.release()
-    countDrop(reason)
+    countDrop(reason, enc.size)
 
   /** Any thread */
-  private def countDrop(reason: String): Unit =
+  private def countDrop(reason: String, size: Long = 0): Unit =
     dropCount.incrementAndGet()
     dropsSinceLog.incrementAndGet()
     val now = System.nanoTime()
     val last = lastDropLog.get()
     if now - last >= DropLogIntervalNanos && lastDropLog.compareAndSet(last, now) then
       val n = dropsSinceLog.getAndSet(0)
-      logger.warn(s"QUIC connection ${remoteName}: dropped $n message(s) since last report (latest: $reason)")
+      val mib = 1024 * 1024
+      logger.warn(s"QUIC connection ${remoteName}: dropped $n message(s) since last report (latest: $reason, " +
+        s"$size bytes). Queued on this connection: ${queuedBytes.get() / mib} MiB handed off, ${pendingTotal / mib} MiB " +
+        s"on streams, ceiling ${ceiling / mib} MiB. Host: ${pool.usedBytes / mib} of ${pool.capacity / mib} MiB")
 
   private def remoteName: String =
     val ch = channel

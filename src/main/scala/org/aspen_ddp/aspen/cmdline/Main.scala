@@ -1252,7 +1252,9 @@ object Main {
     val (networkBridge, nnet) = onnet.getOrElse(createNetwork(bootstrapConfig, onRefresh, None, None, tls, None, onetworkCacheDir))
 
     val txStatusCacheDuration = Duration(10, SECONDS)
-    val initialReadDelay = Duration(10, SECONDS)
+    // A dropped read request or reply costs this long. A retry asks every store again, so it can't be so short that
+    // ordinary reads under load repeat
+    val initialReadDelay = Duration(2, SECONDS)
     val maxReadDelay = Duration(6, SECONDS)
     val txRetransmitDelay = Duration(1, SECONDS)
     val allocationRetransmitDelay = Duration(5, SECONDS)

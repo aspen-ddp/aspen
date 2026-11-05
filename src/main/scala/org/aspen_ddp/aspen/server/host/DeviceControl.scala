@@ -45,9 +45,11 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val heartbeatPeriod: Duration,
                           val deviceScanPeriod: Duration,
                           val loadStore: (StorageDeviceId, Backend, Option[Long]) => Future[Unit],
-                          val tryLoadStore: (LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit)
+                          val tryLoadStore: (LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit,
+                          val warn: (os.Path, String) => Unit)
                          (using val ec: ExecutionContext):
   def lock: AnyRef = host
 
   lazy val router: StoreRouter = new StoreRouter(this)
   lazy val loader: StoreLoader = new StoreLoader(this)
+  lazy val discovery: DeviceDiscovery = new DeviceDiscovery(this)

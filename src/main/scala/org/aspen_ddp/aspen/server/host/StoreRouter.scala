@@ -17,8 +17,13 @@ import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
 object StoreRouter:
-  /** A loaded store and the executor it runs on. Compared by identity: a store loaded again gets a new Entry. */
-  final class Entry(val store: Store, val executor: StoreExecutor)
+  /** A loaded store and the executor it runs on. A store loaded again gets a new Entry.
+   *
+   *  `closed` is confined to the executor: the first task of the store's close (or of its replacement by a reload)
+   *  sets it there, so tasks queued ahead of the close still run against the open store (spec section 5) and tasks
+   *  queued behind it never reach it. */
+  final class Entry(val store: Store, val executor: StoreExecutor):
+    var closed: Boolean = false
 
 /** The loaded stores, and the delivery of messages, I/O completions and repairs to them (spec section 4).
  *
@@ -28,11 +33,11 @@ object StoreRouter:
  *  Work for a store reaches it in one of two ways:
  *  - From a foreign thread (network, I/O completion, timer, CRL callback): `post` and the `deliver*`, `repair*` and
  *    `heartbeat` methods built on it. One `threading.dispatch` step looks the store up, then hands the task to the
- *    store's executor, where it runs only if that same store is still installed. In production the dispatch step
+ *    store's executor, where it runs unless the store's close has started there. In production the dispatch step
  *    runs on the calling thread; in lockstep it is the one queued item, and the executor runs inline when it is
  *    drained, as the host's event loop did.
- *  - From the control thread: `onStore`, straight to the executor with no dispatch step, and its result returned
- *    through a Future whose callbacks name the control context.
+ *  - From the control thread: `onStore` and `onEachStore`, straight to the executor with no dispatch step, and any
+ *    result returned through a Future whose callbacks name the control context.
  *
  *  A store that is not loaded but is marked offline is silent: a message for it is dropped instead of answered with
  *  an UnknownStore reply. The mark is set when a store is removed and cleared when one is installed; stores that were
@@ -44,11 +49,26 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private val stores = new ConcurrentHashMap[StoreId, Entry]()
   private val offline: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
 
-  /** Runs `task` on the store's executor if it is loaded, and is still installed when the task runs. */
+  /** Set (markReady) by a control event the Host constructor posts after its device scan, so FIFO order puts it after
+   *  every LoadStore that scan queued. Until then a message for a store not loaded is dropped silently rather than
+   *  answered UnknownStore/StoreNotFound: production dispatch is inline, and traffic arriving between the network
+   *  starting and the host's start would otherwise be told that stores about to load are not here, costing clients
+   *  re-reads, location-cache drops and missed-update marks at every host start. Silence makes them retry, as for an
+   *  offline store. */
+  @volatile private var ready = false
+
+  /** Called on the control thread once the stores found at startup have been loaded (their LoadStores handled). */
+  private[server] def markReady(): Unit = ready = true
+
+  /** Whether a message for a store that is not loaded should be answered: never while starting, nor for an offline
+   *  store. */
+  private def answersUnknown(storeId: StoreId): Boolean = ready && ! offline.contains(storeId)
+
+  /** Runs `task` on the store's executor if it is loaded, unless its close has started there by then. */
   def post(storeId: StoreId)(task: Store => Unit): Unit = route(storeId, () => ())(task)
 
   /** `post`, with `missing` run instead of the task when the store is not installed: in the dispatch step if it is
-   *  not loaded, or on its executor if it left in between. Exactly one of the two runs. */
+   *  not loaded, or on its executor if its close started in between. Exactly one of the two runs. */
   private def route(storeId: StoreId, missing: () => Unit)(task: Store => Unit): Unit =
     ctx.threading.dispatch.execute: () =>
       val entry = stores.get(storeId)
@@ -56,29 +76,32 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
         missing()
       else
         entry.executor.execute: () =>
-          if stores.get(storeId) eq entry then
+          if ! entry.closed then
             task(entry.store)
           else
             missing()
 
-  /** One dispatch step that posts `task` to each loaded store's executor, where it runs only if that store is still
-   *  installed. Callable from any thread. */
-  def postToEachStore(task: Store => Unit): Unit =
-    ctx.threading.dispatch.execute: () =>
-      stores.values.forEach: entry =>
-        entry.executor.execute: () =>
-          if stores.get(entry.store.storeId) eq entry then
-            task(entry.store)
+  /** One dispatch step that runs `onEachStore`. Callable from any thread. */
+  private def postToEachStore(task: Store => Unit): Unit =
+    ctx.threading.dispatch.execute(() => onEachStore(task))
 
-  /** Control side: runs `f` on the store's executor while it is still installed, and completes with its result, or
-   *  None if the store is not (or no longer) installed. */
+  /** Posts `task` to each loaded store's executor, where it runs unless that store's close has started. Called on the
+   *  control thread or in a dispatch step. */
+  def onEachStore(task: Store => Unit): Unit =
+    stores.values.forEach: entry =>
+      entry.executor.execute: () =>
+        if ! entry.closed then
+          task(entry.store)
+
+  /** Control side: runs `f` on the store's executor unless its close has started there, and completes with its
+   *  result, or None if the store is not loaded or its close started first. */
   def onStore[T](storeId: StoreId)(f: Store => T): Future[Option[T]] =
     Option(stores.get(storeId)) match
       case None => Future.successful(None)
       case Some(entry) =>
         val p = Promise[Option[T]]()
         entry.executor.execute: () =>
-          if stores.get(storeId) eq entry then
+          if ! entry.closed then
             try p.success(Some(f(entry.store)))
             catch case NonFatal(t) => p.failure(t)
           else
@@ -90,7 +113,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
 
   def deliverTx(msg: TxMessage): Unit =
     val unknown = () =>
-      if ! offline.contains(msg.to) then
+      if answersUnknown(msg.to) then
         val reply = TxUnknownStore(msg.from, msg.to, msg.transactionId)
         ctx.net.sendTransactionMessage(reply)
     route(msg.to, unknown)(_.receiveTransactionMessage(msg))
@@ -98,7 +121,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   def deliverClient(msg: ClientRequest): Unit = msg match
     case r: Read =>
       val unknown = () =>
-        if ! offline.contains(r.toStore) then
+        if answersUnknown(r.toStore) then
           val msg = ReadResponse(
             r.fromClient,
             r.toStore,
@@ -181,7 +204,10 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** Makes the store loaded on `executor` and clears its offline mark. From here on only the executor touches the
    *  store: the map's put is the happens-before edge for everything the control thread did to it first. */
   private[host] def install(store: Store, executor: StoreExecutor): Unit =
-    stores.put(store.storeId, new Entry(store, executor))
+    val replaced = stores.put(store.storeId, new Entry(store, executor))
+    // A reload over a loaded store, with no close: its queued tasks run, later ones skip it
+    if replaced != null then
+      replaced.executor.execute(() => replaced.closed = true)
     offline.remove(store.storeId)
     ctx.publishView()
 

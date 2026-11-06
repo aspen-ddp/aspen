@@ -86,6 +86,9 @@ object Host:
                                 create: Boolean, previous: Option[SpaceWait], result: Try[Backend],
                                 created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
   private[server] case class InitializeTaskExecutor() extends Event
+  /** Posted by the constructor after its device scan, so it follows every LoadStore that scan queued: from then on
+   *  the router answers messages for stores not loaded here (StoreRouter.markReady). */
+  private[server] case class StoresReady() extends Event
 
   /** What Host posts to its threading's control events: one event, handled by handleEvent. Carries the event so the
    *  test hooks can find queued events, and names it in the log line written when its handler throws. */
@@ -218,9 +221,9 @@ class Host(val client: AspenClient,
 
   val storageDevicesDir: os.Path = rootDir / StorageDeviceManager.StorageDevicesDirName
 
-  /** Posts `task` to each loaded store's executor, where it runs if that store is still installed. Callable from any
-   *  thread. */
-  protected def postToEachStore(task: Store => Unit): Unit = deviceControl.router.postToEachStore(task)
+  /** Posts `task` to each loaded store's executor, where it runs unless that store's close has started. Call on the
+   *  control thread (from handleRecoveryEvent). */
+  protected def onEachStore(task: Store => Unit): Unit = deviceControl.router.onEachStore(task)
 
   private def reconciler = deviceControl.reconciler
 
@@ -266,6 +269,9 @@ class Host(val client: AspenClient,
   private val repairService = new RepairService(client, hostId, this, backgroundTasks)(using ec)
 
   deviceControl.discovery.checkForNewDevices()
+
+  // After the LoadStores the scan queued: until it is handled, messages for stores not loaded get no reply
+  post(StoresReady())
 
   // After we've loaded all the stores, initiate an initial check of all our
   // devices in case operations were preformed while we were down and missed
@@ -429,6 +435,9 @@ class Host(val client: AspenClient,
         deviceControl.discovery.handleMarkerResolved(e)
 
       case ScanDevices() => reconciler.scan()
+
+      case StoresReady() =>
+        deviceControl.router.markReady()
 
       case InitializeTaskExecutor() =>
         services.initializeTaskExecutor()

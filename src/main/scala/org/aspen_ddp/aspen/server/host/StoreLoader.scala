@@ -326,6 +326,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private[host] def closeUnloaded(entry: StoreRouter.Entry): Unit =
     val store = entry.store
     onExecutor(entry):
+      // Tasks queued behind this one skip the store
+      entry.closed = true
       store.objectCache.clear()
       ctx.crl.closeStore(store.storeId)
     .onComplete: _ =>
@@ -348,7 +350,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** Closes a store (spec section 5): removes it from the router, which marks it offline so new traffic gets the
    *  offline handling, then runs the close on its executor, behind any tasks already queued for it: object cache
    *  clear and `crl.closeStore`, then the CRL state saved and `store.close()`. Back on the control thread, its
-   *  executor slot is released and the fail-stop check decides the completion. */
+   *  executor slot is released, whatever the outcome, and the fail-stop check decides the completion; a failed step
+   *  fails it. */
   def handleClose(e: ShutdownStore): Unit =
     val ShutdownStore(storeId, completion) = e
     router.entry(storeId) match
@@ -371,19 +374,26 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
           sds.offlineStores += storeId
         onExecutor(entry):
+          // Tasks queued ahead of this one have run against the open store; those behind it skip it
+          entry.closed = true
           store.objectCache.clear()
           ctx.crl.closeStore(storeId)
-        .foreach: trs =>
+        .flatMap: trs =>
           onExecutor(entry):
             CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)
             store.close()
-          .foreach: _ =>
-            // The close has completed: the backend and directory belong to the control side again
-            ctx.threading.release(storeId)
-            // An FSIF close completes even after a fail-stop during it, and this store is no
-            // longer served, so its BackendFailed (if any) would find nothing to act on.
-            if backendHasFailed(store.backend) then
-              ctx.rebuilds.failedOnClose(store)
-              completion.failure(StoreFailedOnClose(storeId))
-            else
-              completion.success(())
+        .onComplete: result =>
+          // The close has ended: the backend and directory belong to the control side again
+          ctx.threading.release(storeId)
+          result match
+            case Success(_) =>
+              // An FSIF close completes even after a fail-stop during it, and this store is no
+              // longer served, so its BackendFailed (if any) would find nothing to act on.
+              if backendHasFailed(store.backend) then
+                ctx.rebuilds.failedOnClose(store)
+                completion.failure(StoreFailedOnClose(storeId))
+              else
+                completion.success(())
+            case Failure(t) =>
+              logger.error(s"Failed to close store $storeId: $t")
+              completion.failure(t)

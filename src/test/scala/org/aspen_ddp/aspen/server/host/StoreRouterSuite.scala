@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
-import org.aspen_ddp.aspen.server.store.cache.ObjectCache
+import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionStatusCache}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.scalatest.funsuite.AnyFunSuite
@@ -113,8 +113,9 @@ object StoreRouterSuite:
       states += storeId -> (states.getOrElse(storeId, Map()) - txid)
 
   /** A DeviceControl on a StoreThreadPool with what loading, routing and closing a store use. Its posted events run
-   *  the StoreLoader handlers on the control thread. */
-  private class Fixture(crl: CrashRecoveryLog):
+   *  the StoreLoader handlers on the control thread. Its router is ready (as after a Host's startup scan) unless
+   *  `ready` is false; `cached` gives its stores an object cache. */
+  private class Fixture(crl: CrashRecoveryLog, ready: Boolean, cached: Boolean):
     val threading = new StoreThreadPool(maxThreads = 2)
     val net = new RecordingNet
 
@@ -124,7 +125,9 @@ object StoreRouterSuite:
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager, threading = threading,
       post = event => threading.controlEvents.execute(() => handle(event)),
       crl = crl, txStatusCache = new TransactionStatusCache(), wrapCompletionHandler = identity,
-      objectCacheFactory = _ => ObjectCache.NoCache, finalizerFactory = null,
+      objectCacheFactory =
+        if cached then new HostObjectCache(1024 * 1024).forStore else _ => ObjectCache.NoCache,
+      finalizerFactory = null,
       txDriverFactory = TransactionDriver.noErrorRecoveryFactory, heartbeatPeriod = Duration(5, SECONDS),
       deviceScanPeriod = Duration(10, SECONDS), storeRebuildFactory = null, maxConcurrentRebuilds = 2,
       loadStore = null, tryLoadStore = null, loadStoreById = null, warn = null,
@@ -138,6 +141,8 @@ object StoreRouterSuite:
       case e: Host.UnloadFailedStore => ctx.loader.handleUnloadFailed(e)
       case _ => ()
 
+    if ready then
+      ctx.router.markReady()
     threading.start()
 
     def load(backend: MapBackend): Future[Unit] =
@@ -159,8 +164,9 @@ object StoreRouterSuite:
 
     def shutdown(): Unit = threading.shutdown()
 
-  private def withRouter(crl: CrashRecoveryLog)(f: Fixture => Unit): Unit =
-    val fx = new Fixture(crl)
+  private def withRouter(crl: CrashRecoveryLog, ready: Boolean = true, cached: Boolean = false)
+                        (f: Fixture => Unit): Unit =
+    val fx = new Fixture(crl, ready, cached)
     try f(fx) finally fx.shutdown()
 
   private def emptyCrl: CrashRecoveryLog = new GatedCrl(Future.unit)
@@ -263,3 +269,44 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.ctx.router.deliverTx(TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0),
         Nil, Nil, true))
       fx.net.tx.asScala.toList should be(List((TxUnknownStore(peer, unknown, txid), Thread.currentThread.getName)))
+
+  test("tasks queued ahead of a close run against the open store"):
+    val s0 = StoreId(poolId, 0)
+    withRouter(emptyCrl, cached = true): fx =>
+      val backend = bootstrappedBackend(s0)
+      await(fx.load(backend))
+      val executor = fx.ctx.router.entry(s0).get.executor
+      // Warms the object cache, so the queued reads are answered without backend I/O
+      fx.ctx.router.deliverClient(read(s0))
+      fx.awaitExecutor(executor)
+      fx.awaitExecutor(executor)
+      fx.net.client.size should be(1)
+
+      val unblock = new CountDownLatch(1)
+      executor.execute(() => { unblock.await(Bound, TimeUnit.SECONDS); () })
+      val Queued = 10
+      val reads = (0 until Queued).map(_ => read(s0))
+      reads.foreach(fx.ctx.router.deliverClient)
+      val closed = fx.ctx.loader.closeStore(s0)
+      // handleClose has run: the store is removed and its close queued behind the reads
+      fx.awaitControl()
+      fx.ctx.router.entry(s0) should be(None)
+      unblock.countDown()
+      await(closed)
+
+      val answered = fx.net.client.asScala.toList.collect { case r: ReadResponse => r }.drop(1)
+      answered.map(_.readUUID) should be(reads.map(_.readUUID).toList)
+      answered.forall(_.result.isRight) should be(true)
+      backend.closed should be(true)
+
+  test("a message for an unknown store gets no reply until the router is ready"):
+    val unknown = StoreId(poolId, 2)
+    val peer = StoreId(poolId, 1)
+    val txid = TransactionId(new UUID(15, 8))
+    withRouter(emptyCrl, ready = false): fx =>
+      def prepare = TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0), Nil, Nil, true)
+      fx.ctx.router.deliverTx(prepare)
+      fx.net.tx.asScala.toList should be(empty)
+      fx.ctx.router.markReady()
+      fx.ctx.router.deliverTx(prepare)
+      fx.net.tx.asScala.toList.map(_._1) should be(List(TxUnknownStore(peer, unknown, txid)))

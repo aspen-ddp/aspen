@@ -227,7 +227,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   created lazily, least-loaded placement), and everything touching a `Store`, `Frontend` or `Tx` runs there
 - The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
-  still installed. Unknown stores are answered from the calling thread; offline ones are silent
+  not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the
+  calling thread; offline ones are silent, as are all unknown ones until the startup scan's loads are handled
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only

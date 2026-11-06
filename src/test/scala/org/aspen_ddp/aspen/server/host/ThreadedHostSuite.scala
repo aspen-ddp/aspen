@@ -34,8 +34,8 @@ class ThreadedHostSuite extends IntegrationTestSuite:
         _ <- tx.commit()
       yield ptrs
 
-    // Each object's writes follow one another, each requiring the revision the one before wrote; the objects'
-    // chains run concurrently, so 200 transactions are in flight across the store threads.
+    // Each object's writes follow one another, each requiring the revision the one before wrote, so they never
+    // collide; the 20 objects' chains run concurrently, so up to 20 of the 200 transactions are in flight at once.
     def overwrites(obj: Int, ptr: DataObjectPointer): Future[Unit] =
       (1 to WritesPerObject).foldLeft(client.read(ptr).map(_.revision)): (frev, write) =>
         frev.flatMap: rev =>

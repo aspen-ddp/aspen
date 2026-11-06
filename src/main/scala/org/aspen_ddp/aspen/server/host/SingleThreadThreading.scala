@@ -2,10 +2,8 @@ package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
-import scribe.Logging
 
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.{Executor, LinkedBlockingQueue}
+import java.util.concurrent.Executor
 import scala.concurrent.ExecutionContext
 
 /** Production threading, as the host's event loop ran: one thread, `aspen-host-control`, runs everything posted
@@ -14,41 +12,15 @@ import scala.concurrent.ExecutionContext
  *
  *  Work posted before `start` waits for it. The thread is not a daemon: `shutdown` stops it once the work already
  *  queued has run, and anything posted after that is dropped. */
-class SingleThreadThreading extends HostThreading with Logging:
-  private val queue = new LinkedBlockingQueue[Runnable]()
+class SingleThreadThreading extends HostThreading:
+  private val loop = new SerialLoop("aspen-host-control", daemon = false)
 
-  /** Queued by shutdown: the loop ends on taking it. */
-  private val Stop: Runnable = () => ()
-
-  private val started = new AtomicBoolean(false)
-  @volatile private var stopped = false
-  private val droppedWarned = new AtomicBoolean(false)
-
-  private val thread = new Thread(() => loop(), "aspen-host-control")
-
-  private def loop(): Unit =
-    var task = queue.take()
-    while task ne Stop do
-      HostThreading.runLogged(task)
-      task = queue.take()
-
-  private val enqueue: Executor = task =>
-    if !stopped then
-      queue.put(task)
-    else if droppedWarned.compareAndSet(false, true) then
-      logger.warn("Dropping work posted to the host's control thread after its shutdown. Later drops are not logged")
-
-  override val control: ExecutionContext = ExecutionContext.fromExecutor(enqueue,
-    cause => logger.error("Unhandled exception in a control-thread callback", cause))
-  override def controlEvents: Executor = enqueue
-  override def dispatch: Executor = enqueue
+  override def control: ExecutionContext = loop
+  override def controlEvents: Executor = loop
+  override def dispatch: Executor = loop
   override def assign(storeId: StoreId, deviceId: StorageDeviceId): StoreExecutor = HostThreading.InlineStoreExecutor
   override def release(storeId: StoreId): Unit = ()
 
-  override def start(): Unit =
-    if !stopped && started.compareAndSet(false, true) then
-      thread.start()
+  override def start(): Unit = loop.start()
 
-  override def shutdown(): Unit =
-    stopped = true
-    queue.put(Stop)
+  override def shutdown(): Unit = loop.shutdown()

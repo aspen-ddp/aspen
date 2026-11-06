@@ -29,8 +29,8 @@ import scala.concurrent.ExecutionContext
  *     through a `@volatile` field (see `HostStoreView` below).
  *  4. **Store state is never touched from the control thread,** and the reverse also holds.
  *
- *  Both implementations below still run stores inline on the control thread, so rule 4 is not yet in force: it takes
- *  effect once stores have executors of their own.
+ *  SingleThreadThreading and LockstepThreading run stores inline on the control thread, so under them rule 4 is not
+ *  in force. It is under StoreThreadPool, whose stores have executors of their own.
  *
  *  `HostStoreView` is that snapshot: DeviceControl.publishView republishes it after every change to the state it
  *  reflects. Callbacks that are not Futures (timers, FSIF's onFatal, the FSIF open on fsifOpenEc) run on whatever
@@ -38,7 +38,10 @@ import scala.concurrent.ExecutionContext
  *  does this for delayed work. Every place that deliberately leaves the control context says, in a comment, where the
  *  work runs and how its result comes back.
  *
- *  Two implementations:
+ *  Three implementations:
+ *  - StoreThreadPool (the default production strategy, not yet wired in): `aspen-host-control` runs device
+ *    management, and stores run on at most `maxThreads` daemon `aspen-store-N` threads, created lazily and placed
+ *    least-loaded first.
  *  - SingleThreadThreading (production, `cmdline/Main.scala`): one thread, `aspen-host-control`, runs everything
  *    posted, in posting order, as the host's event loop did.
  *  - LockstepThreading (regression tests, `TestNetwork` and every test Host): posted work waits on one FIFO until the
@@ -52,11 +55,16 @@ trait HostThreading:
   /** Where control events are posted (production: the control thread; lockstep: the FIFO). */
   def controlEvents: Executor
   /** Entry hop for work arriving from a foreign thread: network, I/O completion, timers, CRL callbacks.
+   *  StoreThreadPool: runs inline on the calling thread, which hands the work to the store's executor itself.
    *  SingleThreadThreading: enqueues on the control thread, where stores still run. Lockstep: enqueues on the FIFO. */
   def dispatch: Executor
-  /** Binds a store being loaded to an executor. Called on the control thread. */
+  /** Binds a store being loaded to an executor. Called on the control thread.
+   *  StoreThreadPool: a store thread with the fewest assigned stores, ties going to the lowest index; a new thread is
+   *  created only when every existing one has a store and fewer than `maxThreads` exist. SingleThreadThreading and
+   *  Lockstep: runs the store's work inline on the thread that posts it. */
   def assign(storeId: StoreId, deviceId: StorageDeviceId): StoreExecutor
-  /** Called on the control thread once a store's close has completed. */
+  /** Called on the control thread once a store's close has completed. StoreThreadPool: frees the store's slot on
+   *  its thread; threads are never stopped before `shutdown`. */
   def release(storeId: StoreId): Unit
   /** Begins running posted work; until then it waits. Lockstep: nothing to start, as only a drain runs work. */
   def start(): Unit

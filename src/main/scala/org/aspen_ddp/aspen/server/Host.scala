@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
 import org.aspen_ddp.aspen.server.store.Store
-import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, CompletionHandler}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -29,25 +29,12 @@ import scala.util.Try
 object Host:
   private[server] sealed abstract class Event
 
-  private[server] case class IOCompletion(op: Completion) extends Event
-  private[server] case class TransactionMessage(msg: TxMessage) extends Event
-  private[server] case class ClientReq(msg: ClientRequest) extends Event
   private[server] case class HostMsg(msg: HostMessage) extends Event
-  private[server] case class Repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]) extends Event
-  private[server] case class RepairDelete(storeId: StoreId, objectId: ObjectId, storePointer: Array[Byte],
-                                  completion: Promise[Unit]) extends Event:
-    override def equals(other: Any): Boolean = other match
-      case that: RepairDelete => storeId == that.storeId && objectId == that.objectId &&
-        java.util.Arrays.equals(storePointer, that.storePointer) && completion == that.completion
-      case _ => false
-
-    override def hashCode: Int = (storeId, objectId, java.util.Arrays.hashCode(storePointer), completion).##
   private[server] case class LoadStore(storageDeviceId: StorageDeviceId, backend: Backend,
                                   maxSliceSize: Option[Long], completion: Promise[Unit]) extends Event
   private[server] case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
+  /** The CRL state of a loaded store failed to load: it is unloaded, if it is still the store installed */
   private[server] case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
-  /** The CRL holds the state loaded from a store's crl_save.log: its transactions can be recovered */
-  private[server] case class StoreCrlLoaded(storeId: StoreId, store: Store, saveFile: os.Path, p: Promise[Unit]) extends Event
   /** An FSIF backend failed-stop (its onFatal). `backend` is set once its constructor returns; it stays empty if the
    *  constructor threw. An FSIF backend is opened off the event thread, so the event can be handled before then:
    *  the backend is not served yet, and LoadStore retires it on seeing it failed. */
@@ -83,7 +70,6 @@ object Host:
 
   private[server] case class Exit() extends Event
   private[server] case class RecoveryEvent() extends Event
-  private[server] case class HeartbeatEvent() extends Event
 
   private[server] case class SystemTaskHeartbeatEvent() extends Event
   private[server] case class CheckAllDevices() extends Event
@@ -101,13 +87,8 @@ object Host:
                                 created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
   private[server] case class InitializeTaskExecutor() extends Event
 
-  /** Hands each I/O completion to the host's threading as an IOCompletion event. */
-  private[server] class IOHandler(host: Host) extends CompletionHandler:
-    override def complete(op: Completion): Unit =
-      host.post(IOCompletion(op))
-
-  /** What Host posts to its threading: one event, handled by handleEvent. Carries the event so the test hooks can
-   *  find queued events, and names it in the log line written when its handler throws. */
+  /** What Host posts to its threading's control events: one event, handled by handleEvent. Carries the event so the
+   *  test hooks can find queued events, and names it in the log line written when its handler throws. */
   private[server] final class EventTask(host: Host, val event: Event) extends HostThreading.Named:
     override def run(): Unit = host.handleEvent(event)
     override def name: String = event.getClass.getSimpleName
@@ -119,7 +100,8 @@ object Host:
    *  because a recording seam must stand in front of the real thing, which a test cannot build before the Host
    *  exists: `wrapMetadata` receives the metadata Host would have used (so adoption during the Host's own
    *  constructor scan is still seen), and the others replace the DeviceControl callbacks of the same name.
-   *  `warn` also receives the directory, as DeviceControl's callback does. */
+   *  `warn` also receives the directory, as DeviceControl's callback does. `wrapIoHandler` wraps each backend's own
+   *  completion handler. */
   final case class Seams(metadata: Option[DeviceMetadata] = None,
                          wrapMetadata: Option[DeviceMetadata => DeviceMetadata] = None,
                          scheduler: Option[ControlScheduler] = None,
@@ -176,8 +158,6 @@ class Host(val client: AspenClient,
                    seams: Host.Seams = Host.Seams.default) extends Logging with RepairTarget {
   import Host._
 
-  private val ioHandler = new IOHandler(this)
-
   private val txStatusCache = new TransactionStatusCache(Host.txStatusCacheDuration(heartbeatPeriod))
 
   private val crl = crlFactory.createCRL()
@@ -208,7 +188,7 @@ class Host(val client: AspenClient,
     post = event => Host.this.post(event),
     crl = crl,
     txStatusCache = txStatusCache,
-    ioHandler = seams.wrapIoHandler.fold(ioHandler)(wrap => wrap(ioHandler)),
+    wrapCompletionHandler = seams.wrapIoHandler.getOrElse(identity),
     objectCacheFactory = objectCacheFactory,
     finalizerFactory = finalizerFactory,
     txDriverFactory = txDriverFactory,
@@ -238,7 +218,9 @@ class Host(val client: AspenClient,
 
   val storageDevicesDir: os.Path = rootDir / StorageDeviceManager.StorageDevicesDirName
 
-  protected def stores: Map[StoreId, Store] = deviceControl.router.loaded
+  /** Posts `task` to each loaded store's executor, where it runs if that store is still installed. Callable from any
+   *  thread. */
+  protected def postToEachStore(task: Store => Unit): Unit = deviceControl.router.postToEachStore(task)
 
   private def reconciler = deviceControl.reconciler
 
@@ -260,8 +242,9 @@ class Host(val client: AspenClient,
   private[aspen] def retransmitPendingStartTransfers(force: Boolean = false): Unit =
     transfers.retransmitPendingStarts(force)
 
+  // One dispatch step that posts each store's heartbeat to its executor
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
-    post(HeartbeatEvent())
+    deviceControl.router.heartbeat()
   }
 
   private val systemTaskHeartbeatTask = backgroundTasks.schedulePeriodic(Host.SystemTaskHeartbeatPeriod) {
@@ -297,16 +280,10 @@ class Host(val client: AspenClient,
   /** Starts running the host's events. Until then they wait. */
   def start(): Unit = threading.start()
 
-  /** Posts one event to the threading. Hot-path and store-side events take the dispatch hop; every other event is a
-   *  control event. */
+  /** Posts one event to the threading's control events. Store-bound work never comes through here: the hot path
+   *  goes straight to the StoreRouter, which takes the dispatch hop to each store's executor. */
   private def post(event: Event): Unit =
-    val task = EventTask(this, event)
-    event match
-      case _: (TransactionMessage | ClientReq | Repair | RepairDelete | IOCompletion | HeartbeatEvent |
-               StoreCrlLoaded | UnloadFailedStore) =>
-        threading.dispatch.execute(task)
-      case _ =>
-        threading.controlEvents.execute(task)
+    threading.controlEvents.execute(EventTask(this, event))
 
   private def lockstep: LockstepThreading = threading match
     case t: LockstepThreading => t
@@ -344,7 +321,7 @@ class Host(val client: AspenClient,
     */
   def isRepairable(storeId: StoreId): Boolean = deviceControl.currentView.repairable.contains(storeId)
 
-  /** Called from TestNetwork's checker thread: reads the router's @volatile maps. */
+  /** Called from TestNetwork's checker thread: reads the router's concurrent map. */
   def hasTransactions: Boolean = deviceControl.router.hasTransactions
 
   def logTransactionStatus(log: String => Unit): Unit = deviceControl.router.logTransactionStatus(log)
@@ -359,19 +336,19 @@ class Host(val client: AspenClient,
   def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
     post(LoadStoreById(storageDeviceId, storeId))
 
-  def receiveTransactionMessage(msg: TxMessage): Unit = {
-    post(TransactionMessage(msg))
-  }
+  // The hot path: called on network threads, routed straight to the store's executor (see StoreRouter)
 
-  def receiveClientRequest(msg: ClientRequest): Unit = {
-    post(ClientReq(msg))
-  }
+  def receiveTransactionMessage(msg: TxMessage): Unit =
+    deviceControl.router.deliverTx(msg)
+
+  def receiveClientRequest(msg: ClientRequest): Unit =
+    deviceControl.router.deliverClient(msg)
 
   def receiveHostMessage(msg: HostMessage): Unit =
     post(HostMsg(msg))
 
   def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
-    post(Repair(storeId, os, completion))
+    deviceControl.router.repair(storeId, os, completion)
 
   /** Repairs a missed deletion on the given store. Used when the object is gone from the rest
     * of the system, leaving only the ObjectId and the storePointer bytes recorded in the pool's
@@ -381,7 +358,7 @@ class Host(val client: AspenClient,
                    objectId: ObjectId,
                    storePointer: Array[Byte],
                    completion: Promise[Unit]): Unit =
-    post(RepairDelete(storeId, objectId, storePointer, completion))
+    deviceControl.router.repairDelete(storeId, objectId, storePointer, completion)
 
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
     post(Exit())
@@ -407,8 +384,11 @@ class Host(val client: AspenClient,
   /** Whether any posted work is waiting. Lockstep threading only. */
   def hasEvents: Boolean = lockstep.hasQueued
 
-  /** Runs all posted work. Returns when none is left. Lockstep threading only. */
-  def testingOnlyHandleEvents(): Unit = lockstep.drain()
+  /** Lockstep threading: runs all posted work, returning when none is left. Any other threading runs its own work,
+   *  so this returns at once, doing nothing. */
+  def testingOnlyHandleEvents(): Unit = threading match
+    case t: LockstepThreading => t.drain()
+    case _ => ()
 
   /** The components, for tests. */
   private[aspen] def control: DeviceControl = deviceControl
@@ -417,22 +397,11 @@ class Host(val client: AspenClient,
   private def handleEvent(event: Event): Unit =
     event match {
 
-      case IOCompletion(op) => deviceControl.router.deliverCompletion(op)
-
-      case TransactionMessage(msg) => deviceControl.router.deliverTx(msg)
-
-      case ClientReq(msg) => deviceControl.router.deliverClient(msg)
-
       case HostMsg(msg) => msg match
         case m: StartStoreTransfer => transfers.startOut(m)
         case m: CheckStorageDevice => reconciler.handleCheckMessage(m)
         case m: (ServiceMessage | ExecuteSystemTask) => services.deliver(m)
       
-      case Repair(storeId, os, completion) => deviceControl.router.repair(storeId, os, completion)
-
-      case RepairDelete(storeId, objectId, storePointer, completion) =>
-        deviceControl.router.repairDelete(storeId, objectId, storePointer, completion)
-
       case RecoveryEvent() =>
         handleRecoveryEvent()
 
@@ -445,18 +414,11 @@ class Host(val client: AspenClient,
       case e: FsifOpened =>
         deviceControl.loader.handleFsifOpened(e)
 
-      case e: StoreCrlLoaded =>
-        deviceControl.loader.handleCrlLoaded(e)
-
       case e: UnloadFailedStore =>
         deviceControl.loader.handleUnloadFailed(e)
 
       case e: LoadStoreById =>
         deviceControl.loader.handleLoadById(e)
-
-      case HeartbeatEvent() =>
-        //logger.trace("Main loop got heartbeat event")
-        deviceControl.router.heartbeat()
 
       case SystemTaskHeartbeatEvent() =>
         services.systemTaskHeartbeat()

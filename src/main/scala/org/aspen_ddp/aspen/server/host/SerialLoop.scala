@@ -47,3 +47,6 @@ class SerialLoop(name: String, daemon: Boolean) extends StoreExecutor with Execu
   def shutdown(): Unit =
     stopped = true
     queue.put(Stop)
+
+  /** Whether the loop's thread is running. Testing hook. */
+  private[host] def threadIsAlive: Boolean = thread.isAlive

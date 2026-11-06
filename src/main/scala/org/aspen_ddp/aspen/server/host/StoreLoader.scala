@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, FsifOpened, LoadStore, LoadStoreById, ShutdownStore,
-  SpaceWait, StoreCrlLoaded, StoreFailedOnClose, UnloadFailedStore}
+  SpaceWait, StoreFailedOnClose, UnloadFailedStore}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Store
@@ -275,62 +275,91 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         p.failure(err)
 
       case Right(trs) =>
+        val storeId = backend.storeId
+        // A store loaded again over a loaded one replaces it on the same executor, as the map entry is replaced
+        val executor = router.entry(storeId) match
+          case Some(entry) => entry.executor
+          case None => ctx.threading.assign(storeId, storageDeviceId)
+        // Built, wired and set to await its CRL state here, on the control thread, before install publishes it: no
+        // other thread can reach it yet, and no message finds it missing once it is registered. Ownership passes to
+        // its executor at install (spec section 5, refined).
         // The store's transaction drivers run on the host's ec, not the control context; they post back as messages
-        val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(backend.storeId), ctx.net,
+        val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(storeId), ctx.net,
           ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
           Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
-        backend.setCompletionHandler(ctx.ioHandler)
-        router.install(store)
+        backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler()))
+        // Its transactions are recreated, and its transaction messages handled, once the CRL holds them
+        if trs.isDefined then
+          store.frontend.awaitRecovery()
+        router.install(store, executor)
 
         trs match
           case None => p.success(())
           case Some(trs) =>
-            // Its transactions are recreated, and its transaction messages handled, once the CRL holds them
-            store.frontend.awaitRecovery()
-            ctx.crl.loadStore(backend.storeId, trs).onComplete:
+            ctx.crl.loadStore(storeId, trs).onComplete:
               case Success(_) =>
-                ctx.post(StoreCrlLoaded(backend.storeId, store, backend.crlSaveFile, p))
+                // Recovered on the store's executor (StoreRouter.crlLoaded)
+                router.crlLoaded(store, backend.crlSaveFile, p)
               case Failure(err) =>
                 // The save file stays, so a restart tries again. Until then the store must
                 // not serve without the state the file holds.
-                logger.error(s"Failed to load the CRL state of store ${backend.storeId}. Taking it " +
+                logger.error(s"Failed to load the CRL state of store $storeId. Taking it " +
                              s"offline. Error: $err")
-                ctx.post(UnloadFailedStore(backend.storeId, store))
+                ctx.post(UnloadFailedStore(storeId, store))
                 p.failure(err)
 
-  def handleCrlLoaded(e: StoreCrlLoaded): Unit =
-    val StoreCrlLoaded(storeId, store, saveFile, p) = e
-    // A store closed meanwhile keeps its save file, which its close rewrote, and recovers from it when next loaded
-    if router.get(storeId).exists(_ eq store) then
-      os.remove(saveFile)
-      store.frontend.recover()
-    p.success(())
-
+  /** Unloads a store whose CRL state failed to load, if it is still the one installed. Its close runs on its
+   *  executor (closeUnloaded). */
   def handleUnloadFailed(e: UnloadFailedStore): Unit =
     val UnloadFailedStore(storeId, store) = e
-    if router.get(storeId).exists(_ eq store) then
+    router.entry(storeId).filter(_.store eq store).foreach: entry =>
       router.remove(storeId)
-      store.objectCache.clear()
       ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
         sds.offlineStores += storeId
       // Drops whatever part of the saved state did reach the CRL. The save file is not
       // rewritten from it: the file on disk is still the whole state.
-      ctx.crl.closeStore(storeId).onComplete: _ =>
-        store.close()
+      closeUnloaded(entry)
+
+  /** Closes the store of `entry`, already removed from the router, without saving its CRL state: clears its object
+   *  cache and drops its CRL state on its executor, then closes it there, and releases its executor slot once the
+   *  close completes. Nothing is awaited. */
+  private[host] def closeUnloaded(entry: StoreRouter.Entry): Unit =
+    val store = entry.store
+    onExecutor(entry):
+      store.objectCache.clear()
+      ctx.crl.closeStore(store.storeId)
+    .onComplete: _ =>
+      onExecutor(entry)(store.close()).onComplete: _ =>
+        ctx.threading.release(store.storeId)
+
+  /** Runs `f` on the executor of `entry`, whose store the router no longer holds, and completes with its result.
+   *  Callbacks on the returned Future name the control context. Lockstep: inline, so the order is the event loop's. */
+  private def onExecutor[T](entry: StoreRouter.Entry)(f: => Future[T]): Future[T] =
+    val p = Promise[T]()
+    entry.executor.execute: () =>
+      try p.completeWith(f)
+      catch case NonFatal(t) => p.failure(t)
+    p.future
 
   def handleLoadById(e: LoadStoreById): Unit =
     ctx.devices.devices.get(e.sstorageDeviceId).foreach: sds =>
       ctx.tryLoadStore(sds, sds.devicePath / e.toreId.directoryName, None)
 
+  /** Closes a store (spec section 5): removes it from the router, which marks it offline so new traffic gets the
+   *  offline handling, then runs the close on its executor, behind any tasks already queued for it: object cache
+   *  clear and `crl.closeStore`, then the CRL state saved and `store.close()`. Back on the control thread, its
+   *  executor slot is released and the fail-stop check decides the completion. */
   def handleClose(e: ShutdownStore): Unit =
     val ShutdownStore(storeId, completion) = e
-    router.get(storeId) match
+    router.entry(storeId) match
       case None if fsifOpening.contains(storeId) =>
         // Closed once its open ends and it is served (fsifOpened puts this event again)
         fsifOpening += storeId -> (completion :: fsifOpening(storeId))
       case None => completion.success(())
-      case Some(store) =>
+      case Some(entry) =>
+        val store = entry.store
         store.backend match
+          // isWriteFrozen is volatile, which the control side may read
           case b: FsifBackend if b.isWriteFrozen =>
             // The close abandons the held writes as a crash would (Ruling 27): they were never
             // acknowledged, so the CRL saved below keeps their data, and acknowledged commits are
@@ -339,12 +368,18 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                         s"abandoned, as in a crash, and redone from the CRL when it next loads")
           case _ =>
         router.remove(storeId)
-        store.objectCache.clear()
         ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
           sds.offlineStores += storeId
-        ctx.crl.closeStore(storeId).foreach: trs =>
-          CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)
-          store.close().foreach: _ =>
+        onExecutor(entry):
+          store.objectCache.clear()
+          ctx.crl.closeStore(storeId)
+        .foreach: trs =>
+          onExecutor(entry):
+            CrashRecoveryLog.saveStoreState(storeId, trs, store.backend.crlSaveFile)
+            store.close()
+          .foreach: _ =>
+            // The close has completed: the backend and directory belong to the control side again
+            ctx.threading.release(storeId)
             // An FSIF close completes even after a fail-stop during it, and this store is no
             // longer served, so its BackendFailed (if any) would find nothing to act on.
             if backendHasFailed(store.backend) then

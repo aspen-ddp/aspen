@@ -29,8 +29,13 @@ import scala.concurrent.ExecutionContext
  *     through a `@volatile` field (see `HostStoreView` below).
  *  4. **Store state is never touched from the control thread,** and the reverse also holds.
  *
- *  SingleThreadThreading and LockstepThreading run stores inline on the control thread, so under them rule 4 is not
- *  in force. It is under StoreThreadPool, whose stores have executors of their own.
+ *  Rule 4 is enforced by ownership (spec section 5): before `StoreRouter.install` and after a store's close has
+ *  completed, its backend and directory belong to the control side; in between, the Store and its backend belong to
+ *  its executor. The control side may then read only the backend's immutable fields (`storeId`, `path`,
+ *  `crlSaveFile`) and FSIF's `@volatile` `hasFailed` and `isWriteFrozen`; anything else is posted to the executor
+ *  (`StoreRouter.onStore`, or the close sequence in StoreLoader) and its result returned through a Future whose
+ *  callbacks name the control context. SingleThreadThreading and LockstepThreading run stores inline, on the thread
+ *  that posts to them, so under them the hop costs nothing and the order is the event loop's.
  *
  *  `HostStoreView` is that snapshot: DeviceControl.publishView republishes it after every change to the state it
  *  reflects. Callbacks that are not Futures (timers, FSIF's onFatal, the FSIF open on fsifOpenEc) run on whatever
@@ -39,11 +44,10 @@ import scala.concurrent.ExecutionContext
  *  work runs and how its result comes back.
  *
  *  Three implementations:
- *  - StoreThreadPool (the default production strategy, not yet wired in): `aspen-host-control` runs device
- *    management, and stores run on at most `maxThreads` daemon `aspen-store-N` threads, created lazily and placed
- *    least-loaded first.
- *  - SingleThreadThreading (production, `cmdline/Main.scala`): one thread, `aspen-host-control`, runs everything
- *    posted, in posting order, as the host's event loop did.
+ *  - StoreThreadPool (production, `cmdline/Main.scala`): `aspen-host-control` runs device management, and stores
+ *    run on at most `maxThreads` daemon `aspen-store-N` threads, created lazily and placed least-loaded first.
+ *  - SingleThreadThreading: one thread, `aspen-host-control`, runs everything posted, in posting order, as the
+ *    host's event loop did.
  *  - LockstepThreading (regression tests, `TestNetwork` and every test Host): posted work waits on one FIFO until the
  *    test drains it, and Future callbacks run on the test's own ExecutionContext, which is single-threaded and runs
  *    on the test thread, so the single-owner rule still holds.
@@ -54,7 +58,8 @@ trait HostThreading:
   def control: ExecutionContext
   /** Where control events are posted (production: the control thread; lockstep: the FIFO). */
   def controlEvents: Executor
-  /** Entry hop for work arriving from a foreign thread: network, I/O completion, timers, CRL callbacks.
+  /** Entry hop for work arriving from a foreign thread: network, I/O completion, timers, CRL callbacks. StoreRouter
+   *  runs its store lookup here, then hands the work to the store's executor.
    *  StoreThreadPool: runs inline on the calling thread, which hands the work to the store's executor itself.
    *  SingleThreadThreading: enqueues on the control thread, where stores still run. Lockstep: enqueues on the FIFO. */
   def dispatch: Executor

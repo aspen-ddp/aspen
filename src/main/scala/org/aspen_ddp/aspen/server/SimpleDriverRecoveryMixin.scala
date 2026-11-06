@@ -14,9 +14,10 @@ trait SimpleDriverRecoveryMixin extends Host {
     super.shutdown()
   }
 
+  /** Runs on the control thread. Each store's transactions are walked by a task on that store's own executor. */
   override protected def handleRecoveryEvent(): Unit = {
-    val now = System.nanoTime()
-    stores.valuesIterator.foreach { store =>
+    postToEachStore { store =>
+      val now = System.nanoTime()
       store.frontend.transactions.valuesIterator.foreach { tx =>
         val delay = Duration(now - tx.lastEventTime, NANOSECONDS)
         if (delay > txDriverFactory.failedDriverDuration) {

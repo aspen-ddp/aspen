@@ -104,13 +104,9 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
       ex.execute(() => ran.countDown())
       ran.await(10, TimeUnit.SECONDS) should be(true)
 
-  private def liveStoreThreads(): Set[Thread] =
-    Thread.getAllStackTraces.keySet.asScala.filter(th => th.isAlive && th.getName.startsWith("aspen-store-")).toSet
-
   test("assign after shutdown leaves no live store thread and drops the store's work"):
     val t = new StoreThreadPool(4)
     t.start()
-    val before = liveStoreThreads()
     val release = new CountDownLatch(1)
     val assigned = new CountDownLatch(1)
     val ran = new AtomicInteger(0)
@@ -124,6 +120,8 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
     assigned.await(10, TimeUnit.SECONDS) should be(true)
     // Directly, too
     t.assign(store(2), Device).execute(() => ran.incrementAndGet())
-    (liveStoreThreads() -- before) should be(empty)
+    // Only this pool's threads: other suites run StoreThreadPool hosts in the same JVM
+    t.createdLoops.size should be(2)
+    t.createdLoops.exists(_.threadIsAlive) should be(false)
     t.threadCount should be(0)
     ran.get should be(0)

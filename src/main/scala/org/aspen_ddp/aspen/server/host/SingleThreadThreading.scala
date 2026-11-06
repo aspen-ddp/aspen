@@ -6,9 +6,9 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import java.util.concurrent.Executor
 import scala.concurrent.ExecutionContext
 
-/** Production threading, as the host's event loop ran: one thread, `aspen-host-control`, runs everything posted
- *  through `control`, `controlEvents` and `dispatch`, one task at a time in posting order. Stores run inline, as
- *  their work already runs on that thread.
+/** The host's former production threading, as its event loop ran: one thread, `aspen-host-control`, runs everything
+ *  posted through `control`, `controlEvents` and `dispatch`, one task at a time in posting order. Stores run inline,
+ *  as their work already runs on that thread.
  *
  *  Work posted before `start` waits for it. The thread is not a daemon: `shutdown` stops it once the work already
  *  queued has run, and anything posted after that is dropped. */

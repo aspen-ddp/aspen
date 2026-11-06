@@ -7,11 +7,12 @@ import org.aspen_ddp.aspen.common.objects.{Insert, KeyValueObjectPointer}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
 import org.aspen_ddp.aspen.common.util.long2byte
+import org.aspen_ddp.aspen.server.host.{HostThreading, LockstepThreading}
 import org.scalatest.{FutureOutcome, Tag, compatible}
 import org.scalatest.funsuite.AsyncFunSuite
 import org.scalatest.matchers.should.Matchers
 
-import scala.concurrent.{Await, Future}
+import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.{Duration, MILLISECONDS}
 
 class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeAndAfter {
@@ -39,6 +40,9 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
   def testStoreMaxSliceSize: Option[Long] =
     (testPoolMaxSliceSize.toList ++ testBackendMaxSliceSize.toList).minOption.map(_.toLong)
 
+  /** Override to run the TestNetwork's bootstrap host on another threading than lockstep (ThreadedHostSuite). */
+  def testThreading: ExecutionContext => HostThreading = new LockstepThreading(_)
+
   def subFixtureSetup(): Unit = {}
   def subFixtureTeardown(): Unit = ()
 
@@ -51,7 +55,7 @@ class IntegrationTestSuite  extends AsyncFunSuite with Matchers { //with BeforeA
 
   override def withFixture(test: NoArgAsyncTest): FutureOutcome = {
     net = new TestNetwork(executionContext, userTypeFactories, testIda, testPoolMaxSliceSize, testStoreMaxSliceSize,
-      testBackendMaxSliceSize)
+      testBackendMaxSliceSize, testThreading)
     client = net.client
     testName = test.name
     radicle = net.radicle

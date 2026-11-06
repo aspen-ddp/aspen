@@ -21,7 +21,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, transaction}
-import org.aspen_ddp.aspen.server.host.LockstepThreading
+import org.aspen_ddp.aspen.server.host.{HostThreading, LockstepThreading}
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.Bootstrap
@@ -31,7 +31,7 @@ import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFin
 import org.aspen_ddp.aspen.common.ida.IDA
 
 import scala.concurrent.duration.{Duration, MILLISECONDS, SECONDS}
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.language.implicitConversions
 
 
@@ -95,7 +95,9 @@ class TestNetwork(executionContext: ExecutionContext,
                   val ida: IDA = Replication(3, 2),
                   poolMaxSliceSize: Option[Int] = None,
                   storeMaxSliceSize: Option[Long] = None,
-                  backendMaxSliceSize: Option[Int] = None) extends ServerMessenger {
+                  backendMaxSliceSize: Option[Int] = None,
+                  /** The bootstrap host's threading. Only ThreadedHostSuite passes anything but lockstep. */
+                  threading: ExecutionContext => HostThreading = new LockstepThreading(_)) extends ServerMessenger {
   import TestNetwork._
 
   /** A new cache on each call. A HostObjectCache must not be shared between Hosts */
@@ -171,6 +173,11 @@ class TestNetwork(executionContext: ExecutionContext,
 
   private def allHosts: List[Host] = smgr :: poolHosts.values.toList.distinct.filterNot(_ eq smgr)
 
+  private val smgrThreading: HostThreading = threading(executionContext)
+
+  /** Lockstep: the test drains the hosts' events (handleEvents). Otherwise the bootstrap host runs them itself. */
+  private val lockstep: Boolean = smgrThreading.isInstanceOf[LockstepThreading]
+
   private var readCounting = false
   private var countedReads: Set[(UUID, ObjectId)] = Set()
 
@@ -227,7 +234,7 @@ class TestNetwork(executionContext: ExecutionContext,
     new UUID(0, 0),
     os.root,
     executionContext,
-    new LockstepThreading(executionContext),
+    smgrThreading,
     objectCacheFactory,
     this,
     BackgroundTaskManager.NoBackgroundTaskManager,
@@ -238,7 +245,12 @@ class TestNetwork(executionContext: ExecutionContext,
     Duration(60, SECONDS))
 
   // Stands in for each store's StoreConfig.effectiveMaxSliceSize, which Host reads from the store config file
-  (stores ++ metadataStores).foreach(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))
+  private val storesLoaded = (stores ++ metadataStores).map(s => smgr.loadStore(storageDeviceId, s, storeMaxSliceSize))
+
+  // A host not in lockstep runs its own events once started; the network is usable once its stores are loaded
+  if !lockstep then
+    smgr.start()
+    storesLoaded.foreach(loaded => Await.result(loaded, Duration(10, SECONDS)))
 
   // ---- Rebalancing test helpers -------------------------------------------------
 
@@ -356,7 +368,7 @@ class TestNetwork(executionContext: ExecutionContext,
 
   var otestThreadId: Option[Long] = None
 
-  def handleEvents(): Unit = {
+  def handleEvents(): Unit = if lockstep then {
     otestThreadId match
       case None => otestThreadId = Some(Thread.currentThread().threadId())
       case Some(testThreadId) =>

@@ -222,17 +222,27 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - If the refcount of the object is set to zero, it is deleted
 
 ### Host threading model
-- `HostThreading` (`server.host`) decides where a host's work runs. Stores are meant for store threads
-  (`aspen-store-N`, daemon, single-threaded FIFO executors); for now they run inline on the control thread
+- `HostThreading` (`server.host`) decides where a host's work runs. Production (`Main`) uses `StoreThreadPool`: each
+  store is bound to one store thread (`aspen-store-N`, daemon, single-threaded FIFO executor; at most one per core,
+  created lazily, least-loaded placement), and everything touching a `Store`, `Frontend` or `Tx` runs there
+- The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
+  store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
+  still installed. Unknown stores are answered from the calling thread; offline ones are silent
+- Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
+  executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
+  install and after close the backend and directory belong to the control side, which otherwise reads only
+  `storeId`, `path`, `crlSaveFile` and FSIF's volatile `hasFailed`/`isWriteFrozen`. `release` frees the slot
 - Device management (the `server.host` classes `DeviceControl` wires) runs on one control thread, `aspen-host-control`,
   with no locks. Rules (scaladoc of `HostThreading.scala`): the only `given ExecutionContext` is the control context;
   never block the control thread on a Future; other threads read control state only through the `@volatile`
-  `HostStoreView` (`containsStore`, `getStoreIds`, `getDevicePath`, `isRepairable`) or the router's `@volatile`
-  immutable maps (`hasTransactions`, `logTransactionStatus`); store and control state stay apart
+  `HostStoreView` (`containsStore`, `getStoreIds`, `getDevicePath`, `isRepairable`) or the router's concurrent map
+  (`hasTransactions`, `logTransactionStatus`); store and control state stay apart: control posts store work to the
+  executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
 - Callbacks name the control context. Work run elsewhere (FSIF opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
-- Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, and the
-  control context is the suite's serial `ec`, so integration suites keep their exact ordering
+- Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run
+  inline, and the control context is the suite's serial `ec`, so integration suites keep their exact ordering.
+  `ThreadedHostSuite` runs the TestNetwork's host on a `StoreThreadPool` (`IntegrationTestSuite.testThreading`)
 
 ### Host and StorageDevice Management
 - Most administration is done by reading and writing host and device objects containing the desired state

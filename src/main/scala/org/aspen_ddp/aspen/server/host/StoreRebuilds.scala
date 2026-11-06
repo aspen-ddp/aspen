@@ -394,12 +394,13 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
    *  awaited: the close completes in the background. A backend not (or no longer) served is ignored: either its
    *  LoadStore is still queued, and retires it on seeing it failed, or it was closed and replaced. */
   private def backendFailed(storeId: StoreId, backend: Option[Backend], err: Throwable): Unit =
-    ctx.router.loaded.get(storeId) match
-      case Some(store) if backend.exists(_ eq store.backend) =>
+    // Store.backend and Backend.path are immutable, so the control side may read them while the store is served
+    ctx.router.entry(storeId) match
+      case Some(entry) if backend.exists(_ eq entry.store.backend) =>
+        val store = entry.store
         logger.error(s"Store $storeId failed on an I/O error and can no longer be trusted. Taking it offline and " +
                      s"rebuilding it. Error: $err")
         ctx.router.remove(storeId)
-        store.objectCache.clear()
         ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
           sds.loadedStores -= storeId
           sds.offlineStores += storeId
@@ -410,8 +411,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             // Offline for the life of this process either way. A restart recovers whatever is
             // durable, which a failed store may well still hold.
             logger.error(s"Failed to mark store $storeId for rebuild at ${store.backend.path}: $t")
-        ctx.crl.closeStore(storeId).onComplete: _ =>
-          store.close()
+        // Its object cache cleared, CRL state dropped and close run on its executor; its slot released after
+        ctx.loader.closeUnloaded(entry)
         ctx.reconciler.checkStorageDevice(store.storageDeviceId)
       case served =>
         // Not served: its LoadStore is still queued (and retires it), it was replaced by a newer

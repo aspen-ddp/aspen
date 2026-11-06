@@ -6,8 +6,8 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import java.util.concurrent.Executor
 import scala.concurrent.ExecutionContext
 
-/** The default production threading: device management on one control thread, stores on a pool of at most
- *  `maxThreads` store threads (spec section 3).
+/** The production threading (`cmdline/Main.scala`): device management on one control thread, stores on a pool of
+ *  at most `maxThreads` store threads (spec section 3).
  *
  *  - `control` and `controlEvents` are one non-daemon thread, `aspen-host-control`, as in SingleThreadThreading.
  *  - `dispatch` runs each task inline on the calling thread (network, I/O completion, timer or CRL callback), which
@@ -36,6 +36,8 @@ class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()
 
   @volatile private var shut = false
   @volatile private var loops = Vector.empty[SerialLoop]
+  /** Every store loop this pool has created, including those created already shut down. Testing hook. */
+  @volatile private var created = Vector.empty[SerialLoop]
   /** Stores assigned to each loop, by loop index. */
   private var counts = Vector.empty[Int]
   /** The loop index each assigned store runs on. */
@@ -51,12 +53,14 @@ class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()
       // Never started, so no thread is left behind; work posted to it is dropped
       val dead = new SerialLoop(s"aspen-store-${loops.size}", daemon = true)
       dead.shutdown()
+      created = created :+ dead
       dead
     else
       val index =
         if counts.forall(_ >= 1) && loops.size < maxThreads then
           val loop = new SerialLoop(s"aspen-store-${loops.size}", daemon = true)
           loop.start()
+          created = created :+ loop
           loops = loops :+ loop
           // A shutdown racing this assign: it either saw the new loop in `loops` or is seen here (both volatile)
           if shut then
@@ -82,4 +86,5 @@ class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()
     loops.foreach(_.shutdown())
 
   private[host] def threadCount: Int = loops.size
+  private[host] def createdLoops: Vector[SerialLoop] = created
   private[host] def assignedCounts: Vector[Int] = counts

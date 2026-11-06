@@ -120,10 +120,13 @@ class HostServices(ctx: DeviceControl) extends Logging:
       // Invoked on the background task thread: the body is delegated to the control thread, which owns the stores
       // and devices it reads.
       Future.delegate:
-        val slist = ctx.router.loaded.valuesIterator.toList
+        val slist = ctx.router.loaded.keysIterator.toList
         val dlist = ctx.devices.devices.valuesIterator.toList
-        val fs = runSequentially(slist): store =>
-          poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
+        val fs = runSequentially(slist): storeId =>
+          // The size estimate reads the backend, so it runs on the store's executor
+          ctx.router.onStore(storeId)(_.estimateSize()).flatMap:
+            case Some(size) => poolUsageManager.updateStoreSize(storeId, size)
+            case None => Future.unit
         val fd = runSequentially(dlist): sds =>
           deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
 

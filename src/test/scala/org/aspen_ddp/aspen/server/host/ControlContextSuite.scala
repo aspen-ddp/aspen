@@ -34,7 +34,8 @@ class ControlContextSuite extends AnyFunSuite with Matchers:
       metadata = null, scheduler = null, backends = null, devices = new LocalDevices(), client = null,
       hostId = HostId.BootstrapHostId, aspenSystemId = new UUID(0, 0), rootDir = os.root, net = null,
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager, threading = threading, post = _ => (),
-      crl = null, txStatusCache = null, ioHandler = null, objectCacheFactory = null, finalizerFactory = null,
+      crl = null, txStatusCache = null, wrapCompletionHandler = identity, objectCacheFactory = null,
+      finalizerFactory = null,
       txDriverFactory = null, heartbeatPeriod = Duration(5, SECONDS), deviceScanPeriod = Duration(10, SECONDS),
       storeRebuildFactory = null, maxConcurrentRebuilds = 2, loadStore = null, tryLoadStore = null,
       loadStoreById = null, warn = null, storeTransferService = StoreTransferService.Disabled,
@@ -90,7 +91,7 @@ class ControlContextSuite extends AnyFunSuite with Matchers:
       reader.start()
 
       t.controlEvents.execute: () =>
-        ctx.router.install(store(storeId))
+        ctx.router.install(store(storeId), HostThreading.InlineStoreExecutor)
         ctx.publishView()
         published.countDown()
 

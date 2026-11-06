@@ -81,8 +81,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
       // another owner by the branch below. Its stores are being rebuilt elsewhere.
       logger.info(s"Ignoring failed storage device ${local.storageDeviceId}")
     else if remote.hostId != ctx.hostId then
-      ctx.discovery.warnOnce(local.devicePath, s"Storage device ${local.storageDeviceId} owned by host ${remote.hostId} " +
-                                               s"is loaded here. Not claiming it")
+      ctx.discovery.warnOnce(local.devicePath,
+        s"Storage device ${local.storageDeviceId} owned by host ${remote.hostId} is loaded here. Not claiming it")
     else if remote.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
             remote.status == StorageDeviceState.DeviceStatus.Shutdown ||
             ctx.shutdown.isShuttingDown(local.storageDeviceId) then
@@ -164,7 +164,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
           entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
         ) &&
         os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile)
-      ).partition(ctx.host.storeTransferService.isTransferringOut)
+      ).partition(ctx.storeTransferService.isTransferringOut)
       abandonedOut.foreach: storeId =>
         ctx.transfers.reinstateAbandonedOut(local, storeId)
       if stillSending.nonEmpty then

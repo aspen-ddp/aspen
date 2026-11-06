@@ -47,7 +47,8 @@ trait DeviceMetadata:
 
   def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome]
 
-class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionContext) extends DeviceMetadata with Logging:
+class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionContext)
+  extends DeviceMetadata with Logging:
 
   /** Records the outcome of a store transfer that has finished shipping bytes.
    *
@@ -71,7 +72,7 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
    *  deleted-stores pass looks only at offlineStores and reconcileDeviceState ignores a failed
    *  device outright.
    *
-   *  protected so a test subclass can observe the returned Future; the production caller is
+   *  Host's wrapper is protected so a test subclass can observe the returned Future; the production caller is
    *  StoreTransfers.startIn.
    */
   def updateStateForTransferredStore(storeId: StoreId,
@@ -159,13 +160,15 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
           // toDev.hostId, which the guard above has established is this host: the pool names the
           // device's owner, never merely whoever ran the update.
           poolCfg.stores(storeId.poolIndex) = StoragePoolState.StoreEntry(toDev.hostId, toDeviceid)
-          val poolReqs = List(KeyRevision(StoragePoolState.ConfigKey, poolKvos.contents(StoragePoolState.ConfigKey).revision))
+          val poolReqs = List(KeyRevision(StoragePoolState.ConfigKey,
+                                          poolKvos.contents(StoragePoolState.ConfigKey).revision))
           val poolOps = List(Insert(StoragePoolState.ConfigKey, poolCfg.encode()))
           tx.update(poolPtr, None, None, poolReqs, poolOps)
 
           val newFromStores = fromDev.stores - storeId
           val newFromDev = fromDev.copy(stores = newFromStores)
-          val fromDevReqs = List(KeyRevision(StorageDeviceState.StateKey, fromDevKvos.contents(StorageDeviceState.StateKey).revision))
+          val fromDevReqs = List(KeyRevision(StorageDeviceState.StateKey,
+                                             fromDevKvos.contents(StorageDeviceState.StateKey).revision))
           val fromDevOps = List(Insert(StorageDeviceState.StateKey, newFromDev.encode()))
           tx.update(fromDevPtr, None, None, fromDevReqs, fromDevOps)
 
@@ -174,7 +177,8 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
           val newEntry = StorageDeviceState.StoreEntry(toDev.serviceStatus, None)
           val newToStores = toDev.stores + (storeId -> newEntry)
           val newtoDev = toDev.copy(stores = newToStores)
-          val toDevReqs = List(KeyRevision(StorageDeviceState.StateKey, toDevKvos.contents(StorageDeviceState.StateKey).revision))
+          val toDevReqs = List(KeyRevision(StorageDeviceState.StateKey,
+                                           toDevKvos.contents(StorageDeviceState.StateKey).revision))
           val toDevOps = List(Insert(StorageDeviceState.StateKey, newtoDev.encode()))
           tx.update(toDevPtr, None, None, toDevReqs, toDevOps)
 
@@ -242,10 +246,10 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
 
           TransferOutcome.Aborted
 
-  /** Test seam: the read that decides whether the endpoint needs updating. */
+  /** The read that decides whether the endpoint needs updating. */
   def readHostStateForEndpoint(): Future[HostState] = client.getHostState(hostId)
 
-  /** The abort returnLostTransferToRebuild issues. A seam for tests. */
+  /** The abort returnLostTransferToRebuild issues. */
   def abortLostTransfer(storeId: StoreId): Future[Boolean] = client.abortStoreTransfer(storeId)
 
   /** Decides whether a rebuilt store should be adopted or discarded.
@@ -340,7 +344,7 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
    *  Only a collision is retried, as everywhere else in Host: a permanent error would otherwise
    *  hold the device's pendingMarkerResolutions entry for the life of the process.
    *
-   *  protected so a test subclass can record the calls.
+   *  Host's wrapper is protected so a test subclass can record the calls.
    */
   def adoptDevice(storageDeviceId: StorageDeviceId,
                   previousHostId: HostId,
@@ -440,7 +444,7 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
    *
-   *  A seam rather than a direct client call so a test can hold a lookup in flight while the
+   *  Host's wrapper is a seam so a test can hold a lookup in flight while the
    *  device it names is loaded underneath it. That interleaving is what a device appearing on
    *  disk during its own check produces, and it cannot be staged through the real client,
    *  whose reads resolve on their own schedule.
@@ -455,8 +459,8 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
     client.getStorageDeviceState(storageDeviceId)
 
   /** Reads the source device of a transfer in, which the reconcile's TransferringIn pass re-reads
-   *  on every check so a source that has moved, shut down or failed is seen. A seam so a test can
-   *  tell when the read has been acted on, which is otherwise unobservable when the pass decides
+   *  on every check so a source that has moved, shut down or failed is seen. Host's wrapper is a seam so
+   *  a test can tell when the read has been acted on, which is otherwise unobservable when the pass decides
    *  not to start anything. */
   def readTransferSourceState(fromDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     client.getStorageDeviceState(fromDeviceId)
@@ -480,7 +484,7 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
    *  Only a collision is retried. Nothing else would complete the future, and the device's
    *  shutdown guard would be held for the life of the process.
    *
-   *  protected so a test can run work between the stores closing and this transaction.
+   *  Host's wrapper is protected so a test can run work between the stores closing and this transaction.
    */
   def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome] =
     client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>

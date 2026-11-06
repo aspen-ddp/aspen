@@ -37,8 +37,8 @@ class LocalDevices(lock: AnyRef) extends Logging:
    *  Nothing is unloaded because nothing was loaded: the load is downstream of the decision.
    */
   def discardStoreDirectory(storeId: StoreId,
-                                    deviceId: StorageDeviceId,
-                                    reason: String): Unit = lock.synchronized {
+                            deviceId: StorageDeviceId,
+                            reason: String): Unit = lock.synchronized {
     devices.get(deviceId) match
       case None =>
         // The operation completed on a device this process never loaded, or one a shutdown has

@@ -71,13 +71,15 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           router.markOffline(storeCfg.storeId)
           sds.offlineStores += storeCfg.storeId
         else if os.exists(potentialStoreFile / StoreTransfer.TransferOutMarkerFile) then
-          logger.info(s"Skipping load of offline store marked for transfer out. StoreId ${storeCfg.storeId}. $potentialStoreFile")
+          logger.info("Skipping load of offline store marked for transfer out. " +
+                      s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
           router.markOffline(storeCfg.storeId)
           sds.offlineStores += storeCfg.storeId
         else if os.exists(potentialStoreFile / StoreTransfer.TransferredInMarkerFile) then
           // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
           // metadata step for it, and reconcileDeviceState loads it if that step already committed.
-          logger.info(s"Skipping load of transferred-in store awaiting its pool update. StoreId ${storeCfg.storeId}. $potentialStoreFile")
+          logger.info("Skipping load of transferred-in store awaiting its pool update. " +
+                      s"StoreId ${storeCfg.storeId}. $potentialStoreFile")
           router.markOffline(storeCfg.storeId)
           sds.offlineStores += storeCfg.storeId
         else if isFsif(storeCfg) then
@@ -93,7 +95,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
   /** Records an opened backend as loaded and queues its LoadStore. Caller holds the instance lock. */
-  private[server] def serveOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
+  private[host] def serveOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                   backend: Backend): Future[Unit] =
     sds.loadedStores += backend.storeId
     sds.offlineStores -= backend.storeId
@@ -104,7 +106,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** Runs an FSIF open (recovery) or create on fsifOpenEc, off the event thread (the spec's anti-goal: never block it
    *  on I/O or fsync), and posts the outcome as FsifOpened. Meanwhile the store is in its device's loadedStores and
    *  in fsifOpening, so a shutdown waits for it and no second open starts. Caller holds the instance lock. */
-  private[server] def startFsifOpen(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
+  private[host] def startFsifOpen(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                     create: Boolean, created: Option[Promise[Unit]],
                                     onServed: Option[() => Unit] = None): Unit =
     val storeId = storeCfg.storeId
@@ -208,7 +210,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       try callback()
       catch case NonFatal(t) => logger.warn(s"The served callback of store $storeId failed: $t")
 
-  private[server] def isFsif(storeCfg: StoreConfig): Boolean = storeCfg.backend.isInstanceOf[StoreConfig.Fsif]
+  private[host] def isFsif(storeCfg: StoreConfig): Boolean = storeCfg.backend.isInstanceOf[StoreConfig.Fsif]
 
   /** Called once per device scan. Retries the load of every store in storesAwaitingSpace whose backoff has run
    *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
@@ -228,7 +230,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. A RocksDB backend is opened under
    *  the instance lock; an FSIF backend on fsifOpenEc (startFsifOpen), touching no Host state. */
-  private[server] def openBackend(storeCfg: StoreConfig, storePath: os.Path, create: Boolean): Backend =
+  private[host] def openBackend(storeCfg: StoreConfig, storePath: os.Path, create: Boolean): Backend =
     val ref = new AtomicReference[Backend]()
     // Called once, on an FSIF io thread: only enqueues, so it never blocks there.
     val onFatal: Throwable => Unit = err => ctx.post(BackendFailed(storeCfg.storeId, ref, err))
@@ -236,7 +238,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     ref.set(backend)
     backend
 
-  private[server] def backendHasFailed(backend: Backend): Boolean = backend match
+  private[host] def backendHasFailed(backend: Backend): Boolean = backend match
     case b: FsifBackend => b.hasFailed
     case _ => false
 

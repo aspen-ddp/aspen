@@ -57,7 +57,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   private[server] def pendingMarkerResolutions: Set[os.Path] = pendingResolutions
 
   /** Forgets the directory of a device that has been unloaded, so the next scan reads it again. */
-  private[server] def forgetDevice(storageDeviceId: StorageDeviceId): Unit =
+  private[host] def forgetDevice(storageDeviceId: StorageDeviceId): Unit =
     loadedDirs = loadedDirs.filter((_, id) => id != storageDeviceId)
 
   /** Scans storage-devices/ and loads any device found there that this host owns.
@@ -305,8 +305,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
 
   /** The Offline entries of `state` in adoption class `cls`, by their directories under `path`. */
   def offlineStoresIn(path: os.Path,
-                              state: StorageDeviceState,
-                              cls: AdoptionClass): List[StoreId] =
+                      state: StorageDeviceState,
+                      cls: AdoptionClass): List[StoreId] =
     state.stores.collect {
       case (storeId, entry) if entry.status == StorageDeviceState.StoreStatus.Offline &&
                                adoptionClass(storeId, path / storeId.directoryName) == cls => storeId
@@ -361,7 +361,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
     }
     active.foreach: (storeId, entry) =>
       val markerFile = path / storeId.directoryName / StoreTransfer.TransferOutMarkerFile
-      if entry.transferDevice.isEmpty && !ctx.host.storeTransferService.isTransferringOut(storeId) &&
+      if entry.transferDevice.isEmpty && !ctx.storeTransferService.isTransferringOut(storeId) &&
          os.exists(markerFile) then
         try os.remove(markerFile)
         catch case t: Throwable =>
@@ -373,7 +373,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
 
     tryLoadDevice(path).foreach: deviceId =>
       ctx.reconciler.checkStorageDevice(deviceId)
-      active.keysIterator.foreach(ctx.host.gossipStoreOnlineSeam)
+      active.keysIterator.foreach(ctx.gossipStoreOnline)
 
   /** Loads the device at `storageDevicePath` if this host owns it, returning its id when this
    *  call is what loaded it.
@@ -397,7 +397,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       try
         val sdCfg = StorageDeviceConfig.loadStorageDeviceConfig(sdCfgPath)
         if sdCfg.aspenSystemId != ctx.aspenSystemId then
-          warnOnce(storageDevicePath, s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
+          warnOnce(storageDevicePath,
+                   s"Storage Device found that does not belong to this Aspen system: $storageDevicePath. Ignoring")
           None
         else
           DeviceMarkers.readShutdownState(storageDevicePath) match
@@ -406,9 +407,11 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               None
             case None =>
               DeviceMarkers.readOwningHost(storageDevicePath) match
-                case Some(owner) if owner == ctx.hostId => loadOwnedDevice(storageDevicePath, sdCfgPath, sdCfg)
+                case Some(owner) if owner == ctx.hostId =>
+                  loadOwnedDevice(storageDevicePath, sdCfgPath, sdCfg)
                 case owner =>
-                  val who = owner.map(h => s"host $h").getOrElse(s"no host (${DeviceMarkers.OwningHostFile} is missing)")
+                  val who = owner.map(h => s"host $h")
+                    .getOrElse(s"no host (${DeviceMarkers.OwningHostFile} is missing)")
                   warnOnce(storageDevicePath, s"Storage device ${sdCfg.storageDeviceId} at $storageDevicePath " +
                                               s"is owned by $who, not this host. Not loading or claiming it")
                   None

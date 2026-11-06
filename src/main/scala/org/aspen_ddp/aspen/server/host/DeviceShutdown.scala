@@ -148,17 +148,17 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
 
       // The store is already closed and marked by its transfer. Cancelling the send leaves it so.
       entriesIn(StorageDeviceState.StoreStatus.TransferringOut)
-        .filter(ctx.host.storeTransferService.isTransferringOut)
+        .filter(ctx.storeTransferService.isTransferringOut)
         .foreach: storeId =>
           logger.info(s"Cancelling the transfer out of store $storeId for the shutdown of device $deviceId")
-          ctx.host.storeTransferService.cancelTransferOut(storeId)
+          ctx.storeTransferService.cancelTransferOut(storeId)
 
       (ins, rebuilds ++ recording)
     }
 
     cancelledIns.foreach: (storeId, transferUUID) =>
       logger.info(s"Cancelling the transfer in of store $storeId for the shutdown of device ${local.storageDeviceId}")
-      ctx.host.storeTransferService.cancelTransferIn(storeId, transferUUID)
+      ctx.storeTransferService.cancelTransferIn(storeId, transferUUID)
 
     stopping
 
@@ -179,12 +179,12 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       val done = Promise[Unit]()
       Future.sequence(work.valuesIterator.map(_.transform(_ => Success(()))).toList)
         .foreach(_ => done.trySuccess(()))
-      ctx.host.scheduleShutdownWorkTimeoutSeam(deviceId):
+      ctx.scheduleShutdownWorkTimeout(deviceId, () =>
         if done.trySuccess(()) then
           val running = work.collect { case (storeId, f) if !f.isCompleted => storeId }
             .toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
-          logger.warn(s"Work on storage device $deviceId did not stop within ${ctx.host.shutdownWorkTimeout} of " +
-                      s"its shutdown starting: stores ${running.mkString(", ")}. Shutting it down anyway")
+          logger.warn(s"Work on storage device $deviceId did not stop within ${ctx.shutdownWorkTimeout} of " +
+                      s"its shutdown starting: stores ${running.mkString(", ")}. Shutting it down anyway"))
       done.future
 
   /** Step 2 of shutDownDevice, also run once more after Shutdown commits: closes each store open
@@ -207,7 +207,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
     runSequentially(storesToClose(local)): storeId =>
       // A store whose backend failed while closing is marked rebuild-required instead of closed
       // cleanly (see StoreRebuilds.failedOnClose), and an adopter takes it as Rebuilding.
-      ctx.host.closeStoreForShutdownSeam(storeId).transform:
+      ctx.closeStoreForShutdown(storeId).transform:
         case Failure(_: StoreFailedOnClose) => Success(false)
         case other => other.map(_ => true)
       .map: clean =>

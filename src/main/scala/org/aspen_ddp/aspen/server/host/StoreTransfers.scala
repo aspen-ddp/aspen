@@ -57,7 +57,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
   // are tracked by storeTransferService, which is what knows when a send has ended.
   private[server] var transferringIn: Map[StoreId, UUID] = Map()
   private var abandoningTransferIns: Set[StoreId] = Set()
-  private[server] var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
+  private[host] var pendingStartTransfers: Map[StoreId, PendingTransfer] = Map()
   // The restart of each failed transfer in that is waiting out TransferInRetryDelay. Its store
   // stays in transferringIn meanwhile, so device checks do not start a parallel attempt.
   private[server] var transferInRetries: Map[StoreId, TransferInRetry] = Map()
@@ -131,7 +131,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  the next send reaches a source that has been adopted by another host. A failed source keeps
    *  its address: its zeroed host id names nobody, and the reconcile abandons the transfer.
    *  Returns whether the address changed. Caller holds the instance lock. */
-  private[server] def readdressPendingTransfer(pt: PendingTransfer, source: StorageDeviceState): Boolean =
+  private[host] def readdressPendingTransfer(pt: PendingTransfer, source: StorageDeviceState): Boolean =
     if !source.isFailed && source.hostId != pt.msg.toHost then
       logger.info(s"Source device ${pt.msg.fromDevice} of the transfer in of store ${pt.msg.storeId} " +
                   s"is now on host ${source.hostId}, not ${pt.msg.toHost}. Asking there")
@@ -219,7 +219,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  The service's registration is dropped too, failing its future. The completion handler in
    *  startIn sees the attempt is no longer current and neither retries nor promotes.
    */
-  private[server] def dropAbandonedTransferIn(storeId: StoreId,
+  private[host] def dropAbandonedTransferIn(storeId: StoreId,
                                       fromDeviceId: StorageDeviceId,
                                       toDeviceId: StorageDeviceId): Unit =
     val cancelled = ctx.lock.synchronized {
@@ -242,14 +242,14 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           Some(transferUUID)
         case _ => None
     }
-    cancelled.foreach(ctx.host.storeTransferService.cancelTransferIn(storeId, _))
+    cancelled.foreach(ctx.storeTransferService.cancelTransferIn(storeId, _))
 
   /** Removes the transferred-in marker from a promoted store, returning whether the store may now
    *  be loaded. A store loaded with the marker still in place would be skipped by the next
    *  restart's scan, so on failure it is left unloaded for reconcileDeviceState's
    *  transferred-in pass to try again.
    */
-  private[server] def clearTransferredInMarker(storeId: StoreId, storePath: os.Path): Boolean =
+  private[host] def clearTransferredInMarker(storeId: StoreId, storePath: os.Path): Boolean =
     try
       os.remove(storePath / StoreTransfer.TransferredInMarkerFile)
       true
@@ -302,7 +302,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
             ctx.lock.synchronized {
               ctx.devices.devices.get(toDeviceid).foreach: sds =>
                 if clearTransferredInMarker(storeId, sds.devicePath / storeId.directoryName) then
-                  ctx.host.loadStoreById(toDeviceid, storeId)
+                  ctx.loadStoreById(toDeviceid, storeId)
                 else
                   // Recorded as a restart's scan would have, which is what the transferred-in
                   // pass keys off.
@@ -399,7 +399,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           val transferUUID = UUID.randomUUID()
           val timestamp = HLCTimestamp.now
 
-          val fcomplete = ctx.host.storeTransferService.beginTransferIn(
+          val fcomplete = ctx.storeTransferService.beginTransferIn(
             storeId, transferUUID, devicePath / StoreTransfer.StagingDirectory)
 
           transferringIn += storeId -> transferUUID
@@ -523,8 +523,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // separate scan.
     for
       // The pool state must be read fresh: a StoragePool object holds no store-to-device mapping,
-      // and a snapshot would show where the stores were when it was taken. The source device must be read fresh -- for a store that has already
-      // moved once (a migration retarget, or two successive rebalances) the snapshot names the
+      // and a snapshot would show where the stores were when it was taken. The source device must be read fresh --
+      // for a store that has already moved once (a migration retarget, or two successive rebalances) the snapshot names the
       // device it used to live on, that device no longer lists the store, and the transfer-out
       // dies below on "Transfer probably completed" without ever starting.
       pstate <- ctx.client.getStoragePoolState(m.storeId.poolId)
@@ -584,7 +584,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
         if devEntry.status == StorageDeviceState.StoreStatus.TransferringOut then
           // A retransmitted request finds the store already closed, and its going offline already gossiped
           val wasLoaded = ctx.router.loaded.contains(m.storeId)
-          val fclosed = ctx.host.closeStoreForTransferOutSeam(m.storeId)
+          val fclosed = ctx.closeStoreForTransferOut(m.storeId)
 
           fclosed.failed.foreach:
             case e: StoreFailedOnClose =>
@@ -617,7 +617,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 // offline across restarts until the transfer is resolved one way or the other.
                 DurableFiles.write(storePath / StoreTransfer.TransferOutMarkerFile,
                                    devEntry.transferId.map(_.toString).getOrElse(""))
-                ctx.host.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
+                ctx.storeTransferService.beginTransferOut(m.storeId, m.transferUUID, storePath,
                   toHostState.address, toHostState.storeTransferPort, m.timestamp)
                 // The transfer may have been aborted after the reads above, and the abort's
                 // nudge handled before the marker above existed. No check would then ever see
@@ -677,7 +677,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  Caller holds the instance lock and has established the tree entry and the marker.
    */
   def reinstateAbandonedOut(local: LocalStorageDeviceState,
-                                            storeId: StoreId): Unit =
+                            storeId: StoreId): Unit =
     val storePath = local.devicePath / storeId.directoryName
 
     logger.warn(s"Store $storeId on device ${local.storageDeviceId} is offline behind a " +
@@ -697,7 +697,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
           false
 
     if markerRemoved then
-      ctx.tryLoadStore(local, storePath, Some(() => ctx.host.gossipStoreOnlineSeam(storeId)))
+      ctx.tryLoadStore(local, storePath, Some(() => ctx.gossipStoreOnline(storeId)))
 
   /** Drops a TransferringIn entry whose source device has been declared failed.
    *
@@ -712,8 +712,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  below leaves it alone; if this wins, the drain's Rebuilding entry simply re-adds the store.
    */
   def abandonIn(toDeviceId: StorageDeviceId,
-                                storeId: StoreId,
-                                fromDeviceId: StorageDeviceId): Unit = ctx.lock.synchronized {
+                storeId: StoreId,
+                fromDeviceId: StorageDeviceId): Unit = ctx.lock.synchronized {
     // The entry that triggers this stands until the transaction commits, so every device check
     // in the meantime calls here again. Without the guard each one starts its own retry loop,
     // all writing the same key and losing to each other on KeyRevision. Same shape as

@@ -5,6 +5,7 @@ import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
+import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
@@ -20,11 +21,11 @@ import scala.concurrent.duration.Duration
  *  the loaded devices. Each component takes the DeviceControl as its only constructor parameter and is added here as
  *  a lazy val, which lets components refer to each other without construction-order cycles.
  *
- *  `host` is the Host instance, which is also the lock, and `post` puts an event on its queue; both go away with the
- *  event queue. Components reach members of Host that have not been extracted yet through `host`.
+ *  `lock` is the Host instance, which guards the components' state, and `post` puts an event on its queue; both go
+ *  away with the event queue.
  *
- *  `loadStore` and `tryLoadStore` are adapters that call the overridable methods on Host, so the test subclasses that
- *  replace them still take effect when a component loads a store. */
+ *  The function-valued parameters from `loadStore` on are adapters that call the overridable methods on Host, so the
+ *  test subclasses that replace them still take effect when a component calls them. */
 final class DeviceControl(val metadata: DeviceMetadata,
                           val scheduler: ControlScheduler,
                           val backends: BackendOpener,
@@ -35,7 +36,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val rootDir: os.Path,
                           val net: Messenger,
                           val backgroundTasks: BackgroundTaskManager,
-                          val host: Host,
+                          val lock: AnyRef,
                           val post: Host.Event => Unit,
                           val crl: CrashRecoveryLog,
                           val txStatusCache: TransactionStatusCache,
@@ -49,10 +50,16 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val maxConcurrentRebuilds: Int,
                           val loadStore: (StorageDeviceId, Backend, Option[Long]) => Future[Unit],
                           val tryLoadStore: (LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit,
-                          val warn: (os.Path, String) => Unit)
+                          val loadStoreById: (StorageDeviceId, StoreId) => Unit,
+                          val warn: (os.Path, String) => Unit,
+                          val storeTransferService: StoreTransferService,
+                          val shutdownWorkTimeout: Duration,
+                          val gossipStoreOnline: StoreId => Unit,
+                          val closeStoreForTransferOut: StoreId => Future[Unit],
+                          val closeStoreForShutdown: StoreId => Future[Unit],
+                          val scheduleShutdownWorkTimeout: (StorageDeviceId, () => Unit) => Unit,
+                          val scheduleEndpointRetry: (() => Unit) => Unit)
                          (using val ec: ExecutionContext):
-  def lock: AnyRef = host
-
   lazy val router: StoreRouter = new StoreRouter(this)
   lazy val loader: StoreLoader = new StoreLoader(this)
   lazy val discovery: DeviceDiscovery = new DeviceDiscovery(this)

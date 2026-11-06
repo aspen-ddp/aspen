@@ -183,7 +183,7 @@ class HostServices(ctx: DeviceControl) extends Logging:
       val result = attempt()
       result.failed.foreach: err =>
         logger.warn(s"Failed to reconcile host endpoint, retrying in 5 seconds: $err")
-        ctx.host.scheduleEndpointRetrySeam(run())
+        ctx.scheduleEndpointRetry(() => run())
       result
 
     run()

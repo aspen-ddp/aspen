@@ -45,8 +45,6 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   /** The stores whose rebuild is running here, for any device. */
   def rebuildingStoreIds: Set[StoreId] = ctx.lock.synchronized(rebuildingStores.keySet)
 
-  def isCreating(storeId: StoreId): Boolean = ctx.lock.synchronized(creatingStores.contains(storeId))
-
   /** Cancels the rebuilds of the given stores of `deviceId` for its shutdown, returning, by store, the future of
    *  each one's slot release. A rebuild already past its walk finishes instead and writes its entry Offline. Caller
    *  holds the instance lock. */
@@ -131,7 +129,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               val status = state.serviceStatus
               val newState = state.setStoreEntry(storeId, status, None)
 
-              val reqs = List(KeyRevision(StorageDeviceState.StateKey, kvos.contents(StorageDeviceState.StateKey).revision))
+              val reqs = List(KeyRevision(StorageDeviceState.StateKey,
+                                          kvos.contents(StorageDeviceState.StateKey).revision))
               val ops = List(Insert(StorageDeviceState.StateKey, newState.encode()))
 
               logger.info(s"Updating device state to mark store $storeId as $status")
@@ -231,10 +230,10 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             // load hands a live copy to a device that markRebuiltStoreActive may be about to
             // decide must not own it (because the device was tombstoned mid-rebuild), and nothing
             // would ever take it back.
-            ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, ctx.host.gossipStoreOnlineSeam).onComplete:
+            ctx.metadata.markRebuiltStoreActive(local.storageDeviceId, storeId, ctx.gossipStoreOnline).onComplete:
               case Success(RebuildOutcome.Adopt) =>
                 try
-                  ctx.host.loadStoreById(local.storageDeviceId, storeId)
+                  ctx.loadStoreById(local.storageDeviceId, storeId)
                 finally
                   release()
                   recheckAll()

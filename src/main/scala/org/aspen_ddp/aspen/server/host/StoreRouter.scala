@@ -109,26 +109,23 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** The loaded stores, by id */
   private[server] def loaded: Map[StoreId, Store] = stores
 
-  /** The ids of the loaded stores */
-  private[server] def storeIdSet: Set[StoreId] = stores.keySet
-
   /** The stores marked offline */
   private[server] def offlineStores: Set[StoreId] = offline
 
   /** Makes the store loaded and clears its offline mark */
-  private[server] def install(store: Store): Unit =
+  private[host] def install(store: Store): Unit =
     stores += store.storeId -> store
     offline -= store.storeId
 
   /** Unloads the store and marks it offline */
-  private[server] def remove(storeId: StoreId): Unit =
+  private[host] def remove(storeId: StoreId): Unit =
     stores -= storeId
     offline += storeId
 
   /** Marks a store offline without touching the loaded stores */
-  private[server] def markOffline(storeId: StoreId): Unit =
+  private[host] def markOffline(storeId: StoreId): Unit =
     offline += storeId
 
   /** Clears a store's offline mark without touching the loaded stores */
-  private[server] def clearOffline(storeId: StoreId): Unit =
+  private[host] def clearOffline(storeId: StoreId): Unit =
     offline -= storeId

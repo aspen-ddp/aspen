@@ -1,48 +1,33 @@
 package org.aspen_ddp.aspen.server
 
-import org.aspen_ddp.aspen.client.{AspenClient, KeyValueObjectState, StopRetrying, StoragePool, Transaction, ObjectState as ClientObjectState}
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, ClientDeviceMetadata, DefaultBackendOpener, DeviceControl, DeviceMetadata, ControlScheduler, LocalDevices}
-import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget, StoreNotHosted}
-
-import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
+import org.aspen_ddp.aspen.client.{AspenClient, ObjectState as ClientObjectState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.*
-import org.aspen_ddp.aspen.common.pool.PoolId
+import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.TransactionStatus
-import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, runSequentially}
-import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory}
-import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifIo, FsifLayout, FsifRecovery}
-import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
-import org.aspen_ddp.aspen.server.store.cache.ObjectCache
-import org.aspen_ddp.aspen.server.store.{Frontend, Store}
-import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
-import scribe.Logging
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState, StoragePoolState}
-import org.aspen_ddp.aspen.common.config.BootstrapConfig
-import org.aspen_ddp.aspen.common.{HLCTimestamp, Radicle}
-import org.aspen_ddp.aspen.common.objects.{Insert, Key, KeyValueObjectPointer, ObjectId, ReadError, Value}
-import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.{DoesNotExist, KeyRevision}
-import org.aspen_ddp.aspen.server.transfer.{StoreTransfer, StoreTransferService}
-import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
-import org.aspen_ddp.aspen.client.internal.allocation.PoolObjectAllocator
-import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, ServiceEntry, TaskExecutor}
-import org.aspen_ddp.aspen.compute.impl.{SimpleDurableServiceExecutor, SimpleTaskExecutor}
-import org.aspen_ddp.aspen.compute.systemtask.{SystemTaskExecutorService, SystemTaskRunner}
-import org.aspen_ddp.aspen.client.tkvl.{KVObjectRootManager, TieredKeyValueList}
-import org.aspen_ddp.aspen.server.usage.StoragePoolUsageManager
-import org.aspen_ddp.aspen.server.usage.StorageDeviceUsageManager
+import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
-import org.aspen_ddp.aspen.common.rebalancing.{RebalancingDurableService, RebalancingMessage, TransferComplete}
+import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
+import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, LocalDevices}
+import org.aspen_ddp.aspen.server.network.Messenger
+import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
+import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
+import org.aspen_ddp.aspen.server.store.Store
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, Completion, CompletionHandler}
+import org.aspen_ddp.aspen.server.store.cache.ObjectCache
+import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
+import org.aspen_ddp.aspen.server.transfer.StoreTransferService
+import scribe.Logging
 
-import java.nio.charset.StandardCharsets
-import java.util.concurrent.atomic.AtomicReference
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.{Failure, Success, Try}
-import scala.util.control.NonFatal
+import scala.util.Try
+
 
 object Host:
   private[server] sealed abstract class Event
@@ -76,13 +61,12 @@ object Host:
   final case class StoreFailedOnClose(storeId: StoreId)
     extends Exception(s"Store $storeId failed on an I/O error while closing; it is marked for rebuild")
 
-  /** An FSIF store waiting for space to load: retried once `scansLeft` more device scans have passed. Each failed
-   *  retry doubles `waitScans`, up to the cap (SpaceRetryCap in scans). */
-  /** A store whose load awaits space. `onServed` is the waiting load's tryLoadStore callback: the next open of the
+  /** A store whose load awaits space: retried once `scansLeft` more device scans have passed. Each failed retry
+   *  doubles `waitScans`, up to the cap (SpaceRetryCap in scans). `onServed` is the waiting load's tryLoadStore callback: the next open of the
    *  store (a retry or any other load) takes it over, and it is dropped with the entry if the store leaves the wait
    *  for any other reason. */
-  private[server] final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int, scansLeft: Int,
-                                     onServed: Option[() => Unit] = None)
+  private[server] final case class SpaceWait(sds: LocalStorageDeviceState, storePath: os.Path, waitScans: Int,
+                                             scansLeft: Int, onServed: Option[() => Unit] = None)
 
   /** How long a store's Tx may sit idle before the store drives it itself. This is how a lost TxFinalized is recovered */
   def txHeartbeatTimeout(heartbeatPeriod: Duration): Duration = heartbeatPeriod * 5
@@ -281,10 +265,6 @@ class Host(val client: AspenClient,
 
   private val clientMetadata = new ClientDeviceMetadata(client, hostId)
 
-  // Holds the real FSIF open and thread pool. The seams below are adapters that call back into this Host's
-  // protected methods, so test subclasses that override them still take effect.
-  private val defaultBackends = new DefaultBackendOpener(ec)
-
   private val deviceControl = new DeviceControl(
     metadata = new DeviceMetadata:
       override def updateStateForTransferredStore(storeId: StoreId, fromDeviceId: StorageDeviceId,
@@ -313,6 +293,8 @@ class Host(val client: AspenClient,
     scheduler = new ControlScheduler:
       override def schedule(delay: Duration)(fn: => Unit): ScheduledTask = backgroundTasks.schedule(delay)(fn)
     ,
+    // The real FSIF open and thread pool, with the two seams below redirected to this Host's protected methods so
+    // that test subclasses that override them still take effect.
     backends = new DefaultBackendOpener(ec):
       override def openFsifBackend(storeId: StoreId, storePath: os.Path, layout: FsifLayout,
                                    onFatal: Throwable => Unit) =
@@ -326,7 +308,7 @@ class Host(val client: AspenClient,
     rootDir = rootDir,
     net = net,
     backgroundTasks = backgroundTasks,
-    host = this,
+    lock = this,
     post = event => events.put(event),
     crl = crl,
     txStatusCache = txStatusCache,
@@ -340,7 +322,15 @@ class Host(val client: AspenClient,
     maxConcurrentRebuilds = maxConcurrentRebuilds,
     loadStore = (deviceId, backend, maxSliceSize) => Host.this.loadStore(deviceId, backend, maxSliceSize),
     tryLoadStore = (sds, path, onServed) => Host.this.tryLoadStore(sds, path, onServed),
-    warn = (path, msg) => Host.this.logDeviceDirWarning(path, msg))
+    loadStoreById = (deviceId, storeId) => Host.this.loadStoreById(deviceId, storeId),
+    warn = (path, msg) => Host.this.logDeviceDirWarning(path, msg),
+    storeTransferService = storeTransferService,
+    shutdownWorkTimeout = shutdownWorkTimeout,
+    gossipStoreOnline = storeId => Host.this.gossipStoreOnline(storeId),
+    closeStoreForTransferOut = storeId => Host.this.closeStoreForTransferOut(storeId),
+    closeStoreForShutdown = storeId => Host.this.closeStoreForShutdown(storeId),
+    scheduleShutdownWorkTimeout = (deviceId, fn) => Host.this.scheduleShutdownWorkTimeout(deviceId)(fn()),
+    scheduleEndpointRetry = fn => Host.this.scheduleEndpointRetry(fn()))
 
   private val threadPool = Executors.newFixedThreadPool(1)
 
@@ -412,20 +402,17 @@ class Host(val client: AspenClient,
 
   def getServiceExecutor(): Future[DurableServiceExecutor] = services.getServiceExecutor()
 
-  // protected so tests can subclass with a recording implementation instead of opening a
-  // real RocksDB backend. `stores` and `storageDevices` are already protected.
-  //
-  // protected so tests can subclass with a recording implementation instead of opening a
-  // real RocksDB backend. `stores` and `storageDevices` are already protected.
   // protected so a test subclass can count what warnOnce lets through.
   protected def logDeviceDirWarning(path: os.Path, msg: String): Unit = logger.warn(msg)
 
+  // protected so tests can subclass with a recording implementation instead of opening a real RocksDB backend.
+  // `stores` and `storageDevices` are already protected. onServed is run only if the store ends up served.
   protected def tryLoadStore(sds: LocalStorageDeviceState, potentialStoreFile: os.Path,
                              onServed: Option[() => Unit] = None): Unit =
     deviceControl.loader.tryLoadStore(sds, potentialStoreFile, onServed)
 
   /** Where FSIF stores are opened (recovered) and created, off the event thread. protected as a test seam. */
-  protected def fsifOpenEc: ExecutionContext = defaultBackends.fsifOpenEc
+  protected def fsifOpenEc: ExecutionContext = Host.FsifOpenEc
 
   /** Opens an existing FSIF store (FsifBackend.open: a directory without the marker is initialized only if its
    *  files are blank, otherwise recovered). protected as a test seam: a subclass can fail the open or keep
@@ -434,7 +421,7 @@ class Host(val client: AspenClient,
                                 storePath: os.Path,
                                 layout: FsifLayout,
                                 onFatal: Throwable => Unit): Backend =
-    defaultBackends.openFsifBackend(storeId, storePath, layout, onFatal)
+    FsifBackend.open(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
 
   def start(): Unit =
     threadPool.submit(new Runnable {
@@ -500,9 +487,6 @@ class Host(val client: AspenClient,
   protected def scheduleEndpointRetry(fn: => Unit): Unit =
     backgroundTasks.schedule(Duration(5, SECONDS))(fn)
 
-  /** Lets HostServices reach the scheduleEndpointRetry seam. */
-  private[server] def scheduleEndpointRetrySeam(fn: => Unit): Unit = scheduleEndpointRetry(fn)
-
   private def discardStoreDirectory(storeId: StoreId,
                                     deviceId: StorageDeviceId,
                                     reason: String): Unit =
@@ -517,18 +501,9 @@ class Host(val client: AspenClient,
                                        storeId: StoreId): Future[RebuildOutcome] =
     clientMetadata.markRebuiltStoreActive(storageDeviceId, storeId, gossipStoreOnline)
 
-  /** Gossips StoreMoved for a store this host has brought back online without repointing the
-   *  pool: one whose rebuild has completed, or whose abandoned transfer out has been reinstated.
-   *
-   *  For a rebuild, the pool was repointed when the rebuild was assigned, but peers only learn it
-   *  now, as at the end of a transfer. That was a different transaction, so the pool is read for
-   *  the host and timestamp its config value carries. The store came online now, before the read,
-   *  which is what clears its StoreOffline. Best-effort: a failed read only means peers find the
-   *  store the slow way and keep it offline until their next recheck.
-   */
-  // protected as a test seam, so a test can see that it was called without a readable pool
-  private[server] def gossipStoreOnlineSeam(storeId: StoreId): Unit = gossipStoreOnline(storeId)
-
+  /** Gossips StoreMoved for a store brought back online without repointing the pool. See
+   *  HostServices.gossipStoreOnline. protected as a test seam, so a test can see that it was called without a
+   *  readable pool. */
   protected def gossipStoreOnline(storeId: StoreId): Unit = services.gossipStoreOnline(storeId)
 
   /** Adopts a Shutdown device from its previous host. See ClientDeviceMetadata.adoptDevice.
@@ -562,28 +537,16 @@ class Host(val client: AspenClient,
   protected def closeStoreForTransferOut(storeId: StoreId): Future[Unit] =
     transfers.closeForTransferOut(storeId)
 
-  /** Lets StoreTransfers reach the closeStoreForTransferOut seam. */
-  private[server] def closeStoreForTransferOutSeam(storeId: StoreId): Future[Unit] =
-    closeStoreForTransferOut(storeId)
-
   /** Takes one store out of service for a device shutdown. The default is closeStore, which saves
    *  the store's CRL state beside it. A seam so a test can hold a close open, and count closes,
    *  without real backends. */
   protected def closeStoreForShutdown(storeId: StoreId): Future[Unit] =
     deviceControl.shutdown.closeForShutdown(storeId)
 
-  /** Lets DeviceShutdown reach the closeStoreForShutdown seam. */
-  private[server] def closeStoreForShutdownSeam(storeId: StoreId): Future[Unit] =
-    closeStoreForShutdown(storeId)
-
   /** Runs `fn` after shutdownWorkTimeout. A seam so a test can fire the timeout itself, since the
    *  test hosts' BackgroundTaskManager never fires anything. */
   protected def scheduleShutdownWorkTimeout(storageDeviceId: StorageDeviceId)(fn: => Unit): Unit =
     backgroundTasks.schedule(shutdownWorkTimeout)(fn)
-
-  /** Lets DeviceShutdown reach the scheduleShutdownWorkTimeout seam. */
-  private[server] def scheduleShutdownWorkTimeoutSeam(storageDeviceId: StorageDeviceId)(fn: => Unit): Unit =
-    scheduleShutdownWorkTimeout(storageDeviceId)(fn)
 
   /** The last step of a shutdown: one transaction on the device state that either commits
    *  Shutdown or explains why it did not. See ClientDeviceMetadata.completeDeviceShutdown.
@@ -605,7 +568,7 @@ class Host(val client: AspenClient,
     * load budget on work that will be redone or discarded.
     */
   def repairableStoreIds: List[StoreId] = synchronized {
-    (deviceControl.router.storeIdSet -- deviceControl.router.offlineStores -- deviceControl.rebuilds.rebuildingStoreIds --
+    (stores.keySet -- deviceControl.router.offlineStores -- deviceControl.rebuilds.rebuildingStoreIds --
       storeTransferService.transferringOutStores).toList
   }
 
@@ -700,12 +663,15 @@ class Host(val client: AspenClient,
   /** Testing hook: runs a ScanDevices event synchronously. See testingOnlyCheckAllDevices. */
   private[aspen] def testingOnlyScanDevices(): Unit = handleEvent(ScanDevices())
 
-  private[aspen] def testingOnlyLoadedDeviceDirs: Map[os.Path, StorageDeviceId] = synchronized(deviceControl.discovery.loadedDeviceDirs)
+  private[aspen] def testingOnlyLoadedDeviceDirs: Map[os.Path, StorageDeviceId] =
+    synchronized(deviceControl.discovery.loadedDeviceDirs)
 
-  private[aspen] def testingOnlyReportedDeviceDirs: Set[os.Path] = synchronized(deviceControl.discovery.reportedDeviceDirs)
+  private[aspen] def testingOnlyReportedDeviceDirs: Set[os.Path] =
+    synchronized(deviceControl.discovery.reportedDeviceDirs)
 
   /** Testing hook: device directories with a shutdown-marker lookup or adoption in flight. */
-  private[aspen] def testingOnlyPendingMarkerResolutions: Set[os.Path] = synchronized(deviceControl.discovery.pendingMarkerResolutions)
+  private[aspen] def testingOnlyPendingMarkerResolutions: Set[os.Path] =
+    synchronized(deviceControl.discovery.pendingMarkerResolutions)
 
   /** Testing hook: how many ShutdownMarkerResolved events are queued. */
   private[aspen] def testingOnlyQueuedMarkerResolutions: Int =
@@ -766,8 +732,8 @@ class Host(val client: AspenClient,
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =
     reconciler.activeDeviceChecks
 
-  /** Testing hook: the stores currently marked offline. */
-  /** Whether a store awaiting space holds a real onServed callback; None if it is not awaiting space */
+  /** Testing hook: whether a store awaiting space holds a real onServed callback; None if it is not awaiting
+   *  space */
   private[aspen] def testingOnlyAwaitingSpaceHasCallback(storeId: StoreId): Option[Boolean] =
     synchronized(deviceControl.loader.awaitingSpaceHasCallback(storeId))
 

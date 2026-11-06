@@ -113,15 +113,19 @@ The question was whether the threading change made the shared cache unsafe. It d
 
 **Rule:** from a store's perspective, a committed transaction is not complete until every backend commit it issued
 for that transaction has succeeded. Until then the store keeps the transaction's CRL state, including its object
-data, and the committed ObjectStates stay pinned in memory. A crash with a commit in flight must lose nothing:
-recovery loads the CRL state and restarts the commit, giving the same pinned, updated state as before the crash.
+data, and the committed ObjectStates stay pinned in memory. A crash with a commit in flight must not lose the CRL
+state: on the next load the store recovers the transaction from it, and the existing recovery path (a `Tx` idle for
+`txHeartbeatTimeout` gets a `TransactionDriver`) drives it to a conclusion. If that concludes commit, the update is
+applied; if it concludes abort, discarding the state is safe, since the store is then known to be behind and in need
+of repair. No extra CRL write is added (user decision). Making that driver reliably reach the commit decision is the
+"Potential hole in transaction recovery" item in `Todo.txt`, out of scope here.
 
 **What the code does today (verified 2026-11-06), both bugs under this rule:**
 
 1. *Failed backend commit.* `Tx.commitComplete` (`Tx.scala:603`) counts a failure like a success. When the last
    completion arrives, `allObjectCommitsComplete` (`Tx.scala:429-432`) calls `crl.dropTransactionObjectData`, and
    `Frontend.backendOperationComplete` discards the state, so reads return the pre-commit backend state and a crash
-   leaves recovery nothing to restart.
+   leaves recovery nothing to work from.
 2. *TxFinalized during an in-flight commit.* The finalizer waits at most `MissedUpdateFinalizationAction.errorTimeout`
    (2 s) for each store's `TxCommitted`, then finalizes. `Tx.receiveFinalized` (`Tx.scala:582-590`) calls
    `crl.deleteTransaction` unconditionally and `Frontend` forgets the `Tx` (`Frontend.scala:237`). A crash before the
@@ -142,18 +146,16 @@ pre-commit state until repair.
 - The Frontend must keep enough of the transaction (or a per-commit record) after TxFinalized to perform that deferred
   deletion when the completion arrives; today the `Tx` is forgotten at once.
 - A failed backend commit leaves the transaction incomplete for the life of the store: its CRL entry and object data
-  stay, and the state stays pinned and served. It is not retried in-process; the next load of the store recovers it
-  from the CRL and restarts the commit. The failure is still reported in `TxCommitted`, so the ErrorTree mark stays as
-  an extra safety net.
+  stay, and the state stays pinned and served. It is not retried in-process; the next load of the store recovers the
+  transaction from the CRL and the transaction driver concludes it, as above. The failure is still reported in
+  `TxCommitted`, so the ErrorTree mark stays as an extra safety net.
 - Store close/save (`crl.closeStore`, `CrashRecoveryLog.saveStoreState`) must include such incomplete transactions, so
   a planned shutdown or transfer carries them too.
 - Lock/requirement behaviour after TxFinalized is unchanged: an incomplete transaction must not keep requirement locks
   or block other transactions; only its states stay pinned and its CRL state stays.
 
-**Must be verified by the builder, with tests (not assumed):** that recovery of a CRL entry for a transaction that
-committed re-runs its backend commits and reaches the same served state, including when TxFinalized was lost or had
-already been received before the crash, and when the recovered transaction's outcome is learned from a recovery
-driver or the status caches. Fix it if it does not.
+- The transaction is not kept in `Frontend.transactions` after TxFinalized (the heartbeat would otherwise drive an
+  already-finalized transaction); the deferred deletion is tracked separately.
 
 ## Design constraints for the builder
 
@@ -193,9 +195,9 @@ driver or the status caches. Fix it if it does not.
   object is outstanding, including after eviction pressure, after a delete, and after the `Tx` is gone); and a
   threaded test (`ThreadedHostSuite`-style) exercising cross-store eviction on real store threads. Store-side
   completion: TxFinalized before the backend commit completes keeps the CRL entry until the completion arrives; a
-  failed backend commit keeps the CRL entry and the served, pinned state, and a reload of the store restarts the commit
-  from the CRL; the recovery cases listed in the section above; and that requirement locks are released at
-  finalization as today. The existing
+  failed backend commit keeps the CRL entry (object data included) and the served, pinned state, and the entry is in
+  the store's saved CRL state at close; a reloaded store recreates that transaction; and requirement locks are
+  released at finalization as today. The existing
   `HostObjectCacheSuite`, `LRUCacheIdentitySuite` and `FrontendSuite` cache tests are updated or replaced.
 
 ## Left to the builder

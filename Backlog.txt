@@ -75,6 +75,11 @@ Need a mechanism to handle "out of space" errors
   - Will present when we attempt to commit an object update to the store
     - Read-Only or out of space underlying media will cause it to fail
   - Will clog up the CRL if left untreated
+  - Need a mechanism to properly handle backend commit failures (probably when out of space)
+    - Immediately flip the store to read-only to prevent CRL clog
+    - Keep CRL entries for read-only stores, do not discard on TxFinalized
+    - continue serving updated state of objects that cannot be committed since we may have voted
+      to commit them at write-threshold. Cannot lose the state or return pre-commit object state.
   - Might start with just relying on TransferStore to a device with space
     - Might be able to automate this eventually
   - Could set up "spillover stores"

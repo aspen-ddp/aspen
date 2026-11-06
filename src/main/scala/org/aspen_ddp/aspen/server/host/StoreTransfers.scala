@@ -356,7 +356,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // The shutdown guard covers a source read issued before this device's shutdown began, and a
     // retry whose delay ran out during it: the shutdown has already cancelled this device's
     // transfers in and would not see a new one.
-    if ! transferringIn.contains(storeId) && ! ctx.host.shuttingDownDevices.contains(toDeviceid) then
+    if ! transferringIn.contains(storeId) && ! ctx.shutdown.isShuttingDown(toDeviceid) then
       ctx.devices.devices.get(toDeviceid).foreach: toDevice =>
         val devicePath = toDevice.devicePath
         val finalPath = devicePath / storeId.directoryName
@@ -570,7 +570,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       ctx.lock.synchronized {
         // The reads above may predate the shutdown request, so the device's own guard is checked
         // as well: the shutdown has started and its step 1 may already be past this store.
-        if ctx.host.shuttingDownDevices.contains(sourceDs.storageDeviceId) then
+        if ctx.shutdown.isShuttingDown(sourceDs.storageDeviceId) then
           err(s"Source device ${sourceDs.storageDeviceId} for transfer of store ${m.storeId} is " +
               s"being shut down")
         val markedPath = sourceDs.devicePath / m.storeId.directoryName
@@ -603,7 +603,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
               // on a device being shelved. The store is left closed and unmarked, which the
               // shutdown's closeStoresForShutdown picks up and marks like its own. A device
               // unloaded meanwhile -- its shutdown already finished -- is not ours to send from.
-              if ctx.host.shuttingDownDevices.contains(sourceDs.storageDeviceId) ||
+              if ctx.shutdown.isShuttingDown(sourceDs.storageDeviceId) ||
                  !ctx.devices.devices.get(sourceDs.storageDeviceId).contains(sourceDs) then
                 logger.info(s"Not starting the transfer out of store ${m.storeId}: source device " +
                             s"${sourceDs.storageDeviceId} began shutting down while the store closed")

@@ -82,7 +82,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     val storePath = local.devicePath / storeId.directoryName
     val deviceId = local.storageDeviceId
 
-    if ! creatingStores.contains(storeId) && ! ctx.host.shuttingDownDevices.contains(deviceId) then
+    if ! creatingStores.contains(storeId) && ! ctx.shutdown.isShuttingDown(deviceId) then
       creatingStores += storeId
 
       // True when the store exists on disk (created here, or by an attempt that crashed before
@@ -92,7 +92,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       else
         ctx.client.getStoragePoolState(storeId.poolId).flatMap: pstate =>
           ctx.lock.synchronized {
-            if ctx.host.shuttingDownDevices.contains(deviceId) || ! ctx.devices.devices.get(deviceId).contains(local) then
+            if ctx.shutdown.isShuttingDown(deviceId) || ! ctx.devices.devices.get(deviceId).contains(local) then
               logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
               Future.successful(false)
             else
@@ -171,7 +171,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
   def startRebuild(local: LocalStorageDeviceState, storeId: StoreId): Unit =
     ctx.lock.synchronized {
       if !rebuildingStores.contains(storeId) && rebuildingStores.size < ctx.maxConcurrentRebuilds &&
-         !ctx.host.shuttingDownDevices.contains(local.storageDeviceId) && discardLostStore(local, storeId) then
+         ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && discardLostStore(local, storeId) then
         val sr = ctx.storeRebuildFactory.createRebuild(
           ctx.client, storeId, local.storageDeviceId, local.devicePath)
 

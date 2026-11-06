@@ -223,7 +223,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         storesAwaitingSpace -= storeId
       else if wait.scansLeft > 1 then
         storesAwaitingSpace += storeId -> wait.copy(scansLeft = wait.scansLeft - 1)
-      else if ! ctx.host.shuttingDownDevices.contains(deviceId) then
+      else if ! ctx.shutdown.isShuttingDown(deviceId) then
         ctx.tryLoadStore(wait.sds, wait.storePath, None)
 
   /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. A RocksDB backend is opened under

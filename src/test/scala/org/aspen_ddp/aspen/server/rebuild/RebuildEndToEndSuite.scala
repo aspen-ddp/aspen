@@ -99,8 +99,8 @@ class RebuildEndToEndSuite extends IntegrationTestSuite
         val stagingPath = deviceDir / RebuildingStore.RebuildDirectory / sid.directoryName
         os.exists(stagingPath) should be(false)
 
-      // A read-back assertion against the pool is not valid in this harness: Host
-      // overrides tryLoadStore to record instead of opening a RocksDB backend, so the rebuilt stores
+      // A read-back assertion against the pool is not valid in this harness: ControlFixture's
+      // RecordingSeams make tryLoadStore record instead of opening a RocksDB backend, so the rebuilt stores
       // do not actually come online. Reads are served by net.smgr's in-memory MapBackends throughout,
       // and a read-back would therefore pass whether the rebuild ran or not -- a vacuous assertion.
 

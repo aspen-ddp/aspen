@@ -134,7 +134,6 @@ object DeviceMetadata:
      *  failed). Nothing was written. */
     case Cancelled
 
-
   /** What adoptDevice decided, from the device state it re-read inside its transaction. */
   private[aspen] enum AdoptOutcome:
     /** Committed. `state` is exactly what was written, for the post-commit steps to act on. */
@@ -153,8 +152,13 @@ object DeviceMetadata:
  *  (`uncleanStores`, `crlLostStores`, `markRebuildRequired`, `gossipStoreOnline`), run on the control context it
  *  imports from `ctx`. */
 class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata with Logging:
-  // By name: Host builds this before the DeviceControl that holds it, which only calls it once constructed.
-  private lazy val ctx: DeviceControl = control
+  // By name: Host builds this before the DeviceControl that holds it, which only calls it once constructed. Used
+  // during that construction, `control` would still be null: fail then, rather than cache the null for good (a
+  // failed lazy val initializer is retried on next use).
+  private lazy val ctx: DeviceControl =
+    val c = control
+    require(c != null, "ClientDeviceMetadata used before its DeviceControl was constructed")
+    c
   import ctx.given
 
   private def client: AspenClient = ctx.client

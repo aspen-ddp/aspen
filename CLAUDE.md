@@ -95,6 +95,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
       operations must complete successfully to avoid a corrupted file system but cannot be done in a single
       transaction. Using a DurableTask ensures that the operations proceed successfully and in the correct order.
   - Provides Exactly-Once guarantees
+- **Hosts** (`server.Host`, components in `server.host`): a thin shell over `DeviceControl` (device management on
+  one control thread) and `StoreRouter` (stores on their own executors); see "Host threading model" below
   
 ## Key Design Aspects
 - Building and using Distributed Data Structures is the primary use case for Aspen-based systems
@@ -222,13 +224,19 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - If the refcount of the object is set to zero, it is deleted
 
 ### Host threading model
-- `HostThreading` (`server.host`) decides where a host's work runs. Production (`Main`) uses `StoreThreadPool`: each
-  store is bound to one store thread (`aspen-store-N`, daemon, single-threaded FIFO executor; at most one per core,
-  created lazily, least-loaded placement), and everything touching a `Store`, `Frontend` or `Tx` runs there
+- `HostThreading` (`server.host`) decides where a host's work runs. It is a `Host` constructor parameter, chosen in
+  code (no config option). The default strategy, which `Main` passes, is `StoreThreadPool`: each store is bound to one
+  store thread (`aspen-store-N`, daemon, single-threaded FIFO executor), created lazily, at most one per CPU
+  (`availableProcessors`), placed on the least-loaded thread, its slot freed by `release`. Everything touching a
+  `Store`, `Frontend` or `Tx` runs there, so they take no locks. The exception is `Store.transactionDrivers`, a
+  `@volatile` immutable Map so `hasTransactions`/`logTransactionStatus` may read it from any thread;
+  `TransactionDriver`s keep their own locks for their timer threads
 - The hot path (network messages, I/O completions, heartbeats, repairs) goes through `StoreRouter` straight to the
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
   not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the
-  calling thread; offline ones are silent, as are all unknown ones until the startup scan's loads are handled
+  calling thread; offline ones are silent, as are all unknown ones until the startup scan's LoadStores are handled.
+  Stores whose load comes later (FSIF stores opening on `FsifOpenEc`, devices awaiting a shutdown-marker lookup) are
+  not covered and can still get unknown-store replies, as before
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only
@@ -236,7 +244,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - Device management (the `server.host` classes `DeviceControl` wires) runs on one control thread, `aspen-host-control`,
   with no locks. Rules (scaladoc of `HostThreading.scala`): the only `given ExecutionContext` is the control context;
   never block the control thread on a Future; other threads read control state only through the `@volatile`
-  `HostStoreView` (`containsStore`, `getStoreIds`, `getDevicePath`, `isRepairable`) or the router's concurrent map
+  `HostStoreView` (an immutable snapshot the control thread republishes on every change: `containsStore`,
+  `getStoreIds`, `getDevicePath`, `isRepairable`) or the router's concurrent map
   (`hasTransactions`, `logTransactionStatus`); store and control state stay apart: control posts store work to the
   executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
 - Callbacks name the control context. Work run elsewhere (FSIF opens, client transactions on the host's `ec`) names

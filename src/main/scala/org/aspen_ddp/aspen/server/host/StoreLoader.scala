@@ -336,10 +336,12 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
 
   /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
    *  queued ahead of it has run against the open store. It then sets `closing`, so I/O completions posted from now on
-   *  are dropped, and posts `f` behind it: completions already posted (for I/O those tasks issued, a MapBackend's
-   *  arriving inline) are delivered first. `f` sets `closed`, so nothing queued behind it reaches the store, and
-   *  starts the close. Lockstep: both run inline, as the event loop's ShutdownStore handler did, and a completion is
-   *  dropped if its queued item drains after the close began. */
+   *  are dropped, and posts `f` behind it: completions already on the executor's queue (for I/O those tasks issued, a
+   *  MapBackend's arriving inline) are delivered first. A completion from another thread that checked `closing` just
+   *  before it was set and is queued after `f` is dropped, which is a lost message (spec section 5 allows it). `f`
+   *  sets `closed`, so nothing queued behind it reaches the store, and starts the close. Lockstep: both run inline,
+   *  as the event loop's ShutdownStore handler did, and a completion is dropped if its queued item drains after the
+   *  close began. */
   private def startClose[T](entry: StoreRouter.Entry)(f: => Future[T]): Future[T] =
     onExecutor(entry):
       entry.closing = true

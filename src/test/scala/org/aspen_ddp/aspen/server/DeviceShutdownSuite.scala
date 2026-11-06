@@ -92,7 +92,8 @@ class DeviceShutdownSuite extends IntegrationTestSuite with ControlFixture:
 
   /** A host with deviceA registered, written to disk and loaded, carrying `stores` in the tree. The
    *  stores in `loaded` are given directories and recorded as open on the device, as tryLoadStore
-   *  would have done. Host never opens a backend, so that is done by hand. */
+   *  would have done. ControlFixture's RecordingSeams make tryLoadStore only record the path, so no
+   *  backend is opened and that is done by hand. */
   private def setUp(stores: Map[StoreId, StoreEntry],
                     loaded: Set[StoreId] = Set(),
                     transfers: StagedTransferService = new StagedTransferService,

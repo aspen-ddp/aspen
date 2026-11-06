@@ -35,8 +35,13 @@ class Store(val storageDeviceId: StorageDeviceId,
   val storeId: StoreId = backend.storeId
   val frontend = new Frontend(backend.storeId, backend, objectCache, net, crl, txStatusCache, maxSliceSize)
 
-  private var transactionDrivers: Map[TransactionId, TransactionDriver] = Map()
-  
+  /** Every method of a Store runs on its store executor (StoreRouter), so no lock guards its state. The one
+   *  exception is this map: `hasTransactions` and `logTransactionStatus` read it from other threads (TestNetwork's
+   *  checker thread, through Host.hasTransactions), so it is an immutable Map in a `@volatile` field and those two
+   *  read one snapshot of it. TransactionDrivers keep their own locks for their timer threads, and are never handed
+   *  the Store, so those threads never reach its state. */
+  @volatile private var transactionDrivers: Map[TransactionId, TransactionDriver] = Map()
+
   def close(): Future[Unit] = frontend.close()
 
   def estimateSize(): Long = backend.estimateSize()
@@ -45,7 +50,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     transactionDrivers.values.foreach { td =>
       td.heartbeat()
     }
-    synchronized(frontend.transactions.values.foreach(_.checkCollisionWait()))
+    frontend.transactions.values.foreach(_.checkCollisionWait())
     frontend.transactions.values.foreach { tx =>
       tx.reportIfStuck()
       if (tx.durationSinceLastEvent > txHeartbeatTimeout && !transactionDrivers.contains(tx.transactionId))
@@ -57,7 +62,7 @@ class Store(val storageDeviceId: StorageDeviceId,
     .maximumSize(1000)
     .build[TransactionId, List[TxPrepareResponse]]()
 
-  def driveTransaction(txd: TransactionDescription): Unit = synchronized {
+  def driveTransaction(txd: TransactionDescription): Unit = {
     if (!transactionDrivers.contains(txd.transactionId)) {
 
       val driver = txDriverFactory.create(executionContext, storeId, net, backgroundTasks, txd, finalizerFactory)
@@ -71,23 +76,24 @@ class Store(val storageDeviceId: StorageDeviceId,
     }
   }
 
-  def repair(os: ClientObjectState, completion: Promise[Unit]) = synchronized {
+  def repair(os: ClientObjectState, completion: Promise[Unit]): Unit = {
     frontend.readObjectForRepair(os, completion)
   }
 
   def repairDelete(objectId: ObjectId,
                    storePointer: Array[Byte],
-                   completion: Promise[Unit]): Unit = synchronized {
+                   completion: Promise[Unit]): Unit = {
     frontend.deleteObjectForRepair(objectId, storePointer, completion)
   }
 
-  def hasTransactions: Boolean = synchronized { transactionDrivers.nonEmpty }
+  /** Callable from any thread: reads one snapshot of `transactionDrivers` */
+  def hasTransactions: Boolean = transactionDrivers.nonEmpty
 
-  def logTransactionStatus(log: String => Unit): Unit = synchronized {
+  /** Callable from any thread: reads one snapshot of `transactionDrivers`; printState takes each driver's own lock */
+  def logTransactionStatus(log: String => Unit): Unit =
     transactionDrivers.values.foreach(_.printState(log))
-  }
 
-  def receiveTransactionMessage(msg: TxMessage): Unit = synchronized {
+  def receiveTransactionMessage(msg: TxMessage): Unit = {
 
     msg match {
       case m: TxPrepare =>

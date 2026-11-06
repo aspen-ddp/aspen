@@ -24,6 +24,14 @@ Next steps:
 3. Profile the event thread during randrw (async-profiler or JFR) to find the hot paths in handleEvent.
 4. Depending on the results: make the event loop cheaper, or split it (e.g. one event loop per store, since stores
    share no transaction state), and remove the host-wide `synchronized` from the hot path.
+Update (host-refactor branch): the event loop is split. Stores run on their own `aspen-store-N` threads
+(StoreThreadPool), device management on `aspen-host-control`, and the host-wide `synchronized` and Store's locks are
+gone (docs/superpowers/specs/2026-11-05-host-refactor-design.md). The next step is the before/after measurement in
+docs/host-threading-measurement.md; if "store commit (FsifBackend)" does not improve, record what its thread dumps
+show here as the next investigation.
+
+HostObjectCache is one `synchronized` cache shared by every store; with stores on parallel threads it is the likely
+next contention point (see docs/superpowers/specs/2026-11-05-host-refactor-design.md).
 
 vdisk (native TCMU frontend) follow-ups:
 - Run the root end-to-end scripts in scripts/vdisk-e2e/ (setup.sh, restart-under-io.sh, grow.sh in both modes,
@@ -65,5 +73,14 @@ holding requirement locks. They come from finalization actions waiting ~2.5-3.2 
 backoff; the tests pass. Investigate together with the DataObject TKVL item above: determine whether the backoff is
 too conservative or whether finalization actions collide more than they should.
 
+Load-sensitive test failures under full CPU load, all predating the host-refactor branch (seen on its base commits
+too): StoreTransferManagerSuite "one pass starts as many transfers as the floor admits", a StoreTransferManagerSuite
+broken pipe, QUIC and vdisk timing tests, and the intermittent "Hung Test" print in TKVLBatchSuite above. Flaky tests
+are not permitted: find what each one's timing depends on and make it deterministic.
 
-
+JVM SIGSEGV in librocksdbjni, seen once in a full `sbt test` run on commit e427c74c (2026-11-05, 27 s into the run).
+Problematic frame `rocksdb::WriteBatchInternal::Count(rocksdb::WriteBatch const*)+0x4`, SEGV_MAPERR at address 0x58
+(a near-null WriteBatch), from `org.rocksdb.WriteBatch.count0` <- BufferedConsistentRocksDB.commitOnPool <-
+BufferedConsistentRocksDB.commit's Future callback, on a ScheduledThreadPoolExecutor thread ("pool-1233-thread-1").
+Looks like a WriteBatch used after it (or its DB) was closed, e.g. a test closing a store while a buffered commit is
+still scheduled. Check whether commitOnPool can run after close and guard it.

@@ -22,7 +22,10 @@ object StoreRouter:
    *  `closed` is confined to the executor: the store's close (or its replacement by a reload) sets it there, so tasks
    *  queued ahead of the close still run against the open store (spec section 5) and tasks queued behind it never
    *  reach it. `closing` is set on the executor when the close starts and read by I/O completions as they are
-   *  posted: those posted earlier are delivered, those posted later dropped (StoreLoader.startClose). */
+   *  posted: those that see it set are dropped, and those that see it clear are delivered unless they reach the
+   *  executor after the close's own task (StoreLoader.startClose). An asynchronous backend's completion can check
+   *  just before the close starts and be queued just after it, and is then dropped: that is a lost message, which
+   *  spec section 5 allows. */
   final class Entry(val store: Store, val executor: StoreExecutor):
     var closed: Boolean = false
     @volatile var closing: Boolean = false
@@ -113,9 +116,10 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
 
   /** The completion handler of `entry`'s backend, set before the entry is installed. It never looks in the map: a
    *  completion arriving after `remove` but before the close starts on the executor belongs to I/O the still-open
-   *  store issued (reads queued ahead of the close), so it is delivered; only those arriving after the close has
-   *  started there are dropped (spec section 5). One dispatch step, then the executor: in lockstep it is one queued
-   *  item, as the host's IOCompletion event was. */
+   *  store issued (reads queued ahead of the close), so it is delivered; those arriving after the close has
+   *  started there are dropped (spec section 5). The check and the enqueue are not atomic, so one that checks just
+   *  before the close starts and is queued just after it is dropped too, as a lost message would be. One dispatch
+   *  step, then the executor: in lockstep it is one queued item, as the host's IOCompletion event was. */
   private[host] def completionHandler(entry: Entry): CompletionHandler = op =>
     ctx.threading.dispatch.execute: () =>
       if ! entry.closing then
@@ -199,7 +203,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
 
   def isOffline(storeId: StoreId): Boolean = offline.contains(storeId)
 
-  /** Callable from any thread (TestNetwork's checker thread): Store.hasTransactions is synchronized. */
+  /** Callable from any thread (TestNetwork's checker thread): Store.hasTransactions reads a volatile snapshot. */
   def hasTransactions: Boolean = stores.values.asScala.exists(_.store.hasTransactions)
 
   def logTransactionStatus(log: String => Unit): Unit = stores.values.forEach(_.store.logTransactionStatus(log))

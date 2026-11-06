@@ -21,8 +21,8 @@ import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 
 /** Restart of a shut-down device on the host that shut it down, and adoption of one by another
- *  host. The adopting host is always the Host (BootstrapHostId); the "old host" is a
- *  second host registered with client.createHost. */
+ *  host. The adopting host is always the one ControlFixture's newHost builds (BootstrapHostId,
+ *  with RecordingSeams); the "old host" is a second host registered with client.createHost. */
 class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
   import StorageDeviceState.{DeviceStatus, StoreEntry, StoreStatus}
 
@@ -376,8 +376,8 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
       st <- state(deviceA)
       markerKeptByAdoption = os.exists(d1 / StoreTransfer.TransferredInMarkerFile)
       attemptsAfterAdoption = recorded(host).storeLoadAttempts.map(_._2).toList
-      // Host's tryLoadStore does not record the skipped store offline, as the real one
-      // does on seeing the marker; done by hand so the completed-transfers-in pass sees it.
+      // RecordingSeams' tryLoadStore (ControlFixture) does not record the skipped store offline, as
+      // the real one does on seeing the marker; done by hand so the completed-transfers-in pass sees it.
       _ = loadedDevices(host)(deviceA).offlineStores += s1
       _ = host.control.reconciler.checkAll()
       _ <- pumpUntil(!os.exists(d1 / StoreTransfer.TransferredInMarkerFile) &&
@@ -492,7 +492,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with ControlFixture:
     for
       (s0, firstAsk, dest, host) <- adoptTransferSource(transfers, sends)
       // The re-send goes out to the address held, then again once the source is re-read.
-      _ = dest.retransmitPendingStartTransfers(force = true)
+      _ = dest.control.transfers.retransmitPendingStarts(force = true)
       _ <- pumpUntil(net.capturedHostMessages.exists:
              case m: StartStoreTransfer => m.toHost == HostId.BootstrapHostId
              case _ => false)

@@ -115,6 +115,10 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
 
   private val fsifSeams = new java.util.IdentityHashMap[Host, FsifSeams]()
 
+  override def subFixtureTeardown(): Unit =
+    fsifSeams.clear()
+    super.subFixtureTeardown()
+
   /** What `host` did through its FSIF seams, and the knobs that make it do something else */
   private def fsif(host: Host): FsifSeams = fsifSeams.get(host)
 

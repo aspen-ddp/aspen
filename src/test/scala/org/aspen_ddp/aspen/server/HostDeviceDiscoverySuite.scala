@@ -1190,7 +1190,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
 
       // The retry's message replaced the failed attempt's in the retransmit set, so the old
       // UUID is never sent again.
-      t.host.retransmitPendingStartTransfers(force = true)
+      t.host.control.transfers.retransmitPendingStarts(force = true)
       takeStartTransfers(t.movingStore).map(_.transferUUID) should be(List(retryUUID))
 
   atest("retransmit stops once the transfer in completes"):
@@ -1201,13 +1201,13 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = takeStartTransfers(t.movingStore)
 
       // Pins the forced retransmit itself, so the empty result below is not vacuous.
-      _ = t.host.retransmitPendingStartTransfers(force = true)
+      _ = t.host.control.transfers.retransmitPendingStarts(force = true)
       beforeCompletion = takeStartTransfers(t.movingStore)
 
       _ = t.transfers.finishTransferIn(t.movingStore)
       _ <- pumpUntil(recorded(t.host).transferOutcomes.contains(t.movingStore))
       _ = takeStartTransfers(t.movingStore)
-      _ = t.host.retransmitPendingStartTransfers(force = true)
+      _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
       beforeCompletion.size should be(1)
       recorded(t.host).transferOutcomes.contains(t.movingStore) should be(true)
@@ -1225,7 +1225,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       // A device check during the wait must not start a parallel attempt either
       _ = t.host.control.reconciler.checkAll()
       _ <- pumpUntil(startTransferSent(t.transfers, t.movingStore, 2), rounds = 3)
-      _ = t.host.retransmitPendingStartTransfers(force = true)
+      _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
       t.transfers.transfersIn.size should be(1)
       t.host.control.transfers.transferringIn.keySet should contain(t.movingStore)
@@ -1291,7 +1291,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.nonEmpty, rounds = 3)
 
       _ = takeStartTransfers(t.movingStore)
-      _ = t.host.retransmitPendingStartTransfers(force = true)
+      _ = t.host.control.transfers.retransmitPendingStarts(force = true)
       dest <- client.getStorageDeviceState(net.secondDeviceId)
     yield
       dest.stores.contains(t.movingStore) should be(false)
@@ -1351,7 +1351,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = retryTransferIns(t.host)
       _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
       _ = takeStartTransfers(t.movingStore)
-      _ = t.host.retransmitPendingStartTransfers(force = true)
+      _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
       t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
       t.host.control.transfers.transferInRetries.keySet should be(Set())
@@ -1398,7 +1398,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ <- pumpUntil(t.host.control.transfers.transferInRetries.keySet.nonEmpty, rounds = 3)
 
       _ = takeStartTransfers(t.movingStore)
-      _ = t.host.retransmitPendingStartTransfers(force = true)
+      _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
       t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
       t.transfers.cancelledTransfersIn should be(Vector((t.movingStore, registered)))
@@ -1424,7 +1424,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with ControlFixture:
       _ = retryTransferIns(t.host)
       _ <- pumpUntil(t.transfers.transfersIn.size > 1, rounds = 3)
       _ = takeStartTransfers(t.movingStore)
-      _ = t.host.retransmitPendingStartTransfers(force = true)
+      _ = t.host.control.transfers.retransmitPendingStarts(force = true)
     yield
       t.host.control.transfers.transferringIn.keySet should not contain t.movingStore
       t.host.control.transfers.transferInRetries.keySet should be(Set())

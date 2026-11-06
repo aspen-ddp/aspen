@@ -240,10 +240,9 @@ class Host(val client: AspenClient,
   private def transfers = deviceControl.transfers
 
   /** Re-sends the StartStoreTransfer of every transfer in that has not yet completed and was last
-   *  sent more than 30 s ago. `force` skips the age check so tests need not wait it out. See
-   *  StoreTransfers.retransmitPendingStarts. */
-  private[aspen] def retransmitPendingStartTransfers(force: Boolean = false): Unit =
-    transfers.retransmitPendingStarts(force)
+   *  sent more than 30 s ago. See StoreTransfers.retransmitPendingStarts. */
+  private[aspen] def retransmitPendingStartTransfers(): Unit =
+    transfers.retransmitPendingStarts()
 
   // One dispatch step that posts each store's heartbeat to its executor
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
@@ -290,11 +289,6 @@ class Host(val client: AspenClient,
    *  goes straight to the StoreRouter, which takes the dispatch hop to each store's executor. */
   private def post(event: Event): Unit =
     threading.controlEvents.execute(EventTask(this, event))
-
-  private def lockstep: LockstepThreading = threading match
-    case t: LockstepThreading => t
-    case other => throw new IllegalStateException(
-      s"Testing hook needs LockstepThreading, not ${other.getClass.getSimpleName}")
 
   /** Callable from any thread: reads the published HostStoreView. */
   def getDevicePath(storageDeviceId: StorageDeviceId): Option[os.Path] =
@@ -386,9 +380,6 @@ class Host(val client: AspenClient,
 
   /** Placeholder for mixin class to implement transaction recovery */
   protected def handleRecoveryEvent(): Unit = ()
-
-  /** Whether any posted work is waiting. Lockstep threading only. */
-  def hasEvents: Boolean = lockstep.hasQueued
 
   /** Lockstep threading: runs all posted work, returning when none is left. Any other threading runs its own work,
    *  so this returns at once, doing nothing. */

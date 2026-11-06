@@ -136,7 +136,7 @@ class Host(val client: AspenClient,
                    val ec: ExecutionContext,
                    /** Where the host's events and stores run. See HostThreading. */
                    val threading: HostThreading,
-                   val objectCacheFactory: StoreId => ObjectCache,
+                   val objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache,
                    val net: Messenger,
                    val backgroundTasks: BackgroundTaskManager,
                    crlFactory: CrashRecoveryLogFactory,

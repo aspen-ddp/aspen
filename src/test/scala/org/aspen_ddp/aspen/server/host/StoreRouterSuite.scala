@@ -137,7 +137,7 @@ object StoreRouterSuite:
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager, threading = threading,
       post = event => threading.controlEvents.execute(() => handle(event)),
       crl = crl, txStatusCache = new TransactionStatusCache(), wrapCompletionHandler = identity,
-      objectCacheFactory = _ => ObjectCache.NoCache,
+      objectCacheFactory = (_, _) => ObjectCache.NoCache,
       finalizerFactory = null,
       txDriverFactory = TransactionDriver.noErrorRecoveryFactory, heartbeatPeriod = Duration(5, SECONDS),
       deviceScanPeriod = Duration(10, SECONDS), storeRebuildFactory = null, maxConcurrentRebuilds = 2,

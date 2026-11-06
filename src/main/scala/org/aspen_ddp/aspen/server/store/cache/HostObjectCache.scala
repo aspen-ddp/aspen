@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.store.cache
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
+import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.store.ObjectState
 import scribe.Logging
@@ -14,7 +15,8 @@ import scala.concurrent.ExecutionContext
   * Each store accesses the cache through the [[StoreObjectCache]] returned by forStore, so the stores of a pool
   * hosted together never see each other's slices of the same object. A view's state is owned by its store's
   * executor and takes no locks. The only state shared between store threads is the host byte total
-  * (an AtomicLong), the registry of views (a ConcurrentHashMap) and the views' volatile flags.
+  * (an AtomicLong), the registry of views (a ConcurrentHashMap) and the views' volatile and atomic published values.
+  * The budget is soft: a view over it sheds or asks another view to shed, so the total may briefly overshoot.
   *
   * @param maxBytes Host-wide budget, in estimated bytes
   * @param clock Source of access times (nanoseconds)
@@ -31,7 +33,7 @@ class HostObjectCache(val maxBytes: Long, private[cache] val clock: () => Long =
   /** Estimated bytes currently held by all stores */
   def sizeInBytes: Long = total.get
 
-  /** Returns the cache view for a store, to be used only from `executor`.
+  /** Returns the cache view for a store, to be used only from `executor`, where other views post its sheds.
     *
     * A view of the store that was never cleared belongs to a store that is no longer running. It is warned about,
     * uncounted and ended.
@@ -45,6 +47,38 @@ class HostObjectCache(val maxBytes: Long, private[cache] val clock: () => Long =
     view
 
   private[cache] def unregister(view: StoreObjectCache): Unit = views.remove(view.storeId, view)
+
+  /** Called on `from`'s executor when the host total is over budget. Picks the view whose LRU head is oldest (`from`
+    * on a tie). If that is `from`, it evicts its own oldest entries, never `keep`, re-picking after each one, until
+    * the total fits or another view's head is older. Another view is asked to shed by a task posted to its executor,
+    * at most one pending per view; it then carries the pressure on itself.
+    */
+  private[cache] def rebalance(from: StoreObjectCache, keep: Option[ObjectId]): Unit =
+    var done = false
+    while !done && total.get > maxBytes do
+      val victim = pickVictim(from)
+      if victim == null then
+        done = true
+      else if victim eq from then
+        done = !from.evictOldest(keep)
+      else
+        if victim.shedPending.compareAndSet(false, true) then
+          victim.executor.execute(() => victim.shed())
+        done = true
+
+  /** The registered view with the smallest published oldestAccess, `from` winning ties; null if every LRU is empty */
+  private def pickVictim(from: StoreObjectCache): StoreObjectCache =
+    var victim: StoreObjectCache = null
+    var oldest = from.oldestAccess
+    if oldest < Long.MaxValue then victim = from
+    val iter = views.values.iterator
+    while iter.hasNext do
+      val v = iter.next()
+      val t = v.oldestAccess
+      if t < oldest then
+        oldest = t
+        victim = v
+    victim
 
 
 object HostObjectCache:

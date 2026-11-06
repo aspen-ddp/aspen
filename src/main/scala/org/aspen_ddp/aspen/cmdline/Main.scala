@@ -36,7 +36,7 @@ import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
 import org.aspen_ddp.aspen.vdisk.tcmu.sys.{Libc, Linux}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendConfig, FsifConfig, RocksDBConfig}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
-import org.aspen_ddp.aspen.server.store.cache.HostObjectCache
+import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.SimpleTransactionDriver
 import org.aspen_ddp.aspen.server.transfer.StoreTransferManager
 import org.aspen_ddp.aspen.server.*
@@ -1712,8 +1712,8 @@ object Main {
 
     val tls = TlsCredentials.fromPem(bootstrapCfg.caCertificate, hostCfg.tlsCertificate, hostCfg.tlsPrivateKey)
 
-    val hostObjectCache = new HostObjectCache(hostCfg.objectCacheBytes)
-    val objectCacheFactory = (storeId: StoreId) => hostObjectCache.forStore(storeId)
+    val objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache =
+      new HostObjectCache(hostCfg.objectCacheBytes).forStore
 
     val (networkBridge, nnet) = createNetwork(bootstrapCfg, onBootstrapConfigRefreshed,
                                               Some((hostCfg.hostId, hostCfg.dataPort)), None, tls,

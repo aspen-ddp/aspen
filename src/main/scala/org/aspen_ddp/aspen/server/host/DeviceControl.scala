@@ -48,7 +48,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val txStatusCache: TransactionStatusCache,
                           /** Wraps each backend's completion handler (a test seam; production: identity). */
                           val wrapCompletionHandler: CompletionHandler => CompletionHandler,
-                          val objectCacheFactory: StoreId => ObjectCache,
+                          val objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache,
                           val finalizerFactory: TransactionFinalizer.Factory,
                           val txDriverFactory: TransactionDriver.Factory,
                           val heartbeatPeriod: Duration,

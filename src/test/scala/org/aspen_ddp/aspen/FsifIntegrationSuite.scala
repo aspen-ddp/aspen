@@ -43,7 +43,7 @@ private object FsifTestHost:
         override def complete(op: Completion): Unit =
           queue.complete(op)
           ec.execute(() => network.handleEvents()))
-    new Host(client, hostId, systemId, hostRoot, ec, new LockstepThreading(ec), _ => ObjectCache.NoCache, network,
+    new Host(client, hostId, systemId, hostRoot, ec, new LockstepThreading(ec), (_, _) => ObjectCache.NoCache, network,
       BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, network.FinalizerFactory,
       TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
       StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2, seams = seams)

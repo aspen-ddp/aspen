@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
+import java.util.concurrent.Executors
 
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.objects.{Key, Metadata, ObjectId, ObjectRefcount, ObjectRevision, ObjectType, Value}
@@ -11,6 +12,8 @@ import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, StoreObjectCache
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.*
 import scala.language.implicitConversions
 
 object HostObjectCacheSuite {
@@ -19,6 +22,19 @@ object HostObjectCacheSuite {
 
   val store0: StoreId = StoreId(PoolId(new UUID(0, 9)), 0)
   val store1: StoreId = StoreId(PoolId(new UUID(0, 9)), 1)
+  val store2: StoreId = StoreId(PoolId(new UUID(0, 9)), 2)
+
+  /** Records posted tasks so a test decides when they run */
+  class Queue extends ExecutionContext {
+    var tasks: Vector[Runnable] = Vector()
+    def execute(r: Runnable): Unit = tasks :+= r
+    def runAll(): Unit =
+      while tasks.nonEmpty do
+        val t = tasks.head
+        tasks = tasks.tail
+        t.run()
+    def reportFailure(t: Throwable): Unit = throw t
+  }
 
   def mkobj(n: Int, dataSize: Int = 0): ObjectState = new ObjectState(
     ObjectId(new UUID(0, n)),
@@ -258,5 +274,179 @@ class HostObjectCacheSuite extends AnyFunSuite with Matchers {
     hc.sizeInBytes should be(Overhead)
     fresh.insert(o1)
     hc.sizeInBytes should be(2 * Overhead)
+  }
+
+  test("a hot store's inserts evict a cold store's oldest entries") {
+    val hc = new HostObjectCache(4 * Overhead, clock)
+    val coldQueue = new Queue
+    val cold = hc.forStore(store0, coldQueue)
+    val hot = hc.forStore(store1)
+    val c1 = mkobj(1); val c2 = mkobj(2)
+    val hs = (11 to 14).map(mkobj(_))
+
+    cold.insert(c1); cold.insert(c2)
+    hs.foreach(hot.insert)
+
+    coldQueue.tasks.size shouldBe 1
+    coldQueue.runAll()
+    cold.get(c1.objectId) shouldBe None
+    cold.get(c2.objectId) shouldBe None
+    hc.sizeInBytes shouldBe 4 * Overhead
+    hs.foreach(h => hot.get(h.objectId) should be(Some(h)))
+  }
+
+  test("a store evicts its own entries when they are the oldest") {
+    val hc = new HostObjectCache(4 * Overhead, clock)
+    val qa = new Queue
+    val qb = new Queue
+    val a = hc.forStore(store0, qa)
+    val b = hc.forStore(store1, qb)
+    val b1 = mkobj(1); val b2 = mkobj(2); val b3 = mkobj(3)
+    val a1 = mkobj(11); val a2 = mkobj(12)
+
+    b.insert(b1); b.insert(b2)
+    a.insert(a1); a.insert(a2)
+    b.insert(b3)
+
+    qa.tasks shouldBe empty
+    qb.tasks shouldBe empty
+    b.get(b1.objectId) shouldBe None
+    b.get(b2.objectId) should be(Some(b2))
+    b.get(b3.objectId) should be(Some(b3))
+    a.get(a1.objectId) should be(Some(a1))
+    hc.sizeInBytes shouldBe 4 * Overhead
+  }
+
+  test("only one shed is pending per victim") {
+    val hc = new HostObjectCache(2 * Overhead, clock)
+    val coldQueue = new Queue
+    val cold = hc.forStore(store0, coldQueue)
+    val hot = hc.forStore(store1)
+
+    cold.insert(mkobj(1)); cold.insert(mkobj(2))
+    hot.insert(mkobj(11)); hot.insert(mkobj(12)); hot.insert(mkobj(13))
+
+    coldQueue.tasks.size shouldBe 1
+    coldQueue.runAll()
+    cold.entryCount shouldBe 0
+    // The cold view's two entries were not enough: its shed passed the rest on to the hot view
+    hot.entryCount shouldBe 2
+    hc.sizeInBytes shouldBe 2 * Overhead
+  }
+
+  test("a shed that arrives after the pressure passed evicts nothing") {
+    val hc = new HostObjectCache(2 * Overhead, clock)
+    val coldQueue = new Queue
+    val cold = hc.forStore(store0, coldQueue)
+    val hot = hc.forStore(store1)
+    val c1 = mkobj(1); val c2 = mkobj(2)
+
+    cold.insert(c1); cold.insert(c2)
+    hot.insert(mkobj(11))
+    coldQueue.tasks.size shouldBe 1
+    hot.clear()
+    coldQueue.runAll()
+
+    cold.get(c1.objectId) should be(Some(c1))
+    cold.get(c2.objectId) should be(Some(c2))
+    hc.sizeInBytes shouldBe 2 * Overhead
+  }
+
+  test("a shed queued for a cleared view does nothing") {
+    val hc = new HostObjectCache(2 * Overhead, clock)
+    val coldQueue = new Queue
+    val cold = hc.forStore(store0, coldQueue)
+    val hot = hc.forStore(store1)
+
+    cold.insert(mkobj(1)); cold.insert(mkobj(2))
+    hot.insert(mkobj(11)); hot.insert(mkobj(12)); hot.insert(mkobj(13))
+    coldQueue.tasks.size shouldBe 1
+    cold.clear()
+    hc.sizeInBytes shouldBe 3 * Overhead
+    coldQueue.runAll()
+
+    hc.sizeInBytes shouldBe 3 * Overhead
+    hot.entryCount shouldBe 3
+  }
+
+  test("a victim with too few entries passes the rest of the pressure on") {
+    val hc = new HostObjectCache(4 * Overhead, clock)
+    val qa = new Queue
+    val qb = new Queue
+    val a = hc.forStore(store0, qa)
+    val b = hc.forStore(store1, qb)
+    val c = hc.forStore(store2)
+    val a1 = mkobj(1)
+    val b1 = mkobj(2); val b2 = mkobj(3)
+    val cs = (11 to 13).map(mkobj(_))
+
+    a.insert(a1)
+    b.insert(b1); b.insert(b2)
+    cs.foreach(c.insert)
+
+    qa.tasks.size shouldBe 1
+    qb.tasks shouldBe empty
+    qa.runAll()
+    a.entryCount shouldBe 0
+    qb.tasks.size shouldBe 1
+    qb.runAll()
+
+    b.get(b1.objectId) shouldBe None
+    b.get(b2.objectId) should be(Some(b2))
+    cs.foreach(o => c.get(o.objectId) should be(Some(o)))
+    hc.sizeInBytes shouldBe 4 * Overhead
+  }
+
+  test("pinned states never make a store a victim") {
+    val hc = new HostObjectCache(2 * Overhead, clock)
+    val coldQueue = new Queue
+    val cold = hc.forStore(store0, coldQueue)
+    val hot = hc.forStore(store1)
+    val c1 = mkobj(1)
+    val h1 = mkobj(11); val h2 = mkobj(12)
+
+    cold.insert(c1)
+    cold.pin(c1)
+    hot.insert(h1); hot.insert(h2)
+
+    coldQueue.tasks shouldBe empty
+    cold.get(c1.objectId) should be(Some(c1))
+    hot.get(h1.objectId) shouldBe None
+    hot.get(h2.objectId) should be(Some(h2))
+    hc.sizeInBytes shouldBe 2 * Overhead
+  }
+
+  test("stores on their own threads keep the host total consistent") {
+    val cap = 1000 * Overhead
+    val hc = new HostObjectCache(cap)
+    val poolA = Executors.newSingleThreadExecutor()
+    val poolB = Executors.newSingleThreadExecutor()
+    try
+      val ecA = ExecutionContext.fromExecutor(poolA)
+      val ecB = ExecutionContext.fromExecutor(poolB)
+      val a = hc.forStore(store0, ecA)
+      val b = hc.forStore(store1, ecB)
+
+      def run(ec: ExecutionContext, view: StoreObjectCache, base: Int): Future[Unit] =
+        Future((0 until 10000).foreach(n => ec.execute(() => view.insert(mkobj(base + n)))))(using ec)
+          .flatMap(_ => Future(())(using ec))(using ec)
+
+      val doneA = run(ecA, a, 0)
+      val doneB = run(ecB, b, 100000)
+      Await.result(doneA, 60.seconds)
+      Await.result(doneB, 60.seconds)
+
+      // Drain until no shed is pending on either view
+      def drain(ec: ExecutionContext): Unit = Await.result(Future(())(using ec), 60.seconds)
+      var rounds = 0
+      while { drain(ecA); drain(ecB); a.shedPending.get || b.shedPending.get } do
+        rounds += 1
+        rounds should be < 1000
+
+      hc.sizeInBytes shouldBe (a.sizeInBytes + b.sizeInBytes)
+      hc.sizeInBytes should be <= (cap + Overhead * 2)
+    finally
+      poolA.shutdown()
+      poolB.shutdown()
   }
 }

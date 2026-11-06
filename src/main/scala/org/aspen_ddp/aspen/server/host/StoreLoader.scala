@@ -304,8 +304,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
               // Ownership passes to its executor at install (spec section 5, refined).
               // The store's transaction drivers run on the host's ec, not the control context; they post back as
               // messages
-              val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(storeId), ctx.net,
-                ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
+              val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(storeId, executor),
+                ctx.net, ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
               val entry = new StoreRouter.Entry(store, executor)
               // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any

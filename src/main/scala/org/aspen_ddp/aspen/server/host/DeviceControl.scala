@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
-import org.aspen_ddp.aspen.server.store.backend.{Backend, CompletionHandler}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 

@@ -8,7 +8,8 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Metadata, ObjectId
 import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.server.host.{ControlFixture, DefaultBackendOpener, DeviceMetadata, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LockstepThreading}
+import org.aspen_ddp.aspen.server.store.backend.DefaultBackendOpener
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.{CommitState, UpdateForm}

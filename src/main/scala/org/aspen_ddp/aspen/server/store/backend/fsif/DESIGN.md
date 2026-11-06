@@ -634,9 +634,9 @@ described in 4.5. A plain `IOException` from the open is not a loss (4.6).
 | L11 | After applying the kept Deltas and forcing, a mapped slot starts at or beyond the end of `data` | :230-236 | A mapped slot was either written in place (forced before index m+1) or its Delta was replayed now | A truncation that is too aggressive (compaction's `used` missing a mapped slot) that became durable; a `stride` change |
 | L12 | The computed slot count exceeds `Int.MaxValue` | :263-264 | Not reachable with a bounded data file | A `stride` computed as 0 or very small |
 
-Related, for staging only: `RebuildingStore.openFsifStaging` (`rebuild/RebuildingStore.scala`:228) catches
-`StoreLost` for the rebuild's staging store. It deletes the staging directory and its checkpoint
-(`cleanupStaging`), so the next pass starts over. The live store is already Rebuilding, so this costs only
+Related, for staging only: `RebuildingStore.openStaging` (`rebuild/RebuildingStore.scala`) opens the rebuild's
+staging store through the host's `BackendOpener` and catches `BackendStateLost`, which `StoreLost` extends. It
+deletes the staging directory and its checkpoint (`cleanupStaging`), so the next pass starts over. The live store is already Rebuilding, so this costs only
 rebuild progress. A recovery bug of the L1-L12 kind would make every rebuild restart from scratch forever.
 
 ### 4.2 Detected at runtime by FSIF fail-stop (`onFatal`)

@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
 import org.aspen_ddp.aspen.client.AspenClient
@@ -29,7 +30,8 @@ private class RecordingRebuildFactory extends StoreRebuildFactory:
   def createRebuild(client: AspenClient,
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
-                    devicePath: os.Path): StoreRebuild =
+                    devicePath: os.Path,
+                    backends: BackendOpener): StoreRebuild =
     val r = new RecordedRebuild(storeId, storageDeviceId)
     synchronized:
       created += r

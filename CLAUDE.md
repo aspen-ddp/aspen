@@ -247,10 +247,11 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   calling thread; offline ones are silent, as are all unknown ones until the startup scan's LoadStores are handled.
   A store whose load is under way is silent too: `loading` from `StoreLoader.startOpen` until install, and
   `awaitingDevice` while its device's shutdown-marker lookup (or adoption) decides. Neither mark is `offline`
-- Backend opens are backend-neutral: `BackendOpener.open` returns a Future and decides where the open runs (RocksDB
-  inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one inline and otherwise posts
-  `BackendOpened`. The host sees only `Backend.hasFailed`/`isWriteFrozen`, `BackendStateLost` and
-  `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
+- Backend opens are backend-neutral: `BackendOpener.open` (`server.store.backend`) returns a Future and decides where
+  the open runs (RocksDB inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one
+  inline and otherwise posts `BackendOpened`. A rebuild's staging store opens through the same opener (passed by
+  `StoreRebuildFactory.createRebuild`). The host and the rebuild see only `Backend.hasFailed`/`isWriteFrozen`,
+  `BackendStateLost` and `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only

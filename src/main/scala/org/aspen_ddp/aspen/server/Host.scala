@@ -8,12 +8,12 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
-import org.aspen_ddp.aspen.server.host.{BackendOpener, BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LocalStorageDeviceState, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LocalStorageDeviceState, LockstepThreading}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
 import org.aspen_ddp.aspen.server.store.Store
-import org.aspen_ddp.aspen.server.store.backend.{Backend, CompletionHandler}
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, CompletionHandler, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService

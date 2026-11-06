@@ -3,6 +3,7 @@ package org.aspen_ddp.aspen.server.rebuild
 import org.aspen_ddp.aspen.client.AspenClient
 import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
+import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 
 import scala.concurrent.Future
 
@@ -21,18 +22,20 @@ trait StoreRebuild:
    *  (unless it had already finished). */
   def cancel(): Unit
 
-/** Constructs a store rebuild. The default `Filesystem` factory produces the real
- *  implementation. Tests inject a factory that records the request and resolves on command. */
+/** Constructs a store rebuild, whose staging store is opened through `backends`. The default `Filesystem` factory
+ *  produces the real implementation. Tests inject a factory that records the request and resolves on command. */
 trait StoreRebuildFactory:
   def createRebuild(client: AspenClient,
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
-                    devicePath: os.Path): StoreRebuild
+                    devicePath: os.Path,
+                    backends: BackendOpener): StoreRebuild
 
 object StoreRebuildFactory:
   object Filesystem extends StoreRebuildFactory:
     def createRebuild(client: AspenClient,
                       storeId: StoreId,
                       storageDeviceId: StorageDeviceId,
-                      devicePath: os.Path): StoreRebuild =
-      new RebuildingStore(client, storeId, storageDeviceId, devicePath)
+                      devicePath: os.Path,
+                      backends: BackendOpener): StoreRebuild =
+      new RebuildingStore(client, storeId, storageDeviceId, devicePath, backends)

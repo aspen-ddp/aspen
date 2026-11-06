@@ -1,5 +1,6 @@
 package org.aspen_ddp.aspen.server
 
+import org.aspen_ddp.aspen.server.store.backend.BackendOpener
 import org.aspen_ddp.aspen.IntegrationTestSuite
 import org.aspen_ddp.aspen.server.host.{ControlFixture, DeviceMetadata, LocalStorageDeviceState, StagedSendService, StagedTransferService}
 import org.aspen_ddp.aspen.client.AspenClient
@@ -34,7 +35,8 @@ private class CancellableRebuildFactory extends StoreRebuildFactory:
   def createRebuild(client: AspenClient,
                     storeId: StoreId,
                     storageDeviceId: StorageDeviceId,
-                    devicePath: os.Path): StoreRebuild = synchronized:
+                    devicePath: os.Path,
+                    backends: BackendOpener): StoreRebuild = synchronized:
     val r = new CancellableRebuild(storeId)
     created += r
     r

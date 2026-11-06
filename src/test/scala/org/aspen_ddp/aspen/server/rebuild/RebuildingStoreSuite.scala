@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.common.objects.{ByteArrayKeyOrdering, Key, ObjectId, 
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost, DefaultBackendOpener}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.BufferedConsistentRocksDB
 
 import java.nio.ByteBuffer
@@ -21,6 +22,24 @@ import scala.util.Try
 class RebuildingStoreSuite extends IntegrationTestSuite:
 
   private val storeId = StoreId(PoolId.BootstrapPoolId, 0.toByte)
+
+  private lazy val backends: BackendOpener = new DefaultBackendOpener(executionContext)
+
+  /** Opens through the default opener, recording each open and its onFatal, or fails it with BackendStateLost while
+   *  `lose` is set */
+  private final class RecordingOpener extends BackendOpener:
+    @volatile var opens: List[(StoreConfig, os.Path, Boolean)] = Nil
+    @volatile var onFatals: List[Throwable => Unit] = Nil
+    @volatile var lose: Boolean = false
+
+    def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
+             onFatal: Throwable => Unit): Future[Backend] =
+      opens = (storeCfg, storePath, create) :: opens
+      onFatals = onFatal :: onFatals
+      if lose then
+        Future.failed(new BackendStateLost("injected lost staging store"))
+      else
+        backends.open(storeCfg, storePath, create, onFatal)
 
   /** A bare device directory: no StorageDeviceConfig, since nothing here loads it as a device. */
   private def deviceDir(): os.Path =
@@ -60,7 +79,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5)
       _ <- rebuild.complete
 
@@ -109,7 +128,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
     for
       _ <- populate(20)
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
     yield
@@ -130,7 +149,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
       _ = os.makeDir.all(staging)
       _ = os.write.over(staging / RebuildState.stateFilename, contents)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5,
                                     testingOnlyTrackRestoredKeys = true)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -166,7 +185,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil))
 
       // The rebuild should resume from that key
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5,
                                     testingOnlyTrackRestoredKeys = true)
       _ <- rebuild.complete
@@ -190,7 +209,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // A checkpoint every 5 objects rather than every 1000, so the walk actually checkpoints
       // without needing a thousand allocations.
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5)
       _ <- rebuild.complete
     yield
@@ -207,7 +226,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       ids <- populate(20)
       _ <- net.waitForTransactionsToComplete()
       doomed = Key(ids.head.toBytes)
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5,
                                     testingOnlyFailKeys = Set(doomed))
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -231,7 +250,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Fail enough keys to exceed a low cap
       doomed = ids.take(15).map(id => Key(id.toBytes)).toSet
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5,
                                     testingOnlyFailKeys = doomed,
                                     maxFailedObjects = 10)
@@ -275,7 +294,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
              client.getStoragePool(PoolId.BootstrapPoolId).flatMap: pool =>
                pool.allocationTree.set(bogusKey, Value(Array[Byte](-1, -1, -1)))
       _ <- net.waitForTransactionsToComplete()
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5)
       settled <- outcomeOrStalled(rebuild)
     yield
@@ -305,7 +324,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Cancelled from inside the walk, after a checkpoint has been written, so the cancel
       // cannot race the walk finishing.
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 2,
                                     testingOnlyOnRestored = () =>
                                       restored += 1
@@ -315,7 +334,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // What the cancelled pass left behind, before a new one resumes from it
       checkpointed = RebuildState.load(staging).isDefined
       placed = os.exists(dev / storeId.directoryName)
-      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev)
+      resumed = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends)
       _ <- resumed.complete
     yield
       outcome.failed.get should be(RebuildingStore.RebuildCancelled(storeId))
@@ -332,7 +351,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- populate(6)
       _ <- net.waitForTransactionsToComplete()
       // As a fail-stop of the staging store's final I/O would: the abort arrives once the walk is done
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 2,
                                     testingOnlyOnFinishClosed = () => rebuildRef.cancel())
       _ = rebuildRef = rebuild
@@ -356,7 +375,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Read counting starts the moment cancel() returns, inside the walk's own callback, and
       // covers everything up to the rebuild's completion.
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 2,
                                     testingOnlyOnRestored = () =>
                                       restored += 1
@@ -380,7 +399,7 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       _ <- net.waitForTransactionsToComplete()
       // Inject an out-of-space error on the first object
       doomed = Set(Key(ids.head.toBytes))
-      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev,
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, backends,
                                     checkpointInterval = 5,
                                     testingOnlyOutOfSpaceKeys = doomed)
       outcome <- rebuild.complete.transform(scala.util.Success.apply)
@@ -394,3 +413,68 @@ class RebuildingStoreSuite extends IntegrationTestSuite:
       // failedObjects is EMPTY -- proving the latch alone failed the pass, not retryFailures()
       val saved = RebuildState.load(staging).get
       saved.failedObjects should be(Nil)
+
+  atest("the staging store is opened through the BackendOpener with the pool's backend config"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val opener = new RecordingOpener
+    for
+      _ <- populate(3)
+      _ <- net.waitForTransactionsToComplete()
+      pstate <- client.getStoragePoolState(storeId.poolId)
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener)
+      _ <- rebuild.complete
+    yield
+      val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+      opener.opens.map((cfg, path, create) => (cfg.storeId, cfg.backend, path, create)) should be(
+        List((storeId, StoreConfig.storageBackendFor(pstate.backendConfig), staging, false)))
+      os.exists(dev / storeId.directoryName) should be(true)
+
+  atest("a staging store whose state is lost is discarded, checkpoint and all, and the next rebuild starts over"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    val opener = new RecordingOpener
+    for
+      ids <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      // A checkpoint part-way through, as a crashed pass leaves it
+      _ = os.makeDir.all(staging)
+      sorted = ids.map(id => Key(id.toBytes)).sortWith(ByteArrayKeyOrdering.lt)
+      _ = RebuildState.save(staging, RebuildState(storeId, Some(sorted(9)), Nil))
+      _ = opener.lose = true
+      lost = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener)
+      outcome <- lost.complete.transform(scala.util.Success.apply)
+      stagingLeft = os.exists(staging)
+      _ = opener.lose = false
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener,
+                                    testingOnlyTrackRestoredKeys = true)
+      _ <- rebuild.complete
+    yield
+      outcome.failed.get shouldBe a[BackendStateLost]
+      stagingLeft should be(false)
+      // From the beginning: every allocated object, not only those after the discarded checkpoint
+      val restoredBytes = rebuild.testingOnlyRestoredKeys.map(_.bytes.toList).toSet
+      (restoredBytes intersect sorted.map(_.bytes.toList).toSet) should be(sorted.map(_.bytes.toList).toSet)
+      os.exists(dev / storeId.directoryName) should be(true)
+
+  atest("a fail-stop of the staging store fails the pass and leaves its checkpoint for the next one"):
+    given ExecutionContext = executionContext
+    val dev = deviceDir()
+    val staging = dev / RebuildingStore.RebuildDirectory / storeId.directoryName
+    val opener = new RecordingOpener
+    val failure = new java.io.IOException("injected fail-stop")
+    var restored = 0
+    for
+      _ <- populate(20)
+      _ <- net.waitForTransactionsToComplete()
+      rebuild = new RebuildingStore(client, storeId, StorageDeviceId.BootstrapStorageDeviceId, dev, opener,
+                                    checkpointInterval = 2,
+                                    testingOnlyOnRestored = () =>
+                                      restored += 1
+                                      if restored == 5 then opener.onFatals.head(failure))
+      outcome <- rebuild.complete.transform(scala.util.Success.apply)
+    yield
+      outcome.failed.get should be(failure)
+      os.exists(dev / storeId.directoryName) should be(false)
+      RebuildState.load(staging).isDefined should be(true)

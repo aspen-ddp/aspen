@@ -1,8 +1,7 @@
-package org.aspen_ddp.aspen.server.host
+package org.aspen_ddp.aspen.server.store.backend
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.StoreConfig
-import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
@@ -11,12 +10,12 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Try
 
-/** Opens store backends. The only part of the host that knows the concrete backends: the rest of it treats every open
- *  alike (StoreLoader.startOpen). */
+/** Opens store backends. The one place that names the concrete backends: the host's loads (StoreLoader.startOpen)
+ *  and a rebuild's staging store (RebuildingStore) treat every open alike. */
 trait BackendOpener:
   /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. The opener decides where the
    *  open runs: a quick one may run in the caller and return a completed Future; a slow one (recovery that reads and
-   *  fsyncs a whole store) must run elsewhere, touching no host state, since the caller is the control thread.
+   *  fsyncs a whole store) must run elsewhere, touching no host state, since the caller may be the host's control thread.
    *  `onFatal` is called once, from a backend thread, when the backend fail-stops: it must only enqueue.
    *
    *  A failure that is `Backend.isOutOfSpace` leaves the store's data intact; a `BackendStateLost` means it must be

@@ -8,9 +8,7 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjectPointer, Metadata, ObjectId, ObjectPointer, ObjectType}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
-import org.aspen_ddp.aspen.server.store.backend.{Backend, FsifConfig, RocksDBConfig}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout, FsifRecovery}
-import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
+import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendOpener, BackendStateLost}
 import scribe.Logging
 
 import scala.collection.mutable
@@ -59,6 +57,7 @@ class RebuildingStore(client: AspenClient,
                       val storeId: StoreId,
                       storageDeviceId: StorageDeviceId,
                       devicePath: os.Path,
+                      backends: BackendOpener,
                       checkpointInterval: Int = RebuildingStore.CheckpointInterval,
                       testingOnlyFailKeys: Set[Key] = Set(),
                       testingOnlyOutOfSpaceKeys: Set[Key] = Set(),
@@ -182,15 +181,13 @@ class RebuildingStore(client: AspenClient,
 
     for
       pstate <- client.getStoragePoolState(storeId.poolId)
+      stagingCfg = StoreConfig(storeId, StoreConfig.storageBackendFor(pstate.backendConfig), pstate.maxSliceSize)
       _ = if !os.exists(stagingPath / StoreConfig.configFilename) then
             // Written up front so the directory is loadable the instant it is moved into place.
-            val backendCfg = StoreConfig.storageBackendFor(pstate.backendConfig)
-            os.write.over(stagingPath / StoreConfig.configFilename,
-              StoreConfig(storeId, backendCfg, pstate.maxSliceSize).yamlConfig)
+            os.write.over(stagingPath / StoreConfig.configFilename, stagingCfg.yamlConfig)
+      opened <- openStaging(stagingCfg)
       _ = synchronized:
-            backend = pstate.backendConfig match
-              case _: RocksDBConfig => new RocksDBBackend(stagingPath, storeId, summon)
-              case cfg: FsifConfig => openFsifStaging(cfg)
+            backend = opened
       pool <- client.getStoragePool(storeId.poolId)
       tree = pool.allocationTree
       _ <- resume.flatMap(_.lastRestoredKey) match
@@ -208,26 +205,27 @@ class RebuildingStore(client: AspenClient,
       _ <- finish()
     yield ()
 
-  /** Opens the staging FSIF store: initialized on the first pass (or if that pass was cut off before writing
-   *  anything), recovered on a resume. A fail-stop latches the abort, so the pass fails with the checkpoint left for the next
-   *  one. A staging store that cannot be recovered is discarded, checkpoint and all, so the next pass starts over
-   *  rather than failing on it forever.
+  /** Opens the staging store through the BackendOpener, which decides where the open runs: initialized on the first
+   *  pass (or if that pass was cut off before writing anything), recovered on a resume. A fail-stop latches the
+   *  abort, so the pass fails with the checkpoint left for the next one. A staging store whose state is lost
+   *  (BackendStateLost) is discarded, checkpoint and all, so the next pass starts over rather than failing on it
+   *  forever.
    */
-  private def openFsifStaging(cfg: FsifConfig): Backend =
-    val layout = FsifLayout(cfg.segmentPayloadSize, cfg.segmentCount)
+  private def openStaging(cfg: StoreConfig): Future[Backend] =
     def onFatal(err: Throwable): Unit =
-      logger.error(s"Rebuild of $storeId: the staging FSIF store failed. Abandoning this pass. Error: $err")
+      logger.error(s"Rebuild of $storeId: the staging store failed. Abandoning this pass. Error: $err")
       synchronized:
         if abortCause.isEmpty then
           abortCause = Some(err)
-    try
-      FsifBackend.open(storeId, stagingPath, layout, FsifBackend.sharedIo, onFatal)
-    catch
-      case e: FsifRecovery.StoreLost =>
-        logger.error(s"Rebuild of $storeId: the staging FSIF store cannot be recovered. Discarding it to start " +
+    val fopen =
+      try backends.open(cfg, stagingPath, create = false, onFatal)
+      catch case NonFatal(t) => Future.failed(t)
+    fopen.recoverWith:
+      case e: BackendStateLost =>
+        logger.error(s"Rebuild of $storeId: the staging store cannot be recovered. Discarding it to start " +
                      s"over. Error: ${e.getMessage}")
         cleanupStaging()
-        throw e
+        Future.failed(e)
 
   /** Copy one object's slice of this store into the backend.
    *
@@ -458,7 +456,7 @@ class RebuildingStore(client: AspenClient,
     backend.rebuildFlush()
     closeBackend().map: _ =>
       testingOnlyOnFinishClosed()
-      // An abort latched while the backend closed (a fail-stop of the staging FSIF store's last I/O, a cancel)
+      // An abort latched while the backend closed (a fail-stop of the staging store's last I/O, a cancel)
       // means the staging copy must not become the live store: the pass fails with the checkpoint left in place
       synchronized(abortCause).foreach(cause => throw cause)
       // The temp file only exists if a crash caught a save between its write and its rename, and

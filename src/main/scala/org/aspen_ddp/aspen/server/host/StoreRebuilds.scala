@@ -159,7 +159,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
     if !rebuildingStores.contains(storeId) && rebuildingStores.size < ctx.maxConcurrentRebuilds &&
        ! ctx.shutdown.isShuttingDown(local.storageDeviceId) && discardLostStore(local, storeId) then
       val sr = ctx.storeRebuildFactory.createRebuild(
-        ctx.client, storeId, local.storageDeviceId, local.devicePath)
+        ctx.client, storeId, local.storageDeviceId, local.devicePath, ctx.backends)
 
       val settled = Promise[Unit]()
 

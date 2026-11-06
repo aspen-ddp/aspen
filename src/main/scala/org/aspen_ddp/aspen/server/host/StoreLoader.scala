@@ -155,7 +155,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         if router.get(storeId).isEmpty then
           sds.loadedStores -= storeId
         if backendHasFailed(backend) then
-          try ctx.host.markRebuildRequired(storePath)
+          try ctx.rebuilds.markRebuildRequired(storePath)
           catch case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $storePath: $t")
         backend.close()
         created.foreach(_.tryFailure(new IllegalStateException(s"store $storeId was opened but not served")))
@@ -168,7 +168,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
                      s"Rebuilding it. $storePath. Error: ${e.getMessage}")
         leaveOffline()
         try
-          ctx.host.markRebuildRequired(storePath)
+          ctx.rebuilds.markRebuildRequired(storePath)
         catch
           case t: Throwable =>
             // Offline for the life of this process either way. The next start recovers the
@@ -263,11 +263,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     savedState match
       case Left(err) if failed =>
         logger.error(s"Store ${backend.storeId} cannot be loaded: its backend failed. Rebuilding it. Error: $err")
-        ctx.host.retireUnservedStore(storageDeviceId, backend)
+        ctx.rebuilds.retireUnserved(storageDeviceId, backend)
         p.failure(err)
 
       case Left(err) =>
-        ctx.host.crlSaveFileLost(storageDeviceId, backend, err)
+        ctx.rebuilds.crlSaveFileLost(storageDeviceId, backend, err)
         p.failure(err)
 
       case Right(trs) =>
@@ -343,7 +343,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // An FSIF close completes even after a fail-stop during it, and this store is no
             // longer served, so its BackendFailed (if any) would find nothing to act on.
             if backendHasFailed(store.backend) then
-              ctx.lock.synchronized(ctx.host.failedOnClose(store))
+              ctx.lock.synchronized(ctx.rebuilds.failedOnClose(store))
               completion.failure(StoreFailedOnClose(storeId))
             else
               completion.success(())

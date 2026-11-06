@@ -281,7 +281,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       val fadopt =
         try ctx.metadata.adoptDevice(deviceId, previousHostId, path, uncleanStores,
                                      (p, s) => offlineStoresIn(p, s, AdoptionClass.CrlLost),
-                                     ctx.host.markRebuildRequired)
+                                     ctx.rebuilds.markRebuildRequired)
         catch case t: Throwable => Future.failed(t)
       fadopt.onComplete: result =>
         ctx.lock.synchronized:

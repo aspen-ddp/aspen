@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.network.Messenger
+import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.store.backend.{Backend, CompletionHandler}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer, TransactionStatusCache}
@@ -44,6 +45,8 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val txDriverFactory: TransactionDriver.Factory,
                           val heartbeatPeriod: Duration,
                           val deviceScanPeriod: Duration,
+                          val storeRebuildFactory: StoreRebuildFactory,
+                          val maxConcurrentRebuilds: Int,
                           val loadStore: (StorageDeviceId, Backend, Option[Long]) => Future[Unit],
                           val tryLoadStore: (LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit,
                           val warn: (os.Path, String) => Unit)
@@ -54,3 +57,4 @@ final class DeviceControl(val metadata: DeviceMetadata,
   lazy val loader: StoreLoader = new StoreLoader(this)
   lazy val discovery: DeviceDiscovery = new DeviceDiscovery(this)
   lazy val transfers: StoreTransfers = new StoreTransfers(this)
+  lazy val rebuilds: StoreRebuilds = new StoreRebuilds(this)

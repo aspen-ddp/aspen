@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, BackgroundControlScheduler, ClientDeviceMetadata, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, BackendOpener, BackgroundControlScheduler, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LockstepThreading}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
@@ -22,7 +22,6 @@ import scribe.Logging
 
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.Executors
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.Try
@@ -83,14 +82,6 @@ object Host:
   /** Longest wait between load retries of a store whose device is out of space */
   val SpaceRetryCap: Duration = Duration(5, MINUTES)
 
-  /** Host-wide pool for FSIF opens and creates (recovery reads and fsyncs whole stores): cached daemon threads
-   *  named fsif-open-N */
-  private[server] lazy val FsifOpenEc: ExecutionContext =
-    val counter = new java.util.concurrent.atomic.AtomicInteger(0)
-    ExecutionContext.fromExecutorService(Executors.newCachedThreadPool: r =>
-      val t = new Thread(r, s"fsif-open-${counter.getAndIncrement()}")
-      t.setDaemon(true)
-      t)
   private[server] case class Exit() extends Event
   private[server] case class RecoveryEvent() extends Event
   private[server] case class HeartbeatEvent() extends Event
@@ -222,6 +213,29 @@ object Host:
 
   type LocalStorageDeviceState = org.aspen_ddp.aspen.server.host.LocalStorageDeviceState
 
+  /** Replacements for what Host would otherwise do itself, injected by tests. `None` is the production
+   *  implementation. A `Some` is passed straight to DeviceControl in place of Host's own adapter.
+   *
+   *  Beyond the fields the design names, `wrapMetadata`, `loadStore`, `tryLoadStore` and `loadStoreById` exist
+   *  because a recording seam must stand in front of the real thing, which a test cannot build before the Host
+   *  exists: `wrapMetadata` receives the metadata Host would have used (so adoption during the Host's own
+   *  constructor scan is still seen), and the others replace the DeviceControl callbacks of the same name.
+   *  `warn` also receives the directory, as DeviceControl's callback does. */
+  final case class Seams(metadata: Option[DeviceMetadata] = None,
+                         wrapMetadata: Option[DeviceMetadata => DeviceMetadata] = None,
+                         scheduler: Option[ControlScheduler] = None,
+                         backends: Option[BackendOpener] = None,
+                         warn: Option[(os.Path, String) => Unit] = None,
+                         closeForTransferOut: Option[StoreId => Future[Unit]] = None,
+                         closeForShutdown: Option[StoreId => Future[Unit]] = None,
+                         gossipStoreOnline: Option[StoreId => Unit] = None,
+                         loadStore: Option[(StorageDeviceId, Backend, Option[Long]) => Future[Unit]] = None,
+                         tryLoadStore: Option[(LocalStorageDeviceState, os.Path, Option[() => Unit]) => Unit] = None,
+                         loadStoreById: Option[(StorageDeviceId, StoreId) => Unit] = None)
+
+  object Seams:
+    val default: Seams = Seams()
+
   /** How long after a transfer out begins, or is found still sending, its source device is
    *  checked again. See scheduleDeviceRecheck. */
   val TransferOutRecheckDelay: Duration = Duration(10, SECONDS)
@@ -256,7 +270,9 @@ class Host(val client: AspenClient,
                    /** How long a device shutdown waits for the work it cancelled -- rebuilds,
                     *  transfer-in pool updates already in flight -- to stop before it closes the
                     *  device's stores anyway. See awaitShutdownWork. */
-                   val shutdownWorkTimeout: Duration = Duration(60, SECONDS)) extends Logging with RepairTarget {
+                   val shutdownWorkTimeout: Duration = Duration(60, SECONDS),
+                   /** What tests replace. See Host.Seams. */
+                   seams: Host.Seams = Host.Seams.default) extends Logging with RepairTarget {
   import Host._
 
   private val ioHandler = new IOHandler(this)
@@ -270,8 +286,11 @@ class Host(val client: AspenClient,
   // Lazy: it takes the DeviceControl below, whose control context its callbacks run on.
   private lazy val clientMetadata = new ClientDeviceMetadata(deviceControl)
 
-  private val deviceControl = new DeviceControl(
-    metadata = new DeviceMetadata:
+  // A delay expires on a BackgroundTaskManager thread; its function is posted to the control thread.
+  private val controlScheduler: ControlScheduler = seams.scheduler.getOrElse(
+    new BackgroundControlScheduler(backgroundTasks, fn => threading.controlEvents.execute(() => fn())))
+
+  private val hostMetadata: DeviceMetadata = seams.metadata.getOrElse(new DeviceMetadata:
       override def updateStateForTransferredStore(storeId: StoreId, fromDeviceId: StorageDeviceId,
                                                   toDeviceid: StorageDeviceId,
                                                   gossipRetransmitter: GossipRetransmitter) =
@@ -291,18 +310,18 @@ class Host(val client: AspenClient,
       override def readTransferSourceState(fromDeviceId: StorageDeviceId) =
         Host.this.readTransferSourceState(fromDeviceId)
       override def completeDeviceShutdown(storageDeviceId: StorageDeviceId) =
-        Host.this.completeDeviceShutdown(storageDeviceId)
-    ,
-    // A delay expires on a BackgroundTaskManager thread; its function is posted to the control thread.
-    scheduler = new BackgroundControlScheduler(backgroundTasks, fn => threading.controlEvents.execute(() => fn())),
+        Host.this.completeDeviceShutdown(storageDeviceId))
+
+  private val deviceControl = new DeviceControl(
+    metadata = seams.wrapMetadata.fold(hostMetadata)(wrap => wrap(hostMetadata)),
+    scheduler = controlScheduler,
     // The real FSIF open and thread pool, with the two seams below redirected to this Host's protected methods so
     // that test subclasses that override them still take effect.
-    backends = new DefaultBackendOpener(ec):
+    backends = seams.backends.getOrElse(new DefaultBackendOpener(ec):
       override def openFsifBackend(storeId: StoreId, storePath: os.Path, layout: FsifLayout,
                                    onFatal: Throwable => Unit) =
         Host.this.openFsifBackend(storeId, storePath, layout, onFatal)
-      override def fsifOpenEc = Host.this.fsifOpenEc
-    ,
+      override def fsifOpenEc = Host.this.fsifOpenEc),
     devices = localDevices,
     client = client,
     hostId = hostId,
@@ -322,15 +341,16 @@ class Host(val client: AspenClient,
     deviceScanPeriod = deviceScanPeriod,
     storeRebuildFactory = storeRebuildFactory,
     maxConcurrentRebuilds = maxConcurrentRebuilds,
-    loadStore = (deviceId, backend, maxSliceSize) => Host.this.loadStore(deviceId, backend, maxSliceSize),
-    tryLoadStore = (sds, path, onServed) => Host.this.tryLoadStore(sds, path, onServed),
-    loadStoreById = (deviceId, storeId) => Host.this.loadStoreById(deviceId, storeId),
-    warn = (path, msg) => Host.this.logDeviceDirWarning(path, msg),
+    loadStore = seams.loadStore.getOrElse(
+      (deviceId, backend, maxSliceSize) => Host.this.loadStore(deviceId, backend, maxSliceSize)),
+    tryLoadStore = seams.tryLoadStore.getOrElse((sds, path, onServed) => Host.this.tryLoadStore(sds, path, onServed)),
+    loadStoreById = seams.loadStoreById.getOrElse((deviceId, storeId) => Host.this.loadStoreById(deviceId, storeId)),
+    warn = seams.warn.getOrElse((path, msg) => Host.this.logDeviceDirWarning(path, msg)),
     storeTransferService = storeTransferService,
     shutdownWorkTimeout = shutdownWorkTimeout,
-    gossipStoreOnline = storeId => Host.this.gossipStoreOnline(storeId),
-    closeStoreForTransferOut = storeId => Host.this.closeStoreForTransferOut(storeId),
-    closeStoreForShutdown = storeId => Host.this.closeStoreForShutdown(storeId),
+    gossipStoreOnline = seams.gossipStoreOnline.getOrElse(storeId => Host.this.gossipStoreOnline(storeId)),
+    closeStoreForTransferOut = seams.closeForTransferOut.getOrElse(storeId => Host.this.closeStoreForTransferOut(storeId)),
+    closeStoreForShutdown = seams.closeForShutdown.getOrElse(storeId => Host.this.closeStoreForShutdown(storeId)),
     scheduleShutdownWorkTimeout = (deviceId, fn) => Host.this.scheduleShutdownWorkTimeout(deviceId)(fn()),
     scheduleEndpointRetry = fn => Host.this.scheduleEndpointRetry(fn()),
     ec = ec)
@@ -414,7 +434,7 @@ class Host(val client: AspenClient,
     deviceControl.loader.tryLoadStore(sds, potentialStoreFile, onServed)
 
   /** Where FSIF stores are opened (recovered) and created, off the event thread. protected as a test seam. */
-  protected def fsifOpenEc: ExecutionContext = Host.FsifOpenEc
+  protected def fsifOpenEc: ExecutionContext = DefaultBackendOpener.FsifOpenEc
 
   /** Opens an existing FSIF store (FsifBackend.open: a directory without the marker is initialized only if its
    *  files are blank, otherwise recovered). protected as a test seam: a subclass can fail the open or keep
@@ -471,7 +491,7 @@ class Host(val client: AspenClient,
 
   /** Test seam: runs a failed reconcileEndpoint attempt's retry after the retry delay. */
   protected def scheduleEndpointRetry(fn: => Unit): Unit =
-    backgroundTasks.schedule(Duration(5, SECONDS))(threading.controlEvents.execute(() => fn))
+    controlScheduler.schedule(Duration(5, SECONDS))(fn)
 
   private def discardStoreDirectory(storeId: StoreId,
                                     deviceId: StorageDeviceId,
@@ -532,7 +552,7 @@ class Host(val client: AspenClient,
   /** Runs `fn` after shutdownWorkTimeout. A seam so a test can fire the timeout itself, since the
    *  test hosts' BackgroundTaskManager never fires anything. */
   protected def scheduleShutdownWorkTimeout(storageDeviceId: StorageDeviceId)(fn: => Unit): Unit =
-    backgroundTasks.schedule(shutdownWorkTimeout)(threading.controlEvents.execute(() => fn))
+    controlScheduler.schedule(shutdownWorkTimeout)(fn)
 
   /** The last step of a shutdown: one transaction on the device state that either commits
    *  Shutdown or explains why it did not. See ClientDeviceMetadata.completeDeviceShutdown.
@@ -680,6 +700,9 @@ class Host(val client: AspenClient,
                                                                fromDeviceId: StorageDeviceId,
                                                                toDeviceId: StorageDeviceId): Future[TransferOutcome] =
     updateStateForTransferredStore(storeId, fromDeviceId, toDeviceId)
+
+  /** The components, for tests. */
+  private[aspen] def control: DeviceControl = deviceControl
 
   /** Testing hook: the stores with a transfer in under way, including one waiting out its retry delay. */
   private[aspen] def testingOnlyTransferringIn: Set[StoreId] =

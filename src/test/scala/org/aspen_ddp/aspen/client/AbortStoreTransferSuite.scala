@@ -86,7 +86,8 @@ class AbortStoreTransferSuite extends IntegrationTestSuite:
       _ <- waitForTransactionsToComplete()
       _ <- client.transferStore(storeId, net.secondDeviceId)
       _ <- waitForTransactionsToComplete()
-      _ <- net.smgr.testingOnlyUpdateStateForTransferredStore(storeId, sourceId, net.secondDeviceId)
+      _ <- net.smgr.control.metadata.updateStateForTransferredStore(storeId, sourceId, net.secondDeviceId,
+                                                                  net.smgr.gossipRetransmitter)
       _ <- waitForTransactionsToComplete()
       srcBefore <- client.getStorageDeviceState(sourceId)
       dstBefore <- client.getStorageDeviceState(net.secondDeviceId)

@@ -1,12 +1,13 @@
 package org.aspen_ddp.aspen.server.host
 
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.StoreConfig
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.ExecutionContext
 
 trait BackendOpener:
@@ -36,4 +37,14 @@ class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
                       onFatal: Throwable => Unit): Backend =
     FsifBackend.open(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
 
-  override def fsifOpenEc: ExecutionContext = Host.FsifOpenEc
+  override def fsifOpenEc: ExecutionContext = DefaultBackendOpener.FsifOpenEc
+
+object DefaultBackendOpener:
+  /** Host-wide pool for FSIF opens and creates (recovery reads and fsyncs whole stores): cached daemon threads
+   *  named fsif-open-N */
+  private[aspen] lazy val FsifOpenEc: ExecutionContext =
+    val counter = new AtomicInteger(0)
+    ExecutionContext.fromExecutorService(Executors.newCachedThreadPool: r =>
+      val t = new Thread(r, s"fsif-open-${counter.getAndIncrement()}")
+      t.setDaemon(true)
+      t)

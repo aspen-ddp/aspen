@@ -140,7 +140,7 @@ rethrows, best effort, so the retry finds a blank directory (2.13).
   not every store's serial work. Tests pass one deterministic EC for both.
 - **ENOSPC retries** are scheduled on `SharedRetryScheduler` (one `fsif-retry` thread).
 - **Recovery runs synchronously in the constructor.** The host therefore runs the open or create on
-  `Host.FsifOpenEc` (cached `fsif-open-N` threads), never on its event thread (`Host.startFsifOpen`).
+  `DefaultBackendOpener.FsifOpenEc` (cached `fsif-open-N` threads), never on its event thread (`Host.startFsifOpen`).
 - **Exceptions to "post and return":** `rebuildWrite` writes the segment on the calling thread and uses
   `onSerialSync` (`Await`) for its bookkeeping. `rebuildFlush` blocks the calling thread as well. Compaction's
   truncate of free tail slots runs inline on the serial executor (section 5).

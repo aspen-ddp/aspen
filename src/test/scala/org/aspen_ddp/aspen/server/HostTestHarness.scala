@@ -514,7 +514,7 @@ private class RecordingHost(mgrClient: AspenClient,
         transferOutCloseGate.get.map(_.future).getOrElse(super.closeStoreForTransferOut(storeId))
 
   /** Makes the next transfer-out close fail as a ShutdownStore does when the backend failed-stop during it, after
-   *  running the given function, which leaves the store as Host.failedOnClose would. Lazy, as above. */
+   *  running the given function, which leaves the store as StoreRebuilds.failedOnClose would. Lazy, as above. */
   lazy val failNextTransferOutClose = new AtomicReference[Option[() => Unit]](None)
 
   /** Every abortLostTransfer call, in order. Lazy, as above. */

@@ -524,8 +524,8 @@ class FailedStorageDeviceSuite extends IntegrationTestSuite
       // failure mode is not a wrong answer but a never-completing future -- prepRadicleUpdate
       // looks up HostId(0,0), which is absent from the host tree, and the bare retry loop
       // re-runs it every 60 s forever.
-      _ <- withTimeout(net.smgr.testingOnlyUpdateStateForTransferredStore(
-                         storeId, sourceId, net.secondDeviceId),
+      _ <- withTimeout(net.smgr.control.metadata.updateStateForTransferredStore(
+                         storeId, sourceId, net.secondDeviceId, net.smgr.gossipRetransmitter),
                        Duration(120000, MILLISECONDS),
                        "post-transfer update against a tombstoned destination")
       _ <- waitForTransactionsToComplete()

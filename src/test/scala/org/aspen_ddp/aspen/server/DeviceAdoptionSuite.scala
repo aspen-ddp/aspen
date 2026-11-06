@@ -212,7 +212,7 @@ class DeviceAdoptionSuite extends IntegrationTestSuite with HostTestHarness:
         ("a truncated", (file, _) => os.write.over(file, "")),
         ("another store's", (file, s) =>
           CrashRecoveryLog.saveStoreState(StoreId(s.poolId, (s.poolIndex + 1).toByte), Nil, file)),
-        // As a close whose backend failed-stop leaves it (Host.failedOnClose): marked, no CRL file, no
+        // As a close whose backend failed-stop leaves it (StoreRebuilds.failedOnClose): marked, no CRL file, no
         // transfer-out marker
         ("a failed-on-close store's", (file, _) =>
           os.remove(file)

@@ -9,16 +9,12 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.*
 
-/** The bootstrap host of the TestNetwork runs on a StoreThreadPool: its stores run on their own store threads, and
- *  its control work on its control thread, rather than in lockstep with the test. The pool rebalances every 20 ms
- *  with no imbalance allowance, so stores keep moving between the three threads while transactions run. Assertions
+/** The bootstrap host of the TestNetwork runs on a StoreThreadPool, the default fixed one: its stores run on their
+ *  own store threads, and its control work on its control thread, rather than in lockstep with the test. Assertions
  *  are on outcomes only. */
 class ThreadedHostSuite extends IntegrationTestSuite:
 
-  override def testThreading: ExecutionContext => HostThreading = _ =>
-    new StoreThreadPool(maxThreads = 3, minThreads = 3,
-      config = StoreBalancer.Config(window = 200.millis, imbalance = 0.0, settle = 100.millis),
-      checkPeriod = Some(20.millis))
+  override def testThreading: ExecutionContext => HostThreading = _ => new StoreThreadPool(maxThreads = 3)
 
   override def subFixtureTeardown(): Unit = net.smgr.threading.shutdown()
 
@@ -59,3 +55,11 @@ class ThreadedHostSuite extends IntegrationTestSuite:
       net.smgr.threading.asInstanceOf[StoreThreadPool].threadCount should be(3)
       states.map(_.data.getByteArray.toList) should be(
         (0 until Objects).toList.map(obj => content(obj, WritesPerObject).getByteArray.toList))
+
+/** ThreadedHostSuite on an adaptive pool that checks every 20 ms over a 200 ms window: it packs the stores the first
+ *  three spread over three threads while transactions run, moving them between threads. */
+class AdaptiveThreadedHostSuite extends ThreadedHostSuite:
+  override def testThreading: ExecutionContext => HostThreading = _ =>
+    new StoreThreadPool(maxThreads = 3, Some(StoreThreadPool.Adaptive(minThreads = 3,
+      config = StoreBalancer.Config(window = 200.millis, settle = 100.millis),
+      checkPeriod = Some(20.millis))))

@@ -95,47 +95,13 @@ Then update the "Store commit delay" entry in `Todo.txt` from the report. Includ
 (FsifBackend)" and "fsif commit", the per-thread CPU, and fio's summary. If "store commit (FsifBackend)" does not
 improve, also add the busiest threads and where they spend their time as the next investigation.
 
-## Next run: the adaptive pool
+## Status
 
-The `before`, `after`, `after-4t` and `after-2t` captures in `results/` stay as they are. This run adds one build,
-`after-adaptive`: the `host-refactor` host with no `--store-threads`, so it runs the adaptive pool. The pool starts
-with one store thread and adds more under load, so a run that starts cold measures its ramp-up as well. This run
-warms the pool up first and captures only after it has stopped changing. That makes it comparable with the
-fixed-thread runs, whose threads existed from startup.
-
-1. Compile this checkout (`./aspen` does not compile by itself), then start the newly created host from it, without
-   `--store-threads`:
-
-       sbt compile
-       ./aspen host <host-directory>
-
-2. Run `scripts/vdisk-e2e/setup.sh` as usual. Its `smoke.fio` load (both jobs, 60 s each) is the first warm-up.
-   The host logs each change to the pool. To see what the load did:
-
-       log=<host-directory>/logs/host.log
-       grep -E 'Added store thread|Moved store' "$log"
-
-3. Warm up randrw until the pool stops changing. Run the job uncaptured and look for changes made during it:
-
-       offset=$(stat -c %s "$log")
-       sudo fio scripts/vdisk-e2e/smoke.fio --directory=/mnt/vd1 --section=randrw-verify
-       tail -c +$((offset + 1)) "$log" | grep -E 'Added store thread|Moved store'
-
-   Repeat until the `grep` prints nothing. Then capture straight away, before any other load:
-
-       scripts/host-threading/capture-job.sh results after-adaptive randrw-verify /mnt/vd1
-
-4. Do the same for seqwrite. Its load is spread differently, so the pool may move stores again, although it should
-   not need more threads: repeat the step 3 commands with `--section=seqwrite` until nothing is printed, then:
-
-       scripts/host-threading/capture-job.sh results after-adaptive seqwrite /mnt/vd1
-
-5. Analyse all the captures together:
-
-       scripts/host-threading/analyze.py results
-
-   In each job's summary, the `after-adaptive` row's "pool changes in window" should read `+0 threads, 0 moves`, and
-   the report then has no warning saying the pool changed. If it did change, the measurement includes ramp-up. Move
-   that job's capture aside (`results/after-adaptive/<section>`), warm up again and recapture it. "In use" shows how
-   many store threads the pool settled on. Compare its row with `after-2t` and `after-4t`, and especially the CPU per
-   store commit.
+The measurements are summarised under "Store commit delay" and "Adaptive store threading" in `Todo.txt`. The
+default is now a fixed pool of min(4, CPUs/4) store threads, stores spread over them by count; `--store-threads=<n>`
+sets the count. The adaptive policy (`StoreThreadPool.Adaptive`) is parked and can only be chosen in code: to measure
+it again, pass `adaptive = Some(StoreThreadPool.Adaptive())` where `Main.startHost` builds the pool. It packs stores
+onto threads by load and adds threads only when work waits for them. Warm the pool up before capturing, as its runs
+in `results/` (`after-adaptive`, `after-packed`) did: run each job uncaptured until the host log shows no
+"Added store thread" or "Moved store" lines during it, then capture straight away. Any idle time in between lets
+it repack.

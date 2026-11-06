@@ -364,13 +364,15 @@ def timing_section(builds, runs):
 
 
 def host_cpu(run):
-    """The host's total CPU seconds per 10 s, averaged over the dump intervals, and the store threads in use."""
+    """The host's total CPU seconds per 10 s, averaged over the dump intervals, and the store threads in use: those
+    that used at least MIN_OTHER_CPU, as a pool keeps threads it no longer gives stores to, parked."""
     dumps = run.get("dumps") or []
     if len(dumps) < 2:
         return None, None
     rates = thread_cpu(dumps)
     total = sum(sum(r) / len(r) for r in rates.values())
-    stores = sum(1 for k in rates if re.match(r"aspen-store-\d+$", k[0]))
+    stores = sum(1 for k, r in rates.items()
+                 if re.match(r"aspen-store-\d+$", k[0]) and sum(r) / len(r) >= MIN_OTHER_CPU)
     return total, stores
 
 
@@ -536,8 +538,8 @@ def main():
                      f"`{meta.get('checkout', '?')}`"])
     out += table(["build", "store threads", "in use", "commit", "checkout"], rows) + [""]
     out += ["\"store threads\" is the host's --store-threads, and \"default\" that build's own default: one per CPU "
-            "before the adaptive pool, and since then one thread at first, growing with load up to a quarter of the "
-            "CPUs. \"in use\" is the most store threads in its thread dumps. A build without store threads (before "
+            "until commit 192e4c9e; then an adaptive pool (one thread at first, growing with load up to a quarter of "
+            "the CPUs) in after-adaptive and after-packed; since then a fixed min(4, CPUs/4). \"in use\" is the most store threads that used CPU between its thread dumps. A build without store threads (before "
             "the refactor) runs every store on one event thread.", ""]
 
     for s in SECTIONS:

@@ -19,8 +19,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  after `scheduled` is cleared), so the store is never on two threads at once. The handover's happens-before edge is
  *  the `scheduled` flag together with the task queue, as for any two consecutive drains.
  *
- *  `busyNanos` is the total time spent running the store's tasks, measured with `nanoClock`; StoreThreadPool turns
- *  it into the store's load. It is written only by the running drain (drains never overlap) and read by the pool. */
+ *  The pool measures the store with `nanoClock`: `busyNanos` is the total time spent running its tasks, and
+ *  `waitNanos` the total time its drains waited on their thread, from being queued to starting, over `drains`
+ *  drains. A drain's wait is time lost to the thread's other work; time a task waits behind the store's own earlier
+ *  tasks is not counted, as no other thread could have run it sooner. The counters are written only by the running
+ *  drain (drains never overlap) and read by the pool. */
 final class StoreMailbox(val storeId: StoreId, initial: SerialLoop, batch: Int, nanoClock: () => Long)
   extends StoreExecutor with Logging:
 
@@ -29,10 +32,23 @@ final class StoreMailbox(val storeId: StoreId, initial: SerialLoop, batch: Int, 
   private val queue = new ConcurrentLinkedQueue[Runnable]()
   private val scheduled = new AtomicBoolean(false)
   @volatile private var loop: SerialLoop = initial
+  /** When the queued drain was queued. Written before the drain is queued, so the drain sees it. */
+  @volatile private var queuedAt = 0L
   @volatile private var busy = 0L
+  @volatile private var waited = 0L
+  @volatile private var drainCount = 0L
 
   /** Total time spent running this store's tasks. */
   def busyNanos: Long = busy
+
+  /** Total time this store's drains waited for their thread. */
+  def waitNanos: Long = waited
+
+  /** Drains run so far. */
+  def drains: Long = drainCount
+
+  /** No drain is queued or running: every drain so far has finished, counters included. Testing hook. */
+  private[host] def isIdle: Boolean = !scheduled.get
 
   /** The thread loop the next drain is queued on. */
   private[host] def currentLoop: SerialLoop = loop
@@ -50,10 +66,13 @@ final class StoreMailbox(val storeId: StoreId, initial: SerialLoop, batch: Int, 
 
   private def schedule(): Unit =
     if scheduled.compareAndSet(false, true) then
+      queuedAt = nanoClock()
       loop.execute(drain)
 
   private val drain: Runnable = () =>
     val start = nanoClock()
+    waited += start - queuedAt
+    drainCount += 1
     var ran = 0
     var task = queue.poll()
     while task ne null do

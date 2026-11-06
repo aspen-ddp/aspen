@@ -230,12 +230,14 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - `HostThreading` (`server.host`) decides where a host's work runs. It is a `Host` constructor parameter, chosen in
   code. The default strategy, which `Main` passes, is `StoreThreadPool`: each store's executor is its own
   `StoreMailbox` (a FIFO with at most one drain at a time, so the store's tasks never overlap and keep their order),
-  scheduled onto one of the `aspen-store-N` daemon threads. The pool starts with one thread and adds one (up to
-  `aspen host --store-threads`, default a quarter of the CPUs) when the average thread load, measured from mailbox busy
-  time, stays above 70%; it never removes one. New stores go to the least loaded thread, and a once-a-second check on
-  the control thread moves stores off a much busier thread (`StoreBalancer`). A move only changes where the mailbox's
-  next drain is queued. Fewer busy threads beat many idle ones: waking a parked thread for each task multiplied CPU per
-  operation (docs/host-threading-measurement.md). Everything touching a
+  scheduled onto one of the `aspen-store-N` daemon threads. By default the pool is fixed: up to
+  `aspen host --store-threads` threads (default a quarter of the CPUs, at most 4), created lazily, each new store on
+  the thread with the fewest stores; stores never move. Fewer busy threads beat many idle ones: waking a parked thread
+  for each task multiplied CPU per operation, and fixed pools of 2 to 4 threads beat one per CPU and both adaptive
+  policies tried (docs/host-threading-measurement.md). `StoreThreadPool.Adaptive` (code only, parked until revisited)
+  runs `StoreBalancer` instead: it packs stores by load, grows on drain-wait congestion and moves stores between threads;
+  a move only changes where the mailbox's next drain is queued. Its known problems are in `StoreThreadPool`'s scaladoc
+  and `Todo.txt`. Everything touching a
   `Store`, `Frontend` or `Tx` runs there, so they take no locks. The exception is `Store.transactionDrivers`, a
   `@volatile` immutable Map so `hasTransactions`/`logTransactionStatus` may read it from any thread;
   `TransactionDriver`s keep their own locks for their timer threads
@@ -260,8 +262,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run
   inline, and the control context is the suite's serial `ec`, so integration suites keep their exact ordering.
-  `ThreadedHostSuite` runs the TestNetwork's host on a `StoreThreadPool` rebalancing every 20 ms, so stores move
-  between threads mid-test (`IntegrationTestSuite.testThreading`)
+  `ThreadedHostSuite` runs the TestNetwork's host on a fixed `StoreThreadPool` (`IntegrationTestSuite.testThreading`),
+  and `AdaptiveThreadedHostSuite` on an adaptive one that moves stores between threads mid-test
 
 ### Host and StorageDevice Management
 - Most administration is done by reading and writing host and device objects containing the desired state

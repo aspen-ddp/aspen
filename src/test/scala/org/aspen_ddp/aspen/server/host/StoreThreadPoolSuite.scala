@@ -25,8 +25,15 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
     def apply(): Long = nanos.get
     def advance(d: FiniteDuration): Unit = nanos.addAndGet(d.toNanos)
 
+  /** The default: a fixed pool. */
+  private def withFixedPool(threads: Int)(f: StoreThreadPool => Unit): Unit =
+    val t = new StoreThreadPool(threads)
+    t.start()
+    try f(t) finally t.shutdown()
+
+  /** An adaptive pool whose checks never run. */
   private def withPool(maxThreads: Int, minThreads: Int = 1)(f: StoreThreadPool => Unit): Unit =
-    val t = new StoreThreadPool(maxThreads, minThreads, checkPeriod = None)
+    val t = new StoreThreadPool(maxThreads, Some(StoreThreadPool.Adaptive(minThreads, checkPeriod = None)))
     t.start()
     try f(t) finally t.shutdown()
 
@@ -35,7 +42,8 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
   private def withLoadPool(maxThreads: Int, minThreads: Int = 1, config: StoreBalancer.Config = StoreBalancer.Config())
                           (f: (StoreThreadPool, ManualClock) => Unit): Unit =
     val clock = new ManualClock
-    val t = new StoreThreadPool(maxThreads, minThreads, config, checkPeriod = None, nanoClock = () => clock())
+    val t = new StoreThreadPool(maxThreads, Some(StoreThreadPool.Adaptive(minThreads, config, checkPeriod = None)),
+      nanoClock = () => clock())
     t.start()
     try f(t, clock) finally t.shutdown()
 
@@ -58,6 +66,40 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
     clock.advance(1.second)
     t.check()
 
+  /** Makes `waiter`'s next drain wait `d` for its thread, without moving the pool's wall clock: a task of `holder`, on
+   *  the same thread, occupies it while `waiter`'s drain is queued, and advances the clock by `d` before it returns.
+   *  Once both mailboxes have counted it the clock is moved back. `holder` is also busy for `d`. */
+  private def addWait(clock: ManualClock, holder: StoreExecutor, waiter: StoreExecutor, d: FiniteDuration): Unit =
+    val h = holder.asInstanceOf[StoreMailbox]
+    val w = waiter.asInstanceOf[StoreMailbox]
+    (h.currentLoop eq w.currentLoop) should be(true)
+    val drains = w.drains
+    val busy = h.busyNanos + d.toNanos
+    val running = new CountDownLatch(1)
+    val go = new CountDownLatch(1)
+    holder.execute: () =>
+      running.countDown()
+      go.await(10, TimeUnit.SECONDS)
+      clock.advance(d)
+    running.await(10, TimeUnit.SECONDS) should be(true)
+    waiter.execute(() => ())
+    go.countDown()
+    val deadline = System.nanoTime() + 10.seconds.toNanos
+    // The waiter's drain must have finished, not just started: it reads the clock again at its end
+    while (w.drains == drains || !w.isIdle || h.busyNanos < busy) && System.nanoTime() < deadline do
+      Thread.onSpinWait()
+    w.drains should be(drains + 1)
+    w.isIdle should be(true)
+    clock.advance(-d)
+
+  /** One second in which `waiter`'s work waited 20 ms behind `holder`'s, followed by a check. */
+  private def congestedSecond(t: StoreThreadPool, clock: ManualClock, holder: StoreExecutor,
+                              waiter: StoreExecutor): Unit =
+    addWait(clock, holder, waiter, 20.millis)
+    addBusy(clock, waiter, 10.millis)
+    clock.advance(1.second)
+    t.check()
+
   private def threadName(ex: StoreExecutor): String =
     val name = new AtomicReference[String]()
     val ran = new CountDownLatch(1)
@@ -67,21 +109,52 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
     ran.await(10, TimeUnit.SECONDS) should be(true)
     name.get
 
-  test("one store thread, created at the first assign, until the load needs more"):
+  test("fixed: threads are created lazily, one per store until there are maxThreads"):
+    withFixedPool(4): t =>
+      t.threadCount should be(0)
+      t.assign(store(1), Device)
+      t.assign(store(2), Device)
+      t.threadCount should be(2)
+      for n <- 3 until 10 do t.assign(store(n), Device)
+      t.threadCount should be(4)
+      t.assignedCounts.sorted should be(Vector(2, 2, 2, 3))
+
+  test("fixed: a new store goes to the thread with the fewest stores, which a release can make an earlier one"):
+    withFixedPool(2): t =>
+      t.assign(store(1), Device)
+      val s2 = t.assign(store(2), Device).asInstanceOf[StoreMailbox]
+      t.assign(store(3), Device)
+      t.assignedCounts should be(Vector(2, 1))
+      t.release(store(1))
+      // Thread 0 lost a store: both threads now hold one, and the tie goes to thread 0
+      val s4 = t.assign(store(4), Device).asInstanceOf[StoreMailbox]
+      t.assignedCounts should be(Vector(2, 1))
+      (s4.currentLoop eq s2.currentLoop) should be(false)
+
+  test("fixed: stores never move and a check does nothing"):
+    withFixedPool(2): t =>
+      for n <- 1 to 4 do t.assign(store(n), Device)
+      val before = (1 to 4).map(n => t.threadOf(store(n)))
+      t.check()
+      (1 to 4).map(n => t.threadOf(store(n))) should be(before)
+      t.moveCount should be(0)
+
+  test("adaptive: one store thread, created at the first assign, until the load needs more"):
     withPool(4): t =>
       t.threadCount should be(0)
       for n <- 0 until 10 do t.assign(store(n), Device)
       t.threadCount should be(1)
       t.assignedCounts should be(Vector(10))
 
-  test("the first minThreads stores each get a new thread"):
+  test("adaptive: the first minThreads stores each get a new thread"):
     withPool(4, minThreads = 3): t =>
       for n <- 0 until 5 do t.assign(store(n), Device)
       t.threadCount should be(3)
-      t.assignedCounts should be(Vector(2, 2, 1))
+      // After those, packing: the lowest-index thread below target
+      t.assignedCounts should be(Vector(3, 1, 1))
 
   test("release frees the store's place"):
-    withPool(4): t =>
+    withFixedPool(4): t =>
       for _ <- 0 until 100 do
         t.assign(store(1), Device)
         t.release(store(1))
@@ -90,75 +163,101 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
       t.assign(store(1), Device)
       an[HostThreading.AlreadyAssigned] should be thrownBy t.assign(store(1), Device)
 
-  test("a new store goes to the least loaded thread"):
+  test("adaptive: a new store goes to the lowest-index thread below target"):
     withLoadPool(2, minThreads = 2): (t, clock) =>
       val s1 = t.assign(store(1), Device)
       t.assign(store(2), Device)
+      // Both threads are idle: packing fills thread 0 first
+      t.assign(store(3), Device)
+      t.threadOf(store(3)) should be(Some(0))
       second(t, clock, s1 -> 0.8)
       t.loadOf(store(1)).get should be(0.8 +- 0.001)
-      // Thread 1 holds an idle store: by count the threads tie, by load it is the only choice
-      t.assign(store(3), Device)
-      t.threadOf(store(3)) should be(Some(1))
+      t.assign(store(4), Device)
+      t.threadOf(store(4)) should be(Some(1))
 
-  test("a thread is added after growAfter overloaded checks, and stores move onto it"):
-    withLoadPool(2, config = StoreBalancer.Config(growAfter = 2)): (t, clock) =>
-      val s1 = t.assign(store(1), Device)
-      val s2 = t.assign(store(2), Device)
-      second(t, clock, s1 -> 0.5, s2 -> 0.4)
-      t.threadCount should be(1)
-      second(t, clock, s1 -> 0.5, s2 -> 0.4)
-      t.threadCount should be(2)
-      t.assignedCounts should be(Vector(1, 1))
-      t.moveCount should be(1)
-      val moved = List(store(1) -> s1, store(2) -> s2).collectFirst { case (id, ex) if t.threadOf(id).contains(1) => ex }
-      threadName(moved.get) should be("aspen-store-1")
-
-  test("overload must be sustained: a quiet check starts the count again"):
-    withLoadPool(2, config = StoreBalancer.Config(growAfter = 2)): (t, clock) =>
-      val s1 = t.assign(store(1), Device)
-      val s2 = t.assign(store(2), Device)
-      second(t, clock, s1 -> 0.5, s2 -> 0.4)
-      // Long enough idle that the window's load falls below growAbove
-      clock.advance(10.seconds)
-      t.check()
-      second(t, clock, s1 -> 0.5, s2 -> 0.4)
-      t.threadCount should be(1)
-
-  test("no thread is added beyond maxThreads or for a single store"):
-    withLoadPool(1, config = StoreBalancer.Config(growAfter = 1)): (t, clock) =>
+  test("adaptive: busy time alone never adds a thread"):
+    withLoadPool(4, config = StoreBalancer.Config(growAfter = 1)): (t, clock) =>
       val s1 = t.assign(store(1), Device)
       val s2 = t.assign(store(2), Device)
       for _ <- 0 until 3 do second(t, clock, s1 -> 0.5, s2 -> 0.45)
       t.threadCount should be(1)
-    withLoadPool(4, config = StoreBalancer.Config(growAfter = 1)): (t, clock) =>
+
+  test("adaptive: drain wait is measured from a drain being queued to it starting"):
+    withLoadPool(1): (t, clock) =>
       val s1 = t.assign(store(1), Device)
-      for _ <- 0 until 3 do second(t, clock, s1 -> 0.95)
+      val s2 = t.assign(store(2), Device)
+      addWait(clock, s1, s2, 20.millis)
+      val m2 = s2.asInstanceOf[StoreMailbox]
+      m2.waitNanos should be(20.millis.toNanos)
+      m2.drains should be(1)
+      s1.asInstanceOf[StoreMailbox].waitNanos should be(0)
+
+  test("adaptive: a thread is added after growAfter congested checks, and the congested thread's stores move onto it"):
+    withLoadPool(2, config = StoreBalancer.Config(growAfter = 2, growWait = 1.millis)): (t, clock) =>
+      val s1 = t.assign(store(1), Device)
+      val s2 = t.assign(store(2), Device)
+      congestedSecond(t, clock, s1, s2)
+      t.waitOf(0).get should be > 1.millis.toNanos.toDouble
+      t.threadCount should be(1)
+      congestedSecond(t, clock, s1, s2)
+      t.threadCount should be(2)
+      t.assignedCounts should be(Vector(1, 1))
+      t.moveCount should be(1)
+      // The busier store moved: its share of the holding task's time makes it s1
+      t.threadOf(store(1)) should be(Some(1))
+      threadName(s1) should be("aspen-store-1")
+
+  test("adaptive: congestion must be sustained: a quiet check starts the count again"):
+    withLoadPool(2, config = StoreBalancer.Config(growAfter = 2)): (t, clock) =>
+      val s1 = t.assign(store(1), Device)
+      val s2 = t.assign(store(2), Device)
+      congestedSecond(t, clock, s1, s2)
+      // Long enough idle that the window holds no drains
+      clock.advance(10.seconds)
+      t.check()
+      congestedSecond(t, clock, s1, s2)
       t.threadCount should be(1)
 
-  test("stores move off a thread that is more than imbalance busier, and a moved store settles"):
-    val config = StoreBalancer.Config(imbalance = 0.3, settle = 10.seconds)
+  test("adaptive: no thread is added beyond maxThreads"):
+    withLoadPool(1, config = StoreBalancer.Config(growAfter = 1)): (t, clock) =>
+      val s1 = t.assign(store(1), Device)
+      val s2 = t.assign(store(2), Device)
+      for _ <- 0 until 3 do congestedSecond(t, clock, s1, s2)
+      t.threadCount should be(1)
+
+  test("adaptive: light load gathers onto the lowest threads, and threads left without stores are kept"):
+    withLoadPool(3, minThreads = 3): (t, clock) =>
+      val s1 = t.assign(store(1), Device)
+      val s2 = t.assign(store(2), Device)
+      val s3 = t.assign(store(3), Device)
+      t.assignedCounts should be(Vector(1, 1, 1))
+      second(t, clock, s1 -> 0.1, s2 -> 0.1, s3 -> 0.1)
+      t.assignedCounts should be(Vector(3, 0, 0))
+      t.moveCount should be(2)
+      t.threadCount should be(3)
+      threadName(s3) should be("aspen-store-0")
+
+  test("adaptive: a store over target moves to a busy thread with room, and a moved store settles before moving again"):
+    // A one-second window, so each check sees only the second before it
+    val config = StoreBalancer.Config(window = 1.second, settle = 10.seconds)
     withLoadPool(2, minThreads = 2, config): (t, clock) =>
       val s1 = t.assign(store(1), Device) // thread 0
       val s2 = t.assign(store(2), Device) // thread 1
-      val s3 = t.assign(store(3), Device) // thread 0: both idle with one store, so the lowest index
-      t.threadOf(store(3)) should be(Some(0))
-      second(t, clock, s1 -> 0.3, s3 -> 0.3)
+      val s3 = t.assign(store(3), Device) // thread 0, the lowest below target
+      // Thread 0 at 0.8: s1 fits on thread 1 (0.55)
+      second(t, clock, s1 -> 0.5, s3 -> 0.3, s2 -> 0.05)
       t.moveCount should be(1)
-      t.assignedCounts should be(Vector(1, 2))
-      // Thread 1 now holds the moved store and s2. Make it more than imbalance busier (0.8 against 0.25), with s2 too
-      // busy to help (moving it would make thread 0 the busier) and the moved store the one that would: it has not
-      // settled, so nothing moves
-      val movedEx = if t.threadOf(store(1)).contains(1) then s1 else s3
-      val stayedEx = if movedEx eq s1 then s3 else s1
-      for _ <- 0 until 5 do second(t, clock, movedEx -> 0.2, stayedEx -> 0.25, s2 -> 0.6)
-      t.moveCount should be(1)
-      // Once settled (10 s after its move) it moves back
-      for _ <- 0 until 6 do second(t, clock, movedEx -> 0.2, stayedEx -> 0.25, s2 -> 0.6)
+      t.threadOf(store(1)) should be(Some(1))
+      // Now light: thread 1's stores gather onto thread 0, but s1 only once it has settled, 10 s after its move
+      for _ <- 0 until 9 do second(t, clock, s1 -> 0.05, s3 -> 0.05, s2 -> 0.05)
       t.moveCount should be(2)
-      t.assignedCounts should be(Vector(2, 1))
+      t.threadOf(store(1)) should be(Some(1))
+      second(t, clock, s1 -> 0.05, s3 -> 0.05, s2 -> 0.05)
+      t.moveCount should be(3)
+      t.assignedCounts should be(Vector(3, 0))
 
   test("store threads are daemon threads named aspen-store-N"):
-    withPool(4): t =>
+    withFixedPool(4): t =>
       val seen = new AtomicReference[(String, Boolean)]()
       val ran = new CountDownLatch(1)
       t.assign(store(1), Device).execute: () =>
@@ -171,7 +270,7 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
     val Stores = 16
     val Posters = 8
     val TasksPerPoster = 4000
-    withPool(4, minThreads = 4): t =>
+    withFixedPool(4): t =>
       val executors = (0 until Stores).map(n => t.assign(store(n), Device).asInstanceOf[StoreMailbox])
       val loops = executors.map(_.currentLoop).distinct
       loops.size should be(4)
@@ -215,7 +314,8 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
       records.map(_.size).sum should be(Posters * TasksPerPoster)
 
   test("a store runs at most batch tasks before its thread runs another store's"):
-    val t = new StoreThreadPool(1, config = StoreBalancer.Config(batch = 2), checkPeriod = None)
+    val t = new StoreThreadPool(1,
+      Some(StoreThreadPool.Adaptive(config = StoreBalancer.Config(batch = 2), checkPeriod = None)))
     t.start()
     try
       val a = t.assign(store(1), Device)
@@ -234,37 +334,38 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
     finally t.shutdown()
 
   test("a throwing task does not kill its store thread"):
-    withPool(1): t =>
+    withFixedPool(1): t =>
       val ex = t.assign(store(1), Device)
       val ran = new CountDownLatch(1)
       ex.execute(() => throw new RuntimeException("expected by the test"))
       ex.execute(() => ran.countDown())
       ran.await(10, TimeUnit.SECONDS) should be(true)
 
-  test("the periodic check runs on its own once started"):
-    val config = StoreBalancer.Config(growAbove = 0.0, growAfter = 1, window = 100.millis)
-    val t = new StoreThreadPool(2, config = config, checkPeriod = Some(10.millis))
+  test("adaptive: the periodic check runs on its own once started"):
+    // Any drain wait at all is congestion, and one congested check adds a thread
+    val config = StoreBalancer.Config(growWait = Duration.Zero, growAfter = 1, window = 100.millis)
+    val t = new StoreThreadPool(2, Some(StoreThreadPool.Adaptive(config = config, checkPeriod = Some(10.millis))))
     t.start()
     try
       // On the control thread, where the checks run: the pool's bookkeeping has that single owner
-      val assigned = new AtomicReference[StoreExecutor]()
+      val assigned = new AtomicReference[(StoreExecutor, StoreExecutor)]()
       val ready = new CountDownLatch(1)
       t.controlEvents.execute: () =>
-        assigned.set(t.assign(store(1), Device))
-        t.assign(store(2), Device)
+        assigned.set((t.assign(store(1), Device), t.assign(store(2), Device)))
         ready.countDown()
       ready.await(10, TimeUnit.SECONDS) should be(true)
-      val s1 = assigned.get
-      // Any busy time at all is above a growAbove of 0
-      s1.execute(() => Thread.sleep(20))
+      val (s1, s2) = assigned.get
+      // s2's work waits behind s1's sleep, until a check sees it
       val deadline = System.nanoTime() + 10.seconds.toNanos
       while t.threadCount < 2 && System.nanoTime() < deadline do
-        Thread.sleep(5)
+        s1.execute(() => Thread.sleep(5))
+        s2.execute(() => ())
+        Thread.sleep(10)
       t.threadCount should be(2)
     finally t.shutdown()
 
   test("assign after shutdown leaves no live store thread and drops the store's work"):
-    val t = new StoreThreadPool(4, checkPeriod = None)
+    val t = new StoreThreadPool(4)
     t.start()
     val release = new CountDownLatch(1)
     val assigned = new CountDownLatch(1)

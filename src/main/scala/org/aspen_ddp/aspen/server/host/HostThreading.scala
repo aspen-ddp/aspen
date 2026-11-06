@@ -45,8 +45,9 @@ import scala.concurrent.ExecutionContext
  *
  *  Three implementations:
  *  - StoreThreadPool (production, `cmdline/Main.scala`): `aspen-host-control` runs device management, and each
- *    store runs through its own mailbox on one of the daemon `aspen-store-N` threads: one at first, more (up to
- *    `maxThreads`) as the stores' measured load needs them, with stores moved between threads to even out the load.
+ *    store runs through its own mailbox on one of the daemon `aspen-store-N` threads: by default a fixed pool
+ *    of up to `maxThreads` threads (a quarter of the CPUs, at most 4), stores spread over them by count; an opt-in
+ *    adaptive policy grows the pool and moves stores between threads.
  *  - SingleThreadThreading: one thread, `aspen-host-control`, runs everything posted, in posting order, as the
  *    host's event loop did.
  *  - LockstepThreading (regression tests, `TestNetwork` and every test Host): posted work waits on one FIFO until the
@@ -65,7 +66,8 @@ trait HostThreading:
    *  SingleThreadThreading: enqueues on the control thread, where stores still run. Lockstep: enqueues on the FIFO. */
   def dispatch: Executor
   /** Binds a store being loaded to an executor. Called on the control thread.
-   *  StoreThreadPool: the store's own mailbox, placed on the least loaded store thread (it may move later).
+   *  StoreThreadPool: the store's own mailbox, on the thread with the fewest stores (adaptive: the lowest-index thread
+   *  below its load target, and it may move later).
    *  SingleThreadThreading and
    *  Lockstep: runs the store's work inline on the thread that posts it. StoreThreadPool throws AlreadyAssigned,
    *  changing nothing, for a store whose earlier slot `release` has not freed yet (its close is still running). */

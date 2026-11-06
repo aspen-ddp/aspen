@@ -70,6 +70,9 @@ class Tx( trs: TransactionRecoveryState,
   private val acceptor = new Acceptor(storeId.poolIndex, trs.paxosAcceptorState)
   private var lastEvent: Long = System.nanoTime()
   private var saveObjectUpdates: Boolean = true
+
+  /** Some backend commit of this transaction failed: its CRL state, object data included, is kept */
+  private var backendCommitFailed: Boolean = false
   private var committed: Boolean = false
   private var committing: Boolean = false
   private var commitHeld: Boolean = false
@@ -417,7 +420,7 @@ class Tx( trs: TransactionRecoveryState,
       val form = UpdateForm.of(os.objectId, requirements, ou, allocating)
       val cs = CommitState(pointerOf(os.objectId), os.metadata, os.objectType, os.data, allocating, form)
 
-      frontend.commit(os, cs, transactionId)
+      frontend.commit(os, cs, transactionId, forTransaction = true)
     }
 
     // Nothing was committed, so no commit completions will arrive to trigger the notification.
@@ -428,8 +431,11 @@ class Tx( trs: TransactionRecoveryState,
 
   private def allObjectCommitsComplete(): Unit = {
     committed = true
-    saveObjectUpdates = false
-    crl.dropTransactionObjectData(storeId, transactionId)
+    // A failed backend commit keeps the object data: a reloaded store recovers the transaction from it. See
+    // Frontend.transactionFinalized
+    if !backendCommitFailed then
+      saveObjectUpdates = false
+      crl.dropTransactionObjectData(storeId, transactionId)
     val m = TxCommitted(lastProposer, storeId, transactionId, objectCommitErrors)
     net.sendTransactionMessage(m)
   }
@@ -585,8 +591,9 @@ class Tx( trs: TransactionRecoveryState,
     resolved(m.committed)
     ofinalized = Some(m.committed)
     releaseHeldCommit()
-    // Whatever the outcome: a prepare after an abort, or from a recovery driver, may have saved this Tx again
-    crl.deleteTransaction(storeId, transactionId)
+    // Whatever the outcome: a prepare after an abort, or from a recovery driver, may have saved this Tx again. Deferred
+    // while backend commits of a committed transaction are outstanding or failed
+    frontend.transactionFinalized(transactionId)
     statusCache.updateStatus(transactionId, status, finalized = true)
   }
 
@@ -605,6 +612,7 @@ class Tx( trs: TransactionRecoveryState,
       case Right(err) =>
         logger.error(s"Tx $transactionId. Store $storeId failed to commit object $objectId: $err")
         objectCommitErrors = objectId :: objectCommitErrors
+        backendCommitFailed = true
       case Left(_) =>
     pendingObjectCommits -= 1
     if (pendingObjectCommits == 0)

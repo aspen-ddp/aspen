@@ -4,7 +4,8 @@ import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.network.{TxFinalized, TxPrepare, TxResolved}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.store.StoreId
-import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, TransactionStatus}
+import org.aspen_ddp.aspen.common.DataBuffer
+import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, ObjectUpdate, TransactionStatus}
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
@@ -28,8 +29,8 @@ class StoreSuite extends AnyFunSuite with Matchers:
   private def prepare(to: StoreId, from: StoreId) =
     TxPrepare(to, from, txd, ProposalId.initialProposal(txd.designatedLeaderUID), Nil, Nil, fromClient = false)
 
-  private def mkStore(id: StoreId, statusCache: TransactionStatusCache, heartbeatTimeout: Duration) =
-    val backend = new MapBackend(id)
+  private def mkStore(id: StoreId, statusCache: TransactionStatusCache, heartbeatTimeout: Duration,
+                      backend: MapBackend = new MapBackend(storeId)) =
     val net = new TestNet
     val crl = new TestCrl
     val store = new Store(StorageDeviceId(new UUID(0, 99)), ExecutionContext.global, backend,
@@ -74,4 +75,22 @@ class StoreSuite extends AnyFunSuite with Matchers:
     store.frontend.transactions.contains(txid1) shouldBe false
     store.hasTransactions shouldBe false
     crl.txDel shouldBe true
+  }
+
+  test("a finalized transaction with an outstanding commit is not driven again") {
+    val backend = new DeferredCommitBackend
+    val (store, _, crl) = mkStore(storeId, new TransactionStatusCache(), Duration.Zero, backend)
+
+    store.receiveTransactionMessage(prepare(storeId, leader).copy(fromClient = true,
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1))))))
+    store.receiveTransactionMessage(TxResolved(storeId, leader, txid1, committed = true))
+    store.receiveTransactionMessage(TxFinalized(storeId, leader, txid1, committed = true))
+    backend.heldCommits shouldBe 1
+    crl.deleted shouldBe Nil
+
+    store.heartbeat()
+    store.hasTransactions shouldBe false
+
+    backend.deliverCommits()
+    crl.deleted shouldBe List(txid1)
   }

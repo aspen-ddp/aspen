@@ -67,7 +67,7 @@ class Frontend(val storeId: StoreId,
     * the backend reports it complete, so the state is served and checked from memory rather than read from a backend
     * that may not have it yet. `start` times the commit as the store sees it: BackendTiming
     */
-  private case class InFlight(os: ObjectState, start: Long, deletes: Boolean)
+  private case class InFlight(os: ObjectState, start: Long, deletes: Boolean, forTransaction: Boolean)
   private val inFlight = scala.collection.mutable.HashMap[(ObjectId, TransactionId), List[InFlight]]()
 
   /** Outstanding backend commits deleting each object. Reads that would reach the backend get the answer it will give
@@ -75,6 +75,20 @@ class Frontend(val storeId: StoreId,
     */
   private val deleting = scala.collection.mutable.HashMap[ObjectId, Int]()
   private val commitStage = s"store commit (${backend.getClass.getSimpleName})"
+
+  /** A transaction's backend commits on this store, made through commit with `forTransaction = true`.
+    *
+    * The store deletes a committed transaction's CRL state only once every backend commit it issued for that
+    * transaction has succeeded. Until then the CRL entry, object data included, outlives the Tx, which is forgotten at
+    * finalization. A failed commit leaves the record, and so the CRL entry, for the life of the loaded store: a reloaded
+    * store recovers the transaction from it, and its transaction driver concludes it.
+    *
+    * @param outstanding commits not yet reported complete by the backend
+    * @param failed some commit failed
+    * @param finalized TxFinalized arrived while commits were outstanding: the CRL deletion waits for them
+    */
+  private final class TxCommits(var outstanding: Int, var failed: Boolean, var finalized: Boolean)
+  private val txCommits = scala.collection.mutable.HashMap[TransactionId, TxCommits]()
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
@@ -188,10 +202,34 @@ class Frontend(val storeId: StoreId,
     val lockedOther = referenced.get(os.objectId).exists(r => !(r eq os) && r.reloadRequired && r.lockHolders.nonEmpty)
     retain(os, shared = !lockedOther)
     val key = (cs.objectId, txid)
-    inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes)
+    inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes, forTransaction)
     if deletes then
       deleting(os.objectId) = deleting.getOrElse(os.objectId, 0) + 1
+    // Before the backend commit: a synchronous backend completes inside it
+    if forTransaction then
+      txCommits.getOrElseUpdate(txid, new TxCommits(0, false, false)).outstanding += 1
     backend.commit(cs, txid)
+
+  /** A transaction was finalized. Its CRL state is deleted now, unless backend commits this store issued for it are
+    * outstanding or failed: the store deletes a committed transaction's CRL state only once every backend commit it
+    * issued for that transaction has succeeded (see TxCommits). A reloaded store recovers the rest from the CRL, and its
+    * transaction driver concludes them. Aborted transactions, and those that committed nothing here, are deleted at once.
+    */
+  def transactionFinalized(txid: TransactionId): Unit =
+    txCommits.get(txid) match
+      case Some(r) => r.finalized = true
+      case None => crl.deleteTransaction(storeId, txid)
+
+  private def transactionCommitComplete(txid: TransactionId, succeeded: Boolean): Unit =
+    txCommits.get(txid).foreach { r =>
+      r.outstanding -= 1
+      if !succeeded then
+        r.failed = true
+      if r.outstanding == 0 && !r.failed then
+        txCommits.remove(txid)
+        if r.finalized then
+          crl.deleteTransaction(storeId, txid)
+    }
 
   /** Called when a transaction takes `os` for one of its objects, and by commit for the commit's duration. A state that
     * only this transaction can know, such as that of an object it allocates, is not shared with others
@@ -312,6 +350,8 @@ class Frontend(val storeId: StoreId,
         case Some(f :: rest) =>
           if rest.isEmpty then inFlight.remove(key) else inFlight(key) = rest
           BackendTiming.report.record(commitStage, System.nanoTime() - f.start)
+          if f.forTransaction then
+            transactionCommitComplete(c.transactionId, c.result.isLeft)
           c.result match
             case Left(_) =>
               release(f.os)
@@ -321,7 +361,8 @@ class Frontend(val storeId: StoreId,
             case Right(err) =>
               // The state stays pinned and served, and a deletion keeps answering ObjectNotFound, while the store is
               // loaded: the store may have voted to commit at the write threshold, so it must neither lose the
-              // committed state nor return the pre-commit one. Backlog.txt covers handling this properly
+              // committed state nor return the pre-commit one. A transaction's CRL state is kept too (see TxCommits).
+              // Backlog.txt covers handling this properly
               logger.error(s"Store $storeId: backend commit of object ${c.objectId} for transaction " +
                 s"${c.transactionId} failed: $err. Its committed state stays in memory while the store is loaded")
         case _ =>

@@ -1,6 +1,7 @@
 package org.aspen_ddp.aspen.server.store
 
 import java.util.UUID
+import java.util.concurrent.LinkedBlockingQueue
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
@@ -10,7 +11,9 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.paxos.PersistentState
 import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, KeyValueUpdate, ObjectUpdate, RefcountUpdate, SharedRevisionLock, TransactionCollision, TransactionDescription, TransactionDisposition, TransactionId, TransactionRequirement, TransactionStatus}
+import org.aspen_ddp.aspen.TempDirManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
+import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache, StoreObjectCache}
@@ -71,6 +74,8 @@ object FrontendSuite {
     var txSaved = false
     var txDel = false
     var aDrop = false
+    var deleted: List[TransactionId] = Nil
+    var dropped: List[TransactionId] = Nil
 
     override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = Nil
 
@@ -83,10 +88,47 @@ object FrontendSuite {
       txSaved = true
       completionHandler()
 
-    override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit = aDrop = true
+    override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
+      aDrop = true
+      dropped = dropped :+ txid
 
-    override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = txDel = true
+    override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit =
+      txDel = true
+      deleted = deleted :+ txid
   }
+
+  /** Holds commits until deliverCommits, applying each to the map only then, and counts backend reads */
+  class DeferredCommitBackend extends MapBackend(storeId):
+    private var handler: Option[CompletionHandler] = None
+    private var held: List[(CommitState, TransactionId)] = Nil
+    var reads: Int = 0
+
+    override def setCompletionHandler(h: CompletionHandler): Unit =
+      handler = Some(h)
+      super.setCompletionHandler(h)
+
+    override def read(pointer: ObjectPointer): Unit =
+      reads += 1
+      super.read(pointer)
+
+    override def commit(state: CommitState, transactionId: TransactionId): Unit =
+      held = held :+ (state, transactionId)
+
+    def heldCommits: Int = held.size
+
+    /** Completes the oldest held commit */
+    def deliverOne(result: Either[Unit, CommitError.Value] = Left(())): Unit =
+      val (state, txid) = held.head
+      held = held.tail
+      if result.isLeft then
+        if state.metadata.refcount.count == 0 then
+          m -= state.objectId
+        else
+          m += (state.objectId -> new ObjectState(state.objectId, state.metadata, state.objectType, state.data))
+      handler.foreach(_.complete(Commit(this.storeId, state.objectId, txid, result)))
+
+    def deliverCommits(result: Either[Unit, CommitError.Value] = Left(())): Unit =
+      while held.nonEmpty do deliverOne(result)
 
   def mkFrontend(): (Frontend, MapBackend, ObjectCache) =
     val backend = new MapBackend(storeId)
@@ -1127,44 +1169,11 @@ class FrontendSuite extends AnyFunSuite with Matchers {
 
   // ---- States stay in memory from a commit until the backend reports it complete ----
 
-  /** Holds commits until deliverCommits, applying each to the map only then, and counts backend reads */
-  class DeferredCommitBackend extends MapBackend(storeId):
-    private var handler: Option[CompletionHandler] = None
-    private var held: List[(CommitState, TransactionId)] = Nil
-    var reads: Int = 0
-
-    override def setCompletionHandler(h: CompletionHandler): Unit =
-      handler = Some(h)
-      super.setCompletionHandler(h)
-
-    override def read(pointer: ObjectPointer): Unit =
-      reads += 1
-      super.read(pointer)
-
-    override def commit(state: CommitState, transactionId: TransactionId): Unit =
-      held = held :+ (state, transactionId)
-
-    def heldCommits: Int = held.size
-
-    /** Completes the oldest held commit */
-    def deliverOne(result: Either[Unit, CommitError.Value] = Left(())): Unit =
-      val (state, txid) = held.head
-      held = held.tail
-      if result.isLeft then
-        if state.metadata.refcount.count == 0 then
-          m -= state.objectId
-        else
-          m += (state.objectId -> new ObjectState(state.objectId, state.metadata, state.objectType, state.data))
-      handler.foreach(_.complete(Commit(storeId, state.objectId, txid, result)))
-
-    def deliverCommits(result: Either[Unit, CommitError.Value] = Left(())): Unit =
-      while held.nonEmpty do deliverOne(result)
-
   val others: List[DataObjectPointer] =
     (20 to 22).toList.map(n => DataObjectPointer(ObjectId(new UUID(0, n)), poolId, Array[Byte]()))
 
   /** A Frontend over a DeferredCommitBackend, with a cache that holds two empty data objects */
-  def commitWindowFixture(cacheBytes: Long = 2 * HostObjectCache.EntryOverhead)
+  def commitWindowFixture(cacheBytes: Long = 2 * HostObjectCache.EntryOverhead, crl: CrashRecoveryLog = new TestCrl)
       : (Frontend, DeferredCommitBackend, StoreObjectCache, TestNet) =
     val backend = new DeferredCommitBackend
     populate(backend)
@@ -1173,7 +1182,7 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       backend.bootstrapAllocate(p.id, os.objectType, os.metadata, os.data)
     val cache = new HostObjectCache(cacheBytes).forStore(storeId)
     val net = new TestNet
-    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache())
+    val frontend = new Frontend(storeId, backend, cache, net, crl, new TransactionStatusCache())
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
     (frontend, backend, cache, net)
 
@@ -1345,5 +1354,115 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       case Some(rr: ReadResponse) => rr.result.toOption.get.objectData.get.getByteArray.toList shouldBe rebuilt.getByteArray.toList
       case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
     backend.reads shouldBe reads
+  }
+
+  // ---- A store keeps a committed transaction's CRL state until its backend commits succeed ----
+
+  /** Prepares txid1 overwriting op1 and resolves it committed, its backend commit held */
+  def heldCommit(crl: CrashRecoveryLog): (Frontend, DeferredCommitBackend, TestNet) =
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024, crl = crl)
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+    (frontend, backend, net)
+
+  def finalizeTx1(frontend: Frontend): Unit =
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true))
+
+  test("finalization before the backend commit completes defers the CRL deletion") {
+    val crl = new TestCrl
+    val (frontend, backend, _) = heldCommit(crl)
+    finalizeTx1(frontend)
+    crl.deleted shouldBe Nil
+    frontend.transactions.contains(txid1) shouldBe false
+
+    backend.deliverCommits()
+    crl.deleted shouldBe List(txid1)
+  }
+
+  test("a backend commit completing before finalization leaves the deletion to it") {
+    val crl = new TestCrl
+    val (frontend, backend, _) = heldCommit(crl)
+    backend.deliverCommits()
+    crl.dropped shouldBe List(txid1)
+    crl.deleted shouldBe Nil
+
+    finalizeTx1(frontend)
+    crl.deleted shouldBe List(txid1)
+  }
+
+  test("a failed backend commit keeps the transaction's CRL entry and its object data") {
+    val crl = new TestCrl
+    val (frontend, backend, net) = heldCommit(crl)
+    backend.deliverCommits(Right(CommitError.IOFailure))
+    committedMessages(net).map(_.objectCommitErrors) shouldBe List(List(oid1))
+    finalizeTx1(frontend)
+    crl.deleted shouldBe Nil
+    crl.dropped shouldBe Nil
+    frontend.transactions.contains(txid1) shouldBe false
+  }
+
+  test("a failed backend commit after finalization keeps the transaction's CRL entry") {
+    val crl = new TestCrl
+    val (frontend, backend, _) = heldCommit(crl)
+    finalizeTx1(frontend)
+    backend.deliverCommits(Right(CommitError.IOFailure))
+    crl.deleted shouldBe Nil
+    crl.dropped shouldBe Nil
+  }
+
+  /** A SimpleCRL whose saves complete before save returns, so the store answers on the test's thread */
+  class SyncCrl(val crl: SimpleCRL) extends CrashRecoveryLog:
+    override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] =
+      crl.getFullRecoveryState(storeId)
+    override def closeStore(storeId: StoreId): Future[List[TransactionRecoveryState]] = crl.closeStore(storeId)
+    override def save(txid: TransactionId, state: TransactionRecoveryState, completionHandler: () => Unit): Unit =
+      val done = new LinkedBlockingQueue[Unit]()
+      crl.save(txid, state, () => done.put(()))
+      done.take()
+      completionHandler()
+    override def dropTransactionObjectData(storeId: StoreId, txid: TransactionId): Unit =
+      crl.dropTransactionObjectData(storeId, txid)
+    override def deleteTransaction(storeId: StoreId, txid: TransactionId): Unit = crl.deleteTransaction(storeId, txid)
+
+  /** The CRL state a store closed with after txid1's backend commit failed and it was finalized */
+  def savedAfterFailedCommit(): List[TransactionRecoveryState] =
+    val tdir = new TempDirManager
+    val crl = new SyncCrl(SimpleCRL(tdir.tdir, 3, 1024 * 1024).crl)
+    try
+      val (frontend, backend, _) = heldCommit(crl)
+      backend.deliverCommits(Right(CommitError.IOFailure))
+      finalizeTx1(frontend)
+      Await.result(crl.closeStore(storeId), Duration(10, SECONDS))
+    finally
+      crl.crl.shutdown()
+      tdir.delete()
+
+  test("a failed commit's CRL entry is in the store's saved state") {
+    savedAfterFailedCommit() match
+      case trs :: Nil =>
+        TransactionDescription.deserialize(trs.serializedTxd).transactionId shouldBe txid1
+        trs.objectUpdates.map(ou => (ou.objectId, ou.data.getByteArray.toList)) shouldBe List((oid1, List[Byte](1)))
+      case other => throw new AssertionError(s"Expected txid1's entry, got $other")
+  }
+
+  test("a store loaded with such an entry recreates the transaction") {
+    val saved = savedAfterFailedCommit()
+    val backend = new MapBackend(storeId)
+    populate(backend)
+    val crl = new TestCrl:
+      override def getFullRecoveryState(storeId: StoreId): List[TransactionRecoveryState] = saved
+    val frontend = new Frontend(storeId, backend, new HostObjectCache(1024 * 1024).forStore(storeId), new TestNet, crl,
+      new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    frontend.transactions.contains(txid1) shouldBe true
+  }
+
+  test("locks are released at finalization while a commit is outstanding") {
+    val (frontend, backend, net) = heldCommit(new TestCrl)
+    finalizeTx1(frontend)
+    prepare(frontend, net, lockTxd(txid2, List(overwriteAfter(txid1)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    backend.heldCommits shouldBe 1
   }
 }

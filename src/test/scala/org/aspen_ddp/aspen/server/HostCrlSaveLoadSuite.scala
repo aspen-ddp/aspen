@@ -16,6 +16,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
+import org.aspen_ddp.aspen.server.host.LockstepThreading
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
@@ -55,7 +56,7 @@ private class CrlSaveHost(mgrClient: AspenClient,
                           messenger: ServerMessenger,
                           finalizers: TransactionFinalizer.Factory,
                           crl: CrashRecoveryLog)
-  extends Host(mgrClient, HostId.BootstrapHostId, systemId, hostRootDir, execCtx, cacheFactory, messenger,
+  extends Host(mgrClient, HostId.BootstrapHostId, systemId, hostRootDir, execCtx, new LockstepThreading(execCtx), cacheFactory, messenger,
     BackgroundTaskManager.NoBackgroundTaskManager, new CrashRecoveryLogFactory { def createCRL() = crl }, finalizers,
     TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS)):
 

@@ -7,6 +7,7 @@ import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
+import org.aspen_ddp.aspen.server.host.LockstepThreading
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionFinalizer}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -197,6 +198,7 @@ private class RecordingHost(mgrClient: AspenClient,
     systemId,
     hostRootDir,
     execCtx,
+    new LockstepThreading(execCtx),
     cacheFactory,
     messenger,
     BackgroundTaskManager.NoBackgroundTaskManager,

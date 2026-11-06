@@ -10,6 +10,7 @@ import org.aspen_ddp.aspen.common.transaction.TransactionId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
+import org.aspen_ddp.aspen.server.host.LockstepThreading
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.{CommitState, UpdateForm}
@@ -35,7 +36,7 @@ private class FsifSeamHost(mgrClient: AspenClient,
                            cacheFactory: StoreId => ObjectCache,
                            messenger: ServerMessenger,
                            finalizers: TransactionFinalizer.Factory)
-  extends Host(mgrClient, HostId.BootstrapHostId, systemId, hostRootDir, execCtx, cacheFactory, messenger,
+  extends Host(mgrClient, HostId.BootstrapHostId, systemId, hostRootDir, execCtx, new LockstepThreading(execCtx), cacheFactory, messenger,
     BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, finalizers,
     TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
     StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2):

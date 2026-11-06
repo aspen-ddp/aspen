@@ -10,6 +10,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.host.LockstepThreading
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
@@ -820,12 +821,12 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
       val hostRoot = newHostDir()
       scanPeriod match
         case None =>
-          new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+          new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
             net.objectCacheFactory, net, tasks, TestNetwork.TestCRL,
             net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
             Duration(60, SECONDS))
         case Some(p) =>
-          new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+          new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
             net.objectCacheFactory, net, tasks, TestNetwork.TestCRL,
             net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
             Duration(60, SECONDS), deviceScanPeriod = p)
@@ -1850,7 +1851,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
     os.write.over(storeDir / StoreConfig.configFilename, StoreConfig(storeId, StoreConfig.RocksDB(None), None).yamlConfig)
     os.write.over(storeDir / StoreTransfer.TransferredInMarkerFile, Array.emptyByteArray)
 
-    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+    val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
       net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
       net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
       Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)
@@ -1897,7 +1898,7 @@ class HostDeviceDiscoverySuite extends IntegrationTestSuite with HostTestHarness
 
   /** A real Host, which opens RocksDB backends and honours the markers, over `hostRoot`. */
   private def newRealHost(hostRoot: os.Path): Host =
-    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
+    new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext, new LockstepThreading(executionContext),
       net.objectCacheFactory, net, BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL,
       net.FinalizerFactory, TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS),
       Duration(60, SECONDS), StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2)

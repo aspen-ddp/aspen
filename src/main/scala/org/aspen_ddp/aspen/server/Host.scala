@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, LocalDevices}
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LockstepThreading}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
@@ -23,7 +23,7 @@ import scribe.Logging
 
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicReference
-import java.util.concurrent.{Executors, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.Executors
 import scala.concurrent.duration.*
 import scala.concurrent.{ExecutionContext, Future, Promise}
 import scala.util.Try
@@ -210,9 +210,16 @@ object Host:
      *  written. */
     case Unclean(stores: List[StoreId])
 
+  /** Hands each I/O completion to the host's threading as an IOCompletion event. */
   class IOHandler(host: Host) extends CompletionHandler:
     override def complete(op: Completion): Unit =
-      host.events.add(IOCompletion(op))
+      host.post(IOCompletion(op))
+
+  /** What Host posts to its threading: one event, handled by handleEvent. Carries the event so the test hooks can
+   *  find queued events, and names it in the log line written when its handler throws. */
+  private[server] final class EventTask(host: Host, val event: Event) extends HostThreading.Named:
+    override def run(): Unit = host.handleEvent(event)
+    override def name: String = event.getClass.getSimpleName
 
   type LocalStorageDeviceState = org.aspen_ddp.aspen.server.host.LocalStorageDeviceState
 
@@ -226,6 +233,8 @@ class Host(val client: AspenClient,
                    val aspenSystemId: UUID,
                    val rootDir: os.Path,
                    val ec: ExecutionContext,
+                   /** Where the host's events and stores run. See HostThreading. */
+                   val threading: HostThreading,
                    val objectCacheFactory: StoreId => ObjectCache,
                    val net: Messenger,
                    val backgroundTasks: BackgroundTaskManager,
@@ -252,8 +261,6 @@ class Host(val client: AspenClient,
   import Host._
   
   given ExecutionContext = ec
-
-  private val events = new LinkedBlockingQueue[Event]()
 
   private val ioHandler = new IOHandler(this)
 
@@ -309,7 +316,7 @@ class Host(val client: AspenClient,
     net = net,
     backgroundTasks = backgroundTasks,
     lock = this,
-    post = event => events.put(event),
+    post = event => Host.this.post(event),
     crl = crl,
     txStatusCache = txStatusCache,
     ioHandler = ioHandler,
@@ -332,9 +339,6 @@ class Host(val client: AspenClient,
     scheduleShutdownWorkTimeout = (deviceId, fn) => Host.this.scheduleShutdownWorkTimeout(deviceId)(fn()),
     scheduleEndpointRetry = fn => Host.this.scheduleEndpointRetry(fn()))
 
-  private val threadPool = Executors.newFixedThreadPool(1)
-
-  protected var shutdownCalled = false
   private val shutdownPromise: Promise[Unit] = Promise()
 
   val storageDevicesDir: os.Path = rootDir / StorageDeviceManager.StorageDevicesDirName
@@ -369,19 +373,19 @@ class Host(val client: AspenClient,
     transfers.retransmitPendingStarts(force)
 
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
-    events.put(HeartbeatEvent())
+    post(HeartbeatEvent())
   }
 
   private val systemTaskHeartbeatTask = backgroundTasks.schedulePeriodic(Host.SystemTaskHeartbeatPeriod) {
-    events.put(SystemTaskHeartbeatEvent())
+    post(SystemTaskHeartbeatEvent())
   }
   
   private val checkStorageDeviceTask = backgroundTasks.schedulePeriodic(checkStorageDevicePeriod) {
-    events.put(CheckAllDevices())
+    post(CheckAllDevices())
   }
 
   private val deviceScanTask = backgroundTasks.schedulePeriodic(deviceScanPeriod) {
-    events.put(ScanDevices())
+    post(ScanDevices())
   }
 
   /** Continual repair of this host's stores. Constructed here rather than after task-executor
@@ -395,8 +399,8 @@ class Host(val client: AspenClient,
   // After we've loaded all the stores, initiate an initial check of all our
   // devices in case operations were preformed while we were down and missed
   // the CheckDeviceState messages
-  events.put(CheckAllDevices())
-  events.put(InitializeTaskExecutor())
+  post(CheckAllDevices())
+  post(InitializeTaskExecutor())
 
   def getTaskExecutor(): Future[TaskExecutor] = services.getTaskExecutor()
 
@@ -423,40 +427,24 @@ class Host(val client: AspenClient,
                                 onFatal: Throwable => Unit): Backend =
     FsifBackend.open(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
 
-  def start(): Unit =
-    threadPool.submit(new Runnable {
-      override def run(): Unit =
-        while !shutdownCalled do
-          var event = events.poll(3, TimeUnit.SECONDS)
-          while (event != null)
-            try
-              handleEvent(event)
-            catch
-              case t: Throwable =>
-                // Nothing consumes the Future this Runnable was submitted with, so without
-                // this the escape would terminate the event loop with no log line at all and
-                // the host would go silently deaf while still appearing to run.
-                //
-                // Swallowing and continuing is deliberate even though Aspen is crash-only: a
-                // single poisoned event must not take down an otherwise-healthy host, and
-                // handleEvent dispatches one event at a time with no loop state carried
-                // between them.
-                //
-                // The trade is that a throw part-way through a handler leaves whatever that
-                // handler had already mutated half-updated, and LoadStore, Repair and
-                // ShutdownStore each carry a Promise completed by the handler or by work the
-                // handler starts, so that promise stays uncompleted and its awaiter hangs
-                // forever. Neither is new -- a dead loop left both too -- but a dead loop hung
-                // everything at once and so was obvious, whereas now one caller hangs inside
-                // a host that still looks healthy. This log line is the only signal that it
-                // happened.
-                //
-                // Only the event class is interpolated: this call is inside the catch, so a
-                // throwing toString on the event's payload would escape and kill the loop
-                // anyway. The stack trace below names the handler.
-                logger.error(s"Unhandled exception processing event ${event.getClass.getSimpleName}", t)
-            event = events.poll(0, TimeUnit.SECONDS)
-    })
+  /** Starts running the host's events. Until then they wait. */
+  def start(): Unit = threading.start()
+
+  /** Posts one event to the threading. Hot-path and store-side events take the dispatch hop; every other event is a
+   *  control event. */
+  private def post(event: Event): Unit =
+    val task = EventTask(this, event)
+    event match
+      case _: (TransactionMessage | ClientReq | Repair | RepairDelete | IOCompletion | HeartbeatEvent |
+               StoreCrlLoaded | UnloadFailedStore) =>
+        threading.dispatch.execute(task)
+      case _ =>
+        threading.controlEvents.execute(task)
+
+  private def lockstep: LockstepThreading = threading match
+    case t: LockstepThreading => t
+    case other => throw new IllegalStateException(
+      s"Testing hook needs LockstepThreading, not ${other.getClass.getSimpleName}")
 
   def getDevicePath(storageDeviceId: StorageDeviceId): Option[os.Path] = synchronized {
     localDevices.devicePath(storageDeviceId)
@@ -587,26 +575,26 @@ class Host(val client: AspenClient,
   /** @param maxSliceSize the store's effective slice size limit, from its StoreConfig. None means unlimited. */
   def loadStore(storageDeviceId: StorageDeviceId, backend: Backend, maxSliceSize: Option[Long]): Future[Unit] = {
     val p = Promise[Unit]()
-    events.put(LoadStore(storageDeviceId, backend, maxSliceSize, p))
+    post(LoadStore(storageDeviceId, backend, maxSliceSize, p))
     p.future
   }
 
   def loadStoreById(storageDeviceId: StorageDeviceId, storeId: StoreId): Unit =
-    events.put(LoadStoreById(storageDeviceId, storeId))
+    post(LoadStoreById(storageDeviceId, storeId))
 
   def receiveTransactionMessage(msg: TxMessage): Unit = {
-    events.put(TransactionMessage(msg))
+    post(TransactionMessage(msg))
   }
 
   def receiveClientRequest(msg: ClientRequest): Unit = {
-    events.put(ClientReq(msg))
+    post(ClientReq(msg))
   }
 
   def receiveHostMessage(msg: HostMessage): Unit =
-    events.put(HostMsg(msg))
+    post(HostMsg(msg))
 
   def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
-    events.put(Repair(storeId, os, completion))
+    post(Repair(storeId, os, completion))
 
   /** Repairs a missed deletion on the given store. Used when the object is gone from the rest
     * of the system, leaving only the ObjectId and the storePointer bytes recorded in the pool's
@@ -616,12 +604,12 @@ class Host(val client: AspenClient,
                    objectId: ObjectId,
                    storePointer: Array[Byte],
                    completion: Promise[Unit]): Unit =
-    events.put(RepairDelete(storeId, objectId, storePointer, completion))
+    post(RepairDelete(storeId, objectId, storePointer, completion))
 
   def shutdown()(using ec: ExecutionContext): Future[Unit] = {
-    events.put(Exit())
-    // Lets the event loop's thread exit once it has handled Exit; it is not a daemon thread.
-    threadPool.shutdown()
+    post(Exit())
+    // Lets the control thread exit once it has handled Exit; it is not a daemon thread.
+    threading.shutdown()
     services.shutdown()
     pendingStartTask.cancel()
     heartbeatTask.cancel()
@@ -634,27 +622,20 @@ class Host(val client: AspenClient,
   private[aspen] def closeStore(storeId: StoreId): Future[Unit] =
     deviceControl.loader.closeStore(storeId)
 
-  protected def addRecoveryEvent(): Unit = events.add(RecoveryEvent())
+  protected def addRecoveryEvent(): Unit = post(RecoveryEvent())
 
   /** Placeholder for mixin class to implement transaction recovery */
   protected def handleRecoveryEvent(): Unit = ()
 
-  def hasEvents: Boolean = synchronized {
-    events.size() != 0
-  }
+  /** Whether any posted work is waiting. Lockstep threading only. */
+  def hasEvents: Boolean = lockstep.hasQueued
 
-  /** Handles all events in the event queue. Returns when the queue is empty */
-  def testingOnlyHandleEvents(): Unit = {
-    var event = events.poll(0, TimeUnit.NANOSECONDS)
-    while (event != null) {
-      handleEvent(event)
-      event = events.poll(0, TimeUnit.NANOSECONDS)
-    }
-  }
+  /** Runs all posted work. Returns when none is left. Lockstep threading only. */
+  def testingOnlyHandleEvents(): Unit = lockstep.drain()
 
   /** Testing hook: runs a CheckAllDevices event synchronously.
    *
-   *  Direct rather than events.put + testingOnlyHandleEvents so a test does not also drain
+   *  Direct rather than posted + testingOnlyHandleEvents so a test does not also drain
    *  the InitializeTaskExecutor event queued by the constructor, which would attempt a real
    *  task-executor bootstrap transaction.
    */
@@ -675,19 +656,16 @@ class Host(val client: AspenClient,
 
   /** Testing hook: how many ShutdownMarkerResolved events are queued. */
   private[aspen] def testingOnlyQueuedMarkerResolutions: Int =
-    events.toArray.count(_.isInstanceOf[ShutdownMarkerResolved])
+    lockstep.queuedItems.count(isMarkerResolution)
+
+  private def isMarkerResolution(task: Runnable): Boolean = task match
+    case t: EventTask => t.event.isInstanceOf[ShutdownMarkerResolved]
+    case _ => false
 
   /** Testing hook: removes the queued ShutdownMarkerResolved events and handles them
    *  synchronously, leaving every other event queued. See testingOnlyCheckAllDevices. */
   private[aspen] def testingOnlyHandleMarkerResolutions(): Unit =
-    val it = events.iterator()
-    var resolved = List[Event]()
-    while it.hasNext do
-      val e = it.next()
-      if e.isInstanceOf[ShutdownMarkerResolved] then
-        it.remove()
-        resolved = e :: resolved
-    resolved.reverse.foreach(handleEvent)
+    lockstep.removeQueued(isMarkerResolution).foreach(_.run())
 
   /** Testing hook: runs receiveHostMessage's handler synchronously. See
    *  testingOnlyCheckAllDevices for why this bypasses the event queue. */
@@ -807,7 +785,6 @@ class Host(val client: AspenClient,
       case null => // nothing to do
       
       case _:Exit =>
-        shutdownCalled = true
         shutdownPromise.success(())
     }
   }

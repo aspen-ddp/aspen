@@ -21,8 +21,8 @@ import scala.concurrent.duration.Duration
  *  the loaded devices. Each component takes the DeviceControl as its only constructor parameter and is added here as
  *  a lazy val, which lets components refer to each other without construction-order cycles.
  *
- *  `lock` is the Host instance, which guards the components' state, and `post` puts an event on its queue; both go
- *  away with the event queue.
+ *  `lock` is the Host instance, which guards the components' state, and `post` hands an event to the host's
+ *  HostThreading.
  *
  *  The function-valued parameters from `loadStore` on are adapters that call the overridable methods on Host, so the
  *  test subclasses that replace them still take effect when a component calls them. */

@@ -10,6 +10,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.{Host, HostTestHarness, StoreConfig}
+import org.aspen_ddp.aspen.server.host.LockstepThreading
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuildFactory}
 import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler, FsifConfig}
 import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifRecovery}
@@ -37,7 +38,7 @@ private class FsifTestHost(network: TestNetwork,
                            systemId: UUID,
                            hostRootDir: os.Path,
                            execCtx: ExecutionContext)
-  extends Host(mgrClient, hid, systemId, hostRootDir, execCtx, _ => ObjectCache.NoCache, network,
+  extends Host(mgrClient, hid, systemId, hostRootDir, execCtx, new LockstepThreading(execCtx), _ => ObjectCache.NoCache, network,
     BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, network.FinalizerFactory,
     TransactionDriver.noErrorRecoveryFactory, Duration(5, SECONDS), Duration(60, SECONDS),
     StoreTransferService.Disabled, StoreRebuildFactory.Filesystem, 2):

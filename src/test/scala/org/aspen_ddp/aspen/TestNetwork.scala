@@ -21,6 +21,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.common.util.{BackgroundTaskManager, printStack}
 import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceSetId, StorageDeviceSetState, StorageDeviceState, StoragePoolState}
 import org.aspen_ddp.aspen.server.{RegisteredTransactionFinalizerFactory, Host, transaction}
+import org.aspen_ddp.aspen.server.host.LockstepThreading
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger as ServerMessenger
 import org.aspen_ddp.aspen.server.store.Bootstrap
@@ -226,6 +227,7 @@ class TestNetwork(executionContext: ExecutionContext,
     new UUID(0, 0),
     os.root,
     executionContext,
+    new LockstepThreading(executionContext),
     objectCacheFactory,
     this,
     BackgroundTaskManager.NoBackgroundTaskManager,

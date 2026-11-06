@@ -29,6 +29,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, CrashRecoveryLogFactory
 import org.aspen_ddp.aspen.server.crl.simple.SimpleCRL
 import org.aspen_ddp.aspen.server.store.Bootstrap
 import org.aspen_ddp.aspen.server.DeviceMarkers
+import org.aspen_ddp.aspen.server.host.SingleThreadThreading
 import org.aspen_ddp.aspen.vdisk.{DiskCatalog, DiskHandle, DiskInfo, VDiskError}
 import org.aspen_ddp.aspen.vdisk.tcmu.{LinuxTcmuKernel, TcmuEvent, TcmuNetlink, TcmuService}
 import org.aspen_ddp.aspen.vdisk.tcmu.dbus.{HandlerLogic, TcmuDbusService}
@@ -1728,6 +1729,7 @@ object Main {
       bootstrapCfg.aspenSystemId,
       hostDir,
       ec,
+      new SingleThreadThreading(),
       objectCacheFactory,
       nodeNet,
       new BackgroundTaskManager(ec),

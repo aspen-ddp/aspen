@@ -1,63 +1,19 @@
 TODO
 ====
 
-Store commit delay (investigating, 2026-11-05): a store sees an FSIF commit take ~67 ms on average, but FSIF itself
-accounts for only ~19 ms of it. Measured in the vdisk fio runs (16-store RS 16/10/12 pool, one host, all 16 stores on
-one disk) from BackendTiming's lines:
-- "store commit (FsifBackend)" runs from Frontend.commit (just before backend.commit) until Frontend
-  .backendOperationComplete sees the Commit completion. "fsif commit" runs from when FSIF's serial executor starts the
-  update (after `post` and `admitted`) until it replies. Neither includes Tx's own work before or after.
-- The unmeasured ~48 ms is therefore some mix of: (1) waiting in FSIF's `serial` executor queue before the update
-  starts, (2) waiting in `admitted` for journal room (no "journal ... is at its hard limit" warnings were logged, so
-  probably not), and (3) the completion's trip back: FSIF hands it to Host.IOHandler, which only enqueues it on
-  `host.events`, a single queue drained by one thread for every store, network message and timer on the host.
-- Strong lead for (3): the thread dumps show one host thread ("pool-3-thread-1", the one running Host's event loop)
-  using ~9 s of CPU per 10 s during randrw and ~3.5-5 s per 10 s during seqwrite, so it is close to saturated and
-  every event, completions included, queues behind it. Host.handleEvent is also `synchronized`.
-- Not the cause: the disk (FSIF journal force ~11 ms, data force ~14 ms, no backpressure), QUIC (no drops, stream waits
-  under 700 ms do not affect this measurement), GC.
-Next steps:
-1. Time the three gaps separately in BackendTiming: commit() call to the serial task starting, the `admitted` wait,
-   and IOHandler.complete to the Commit being handled on the event thread (enqueue timestamp on IOCompletion).
-2. Record the host event queue's depth and per-event-type handling time (count, total, max per second), to see what
-   the event thread spends its time on and how long events wait.
-3. Profile the event thread during randrw (async-profiler or JFR) to find the hot paths in handleEvent.
-4. Depending on the results: make the event loop cheaper, or split it (e.g. one event loop per store, since stores
-   share no transaction state), and remove the host-wide `synchronized` from the hot path.
-Update (host-refactor branch): the event loop is split. Stores run on their own `aspen-store-N` threads
-(StoreThreadPool), device management on `aspen-host-control`, and the host-wide `synchronized` and Store's locks are
-gone (docs/superpowers/specs/2026-11-05-host-refactor-design.md). The next step is the before/after measurement in
-docs/host-threading-measurement.md; if "store commit (FsifBackend)" does not improve, record what its thread dumps
-show here as the next investigation.
-Measured (2026-11-06, scripts/host-threading, 60 s smoke.fio jobs, one run per build): randrw-verify store commits/s,
-"store commit (FsifBackend)" avg, host CPU µs per store commit:
-- before (one event thread): 9,266, 52.2 ms, 562
-- one store thread per CPU (16 in use): 8,526, 38.6 ms, 1,513
-- fixed 4 threads: 10,977, 39.7 ms, 1,008; fixed 2 threads: 9,767, 26.7 ms, 694
-- seqwrite: before 1,833/s at 2,650 µs; fixed 2 threads 1,764/s at 2,860 µs; fixed 4 threads 1,671/s at 3,406 µs
-CPU per operation rises with the number of store threads the work is spread over: tasks wake parked threads. The
-default is now a fixed pool of min(4, CPUs/4). The commit gap outside FSIF fell from ~20 ms to ~8-11 ms. seqwrite
-looks bound by one QUIC event-loop thread (aspen-quic-N above 8 CPU-s per 10 s in every build).
-
-Adaptive store threading (parked, 2026-11-06): `StoreThreadPool.Adaptive` (code only) runs `StoreBalancer`; both
-policies tried lost to a fixed 2-4 thread pool. Growing on busy time (>70%) grew to the cap, because busy time per
-operation rises with each added thread, and evening out the loads spread light seqwrite load thinly: randrw 11,175/s
-at 1,307 µs, seqwrite 1,363/s at 4,441 µs. Packing to 65% with growth on drain wait (>1 ms) did worse: randrw
-8,004/s at 1,791 µs. Its problems, from its "Store threads:" log lines: idle load packs every store onto one thread,
-so each burst starts there; once every thread is over target it stops balancing (four threads ran at ~90% while two
-were at ~65%); it moves near-idle stores to no effect; seqwrite's normal drain wait (0.5-1.0 ms) is near the 1 ms
-threshold, so it flipped between 2 and 4 threads. To revisit: consolidate only under sustained moderate load, even
-out when every thread is over target, ignore near-idle stores, set congestion relative to each thread's normal wait,
-and measure with longer runs and more than one workload.
-
 Host start: FSIF stores still recovering on `FsifOpenEc`, and devices awaiting a shutdown-marker lookup, answer
 TxUnknownStore/StoreNotFound until they are installed. Same as before the refactor, but StoreRouter's `ready` flag
 does not cover them, so every client retries elsewhere and drops its location cache for them. Matters for vdisk host
 restarts. Follow-up: mark such a store offline in the router from StoreLoader.startFsifOpen until it is installed (and
-likewise a device's stores while its marker lookup runs), so its traffic is dropped silently and retransmitted.
+likewise a device's stores while its marker lookup runs), so its traffic is dropped silently and retransmitted. Also,
+the host needing to know what an Fsif store is breaks the encapsulation model. This should be generalized such that
+a whole class of store backends with similar behavior are correctly handled rather than having fsif-specific code.
 
 HostObjectCache is one `synchronized` cache shared by every store; with stores on parallel threads it is the likely
 next contention point (see docs/superpowers/specs/2026-11-05-host-refactor-design.md).
+
+Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
+timing of commits.
 
 vdisk (native TCMU frontend) follow-ups:
 - Run the root end-to-end scripts in scripts/vdisk-e2e/ (setup.sh, restart-under-io.sh, grow.sh in both modes,

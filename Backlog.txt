@@ -86,6 +86,17 @@ Mint per-client certificates for the CLI and other client applications
     certificate and private key written to aspen-client-config.yaml at bootstrap,
     and TLS is not enforced yet.
 
+Adaptive store threading (parked, 2026-11-06): `StoreThreadPool.Adaptive` (code only) runs `StoreBalancer`; both
+policies tried lost to a fixed 2-4 thread pool. Growing on busy time (>70%) grew to the cap, because busy time per
+operation rises with each added thread, and evening out the loads spread light seqwrite load thinly: randrw 11,175/s
+at 1,307 µs, seqwrite 1,363/s at 4,441 µs. Packing to 65% with growth on drain wait (>1 ms) did worse: randrw
+8,004/s at 1,791 µs. Its problems, from its "Store threads:" log lines: idle load packs every store onto one thread,
+so each burst starts there; once every thread is over target it stops balancing (four threads ran at ~90% while two
+were at ~65%); it moves near-idle stores to no effect; seqwrite's normal drain wait (0.5-1.0 ms) is near the 1 ms
+threshold, so it flipped between 2 and 4 threads. To revisit: consolidate only under sustained moderate load, even
+out when every thread is over target, ignore near-idle stores, set congestion relative to each thread's normal wait,
+and measure with longer runs and more than one workload.
+
 TLS certificate rotation, renewal and revocation
   - CA and entity certificates are issued with ~100 year lifetimes and are never
     renewed or revoked.

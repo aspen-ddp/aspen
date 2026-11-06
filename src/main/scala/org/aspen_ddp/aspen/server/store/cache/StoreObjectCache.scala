@@ -11,9 +11,9 @@ import scala.concurrent.ExecutionContext
 /** One store's view of the host object cache.
   *
   * Every method runs on the store's executor, which exclusively owns the view's mutable state, so nothing here is
-  * locked. The only state touched from other threads is the host byte total (an AtomicLong), the volatile `bytes`
-  * counter (read when a replacement view uncounts this one), the volatile `cleared` flag, the volatile
-  * `oldestAccess` (read by other views choosing a victim) and the `shedPending` flag.
+  * locked. The only state touched from other threads is the host byte total (an AtomicLong), the volatile
+  * `oldestAccess` (read by other views choosing a victim) and the `shedPending` flag. `bytes` is volatile only so that
+  * sizeInBytes may be read from any thread; it is written only here. A view is ended by `clear`, on its executor.
   *
   * Evictable entries sit in an access-ordered LRU. States a transaction references are pinned: they are counted but
   * never evicted. A pinned state that is also the cached state for its object is held out of the LRU and is returned
@@ -41,7 +41,7 @@ final class StoreObjectCache private[cache] (host: HostObjectCache,
 
   @volatile private var bytes: Long = 0
 
-  @volatile private var cleared: Boolean = false
+  private var cleared: Boolean = false
 
   /** The LRU head's last access, or Long.MaxValue when the LRU is empty. Republished after every mutation */
   @volatile private[cache] var oldestAccess: Long = Long.MaxValue
@@ -63,13 +63,6 @@ final class StoreObjectCache private[cache] (host: HostObjectCache,
 
   private def publishOldest(): Unit =
     oldestAccess = if lru.isEmpty then Long.MaxValue else lru.firstEntry.getValue.lastAccess
-
-  /** Called by the host when a new view replaces this one while the old store is no longer running */
-  private[cache] def abandon(): Unit =
-    if !cleared then
-      cleared = true
-      oldestAccess = Long.MaxValue
-      host.total.addAndGet(-bytes)
 
   def clear(): Unit =
     if !cleared then

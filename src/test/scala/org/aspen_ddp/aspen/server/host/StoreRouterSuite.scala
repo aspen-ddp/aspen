@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{CompletionHandler, MapBackend}
-import org.aspen_ddp.aspen.server.store.cache.ObjectCache
+import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionStatusCache}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.scalatest.funsuite.AnyFunSuite
@@ -75,6 +75,7 @@ object StoreRouterSuite:
   private class TrackingBackend(storeId: StoreId, dir: os.Path) extends MapBackend(storeId):
     @volatile var closed = false
     val usedAfterClose = new AtomicInteger(0)
+    val reads = new AtomicInteger(0)
 
     override def path: os.Path = dir
 
@@ -85,6 +86,7 @@ object StoreRouterSuite:
     override def read(pointer: org.aspen_ddp.aspen.common.objects.ObjectPointer): Unit =
       if closed then
         usedAfterClose.incrementAndGet()
+      reads.incrementAndGet()
       super.read(pointer)
 
   /** A TrackingBackend whose completions are handed to `completer`, a thread of its own, as an FSIF or RocksDB
@@ -127,7 +129,8 @@ object StoreRouterSuite:
   /** A DeviceControl on a StoreThreadPool with what loading, routing and closing a store use. Its posted events run
    *  the StoreLoader handlers on the control thread. Its router is ready (as after a Host's startup scan) unless
    *  `ready` is false. */
-  private class Fixture(crl: CrashRecoveryLog, ready: Boolean):
+  private class Fixture(crl: CrashRecoveryLog, ready: Boolean,
+                        objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache):
     val threading = new StoreThreadPool(maxThreads = 2)
     val net = new RecordingNet
 
@@ -137,7 +140,7 @@ object StoreRouterSuite:
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager, threading = threading,
       post = event => threading.controlEvents.execute(() => handle(event)),
       crl = crl, txStatusCache = new TransactionStatusCache(), wrapCompletionHandler = identity,
-      objectCacheFactory = (_, _) => ObjectCache.NoCache,
+      objectCacheFactory = objectCacheFactory,
       finalizerFactory = null,
       txDriverFactory = TransactionDriver.noErrorRecoveryFactory, heartbeatPeriod = Duration(5, SECONDS),
       deviceScanPeriod = Duration(10, SECONDS), storeRebuildFactory = null, maxConcurrentRebuilds = 2,
@@ -182,15 +185,17 @@ object StoreRouterSuite:
       sds
 
     /** Returns once every task posted to `executor` before it has run. */
-    def awaitExecutor(executor: StoreExecutor): Unit =
+    def awaitExecutor(executor: ExecutionContext): Unit =
       val done = new CountDownLatch(1)
       executor.execute(() => done.countDown())
       assert(done.await(Bound, TimeUnit.SECONDS))
 
     def shutdown(): Unit = threading.shutdown()
 
-  private def withRouter(crl: CrashRecoveryLog, ready: Boolean = true)(f: Fixture => Unit): Unit =
-    val fx = new Fixture(crl, ready)
+  private def withRouter(crl: CrashRecoveryLog, ready: Boolean = true,
+                         objectCacheFactory: (StoreId, ExecutionContext) => ObjectCache = (_, _) => ObjectCache.NoCache)
+                        (f: Fixture => Unit): Unit =
+    val fx = new Fixture(crl, ready, objectCacheFactory)
     try f(fx) finally fx.shutdown()
 
   private def emptyCrl: CrashRecoveryLog = new GatedCrl(Future.unit)
@@ -393,6 +398,60 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       await(fx.load(backend))
       fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(backend))
       fx.onControl(fx.threading.assignedCounts.sum) should be(1)
+
+  test("a reload over a loaded store leaves its view to its queued tasks, then uncounts it"):
+    val s0 = StoreId(poolId, 0)
+    val hc = new HostObjectCache(1024 * 1024)
+    withRouter(emptyCrl, objectCacheFactory = hc.forStore): fx =>
+      val first = bootstrappedBackend(s0)
+      await(fx.load(first))
+      val executor = fx.ctx.router.entry(s0).get.executor
+      fx.ctx.router.deliverClient(read(s0))
+      fx.awaitExecutor(executor)
+      fx.awaitExecutor(executor)
+      first.reads.get should be(1)
+      val cached = hc.sizeInBytes
+      cached should be > 0L
+
+      // The old store's queued read runs after the reload replaced it in the router
+      val unblock = new CountDownLatch(1)
+      executor.execute(() => { unblock.await(Bound, TimeUnit.SECONDS); () })
+      fx.ctx.router.deliverClient(read(s0))
+      val second = bootstrappedBackend(s0)
+      await(fx.load(second))
+      fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(second))
+      unblock.countDown()
+      fx.awaitExecutor(executor)
+      fx.awaitExecutor(executor)
+
+      // Served from the old store's view, which was still its own
+      first.reads.get should be(1)
+      fx.net.client.asScala.toList.collect { case r: ReadResponse => r.result.isRight } should be(List(true, true))
+      // The old view was cleared behind the old store's tasks; the new one holds nothing yet
+      hc.sizeInBytes should be(0L)
+      hc.viewCount should be(1)
+
+      fx.ctx.router.deliverClient(read(s0))
+      fx.awaitExecutor(executor)
+      fx.awaitExecutor(executor)
+      second.reads.get should be(1)
+      hc.sizeInBytes should be(cached)
+
+  test("a load whose store fails to build clears its object cache view"):
+    val s0 = StoreId(poolId, 0)
+    val hc = new HostObjectCache(1024 * 1024)
+    val executors = new ConcurrentLinkedQueue[ExecutionContext]()
+    val factory: (StoreId, ExecutionContext) => ObjectCache = (id, ec) =>
+      executors.add(ec)
+      hc.forStore(id, ec)
+    withRouter(emptyCrl, objectCacheFactory = factory): fx =>
+      fx.addDevice(s0)
+      intercept[IllegalStateException](await(fx.load(new UnwirableBackend(s0, os.temp.dir()))))
+      executors.asScala.foreach(fx.awaitExecutor)
+      hc.viewCount should be(0)
+
+      await(fx.load(bootstrappedBackend(s0)))
+      hc.viewCount should be(1)
 
   test("a load while the store still holds an executor slot fails without freeing it"):
     val s0 = StoreId(poolId, 0)

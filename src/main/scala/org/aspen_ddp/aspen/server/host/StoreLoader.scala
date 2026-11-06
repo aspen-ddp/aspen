@@ -9,6 +9,7 @@ import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryStat
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.{Backend, BackendStateLost}
+import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
@@ -298,13 +299,17 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           case Success(executor) =>
             // Everything up to install may throw (the Store constructor, the backend's setCompletionHandler). The
             // store is then not served, so the load is undone here rather than throwing out of the handler.
+            // The store's object cache view, once made: a failed build clears it, so it does not stay registered
+            var cache: Option[ObjectCache] = None
             val built = Try:
+              val objectCache = ctx.objectCacheFactory(storeId, executor)
+              cache = Some(objectCache)
               // Built, wired and set to await its CRL state here, on the control thread, before install publishes
               // it: no other thread can reach it yet, and no message finds it missing once it is registered.
               // Ownership passes to its executor at install (spec section 5, refined).
               // The store's transaction drivers run on the host's ec, not the control context; they post back as
               // messages
-              val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(storeId, executor),
+              val store = new Store(storageDeviceId, ctx.ec, backend, objectCache,
                 ctx.net, ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
                 Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
               val entry = new StoreRouter.Entry(store, executor)
@@ -317,6 +322,8 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             built match
               case Failure(err) =>
                 logger.error(s"Failed to build store $storeId. Not serving it. Error: $err")
+                // On the executor, where other views post its sheds, and before its slot is released
+                cache.foreach(c => executor.execute(() => c.clear()))
                 if replacing.isEmpty then
                   ctx.threading.release(storeId)
                 abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)

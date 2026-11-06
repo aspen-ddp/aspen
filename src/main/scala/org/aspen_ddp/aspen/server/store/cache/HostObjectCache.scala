@@ -9,13 +9,14 @@ import org.aspen_ddp.aspen.server.store.ObjectState
 import scribe.Logging
 
 import scala.concurrent.ExecutionContext
+import scala.jdk.CollectionConverters.*
 
 /** Host-wide object cache: one byte budget shared by per-store LRU views.
   *
   * Each store accesses the cache through the [[StoreObjectCache]] returned by forStore, so the stores of a pool
   * hosted together never see each other's slices of the same object. A view's state is owned by its store's
   * executor and takes no locks. The only state shared between store threads is the host byte total
-  * (an AtomicLong), the registry of views (a ConcurrentHashMap) and the views' volatile and atomic published values.
+  * (an AtomicLong), the registry of views (a concurrent set) and the views' volatile and atomic published values.
   * The budget is soft: a view over it sheds or asks another view to shed, so the total may briefly overshoot.
   *
   * @param maxBytes Host-wide budget, in estimated bytes
@@ -28,7 +29,9 @@ class HostObjectCache(val maxBytes: Long, private[cache] val clock: () => Long =
 
   private[cache] val total = new AtomicLong(0)
 
-  private val views = new ConcurrentHashMap[StoreId, StoreObjectCache]
+  // Every view not yet cleared. A store loaded again over a loaded one has two until the old store's view is cleared
+  // on its executor (StoreRouter.install)
+  private val views = ConcurrentHashMap.newKeySet[StoreObjectCache]()
 
   /** A shed frees down to this, below the budget, so the next inserts fit without posting another shed */
   private[cache] val shedLowWater: Long = maxBytes - maxBytes / HostObjectCache.ShedSlackDivisor
@@ -36,20 +39,23 @@ class HostObjectCache(val maxBytes: Long, private[cache] val clock: () => Long =
   /** Estimated bytes currently held by all stores */
   def sizeInBytes: Long = total.get
 
+  /** Number of views not yet cleared */
+  private[server] def viewCount: Int = views.size
+
   /** Returns the cache view for a store, to be used only from `executor`, where other views post its sheds.
     *
-    * A view of the store that was never cleared belongs to a store that is no longer running. It is warned about,
-    * uncounted and ended.
+    * An earlier view of the store that is still registered stays counted and working: its store may still be running
+    * (a reload over a loaded store clears it on that store's executor once the store's queued tasks have run), and its
+    * bytes belong to that executor, so they are never touched from here. It is only warned about.
     */
   def forStore(storeId: StoreId, executor: ExecutionContext = ExecutionContext.parasitic): StoreObjectCache =
     val view = new StoreObjectCache(this, storeId, executor)
-    val old = views.put(storeId, view)
-    if old != null then
-      logger.warn(s"Object cache view for store $storeId replaced before it was cleared")
-      old.abandon()
+    if views.iterator.asScala.exists(_.storeId == storeId) then
+      logger.warn(s"Object cache view for store $storeId created while an earlier one is still registered")
+    views.add(view)
     view
 
-  private[cache] def unregister(view: StoreObjectCache): Unit = views.remove(view.storeId, view)
+  private[cache] def unregister(view: StoreObjectCache): Unit = views.remove(view)
 
   /** Called on `from`'s executor when the host total is over budget. Picks the view whose LRU head is oldest (`from`
     * on a tie). If that is `from`, it evicts its own oldest entries, never `keep`, re-picking after each one, until
@@ -74,7 +80,7 @@ class HostObjectCache(val maxBytes: Long, private[cache] val clock: () => Long =
     var victim: StoreObjectCache = null
     var oldest = from.oldestAccess
     if oldest < Long.MaxValue then victim = from
-    val iter = views.values.iterator
+    val iter = views.iterator
     while iter.hasNext do
       val v = iter.next()
       val t = v.oldestAccess

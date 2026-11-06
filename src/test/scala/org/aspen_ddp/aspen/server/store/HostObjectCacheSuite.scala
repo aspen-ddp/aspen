@@ -272,7 +272,7 @@ class HostObjectCacheSuite extends AnyFunSuite with Matchers {
     c1.get(o4.objectId) should be(Some(o4))
   }
 
-  test("a new view replacing an uncleared one uncounts the old one") {
+  test("a second view of a store leaves the earlier one counted and working until it is cleared") {
     val hc = new HostObjectCache(10 * Overhead, clock)
     val old = hc.forStore(store0)
     val other = hc.forStore(store1)
@@ -282,18 +282,22 @@ class HostObjectCacheSuite extends AnyFunSuite with Matchers {
     old.insert(o2)
     other.insert(o3)
 
+    // As a reload over a loaded store makes it: the old store may still be running its queued tasks
     val fresh = hc.forStore(store0)
-    hc.sizeInBytes should be(Overhead)
+    hc.viewCount should be(3)
+    hc.sizeInBytes should be(3 * Overhead)
     fresh.get(o1.objectId) shouldBe None
-    old.get(o1.objectId) shouldBe None
-    old.insert(o1)
-    hc.sizeInBytes should be(Overhead)
+    old.get(o1.objectId) should be(Some(o1))
+    old.remove(o2.objectId)
+    hc.sizeInBytes should be(2 * Overhead)
 
-    // Clearing the replaced view later must not uncount again
+    // Clearing the old view uncounts only its own entries and leaves the new view registered
     old.clear()
+    hc.viewCount should be(2)
     hc.sizeInBytes should be(Overhead)
     fresh.insert(o1)
     hc.sizeInBytes should be(2 * Overhead)
+    fresh.get(o1.objectId) should be(Some(o1))
   }
 
   // Cross-store tests use a cap of 32 entries: a shed then frees down to 31 (the cap less a 1/32 slack of one entry)

@@ -235,11 +235,13 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def install(entry: Entry): Unit =
     val store = entry.store
     val replaced = stores.put(store.storeId, entry)
-    // A reload over a loaded store, with no close: its queued tasks run, later ones skip it
+    // A reload over a loaded store, with no close: its queued tasks run, later ones skip it. Its object cache view is
+    // cleared here, on its executor, behind those tasks: the view's bytes belong to that executor
     if replaced != null then
       replaced.executor.execute: () =>
         replaced.closing = true
         replaced.closed = true
+        replaced.store.objectCache.clear()
     offline.remove(store.storeId)
     loading.remove(store.storeId)
     ctx.publishView()

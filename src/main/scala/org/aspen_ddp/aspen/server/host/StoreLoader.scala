@@ -17,11 +17,12 @@ import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
 
-/** Opens and serves the stores of the devices loaded on this host, and closes them.
+/** Runs only on the control thread. See HostThreading.scala.
  *
- *  Everything here runs on the host's event thread under the host's lock, except the FSIF opens, which run on
- *  `fsifOpenEc` and touch no host state. Loads go back through `ctx.tryLoadStore`/`ctx.loadStore`, which call the
- *  overridable methods on Host. */
+ *  Opens and serves the stores of the devices loaded on this host, and closes them.
+ *
+ *  The exception is the FSIF opens, which run on `fsifOpenEc`, touch no host state and post their outcome back as
+ *  FsifOpened. Loads go back through `ctx.tryLoadStore`/`ctx.loadStore`, which call the overridable methods on Host. */
 class StoreLoader(ctx: DeviceControl) extends Logging:
   import ctx.given
 
@@ -30,7 +31,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   // FSIF stores whose backend could not be opened because their device is out of space. Each is
   // offline and unloaded, and ScanDevices (every deviceScanPeriod, 10 s) tries the load again with
   // an exponential backoff counted in scans: next scan, then 2, 4, ... scans later, capped at
-  // SpaceRetryCap. Each retry runs recovery on fsifOpenEc, never the event thread. A store
+  // SpaceRetryCap. Each retry runs recovery on fsifOpenEc, never the control thread. A store
   // leaves this map when its load succeeds or fails for any other reason. Never marked for
   // rebuild: the store's data is intact, it just cannot finish recovery until space returns.
   private var storesAwaitingSpace: Map[StoreId, SpaceWait] = Map()
@@ -52,7 +53,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   private[server] def awaitingSpaceHasCallback(storeId: StoreId): Option[Boolean] =
     storesAwaitingSpace.get(storeId).map(_.onServed.isDefined)
 
-  // `onServed` runs, under the instance lock, once the store is recorded as served and its LoadStore queued:
+  // `onServed` runs, on the control thread, once the store is recorded as served and its LoadStore queued:
   // before this returns for RocksDB, but only when FsifOpened is handled for FSIF, whose open runs on fsifOpenEc.
   // It never runs if the store is not served (skipped, already open or opening, or its open fails), except that an
   // FSIF open that runs out of space hands it to the store's next open (SpaceWait). It runs at most once. A caller
@@ -94,7 +95,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       catch
         case t: Throwable => logger.warn(s"Failed to load store $potentialStoreFile. Error: $t")
 
-  /** Records an opened backend as loaded and queues its LoadStore. Caller holds the instance lock. */
+  /** Records an opened backend as loaded and queues its LoadStore. */
   private[host] def serveOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                   backend: Backend): Future[Unit] =
     sds.loadedStores += backend.storeId
@@ -103,9 +104,9 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     logger.info(s"Loading store ${storeCfg.storeId}: $storePath")
     ctx.loadStore(sds.storageDeviceId, backend, storeCfg.effectiveMaxSliceSize.map(_.toLong))
 
-  /** Runs an FSIF open (recovery) or create on fsifOpenEc, off the event thread (the spec's anti-goal: never block it
+  /** Runs an FSIF open (recovery) or create on fsifOpenEc, off the control thread (the spec's anti-goal: never block it
    *  on I/O or fsync), and posts the outcome as FsifOpened. Meanwhile the store is in its device's loadedStores and
-   *  in fsifOpening, so a shutdown waits for it and no second open starts. Caller holds the instance lock. */
+   *  in fsifOpening, so a shutdown waits for it and no second open starts. */
   private[host] def startFsifOpen(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                     create: Boolean, created: Option[Promise[Unit]],
                                     onServed: Option[() => Unit] = None): Unit =
@@ -120,6 +121,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
     fsifOpening += storeId -> Nil
     sds.loadedStores += storeId
     try
+      // Leaves the control context: the open runs on fsifOpenEc and its result comes back as a posted FsifOpened.
       ctx.backends.fsifOpenEc.execute: () =>
         val result = Try(openBackend(storeCfg, storePath, create))
         ctx.post(FsifOpened(sds, storeCfg, storePath, create, previous, result, created, servedCallback))
@@ -129,7 +131,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         sds.loadedStores -= storeId
         throw t
 
-  /** The outcome of startFsifOpen, on the event thread:
+  /** The outcome of startFsifOpen, on the control thread:
    *  - opened: the store is served (LoadStore, which retires a backend that failed-stop meanwhile), unless its
    *    device was unloaded meanwhile or another backend serves it, when it is closed unserved;
    *  - FsifRecovery.StoreLost: the store's acknowledged state is gone. It is marked rebuild-required and left
@@ -215,7 +217,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
   /** Called once per device scan. Retries the load of every store in storesAwaitingSpace whose backoff has run
    *  out, whose device is still loaded here and not shutting down, and which is still offline and unloaded. Others
    *  are dropped, with their onServed callback unrun: whatever replaced or removed them has taken over. A retry's
-   *  open takes the callback over from the entry (startFsifOpen). Caller holds the instance lock. */
+   *  open takes the callback over from the entry (startFsifOpen). */
   def retryStoresAwaitingSpace(): Unit =
     storesAwaitingSpace.foreach: (storeId, wait) =>
       val deviceId = wait.sds.storageDeviceId
@@ -228,11 +230,11 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       else if ! ctx.shutdown.isShuttingDown(deviceId) then
         ctx.tryLoadStore(wait.sds, wait.storePath, None)
 
-  /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. A RocksDB backend is opened under
-   *  the instance lock; an FSIF backend on fsifOpenEc (startFsifOpen), touching no Host state. */
+  /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. A RocksDB backend is opened on
+   *  the control thread; an FSIF backend on fsifOpenEc (startFsifOpen), touching no Host state. */
   private[host] def openBackend(storeCfg: StoreConfig, storePath: os.Path, create: Boolean): Backend =
     val ref = new AtomicReference[Backend]()
-    // Called once, on an FSIF io thread: only enqueues, so it never blocks there.
+    // Called once, on an FSIF io thread: it only posts BackendFailed to the control thread, so it never blocks there.
     val onFatal: Throwable => Unit = err => ctx.post(BackendFailed(storeCfg.storeId, ref, err))
     val backend = ctx.backends.open(storeCfg, storePath, create, onFatal)
     ref.set(backend)
@@ -273,6 +275,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         p.failure(err)
 
       case Right(trs) =>
+        // The store's transaction drivers run on the host's ec, not the control context; they post back as messages
         val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(backend.storeId), ctx.net,
           ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
           Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
@@ -345,7 +348,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             // An FSIF close completes even after a fail-stop during it, and this store is no
             // longer served, so its BackendFailed (if any) would find nothing to act on.
             if backendHasFailed(store.backend) then
-              ctx.lock.synchronized(ctx.rebuilds.failedOnClose(store))
+              ctx.rebuilds.failedOnClose(store)
               completion.failure(StoreFailedOnClose(storeId))
             else
               completion.success(())

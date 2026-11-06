@@ -6,10 +6,9 @@ import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
-import org.aspen_ddp.aspen.common.util.BackgroundTaskManager.ScheduledTask
 import org.aspen_ddp.aspen.compute.{DurableServiceExecutor, TaskExecutor}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLogFactory
-import org.aspen_ddp.aspen.server.host.{AdoptionClass, ClientDeviceMetadata, ControlScheduler, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LockstepThreading}
+import org.aspen_ddp.aspen.server.host.{AdoptionClass, BackgroundControlScheduler, ClientDeviceMetadata, DefaultBackendOpener, DeviceControl, DeviceMetadata, HostThreading, LocalDevices, LockstepThreading}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.rebuild.StoreRebuildFactory
 import org.aspen_ddp.aspen.server.repair.{RepairService, RepairTarget}
@@ -259,8 +258,6 @@ class Host(val client: AspenClient,
                     *  device's stores anyway. See awaitShutdownWork. */
                    val shutdownWorkTimeout: Duration = Duration(60, SECONDS)) extends Logging with RepairTarget {
   import Host._
-  
-  given ExecutionContext = ec
 
   private val ioHandler = new IOHandler(this)
 
@@ -268,9 +265,11 @@ class Host(val client: AspenClient,
 
   private val crl = crlFactory.createCRL()
 
-  private val localDevices = new LocalDevices(this)
+  private val localDevices = new LocalDevices()
 
-  private val clientMetadata = new ClientDeviceMetadata(client, hostId)
+  // Off the control context on purpose: its reads and transactions run on the host's ec, and each result comes back
+  // through the caller's control-context callback. See ClientDeviceMetadata.
+  private val clientMetadata = new ClientDeviceMetadata(client, hostId)(using ec)
 
   private val deviceControl = new DeviceControl(
     metadata = new DeviceMetadata:
@@ -295,11 +294,8 @@ class Host(val client: AspenClient,
       override def completeDeviceShutdown(storageDeviceId: StorageDeviceId) =
         Host.this.completeDeviceShutdown(storageDeviceId)
     ,
-    // Not yet posted to the control thread: until the extracted classes take over scheduling, a delay runs its
-    // function where the BackgroundTaskManager runs it, as before.
-    scheduler = new ControlScheduler:
-      override def schedule(delay: Duration)(fn: => Unit): ScheduledTask = backgroundTasks.schedule(delay)(fn)
-    ,
+    // A delay expires on a BackgroundTaskManager thread; its function is posted to the control thread.
+    scheduler = new BackgroundControlScheduler(backgroundTasks, fn => threading.controlEvents.execute(() => fn())),
     // The real FSIF open and thread pool, with the two seams below redirected to this Host's protected methods so
     // that test subclasses that override them still take effect.
     backends = new DefaultBackendOpener(ec):
@@ -315,7 +311,7 @@ class Host(val client: AspenClient,
     rootDir = rootDir,
     net = net,
     backgroundTasks = backgroundTasks,
-    lock = this,
+    threading = threading,
     post = event => Host.this.post(event),
     crl = crl,
     txStatusCache = txStatusCache,
@@ -337,7 +333,8 @@ class Host(val client: AspenClient,
     closeStoreForTransferOut = storeId => Host.this.closeStoreForTransferOut(storeId),
     closeStoreForShutdown = storeId => Host.this.closeStoreForShutdown(storeId),
     scheduleShutdownWorkTimeout = (deviceId, fn) => Host.this.scheduleShutdownWorkTimeout(deviceId)(fn()),
-    scheduleEndpointRetry = fn => Host.this.scheduleEndpointRetry(fn()))
+    scheduleEndpointRetry = fn => Host.this.scheduleEndpointRetry(fn()),
+    ec = ec)
 
   private val shutdownPromise: Promise[Unit] = Promise()
 
@@ -350,6 +347,7 @@ class Host(val client: AspenClient,
   protected def storageDevices: Map[StorageDeviceId, LocalStorageDeviceState] = localDevices.devices
   protected def storageDevices_=(devices: Map[StorageDeviceId, LocalStorageDeviceState]): Unit =
     localDevices.devices = devices
+    deviceControl.publishView()
 
   protected def stores: Map[StoreId, Store] = deviceControl.router.loaded
 
@@ -361,8 +359,9 @@ class Host(val client: AspenClient,
   /** All StoreMoved and HostEndpointChanged gossip goes through here. See HostServices. */
   private[aspen] def gossipRetransmitter: GossipRetransmitter = services.gossipRetransmitter
 
+  // Fires on a BackgroundTaskManager thread; the retransmit reads control state, so it is posted to the control thread
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
-    retransmitPendingStartTransfers()
+    threading.controlEvents.execute(() => retransmitPendingStartTransfers())
 
   private def transfers = deviceControl.transfers
 
@@ -446,9 +445,9 @@ class Host(val client: AspenClient,
     case other => throw new IllegalStateException(
       s"Testing hook needs LockstepThreading, not ${other.getClass.getSimpleName}")
 
-  def getDevicePath(storageDeviceId: StorageDeviceId): Option[os.Path] = synchronized {
-    localDevices.devicePath(storageDeviceId)
-  }
+  /** Callable from any thread: reads the published HostStoreView. */
+  def getDevicePath(storageDeviceId: StorageDeviceId): Option[os.Path] =
+    deviceControl.currentView.devicePaths.get(storageDeviceId)
 
   /** Records the outcome of a store transfer that has finished shipping bytes. See
    *  ClientDeviceMetadata.updateStateForTransferredStore.
@@ -473,7 +472,7 @@ class Host(val client: AspenClient,
 
   /** Test seam: runs a failed reconcileEndpoint attempt's retry after the retry delay. */
   protected def scheduleEndpointRetry(fn: => Unit): Unit =
-    backgroundTasks.schedule(Duration(5, SECONDS))(fn)
+    backgroundTasks.schedule(Duration(5, SECONDS))(threading.controlEvents.execute(() => fn))
 
   private def discardStoreDirectory(storeId: StoreId,
                                     deviceId: StorageDeviceId,
@@ -521,7 +520,7 @@ class Host(val client: AspenClient,
     clientMetadata.readTransferSourceState(fromDeviceId)
 
   /** Takes a store out of service for a transfer out: closeStore if it is open, else nothing. A
-   *  seam so a test can hold the close open. Caller holds the instance lock. */
+   *  seam so a test can hold the close open. Called on the control thread. */
   protected def closeStoreForTransferOut(storeId: StoreId): Future[Unit] =
     transfers.closeForTransferOut(storeId)
 
@@ -534,7 +533,7 @@ class Host(val client: AspenClient,
   /** Runs `fn` after shutdownWorkTimeout. A seam so a test can fire the timeout itself, since the
    *  test hosts' BackgroundTaskManager never fires anything. */
   protected def scheduleShutdownWorkTimeout(storageDeviceId: StorageDeviceId)(fn: => Unit): Unit =
-    backgroundTasks.schedule(shutdownWorkTimeout)(fn)
+    backgroundTasks.schedule(shutdownWorkTimeout)(threading.controlEvents.execute(() => fn))
 
   /** The last step of a shutdown: one transaction on the device state that either commits
    *  Shutdown or explains why it did not. See ClientDeviceMetadata.completeDeviceShutdown.
@@ -544,30 +543,27 @@ class Host(val client: AspenClient,
   protected def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome] =
     clientMetadata.completeDeviceShutdown(storageDeviceId)
 
-  def containsStore(storeId: StoreId): Boolean = synchronized {
-    logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
-    stores.contains(storeId)
-  }
+  // containsStore, getStoreIds, repairableStoreIds and isRepairable are called from other threads (the repair
+  // service, the network bridge, RunningHost.stop), so each reads the published HostStoreView.
 
-  def getStoreIds: List[StoreId] = deviceControl.router.storeIds
+  def containsStore(storeId: StoreId): Boolean =
+    deviceControl.currentView.served.contains(storeId)
+
+  def getStoreIds: List[StoreId] = deviceControl.currentView.served.toList
 
   /** Stores this host can currently repair. A store mid-rebuild is already having everything
     * read, and a store transferring out is about to stop being ours; scanning either wastes the
     * load budget on work that will be redone or discarded.
     */
-  def repairableStoreIds: List[StoreId] = synchronized {
-    (stores.keySet -- deviceControl.router.offlineStores -- deviceControl.rebuilds.rebuildingStoreIds --
-      storeTransferService.transferringOutStores).toList
-  }
+  def repairableStoreIds: List[StoreId] = deviceControl.currentView.repairable.toList
 
   /** O(1) per-entry counterpart to `repairableStoreIds`: whether the given store is currently
-    * repairable on this host. Must agree with `repairableStoreIds.contains(storeId)` exactly.
+    * repairable on this host. Must agree with `repairableStoreIds.contains(storeId)` exactly, which it does by
+    * reading the same snapshot.
     */
-  def isRepairable(storeId: StoreId): Boolean = synchronized {
-    stores.contains(storeId) && !deviceControl.router.isOffline(storeId) &&
-      !deviceControl.rebuilds.isRebuilding(storeId) && !storeTransferService.isTransferringOut(storeId)
-  }
+  def isRepairable(storeId: StoreId): Boolean = deviceControl.currentView.repairable.contains(storeId)
 
+  /** Called from TestNetwork's checker thread: reads the router's @volatile maps. */
   def hasTransactions: Boolean = deviceControl.router.hasTransactions
 
   def logTransactionStatus(log: String => Unit): Unit = deviceControl.router.logTransactionStatus(log)
@@ -645,14 +641,14 @@ class Host(val client: AspenClient,
   private[aspen] def testingOnlyScanDevices(): Unit = handleEvent(ScanDevices())
 
   private[aspen] def testingOnlyLoadedDeviceDirs: Map[os.Path, StorageDeviceId] =
-    synchronized(deviceControl.discovery.loadedDeviceDirs)
+    deviceControl.discovery.loadedDeviceDirs
 
   private[aspen] def testingOnlyReportedDeviceDirs: Set[os.Path] =
-    synchronized(deviceControl.discovery.reportedDeviceDirs)
+    deviceControl.discovery.reportedDeviceDirs
 
   /** Testing hook: device directories with a shutdown-marker lookup or adoption in flight. */
   private[aspen] def testingOnlyPendingMarkerResolutions: Set[os.Path] =
-    synchronized(deviceControl.discovery.pendingMarkerResolutions)
+    deviceControl.discovery.pendingMarkerResolutions
 
   /** Testing hook: how many ShutdownMarkerResolved events are queued. */
   private[aspen] def testingOnlyQueuedMarkerResolutions: Int =
@@ -675,7 +671,7 @@ class Host(val client: AspenClient,
   /** Testing hook: handles a StartStoreTransfer as the event loop would, returning the Future that
    *  fails when the request is refused, so a test can tell a refusal from a request still in flight. */
   private[aspen] def testingOnlyStartStoreTransferOut(m: StartStoreTransfer): Future[Unit] =
-    synchronized(transfers.startOut(m))
+    transfers.startOut(m)
 
   /** Testing hook: runs the post-transfer metadata update synchronously.
    *
@@ -688,15 +684,15 @@ class Host(val client: AspenClient,
 
   /** Testing hook: the stores with a transfer in under way, including one waiting out its retry delay. */
   private[aspen] def testingOnlyTransferringIn: Set[StoreId] =
-    synchronized(transfers.transferringIn.keySet)
+    transfers.transferringIn.keySet
 
   /** Testing hook: the stores whose failed transfer in is waiting out its retry delay. */
   private[aspen] def testingOnlyScheduledTransferInRetries: Set[StoreId] =
-    synchronized(transfers.transferInRetries.keySet)
+    transfers.transferInRetries.keySet
 
   /** Testing hook: runs every scheduled transfer-in retry now rather than after its delay. */
   private[aspen] def testingOnlyRetryTransferIns(): Unit =
-    synchronized(transfers.transferInRetries.values.toList).foreach(_.run())
+    transfers.transferInRetries.values.toList.foreach(_.run())
 
   /** Testing hook: the devices with a re-check waiting out TransferOutRecheckDelay. */
   private[aspen] def testingOnlyScheduledDeviceRechecks: Set[StorageDeviceId] =
@@ -713,16 +709,17 @@ class Host(val client: AspenClient,
   /** Testing hook: whether a store awaiting space holds a real onServed callback; None if it is not awaiting
    *  space */
   private[aspen] def testingOnlyAwaitingSpaceHasCallback(storeId: StoreId): Option[Boolean] =
-    synchronized(deviceControl.loader.awaitingSpaceHasCallback(storeId))
+    deviceControl.loader.awaitingSpaceHasCallback(storeId)
 
   private[aspen] def testingOnlyOfflineStores: Set[StoreId] =
-    synchronized(deviceControl.router.offlineStores)
+    deviceControl.router.offlineStores
 
   /** Testing hook: devices with a check request deferred behind an in-flight lookup. */
   private[aspen] def testingOnlyDeferredDeviceChecks: Set[StorageDeviceId] =
     reconciler.deferredDeviceChecks
 
-  private def handleEvent(event: Event): Unit = synchronized {
+  /** Runs on the control thread (lockstep: the draining test thread). */
+  private def handleEvent(event: Event): Unit =
     event match {
 
       case IOCompletion(op) => deviceControl.router.deliverCompletion(op)
@@ -787,5 +784,4 @@ class Host(val client: AspenClient,
       case _:Exit =>
         shutdownPromise.success(())
     }
-  }
 }

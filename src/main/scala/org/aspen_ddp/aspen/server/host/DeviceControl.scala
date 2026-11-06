@@ -17,12 +17,19 @@ import java.util.UUID
 import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 
-/** What the classes extracted from Host share: the host's identity and services, the seams that tests replace, and
+/** Runs only on the control thread. See HostThreading.scala.
+ *
+ *  What the classes extracted from Host share: the host's identity and services, the seams that tests replace, and
  *  the loaded devices. Each component takes the DeviceControl as its only constructor parameter and is added here as
  *  a lazy val, which lets components refer to each other without construction-order cycles.
  *
- *  `lock` is the Host instance, which guards the components' state, and `post` hands an event to the host's
- *  HostThreading.
+ *  The only given context is `threading.control`, which every component imports (`import ctx.given`), so
+ *  every Future callback in device management runs on the control thread. `ec` is the host's general-purpose
+ *  context: it is never a given, and only work deliberately run elsewhere names it. `post` hands an event to the
+ *  host's HostThreading.
+ *
+ *  `currentView` is the one piece of control state other threads may read: an immutable HostStoreView, republished
+ *  by `publishView` after every change to what it reflects.
  *
  *  The function-valued parameters from `loadStore` on are adapters that call the overridable methods on Host, so the
  *  test subclasses that replace them still take effect when a component calls them. */
@@ -36,7 +43,7 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val rootDir: os.Path,
                           val net: Messenger,
                           val backgroundTasks: BackgroundTaskManager,
-                          val lock: AnyRef,
+                          val threading: HostThreading,
                           val post: Host.Event => Unit,
                           val crl: CrashRecoveryLog,
                           val txStatusCache: TransactionStatusCache,
@@ -58,8 +65,12 @@ final class DeviceControl(val metadata: DeviceMetadata,
                           val closeStoreForTransferOut: StoreId => Future[Unit],
                           val closeStoreForShutdown: StoreId => Future[Unit],
                           val scheduleShutdownWorkTimeout: (StorageDeviceId, () => Unit) => Unit,
-                          val scheduleEndpointRetry: (() => Unit) => Unit)
-                         (using val ec: ExecutionContext):
+                          val scheduleEndpointRetry: (() => Unit) => Unit,
+                          /** The host's general-purpose context: stores' transaction drivers and client
+                           *  transactions run on it. Never a given. */
+                          val ec: ExecutionContext):
+  given ExecutionContext = threading.control
+
   lazy val router: StoreRouter = new StoreRouter(this)
   lazy val loader: StoreLoader = new StoreLoader(this)
   lazy val discovery: DeviceDiscovery = new DeviceDiscovery(this)
@@ -68,3 +79,16 @@ final class DeviceControl(val metadata: DeviceMetadata,
   lazy val shutdown: DeviceShutdown = new DeviceShutdown(this)
   lazy val reconciler: DeviceReconciler = new DeviceReconciler(this)
   lazy val services: HostServices = new HostServices(this)
+
+  @volatile private var view: HostStoreView = HostStoreView.Empty
+
+  /** The latest snapshot published by the control thread. Safe to read from any thread. */
+  def currentView: HostStoreView = view
+
+  /** Rebuilds the snapshot from the router's maps, the loaded devices, the rebuilds running and the stores
+   *  transferring out, and publishes it. Called on the control thread after every change to any of them. */
+  private[server] def publishView(): Unit =
+    val served = router.loaded.keySet
+    val offline = router.offlineStores
+    val repairable = served -- offline -- rebuilds.rebuildingStoreIds -- storeTransferService.transferringOutStores
+    view = HostStoreView(served, offline, repairable, devices.devices.map((id, sds) => id -> sds.devicePath))

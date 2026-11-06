@@ -21,9 +21,14 @@ import scala.concurrent.duration.*
 import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success}
 
-/** The services a host runs for the rest of the system: the task and durable-service executors, the system task
+/** Runs only on the control thread. See HostThreading.scala.
+ *
+ *  The services a host runs for the rest of the system: the task and durable-service executors, the system task
  *  runner, usage tracking, the endpoint reconcile, and the gossip retransmitter that all StoreMoved and
- *  HostEndpointChanged gossip goes through. */
+ *  HostEndpointChanged gossip goes through.
+ *
+ *  The exceptions: the gossip retransmitter is thread-safe, so its periodic retransmit runs on the
+ *  background task thread; `shutdown` is called on the caller's thread and touches only what is safe there. */
 class HostServices(ctx: DeviceControl) extends Logging:
   import ctx.given
 
@@ -35,13 +40,15 @@ class HostServices(ctx: DeviceControl) extends Logging:
   private val systemTaskRunnerPromise: Promise[SystemTaskRunner] = Promise()
   private val poolUsageManager = new StoragePoolUsageManager(ctx.client)
   private val deviceUsageManager = new StorageDeviceUsageManager(ctx.client)
-  private var usageUpdateTask: Option[ScheduledTask] = None
+  // Written once, on the control thread; @volatile because shutdown reads it on the caller's thread.
+  @volatile private var usageUpdateTask: Option[ScheduledTask] = None
 
   /** All StoreMoved and HostEndpointChanged gossip goes through here, so hosts that miss the
    *  first broadcast still hear it from a retransmit. */
   private[server] val gossipRetransmitter =
     new GossipRetransmitter(GossipRetransmitter.stateFile(ctx.rootDir), ctx.net.broadcastGossip)
 
+  // Runs on the background task thread: the retransmitter is thread-safe and touches no control state.
   private val gossipRetransmitTask = ctx.backgroundTasks.schedulePeriodic(GossipRetransmitter.Period):
     gossipRetransmitter.retransmit()
 
@@ -57,19 +64,14 @@ class HostServices(ctx: DeviceControl) extends Logging:
               ctx.client.getStoragePool(Radicle.poolId).foreach: pool =>
                 val allocator = new PoolObjectAllocator(ctx.client, pool)
                 SimpleTaskExecutor(ctx.client, allocator, executorPtr).foreach: executor =>
-                  ctx.lock.synchronized:
-                    taskExecutorPromise.success(executor)
-                    startUsageTracking(executor)
-                    val serviceExec = new SimpleDurableServiceExecutor(ctx.client, ctx.hostId, ctx.backgroundTasks,
-                      hostCount = () => ctx.net.knownHostCount)
-                    serviceExecutorPromise.success(serviceExec)
-                    initializeSystemTaskRunner(executor)
+                  executorReady(executor)
 
             case None =>
               ctx.client.getStoragePool(Radicle.poolId).foreach: pool =>
                 val allocator = new PoolObjectAllocator(ctx.client, pool)
 
-                ctx.client.transactUntilSuccessful: tx =>
+                // The transaction runs on the host's ec; its result comes back through the control-context foreach
+                ctx.client.transactUntilSuccessful { tx =>
                   for
                     executorRoot <- allocator.allocateKeyValueObject(Map())(using tx)
                     currentHostKvos <- ctx.client.read(hostPtr)
@@ -78,19 +80,24 @@ class HostServices(ctx: DeviceControl) extends Logging:
                     val ops = List(Insert(HostState.TaskExecutorRootKey, executorRoot.toArray))
                     tx.update(hostPtr, None, None, reqs, ops)
                     executorRoot
+                }(using ctx.ec)
                 .foreach: executorRoot =>
                   SimpleTaskExecutor(ctx.client, allocator, executorRoot).foreach: executor =>
-                    ctx.lock.synchronized:
-                      taskExecutorPromise.success(executor)
-                      startUsageTracking(executor)
-                      val serviceExec = new SimpleDurableServiceExecutor(ctx.client, ctx.hostId, ctx.backgroundTasks,
-                        hostCount = () => ctx.net.knownHostCount)
-                      serviceExecutorPromise.success(serviceExec)
-                      initializeSystemTaskRunner(executor)
+                    executorReady(executor)
 
       case Failure(err) =>
         // In test environments or when host is not yet registered, silently skip initialization
         logger.debug(s"TaskExecutor initialization skipped: ${err.getMessage}")
+
+  /** The task executor exists: completes the executor promises and starts what needs it. */
+  private def executorReady(executor: TaskExecutor): Unit =
+    taskExecutorPromise.success(executor)
+    startUsageTracking(executor)
+    // hostCount is called on the service executor's own threads: the messenger is thread-safe
+    val serviceExec = new SimpleDurableServiceExecutor(ctx.client, ctx.hostId, ctx.backgroundTasks,
+      hostCount = () => ctx.net.knownHostCount)
+    serviceExecutorPromise.success(serviceExec)
+    initializeSystemTaskRunner(executor)
 
   private def initializeSystemTaskRunner(executor: TaskExecutor): Unit =
     val servicesTkvl = TieredKeyValueList(ctx.client,
@@ -99,9 +106,8 @@ class HostServices(ctx: DeviceControl) extends Logging:
       case Some(vs) =>
         val statePtr = ServiceEntry.decode(vs.value.bytes).statePointer
         val runner = new SystemTaskRunner(ctx.client, statePtr, ctx.hostId, executor)
-        ctx.lock.synchronized:
-          if !systemTaskRunnerPromise.isCompleted then
-            systemTaskRunnerPromise.success(runner)
+        if !systemTaskRunnerPromise.isCompleted then
+          systemTaskRunnerPromise.success(runner)
       case None =>
         logger.debug("SystemTaskExecutorService not registered; system task runner not started")
 
@@ -110,15 +116,17 @@ class HostServices(ctx: DeviceControl) extends Logging:
 
     usageUpdateTask = Some(ctx.backgroundTasks.scheduleNonConcurrentPollingTask(
       "store-usage-update", Duration(20, SECONDS)):
-      val (slist, dlist) =
-        ctx.lock.synchronized:
-          (ctx.router.loaded.valuesIterator.toList, ctx.devices.devices.valuesIterator.toList)
-      val fs = runSequentially(slist): store =>
-        poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
-      val fd = runSequentially(dlist): sds =>
-        deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
+      // Invoked on the background task thread: the body is delegated to the control thread, which owns the stores
+      // and devices it reads.
+      Future.delegate:
+        val slist = ctx.router.loaded.valuesIterator.toList
+        val dlist = ctx.devices.devices.valuesIterator.toList
+        val fs = runSequentially(slist): store =>
+          poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
+        val fd = runSequentially(dlist): sds =>
+          deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
 
-      Future.sequence(List(fs, fd))
+        Future.sequence(List(fs, fd))
     )
 
   def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
@@ -157,7 +165,8 @@ class HostServices(ctx: DeviceControl) extends Logging:
            hs.httpPort == httpPort && hs.storeTransferPort == storeTransferPort then
           Future.successful(false)
         else
-          ctx.client.transactUntilSuccessful: tx =>
+          // The transaction runs on the host's ec; its result comes back through the control-context flatMap below
+          ctx.client.transactUntilSuccessful { tx =>
             for
               hostPtr <- ctx.client.getHostPointer(ctx.hostId)
               kvos <- ctx.client.read(hostPtr)
@@ -169,6 +178,7 @@ class HostServices(ctx: DeviceControl) extends Logging:
                   current.copy(address = address, dataPort = dataPort, httpPort = httpPort,
                                storeTransferPort = storeTransferPort).encode())))
               tx
+          }(using ctx.ec)
           // The committed transaction's timestamp is the new HostState value's
           .flatMap(_.result)
           .map: timestamp =>
@@ -206,9 +216,11 @@ class HostServices(ctx: DeviceControl) extends Logging:
       case Failure(err) =>
         logger.warn(s"Failed to read pool ${storeId.poolId} to gossip that store $storeId is online: $err")
 
-  /** Cancels the periodic tasks and shuts down the executors. */
+  /** Cancels the periodic tasks and shuts down the executors. Called on the caller's thread, once the control thread
+   *  has been told to stop, so nothing here may post to it. */
   def shutdown(): Unit =
-    serviceExecutorPromise.future.foreach(_.shutdown())
-    systemTaskRunnerPromise.future.foreach(_.shutdown())
+    // On the host's ec: the control thread drops what is posted after its shutdown. The executors are thread-safe.
+    serviceExecutorPromise.future.foreach(_.shutdown())(using ctx.ec)
+    systemTaskRunnerPromise.future.foreach(_.shutdown())(using ctx.ec)
     gossipRetransmitTask.cancel()
     usageUpdateTask.foreach(_.cancel())

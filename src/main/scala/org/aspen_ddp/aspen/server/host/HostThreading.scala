@@ -9,20 +9,50 @@ import scala.concurrent.ExecutionContext
 
 /** How a host runs its stores and its device-management control thread.
  *
+ *  Device management (the classes in `server.host` that DeviceControl wires together) runs on a dedicated
+ *  single-threaded ExecutionContext, the control context (`control`). Every Future combinator in that code names the
+ *  control context, so its callback runs on the control thread, and that code needs no locks: each handler and
+ *  callback runs to completion before the next one starts, and all mutable device-management state is read and
+ *  written only on that thread. This is deliberately unlike ordinary Scala Future usage, where callbacks run on a
+ *  shared pool and shared state needs locks. It is an actor-style "single owner" model built from plain Futures, and
+ *  it needs these rules:
+ *  1. **Device-management classes must not have a general-purpose `given ExecutionContext` in scope.** The only
+ *     `given` is the control context, so a callback with no context named does not compile into "runs somewhere on a
+ *     pool". Work that must run elsewhere (an FSIF open on `FsifOpenEc`, client transactions) names its context
+ *     explicitly, and its result comes back through a control-context callback.
+ *  2. **Never block the control thread on a Future** (`Await`, `.get` on a Java future, a `LinkedBlockingQueue.take`
+ *     waiting for another thread's answer). The thread would deadlock against its own callbacks. Slow local disk
+ *     work (marker files, directory moves, fsyncs through `DurableFiles`) is allowed there, because those operations
+ *     are rare.
+ *  3. **State owned by the control thread is never read from other threads.** Other threads that need an answer
+ *     either post a request and receive a Future, or read an immutable snapshot that the control thread publishes
+ *     through a `@volatile` field (see `HostStoreView` below).
+ *  4. **Store state is never touched from the control thread,** and the reverse also holds.
+ *
+ *  Both implementations below still run stores inline on the control thread, so rule 4 is not yet in force: it takes
+ *  effect once stores have executors of their own.
+ *
+ *  `HostStoreView` is that snapshot: DeviceControl.publishView republishes it after every change to the state it
+ *  reflects. Callbacks that are not Futures (timers, FSIF's onFatal, the FSIF open on fsifOpenEc) run on whatever
+ *  thread invokes them, so each posts to `controlEvents` before touching control state; BackgroundControlScheduler
+ *  does this for delayed work. Every place that deliberately leaves the control context says, in a comment, where the
+ *  work runs and how its result comes back.
+ *
  *  Two implementations:
  *  - SingleThreadThreading (production, `cmdline/Main.scala`): one thread, `aspen-host-control`, runs everything
  *    posted, in posting order, as the host's event loop did.
  *  - LockstepThreading (regression tests, `TestNetwork` and every test Host): posted work waits on one FIFO until the
- *    test drains it, and Future callbacks run on the test's own ExecutionContext.
+ *    test drains it, and Future callbacks run on the test's own ExecutionContext, which is single-threaded and runs
+ *    on the test thread, so the single-owner rule still holds.
  *
- *  See section 6 of docs/superpowers/specs/2026-11-05-host-refactor-design.md for the lockstep rules. */
+ *  See sections 2 and 6 of docs/superpowers/specs/2026-11-05-host-refactor-design.md. */
 trait HostThreading:
   /** Where every device-management Future callback runs. Single-threaded. */
   def control: ExecutionContext
   /** Where control events are posted (production: the control thread; lockstep: the FIFO). */
   def controlEvents: Executor
   /** Entry hop for work arriving from a foreign thread: network, I/O completion, timers, CRL callbacks.
-   *  Production: runs inline. Lockstep: enqueues on the FIFO. */
+   *  SingleThreadThreading: enqueues on the control thread, where stores still run. Lockstep: enqueues on the FIFO. */
   def dispatch: Executor
   /** Binds a store being loaded to an executor. Called on the control thread. */
   def assign(storeId: StoreId, deviceId: StorageDeviceId): StoreExecutor

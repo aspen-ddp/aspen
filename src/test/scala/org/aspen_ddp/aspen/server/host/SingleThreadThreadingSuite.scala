@@ -54,3 +54,38 @@ class SingleThreadThreadingSuite extends AnyFunSuite with Matchers:
       t.dispatch.execute(() => throw new RuntimeException("expected by the test"))
       t.dispatch.execute(() => ran.countDown())
       ran.await(10, TimeUnit.SECONDS) should be(true)
+
+  test("work posted before start runs after start"):
+    val t = new SingleThreadThreading()
+    try
+      val ran = new CountDownLatch(1)
+      t.controlEvents.execute(() => ran.countDown())
+      ran.getCount should be(1)
+      t.start()
+      ran.await(10, TimeUnit.SECONDS) should be(true)
+    finally t.shutdown()
+
+  test("work queued before shutdown still runs"):
+    val t = new SingleThreadThreading()
+    t.start()
+    val release = new CountDownLatch(1)
+    val ran = new CountDownLatch(1)
+    // Holds the thread so the second task is still queued when shutdown is called
+    t.controlEvents.execute(() => { release.await(10, TimeUnit.SECONDS); () })
+    t.controlEvents.execute(() => ran.countDown())
+    t.shutdown()
+    release.countDown()
+    ran.await(10, TimeUnit.SECONDS) should be(true)
+
+  test("the thread terminates after shutdown"):
+    val t = new SingleThreadThreading()
+    t.start()
+    val thread = new java.util.concurrent.atomic.AtomicReference[Thread]()
+    val captured = new CountDownLatch(1)
+    t.controlEvents.execute: () =>
+      thread.set(Thread.currentThread)
+      captured.countDown()
+    captured.await(10, TimeUnit.SECONDS) should be(true)
+    t.shutdown()
+    thread.get.join(TimeUnit.SECONDS.toMillis(10))
+    thread.get.isAlive should be(false)

@@ -13,7 +13,9 @@ import scribe.Logging
 import scala.concurrent.{Future, Promise}
 import scala.util.{Failure, Success}
 
-/** Shuts a device down for a planned physical move: stops the work running on it, closes its stores, commits Shutdown
+/** Runs only on the control thread. See HostThreading.scala.
+ *
+ *  Shuts a device down for a planned physical move: stops the work running on it, closes its stores, commits Shutdown
  *  and unloads it. Also owns the guard that keeps one shutdown sequence per device at a time.
  *
  *  Metadata goes through `ctx.metadata`; the close of each store, the work timeout and the reconcile of a device
@@ -28,7 +30,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
   private var shuttingDownDevices: Set[StorageDeviceId] = Set()
 
   /** True while the shutdown sequence of `id` is running. */
-  def isShuttingDown(id: StorageDeviceId): Boolean = ctx.lock.synchronized(shuttingDownDevices.contains(id))
+  def isShuttingDown(id: StorageDeviceId): Boolean = shuttingDownDevices.contains(id)
 
   /** Takes one store out of service for a device shutdown. This is the default of Host.closeStoreForShutdown, the
    *  seam a test replaces. */
@@ -54,8 +56,6 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  A loaded device reading Shutdown gets the same treatment. That is a shutdown whose commit
    *  landed but whose unload did not happen in this process, and finishing it is the same work:
    *  completeDeviceShutdown reports Completed without writing.
-   *
-   *  Caller holds the instance lock; the continuations take it as they need it.
    */
   def shutDownDevice(local: LocalStorageDeviceState, remote: StorageDeviceState): Unit =
     val deviceId = local.storageDeviceId
@@ -63,7 +63,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
       shuttingDownDevices += deviceId
       logger.info(s"Shutting down storage device $deviceId at ${local.devicePath}")
 
-      def release(): Unit = ctx.lock.synchronized:
+      def release(): Unit =
         shuttingDownDevices -= deviceId
 
       // A throw before the first Future exists would otherwise skip the onComplete below, and
@@ -132,7 +132,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    */
   private def stopDeviceWork(local: LocalStorageDeviceState,
                              remote: StorageDeviceState): Map[StoreId, Future[Unit]] =
-    val (cancelledIns, stopping) = ctx.lock.synchronized {
+    val (cancelledIns, stopping) =
       val deviceId = local.storageDeviceId
       def entriesIn(status: StorageDeviceState.StoreStatus): Set[StoreId] =
         remote.stores.collect { case (storeId, entry) if entry.status == status => storeId }.toSet
@@ -152,9 +152,9 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         .foreach: storeId =>
           logger.info(s"Cancelling the transfer out of store $storeId for the shutdown of device $deviceId")
           ctx.storeTransferService.cancelTransferOut(storeId)
+      ctx.publishView()
 
       (ins, rebuilds ++ recording)
-    }
 
     cancelledIns.foreach: (storeId, transferUUID) =>
       logger.info(s"Cancelling the transfer in of store $storeId for the shutdown of device ${local.storageDeviceId}")
@@ -211,44 +211,41 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
         case Failure(_: StoreFailedOnClose) => Success(false)
         case other => other.map(_ => true)
       .map: clean =>
-        ctx.lock.synchronized:
-          // ShutdownStore records this too. Done here as well so the bookkeeping that later
-          // steps read does not depend on how the store was closed.
-          ctx.router.markOffline(storeId)
-          local.offlineStores += storeId
-          // Forced to disk, as the CRL file ShutdownStore saved beside it was: once Shutdown
-          // commits the disk may be pulled at any moment, and an adopter refuses a store whose
-          // marker or CRL file did not survive.
-          if clean then
-            DurableFiles.write(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
-          ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
+        // ShutdownStore records this too. Done here as well so the bookkeeping that later
+        // steps read does not depend on how the store was closed.
+        ctx.router.markOffline(storeId)
+        local.offlineStores += storeId
+        // Forced to disk, as the CRL file ShutdownStore saved beside it was: once Shutdown
+        // commits the disk may be pulled at any moment, and an adopter refuses a store whose
+        // marker or CRL file did not survive.
+        if clean then
+          DurableFiles.write(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
+        ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
     .map(_ => ())
 
   /** The stores closeStoresForShutdown picks. */
-  private def storesToClose(local: LocalStorageDeviceState): List[StoreId] = ctx.lock.synchronized {
+  private def storesToClose(local: LocalStorageDeviceState): List[StoreId] =
     local.loadedStores.filter: storeId =>
       val storePath = local.devicePath / storeId.directoryName
       val unmarked = os.isDir(storePath) && !os.exists(storePath / StoreTransfer.TransferOutMarkerFile)
       !ctx.router.isOffline(storeId) || unmarked
     .toList.sortBy(s => (s.poolId.uuid, s.poolIndex))
-  }
 
   /** Unloads a device whose Shutdown has committed, first closing any store loaded on it since
    *  the shutdown's own close: a rebuild or transfer in that flipped its entry Active before
    *  completeDeviceShutdown flipped it back may have loaded its store meanwhile. Unloaded with
    *  such a store open, nothing would ever close it.
    *
-   *  The emptiness check and the unload share one hold of the lock, which is the lock the
-   *  LoadStoreById handler takes. A load that has not happened by then finds the device gone
+   *  The emptiness check and the unload run in one control-thread task, as does the
+   *  LoadStoreById handler. A load that has not happened by then finds the device gone
    *  and does nothing; one that has is in loadedStores and is closed by another round.
    */
-  private def closeThenUnload(local: LocalStorageDeviceState): Future[Unit] = ctx.lock.synchronized {
+  private def closeThenUnload(local: LocalStorageDeviceState): Future[Unit] =
     if storesToClose(local).isEmpty then
       unloadDevice(local.storageDeviceId)
       Future.unit
     else
       closeStoresForShutdown(local).flatMap(_ => closeThenUnload(local))
-  }
 
   /** Forgets a device that has been shut down. Its stores stay in offlineStores, so messages for
    *  them are dropped rather than answered with UnknownStore, and it stays in this host's
@@ -257,7 +254,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
    *  Dropping its loadedDeviceDirs entry means the scan reads the directory again, finds
    *  shutdown.state and leaves the device unloaded until a restart or adoption resolves it.
    */
-  def unloadDevice(storageDeviceId: StorageDeviceId): Unit = ctx.lock.synchronized {
+  def unloadDevice(storageDeviceId: StorageDeviceId): Unit =
     ctx.devices.devices -= storageDeviceId
     ctx.discovery.forgetDevice(storageDeviceId)
-  }
+    ctx.publishView()

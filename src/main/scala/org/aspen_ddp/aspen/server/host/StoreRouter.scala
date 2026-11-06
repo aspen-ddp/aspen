@@ -13,15 +13,20 @@ import scribe.Logging
 
 import scala.concurrent.Promise
 
-/** The loaded stores, and the delivery of messages, I/O completions and repairs to them.
+/** Runs only on the control thread. See HostThreading.scala.
+ *
+ *  The loaded stores, and the delivery of messages, I/O completions and repairs to them.
  *
  *  A store that is not loaded but is marked offline is silent: a message for it is dropped instead of answered with
  *  an UnknownStore reply. The mark is set when a store is removed and cleared when one is installed; stores that were
- *  never loaded are marked and unmarked directly, so `offline` is not a subset of the stores loaded. All access is on
- *  the host's event thread, under the host's lock. */
+ *  never loaded are marked and unmarked directly, so `offline` is not a subset of the stores loaded.
+ *
+ *  The two maps are immutable values in `@volatile` fields, written only on the control thread, so `storeIds`,
+ *  `hasTransactions` and `logTransactionStatus` may read them from any thread (TestNetwork's checker thread calls the
+ *  latter two). Every write republishes the host's HostStoreView. */
 class StoreRouter(ctx: DeviceControl) extends Logging:
-  private var stores: Map[StoreId, Store] = Map()
-  private var offline: Set[StoreId] = Set()
+  @volatile private var stores: Map[StoreId, Store] = Map()
+  @volatile private var offline: Set[StoreId] = Set()
 
   def deliverTx(msg: TxMessage): Unit =
     stores.get(msg.to) match
@@ -97,14 +102,11 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
 
   def isOffline(storeId: StoreId): Boolean = offline.contains(storeId)
 
-  def storeIds: List[StoreId] = ctx.lock.synchronized:
-    stores.keysIterator.toList
+  def storeIds: List[StoreId] = stores.keysIterator.toList
 
-  def hasTransactions: Boolean = ctx.lock.synchronized:
-    stores.valuesIterator.exists(_.hasTransactions)
+  def hasTransactions: Boolean = stores.valuesIterator.exists(_.hasTransactions)
 
-  def logTransactionStatus(log: String => Unit): Unit = ctx.lock.synchronized:
-    stores.values.foreach(_.logTransactionStatus(log))
+  def logTransactionStatus(log: String => Unit): Unit = stores.values.foreach(_.logTransactionStatus(log))
 
   /** The loaded stores, by id */
   private[server] def loaded: Map[StoreId, Store] = stores
@@ -116,16 +118,20 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def install(store: Store): Unit =
     stores += store.storeId -> store
     offline -= store.storeId
+    ctx.publishView()
 
   /** Unloads the store and marks it offline */
   private[host] def remove(storeId: StoreId): Unit =
     stores -= storeId
     offline += storeId
+    ctx.publishView()
 
   /** Marks a store offline without touching the loaded stores */
   private[host] def markOffline(storeId: StoreId): Unit =
     offline += storeId
+    ctx.publishView()
 
   /** Clears a store's offline mark without touching the loaded stores */
   private[host] def clearOffline(storeId: StoreId): Unit =
     offline -= storeId
+    ctx.publishView()

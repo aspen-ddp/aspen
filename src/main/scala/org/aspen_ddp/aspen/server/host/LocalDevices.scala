@@ -13,16 +13,16 @@ class LocalStorageDeviceState(val storageDeviceId: StorageDeviceId,
   def totalSize: Long = configFile.toIO.getTotalSpace
   def currentUsage: Long = totalSize - configFile.toIO.getFreeSpace
 
-/** The storage devices loaded on this host.
+/** Runs only on the control thread. See HostThreading.scala.
+ *
+ *  The storage devices loaded on this host. Whoever changes `devices` calls DeviceControl.publishView afterwards.
  *
  *  tryLoadDevice is the only writer that adds entries in production. Entries are removed when a
  *  device is shut down and unloaded, so a lookup miss means a device that is not loaded right
  *  now: one never seen, one rejected by the load decision, or one unloaded by a shutdown. Tests
  *  inject entries directly via RecordingHost.injectLoadedDevice. */
-class LocalDevices(lock: AnyRef) extends Logging:
+class LocalDevices extends Logging:
   var devices: Map[StorageDeviceId, LocalStorageDeviceState] = Map()
-
-  def devicePath(id: StorageDeviceId): Option[os.Path] = devices.get(id).map(_.devicePath)
 
   /** Reclaims the store copy a transfer just delivered onto a device that turned out to be
    *  tombstoned.
@@ -38,7 +38,7 @@ class LocalDevices(lock: AnyRef) extends Logging:
    */
   def discardStoreDirectory(storeId: StoreId,
                             deviceId: StorageDeviceId,
-                            reason: String): Unit = lock.synchronized {
+                            reason: String): Unit =
     devices.get(deviceId) match
       case None =>
         // The operation completed on a device this process never loaded, or one a shutdown has
@@ -57,4 +57,3 @@ class LocalDevices(lock: AnyRef) extends Logging:
               // The store is not loaded, so nothing serves it now. The cost of the leak is a
               // directory on a dead device that a restart would load and then never route to.
               logger.error(s"Failed to delete the discarded store copy $storePath. Error: $t")
-  }

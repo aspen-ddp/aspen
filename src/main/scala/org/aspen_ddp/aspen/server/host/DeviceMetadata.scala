@@ -47,6 +47,11 @@ trait DeviceMetadata:
 
   def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome]
 
+/** The real metadata reads and transactions. Deliberately off the control context: Host gives it the host's
+ *  general-purpose ExecutionContext, on which its transactions and their callbacks run, and each caller acts on the
+ *  returned Future through a control-context callback. It therefore touches no control state: what it needs is passed
+ *  in, and the functions passed in (`uncleanStores`, `crlLostStores`, `markRebuildRequired`, `gossipStoreOnline`)
+ *  read or write only disk, the client and the thread-safe GossipRetransmitter. */
 class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionContext)
   extends DeviceMetadata with Logging:
 
@@ -449,8 +454,8 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
    *  disk during its own check produces, and it cannot be staged through the real client,
    *  whose reads resolve on their own schedule.
    *
-   *  Called while holding the instance lock, so an override must return promptly rather than
-   *  block: the lock it holds is the one handleEvent takes.
+   *  Called on the control thread, so an override must return promptly rather than
+   *  block: that thread runs every handler (HostThreading.scala, rule 2).
    *
    *  May throw rather than return a failed Future. startDeviceCheck treats the two alike, so an
    *  override is free to do either.

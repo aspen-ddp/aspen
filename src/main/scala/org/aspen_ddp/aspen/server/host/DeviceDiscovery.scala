@@ -23,9 +23,9 @@ private[aspen] enum AdoptionClass:
   /** Its close did not finish: the device is refused. */
   case Unclean
 
-/** Finds the storage devices under `storage-devices/` and decides whether to load, restart, or adopt each.
+/** Runs only on the control thread. See HostThreading.scala.
  *
- *  Everything here runs on the host's event thread under the host's lock. */
+ *  Finds the storage devices under `storage-devices/` and decides whether to load, restart, or adopt each. */
 class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   import ctx.given
 
@@ -75,8 +75,8 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *
    *  Returns the devices this call loaded, so ScanDevices can check them at once.
    *
-   *  Mutual exclusion: the handleEvent calls hold the instance lock; the constructor call
-   *  precedes start(), so no event-loop thread exists yet.
+   *  Mutual exclusion: the handleEvent calls run on the control thread; the constructor call
+   *  precedes start(), so no control thread runs yet.
    */
   def checkForNewDevices(): List[StorageDeviceId] =
     if ! os.isDir(storageDevicesDir) then
@@ -114,8 +114,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  which shutdownMarkerResolved acts on from the event loop. Until then the directory is not
    *  in loadedDeviceDirs, so later scans reach it again; pendingMarkerResolutions keeps them from
    *  issuing a second lookup while this one is in flight.
-   *
-   *  Caller holds the instance lock.
    */
   private def resolveShutdownMarker(storageDevicePath: os.Path,
                                     sdCfg: StorageDeviceConfig,
@@ -148,8 +146,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *
    *  Every row that does nothing leaves the directory out of loadedDeviceDirs, so the next scan
    *  decides again from a fresh read: a restart or a finished shutdown is picked up that way.
-   *
-   *  Called from handleEvent, which holds the instance lock.
    */
   def handleMarkerResolved(e: Host.ShutdownMarkerResolved): Unit =
     val Host.ShutdownMarkerResolved(path, sdCfg, markerHost, result) = e
@@ -261,8 +257,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *
    *  The directory stays in pendingMarkerResolutions until the adoption has been acted on, so a
    *  scan arriving meanwhile does not start a second one.
-   *
-   *  Caller holds the instance lock.
    */
   private def tryAdoptDevice(path: os.Path,
                              sdCfg: StorageDeviceConfig,
@@ -284,24 +278,23 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                                      ctx.rebuilds.markRebuildRequired)
         catch case t: Throwable => Future.failed(t)
       fadopt.onComplete: result =>
-        ctx.lock.synchronized:
-          pendingResolutions -= path
-          result match
-            case Success(AdoptOutcome.Adopted(committed)) =>
-              try bringIntoService(path, sdCfg, committed, rewriteOwner = true)
-              catch case t: Throwable =>
-                // The adoption is committed, so the next scan reaching this directory takes the
-                // "Operational, owned here" row and runs these steps again.
-                logger.error(s"Adopted storage device $deviceId but failed to load it from $path. " +
-                             s"Will retry on the next scan. Error: $t")
-            case Success(AdoptOutcome.Changed) =>
-              logger.info(s"Storage device $deviceId changed state before it could be adopted. " +
-                          s"The next scan will look at it again")
-            case Success(AdoptOutcome.Unclean(stores)) =>
-              warnUnclean(path, deviceId, previousHostId, stores)
-            case Failure(t) =>
-              warnOnce(path, s"Failed to adopt storage device $deviceId at $path. Will retry on the " +
-                             s"next scan. Error: $t")
+        pendingResolutions -= path
+        result match
+          case Success(AdoptOutcome.Adopted(committed)) =>
+            try bringIntoService(path, sdCfg, committed, rewriteOwner = true)
+            catch case t: Throwable =>
+              // The adoption is committed, so the next scan reaching this directory takes the
+              // "Operational, owned here" row and runs these steps again.
+              logger.error(s"Adopted storage device $deviceId but failed to load it from $path. " +
+                           s"Will retry on the next scan. Error: $t")
+          case Success(AdoptOutcome.Changed) =>
+            logger.info(s"Storage device $deviceId changed state before it could be adopted. " +
+                        s"The next scan will look at it again")
+          case Success(AdoptOutcome.Unclean(stores)) =>
+            warnUnclean(path, deviceId, previousHostId, stores)
+          case Failure(t) =>
+            warnOnce(path, s"Failed to adopt storage device $deviceId at $path. Will retry on the " +
+                           s"next scan. Error: $t")
 
   /** The Offline entries of `state` in adoption class `cls`, by their directories under `path`. */
   def offlineStoresIn(path: os.Path,
@@ -346,8 +339,6 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  A failed marker removal in step 2 only leaves that store offline: the reconcile's
    *  abandoned-transfer-out pass picks it up on a later check. A failed step 3 leaves the whole
    *  device to the next scan.
-   *
-   *  Caller holds the instance lock.
    */
   private def bringIntoService(path: os.Path,
                                sdCfg: StorageDeviceConfig,
@@ -474,6 +465,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             // LoadStore events are already queued; tryLoadStore's own catch absorbs the
             // resulting duplicate-backend failures.
             ctx.devices.devices += sdCfg.storageDeviceId -> sds
+            ctx.publishView()
             loadedDirs += storageDevicePath -> sdCfg.storageDeviceId
             reportedDirs -= storageDevicePath
             Some(sdCfg.storageDeviceId)

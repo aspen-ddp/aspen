@@ -22,6 +22,7 @@ class SingleThreadThreading extends HostThreading with Logging:
 
   private val started = new AtomicBoolean(false)
   @volatile private var stopped = false
+  private val droppedWarned = new AtomicBoolean(false)
 
   private val thread = new Thread(() => loop(), "aspen-host-control")
 
@@ -34,6 +35,8 @@ class SingleThreadThreading extends HostThreading with Logging:
   private val enqueue: Executor = task =>
     if !stopped then
       queue.put(task)
+    else if droppedWarned.compareAndSet(false, true) then
+      logger.warn("Dropping work posted to the host's control thread after its shutdown. Later drops are not logged")
 
   override val control: ExecutionContext = ExecutionContext.fromExecutor(enqueue,
     cause => logger.error("Unhandled exception in a control-thread callback", cause))

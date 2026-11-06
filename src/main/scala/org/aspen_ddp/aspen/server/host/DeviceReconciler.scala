@@ -10,7 +10,9 @@ import scribe.Logging
 
 import scala.util.{Failure, Success}
 
-/** Reconciles each loaded device against the state recorded for it in the storage-devices tree, and owns the
+/** Runs only on the control thread. See HostThreading.scala.
+ *
+ *  Reconciles each loaded device against the state recorded for it in the storage-devices tree, and owns the
  *  bookkeeping that keeps one lookup per device in flight.
  *
  *  Metadata reads go through `ctx.metadata`; the load of a store goes through the adapter on `ctx`, so the seams on
@@ -23,11 +25,11 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
   private var scheduledRechecks: Set[StorageDeviceId] = Set()
   private var deferredChecks: Set[StorageDeviceId] = Set()
 
-  private[server] def activeDeviceChecks: Set[StorageDeviceId] = ctx.lock.synchronized(activeChecks)
+  private[server] def activeDeviceChecks: Set[StorageDeviceId] = activeChecks
 
-  private[server] def scheduledDeviceRechecks: Set[StorageDeviceId] = ctx.lock.synchronized(scheduledRechecks)
+  private[server] def scheduledDeviceRechecks: Set[StorageDeviceId] = scheduledRechecks
 
-  private[server] def deferredDeviceChecks: Set[StorageDeviceId] = ctx.lock.synchronized(deferredChecks)
+  private[server] def deferredDeviceChecks: Set[StorageDeviceId] = deferredChecks
 
   /** The CheckAllDevices event: discovers new devices, then checks every loaded one. */
   def checkAll(): Unit =
@@ -70,8 +72,6 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  reconciled, and its stores are being rebuilt elsewhere.
    *  A device the tree records as ShuttingDown (or Shutdown) is handed to shutDownDevice instead
    *  of any of the passes, so nothing new starts on a disk about to be shelved.
-   *
-   *  Callers hold the instance lock; the continuations it registers do not.
    */
   private def reconcileDeviceState(local: LocalStorageDeviceState,
                                    remote: StorageDeviceState): Unit =
@@ -268,11 +268,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
               // An attempt already asking the source's old host -- the source was shut down and
               // adopted since -- is pointed at the new one and asked again now, rather than at
               // the next retransmit.
-              ctx.lock.synchronized:
-                ctx.transfers.pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId).foreach: pt =>
-                  if ctx.transfers.readdressPendingTransfer(pt, fromDevice) then
-                    pt.lastSend = HLCTimestamp.now
-                    ctx.client.sendHostMessage(pt.msg)
+              ctx.transfers.pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId).foreach: pt =>
+                if ctx.transfers.readdressPendingTransfer(pt, fromDevice) then
+                  pt.lastSend = HLCTimestamp.now
+                  ctx.client.sendHostMessage(pt.msg)
               ctx.transfers.startIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId, transferId)
 
       //----------------------
@@ -288,17 +287,15 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  the next periodic check. At most one is scheduled per device; requests made meanwhile are
    *  covered by it.
    */
-  def scheduleDeviceRecheck(storageDeviceId: StorageDeviceId): Unit = ctx.lock.synchronized {
+  def scheduleDeviceRecheck(storageDeviceId: StorageDeviceId): Unit =
     if ! scheduledRechecks.contains(storageDeviceId) then
       scheduledRechecks += storageDeviceId
       ctx.scheduler.schedule(Host.TransferOutRecheckDelay)(runDeviceRecheck(storageDeviceId))
-  }
 
-  private[server] def runDeviceRecheck(storageDeviceId: StorageDeviceId): Unit = ctx.lock.synchronized {
+  private[server] def runDeviceRecheck(storageDeviceId: StorageDeviceId): Unit =
     if scheduledRechecks.contains(storageDeviceId) then
       scheduledRechecks -= storageDeviceId
       checkStorageDevice(storageDeviceId)
-  }
 
   /** Requests a check of one storage device.
    *
@@ -315,11 +312,10 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  lossy.
    */
   def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
-    ctx.lock.synchronized:
-      if activeChecks.contains(storageDeviceId) then
-        deferredChecks += storageDeviceId
-      else
-        startDeviceCheck(storageDeviceId)
+    if activeChecks.contains(storageDeviceId) then
+      deferredChecks += storageDeviceId
+    else
+      startDeviceCheck(storageDeviceId)
 
   /** Issues the one outstanding lookup for a device and acts on its result: a loaded device
    *  is reconciled against the tree, a device this process has not loaded -- never seen on disk,
@@ -328,8 +324,7 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  failed lookup is warned about. The guard entry is then released and any request deferred
    *  behind it re-dispatched.
    *
-   *  Caller holds the instance lock and has established that no check is active for this
-   *  device.
+   *  Caller has established that no check is active for this device.
    *
    *  Which of those two branches runs is decided when the lookup completes, not when it is
    *  issued. Runtime device discovery can load a device while its check is in flight, and a
@@ -339,15 +334,15 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    *  reconcileDeviceState's deleted-stores pass, which touches ids recorded in the device's
    *  own offlineStores set, which these never enter.
    *
-   *  The lookup is issued under the caller's lock and the callback re-takes it, so the whole
-   *  of reconcileDeviceState -- filesystem work included -- runs with the event loop stalled.
-   *  That same lock is what makes the load-state re-read safe: it is the one handleEvent
-   *  takes, so no device can be loading while the callback runs.
+   *  The lookup is issued on the control thread and the callback runs there too, so the whole
+   *  of reconcileDeviceState -- filesystem work included -- runs with the control thread busy.
+   *  That same thread is what makes the load-state re-read safe: every handler runs on it, so
+   *  no device can be loading while the callback runs.
    *
    *  It is also what keeps a deferral from being stranded. checkStorageDevice's deferral
-   *  write and this callback's release-and-read of the guard all happen under that one
-   *  instance monitor, so a colliding request either finds no active check and starts its
-   *  own, or records a deferral the in-flight check's endDeviceCheck is guaranteed to see.
+   *  write and this callback's release-and-read of the guard all happen on that one thread,
+   *  so a colliding request either finds no active check and starts its own, or records a
+   *  deferral the in-flight check's endDeviceCheck is guaranteed to see.
    *
    *  Releasing the guard is hostage to the lookup completing. The default
    *  lookupStorageDeviceState reads through the client, whose read driver retransmits with
@@ -391,8 +386,8 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
    */
   private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
     // Releases the guard and re-dispatches whatever was deferred behind it. Called from the
-    // callback's finally and from the synchronous-throw path below; both hold the instance
-    // lock. Nested rather than a method on the class because it has no other caller, and
+    // callback's finally and from the synchronous-throw path below; both run on the control
+    // thread. Nested rather than a method on the class because it has no other caller, and
     // because closing over storageDeviceId leaves the two call sites no way to disagree about
     // which device they are releasing.
     //
@@ -421,41 +416,40 @@ class DeviceReconciler(ctx: DeviceControl) extends Logging:
     lookup match
       case Success(pendingState) =>
         pendingState.onComplete: result =>
-          ctx.lock.synchronized:
-            try
-              result match
-                case Success(remote) =>
-                  // Load state re-read here, not at dispatch. See startDeviceCheck's scaladoc.
-                  ctx.devices.devices.get(storageDeviceId) match
-                    case Some(local) => reconcileDeviceState(local, remote)
-                    case None =>
-                      // A device not loaded right now: one that has not appeared on disk in this
-                      // process, one the load decision rejected, or one a shutdown unloaded.
-                      // Silence its stores rather than sending "UnknownStore".
-                      remote.stores.keysIterator.foreach: storeId =>
-                        ctx.router.markOffline(storeId)
+          try
+            result match
+              case Success(remote) =>
+                // Load state re-read here, not at dispatch. See startDeviceCheck's scaladoc.
+                ctx.devices.devices.get(storageDeviceId) match
+                  case Some(local) => reconcileDeviceState(local, remote)
+                  case None =>
+                    // A device not loaded right now: one that has not appeared on disk in this
+                    // process, one the load decision rejected, or one a shutdown unloaded.
+                    // Silence its stores rather than sending "UnknownStore".
+                    remote.stores.keysIterator.foreach: storeId =>
+                      ctx.router.markOffline(storeId)
 
-                // The lookup fails whenever the device has no entry in the storage-devices tree:
-                // a config written out-of-band naming an id that was never registered -- the
-                // supported path cannot produce this, since
-                // StorageDeviceManager.createStorageDevice commits the registration before
-                // writing the config file, so its orphan is the reverse one, a registration with
-                // no directory (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree
-                // entry removed after the fact, which no command does today. It also fails on any
-                // failure of the metadata read itself, transient or not, which is the only
-                // routinely reachable case.
-                //
-                // A copied or moved config is NOT one of these: its device is registered, so the
-                // lookup succeeds. A device carried to another host keeps its registration too, so
-                // a check of it there succeeds and takes the not-loaded branch above: it is not
-                // loaded there until adopted (its owning-host file names its old host).
-                case Failure(err) =>
-                  val what =
-                    if ctx.devices.devices.contains(storageDeviceId) then "storage device"
-                    else "never-loaded storage device"
-                  logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
-                              s"be registered in the storage-devices tree. Error: $err")
-            finally endDeviceCheck()
+              // The lookup fails whenever the device has no entry in the storage-devices tree:
+              // a config written out-of-band naming an id that was never registered -- the
+              // supported path cannot produce this, since
+              // StorageDeviceManager.createStorageDevice commits the registration before
+              // writing the config file, so its orphan is the reverse one, a registration with
+              // no directory (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree
+              // entry removed after the fact, which no command does today. It also fails on any
+              // failure of the metadata read itself, transient or not, which is the only
+              // routinely reachable case.
+              //
+              // A copied or moved config is NOT one of these: its device is registered, so the
+              // lookup succeeds. A device carried to another host keeps its registration too, so
+              // a check of it there succeeds and takes the not-loaded branch above: it is not
+              // loaded there until adopted (its owning-host file names its old host).
+              case Failure(err) =>
+                val what =
+                  if ctx.devices.devices.contains(storageDeviceId) then "storage device"
+                  else "never-loaded storage device"
+                logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
+                            s"be registered in the storage-devices tree. Error: $err")
+          finally endDeviceCheck()
 
       // A distinct message from the Failure(err) branch above, which explains itself with a
       // missing tree registration. True of a failed read; not necessarily true of a throw, which

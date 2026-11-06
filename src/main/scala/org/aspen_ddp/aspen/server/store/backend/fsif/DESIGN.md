@@ -140,7 +140,9 @@ rethrows, best effort, so the retry finds a blank directory (2.13).
   not every store's serial work. Tests pass one deterministic EC for both.
 - **ENOSPC retries** are scheduled on `SharedRetryScheduler` (one `fsif-retry` thread).
 - **Recovery runs synchronously in the constructor.** The host therefore runs the open or create on
-  `DefaultBackendOpener.FsifOpenEc` (cached `fsif-open-N` threads), never on its event thread (`Host.startFsifOpen`).
+  `DefaultBackendOpener.FsifOpenEc` (cached `fsif-open-N` threads), never on its control thread:
+  `StoreLoader.startFsifOpen`, called on the control thread, hands the open to `FsifOpenEc` and gets the outcome
+  back as a posted `FsifOpened`.
 - **Exceptions to "post and return":** `rebuildWrite` writes the segment on the calling thread and uses
   `onSerialSync` (`Await`) for its bookkeeping. `rebuildFlush` blocks the calling thread as well. Compaction's
   truncate of free tail slots runs inline on the serial executor (section 5).
@@ -372,10 +374,10 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 
 ### 2.13 Host integration
 
-- **Open and create** (`Host.startFsifOpen`, `fsifOpened`) run on `fsifOpenEc`. While an open runs, the store is
+- **Open and create** (`StoreLoader.startFsifOpen`, `handleFsifOpened`) run on `fsifOpenEc`. While an open runs, the store is
   in its device's `loadedStores` and in `fsifOpening`. A `ShutdownStore` that arrives meanwhile is deferred and
   replayed after the store is served.
-- **Outcomes** (`fsifOpened`):
+- **Outcomes** (`handleFsifOpened`):
 
   | Outcome | Host action |
   |---|---|
@@ -607,13 +609,13 @@ host after an upgrade, loses the whole pool, because the peers the rebuild needs
 away. This cannot be solved inside the backend: each store sees only its own files. See the `Backlog.txt` item
 "System-level protection against correlated 'lost store' declarations".
 
-Every case below runs without an operator. Line numbers are as of now.
+Every case below runs without an operator. Line numbers are as of now; host code is named by class and method.
 
 ### 4.1 Detected by FSIF recovery (`FsifRecovery.StoreLost`)
 
 All of these are thrown from `FsifBackend`'s constructor through `FsifBackend.open`. The host reaction is the same
-for each: `Host.fsifOpened` (Host.scala:1089-1100) logs, leaves the store offline, writes `rebuild-required`
-(`markRebuildRequired`, :2366), and calls `checkStorageDevice`. The `rebuild-required` marker is acted on as
+for each: `StoreLoader.handleFsifOpened` logs, leaves the store offline, writes `rebuild-required`
+(`StoreRebuilds.markRebuildRequired`), and calls `DeviceReconciler.checkStorageDevice`. The `rebuild-required` marker is acted on as
 described in 4.5. A plain `IOException` from the open is not a loss (4.6).
 
 | # | Trigger | Where (`store/backend/fsif/FsifRecovery.scala:recover` unless noted) | Why it is believed to mean loss | What a false trigger from a systemic bug looks like |
@@ -638,7 +640,7 @@ rebuild progress. A recovery bug of the L1-L12 kind would make every rebuild res
 
 ### 4.2 Detected at runtime by FSIF fail-stop (`onFatal`)
 
-Every fail-stop calls `onFatal` once. The host's `onFatal` posts `BackendFailed` (Host.scala:1165).
+Every fail-stop calls `onFatal` once. The host's `onFatal` posts `BackendFailed` (`StoreLoader.openBackend`).
 
 | # | Trigger | Where |
 |---|---|---|
@@ -664,30 +666,30 @@ correlated loss.
 
 **Host routes for `BackendFailed` and other failed-backend checks.** Each of these writes `rebuild-required`:
 
-- **Served store** (`Host.backendFailed`, :2437-2459, marker at :2449). The store is unloaded, its CRL state is
+- **Served store** (`StoreRebuilds.handleBackendFailed`, then `backendFailed`). The store is unloaded, its CRL state is
   dropped (`crl.closeStore`), it is marked and left offline, and the device is checked.
-- **Not served, not replaced, directory on a loaded device** (`backendFailed`, :2460-2471).
-- **Failed before its `LoadStore` ran** (`LoadStore` handler, :3814-3829, then `retireUnservedStore`, :2389).
-- **Opened but not served** (device unloaded or another backend serves it) **and failed** (`fsifOpened`,
-  :1076-1083).
-- **Failed during a `ShutdownStore` close** (:3928-3932, then `failedOnClose`, :2413-2427). The store is marked,
-  and the `crl_save.log` the close just wrote is **deleted**. `closeStoresForShutdown` (:2952-2966) then writes no
-  transfer-out marker, so an adopter sees `rebuild-required` and treats the store as CrlLost (L22).
-- **Transfer out** (`startStoreTransferOut` region, :1935-1974):
+- **Not served, not replaced, directory on a loaded device** (`StoreRebuilds.backendFailed`).
+- **Failed before its `LoadStore` ran** (`StoreLoader.handleLoad`, then `StoreRebuilds.retireUnserved`).
+- **Opened but not served** (device unloaded or another backend serves it) **and failed**
+  (`StoreLoader.handleFsifOpened`).
+- **Failed during a `ShutdownStore` close** (`StoreLoader.handleClose`, then `StoreRebuilds.failedOnClose`). The
+  store is marked, and the `crl_save.log` the close just wrote is **deleted**. `DeviceShutdown.closeStoresForShutdown`
+  then writes no transfer-out marker, so an adopter sees `rebuild-required` and treats the store as CrlLost (L22).
+- **Transfer out** (`StoreTransfers.startOut`):
   - a store already marked whose entry is TransferringOut is returned to rebuild (Ruling 25,
-    `returnLostTransferToRebuild`, :2001);
-  - a close that fails with `StoreFailedOnClose` is never shipped, and its transfer is aborted (:1949-1952);
-  - a store marked while it closed is likewise never shipped (:1969-1973).
+    `StoreTransfers.returnLostTransferToRebuild`);
+  - a close that fails with `StoreFailedOnClose` is never shipped, and its transfer is aborted;
+  - a store marked while it closed is likewise never shipped.
 
 ### 4.3 Host-level, backend-independent paths that apply to FSIF stores
 
 | # | Trigger | Where | What happens | Why believed | False trigger looks like |
 |---|---|---|---|---|---|
-| L20 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` rejects it (truncated, unparsable, or naming another store) | `LoadStore` handler, Host.scala:3818-3833, then `crlSaveFileLost` :2379 and `retireUnservedStore` :2389 | Closed unserved, marked, offline, device checked | The file is the only copy of the store's transaction state | A CRL save format change: every store with a save file (every store closed by a shutdown or transfer) is declared lost on its next load. **Generic: all backends** |
-| L21 | Adoption of a Shutdown device: an Offline store has a transfer-out marker but a missing or unusable `crl_save.log` | `adoptionClass`, :750-754; marked in `adoptDevice` :2655-2659; entry written Rebuilding in the same transaction (:2661-2663) | Adopted as Rebuilding, marked | Shutdown commits only after every close is forced, so the file was lost afterwards | A save-file read path that fails on the adopting host's version (format, or a path change in `Backend.crlSaveFile`): every store on every moved device. **Generic** |
-| L22 | Adoption: an Offline store's directory has `rebuild-required` | `adoptionClass`, :745-748 | CrlLost, so adopted Rebuilding | The previous host already marked it | Inherits whatever falsely marked it on the previous host. **Generic** |
+| L20 | `crl_save.log` exists but `CrashRecoveryLog.loadValidStoreState` rejects it (truncated, unparsable, or naming another store) | `StoreLoader.handleLoad`, then `StoreRebuilds.crlSaveFileLost` and `retireUnserved` | Closed unserved, marked, offline, device checked | The file is the only copy of the store's transaction state | A CRL save format change: every store with a save file (every store closed by a shutdown or transfer) is declared lost on its next load. **Generic: all backends** |
+| L21 | Adoption of a Shutdown device: an Offline store has a transfer-out marker but a missing or unusable `crl_save.log` | `DeviceDiscovery.adoptionClass`; marked in `DeviceMetadata.adoptDevice`; entry written Rebuilding in the same transaction | Adopted as Rebuilding, marked | Shutdown commits only after every close is forced, so the file was lost afterwards | A save-file read path that fails on the adopting host's version (format, or a path change in `Backend.crlSaveFile`): every store on every moved device. **Generic** |
+| L22 | Adoption: an Offline store's directory has `rebuild-required` | `DeviceDiscovery.adoptionClass` | CrlLost, so adopted Rebuilding | The previous host already marked it | Inherits whatever falsely marked it on the previous host. **Generic** |
 
-At LoadStore a *missing* `crl_save.log` is not a loss: it loads with no saved state (:3819-3822). A missing file
+At LoadStore a *missing* `crl_save.log` is not a loss: it loads with no saved state (`StoreLoader.handleLoad`). A missing file
 counts as loss only at adoption (L21), where a transfer-out marker shows that a close completed.
 
 ### 4.4 Count
@@ -701,15 +703,15 @@ In addition, the rebuild staging store is discarded on `StoreLost` (4.1, related
 
 ### 4.5 What happens after the mark
 
-1. `tryLoadStore` (Host.scala:989) never loads a directory with `rebuild-required`. It goes into
+1. `StoreLoader.tryLoadStore` never loads a directory with `rebuild-required`. It goes into
    `offlineStores`.
-2. The reconcile's Lost CRL State pass (:3073-3081) finds marked offline stores whose entry is Active and calls
-   `requestStoreRebuild` (:2483). That flips the entry to Rebuilding in a transaction, but only if the device is
+2. The reconcile's Lost CRL State pass (`DeviceReconciler.reconcileDeviceState`) finds marked offline stores whose
+   entry is Active and calls `StoreRebuilds.requestRebuild`. That flips the entry to Rebuilding in a transaction, but only if the device is
    not failed and is owned by this host.
-3. `startStoreRebuild` (:2127) calls `discardLostStore` (:2526) first. It moves the directory to
+3. `StoreRebuilds.startRebuild` calls `discardLostStore` first. It moves the directory to
    `<device>/discarded/<store>-<uuid>`, syncs the device directory, and **deletes it at once**
-   (`os.remove.all`). If the delete fails, the copy is removed by `tryLoadDevice` at the next device load, which
-   empties `discarded/` (:945-950).
+   (`os.remove.all`). If the delete fails, the copy is removed by `DeviceDiscovery.tryLoadDevice` at the next device
+   load, which empties `discarded/`.
 4. `RebuildingStore` rebuilds into `<device>/rebuilding/...` and moves it into place.
 
 So the store's content is gone as soon as the rebuild starts. The Backlog item proposes keeping it instead in
@@ -795,7 +797,7 @@ held, not failed, and complete once it clears" (L2 cannot be reached).
   after the last force began. A continuous stream of commits to X keeps `dirty` set, so the move never completes.
   It still holds f reserved and keeps t from being truncated. Nothing breaks: commits to X are acknowledged
   normally, and a copy-on-write, delete or re-allocation cancels the move.
-- **`bringIntoService` gossips early.** `Host.bringIntoService` (:870-872) gossips `StoreMoved`
+- **`bringIntoService` gossips early.** `DeviceDiscovery.bringIntoService` gossips `StoreMoved`
   (`gossipStoreOnline`) for every Active store right after `tryLoadDevice`. For FSIF stores the open is still
   running on `fsifOpenEc`, and it may yet find the store lost or out of space. The reinstated-transfer path waits
   for `onServed`, but this restart and adoption path does not.

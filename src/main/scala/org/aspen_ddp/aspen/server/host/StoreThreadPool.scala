@@ -48,7 +48,8 @@ class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()
   override def dispatch: Executor = inline
 
   override def assign(storeId: StoreId, deviceId: StorageDeviceId): StoreExecutor =
-    require(!placement.contains(storeId), s"$storeId is already assigned")
+    if placement.contains(storeId) then
+      throw HostThreading.AlreadyAssigned(storeId)
     if shut then
       // Never started, so no thread is left behind; work posted to it is dropped
       val dead = new SerialLoop(s"aspen-store-${loops.size}", daemon = true)

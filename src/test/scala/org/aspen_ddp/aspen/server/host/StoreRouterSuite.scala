@@ -16,7 +16,7 @@ import org.aspen_ddp.aspen.common.util.BackgroundTaskManager
 import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
-import org.aspen_ddp.aspen.server.store.backend.MapBackend
+import org.aspen_ddp.aspen.server.store.backend.{CompletionHandler, MapBackend}
 import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionStatusCache}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
@@ -87,6 +87,18 @@ object StoreRouterSuite:
         usedAfterClose.incrementAndGet()
       super.read(pointer)
 
+  /** A TrackingBackend whose completions are handed to `completer`, a thread of its own, as an FSIF or RocksDB
+   *  backend's arrive from their I/O threads. */
+  private class AsyncCompletingBackend(storeId: StoreId, dir: os.Path, completer: java.util.concurrent.Executor)
+    extends TrackingBackend(storeId, dir):
+    override def setCompletionHandler(handler: CompletionHandler): Unit =
+      super.setCompletionHandler(op => completer.execute(() => handler.complete(op)))
+
+  /** A TrackingBackend whose setCompletionHandler throws, failing a LoadStore after its executor is assigned. */
+  private class UnwirableBackend(storeId: StoreId, dir: os.Path) extends TrackingBackend(storeId, dir):
+    override def setCompletionHandler(handler: CompletionHandler): Unit =
+      throw new IllegalStateException("injected setCompletionHandler failure")
+
   /** An in-memory CRL whose loadStore waits for `gate`. */
   private class GatedCrl(gate: Future[Unit]) extends CrashRecoveryLog:
     private var states: Map[StoreId, Map[TransactionId, TransactionRecoveryState]] = Map()
@@ -155,6 +167,20 @@ object StoreRouterSuite:
       threading.controlEvents.execute(() => done.countDown())
       assert(done.await(Bound, TimeUnit.SECONDS))
 
+    /** Runs `f` on the control thread and returns its result. */
+    def onControl[T](f: => T): T =
+      val p = Promise[T]()
+      threading.controlEvents.execute(() => p.complete(scala.util.Try(f)))
+      Await.result(p.future, Duration(Bound, SECONDS))
+
+    /** A device whose loadedStores already holds `storeId`, as serveOpened leaves it before its LoadStore runs. */
+    def addDevice(storeId: StoreId): LocalStorageDeviceState = onControl:
+      val dir = os.temp.dir()
+      val sds = new LocalStorageDeviceState(deviceId, dir, dir / "device.cfg")
+      sds.loadedStores += storeId
+      ctx.devices.devices += deviceId -> sds
+      sds
+
     /** Returns once every task posted to `executor` before it has run. */
     def awaitExecutor(executor: StoreExecutor): Unit =
       val done = new CountDownLatch(1)
@@ -181,6 +207,19 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
     backend
 
   private def read(storeId: StoreId): Read = Read(storeId, clientId, UUID.randomUUID(), ptr, FullObject())
+
+  private def objectPtr(i: Int): DataObjectPointer = DataObjectPointer(ObjectId(new UUID(16, i)), poolId, Array[Byte]())
+
+  /** The load failed before its store was installed: nothing serves it, it is offline, its device no longer lists it
+   *  as loaded, and its backend is closed. */
+  private def assertAbandoned(fx: Fixture, s0: StoreId, sds: LocalStorageDeviceState, backend: TrackingBackend): Unit =
+    val (entry, offline, loaded, offlineInDevice) = fx.onControl:
+      (fx.ctx.router.entry(s0), fx.ctx.router.isOffline(s0), sds.loadedStores.contains(s0), sds.offlineStores.contains(s0))
+    entry should be(None)
+    offline should be(true)
+    loaded should be(false)
+    offlineInDevice should be(true)
+    backend.closed should be(true)
 
   test("close racing traffic gets offline handling"):
     val s0 = StoreId(poolId, 0)
@@ -305,3 +344,103 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.ctx.router.markReady()
       fx.ctx.router.deliverTx(prepare)
       fx.net.tx.asScala.toList.map(_._1) should be(List(TxUnknownStore(peer, unknown, txid)))
+
+  test("a load whose store fails to build is undone and the store can load again"):
+    val s0 = StoreId(poolId, 0)
+    withRouter(emptyCrl): fx =>
+      val sds = fx.addDevice(s0)
+      val failing = new UnwirableBackend(s0, os.temp.dir())
+      val err = intercept[IllegalStateException](await(fx.load(failing)))
+      err.getMessage should be("injected setCompletionHandler failure")
+      assertAbandoned(fx, s0, sds, failing)
+      // Its executor slot was released
+      fx.onControl(fx.threading.assignedCounts.sum) should be(0)
+
+      val backend = bootstrappedBackend(s0)
+      await(fx.load(backend))
+      fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(backend))
+      fx.onControl(fx.threading.assignedCounts.sum) should be(1)
+
+  test("a load while the store still holds an executor slot fails without freeing it"):
+    val s0 = StoreId(poolId, 0)
+    withRouter(emptyCrl): fx =>
+      val sds = fx.addDevice(s0)
+      // As a close still running leaves it: removed from the router, its slot not yet released
+      fx.onControl(fx.threading.assign(s0, deviceId))
+      val first = bootstrappedBackend(s0)
+      intercept[HostThreading.AlreadyAssigned](await(fx.load(first))) should be(HostThreading.AlreadyAssigned(s0))
+      assertAbandoned(fx, s0, sds, first)
+      // The slot is the earlier holder's, so the failed load left it in place
+      fx.onControl(fx.threading.assignedCounts.sum) should be(1)
+
+      fx.onControl(fx.threading.release(s0))
+      val second = bootstrappedBackend(s0)
+      await(fx.load(second))
+      fx.onControl(fx.ctx.router.entry(s0).map(_.store.backend)) should be(Some(second))
+      fx.onControl(fx.threading.assignedCounts.sum) should be(1)
+
+  test("completions from a backend's own thread: those posted before the close are delivered, later ones dropped"):
+    val s0 = StoreId(poolId, 0)
+    val PerBatch = 8
+    val completer = java.util.concurrent.Executors.newSingleThreadExecutor: r =>
+      val t = new Thread(r, "test-completer")
+      t.setDaemon(true)
+      t
+    def awaitCompleter(): Unit =
+      val done = new CountDownLatch(1)
+      completer.execute(() => done.countDown())
+      done.await(Bound, TimeUnit.SECONDS) should be(true)
+    try
+      withRouter(emptyCrl): fx =>
+        val backend = new AsyncCompletingBackend(s0, os.temp.dir(), completer)
+        fx.net.backend = Some(backend)
+        // One object per read: concurrent reads of one object share a single backend read
+        for i <- 0 until 2 * PerBatch do
+          backend.bootstrapAllocate(objectPtr(i).id, ObjectType.Data,
+            Metadata(rev0, ObjectRefcount(1, 1), HLCTimestamp(1)), DataBuffer(Array[Byte](7)))
+        await(fx.load(backend))
+        val executor = fx.ctx.router.entry(s0).get.executor
+        def readOf(i: Int): Read = Read(s0, clientId, UUID.randomUUID(), objectPtr(i), FullObject())
+
+        // The completer holds every completion until a gate opens: before = 0 until PerBatch, after = the rest
+        val gateBefore = new CountDownLatch(1)
+        val gateAfter = new CountDownLatch(1)
+        val beforePosted = new CountDownLatch(1)
+        completer.execute(() => { gateBefore.await(Bound, TimeUnit.SECONDS); () })
+        val before = (0 until PerBatch).map(readOf)
+        before.foreach(fx.ctx.router.deliverClient)
+        // Every read of the first batch has reached the backend, so its completion waits behind gateBefore
+        fx.awaitExecutor(executor)
+        completer.execute: () =>
+          beforePosted.countDown()
+          gateAfter.await(Bound, TimeUnit.SECONDS)
+          ()
+        val after = (PerBatch until 2 * PerBatch).map(readOf)
+        after.foreach(fx.ctx.router.deliverClient)
+        fx.awaitExecutor(executor)
+        fx.net.client.size should be(0)
+
+        // The store's executor is held, so the first batch's completions queue on it ahead of the close
+        val unblock = new CountDownLatch(1)
+        executor.execute(() => { unblock.await(Bound, TimeUnit.SECONDS); () })
+        gateBefore.countDown()
+        beforePosted.await(Bound, TimeUnit.SECONDS) should be(true)
+        val closed = fx.ctx.loader.closeStore(s0)
+        fx.awaitControl()
+        fx.ctx.router.entry(s0) should be(None)
+        unblock.countDown()
+        await(closed)
+        backend.closed should be(true)
+
+        // The second batch's completions are posted only now, after the close
+        gateAfter.countDown()
+        awaitCompleter()
+        fx.awaitExecutor(executor)
+
+        val answered = fx.net.client.asScala.toList.collect { case r: ReadResponse => r }
+        answered.map(_.readUUID).toSet should be(before.map(_.readUUID).toSet)
+        answered.size should be(PerBatch)
+        answered.forall(_.result.isRight) should be(true)
+        backend.usedAfterClose.get should be(0)
+        fx.net.sentAfterClose.get should be(0)
+    finally completer.shutdown()

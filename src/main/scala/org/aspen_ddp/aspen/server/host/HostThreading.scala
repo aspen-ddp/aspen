@@ -66,7 +66,8 @@ trait HostThreading:
   /** Binds a store being loaded to an executor. Called on the control thread.
    *  StoreThreadPool: a store thread with the fewest assigned stores, ties going to the lowest index; a new thread is
    *  created only when every existing one has a store and fewer than `maxThreads` exist. SingleThreadThreading and
-   *  Lockstep: runs the store's work inline on the thread that posts it. */
+   *  Lockstep: runs the store's work inline on the thread that posts it. StoreThreadPool throws AlreadyAssigned,
+   *  changing nothing, for a store whose earlier slot `release` has not freed yet (its close is still running). */
   def assign(storeId: StoreId, deviceId: StorageDeviceId): StoreExecutor
   /** Called on the control thread once a store's close has completed. StoreThreadPool: frees the store's slot on
    *  its thread; threads are never stopped before `shutdown`. */
@@ -79,6 +80,11 @@ trait HostThreading:
 trait StoreExecutor extends ExecutionContext
 
 object HostThreading extends Logging:
+  /** Thrown by `assign` for a store that still holds a slot: its earlier close has not called `release` yet. The
+   *  LoadStore handler fails that load with it. */
+  final case class AlreadyAssigned(storeId: StoreId)
+    extends Exception(s"store $storeId is already assigned to an executor: its earlier close has not released it")
+
   /** A posted task that names itself in the log line written when it throws. */
   trait Named extends Runnable:
     /** Must not throw: it is called inside the catch. */

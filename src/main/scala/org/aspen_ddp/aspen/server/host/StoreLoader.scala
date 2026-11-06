@@ -1,10 +1,11 @@
 package org.aspen_ddp.aspen.server.host
 
+import org.aspen_ddp.aspen.common.metadata.StorageDeviceId
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{Host, StoreConfig}
 import org.aspen_ddp.aspen.server.Host.{BackendFailed, FsifOpened, LoadStore, LoadStoreById, ShutdownStore,
   SpaceWait, StoreFailedOnClose, UnloadFailedStore}
-import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
+import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.Store
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -277,38 +278,81 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
       case Right(trs) =>
         val storeId = backend.storeId
         // A store loaded again over a loaded one replaces it on the same executor, as the map entry is replaced
-        val executor = router.entry(storeId) match
-          case Some(entry) => entry.executor
-          case None => ctx.threading.assign(storeId, storageDeviceId)
-        // Built, wired and set to await its CRL state here, on the control thread, before install publishes it: no
-        // other thread can reach it yet, and no message finds it missing once it is registered. Ownership passes to
-        // its executor at install (spec section 5, refined).
-        // The store's transaction drivers run on the host's ec, not the control context; they post back as messages
-        val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(storeId), ctx.net,
-          ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
-          Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
-        val entry = new StoreRouter.Entry(store, executor)
-        // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any
-        backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler(entry)))
-        // Its transactions are recreated, and its transaction messages handled, once the CRL holds them
-        if trs.isDefined then
-          store.frontend.awaitRecovery()
-        router.install(entry)
-
-        trs match
-          case None => p.success(())
-          case Some(trs) =>
-            ctx.crl.loadStore(storeId, trs).onComplete:
-              case Success(_) =>
-                // Recovered on the store's executor (StoreRouter.crlLoaded)
-                router.crlLoaded(store, backend.crlSaveFile, p)
+        val replacing = router.entry(storeId)
+        val executor = replacing match
+          case Some(entry) => Success(entry.executor)
+          case None => Try(ctx.threading.assign(storeId, storageDeviceId))
+        executor match
+          case Failure(err) =>
+            // HostThreading.AlreadyAssigned: an earlier close has not released its slot yet, and that slot is not
+            // this load's to free. assign made no placement, so there is nothing to release.
+            logger.error(s"Store $storeId cannot be loaded: no executor could be assigned to it. Error: $err")
+            abandonLoad(storageDeviceId, backend, replaced = false, err, p)
+          case Success(executor) =>
+            // Everything up to install may throw (the Store constructor, the backend's setCompletionHandler). The
+            // store is then not served, so the load is undone here rather than throwing out of the handler.
+            val built = Try:
+              // Built, wired and set to await its CRL state here, on the control thread, before install publishes
+              // it: no other thread can reach it yet, and no message finds it missing once it is registered.
+              // Ownership passes to its executor at install (spec section 5, refined).
+              // The store's transaction drivers run on the host's ec, not the control context; they post back as
+              // messages
+              val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(storeId), ctx.net,
+                ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
+                Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
+              val entry = new StoreRouter.Entry(store, executor)
+              // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any
+              backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler(entry)))
+              // Its transactions are recreated, and its transaction messages handled, once the CRL holds them
+              if trs.isDefined then
+                store.frontend.awaitRecovery()
+              entry
+            built match
               case Failure(err) =>
-                // The save file stays, so a restart tries again. Until then the store must
-                // not serve without the state the file holds.
-                logger.error(s"Failed to load the CRL state of store $storeId. Taking it " +
-                             s"offline. Error: $err")
-                ctx.post(UnloadFailedStore(storeId, store))
-                p.failure(err)
+                logger.error(s"Failed to build store $storeId. Not serving it. Error: $err")
+                if replacing.isEmpty then
+                  ctx.threading.release(storeId)
+                abandonLoad(storageDeviceId, backend, replacing.isDefined, err, p)
+              case Success(entry) =>
+                router.install(entry)
+                awaitCrlLoad(entry.store, trs, p)
+
+  /** A LoadStore that failed before its store was installed: closes `backend` unserved and fails `p`. Unless an
+   *  earlier store is still served in its place (`replaced`), the store is also left offline and dropped from its
+   *  device's loadedStores, undoing serveOpened. */
+  private def abandonLoad(storageDeviceId: StorageDeviceId, backend: Backend, replaced: Boolean, err: Throwable,
+                          p: Promise[Unit]): Unit =
+    val storeId = backend.storeId
+    if ! replaced then
+      router.markOffline(storeId)
+      ctx.devices.devices.get(storageDeviceId).foreach: sds =>
+        sds.loadedStores -= storeId
+        sds.offlineStores += storeId
+    try
+      backend.close().onComplete:
+        case Failure(t) => logger.warn(s"Failed to close the unserved backend of store $storeId: $t")
+        case Success(_) =>
+    catch case NonFatal(t) => logger.warn(s"Failed to close the unserved backend of store $storeId: $t")
+    p.tryFailure(err)
+
+  /** The rest of a LoadStore once its store is installed: completes `p` at once with no saved state, or once the CRL
+   *  holds `trs` and the store has recovered from it. */
+  private def awaitCrlLoad(store: Store, trs: Option[List[TransactionRecoveryState]], p: Promise[Unit]): Unit =
+    val storeId = store.storeId
+    trs match
+      case None => p.success(())
+      case Some(trs) =>
+        ctx.crl.loadStore(storeId, trs).onComplete:
+          case Success(_) =>
+            // Recovered on the store's executor (StoreRouter.crlLoaded)
+            router.crlLoaded(store, store.backend.crlSaveFile, p)
+          case Failure(err) =>
+            // The save file stays, so a restart tries again. Until then the store must
+            // not serve without the state the file holds.
+            logger.error(s"Failed to load the CRL state of store $storeId. Taking it " +
+                         s"offline. Error: $err")
+            ctx.post(UnloadFailedStore(storeId, store))
+            p.failure(err)
 
   /** Unloads a store whose CRL state failed to load, if it is still the one installed. Its close runs on its
    *  executor (closeUnloaded). */

@@ -1,7 +1,7 @@
 package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.client.{AspenClient, ObjectState as ClientObjectState}
-import org.aspen_ddp.aspen.common.metadata.{HostId, HostState, StorageDeviceId, StorageDeviceState}
+import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.network.*
 import org.aspen_ddp.aspen.common.objects.ObjectId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -234,15 +234,12 @@ class Host(val client: AspenClient,
   private[aspen] def gossipRetransmitter: GossipRetransmitter = services.gossipRetransmitter
 
   // Fires on a BackgroundTaskManager thread; the retransmit reads control state, so it is posted to the control thread
+  // Re-sends the StartStoreTransfer of every transfer in that has not yet completed and was last sent more than
+  // 30 s ago. See StoreTransfers.retransmitPendingStarts.
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
-    threading.controlEvents.execute(() => retransmitPendingStartTransfers())
+    threading.controlEvents.execute(() => transfers.retransmitPendingStarts())
 
   private def transfers = deviceControl.transfers
-
-  /** Re-sends the StartStoreTransfer of every transfer in that has not yet completed and was last
-   *  sent more than 30 s ago. See StoreTransfers.retransmitPendingStarts. */
-  private[aspen] def retransmitPendingStartTransfers(): Unit =
-    transfers.retransmitPendingStarts()
 
   // One dispatch step that posts each store's heartbeat to its executor
   private val heartbeatTask = backgroundTasks.schedulePeriodic(heartbeatPeriod) {
@@ -369,6 +366,7 @@ class Host(val client: AspenClient,
     heartbeatTask.cancel()
     systemTaskHeartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
+    deviceScanTask.cancel()
     repairService.cancel()
     shutdownPromise.future
   }

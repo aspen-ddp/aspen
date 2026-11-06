@@ -224,6 +224,9 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   - If the refcount of the object is set to zero, it is deleted
 
 ### Host threading model
+- The model deliberately departs from ordinary Scala Future usage: callbacks never run on a shared pool, and each
+  piece of state has a single owner thread (the control thread or one store's executor), actor-style. See the
+  scaladoc of `HostThreading.scala`
 - `HostThreading` (`server.host`) decides where a host's work runs. It is a `Host` constructor parameter, chosen in
   code (no config option). The default strategy, which `Main` passes, is `StoreThreadPool`: each store is bound to one
   store thread (`aspen-store-N`, daemon, single-threaded FIFO executor), created lazily, at most one per CPU

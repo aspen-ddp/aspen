@@ -30,6 +30,12 @@ gone (docs/superpowers/specs/2026-11-05-host-refactor-design.md). The next step 
 docs/host-threading-measurement.md; if "store commit (FsifBackend)" does not improve, record what its thread dumps
 show here as the next investigation.
 
+Host start: FSIF stores still recovering on `FsifOpenEc`, and devices awaiting a shutdown-marker lookup, answer
+TxUnknownStore/StoreNotFound until they are installed. Same as before the refactor, but StoreRouter's `ready` flag
+does not cover them, so every client retries elsewhere and drops its location cache for them. Matters for vdisk host
+restarts. Follow-up: mark such a store offline in the router from StoreLoader.startFsifOpen until it is installed (and
+likewise a device's stores while its marker lookup runs), so its traffic is dropped silently and retransmitted.
+
 HostObjectCache is one `synchronized` cache shared by every store; with stores on parallel threads it is the likely
 next contention point (see docs/superpowers/specs/2026-11-05-host-refactor-design.md).
 

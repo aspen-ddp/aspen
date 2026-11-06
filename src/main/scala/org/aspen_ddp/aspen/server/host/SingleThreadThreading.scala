@@ -10,6 +10,9 @@ import scala.concurrent.ExecutionContext
  *  posted through `control`, `controlEvents` and `dispatch`, one task at a time in posting order. Stores run inline,
  *  as their work already runs on that thread.
  *
+ *  It has no production user (`Main` passes StoreThreadPool). It is kept as a debugging and comparison option, to
+ *  run a host with all its work serialized on one thread, and for tests.
+ *
  *  Work posted before `start` waits for it. The thread is not a daemon: `shutdown` stops it once the work already
  *  queued has run, and anything posted after that is dropped. */
 class SingleThreadThreading extends HostThreading:

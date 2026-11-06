@@ -175,7 +175,8 @@ class TestNetwork(executionContext: ExecutionContext,
 
   private val smgrThreading: HostThreading = threading(executionContext)
 
-  /** Lockstep: the test drains the hosts' events (handleEvents). Otherwise the bootstrap host runs them itself. */
+  /** Whether the bootstrap host is lockstep, so the test drains its events (handleEvents). Otherwise it runs them
+   *  itself once started. */
   private val lockstep: Boolean = smgrThreading.isInstanceOf[LockstepThreading]
 
   private var readCounting = false
@@ -368,17 +369,19 @@ class TestNetwork(executionContext: ExecutionContext,
 
   var otestThreadId: Option[Long] = None
 
-  def handleEvents(): Unit = if lockstep then {
-    otestThreadId match
-      case None => otestThreadId = Some(Thread.currentThread().threadId())
-      case Some(testThreadId) =>
-        if testThreadId != Thread.currentThread().threadId() then
-          println(s"*********** Current thread ${Thread.currentThread().threadId()} != testThreadId $testThreadId")
-          printStack()
+  /** Drains every lockstep host's events. A host on any other threading runs its own, so it is left alone. */
+  def handleEvents(): Unit =
+    val lockstepHosts = allHosts.filter(_.threading.isInstanceOf[LockstepThreading])
+    if lockstepHosts.nonEmpty then
+      otestThreadId match
+        case None => otestThreadId = Some(Thread.currentThread().threadId())
+        case Some(testThreadId) =>
+          if testThreadId != Thread.currentThread().threadId() then
+            println(s"*********** Current thread ${Thread.currentThread().threadId()} != testThreadId $testThreadId")
+            printStack()
 
-    synchronized:
-      allHosts.foreach(_.testingOnlyHandleEvents())
-  }
+      synchronized:
+        lockstepHosts.foreach(_.testingOnlyHandleEvents())
 
   // process load store events
   smgr.testingOnlyHandleEvents()

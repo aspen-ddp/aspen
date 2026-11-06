@@ -186,7 +186,8 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    *  deleted-stores pass looks only at offlineStores and reconcileDeviceState ignores a failed
    *  device outright.
    *
-   *  Host's wrapper is protected so a test subclass can observe the returned Future; the production caller is
+   *  A test reaches it through the `Host.Seams` metadata seam (`metadata` or `wrapMetadata`), whose DeviceMetadata
+   *  can override it to observe the returned Future; the production caller is
    *  StoreTransfers.startIn.
    */
   def updateStateForTransferredStore(storeId: StoreId,
@@ -458,7 +459,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    *  Only a collision is retried, as everywhere else in Host: a permanent error would otherwise
    *  hold the device's pendingMarkerResolutions entry for the life of the process.
    *
-   *  Host's wrapper is protected so a test subclass can record the calls.
+   *  A test overrides it through the `Host.Seams` metadata seam (`metadata` or `wrapMetadata`) to record the calls.
    */
   def adoptDevice(storageDeviceId: StorageDeviceId,
                   previousHostId: HostId,
@@ -558,7 +559,7 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
 
   /** Reads the state recorded for `storageDeviceId` in the storage-devices tree.
    *
-   *  Host's wrapper is a seam so a test can hold a lookup in flight while the
+   *  The `Host.Seams` metadata seam lets a test override it to hold a lookup in flight while the
    *  device it names is loaded underneath it. That interleaving is what a device appearing on
    *  disk during its own check produces, and it cannot be staged through the real client,
    *  whose reads resolve on their own schedule.
@@ -573,9 +574,9 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
     client.getStorageDeviceState(storageDeviceId)
 
   /** Reads the source device of a transfer in, which the reconcile's TransferringIn pass re-reads
-   *  on every check so a source that has moved, shut down or failed is seen. Host's wrapper is a seam so
-   *  a test can tell when the read has been acted on, which is otherwise unobservable when the pass decides
-   *  not to start anything. */
+   *  on every check so a source that has moved, shut down or failed is seen. The `Host.Seams` metadata seam lets a
+   *  test override it to tell when the read has been acted on, which is otherwise unobservable when the pass
+   *  decides not to start anything. */
   def readTransferSourceState(fromDeviceId: StorageDeviceId): Future[StorageDeviceState] =
     client.getStorageDeviceState(fromDeviceId)
 
@@ -598,7 +599,8 @@ class ClientDeviceMetadata(control: => DeviceControl) extends DeviceMetadata wit
    *  Only a collision is retried. Nothing else would complete the future, and the device's
    *  shutdown guard would be held for the life of the process.
    *
-   *  Host's wrapper is protected so a test can run work between the stores closing and this transaction.
+   *  A test overrides it through the `Host.Seams` metadata seam to run work between the stores closing and this
+   *  transaction.
    */
   def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome] =
     client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision): tx =>

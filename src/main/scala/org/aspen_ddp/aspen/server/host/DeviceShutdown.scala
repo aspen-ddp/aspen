@@ -94,7 +94,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           logger.info(s"Stores on storage device $deviceId became Active during its shutdown. " +
                       s"Taking them offline and trying again")
           release()
-          ctx.host.checkStorageDevice(deviceId)
+          ctx.reconciler.checkStorageDevice(deviceId)
 
         case Success(ShutdownOutcome.Cancelled) =>
           // A restart arrived mid-shutdown. Removing shutdown.state lets the device load again
@@ -111,7 +111,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
             logger.error(s"Failed to remove ${DeviceMarkers.ShutdownStateFile} from " +
                          s"${local.devicePath}: $t")
           release()
-          ctx.host.checkStorageDevice(deviceId)
+          ctx.reconciler.checkStorageDevice(deviceId)
 
         case Failure(t) =>
           release()
@@ -221,7 +221,7 @@ class DeviceShutdown(ctx: DeviceControl) extends Logging:
           // marker or CRL file did not survive.
           if clean then
             DurableFiles.write(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile, "")
-          ctx.host.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
+          ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
     .map(_ => ())
 
   /** The stores closeStoresForShutdown picks. */

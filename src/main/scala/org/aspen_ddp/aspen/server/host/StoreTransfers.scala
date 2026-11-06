@@ -293,7 +293,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
     // commits, so nothing routes here before then anyway.
     val foutcome =
       try ctx.metadata.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid,
-                                                          ctx.host.gossipRetransmitter)
+                                                          ctx.services.gossipRetransmitter)
       catch case t: Throwable => Future.failed(t)
     foutcome.onComplete: outcome =>
       try
@@ -623,9 +623,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
                 // nudge handled before the marker above existed. No check would then ever see
                 // the marker beside the Active entry, leaving the store dark for a full
                 // checkStorageDevicePeriod while the tree counts it online.
-                ctx.host.scheduleDeviceRecheck(sourceDs.storageDeviceId)
+                ctx.reconciler.scheduleDeviceRecheck(sourceDs.storageDeviceId)
                 if wasLoaded then
-                  ctx.host.gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
+                  ctx.services.gossipRetransmitter.broadcast(StoreOffline(m.storeId, HLCTimestamp.now))
               catch
                 case t: Throwable =>
                   logger.warn(s"Failed to start transfer out of store ${m.storeId}, transfer " +
@@ -653,7 +653,7 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
             logger.warn(s"Failed to abort the transfer out of store $storeId for its rebuild. A retransmitted " +
                         s"request tries again. Error: $t")
           if ctx.devices.devices.get(sds.storageDeviceId).exists(_ eq sds) then
-            ctx.host.checkStorageDevice(sds.storageDeviceId)
+            ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
 
   /** Brings a store back online after its transfer out was abandoned rather than completed.
    *

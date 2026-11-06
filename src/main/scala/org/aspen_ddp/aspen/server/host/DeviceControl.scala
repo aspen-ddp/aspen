@@ -59,3 +59,5 @@ final class DeviceControl(val metadata: DeviceMetadata,
   lazy val transfers: StoreTransfers = new StoreTransfers(this)
   lazy val rebuilds: StoreRebuilds = new StoreRebuilds(this)
   lazy val shutdown: DeviceShutdown = new DeviceShutdown(this)
+  lazy val reconciler: DeviceReconciler = new DeviceReconciler(this)
+  lazy val services: HostServices = new HostServices(this)

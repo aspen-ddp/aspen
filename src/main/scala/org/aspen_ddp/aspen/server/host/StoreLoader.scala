@@ -176,7 +176,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
             logger.error(s"Failed to mark store $storeId for rebuild at $storePath: $t")
         // A device still being loaded is checked once it is registered.
         if registered then
-          ctx.host.checkStorageDevice(sds.storageDeviceId)
+          ctx.reconciler.checkStorageDevice(sds.storageDeviceId)
         created.foreach(_.tryFailure(e))
       case Failure(e) if FsifIo.isOutOfSpace(e) =>
         if create then

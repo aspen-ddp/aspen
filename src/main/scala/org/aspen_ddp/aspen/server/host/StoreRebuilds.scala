@@ -184,7 +184,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           settled.trySuccess(())
 
         def recheckAll(): Unit =
-          ctx.lock.synchronized(ctx.devices.devices.keys).foreach(ctx.host.checkStorageDevice)
+          ctx.lock.synchronized(ctx.devices.devices.keys).foreach(ctx.reconciler.checkStorageDevice)
 
         /** Every loaded device except the one this rebuild ran on.
          *
@@ -203,7 +203,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         def recheckOtherDevices(): Unit =
           ctx.lock.synchronized(ctx.devices.devices.keys)
             .filter(_ != local.storageDeviceId)
-            .foreach(ctx.host.checkStorageDevice)
+            .foreach(ctx.reconciler.checkStorageDevice)
 
         // Guard-map leak defense: invoke `complete` in a try/catch that substitutes Future.failed(t)
         // on throw, so that either way a Future exists and onComplete below is registered. That
@@ -223,7 +223,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
 
         // The pool already names this device, so peers would otherwise pick a store that cannot
         // answer until the rebuild completes
-        ctx.host.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
+        ctx.services.gossipRetransmitter.broadcast(StoreOffline(storeId, HLCTimestamp.now))
 
         completeFuture.onComplete:
           case Success(_) =>
@@ -373,7 +373,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
         // Offline for the life of this process either way. The next start finds the same
         // unusable state and lands here again.
         logger.error(s"Failed to mark store $storeId for rebuild at ${backend.path}: $t")
-    ctx.host.checkStorageDevice(storageDeviceId)
+    ctx.reconciler.checkStorageDevice(storageDeviceId)
 
   /** A store closed by ShutdownStore whose backend failed-stop meanwhile: its page-cache state can't be trusted, so
    *  it is rebuilt rather than treated as cleanly closed. Marked rebuild-required, and the CRL save file the close
@@ -393,7 +393,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       DurableFiles.remove(Backend.crlSaveFile(path))
     catch
       case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $path: $t")
-    ctx.host.checkStorageDevice(store.storageDeviceId)
+    ctx.reconciler.checkStorageDevice(store.storageDeviceId)
 
   /** An FSIF backend failed-stop: page-cache state can no longer be trusted, so the store is rebuilt. If it is
    *  served, it is unloaded as UnloadFailedStore does, its CRL state dropped (the rebuild discards the directory),
@@ -422,7 +422,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             logger.error(s"Failed to mark store $storeId for rebuild at ${store.backend.path}: $t")
         ctx.crl.closeStore(storeId).onComplete: _ =>
           store.close()
-        ctx.host.checkStorageDevice(store.storageDeviceId)
+        ctx.reconciler.checkStorageDevice(store.storageDeviceId)
       case served =>
         // Not served: its LoadStore is still queued (and retires it), it was replaced by a newer
         // backend, or it was closed. Unless replaced, its directory is marked, so a store closed
@@ -478,7 +478,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
           result match
             case Success(true) =>
               logger.info(s"Store $storeId on device $storageDeviceId is now Rebuilding")
-              ctx.host.checkStorageDevice(storageDeviceId)
+              ctx.reconciler.checkStorageDevice(storageDeviceId)
             case Success(false) => ()
             case Failure(t) =>
               logger.warn(s"Failed to mark store $storeId on device $storageDeviceId for rebuild. " +

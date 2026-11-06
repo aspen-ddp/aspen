@@ -188,7 +188,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
                   logger.info(s"Storage device $deviceId at $path was being shut down when this host " +
                               s"stopped. Loading it to finish the shutdown")
                   loadOwnedDevice(path, path / StorageDeviceConfig.configFilename, sdCfg)
-                    .foreach(ctx.host.checkStorageDevice)
+                    .foreach(ctx.reconciler.checkStorageDevice)
                 case DeviceStatus.Operational if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path has been restarted. Loading it")
                   bringIntoService(path, sdCfg, state, rewriteOwner = false)
@@ -372,7 +372,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       DeviceMarkers.removeShutdownState(path)
 
     tryLoadDevice(path).foreach: deviceId =>
-      ctx.host.checkStorageDevice(deviceId)
+      ctx.reconciler.checkStorageDevice(deviceId)
       active.keysIterator.foreach(ctx.host.gossipStoreOnlineSeam)
 
   /** Loads the device at `storageDevicePath` if this host owns it, returning its id when this

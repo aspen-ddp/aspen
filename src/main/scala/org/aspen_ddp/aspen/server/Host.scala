@@ -359,28 +359,13 @@ class Host(val client: AspenClient,
 
   protected def stores: Map[StoreId, Store] = deviceControl.router.loaded
 
-  private var activeDeviceChecks: Set[StorageDeviceId] = Set()
-  // Devices with a re-check waiting out TransferOutRecheckDelay. At most one each.
-  private var scheduledDeviceRechecks: Set[StorageDeviceId] = Set()
-  private var deferredDeviceChecks: Set[StorageDeviceId] = Set()
+  private def reconciler = deviceControl.reconciler
 
-  private val taskExecutorPromise: Promise[TaskExecutor] = Promise()
-  // Runs the DurableServices this host claims. Every host scans the services TKVL for unclaimed or expired
-  // entries, with its scan interval scaled by the known host count (net.knownHostCount) so the cluster as a whole
-  // scans about every 15 seconds however many hosts there are. See the DurableService scaladoc for details.
-  private val serviceExecutorPromise: Promise[SimpleDurableServiceExecutor] = Promise()
-  private val systemTaskRunnerPromise: Promise[SystemTaskRunner] = Promise()
-  private val poolUsageManager = new StoragePoolUsageManager(client)
-  private val deviceUsageManager = new StorageDeviceUsageManager(client)
-  private var usageUpdateTask: Option[ScheduledTask] = None
+  // Constructed here, as the retransmit task it schedules starts with the Host.
+  private val services = deviceControl.services
 
-  /** All StoreMoved and HostEndpointChanged gossip goes through here, so hosts that miss the
-   *  first broadcast still hear it from a retransmit. */
-  private[aspen] val gossipRetransmitter =
-    new GossipRetransmitter(GossipRetransmitter.stateFile(rootDir), net.broadcastGossip)
-
-  private val gossipRetransmitTask = backgroundTasks.schedulePeriodic(GossipRetransmitter.Period):
-    gossipRetransmitter.retransmit()
+  /** All StoreMoved and HostEndpointChanged gossip goes through here. See HostServices. */
+  private[aspen] def gossipRetransmitter: GossipRetransmitter = services.gossipRetransmitter
 
   private val pendingStartTask = backgroundTasks.schedulePeriodic(Duration(30, SECONDS)):
     retransmitPendingStartTransfers()
@@ -423,88 +408,9 @@ class Host(val client: AspenClient,
   events.put(CheckAllDevices())
   events.put(InitializeTaskExecutor())
 
-  private def initializeTaskExecutor(): Unit =
-    import scala.util.{Failure, Success}
+  def getTaskExecutor(): Future[TaskExecutor] = services.getTaskExecutor()
 
-    val hostPointerFuture = client.getHostPointer(hostId)
-
-    hostPointerFuture.onComplete:
-      case Success(hostPtr) =>
-        client.read(hostPtr).foreach: hostKvos =>
-          hostKvos.contents.get(HostState.TaskExecutorRootKey) match
-            case Some(vs) =>
-              val executorPtr = KeyValueObjectPointer(vs.value.bytes)
-              client.getStoragePool(Radicle.poolId).foreach: pool =>
-                val allocator = new PoolObjectAllocator(client, pool)
-                SimpleTaskExecutor(client, allocator, executorPtr).foreach: executor =>
-                  synchronized:
-                    taskExecutorPromise.success(executor)
-                    startUsageTracking(executor)
-                    val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks,
-                      hostCount = () => net.knownHostCount)
-                    serviceExecutorPromise.success(serviceExec)
-                    initializeSystemTaskRunner(executor)
-
-            case None =>
-              client.getStoragePool(Radicle.poolId).foreach: pool =>
-                val allocator = new PoolObjectAllocator(client, pool)
-
-                client.transactUntilSuccessful: tx =>
-                  given scala.concurrent.ExecutionContext = ec
-                  for
-                    executorRoot <- allocator.allocateKeyValueObject(Map())(using tx)
-                    currentHostKvos <- client.read(hostPtr)
-                  yield
-                    val reqs = List(DoesNotExist(HostState.TaskExecutorRootKey))
-                    val ops = List(Insert(HostState.TaskExecutorRootKey, executorRoot.toArray))
-                    tx.update(hostPtr, None, None, reqs, ops)
-                    executorRoot
-                .foreach: executorRoot =>
-                  SimpleTaskExecutor(client, allocator, executorRoot).foreach: executor =>
-                    synchronized:
-                      taskExecutorPromise.success(executor)
-                      startUsageTracking(executor)
-                      val serviceExec = new SimpleDurableServiceExecutor(client, hostId, backgroundTasks,
-                        hostCount = () => net.knownHostCount)
-                      serviceExecutorPromise.success(serviceExec)
-                      initializeSystemTaskRunner(executor)
-
-      case Failure(err) =>
-        // In test environments or when host is not yet registered, silently skip initialization
-        logger.debug(s"TaskExecutor initialization skipped: ${err.getMessage}")
-
-  private def initializeSystemTaskRunner(executor: TaskExecutor): Unit =
-    val servicesTkvl = TieredKeyValueList(client,
-      KVObjectRootManager(client, Radicle.ServicesTreeKey, client.radicle))
-    servicesTkvl.get(Key(SystemTaskExecutorService.ServiceUUID)).foreach:
-      case Some(vs) =>
-        val statePtr = ServiceEntry.decode(vs.value.bytes).statePointer
-        val runner = new SystemTaskRunner(client, statePtr, hostId, executor)
-        synchronized:
-          if !systemTaskRunnerPromise.isCompleted then
-            systemTaskRunnerPromise.success(runner)
-      case None =>
-        logger.debug("SystemTaskExecutorService not registered; system task runner not started")
-
-  private def startUsageTracking(executor: TaskExecutor): Unit =
-    poolUsageManager.setTaskExecutor(executor)
-
-    usageUpdateTask = Some(backgroundTasks.scheduleNonConcurrentPollingTask(
-      "store-usage-update", Duration(20, SECONDS)):
-      val (slist, dlist) =
-        synchronized:
-          (stores.valuesIterator.toList, storageDevices.valuesIterator.toList)
-      val fs = runSequentially(slist): store =>
-        poolUsageManager.updateStoreSize(store.storeId, store.estimateSize())
-      val fd = runSequentially(dlist): sds =>
-        deviceUsageManager.updateDeviceUsage(sds.storageDeviceId, sds.currentUsage, sds.totalSize)
-
-      Future.sequence(List(fs, fd))
-    )
-
-  def getTaskExecutor(): Future[TaskExecutor] = taskExecutorPromise.future
-
-  def getServiceExecutor(): Future[DurableServiceExecutor] = serviceExecutorPromise.future
+  def getServiceExecutor(): Future[DurableServiceExecutor] = services.getServiceExecutor()
 
   // protected so tests can subclass with a recording implementation instead of opening a
   // real RocksDB backend. `stores` and `storageDevices` are already protected.
@@ -580,54 +486,12 @@ class Host(val client: AspenClient,
                                                toDeviceid: StorageDeviceId): Future[TransferOutcome] =
     clientMetadata.updateStateForTransferredStore(storeId, fromDeviceId, toDeviceid, gossipRetransmitter)
 
-  /** Makes this host's HostState endpoint match the configured one, gossiping
-   *  HostEndpointChanged once the change has committed.
-   *
-   *  Completes false, with no transaction, when the stored endpoint already matches. Completes
-   *  true after a committed update. A failure is logged and retried every 5 seconds in the
-   *  background; the returned Future reflects only the first attempt, so callers must not
-   *  depend on it to start the host.
-   */
+  /** Makes this host's HostState endpoint match the configured one. See HostServices.reconcileEndpoint. */
   def reconcileEndpoint(address: String,
                         dataPort: Int,
                         httpPort: Int,
                         storeTransferPort: Int): Future[Boolean] =
-    def attempt(): Future[Boolean] =
-      readHostStateForEndpoint().flatMap: hs =>
-        if hs.address == address && hs.dataPort == dataPort &&
-           hs.httpPort == httpPort && hs.storeTransferPort == storeTransferPort then
-          Future.successful(false)
-        else
-          client.transactUntilSuccessful: tx =>
-            for
-              hostPtr <- client.getHostPointer(hostId)
-              kvos <- client.read(hostPtr)
-            yield
-              val current = HostState(kvos)
-              tx.update(hostPtr, None, None,
-                List(KeyRevision(HostState.StateKey, kvos.contents(HostState.StateKey).revision)),
-                List(Insert(HostState.StateKey,
-                  current.copy(address = address, dataPort = dataPort, httpPort = httpPort,
-                               storeTransferPort = storeTransferPort).encode())))
-              tx
-          // The committed transaction's timestamp is the new HostState value's
-          .flatMap(_.result)
-          .map: timestamp =>
-            logger.info(s"Host endpoint updated to $address:$dataPort")
-            gossipRetransmitter.broadcast(
-              HostEndpointChanged(hostId, address, dataPort, httpPort, storeTransferPort, timestamp))
-            true
-
-    // Each call is one attempt; a failed one logs and schedules another. The result is the
-    // attempt it was called for, so the first call's Future reflects only the first attempt.
-    def run(): Future[Boolean] =
-      val result = attempt()
-      result.failed.foreach: err =>
-        logger.warn(s"Failed to reconcile host endpoint, retrying in 5 seconds: $err")
-        scheduleEndpointRetry(run())
-      result
-
-    run()
+    services.reconcileEndpoint(address, dataPort, httpPort, storeTransferPort)
 
   /** Test seam: the read that decides whether the endpoint needs updating. */
   protected def readHostStateForEndpoint(): Future[HostState] = clientMetadata.readHostStateForEndpoint()
@@ -635,6 +499,9 @@ class Host(val client: AspenClient,
   /** Test seam: runs a failed reconcileEndpoint attempt's retry after the retry delay. */
   protected def scheduleEndpointRetry(fn: => Unit): Unit =
     backgroundTasks.schedule(Duration(5, SECONDS))(fn)
+
+  /** Lets HostServices reach the scheduleEndpointRetry seam. */
+  private[server] def scheduleEndpointRetrySeam(fn: => Unit): Unit = scheduleEndpointRetry(fn)
 
   private def discardStoreDirectory(storeId: StoreId,
                                     deviceId: StorageDeviceId,
@@ -662,14 +529,7 @@ class Host(val client: AspenClient,
   // protected as a test seam, so a test can see that it was called without a readable pool
   private[server] def gossipStoreOnlineSeam(storeId: StoreId): Unit = gossipStoreOnline(storeId)
 
-  protected def gossipStoreOnline(storeId: StoreId): Unit =
-    val onlineTimestamp = HLCTimestamp.now
-    client.getStoragePoolStateAndTimestamp(storeId.poolId).onComplete:
-      case Success((poolState, timestamp)) =>
-        val hostId = poolState.stores(storeId.poolIndex).hostId
-        gossipRetransmitter.broadcast(StoreMoved(storeId, hostId, timestamp, onlineTimestamp))
-      case Failure(err) =>
-        logger.warn(s"Failed to read pool ${storeId.poolId} to gossip that store $storeId is online: $err")
+  protected def gossipStoreOnline(storeId: StoreId): Unit = services.gossipStoreOnline(storeId)
 
   /** Adopts a Shutdown device from its previous host. See ClientDeviceMetadata.adoptDevice.
    *
@@ -732,424 +592,6 @@ class Host(val client: AspenClient,
    */
   protected def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome] =
     clientMetadata.completeDeviceShutdown(storageDeviceId)
-
-  /** Reconciles a loaded device's on-disk state against the state recorded for it in the
-   *  storage-devices tree: deletes stores transferred away, flips stores whose CRL state was lost
-   *  to Rebuilding, reinstates stores left offline by an abandoned transfer out, creates
-   *  Initializing stores, and starts transfers in.
-   *
-   *  If the tree records a different host, none of that happens and the device is not claimed.
-   *  tryLoadDevice only loads a device whose `owning-host` file names this host, so a mismatch
-   *  means the file and the tree disagree -- a hand-edited or copied file, or a device adopted
-   *  by another host and then carried back here without a shutdown (an adoption itself rewrites
-   *  the file only after its commit, while shutdown.state still keeps the device unloaded) --
-   *  and reconciling against another host's records could delete or create
-   *  stores that are not ours. It is logged once per device and left for an operator.
-   *  A device the tree records as failed is ignored outright: it is neither claimed nor
-   *  reconciled, and its stores are being rebuilt elsewhere.
-   *  A device the tree records as ShuttingDown (or Shutdown) is handed to shutDownDevice instead
-   *  of any of the passes, so nothing new starts on a disk about to be shelved.
-   *
-   *  Callers hold the instance lock; the continuations it registers do not.
-   */
-  private def reconcileDeviceState(local: LocalStorageDeviceState,
-                                   remote: StorageDeviceState): Unit =
-    if remote.isFailed then
-      // An operator has declared this device dead. Its directory can still mount -- a dead
-      // controller rather than a dead platter -- and its zeroed host id must not be mistaken for
-      // another owner by the branch below. Its stores are being rebuilt elsewhere.
-      logger.info(s"Ignoring failed storage device ${local.storageDeviceId}")
-    else if remote.hostId != hostId then
-      deviceControl.discovery.warnOnce(local.devicePath, s"Storage device ${local.storageDeviceId} owned by host ${remote.hostId} " +
-                                 s"is loaded here. Not claiming it")
-    else if remote.status == StorageDeviceState.DeviceStatus.ShuttingDown ||
-            remote.status == StorageDeviceState.DeviceStatus.Shutdown ||
-            deviceControl.shutdown.isShuttingDown(local.storageDeviceId) then
-      // None of the passes below run: each would start work on a device about to be shelved.
-      // A store transferred away meanwhile keeps its directory until the device is next
-      // reconciled while Operational, here or on an adopting host.
-      //
-      // That includes an Operational read while a shutdown is still in flight -- the restart's
-      // own nudge, typically. The in-flight sequence ends in Cancelled and checks the device
-      // again once its own work has stopped, and that check runs the passes. shutDownDevice
-      // itself does nothing then, as the guard is held.
-      deviceControl.shutdown.shutDownDevice(local, remote)
-    else
-      //----------------------
-      // Deleted Stores
-      //
-      local.offlineStores.filter(storeId =>
-        !remote.stores.contains(storeId)
-      ).foreach: storeId =>
-        deviceControl.router.clearOffline(storeId)
-        local.offlineStores -= storeId
-        // Dropped from loadedStores too, or a later shutdown would take this store for one still
-        // open (it is no longer in offlineStores) and fail writing a marker into a deleted
-        // directory on every attempt.
-        local.loadedStores -= storeId
-        val storePath = local.devicePath / storeId.directoryName
-        if os.exists(storePath) then
-          logger.info(s"Deleting successfully transferred store $storePath")
-          try
-            os.remove.all(storePath)
-          catch
-            case t: Throwable => logger.error(s"Failed to delete store $storePath. Error: $t")
-
-      //----------------------
-      // Lost CRL State
-      //
-      // A store marked rebuild-required (crlSaveFileLost, or an adoption) whose entry still
-      // reads Active is flipped to Rebuilding; the Rebuilding pass below then discards its
-      // directory and rebuilds it. Before the abandoned-transfers-out pass, which would
-      // otherwise take a marked store left behind a transfer-out marker for one to reinstate.
-      val lostCrl = local.offlineStores.filter(storeId =>
-        os.exists(local.devicePath / storeId.directoryName / RebuildingStore.RebuildRequiredMarkerFile))
-      lostCrl.foreach: storeId =>
-        if remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) then
-          deviceControl.rebuilds.requestRebuild(local.storageDeviceId, storeId)
-
-      //----------------------
-      // Abandoned Transfers Out
-      //
-      // Nothing else ever clears a transfer-out marker from the source. StoreTransfers.startIn
-      // deletes it only from the destination's unpacked copy, and a transfer that completes
-      // normally has the source's whole store directory deleted by the pass above -- the marker
-      // goes with it. So a transfer that ends without completing, which is what a destination
-      // declared failed mid-flight produces, strands the marker forever, and tryLoadStore re-reads
-      // it on every restart and puts the store straight back into offlineStores.
-      //
-      // That pairs badly with the metadata repair for the same event. That repair puts this
-      // entry back to Active and leaves the pool naming this device, so afterwards the metadata
-      // reads entirely healthy while the slice is served by nobody, here or anywhere. Repairing
-      // the metadata alone would trade a visibly stalled TransferringOut entry for an invisible
-      // outage.
-      //
-      // On the source host's own poll rather than inline at either repair site, because only
-      // this host can touch this disk and one of those two sites -- the drain -- runs wherever
-      // the durable task happens to live. Polling for desired state rather than being told is
-      // also what the rest of this method does.
-      //
-      // The guard is narrow on purpose. Active *and* no transferDevice is the only combination
-      // that says no transfer is outstanding; an entry still TransferringOut, or Active with a
-      // destination still named, means the marker is doing its job. isTransferringOut is the
-      // same question asked of this process rather than the tree, and covers the window where
-      // the drain restores the entry while this host is still shipping bytes.
-      //
-      // A store still sending is left alone but re-checked shortly. An abort's nudge usually
-      // arrives while the send is still running, and the send ends (the destination cancels its
-      // receive) with nothing to prompt another check for a full checkStorageDevicePeriod.
-      val (stillSending, abandonedOut) = (local.offlineStores -- lostCrl).filter(storeId =>
-        remote.stores.get(storeId).exists(entry =>
-          entry.status == StorageDeviceState.StoreStatus.Active && entry.transferDevice.isEmpty
-        ) &&
-        os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferOutMarkerFile)
-      ).partition(storeTransferService.isTransferringOut)
-      abandonedOut.foreach: storeId =>
-        transfers.reinstateAbandonedOut(local, storeId)
-      if stillSending.nonEmpty then
-        scheduleDeviceRecheck(local.storageDeviceId)
-
-      //----------------------
-      // Completed Transfers In
-      //
-      // A crash between the pool update committing and the transferred-in marker's removal
-      // leaves an Active entry naming this device over a copy that tryLoadStore skips. The entry
-      // is no longer TransferringIn, so StoreTransfers.startIn never sees it, and nothing else
-      // removes the marker. Active is the tree's word that the pool now names this device, so
-      // the copy is ours to load. transferringIn covers the window where this process's own
-      // metadata step has committed but has not yet removed the marker itself.
-      local.offlineStores.filter(storeId =>
-        !transfers.transferringIn.contains(storeId) &&
-        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.Active) &&
-        os.exists(local.devicePath / storeId.directoryName / StoreTransfer.TransferredInMarkerFile)
-      ).foreach: storeId =>
-        val storePath = local.devicePath / storeId.directoryName
-        logger.warn(s"Store $storeId on device ${local.storageDeviceId} is Active but still " +
-                    s"carries its transferred-in marker. Completing the transfer and loading the store")
-        if transfers.clearTransferredInMarker(storeId, storePath) then
-          tryLoadStore(local, storePath)
-
-      //----------------------
-      // New Stores
-      //
-      remote.stores.filter((storeId, entry) =>
-        entry.status == StorageDeviceState.StoreStatus.Initializing
-      ).map( (storeId, _) =>
-        storeId
-      ).foreach: storeId =>
-        deviceControl.rebuilds.createNewStore(local, storeId)
-
-      //----------------------
-      // Aborted Transfers In
-      //
-      // An abort removes this device's TransferringIn entry and tells nobody, so this check is the
-      // only thing that learns of it. Left alone, an attempt still waiting on bytes keeps
-      // retransmitting its request and holds the store in transferringIn, which would make the
-      // pass below skip a later transfer of the same store. Before that pass for that reason.
-      // An attempt past promotion is not covered here; updateStateForTransferredStore sees the
-      // abort in the source's entry instead.
-      val trackedTransfersIn =
-        transfers.pendingStartTransfers.valuesIterator
-          .filter(_.toDeviceId == local.storageDeviceId)
-          .map(p => (p.msg.storeId, p.msg.fromDevice)).toList ++
-        transfers.transferInRetries.iterator
-          .filter((_, r) => r.toDeviceId == local.storageDeviceId)
-          .map((storeId, r) => (storeId, r.fromDeviceId)).toList
-      trackedTransfersIn.filterNot((storeId, fromDeviceId) =>
-        remote.stores.get(storeId).exists(entry =>
-          entry.status == StorageDeviceState.StoreStatus.TransferringIn &&
-          entry.transferDevice.contains(fromDeviceId))
-      ).foreach: (storeId, fromDeviceId) =>
-        transfers.dropAbandonedTransferIn(storeId, fromDeviceId, local.storageDeviceId)
-
-      // The same store can be re-targeted at another device of this host. transferringIn is keyed
-      // by store, so the earlier attempt would block the new one until its own device's next
-      // check noticed the abort. This device's entry is the newer word on who receives the store,
-      // so the other device's attempt is dropped here instead of a poll later.
-      val retargeted =
-        transfers.pendingStartTransfers.valuesIterator
-          .filter(_.toDeviceId != local.storageDeviceId)
-          .map(p => (p.msg.storeId, p.msg.fromDevice, p.toDeviceId)).toList ++
-        transfers.transferInRetries.iterator
-          .filter((_, r) => r.toDeviceId != local.storageDeviceId)
-          .map((storeId, r) => (storeId, r.fromDeviceId, r.toDeviceId)).toList
-      retargeted.filter((storeId, _, _) =>
-        remote.stores.get(storeId).exists(_.status == StorageDeviceState.StoreStatus.TransferringIn)
-      ).foreach: (storeId, fromDeviceId, toDeviceId) =>
-        transfers.dropAbandonedTransferIn(storeId, fromDeviceId, toDeviceId)
-
-      //----------------------
-      // Transferring In Stores
-      //
-      remote.stores.filter { (storeId, entry) =>
-        entry.status == StorageDeviceState.StoreStatus.TransferringIn
-      }.map { (storeId, status) =>
-        (storeId, status.transferDevice, status.transferId)
-      }.toList.foreach: (storeId, ofromDeviceId, transferId) =>
-        ofromDeviceId.foreach: fromDeviceId =>
-          readTransferSourceState(fromDeviceId).foreach: fromDevice =>
-            if fromDevice.isFailed then
-              // A tombstoned source has both ids zeroed, so fromDevice.hostId is HostId(0,0).
-              // Starting the transfer would address every StartStoreTransfer to a host that
-              // does not exist; the messages are dropped, the entry never resolves, and this
-              // check re-sends them forever. Nothing reports the stall either: rebalancing's
-              // ownedStores filters TransferringIn out of its accounting, so the store is
-              // invisible to the rebalancer too.
-              transfers.abandonIn(local.storageDeviceId, storeId, fromDeviceId)
-            else if ! fromDevice.isOperational then
-              // The source is shutting down or shut down, and its host refuses to send. The
-              // transfer stays pending: the next check of this device reads the source again,
-              // owner included, so a source adopted by another host is asked there.
-              logger.info(s"Not starting the transfer in of store $storeId onto device " +
-                          s"${local.storageDeviceId}: source device $fromDeviceId is " +
-                          s"${fromDevice.status}. Retrying on a later check")
-            else
-              // An attempt already asking the source's old host -- the source was shut down and
-              // adopted since -- is pointed at the new one and asked again now, rather than at
-              // the next retransmit.
-              synchronized:
-                transfers.pendingStartTransfers.get(storeId).filter(_.msg.fromDevice == fromDeviceId).foreach: pt =>
-                  if transfers.readdressPendingTransfer(pt, fromDevice) then
-                    pt.lastSend = HLCTimestamp.now
-                    client.sendHostMessage(pt.msg)
-              transfers.startIn(storeId, fromDevice.hostId, fromDeviceId, local.storageDeviceId, transferId)
-
-      //----------------------
-      // Rebuilding Stores
-      //
-      remote.stores.filter((_, entry) =>
-        entry.status == StorageDeviceState.StoreStatus.Rebuilding
-      ).keys.toList.sortBy(_.poolIndex).foreach: storeId =>
-        deviceControl.rebuilds.startRebuild(local, storeId)
-
-  /** Checks `storageDeviceId` again after TransferOutRecheckDelay, so a store left offline behind
-   *  a transfer-out marker is reinstated soon after an aborted transfer's send ends rather than at
-   *  the next periodic check. At most one is scheduled per device; requests made meanwhile are
-   *  covered by it.
-   */
-  private[server] def scheduleDeviceRecheck(storageDeviceId: StorageDeviceId): Unit = synchronized {
-    if ! scheduledDeviceRechecks.contains(storageDeviceId) then
-      scheduledDeviceRechecks += storageDeviceId
-      backgroundTasks.schedule(TransferOutRecheckDelay)(runDeviceRecheck(storageDeviceId))
-  }
-
-  private def runDeviceRecheck(storageDeviceId: StorageDeviceId): Unit = synchronized {
-    if scheduledDeviceRechecks.contains(storageDeviceId) then
-      scheduledDeviceRechecks -= storageDeviceId
-      checkStorageDevice(storageDeviceId)
-  }
-
-  /** Requests a check of one storage device.
-   *
-   *  At most one lookup per device is outstanding at a time. A request arriving while one is
-   *  in flight is deferred rather than dropped: dropping it costs a full
-   *  checkStorageDevicePeriod -- Main.CheckStorageDevicesPeriod in production, an hour at
-   *  present -- which is the same cost as losing the notification message outright. At most
-   *  one deferral is held per device, so this still throttles the pile-up of checks that
-   *  builds up over an offline period.
-   *
-   *  One deferral suffices because a check is a reconcile, not a delta: it re-reads the
-   *  storage-devices tree and acts on whatever that says, so a single re-run subsumes any
-   *  number of requests coalesced into it. That is what makes a Set correct here rather than
-   *  lossy.
-   */
-  private[server] def checkStorageDevice(storageDeviceId: StorageDeviceId): Unit =
-    synchronized:
-      if activeDeviceChecks.contains(storageDeviceId) then
-        deferredDeviceChecks += storageDeviceId
-      else
-        startDeviceCheck(storageDeviceId)
-
-  /** Issues the one outstanding lookup for a device and acts on its result: a loaded device
-   *  is reconciled against the tree, a device this process has not loaded -- never seen on disk,
-   *  rejected by the load decision, or unloaded by a shutdown -- has its stores
-   *  added to offlineStores so they stay silent rather than answering UnknownStore, and a
-   *  failed lookup is warned about. The guard entry is then released and any request deferred
-   *  behind it re-dispatched.
-   *
-   *  Caller holds the instance lock and has established that no check is active for this
-   *  device.
-   *
-   *  Which of those two branches runs is decided when the lookup completes, not when it is
-   *  issued. Runtime device discovery can load a device while its check is in flight, and a
-   *  branch chosen at dispatch time would then mark a loaded device's stores offline --
-   *  re-adding ids that tryLoadStore and the LoadStore handler have just removed, and that
-   *  nothing removes again: the only other site that clears offlineStores is
-   *  reconcileDeviceState's deleted-stores pass, which touches ids recorded in the device's
-   *  own offlineStores set, which these never enter.
-   *
-   *  The lookup is issued under the caller's lock and the callback re-takes it, so the whole
-   *  of reconcileDeviceState -- filesystem work included -- runs with the event loop stalled.
-   *  That same lock is what makes the load-state re-read safe: it is the one handleEvent
-   *  takes, so no device can be loading while the callback runs.
-   *
-   *  It is also what keeps a deferral from being stranded. checkStorageDevice's deferral
-   *  write and this callback's release-and-read of the guard all happen under that one
-   *  instance monitor, so a colliding request either finds no active check and starts its
-   *  own, or records a deferral the in-flight check's endDeviceCheck is guaranteed to see.
-   *
-   *  Releasing the guard is hostage to the lookup completing. The default
-   *  lookupStorageDeviceState reads through the client, whose read driver retransmits with
-   *  exponential backoff and imposes no timeout, so an unreachable pool holds this device's
-   *  guard for the whole outage while the deferral coalesces everything arriving meanwhile
-   *  into one re-check. That is intended, and it is what "one lookup in flight" amounts to in
-   *  production.
-   *
-   *  The entry must be released on four exit paths: both outcomes of the lookup, a throw out of
-   *  the callback body, and a throw from lookupStorageDeviceState itself. The first three are
-   *  the finally. The fourth cannot be -- a throw before the Future exists means no callback is
-   *  ever registered and so no finally ever runs -- hence the wrapper around the lookup call,
-   *  which treats such a throw as a failed lookup. Releasing on fewer than all four would skip
-   *  every later check of that device for the life of the process.
-   *
-   *  The callback-body path is not hypothetical: the reconcile touches the filesystem and
-   *  issues transactions, so it can throw. It and the synchronous throw are both covered by
-   *  HostDeviceDiscoverySuite.
-   *
-   *  Treating a synchronous throw as a failed lookup rather than letting it propagate leaves
-   *  this method with no non-fatal synchronous throw path, and that is what makes
-   *  endDeviceCheck's re-dispatch safe: a call that cannot throw cannot replace an exception
-   *  already unwinding out of the try body, which is how a reconcileDeviceState failure used to
-   *  be lost. Not literally none: the onComplete registration below sits outside the wrapper and
-   *  does rethrow if the ExecutionContext throws a fatal, which no real thread-pool EC does.
-   *
-   *  Totality also keeps the CheckAllDevices sweep whole. That handler iterates storageDevices
-   *  and calls this method per device with nothing catching in between, so a propagating throw
-   *  would abandon every device after the throwing one until the next period -- an hour in
-   *  production. No test covers that, and a refactor reintroducing a throw here would lose it
-   *  silently.
-   *
-   *  The wrapper is scoped to the lookup call and not to the onComplete registration, but not
-   *  for the reason one might expect. Widening it would not catch a non-fatal throw out of the
-   *  callback body even under an inline or parasitic ExecutionContext: Future's
-   *  Transformation.run absorbs those and routes them to reportFailure, so onComplete returns
-   *  normally. What a wider scope would catch is a fatal throw, turning it into a logged
-   *  warning. What the narrow scope gives up is an ExecutionContext that rejects the submission
-   *  or accepts it and never runs the callback: either still leaks the entry, and neither is
-   *  guarded here.
-   */
-  private def startDeviceCheck(storageDeviceId: StorageDeviceId): Unit =
-    // Releases the guard and re-dispatches whatever was deferred behind it. Called from the
-    // callback's finally and from the synchronous-throw path below; both hold the instance
-    // lock. Nested rather than a method on the class because it has no other caller, and
-    // because closing over storageDeviceId leaves the two call sites no way to disagree about
-    // which device they are releasing.
-    //
-    // The deferral flag is cleared before the re-dispatch, not after, and the order is enforced
-    // by HostDeviceDiscoverySuite rather than argued. Clearing after recurses an extra
-    // frame whenever the re-dispatched lookup throws synchronously -- the nested call absorbs
-    // its own throw and re-enters here with the flag still set -- which needs no inline or
-    // parasitic ExecutionContext to reach. The callback-body test catches it as a third lookup
-    // attempt.
-    def endDeviceCheck(): Unit =
-      activeDeviceChecks -= storageDeviceId
-      if deferredDeviceChecks.contains(storageDeviceId) then
-        deferredDeviceChecks -= storageDeviceId
-        startDeviceCheck(storageDeviceId)
-
-    activeDeviceChecks += storageDeviceId
-
-    // Deliberately around the lookup call alone and not the onComplete registration below; the
-    // scaladoc has why. Throwable rather than NonFatal is also deliberate: the re-dispatch
-    // safety argument needs this method to be total, so do not condense to Try(...), which
-    // would narrow the catch to NonFatal and reopen the leak for a fatal throw.
-    val lookup =
-      try Success(lookupStorageDeviceState(storageDeviceId))
-      catch case t: Throwable => Failure(t)
-
-    lookup match
-      case Success(pendingState) =>
-        pendingState.onComplete: result =>
-          synchronized:
-            try
-              result match
-                case Success(remote) =>
-                  // Load state re-read here, not at dispatch. See startDeviceCheck's scaladoc.
-                  storageDevices.get(storageDeviceId) match
-                    case Some(local) => reconcileDeviceState(local, remote)
-                    case None =>
-                      // A device not loaded right now: one that has not appeared on disk in this
-                      // process, one the load decision rejected, or one a shutdown unloaded.
-                      // Silence its stores rather than sending "UnknownStore".
-                      remote.stores.keysIterator.foreach: storeId =>
-                        deviceControl.router.markOffline(storeId)
-
-                // The lookup fails whenever the device has no entry in the storage-devices tree:
-                // a config written out-of-band naming an id that was never registered -- the
-                // supported path cannot produce this, since
-                // StorageDeviceManager.createStorageDevice commits the registration before
-                // writing the config file, so its orphan is the reverse one, a registration with
-                // no directory (see the ConfigWriteFailed advice in the cmdline Main) -- or a tree
-                // entry removed after the fact, which no command does today. It also fails on any
-                // failure of the metadata read itself, transient or not, which is the only
-                // routinely reachable case.
-                //
-                // A copied or moved config is NOT one of these: its device is registered, so the
-                // lookup succeeds. A device carried to another host keeps its registration too, so
-                // a check of it there succeeds and takes the not-loaded branch above: it is not
-                // loaded there until adopted (its owning-host file names its old host).
-                case Failure(err) =>
-                  val what =
-                    if storageDevices.contains(storageDeviceId) then "storage device"
-                    else "never-loaded storage device"
-                  logger.warn(s"Failed to read state for $what $storageDeviceId. It may not " +
-                              s"be registered in the storage-devices tree. Error: $err")
-            finally endDeviceCheck()
-
-      // A distinct message from the Failure(err) branch above, which explains itself with a
-      // missing tree registration. True of a failed read; not necessarily true of a throw, which
-      // an override is free to raise after reads have already gone out.
-      //
-      // The throwable is passed rather than interpolated, as the event loop's catch-all does and
-      // unlike the read failures above. A read failure is a reachable outcome that its message
-      // fully explains; a throw here is a bug on the dispatch path, where the class and message
-      // alone can amount to a bare "java.lang.NullPointerException" naming no location. Before
-      // the wrapper existed such a throw reached that catch-all and was logged with its stack,
-      // so dropping it would make this a diagnostic downgrade.
-      case Failure(err) =>
-        logger.warn(s"Lookup of state for storage device $storageDeviceId threw instead of " +
-                    s"returning a pending read", err)
-        endDeviceCheck()
 
   def containsStore(storeId: StoreId): Boolean = synchronized {
     logger.trace(s"********* CONTAINS STORE: ${storeId}: ${stores.contains(storeId)}. Stores: ${stores}")
@@ -1217,14 +659,11 @@ class Host(val client: AspenClient,
     events.put(Exit())
     // Lets the event loop's thread exit once it has handled Exit; it is not a daemon thread.
     threadPool.shutdown()
-    serviceExecutorPromise.future.foreach(_.shutdown())
-    systemTaskRunnerPromise.future.foreach(_.shutdown())
+    services.shutdown()
     pendingStartTask.cancel()
-    gossipRetransmitTask.cancel()
     heartbeatTask.cancel()
     systemTaskHeartbeatTask.cancel()
     checkStorageDeviceTask.cancel()
-    usageUpdateTask.foreach(_.cancel())
     repairService.cancel()
     shutdownPromise.future
   }
@@ -1317,15 +756,15 @@ class Host(val client: AspenClient,
 
   /** Testing hook: the devices with a re-check waiting out TransferOutRecheckDelay. */
   private[aspen] def testingOnlyScheduledDeviceRechecks: Set[StorageDeviceId] =
-    synchronized(scheduledDeviceRechecks)
+    reconciler.scheduledDeviceRechecks
 
   /** Testing hook: runs every scheduled device re-check now rather than after its delay. */
   private[aspen] def testingOnlyRunDeviceRechecks(): Unit =
-    synchronized(scheduledDeviceRechecks).foreach(runDeviceRecheck)
+    reconciler.scheduledDeviceRechecks.foreach(reconciler.runDeviceRecheck)
 
   /** Testing hook: the storage devices with a state lookup currently in flight. */
   private[aspen] def testingOnlyActiveDeviceChecks: Set[StorageDeviceId] =
-    synchronized(activeDeviceChecks)
+    reconciler.activeDeviceChecks
 
   /** Testing hook: the stores currently marked offline. */
   /** Whether a store awaiting space holds a real onServed callback; None if it is not awaiting space */
@@ -1337,7 +776,7 @@ class Host(val client: AspenClient,
 
   /** Testing hook: devices with a check request deferred behind an in-flight lookup. */
   private[aspen] def testingOnlyDeferredDeviceChecks: Set[StorageDeviceId] =
-    synchronized(deferredDeviceChecks)
+    reconciler.deferredDeviceChecks
 
   private def handleEvent(event: Event): Unit = synchronized {
     event match {
@@ -1350,17 +789,8 @@ class Host(val client: AspenClient,
 
       case HostMsg(msg) => msg match
         case m: StartStoreTransfer => transfers.startOut(m)
-        case m: CheckStorageDevice =>
-          // A device id we do not know may simply be one that has appeared on disk since
-          // our last scan -- create-storage-device sends this message as a discovery nudge
-          // for exactly that case -- so rescan before concluding the device is not ours.
-          if ! storageDevices.contains(m.deviceId) then
-            deviceControl.discovery.checkForNewDevices()
-          checkStorageDevice(m.deviceId)
-        case m: ServiceMessage =>
-          serviceExecutorPromise.future.foreach(_.deliverMessage(m))
-        case m: ExecuteSystemTask =>
-          systemTaskRunnerPromise.future.foreach(_.receive(m))
+        case m: CheckStorageDevice => reconciler.handleCheckMessage(m)
+        case m: (ServiceMessage | ExecuteSystemTask) => services.deliver(m)
       
       case Repair(storeId, os, completion) => deviceControl.router.repair(storeId, os, completion)
 
@@ -1393,28 +823,17 @@ class Host(val client: AspenClient,
         deviceControl.router.heartbeat()
 
       case SystemTaskHeartbeatEvent() =>
-        if systemTaskRunnerPromise.isCompleted then
-          systemTaskRunnerPromise.future.foreach(_.heartbeat())
+        services.systemTaskHeartbeat()
 
-      case CheckAllDevices() =>
-        // Discover first so a device found by this scan is checked within the same event
-        // and its Initializing stores are created now rather than a period from now.
-        deviceControl.discovery.checkForNewDevices()
-        storageDevices.valuesIterator.foreach: sds =>
-          checkStorageDevice(sds.storageDeviceId)
+      case CheckAllDevices() => reconciler.checkAll()
 
       case e: ShutdownMarkerResolved =>
         deviceControl.discovery.handleMarkerResolved(e)
 
-      case ScanDevices() =>
-        // Local only: listing the directory reads nothing over the network. A device this scan
-        // loads is checked at once, as CheckAllDevices would, so its Initializing stores are
-        // created now rather than up to checkStorageDevicePeriod from now.
-        deviceControl.discovery.checkForNewDevices().foreach(checkStorageDevice)
-        deviceControl.loader.retryStoresAwaitingSpace()
+      case ScanDevices() => reconciler.scan()
 
       case InitializeTaskExecutor() =>
-        initializeTaskExecutor()
+        services.initializeTaskExecutor()
 
       case e: ShutdownStore =>
         deviceControl.loader.handleClose(e)

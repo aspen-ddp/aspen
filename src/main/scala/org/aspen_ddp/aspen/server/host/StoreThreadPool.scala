@@ -14,7 +14,7 @@ import scala.concurrent.ExecutionContext
  *    routes it straight to the store's executor without a hop through the control thread.
  *  - Store threads, `aspen-store-N`, are daemon threads created lazily: `assign` adds one only when every existing
  *    thread already has a store and fewer than `maxThreads` exist, so a host never runs more store threads than it
- *    has loaded stores. Otherwise the store goes to the thread with the fewest assigned stores, ties going to the
+ *    has ever had stores loaded at once. Otherwise the store goes to the thread with the fewest assigned stores, ties going to the
  *    lowest index. `release` frees the store's slot; threads are never stopped before `shutdown`.
  *
  *  A store thread starts as soon as `assign` creates it rather than waiting for `start`: `assign` is called on the
@@ -22,7 +22,11 @@ import scala.concurrent.ExecutionContext
  *
  *  The placement bookkeeping is read and written only by `assign` and `release`, which are called on the control
  *  thread (or a test's thread), so it needs no lock. `loops` is volatile only because `shutdown` may be called from
- *  another thread. */
+ *  another thread.
+ *
+ *  Control tasks queued before `shutdown` still run after it, and one of them may load a store. `assign` then returns
+ *  a loop that is already shut down, so the store's work is dropped (with SerialLoop's warning) and no thread is left
+ *  running that nothing would stop. */
 class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()) extends HostThreading:
   require(maxThreads >= 1, s"maxThreads must be at least 1: $maxThreads")
 
@@ -30,6 +34,7 @@ class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()
 
   private val inline: Executor = task => task.run()
 
+  @volatile private var shut = false
   @volatile private var loops = Vector.empty[SerialLoop]
   /** Stores assigned to each loop, by loop index. */
   private var counts = Vector.empty[Int]
@@ -41,18 +46,28 @@ class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()
   override def dispatch: Executor = inline
 
   override def assign(storeId: StoreId, deviceId: StorageDeviceId): StoreExecutor =
-    val index =
-      if counts.forall(_ >= 1) && loops.size < maxThreads then
-        val loop = new SerialLoop(s"aspen-store-${loops.size}", daemon = true)
-        loop.start()
-        loops = loops :+ loop
-        counts = counts :+ 0
-        loops.size - 1
-      else
-        counts.indices.minBy(i => (counts(i), i))
-    counts = counts.updated(index, counts(index) + 1)
-    placement += storeId -> index
-    loops(index)
+    require(!placement.contains(storeId), s"$storeId is already assigned")
+    if shut then
+      // Never started, so no thread is left behind; work posted to it is dropped
+      val dead = new SerialLoop(s"aspen-store-${loops.size}", daemon = true)
+      dead.shutdown()
+      dead
+    else
+      val index =
+        if counts.forall(_ >= 1) && loops.size < maxThreads then
+          val loop = new SerialLoop(s"aspen-store-${loops.size}", daemon = true)
+          loop.start()
+          loops = loops :+ loop
+          // A shutdown racing this assign: it either saw the new loop in `loops` or is seen here (both volatile)
+          if shut then
+            loop.shutdown()
+          counts = counts :+ 0
+          loops.size - 1
+        else
+          counts.indices.minBy(i => (counts(i), i))
+      counts = counts.updated(index, counts(index) + 1)
+      placement += storeId -> index
+      loops(index)
 
   override def release(storeId: StoreId): Unit =
     placement.get(storeId).foreach: index =>
@@ -62,6 +77,7 @@ class StoreThreadPool(maxThreads: Int = Runtime.getRuntime.availableProcessors()
   override def start(): Unit = controlLoop.start()
 
   override def shutdown(): Unit =
+    shut = true
     controlLoop.shutdown()
     loops.foreach(_.shutdown())
 

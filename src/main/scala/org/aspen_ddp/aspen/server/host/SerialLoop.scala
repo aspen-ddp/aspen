@@ -9,7 +9,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  logged by `HostThreading.runLogged` and the loop continues.
  *
  *  The thread starts on `start`; work posted before then waits for it. `shutdown` stops the thread once the work
- *  already queued has run, and anything posted after that is dropped, with a warning the first time. */
+ *  already queued has run, and anything posted after that is dropped, with a warning the first time. A post that races
+ *  `shutdown` may instead land behind the stop and be dropped without the warning. `shutdown` before `start` never
+ *  starts the thread, so work queued before it never runs. */
 class SerialLoop(name: String, daemon: Boolean) extends StoreExecutor with Executor with Logging:
   private val queue = new LinkedBlockingQueue[Runnable]()
 

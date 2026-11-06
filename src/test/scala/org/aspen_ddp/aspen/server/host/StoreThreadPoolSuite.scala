@@ -7,7 +7,7 @@ import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
 import java.util.UUID
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, TimeUnit}
 import scala.jdk.CollectionConverters.*
 
@@ -37,17 +37,18 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
 
   test("least-loaded placement"):
     withPool(2): t =>
-      val s1 = t.assign(store(1), Device)
-      t.assign(store(2), Device)
+      t.assign(store(1), Device)
+      val s2 = t.assign(store(2), Device)
       t.assign(store(3), Device)
-      t.release(store(1))
+      t.assignedCounts should be(Vector(2, 1))
+      t.release(store(2))
+      // Lowest-index placement would choose loop 0
       val s4 = t.assign(store(4), Device)
-      (s4 eq s1) should be(true)
-      // s3 and s4 on one loop, s2 on the other
+      (s4 eq s2) should be(true)
       t.assignedCounts should be(Vector(2, 1))
 
   test("release frees a slot for the next store"):
-    withPool(1): t =>
+    withPool(4): t =>
       for _ <- 0 until 100 do
         t.assign(store(1), Device)
         t.release(store(1))
@@ -102,3 +103,27 @@ class StoreThreadPoolSuite extends AnyFunSuite with Matchers:
       ex.execute(() => throw new RuntimeException("expected by the test"))
       ex.execute(() => ran.countDown())
       ran.await(10, TimeUnit.SECONDS) should be(true)
+
+  private def liveStoreThreads(): Set[Thread] =
+    Thread.getAllStackTraces.keySet.asScala.filter(th => th.isAlive && th.getName.startsWith("aspen-store-")).toSet
+
+  test("assign after shutdown leaves no live store thread and drops the store's work"):
+    val t = new StoreThreadPool(4)
+    t.start()
+    val before = liveStoreThreads()
+    val release = new CountDownLatch(1)
+    val assigned = new CountDownLatch(1)
+    val ran = new AtomicInteger(0)
+    // Holds the control thread so the assigning task is still queued when shutdown is called
+    t.controlEvents.execute(() => { release.await(10, TimeUnit.SECONDS); () })
+    t.controlEvents.execute: () =>
+      t.assign(store(1), Device).execute(() => ran.incrementAndGet())
+      assigned.countDown()
+    t.shutdown()
+    release.countDown()
+    assigned.await(10, TimeUnit.SECONDS) should be(true)
+    // Directly, too
+    t.assign(store(2), Device).execute(() => ran.incrementAndGet())
+    (liveStoreThreads() -- before) should be(empty)
+    t.threadCount should be(0)
+    ran.get should be(0)

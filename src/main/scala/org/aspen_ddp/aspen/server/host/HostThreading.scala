@@ -41,7 +41,8 @@ object HostThreading extends Logging:
     /** Must not throw: it is called inside the catch. */
     def name: String
 
-  /** Runs one posted task, logging and swallowing anything it throws.
+  /** Runs one posted task, logging and swallowing anything it throws. Production only: LockstepThreading lets a
+   *  throw propagate to the test.
    *
    *  Swallowing and continuing is deliberate even though Aspen is crash-only: a single poisoned task must not take
    *  down an otherwise-healthy host, and tasks run one at a time with no loop state carried between them. Left to
@@ -65,7 +66,8 @@ object HostThreading extends Logging:
           case _ => task.getClass.getSimpleName
         logger.error(s"Unhandled exception processing event $name", t)
 
-  /** Runs each task on the calling thread, which is already the one the store belongs on. */
+  /** Runs each task on the calling thread, which is already the one the store belongs on. A throw propagates to the
+   *  caller: the task that posted it, which SingleThreadThreading's loop logs, or a lockstep drain. */
   private[host] object InlineStoreExecutor extends StoreExecutor:
-    override def execute(runnable: Runnable): Unit = runLogged(runnable)
+    override def execute(runnable: Runnable): Unit = runnable.run()
     override def reportFailure(cause: Throwable): Unit = logger.error("Unhandled exception in a store task", cause)

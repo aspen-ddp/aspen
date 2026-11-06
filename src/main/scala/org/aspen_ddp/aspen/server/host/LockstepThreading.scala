@@ -12,6 +12,8 @@ import scala.jdk.CollectionConverters.*
  *  ExecutionContext. That keeps the ordering the integration suites have always seen. Stores run inline on whatever
  *  thread posts to them, which is the draining thread.
  *
+ *  Unlike production, a throwing task is not logged and swallowed: it propagates out of `drain` to the test.
+ *
  *  Thread-safe to post to from any thread; draining may be re-entered from a task that is itself being drained. */
 class LockstepThreading(ec: ExecutionContext) extends HostThreading:
   private val queue = new LinkedBlockingQueue[Runnable]()
@@ -27,11 +29,13 @@ class LockstepThreading(ec: ExecutionContext) extends HostThreading:
   /** Nothing to stop: work still queued runs if a test drains again, as before the host had a threading. */
   override def shutdown(): Unit = ()
 
-  /** Runs queued tasks, including any they post, until the queue is empty. */
+  /** Runs queued tasks, including any they post, until the queue is empty. A task's exception is not caught: it
+   *  propagates to the caller and every later task stays queued for the next drain, as testingOnlyHandleEvents
+   *  always behaved. */
   def drain(): Unit =
     var task = queue.poll()
     while task != null do
-      HostThreading.runLogged(task)
+      task.run()
       task = queue.poll()
 
   def hasQueued: Boolean = !queue.isEmpty

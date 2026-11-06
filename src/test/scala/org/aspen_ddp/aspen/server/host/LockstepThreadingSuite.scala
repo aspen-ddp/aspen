@@ -49,10 +49,14 @@ class LockstepThreadingSuite extends AnyFunSuite with Matchers:
     exec.execute(() => ranOn = Some(Thread.currentThread))
     ranOn should be(Some(Thread.currentThread))
 
-  test("a throwing task does not stop the queue"):
+  test("a throwing task propagates from drain and later tasks stay queued"):
     val t = threading
+    val boom = new RuntimeException("expected by the test")
     var ran = false
-    t.dispatch.execute(() => throw new RuntimeException("expected by the test"))
+    t.dispatch.execute(() => throw boom)
     t.dispatch.execute(() => ran = true)
+    val thrown = intercept[RuntimeException](t.drain())
+    thrown should be theSameInstanceAs boom
+    ran should be(false)
     t.drain()
     ran should be(true)

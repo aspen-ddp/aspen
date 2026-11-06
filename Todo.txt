@@ -14,6 +14,14 @@ the commit completes. Usually, commit operations are fast, 10s of milliseconds, 
 delays so buffering of high-transaction volume could be a concern. We are allowed to drop messages though so a
 dropping solution could be incorporated into the solution.
 
+Potential hole in transaction recovery. Scenario, a Tx starts and reaches a commit decision. A store that voted to
+commit crashes and recovers after the transaction was finalized and expunged from the transaction cache. Enough stores
+fail to put the object at read-threshold and the store's pre-committed state is now required to restore the object.
+It's transaction recovery process kicks in and attempts to resolve an abort. If an abort decision is reached and it
+drops the pending update, the object is lost forever. Potential simple fix: if the current revision of the object
+matches that of the transaction (and equivalent for KeyValue updates) then vote to commit (it already has). The
+recovering store then correctly applies its updates and the commit becomes a no-op for the other stores.
+
 Store commit delay FSIF commits seem to be taking longer than they should when backed by NVMe media. Investigate the
 timing of commits.
 

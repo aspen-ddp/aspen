@@ -21,3 +21,12 @@ final case class HostStoreView(served: Set[StoreId],
 
 object HostStoreView:
   val Empty: HostStoreView = HostStoreView(Set(), Set(), Set(), Map())
+
+  /** The view of these inputs. A store is repairable when it is served and neither offline, rebuilding nor
+   *  transferring out: a rebuild already reads everything, and a store transferring out is about to stop being ours. */
+  def of(served: Set[StoreId],
+         offline: Set[StoreId],
+         rebuilding: Set[StoreId],
+         transferringOut: Set[StoreId],
+         devicePaths: Map[StorageDeviceId, os.Path]): HostStoreView =
+    HostStoreView(served, offline, served -- offline -- rebuilding -- transferringOut, devicePaths)

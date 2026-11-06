@@ -227,7 +227,8 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
 - Device management (the `server.host` classes `DeviceControl` wires) runs on one control thread, `aspen-host-control`,
   with no locks. Rules (scaladoc of `HostThreading.scala`): the only `given ExecutionContext` is the control context;
   never block the control thread on a Future; other threads read control state only through the `@volatile`
-  `HostStoreView` (`containsStore`, `getStoreIds`, `getDevicePath`, `isRepairable`); store and control state stay apart
+  `HostStoreView` (`containsStore`, `getStoreIds`, `getDevicePath`, `isRepairable`) or the router's `@volatile`
+  immutable maps (`hasTransactions`, `logTransactionStatus`); store and control state stay apart
 - Callbacks name the control context. Work run elsewhere (FSIF opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, and the

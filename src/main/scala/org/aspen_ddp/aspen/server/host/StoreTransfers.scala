@@ -707,7 +707,8 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
       // Nothing consumes this Future, so retrying a permanent error would be a silent 60 s loop
       // for the life of the process -- and now that the guard above is set, one that no later
       // check could ever displace. Only a collision is retried.
-      // The transaction runs on the host's ec; its result comes back through the control-context onComplete below
+      // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
+      // the control-context onComplete; the prepare closure's combinators run on the control thread
       val fabandon = ctx.client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision) { tx =>
         for
           ptr <- ctx.client.getStorageDevicePointer(toDeviceId)

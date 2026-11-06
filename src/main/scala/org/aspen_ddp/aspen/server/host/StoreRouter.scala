@@ -21,9 +21,9 @@ import scala.concurrent.Promise
  *  an UnknownStore reply. The mark is set when a store is removed and cleared when one is installed; stores that were
  *  never loaded are marked and unmarked directly, so `offline` is not a subset of the stores loaded.
  *
- *  The two maps are immutable values in `@volatile` fields, written only on the control thread, so `storeIds`,
- *  `hasTransactions` and `logTransactionStatus` may read them from any thread (TestNetwork's checker thread calls the
- *  latter two). Every write republishes the host's HostStoreView. */
+ *  The two maps are immutable values in `@volatile` fields, written only on the control thread, so
+ *  `hasTransactions` and `logTransactionStatus` may read them from any thread (TestNetwork's checker thread calls
+ *  them). Every write republishes the host's HostStoreView. */
 class StoreRouter(ctx: DeviceControl) extends Logging:
   @volatile private var stores: Map[StoreId, Store] = Map()
   @volatile private var offline: Set[StoreId] = Set()
@@ -101,8 +101,6 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   def get(storeId: StoreId): Option[Store] = stores.get(storeId)
 
   def isOffline(storeId: StoreId): Boolean = offline.contains(storeId)
-
-  def storeIds: List[StoreId] = stores.keysIterator.toList
 
   def hasTransactions: Boolean = stores.valuesIterator.exists(_.hasTransactions)
 

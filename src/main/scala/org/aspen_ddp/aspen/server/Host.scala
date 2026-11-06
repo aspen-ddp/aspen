@@ -267,9 +267,8 @@ class Host(val client: AspenClient,
 
   private val localDevices = new LocalDevices()
 
-  // Off the control context on purpose: its reads and transactions run on the host's ec, and each result comes back
-  // through the caller's control-context callback. See ClientDeviceMetadata.
-  private val clientMetadata = new ClientDeviceMetadata(client, hostId)(using ec)
+  // Lazy: it takes the DeviceControl below, whose control context its callbacks run on.
+  private lazy val clientMetadata = new ClientDeviceMetadata(deviceControl)
 
   private val deviceControl = new DeviceControl(
     metadata = new DeviceMetadata:

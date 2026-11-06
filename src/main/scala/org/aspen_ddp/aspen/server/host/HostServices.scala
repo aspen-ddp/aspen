@@ -70,7 +70,8 @@ class HostServices(ctx: DeviceControl) extends Logging:
               ctx.client.getStoragePool(Radicle.poolId).foreach: pool =>
                 val allocator = new PoolObjectAllocator(ctx.client, pool)
 
-                // The transaction runs on the host's ec; its result comes back through the control-context foreach
+                // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
+                // the control-context foreach; the prepare closure's combinators run on the control thread
                 ctx.client.transactUntilSuccessful { tx =>
                   for
                     executorRoot <- allocator.allocateKeyValueObject(Map())(using tx)
@@ -165,7 +166,8 @@ class HostServices(ctx: DeviceControl) extends Logging:
            hs.httpPort == httpPort && hs.storeTransferPort == storeTransferPort then
           Future.successful(false)
         else
-          // The transaction runs on the host's ec; its result comes back through the control-context flatMap below
+          // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
+          // the control-context flatMap; the prepare closure's combinators run on the control thread
           ctx.client.transactUntilSuccessful { tx =>
             for
               hostPtr <- ctx.client.getHostPointer(ctx.hostId)

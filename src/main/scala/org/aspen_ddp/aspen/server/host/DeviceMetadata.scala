@@ -14,7 +14,7 @@ import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate.KeyRevision
 import org.aspen_ddp.aspen.server.Host.{AdoptOutcome, RebuildOutcome, ShutdownOutcome, TransferOutcome}
 import scribe.Logging
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.Future
 
 /** The reads and transactions a Host performs against the storage-device, storage-pool and host metadata. Each
  *  method is a seam: Host passes an adapter that calls its own protected methods so that test subclasses can
@@ -47,13 +47,16 @@ trait DeviceMetadata:
 
   def completeDeviceShutdown(storageDeviceId: StorageDeviceId): Future[ShutdownOutcome]
 
-/** The real metadata reads and transactions. Deliberately off the control context: Host gives it the host's
- *  general-purpose ExecutionContext, on which its transactions and their callbacks run, and each caller acts on the
- *  returned Future through a control-context callback. It therefore touches no control state: what it needs is passed
- *  in, and the functions passed in (`uncleanStores`, `crlLostStores`, `markRebuildRequired`, `gossipStoreOnline`)
- *  read or write only disk, the client and the thread-safe GossipRetransmitter. */
-class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionContext)
-  extends DeviceMetadata with Logging:
+/** Runs only on the control thread. See HostThreading.scala.
+ *
+ *  The real metadata reads and transactions. Its Future callbacks, including the functions passed in
+ *  (`uncleanStores`, `crlLostStores`, `markRebuildRequired`, `gossipStoreOnline`), run on the control context it
+ *  imports from `ctx`. */
+class ClientDeviceMetadata(ctx: DeviceControl) extends DeviceMetadata with Logging:
+  import ctx.given
+
+  private def client: AspenClient = ctx.client
+  private def hostId: HostId = ctx.hostId
 
   /** Records the outcome of a store transfer that has finished shipping bytes.
    *

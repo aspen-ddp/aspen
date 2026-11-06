@@ -113,7 +113,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
               local.loadedStores += storeId
               ctx.loadStore(deviceId, backend, storeConfig.effectiveMaxSliceSize.map(_.toLong)).map(_ => true)
 
-      // The transaction runs on the host's ec; its result comes back through the control-context onComplete below
+      // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
+      // the control-context onComplete; the prepare closure's combinators run on the control thread
       val fflip = ctx.client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision) { tx =>
         for
           created <- fcreate
@@ -442,7 +443,8 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       pendingRebuildRequests += storeId
       val f =
         try
-          // The transaction runs on the host's ec; its result comes back through the control-context onComplete
+          // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
+          // the control-context onComplete; the prepare closure's combinators run on the control thread
           ctx.client.transactUntilSuccessfulWithRecovery(StopRetrying.unlessCollision) { tx =>
             for
               ptr <- ctx.client.getStorageDevicePointer(storageDeviceId)

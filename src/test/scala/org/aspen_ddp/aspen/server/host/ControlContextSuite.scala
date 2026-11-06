@@ -64,6 +64,18 @@ class ControlContextSuite extends AnyFunSuite with Matchers:
       ran.await(Bound, TimeUnit.SECONDS) should be(true)
       ranOn.get should be("aspen-host-control")
 
+  test("repairable excludes offline, rebuilding and transferring-out stores"):
+    val Seq(healthy, offline, rebuilding, transferring, unserved) = (10 to 14).map(i => StoreId(poolId, i.toByte))
+    val view = HostStoreView.of(
+      served = Set(healthy, offline, rebuilding, transferring),
+      offline = Set(offline, unserved),
+      rebuilding = Set(rebuilding),
+      transferringOut = Set(transferring),
+      devicePaths = Map())
+    view.repairable should be(Set(healthy))
+    view.served should be(Set(healthy, offline, rebuilding, transferring))
+    view.offline should be(Set(offline, unserved))
+
   test("view is published to other threads"):
     withThreading: t =>
       val ctx = deviceControl(t)

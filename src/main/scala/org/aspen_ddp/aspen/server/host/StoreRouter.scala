@@ -48,12 +48,20 @@ object StoreRouter:
  *  A store that is not loaded but is marked offline is silent: a message for it is dropped instead of answered with
  *  an UnknownStore reply. The mark is set when a store is removed and cleared when one is installed; stores that were
  *  never loaded are marked and unmarked directly, so `offline` is not a subset of the stores loaded. `remove` marks
- *  the store offline before it leaves the map, so any thread that finds it gone also finds it offline. */
+ *  the store offline before it leaves the map, so any thread that finds it gone also finds it offline.
+ *
+ *  A store whose load is under way is silent too: it is marked loading while its backend opens (StoreLoader.startOpen)
+ *  and until its LoadStore installs it, and the stores of a device are marked awaiting their device while its
+ *  shutdown-marker lookup (or the adoption it leads to) decides whether to load it (DeviceDiscovery). Clients
+ *  retransmit rather than being told the store is not here and dropping its location. The two marks are separate so
+ *  each owner clears only its own, and neither is `offline`, which the HostStoreView reports. */
 class StoreRouter(ctx: DeviceControl) extends Logging:
   import StoreRouter.Entry
 
   private val stores = new ConcurrentHashMap[StoreId, Entry]()
   private val offline: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
+  private val loading: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
+  private val awaitingDevice: java.util.Set[StoreId] = ConcurrentHashMap.newKeySet[StoreId]()
 
   /** Set (markReady) by a control event the Host constructor posts after its device scan, so FIFO order puts it after
    *  every LoadStore that scan queued. Until then a message for a store not loaded is dropped silently rather than
@@ -67,8 +75,9 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[server] def markReady(): Unit = ready = true
 
   /** Whether a message for a store that is not loaded should be answered: never while starting, nor for an offline
-   *  store. */
-  private def answersUnknown(storeId: StoreId): Boolean = ready && ! offline.contains(storeId)
+   *  or loading store, nor one awaiting its device. */
+  private def answersUnknown(storeId: StoreId): Boolean =
+    ready && ! offline.contains(storeId) && ! loading.contains(storeId) && ! awaitingDevice.contains(storeId)
 
   /** Runs `task` on the store's executor if it is loaded, unless its close has started there by then. */
   def post(storeId: StoreId)(task: Store => Unit): Unit = route(storeId, () => ())(task)
@@ -203,6 +212,10 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
 
   def isOffline(storeId: StoreId): Boolean = offline.contains(storeId)
 
+  def isLoading(storeId: StoreId): Boolean = loading.contains(storeId)
+
+  def isAwaitingDevice(storeId: StoreId): Boolean = awaitingDevice.contains(storeId)
+
   /** Callable from any thread (TestNetwork's checker thread): Store.hasTransactions reads a volatile snapshot. */
   def hasTransactions: Boolean = stores.values.asScala.exists(_.store.hasTransactions)
 
@@ -217,8 +230,8 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** `install` of a new entry, for a store whose backend needs no completion handler bound to it (tests). */
   private[host] def install(store: Store, executor: StoreExecutor): Unit = install(new Entry(store, executor))
 
-  /** Makes the entry's store loaded and clears its offline mark. From here on only the executor touches the store:
-   *  the map's put is the happens-before edge for everything the control thread did to it first. */
+  /** Makes the entry's store loaded and clears its offline and loading marks. From here on only the executor touches
+   *  the store: the map's put is the happens-before edge for everything the control thread did to it first. */
   private[host] def install(entry: Entry): Unit =
     val store = entry.store
     val replaced = stores.put(store.storeId, entry)
@@ -228,6 +241,7 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
         replaced.closing = true
         replaced.closed = true
     offline.remove(store.storeId)
+    loading.remove(store.storeId)
     ctx.publishView()
 
   /** Marks the store offline, then unloads it, returning the entry it had. */
@@ -246,3 +260,16 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   private[host] def clearOffline(storeId: StoreId): Unit =
     offline.remove(storeId)
     ctx.publishView()
+
+  /** Marks a store whose load is under way, so its messages are dropped rather than answered UnknownStore. Not part
+   *  of the HostStoreView, so nothing is published. */
+  private[host] def markLoading(storeId: StoreId): Unit = loading.add(storeId)
+
+  /** Clears a store's loading mark: its load ended without installing it */
+  private[host] def clearLoading(storeId: StoreId): Unit = loading.remove(storeId)
+
+  /** Marks a store of a device whose load is still being decided (DeviceDiscovery), so its messages are dropped */
+  private[host] def markAwaitingDevice(storeId: StoreId): Unit = awaitingDevice.add(storeId)
+
+  /** Clears a store's awaiting-device mark */
+  private[host] def clearAwaitingDevice(storeId: StoreId): Unit = awaitingDevice.remove(storeId)

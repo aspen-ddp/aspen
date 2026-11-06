@@ -245,12 +245,16 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   store's executor: a concurrent map lookup on the calling thread, then the task, which runs only if that store is
   not closed when the task runs (tasks queued ahead of a close still run). Unknown stores are answered from the
   calling thread; offline ones are silent, as are all unknown ones until the startup scan's LoadStores are handled.
-  Stores whose load comes later (FSIF stores opening on `FsifOpenEc`, devices awaiting a shutdown-marker lookup) are
-  not covered and can still get unknown-store replies, as before
+  A store whose load is under way is silent too: `loading` from `StoreLoader.startOpen` until install, and
+  `awaitingDevice` while its device's shutdown-marker lookup (or adoption) decides. Neither mark is `offline`
+- Backend opens are backend-neutral: `BackendOpener.open` returns a Future and decides where the open runs (RocksDB
+  inline, FSIF on `FsifOpenEc`); `StoreLoader.startOpen` handles an already-completed one inline and otherwise posts
+  `BackendOpened`. The host sees only `Backend.hasFailed`/`isWriteFrozen`, `BackendStateLost` and
+  `Backend.isOutOfSpace`; only `DefaultBackendOpener` names concrete backends
 - Store lifecycle: the control thread builds the `Store` and calls `router.install`, where ownership passes to the
   executor; a close removes it from the router (marking it offline) and then runs the close on its executor. Before
   install and after close the backend and directory belong to the control side, which otherwise reads only
-  `storeId`, `path`, `crlSaveFile` and FSIF's volatile `hasFailed`/`isWriteFrozen`. `release` frees the slot
+  `storeId`, `path`, `crlSaveFile` and the thread-safe `hasFailed`/`isWriteFrozen`. `release` frees the slot
 - Device management (the `server.host` classes `DeviceControl` wires) runs on one control thread, `aspen-host-control`,
   with no locks. Rules (scaladoc of `HostThreading.scala`): the only `given ExecutionContext` is the control context;
   never block the control thread on a Future; other threads read control state only through the `@volatile`
@@ -258,7 +262,7 @@ one or more objects at a time with Atomic, Consistent, and Durable transaction g
   `getStoreIds`, `getDevicePath`, `isRepairable`) or the router's concurrent map
   (`hasTransactions`, `logTransactionStatus`); store and control state stay apart: control posts store work to the
   executor (`StoreRouter.onStore`) and gets results back through a Future whose callbacks name the control context
-- Callbacks name the control context. Work run elsewhere (FSIF opens, client transactions on the host's `ec`) names
+- Callbacks name the control context. Work run elsewhere (backend opens, client transactions on the host's `ec`) names
   its context; timers and other non-Future callbacks post to `controlEvents` before touching control state
 - Tests use `LockstepThreading`: everything posted waits on one FIFO drained by `testingOnlyHandleEvents`, stores run
   inline, and the control context is the suite's serial `ec`, so integration suites keep their exact ordering.

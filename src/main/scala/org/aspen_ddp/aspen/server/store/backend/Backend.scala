@@ -14,12 +14,31 @@ object Backend:
    *  from the store directory alone so a host can check for it without opening the backend. */
   def crlSaveFile(storePath: os.Path): os.Path = storePath / "crl_save.log"
 
+  /** True if "no space left" (ENOSPC) or a quota error (EDQUOT, "disk quota exceeded") appears, ignoring case, in
+   *  the message of the throwable or of any cause: the device is full, and the store's data is intact. */
+  def isOutOfSpace(t: Throwable): Boolean =
+    def matches(e: Throwable): Boolean =
+      val msg = Option(e.getMessage).getOrElse("").toLowerCase
+      msg.contains("no space left") || msg.contains("disk full") ||
+        msg.contains("insufficient space") || msg.contains("injected out of space") ||
+        msg.contains("disk quota exceeded") || msg.contains("edquot")
+    Iterator.iterate(t)(_.getCause).takeWhile(_ != null).take(8).exists(matches)
+
+/** Thrown by a backend's open when the store's acknowledged state cannot be reconstructed: the store must be rebuilt */
+class BackendStateLost(msg: String) extends Exception(msg)
+
 trait Backend extends Logging {
   val storeId: StoreId
 
   def path: os.Path
 
   def crlSaveFile: os.Path = Backend.crlSaveFile(path)
+
+  /** The store has failed-stop on an I/O error and can no longer be trusted. Readable from any thread. */
+  def hasFailed: Boolean = false
+
+  /** Writes are held because the device is full; reads go on. Readable from any thread. */
+  def isWriteFrozen: Boolean = false
 
   def close(): Future[Unit]
 

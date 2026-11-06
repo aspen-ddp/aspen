@@ -345,6 +345,39 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       fx.ctx.router.deliverTx(prepare)
       fx.net.tx.asScala.toList.map(_._1) should be(List(TxUnknownStore(peer, unknown, txid)))
 
+  test("a store whose load is under way, or whose device is undecided, gets no reply until its mark is cleared"):
+    val unknown = StoreId(poolId, 2)
+    val peer = StoreId(poolId, 1)
+    val txid = TransactionId(new UUID(15, 9))
+    withRouter(emptyCrl): fx =>
+      def prepare = TxPrepare(unknown, peer, overwriteTxd(txid), ProposalId.initialProposal(0), Nil, Nil, true)
+      val router = fx.ctx.router
+      router.markLoading(unknown)
+      router.markAwaitingDevice(unknown)
+      router.deliverTx(prepare)
+      router.deliverClient(read(unknown))
+      router.clearLoading(unknown)
+      router.deliverTx(prepare)
+      router.deliverClient(read(unknown))
+      fx.net.tx.asScala.toList should be(empty)
+      fx.net.client.asScala.toList should be(empty)
+      // Neither mark is reported as offline
+      fx.ctx.currentView.offline should be(empty)
+
+      router.clearAwaitingDevice(unknown)
+      router.deliverTx(prepare)
+      router.deliverClient(read(unknown))
+      fx.net.tx.asScala.toList.map(_._1) should be(List(TxUnknownStore(peer, unknown, txid)))
+      fx.net.client.asScala.toList.collect { case r: ReadResponse => r.result } should be(
+        List(Left(ReadError.StoreNotFound)))
+
+  test("installing a store clears its loading mark"):
+    val s0 = StoreId(poolId, 0)
+    withRouter(emptyCrl): fx =>
+      fx.ctx.router.markLoading(s0)
+      await(fx.load(bootstrappedBackend(s0)))
+      fx.ctx.router.isLoading(s0) should be(false)
+
   test("a load whose store fails to build is undone and the store can load again"):
     val s0 = StoreId(poolId, 0)
     withRouter(emptyCrl): fx =>

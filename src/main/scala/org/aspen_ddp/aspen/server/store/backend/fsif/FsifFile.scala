@@ -26,15 +26,8 @@ trait FsifFiles:
   def exists(name: String): Boolean
 
 object FsifIo:
-  /** True if "no space left" (ENOSPC) or a quota error (EDQUOT, "disk quota exceeded") appears, ignoring case, in
-   *  the message of the throwable or of any cause. RebuildingStore.isOutOfSpace uses it too. */
-  def isOutOfSpace(t: Throwable): Boolean =
-    def matches(e: Throwable): Boolean =
-      val msg = Option(e.getMessage).getOrElse("").toLowerCase
-      msg.contains("no space left") || msg.contains("disk full") ||
-        msg.contains("insufficient space") || msg.contains("injected out of space") ||
-        msg.contains("disk quota exceeded") || msg.contains("edquot")
-    Iterator.iterate(t)(_.getCause).takeWhile(_ != null).take(8).exists(matches)
+  /** Backend.isOutOfSpace */
+  def isOutOfSpace(t: Throwable): Boolean = org.aspen_ddp.aspen.server.store.backend.Backend.isOutOfSpace(t)
 
 final class NioFsifFiles(dir: os.Path) extends FsifFiles:
 

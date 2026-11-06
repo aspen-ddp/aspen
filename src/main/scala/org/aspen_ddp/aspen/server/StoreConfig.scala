@@ -2,6 +2,7 @@ package org.aspen_ddp.aspen.server
 
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.util.YamlFormat.*
+import org.aspen_ddp.aspen.server.store.backend.{BackendConfig, FsifConfig, RocksDBConfig}
 
 import java.util.UUID
 
@@ -87,6 +88,11 @@ object StoreConfig extends YObject[StoreConfig]:
       Fsif(positive("segment-payload-size", segmentPayloadSize.get(o)),
            positive("segment-count", segmentCount.get(o)))
 
+
+  /** The store backend a pool's BackendConfig names */
+  def storageBackendFor(cfg: BackendConfig): StorageBackend = cfg match
+    case c: RocksDBConfig => RocksDB(c.maxSliceSize)
+    case c: FsifConfig => Fsif(c.segmentPayloadSize, c.segmentCount)
 
   val storeId: Required[StoreId] = Required("store-id", StoreId.YStoreId)
   /** Format is invariant, so each backend's YObject is wrapped to produce the common StorageBackend */

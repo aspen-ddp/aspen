@@ -9,7 +9,7 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Key, KeyValueObjec
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.{DurableFiles, StoreConfig}
 import org.aspen_ddp.aspen.server.store.backend.{Backend, FsifConfig, RocksDBConfig}
-import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifIo, FsifLayout, FsifRecovery}
+import org.aspen_ddp.aspen.server.store.backend.fsif.{FsifBackend, FsifLayout, FsifRecovery}
 import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 import scribe.Logging
 
@@ -184,9 +184,7 @@ class RebuildingStore(client: AspenClient,
       pstate <- client.getStoragePoolState(storeId.poolId)
       _ = if !os.exists(stagingPath / StoreConfig.configFilename) then
             // Written up front so the directory is loadable the instant it is moved into place.
-            val backendCfg = pstate.backendConfig match
-              case cfg: RocksDBConfig => StoreConfig.RocksDB(cfg.maxSliceSize)
-              case cfg: FsifConfig => StoreConfig.Fsif(cfg.segmentPayloadSize, cfg.segmentCount)
+            val backendCfg = StoreConfig.storageBackendFor(pstate.backendConfig)
             os.write.over(stagingPath / StoreConfig.configFilename,
               StoreConfig(storeId, backendCfg, pstate.maxSliceSize).yamlConfig)
       _ = synchronized:
@@ -316,8 +314,8 @@ class RebuildingStore(client: AspenClient,
   /** Best-effort detection of a full destination. Backends surface it differently -- RocksDB
    *  wraps it, the JDK throws IOException -- so this matches on the message as well as the
    *  type. A false negative only costs the slower path through recordFailure. The matching is
-   *  FsifIo.isOutOfSpace's, which also counts a quota error (EDQUOT) as a full device. */
-  private def isOutOfSpace(err: Throwable): Boolean = FsifIo.isOutOfSpace(err)
+   *  Backend.isOutOfSpace's, which also counts a quota error (EDQUOT) as a full device. */
+  private def isOutOfSpace(err: Throwable): Boolean = Backend.isOutOfSpace(err)
 
   private def attemptRestore(key: Key, ptr: ObjectPointer): Future[Unit] =
     if failBytes.contains(key.bytes.toList) then

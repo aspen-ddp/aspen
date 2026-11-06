@@ -35,8 +35,8 @@ object Host:
   private[server] case class LoadStoreById(sstorageDeviceId: StorageDeviceId, toreId: StoreId) extends Event
   /** The CRL state of a loaded store failed to load: it is unloaded, if it is still the store installed */
   private[server] case class UnloadFailedStore(storeId: StoreId, store: Store) extends Event
-  /** An FSIF backend failed-stop (its onFatal). `backend` is set once its constructor returns; it stays empty if the
-   *  constructor threw. An FSIF backend is opened off the event thread, so the event can be handled before then:
+  /** A backend failed-stop (its onFatal). `backend` is set once its open returns; it stays empty if the open
+   *  threw. A backend may be opened off the event thread, so the event can be handled before then:
    *  the backend is not served yet, and LoadStore retires it on seeing it failed. */
   private[server] case class BackendFailed(storeId: StoreId, backend: AtomicReference[Backend], err: Throwable) extends Event
 
@@ -79,12 +79,14 @@ object Host:
                                             markerHost: HostId,
                                             state: Try[StorageDeviceState]) extends Event
   private[server] case class ShutdownStore(storeId: StoreId, completion: Promise[Unit]) extends Event
-  /** An FSIF open (`create = false`, from tryLoadStore) or create (createNewStore) run on fsifOpenEc has ended.
-   *  `previous` is the store's out-of-space wait before the open, for the backoff; `created` is completed for a
-   *  create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served. */
-  private[server] case class FsifOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
+  /** A backend open (`create = false`, from tryLoadStore) or create (createNewStore) started by StoreLoader.startOpen
+   *  has ended. `previous` is the store's out-of-space wait before the open, for the backoff; `created` is completed
+   *  for a create once its store is loaded, or failed; `onServed` is tryLoadStore's, run only if the store is served.
+   *  `inline` is set when the open completed in startOpen itself, which then handles it without posting it. */
+  private[server] case class BackendOpened(sds: LocalStorageDeviceState, storeCfg: StoreConfig, storePath: os.Path,
                                 create: Boolean, previous: Option[SpaceWait], result: Try[Backend],
-                                created: Option[Promise[Unit]], onServed: Option[() => Unit]) extends Event
+                                created: Option[Promise[Unit]], onServed: Option[() => Unit],
+                                inline: Boolean = false) extends Event
   private[server] case class InitializeTaskExecutor() extends Event
   /** Posted by the constructor after its device scan, so it follows every LoadStore that scan queued: from then on
    *  the router answers messages for stores not loaded here (StoreRouter.markReady). */
@@ -406,8 +408,8 @@ class Host(val client: AspenClient,
       case e: BackendFailed =>
         deviceControl.rebuilds.handleBackendFailed(e)
 
-      case e: FsifOpened =>
-        deviceControl.loader.handleFsifOpened(e)
+      case e: BackendOpened =>
+        deviceControl.loader.handleBackendOpened(e)
 
       case e: UnloadFailedStore =>
         deviceControl.loader.handleUnloadFailed(e)

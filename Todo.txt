@@ -1,13 +1,8 @@
 TODO
 ====
 
-Host start: FSIF stores still recovering on `FsifOpenEc`, and devices awaiting a shutdown-marker lookup, answer
-TxUnknownStore/StoreNotFound until they are installed. Same as before the refactor, but StoreRouter's `ready` flag
-does not cover them, so every client retries elsewhere and drops its location cache for them. Matters for vdisk host
-restarts. Follow-up: mark such a store offline in the router from StoreLoader.startFsifOpen until it is installed (and
-likewise a device's stores while its marker lookup runs), so its traffic is dropped silently and retransmitted. Also,
-the host needing to know what an Fsif store is breaks the encapsulation model. This should be generalized such that
-a whole class of store backends with similar behavior are correctly handled rather than having fsif-specific code.
+RebuildingStore still opens its staging backend by backend type (RocksDBBackend / openFsifStaging, matching
+FsifRecovery.StoreLost). Route it through BackendOpener like StoreLoader so the rebuild package is backend-neutral too.
 
 HostObjectCache is one `synchronized` cache shared by every store; with stores on parallel threads it is the likely
 next contention point (see docs/superpowers/specs/2026-11-05-host-refactor-design.md).

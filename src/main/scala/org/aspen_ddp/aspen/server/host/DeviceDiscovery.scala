@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.host
 import org.aspen_ddp.aspen.common.metadata.{HostId, StorageDeviceId, StorageDeviceState}
 import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.server.host.DeviceMetadata.AdoptOutcome
-import org.aspen_ddp.aspen.server.{DeviceMarkers, Host, StorageDeviceConfig, StorageDeviceManager}
+import org.aspen_ddp.aspen.server.{DeviceMarkers, Host, StorageDeviceConfig, StorageDeviceManager, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.RebuildingStore
 import org.aspen_ddp.aspen.server.store.backend.Backend
@@ -49,12 +49,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   // that lookup led to, is still in flight. One at a time per path: the scan reaches such a
   // directory every deviceScanPeriod, and without this a slow read would pile up a lookup per
   // scan, and a slow adoption a second transaction racing the first. A path leaves the set once
-  // its outcome has been acted on, so the next scan decides afresh.
-  private var pendingResolutions: Set[os.Path] = Set()
+  // its outcome has been acted on, so the next scan decides afresh. Each holds the stores found
+  // in the directory, marked in the router as awaiting their device until then, so their
+  // messages are dropped (and retransmitted) rather than answered as unknown while it is decided.
+  private var pendingResolutions: Map[os.Path, Set[StoreId]] = Map()
 
   private[server] def loadedDeviceDirs: Map[os.Path, StorageDeviceId] = loadedDirs
   private[server] def reportedDeviceDirs: Set[os.Path] = reportedDirs
-  private[server] def pendingMarkerResolutions: Set[os.Path] = pendingResolutions
+  private[server] def pendingMarkerResolutions: Set[os.Path] = pendingResolutions.keySet
 
   /** Forgets the directory of a device that has been unloaded, so the next scan reads it again. */
   private[host] def forgetDevice(storageDeviceId: StorageDeviceId): Unit =
@@ -113,13 +115,16 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  made here. The lookup is issued and its result queued as a ShutdownMarkerResolved event,
    *  which shutdownMarkerResolved acts on from the event loop. Until then the directory is not
    *  in loadedDeviceDirs, so later scans reach it again; pendingMarkerResolutions keeps them from
-   *  issuing a second lookup while this one is in flight.
+   *  issuing a second lookup while this one is in flight. Meanwhile its stores are marked as
+   *  awaiting their device, so the router drops their messages instead of answering UnknownStore.
    */
   private def resolveShutdownMarker(storageDevicePath: os.Path,
                                     sdCfg: StorageDeviceConfig,
                                     markerHost: HostId): Unit =
     if ! pendingResolutions.contains(storageDevicePath) then
-      pendingResolutions += storageDevicePath
+      val stores = storesIn(storageDevicePath)
+      stores.foreach(ctx.router.markAwaitingDevice)
+      pendingResolutions += storageDevicePath -> stores
       // A throw before the Future exists would register no callback, and the path would stay
       // pending -- and the device unresolved -- for the life of the process.
       val lookup =
@@ -150,6 +155,9 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
   def handleMarkerResolved(e: Host.ShutdownMarkerResolved): Unit =
     val Host.ShutdownMarkerResolved(path, sdCfg, markerHost, result) = e
     import StorageDeviceState.DeviceStatus
+    // The marks are cleared once the outcome has been acted on, so a store the outcome loads is
+    // already marked loading by then; an adoption started here takes them over instead.
+    val marked = pendingResolutions.getOrElse(path, Set())
     pendingResolutions -= path
     val deviceId = sdCfg.storageDeviceId
     try
@@ -179,7 +187,10 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
               refuse("It has been declared failed. Not loading it")
             else if markerHost == ctx.hostId then
               state.status match
-                case DeviceStatus.Shutdown if ownedHere => ()
+                case DeviceStatus.Shutdown if ownedHere =>
+                  // Awaiting a restart or a move: silent, as unloadDevice leaves the stores of a
+                  // device shut down while this host ran
+                  marked.foreach(ctx.router.markOffline)
                 case DeviceStatus.ShuttingDown if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path was being shut down when this host " +
                               s"stopped. Loading it to finish the shutdown")
@@ -193,7 +204,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
             else
               state.status match
                 case DeviceStatus.Shutdown if state.hostId == markerHost =>
-                  tryAdoptDevice(path, sdCfg, state, markerHost)
+                  tryAdoptDevice(path, sdCfg, state, markerHost, marked)
                 case DeviceStatus.Operational if ownedHere =>
                   logger.info(s"Storage device $deviceId at $path was adopted by this host but not " +
                               s"yet loaded. Finishing the adoption")
@@ -207,6 +218,20 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       case t: Throwable =>
         warnOnce(path, s"Failed to resolve the shutdown of storage device $deviceId at $path. " +
                        s"Will retry on the next scan. Error: $t")
+    finally
+      releaseMarks(path, marked)
+
+  /** The stores whose directories are under the device directory `path`, by their store configs */
+  private def storesIn(path: os.Path): Set[StoreId] =
+    Try(os.list(path)).getOrElse(Nil).iterator.flatMap: dir =>
+      val cfgPath = dir / StoreConfig.configFilename
+      if os.isFile(cfgPath) then Try(StoreConfig.loadStoreConfig(cfgPath).storeId).toOption else None
+    .toSet
+
+  /** Clears the awaiting-device marks of `stores`, unless an adoption of `path` has taken them over */
+  private def releaseMarks(path: os.Path, stores: Set[StoreId]): Unit =
+    if ! pendingResolutions.contains(path) then
+      stores.foreach(ctx.router.clearAwaitingDevice)
 
   /** How the store at `storePath`, whose entry is Offline, can be put back into service by an
    *  adoption: every piece of its state must be in its own directory, since the host that took
@@ -256,12 +281,14 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
    *  cleanly, adopts it. On success the post-commit steps run from the transaction's callback.
    *
    *  The directory stays in pendingMarkerResolutions until the adoption has been acted on, so a
-   *  scan arriving meanwhile does not start a second one.
+   *  scan arriving meanwhile does not start a second one, and its stores stay marked as awaiting
+   *  their device.
    */
   private def tryAdoptDevice(path: os.Path,
                              sdCfg: StorageDeviceConfig,
                              state: StorageDeviceState,
-                             previousHostId: HostId): Unit =
+                             previousHostId: HostId,
+                             marked: Set[StoreId]): Unit =
     val deviceId = sdCfg.storageDeviceId
     // Checked here as well as inside adoptDevice, against the looked-up state, so a device that
     // is plainly not ready costs no transaction. The check that counts is adoptDevice's own.
@@ -271,14 +298,7 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
       warnUnclean(path, deviceId, previousHostId, unclean)
     else
       logger.info(s"Adopting storage device $deviceId at $path, shut down by host $previousHostId")
-      pendingResolutions += path
-      val fadopt =
-        try ctx.metadata.adoptDevice(deviceId, previousHostId, path, uncleanStores,
-                                     (p, s) => offlineStoresIn(p, s, AdoptionClass.CrlLost),
-                                     ctx.rebuilds.markRebuildRequired)
-        catch case t: Throwable => Future.failed(t)
-      fadopt.onComplete: result =>
-        pendingResolutions -= path
+      def handleAdoption(result: Try[AdoptOutcome]): Unit =
         result match
           case Success(AdoptOutcome.Adopted(committed)) =>
             try bringIntoService(path, sdCfg, committed, rewriteOwner = true)
@@ -295,6 +315,17 @@ class DeviceDiscovery(ctx: DeviceControl) extends Logging:
           case Failure(t) =>
             warnOnce(path, s"Failed to adopt storage device $deviceId at $path. Will retry on the " +
                            s"next scan. Error: $t")
+
+      pendingResolutions += path -> marked
+      val fadopt =
+        try ctx.metadata.adoptDevice(deviceId, previousHostId, path, uncleanStores,
+                                     (p, s) => offlineStoresIn(p, s, AdoptionClass.CrlLost),
+                                     ctx.rebuilds.markRebuildRequired)
+        catch case t: Throwable => Future.failed(t)
+      fadopt.onComplete: result =>
+        pendingResolutions -= path
+        try handleAdoption(result)
+        finally releaseMarks(path, marked)
 
   /** The Offline entries of `state` in adoption class `cls`, by their directories under `path`. */
   def offlineStoresIn(path: os.Path,

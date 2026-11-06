@@ -12,7 +12,7 @@ import org.aspen_ddp.aspen.server.{DurableFiles, Host, StoreConfig}
 import org.aspen_ddp.aspen.server.crl.CrashRecoveryLog
 import org.aspen_ddp.aspen.server.rebuild.{RebuildingStore, StoreRebuild}
 import org.aspen_ddp.aspen.server.store.Store
-import org.aspen_ddp.aspen.server.store.backend.{Backend, FsifConfig, RocksDBConfig}
+import org.aspen_ddp.aspen.server.store.backend.Backend
 import org.aspen_ddp.aspen.server.transfer.StoreTransfer
 import scribe.Logging
 
@@ -91,27 +91,18 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
             logger.info(s"Not creating store $storeId: device $deviceId is being shut down")
             Future.successful(false)
           else
-            val backendCfg = pstate.backendConfig match
-              case cfg: RocksDBConfig => StoreConfig.RocksDB(cfg.maxSliceSize)
-              case cfg: FsifConfig => StoreConfig.Fsif(cfg.segmentPayloadSize, cfg.segmentCount)
+            val backendCfg = StoreConfig.storageBackendFor(pstate.backendConfig)
             val storeConfig = StoreConfig(storeId, backendCfg, pstate.maxSliceSize)
 
             os.makeDir.all(storePath)
             os.write.over(storePath / StoreConfig.configFilename, storeConfig.yamlConfig)
 
-            if ctx.loader.isFsif(storeConfig) then
-              // Initialized on fsifOpenEc; startFsifOpen records the store in loadedStores now, so a
-              // shutdown of this device waits for the create and then closes the store. Out of space is
-              // handed to the load retries (fsifOpened).
-              val created = Promise[Unit]()
-              ctx.loader.startFsifOpen(local, storeConfig, storePath, create = true, Some(created))
-              created.future.map(_ => true)
-            else
-              val backend = ctx.loader.openBackend(storeConfig, storePath, create = true)
-              // Recorded as tryLoadStore records a load, so a shutdown of this device finds the
-              // store and closes it.
-              local.loadedStores += storeId
-              ctx.loadStore(deviceId, backend, storeConfig.effectiveMaxSliceSize.map(_.toLong)).map(_ => true)
+            // Created wherever its backend opens; startOpen records the store in loadedStores now, so a
+            // shutdown of this device waits for the create and then closes the store. Out of space is
+            // handed to the load retries (handleBackendOpened).
+            val created = Promise[Unit]()
+            ctx.loader.startOpen(local, storeConfig, storePath, create = true, Some(created))
+            created.future.map(_ => true)
 
       // The transaction's own machinery (commit, retries) runs on ctx.ec, and its result comes back through
       // the control-context onComplete; the prepare closure's combinators run on the control thread
@@ -387,7 +378,7 @@ class StoreRebuilds(ctx: DeviceControl) extends Logging:
       case t: Throwable => logger.error(s"Failed to mark store $storeId for rebuild at $path: $t")
     ctx.reconciler.checkStorageDevice(store.storageDeviceId)
 
-  /** An FSIF backend failed-stop: page-cache state can no longer be trusted, so the store is rebuilt. If it is
+  /** A backend failed-stop: its state can no longer be trusted, so the store is rebuilt. If it is
    *  served, it is unloaded as UnloadFailedStore does, its CRL state dropped (the rebuild discards the directory),
    *  marked rebuild-required and left offline, and its device checked so the reconcile flips its entry to
    *  Rebuilding. The mark is written before the close, so a crash meanwhile still never serves it. Nothing is

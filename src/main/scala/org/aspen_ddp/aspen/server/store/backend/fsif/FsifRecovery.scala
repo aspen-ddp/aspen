@@ -13,7 +13,7 @@ import scala.util.control.NonFatal
   * acknowledged state.
   */
 object FsifRecovery:
-  final class StoreLost(msg: String) extends Exception(msg)
+  final class StoreLost(msg: String) extends org.aspen_ddp.aspen.server.store.backend.BackendStateLost(msg)
 
   /** `activeIndex` holds index `seq`; `salt` is the active journal's salt; new batches continue at
     * `journalLength` with number `nextBatch`

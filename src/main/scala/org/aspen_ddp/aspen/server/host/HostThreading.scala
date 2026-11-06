@@ -18,8 +18,8 @@ import scala.concurrent.ExecutionContext
  *  it needs these rules:
  *  1. **Device-management classes must not have a general-purpose `given ExecutionContext` in scope.** The only
  *     `given` is the control context, so a callback with no context named does not compile into "runs somewhere on a
- *     pool". Work that must run elsewhere (an FSIF open on `FsifOpenEc`, client transactions) names its context
- *     explicitly, and its result comes back through a control-context callback.
+ *     pool". Work that must run elsewhere (a backend open the BackendOpener runs off the caller, client transactions)
+ *     names its context explicitly, and its result comes back through a control-context callback.
  *  2. **Never block the control thread on a Future** (`Await`, `.get` on a Java future, a `LinkedBlockingQueue.take`
  *     waiting for another thread's answer). The thread would deadlock against its own callbacks. Slow local disk
  *     work (marker files, directory moves, fsyncs through `DurableFiles`) is allowed there, because those operations
@@ -32,13 +32,13 @@ import scala.concurrent.ExecutionContext
  *  Rule 4 is enforced by ownership (spec section 5): before `StoreRouter.install` and after a store's close has
  *  completed, its backend and directory belong to the control side; in between, the Store and its backend belong to
  *  its executor. The control side may then read only the backend's immutable fields (`storeId`, `path`,
- *  `crlSaveFile`) and FSIF's `@volatile` `hasFailed` and `isWriteFrozen`; anything else is posted to the executor
+ *  `crlSaveFile`) and the thread-safe `hasFailed` and `isWriteFrozen`; anything else is posted to the executor
  *  (`StoreRouter.onStore`, or the close sequence in StoreLoader) and its result returned through a Future whose
  *  callbacks name the control context. SingleThreadThreading and LockstepThreading run stores inline, on the thread
  *  that posts to them, so under them the hop costs nothing and the order is the event loop's.
  *
  *  `HostStoreView` is that snapshot: DeviceControl.publishView republishes it after every change to the state it
- *  reflects. Callbacks that are not Futures (timers, FSIF's onFatal, the FSIF open on fsifOpenEc) run on whatever
+ *  reflects. Callbacks that are not Futures (timers, a backend's onFatal, the completion of a backend open) run on whatever
  *  thread invokes them, so each posts to `controlEvents` before touching control state; BackgroundControlScheduler
  *  does this for delayed work. Every place that deliberately leaves the control context says, in a comment, where the
  *  work runs and how its result comes back.

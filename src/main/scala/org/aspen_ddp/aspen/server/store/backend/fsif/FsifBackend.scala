@@ -273,10 +273,10 @@ class FsifBackend(val storeId: StoreId,
   // ---- Backend interface ----
 
   /** Writes are frozen by a full device: held I/O is retried every `tuning.enospcRetry` while reads go on */
-  def isWriteFrozen: Boolean = frozen
+  override def isWriteFrozen: Boolean = frozen
 
   /** The store has failed-stop on an I/O error (and `onFatal` has been, or is about to be, called) */
-  def hasFailed: Boolean = fatal.isDefined
+  override def hasFailed: Boolean = fatal.isDefined
 
   /** Slots the data file is laid out for: every occupied or reserved slot is below it */
   def slotCount: Int = slotTotal

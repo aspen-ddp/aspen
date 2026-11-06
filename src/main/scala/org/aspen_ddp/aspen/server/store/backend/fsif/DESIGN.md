@@ -141,8 +141,8 @@ rethrows, best effort, so the retry finds a blank directory (2.13).
 - **ENOSPC retries** are scheduled on `SharedRetryScheduler` (one `fsif-retry` thread).
 - **Recovery runs synchronously in the constructor.** The host therefore runs the open or create on
   `DefaultBackendOpener.FsifOpenEc` (cached `fsif-open-N` threads), never on its control thread:
-  `StoreLoader.startFsifOpen`, called on the control thread, hands the open to `FsifOpenEc` and gets the outcome
-  back as a posted `FsifOpened`.
+  `DefaultBackendOpener.open` returns a Future run on `FsifOpenEc`, and `StoreLoader.startOpen`, called on the
+  control thread, gets the outcome back as a posted `BackendOpened`.
 - **Exceptions to "post and return":** `rebuildWrite` writes the segment on the calling thread and uses
   `onSerialSync` (`Await`) for its bookkeeping. `rebuildFlush` blocks the calling thread as well. Compaction's
   truncate of free tail slots runs inline on the serial executor (section 5).
@@ -374,10 +374,11 @@ Afterwards commits complete with `IOFailure`, reads with `CorruptedObject`, rebu
 
 ### 2.13 Host integration
 
-- **Open and create** (`StoreLoader.startFsifOpen`, `handleFsifOpened`) run on `fsifOpenEc`. While an open runs, the store is
-  in its device's `loadedStores` and in `fsifOpening`. A `ShutdownStore` that arrives meanwhile is deferred and
+- **Open and create** (`StoreLoader.startOpen`, `handleBackendOpened`, shared by every backend) run on
+  `FsifOpenEc`. While an open runs, the store is in its device's `loadedStores` and in `opening`, and the router
+  keeps it silent (`loading`) until it is installed. A `ShutdownStore` that arrives meanwhile is deferred and
   replayed after the store is served.
-- **Outcomes** (`handleFsifOpened`):
+- **Outcomes** (`handleBackendOpened`; FsifRecovery.StoreLost is a `BackendStateLost`):
 
   | Outcome | Host action |
   |---|---|
@@ -614,7 +615,7 @@ Every case below runs without an operator. Line numbers are as of now; host code
 ### 4.1 Detected by FSIF recovery (`FsifRecovery.StoreLost`)
 
 All of these are thrown from `FsifBackend`'s constructor through `FsifBackend.open`. The host reaction is the same
-for each: `StoreLoader.handleFsifOpened` logs, leaves the store offline, writes `rebuild-required`
+for each: `StoreLoader.handleBackendOpened` logs, leaves the store offline, writes `rebuild-required`
 (`StoreRebuilds.markRebuildRequired`), and calls `DeviceReconciler.checkStorageDevice`. The `rebuild-required` marker is acted on as
 described in 4.5. A plain `IOException` from the open is not a loss (4.6).
 
@@ -671,7 +672,7 @@ correlated loss.
 - **Not served, not replaced, directory on a loaded device** (`StoreRebuilds.backendFailed`).
 - **Failed before its `LoadStore` ran** (`StoreLoader.handleLoad`, then `StoreRebuilds.retireUnserved`).
 - **Opened but not served** (device unloaded or another backend serves it) **and failed**
-  (`StoreLoader.handleFsifOpened`).
+  (`StoreLoader.handleBackendOpened`).
 - **Failed during a `ShutdownStore` close** (`StoreLoader.handleClose`, then `StoreRebuilds.failedOnClose`). The
   store is marked, and the `crl_save.log` the close just wrote is **deleted**. `DeviceShutdown.closeStoresForShutdown`
   then writes no transfer-out marker, so an adopter sees `rebuild-required` and treats the store as CrlLost (L22).
@@ -799,7 +800,7 @@ held, not failed, and complete once it clears" (L2 cannot be reached).
   normally, and a copy-on-write, delete or re-allocation cancels the move.
 - **`bringIntoService` gossips early.** `DeviceDiscovery.bringIntoService` gossips `StoreMoved`
   (`gossipStoreOnline`) for every Active store right after `tryLoadDevice`. For FSIF stores the open is still
-  running on `fsifOpenEc`, and it may yet find the store lost or out of space. The reinstated-transfer path waits
+  running on `FsifOpenEc`, and it may yet find the store lost or out of space. The reinstated-transfer path waits
   for `onServed`, but this restart and adoption path does not.
 - **StoreRepairer leaves errorTree entries behind** after a successful repair (pre-existing; `Backlog.txt`).
   Found during the FSIF integration test.

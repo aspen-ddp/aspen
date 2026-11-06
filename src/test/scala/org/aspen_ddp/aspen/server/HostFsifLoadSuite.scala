@@ -28,6 +28,8 @@ import scala.concurrent.duration.{Duration, SECONDS}
  */
 private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendOpener(execCtx):
   @volatile var outOfSpaceOpens: Int = 0
+  /** Opens to fail with an error that is neither out of space nor a lost store */
+  @volatile var failedOpens: Int = 0
   @volatile var opens: Int = 0
   @volatile var onFatals: List[Throwable => Unit] = Nil
   /** Backends opened from now on report hasFailed while this is set, as one that failed-stop does */
@@ -35,8 +37,8 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
   /** While set, every write, force and truncate of an FSIF store opened from now on fails with ENOSPC */
   @volatile var deviceFull: Boolean = false
   @volatile var lastBackend: Option[FsifBackend] = None
-  /** Where FSIF opens run. Synchronous by default, so a test's testingOnlyHandleEvents also handles the FsifOpened
-   *  the open posts; a test may set the production pool instead. */
+  /** Where FSIF opens run. Synchronous by default, so the open completes, and its outcome is handled, within the
+   *  load that starts it; a test may set the production pool, or one that holds the open, instead. */
   @volatile var openEc: ExecutionContext = ExecutionContext.parasitic
   /** Names of the threads FSIF opens ran on */
   @volatile var openThreads: List[String] = Nil
@@ -45,6 +47,8 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
 
   /** Device states the metadata returns instead of reading the tree, which holds none of these devices */
   @volatile var deviceStates: Map[StorageDeviceId, StorageDeviceState] = Map()
+  /** One-shot lookups the test completes itself, consumed before `deviceStates` is consulted */
+  @volatile var heldLookups: Map[StorageDeviceId, Promise[StorageDeviceState]] = Map()
   /** Stores gossipStoreOnline was called for, most recent first. Recorded only: the test pool cannot be read */
   @volatile var gossipedOnline: List[StoreId] = Nil
 
@@ -67,9 +71,14 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
                              markRebuildRequired: os.Path => Unit) =
       base.adoptDevice(storageDeviceId, previousHostId, devicePath, uncleanStores, crlLostStores, markRebuildRequired)
     override def lookupStorageDeviceState(storageDeviceId: StorageDeviceId): Future[StorageDeviceState] =
-      deviceStates.get(storageDeviceId) match
-        case Some(state) => Future.successful(state)
-        case None => base.lookupStorageDeviceState(storageDeviceId)
+      heldLookups.get(storageDeviceId) match
+        case Some(held) =>
+          heldLookups -= storageDeviceId
+          held.future
+        case None =>
+          deviceStates.get(storageDeviceId) match
+            case Some(state) => Future.successful(state)
+            case None => base.lookupStorageDeviceState(storageDeviceId)
     override def readTransferSourceState(fromDeviceId: StorageDeviceId) = base.readTransferSourceState(fromDeviceId)
     override def completeDeviceShutdown(storageDeviceId: StorageDeviceId) =
       base.completeDeviceShutdown(storageDeviceId)
@@ -99,6 +108,9 @@ private final class FsifSeams(execCtx: ExecutionContext) extends DefaultBackendO
     if outOfSpaceOpens > 0 then
       outOfSpaceOpens -= 1
       throw new IOException("No space left on device")
+    if failedOpens > 0 then
+      failedOpens -= 1
+      throw new IOException("injected open failure")
     onFatals = onFatal :: onFatals
     if !os.exists(path / FsifBackend.InitializedMarkerFile) then
       super.openFsifBackend(storeId, path, layout, onFatal)
@@ -122,8 +134,9 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
   /** What `host` did through its FSIF seams, and the knobs that make it do something else */
   private def fsif(host: Host): FsifSeams = fsifSeams.get(host)
 
-  private def newSeamHost(hostRoot: os.Path): Host =
+  private def newSeamHost(hostRoot: os.Path, configure: FsifSeams => Unit = _ => ()): Host =
     val seams = new FsifSeams(executionContext)
+    configure(seams)
     val host = new Host(client, HostId.BootstrapHostId, systemId, hostRoot, executionContext,
       new LockstepThreading(executionContext), net.objectCacheFactory, net,
       BackgroundTaskManager.NoBackgroundTaskManager, TestNetwork.TestCRL, net.FinalizerFactory,
@@ -363,7 +376,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     host.testingOnlyHandleEvents()
     val storeDir = writeFsifStoreConfig(deviceDir)
     FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().flatMap: _ =>
-      // Runs the open on another thread, and completes `opened` once that task (which posts FsifOpened) has ended
+      // Runs the open on another thread, and completes `opened` once that task (which posts BackendOpened) has ended
       val opened = Promise[Unit]()
       val pool = ExecutionContext.global
       fsif(host).openEc = new ExecutionContext:
@@ -375,7 +388,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       load(host)
       opened.future.map: _ =>
         fsif(host).openThreads.head should not be eventThread
-        host.testingOnlyHandleEvents() // FsifOpened, then the LoadStore it queues
+        host.testingOnlyHandleEvents() // BackendOpened, then the LoadStore it queues
         host.getStoreIds should contain(storeId)
         host.control.router.offlineStores should not contain storeId
 
@@ -398,12 +411,102 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents()
       closed.isCompleted should be(false) // deferred until the open ends
       queued.poll().run()
-      host.testingOnlyHandleEvents() // FsifOpened, LoadStore, then the deferred ShutdownStore
+      host.testingOnlyHandleEvents() // BackendOpened, LoadStore, then the deferred ShutdownStore
       closed.map: _ =>
         host.getStoreIds should not contain storeId
         host.control.router.offlineStores should contain(storeId)
         os.exists(Backend.crlSaveFile(storeDir)) should be(true)
         os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(false)
+
+  /** Holds every FSIF open of `host` until the test runs it */
+  private def holdOpens(host: Host): java.util.concurrent.ConcurrentLinkedQueue[Runnable] =
+    val queued = new java.util.concurrent.ConcurrentLinkedQueue[Runnable]()
+    fsif(host).openEc = new ExecutionContext:
+      def execute(r: Runnable): Unit = queued.add(r)
+      def reportFailure(t: Throwable): Unit = ()
+    queued
+
+  atest("a store is silent while its open runs, until its LoadStore installs it"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      val queued = holdOpens(host)
+      load(host)
+      queued.size should be(1)
+      host.control.router.isLoading(storeId) should be(true)
+      host.control.router.offlineStores should not contain storeId
+      queued.poll().run()
+      host.testingOnlyHandleEvents() // BackendOpened, then its LoadStore
+      host.getStoreIds should contain(storeId)
+      host.control.router.isLoading(storeId) should be(false)
+
+  atest("a store whose open fails answers as unknown again; one out of space stays silent, offline"):
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val host = newSeamHost(hostRoot)
+    host.testingOnlyHandleEvents()
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      fsif(host).failedOpens = 1
+      load(host)
+      host.getStoreIds should not contain storeId
+      host.control.router.isLoading(storeId) should be(false)
+      host.control.router.offlineStores should not contain storeId
+
+      fsif(host).outOfSpaceOpens = 1
+      load(host)
+      host.getStoreIds should not contain storeId
+      host.control.router.isLoading(storeId) should be(false)
+      host.control.router.offlineStores should contain(storeId)
+
+  /** Handles `host`'s events, yielding between rounds, until `condition` holds. Silent on exhaustion: the caller
+   *  asserts the end state. */
+  private def handleUntil(host: Host, rounds: Int = 100)(condition: => Boolean): Future[Unit] =
+    host.testingOnlyHandleEvents()
+    if condition || rounds == 0 then
+      Future.unit
+    else
+      Future(()).flatMap(_ => handleUntil(host, rounds - 1)(condition))
+
+  /** A host whose device dev0 holds an FSIF store and carries shutdown.state naming this host, and whose lookup of
+   *  that device's state is held: returns the host and the lookup to complete */
+  private def shutDownDeviceHost(): Future[(Host, Promise[StorageDeviceState])] =
+    val hostRoot = newHostDir()
+    val deviceDir = writeDevice(hostRoot, "dev0", deviceA)
+    val storeDir = writeFsifStoreConfig(deviceDir)
+    DeviceMarkers.writeShutdownState(deviceDir, HostId.BootstrapHostId)
+    FsifBackend.create(storeId, storeDir, layout, executionContext, _ => ()).close().map: _ =>
+      val lookup = Promise[StorageDeviceState]()
+      val host = newSeamHost(hostRoot, _.heldLookups = Map(deviceA -> lookup))
+      host.testingOnlyHandleEvents()
+      host.control.discovery.pendingMarkerResolutions.size should be(1)
+      host.control.router.isAwaitingDevice(storeId) should be(true)
+      host.control.router.offlineStores should not contain storeId
+      (host, lookup)
+
+  atest("the stores of a device awaiting its shutdown-marker lookup are silent, and stay so once it reads Shutdown"):
+    shutDownDeviceHost().flatMap: (host, lookup) =>
+      lookup.success(deviceState(deviceA).copy(status = StorageDeviceState.DeviceStatus.Shutdown))
+      handleUntil(host)(host.control.discovery.pendingMarkerResolutions.isEmpty).map: _ =>
+        host.control.discovery.pendingMarkerResolutions should be(empty)
+        host.getStoreIds should not contain storeId
+        host.control.router.isAwaitingDevice(storeId) should be(false)
+        host.control.router.offlineStores should contain(storeId)
+
+  atest("the stores of a device awaiting its shutdown-marker lookup load once it reads restarted"):
+    shutDownDeviceHost().flatMap: (host, lookup) =>
+      val active = deviceState(deviceA,
+        Map(storeId -> StorageDeviceState.StoreEntry(StorageDeviceState.StoreStatus.Active, None)))
+      fsif(host).deviceStates = Map(deviceA -> active)
+      lookup.success(active)
+      handleUntil(host)(host.getStoreIds.contains(storeId)).map: _ =>
+        host.getStoreIds should contain(storeId)
+        host.control.router.isAwaitingDevice(storeId) should be(false)
+        host.control.router.isLoading(storeId) should be(false)
+        host.control.router.offlineStores should not contain storeId
 
 
   /** An FSIF store left offline behind a transfer-out marker, whose device check then finds its entry Active with no
@@ -439,7 +542,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.control.router.offlineStores should contain(storeId)
       fsif(host).gossipedOnline should be(Nil)
       queued.poll().run()
-      host.testingOnlyHandleEvents() // FsifOpened, then its LoadStore
+      host.testingOnlyHandleEvents() // BackendOpened, then its LoadStore
       host.getStoreIds should contain(storeId)
       host.control.router.offlineStores should not contain storeId
       fsif(host).gossipedOnline should be(List(storeId))
@@ -454,7 +557,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     reinstateAbandoned(host, storeDir, queued).map: _ =>
       fsif(host).outOfSpaceOpens = 1
       queued.poll().run()
-      host.testingOnlyHandleEvents() // FsifOpened: out of space, left offline
+      host.testingOnlyHandleEvents() // BackendOpened: out of space, left offline
       host.getStoreIds should not contain storeId
       host.control.router.offlineStores should contain(storeId)
       fsif(host).gossipedOnline should be(Nil)
@@ -469,7 +572,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     reinstateAbandoned(host, storeDir, queued).map: _ =>
       os.remove(storeDir / FsifRecovery.IndexFiles(0))
       queued.poll().run()
-      host.testingOnlyHandleEvents() // FsifOpened: StoreLost, marked for rebuild and left offline
+      host.testingOnlyHandleEvents() // BackendOpened: StoreLost, marked for rebuild and left offline
       host.getStoreIds should not contain storeId
       host.control.router.offlineStores should contain(storeId)
       os.exists(storeDir / RebuildingStore.RebuildRequiredMarkerFile) should be(true)
@@ -508,7 +611,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
     reinstateAbandoned(host, storeDir, queued).map: _ =>
       fsif(host).outOfSpaceOpens = 1
       queued.poll().run()
-      host.testingOnlyHandleEvents() // FsifOpened: out of space, left offline awaiting space
+      host.testingOnlyHandleEvents() // BackendOpened: out of space, left offline awaiting space
       host.getStoreIds should not contain storeId
       fsif(host).gossipedOnline should be(Nil)
       host.control.loader.awaitingSpaceHasCallback(storeId) should be(Some(true))
@@ -517,7 +620,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       queued.size should be(1)
       fsif(host).gossipedOnline should be(Nil)
       queued.poll().run()
-      host.testingOnlyHandleEvents() // FsifOpened served, then its LoadStore
+      host.testingOnlyHandleEvents() // BackendOpened served, then its LoadStore
       host.getStoreIds should contain(storeId)
       fsif(host).gossipedOnline should be(List(storeId))
 
@@ -579,7 +682,7 @@ class HostFsifLoadSuite extends IntegrationTestSuite with ControlFixture:
       host.testingOnlyHandleEvents()
       closed.isCompleted should be(false)
       queued.poll().run()
-      host.testingOnlyHandleEvents() // FsifOpened, LoadStore, then the deferred ShutdownStore
+      host.testingOnlyHandleEvents() // BackendOpened, LoadStore, then the deferred ShutdownStore
       closed.map: _ =>
         host.getStoreIds should not contain storeId
         fsif(host).gossipedOnline should be(Nil)

@@ -647,8 +647,9 @@ class StoreTransfers(ctx: DeviceControl) extends Logging:
    *  both this device's offlineStores and the host.s. Those two sets and the marker file are
    *  three representations of one fact and must not be allowed to disagree.
    *
-   *  StoreMoved is gossiped from tryLoadStore's onServed, once the store is served: at once for RocksDB, and for
-   *  FSIF when its open, which runs off the control thread, has succeeded. A store whose open fails is not gossiped.
+   *  StoreMoved is gossiped from tryLoadStore's onServed, once the store is served: at once for a backend that opens
+   *  in the caller, otherwise when its open, which runs off the control thread, has succeeded. A store whose open
+   *  fails is not gossiped.
    *
    *  If the load fails after the marker is gone, tryLoadStore's own catch logs it and the store
    *  stays in offlineStores for the life of the process: this pass will not pick it up again,

@@ -8,26 +8,33 @@ import org.aspen_ddp.aspen.server.store.backend.rocksdb.RocksDBBackend
 
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.Try
 
+/** Opens store backends. The only part of the host that knows the concrete backends: the rest of it treats every open
+ *  alike (StoreLoader.startOpen). */
 trait BackendOpener:
-  /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. A RocksDB backend is opened
-   *  in the caller; an FSIF backend is opened on fsifOpenEc by the caller, touching no host state. `onFatal` is
-   *  called once, on an FSIF io thread, when an FSIF backend fail-stops: it must only enqueue. */
-  def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean, onFatal: Throwable => Unit): Backend
-
-  /** Where FSIF stores are opened (recovered) and created */
-  def fsifOpenEc: ExecutionContext
+  /** Opens (or, with `create`, creates) the backend `storeCfg` names at `storePath`. The opener decides where the
+   *  open runs: a quick one may run in the caller and return a completed Future; a slow one (recovery that reads and
+   *  fsyncs a whole store) must run elsewhere, touching no host state, since the caller is the control thread.
+   *  `onFatal` is called once, from a backend thread, when the backend fail-stops: it must only enqueue.
+   *
+   *  A failure that is `Backend.isOutOfSpace` leaves the store's data intact; a `BackendStateLost` means it must be
+   *  rebuilt. */
+  def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean, onFatal: Throwable => Unit): Future[Backend]
 
 class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
-  override def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean, onFatal: Throwable => Unit): Backend =
+  override def open(storeCfg: StoreConfig, storePath: os.Path, create: Boolean,
+                    onFatal: Throwable => Unit): Future[Backend] =
     val storeId = storeCfg.storeId
     storeCfg.backend match
-      case _: StoreConfig.RocksDB => new RocksDBBackend(storePath, storeId, ec)
+      case _: StoreConfig.RocksDB => Future.fromTry(Try(new RocksDBBackend(storePath, storeId, ec)))
       case b: StoreConfig.Fsif =>
         val layout = FsifLayout(b.segmentPayloadSize, b.segmentCount)
-        if create then FsifBackend.create(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
-        else openFsifBackend(storeId, storePath, layout, onFatal)
+        Future {
+          if create then FsifBackend.create(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
+          else openFsifBackend(storeId, storePath, layout, onFatal)
+        }(using fsifOpenEc)
 
   /** Opens an existing FSIF store (FsifBackend.open: a directory without the marker is initialized only if its
    *  files are blank, otherwise recovered). */
@@ -37,7 +44,8 @@ class DefaultBackendOpener(ec: ExecutionContext) extends BackendOpener:
                       onFatal: Throwable => Unit): Backend =
     FsifBackend.open(storeId, storePath, layout, FsifBackend.sharedIo, onFatal)
 
-  override def fsifOpenEc: ExecutionContext = DefaultBackendOpener.FsifOpenEc
+  /** Where FSIF stores are opened (recovered) and created */
+  protected def fsifOpenEc: ExecutionContext = DefaultBackendOpener.FsifOpenEc
 
 object DefaultBackendOpener:
   /** Host-wide pool for FSIF opens and creates (recovery reads and fsyncs whole stores): cached daemon threads

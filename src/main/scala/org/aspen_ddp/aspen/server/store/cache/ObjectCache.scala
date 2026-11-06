@@ -17,10 +17,18 @@ trait ObjectCache {
 
   /** Inserts an object into the cache, or re-measures one already present after its
     * content changed, evicting other objects as needed to stay within capacity
-    *
-    * @return The evicted objects
     */
-  def insert(state: ObjectState): List[ObjectState]
+  def insert(state: ObjectState): Unit
+
+  /** Starts counting a state a transaction references and exempts it from eviction until unpinned.
+    * Pinning an already-pinned state does nothing.
+    */
+  def pin(state: ObjectState): Unit
+
+  /** Ends a pin. A state that is cached and still valid becomes evictable again, most recently used; any
+    * other state stops being counted.
+    */
+  def unpin(state: ObjectState): Unit
 
   /** Removes an object from the cache
     *
@@ -39,7 +47,11 @@ object ObjectCache {
 
     override def get(objectId: ObjectId): Option[ObjectState] = None
 
-    override def insert(state: ObjectState): List[ObjectState] = Nil
+    override def insert(state: ObjectState): Unit = ()
+
+    override def pin(state: ObjectState): Unit = ()
+
+    override def unpin(state: ObjectState): Unit = ()
 
     override def remove(objectId: ObjectId): Unit = ()
   }

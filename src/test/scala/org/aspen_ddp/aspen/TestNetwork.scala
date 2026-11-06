@@ -101,7 +101,9 @@ class TestNetwork(executionContext: ExecutionContext,
   import TestNetwork._
 
   /** A new cache on each call. A HostObjectCache must not be shared between Hosts */
-  def objectCacheFactory: StoreId => StoreObjectCache = new HostObjectCache(64 * 1024 * 1024).forStore
+  def objectCacheFactory: StoreId => StoreObjectCache =
+    val cache = new HostObjectCache(64 * 1024 * 1024)
+    storeId => cache.forStore(storeId)
 
   /** One store per IDA element. Bootstrap.initialize requires width == stores.length, which
    *  deriving the list from the width satisfies by construction. */

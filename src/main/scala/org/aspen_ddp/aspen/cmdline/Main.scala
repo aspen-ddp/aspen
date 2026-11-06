@@ -1712,7 +1712,8 @@ object Main {
 
     val tls = TlsCredentials.fromPem(bootstrapCfg.caCertificate, hostCfg.tlsCertificate, hostCfg.tlsPrivateKey)
 
-    val objectCacheFactory = new HostObjectCache(hostCfg.objectCacheBytes).forStore
+    val hostObjectCache = new HostObjectCache(hostCfg.objectCacheBytes)
+    val objectCacheFactory = (storeId: StoreId) => hostObjectCache.forStore(storeId)
 
     val (networkBridge, nnet) = createNetwork(bootstrapCfg, onBootstrapConfigRefreshed,
                                               Some((hostCfg.hostId, hostCfg.dataPort)), None, tls,

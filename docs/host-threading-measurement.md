@@ -8,7 +8,9 @@ There is no numeric target. The refactor ships either way, because the single-th
 the figure does not improve, add what the thread dumps and timing show to the "Store commit delay" entry in
 `Todo.txt` as the next investigation.
 
-The runs need root and the TCMU setup, so nothing here runs automatically.
+The runs need root and the TCMU setup, so nothing here runs automatically. Steps 1 and 2 are done by hand;
+`scripts/host-threading/capture-job.sh` runs each fio job and captures its data, and
+`scripts/host-threading/analyze.py` does steps 3 to 5 from the captures.
 
 ## Setup: the same as the Todo.txt runs
 
@@ -29,70 +31,59 @@ Build each in its own checkout so that switching is only a matter of which host 
     (cd ../aspen-before && ./aspen --help)
     (cd ../aspen-after && ./aspen --help)
 
-`./aspen --help` compiles and caches the launcher's classpath, so neither run invokes sbt. Record both commit ids.
+`./aspen --help` compiles and caches the launcher's classpath, so neither run invokes sbt.
 
 ## 2. Run the fio jobs, once per build
 
-For each build, `before` first, then `after`:
+Pick a results directory (`results` below) and use it for both builds. For each build, `before` first, then `after`:
 
-1. Stop any running host. Start the host from that build's checkout: `./aspen host <host-directory>`. It logs to
-   `<host-directory>/logs/host.log`.
+1. Stop any running host. Start the host from that build's checkout: `./aspen host <host-directory>`.
 2. If the vdisk is not set up and mounted yet, run `scripts/vdisk-e2e/setup.sh` as its README shows. It also runs
-   `smoke.fio` once, which warms the disk; do not use that run's figures.
-3. Run the two jobs of `scripts/vdisk-e2e/smoke.fio`, the ones used for the `Todo.txt` numbers, one at a time, so
-   each has its own window in the log. Each is time based and runs for 60 s:
+   `smoke.fio` once, which warms the disk; that run is not measured.
+3. Run the two jobs of `scripts/vdisk-e2e/smoke.fio`, the ones used for the `Todo.txt` numbers, one at a time.
+   Each is time based and runs for 60 s. Run the script as your own user, not under sudo (it asks for your password
+   once, for fio):
 
-       sudo fio scripts/vdisk-e2e/smoke.fio --directory=/mnt/vd1 --section=randrw-verify
-       sudo fio scripts/vdisk-e2e/smoke.fio --directory=/mnt/vd1 --section=seqwrite
+       scripts/host-threading/capture-job.sh results before randrw-verify /mnt/vd1
+       scripts/host-threading/capture-job.sh results before seqwrite /mnt/vd1
 
-   Note the wall-clock start time of each job, and keep fio's summary (IOPS, bandwidth, completion latency).
-4. During each job, take the thread dumps in step 4 below.
+   (`after` in place of `before` for the second build.)
 
-## 3. Record BackendTiming over the same 60 s window
+`capture-job.sh` finds the running host JVM (`HOST_PID` overrides it) and records the commit of the checkout it runs
+from, so `analyze.py` shows which build each capture measured. It runs fio through sudo and keeps fio's summary,
+takes 3 thread dumps 10 s apart starting 15 s into the job, and then copies the part of `<host-directory>/logs/host.log`
+written during the job (`HOST_LOG` overrides the log's path). Each capture goes to
+`results/<build>/<section>/`; the script refuses to overwrite one.
 
-While writes happen, the host logs one BackendTiming line about once a second (`server.store.backend.BackendTiming`):
+## 3 to 5. Analyse
 
-    Backend timing over 1001ms. fsif commit: 412 avg 18.6ms max 41.0ms; ... store commit (FsifBackend): 412 avg 66.9ms max ...
+After both builds are captured:
 
-For each job, take the 60 lines that start 5 s after the job starts (to skip its ramp-up) and compute each stage's
-count-weighted average over them, for "store commit (FsifBackend)" and "fsif commit". For example, with the 60 lines
-in `window.log`:
+    scripts/host-threading/analyze.py results
 
-    for stage in 'store commit (FsifBackend)' 'fsif commit'; do
-      grep -o "$stage: [0-9]* avg [0-9.]*ms" window.log |
-        awk -v s="$stage" '{ n += $(NF-2); t += $(NF-2) * $NF } END { printf "%s: %d over the window, avg %.1f ms\n", s, n, t / n }'
-    done
+It prints a Markdown report and writes it to `results/report.md`. It needs only Python 3's standard library. It
+reports the following.
 
-(`$NF` is the average with its `ms` suffix, which awk drops when it converts it to a number.)
+- BackendTiming. While writes happen, the host logs one BackendTiming line about once a second
+  (`server.store.backend.BackendTiming`). Over the lines whose periods lie wholly between 5 s and 55 s after fio's
+  job start, it gives each stage's count, count-weighted average and max. The window skips ramp-up, and its start
+  comes from fio's own `job_start`. `--window-start`/`--window-end` change it, and both builds use the same window.
+  The gap between "store commit (FsifBackend)" and "fsif commit" is the time a commit's completion spends outside
+  FSIF, and the refactor targets that gap.
+- fio's summary: IOPS, bandwidth, and completion latency (average and p99) for reads and writes, plus fsync latency.
+  fsync is the FLUSH that makes writes durable, so it waits on commits.
+- Per-thread CPU seconds per 10 s, between consecutive dumps, from the `cpu=...ms` in each thread's header:
+  - after (`host-refactor`): `aspen-host-control` and each `aspen-store-N`, and their sum;
+  - before (`main`): the thread running Host's event loop, which is the one whose stacks are in `Host.handleEvent`
+    (an unnamed `pool-N-thread-1`, "pool-3-thread-1" in the `Todo.txt` runs);
+  - for both builds, the 10 busiest other threads, for example FSIF's `serial` executor and the network threads.
+- The stacks in all 3 dumps of every thread using more than 8 s per 10 s (`--busy` changes this limit).
+- The locks that threads were blocked on in each dump: monitors for BLOCKED threads, and explicit locks for parked
+  threads. This shows whether the stores' commits now queue elsewhere, for example in `HostObjectCache` (a
+  `synchronized` cache shared by every store, the expected next contention point).
+- Warnings, for example a missing capture, a dump taken outside the job, a window with too few BackendTiming lines,
+  or a build whose sections ran on different commits.
 
-Use the same window, relative to each job's start, for both builds. The gap between the two figures is the time a
-commit's completion spends outside FSIF; the refactor targets that gap.
-
-## 4. Thread dumps and per-thread CPU
-
-During each job, between 10 s and 50 s into it, take 3 thread dumps of the host process 10 s apart:
-
-    pid=$(pgrep -f 'aspen.*host')        # check that this names the host JVM
-    for i in 1 2 3; do jcmd "$pid" Thread.print > dump-$i.txt; sleep 10; done
-
-Each thread's header line carries its CPU time so far (`cpu=...ms`). For each thread below, record its CPU time in
-each dump, and the difference between consecutive dumps (CPU seconds used per 10 s):
-- after (`host-refactor`): `aspen-host-control` and each `aspen-store-N`;
-- before (`main`): the thread running Host's event loop (an unnamed `pool-N-thread-1`, "pool-3-thread-1" in the
-  `Todo.txt` runs; it is the one whose stacks are in `Host.handleEvent`).
-
-Also note any thread that uses most of its 10 s (above about 8 s), and what its stacks show it doing in all 3 dumps.
-In the after run, check whether the stores' commits now queue elsewhere: for example in `HostObjectCache` (a
-`synchronized` cache shared by every store, the expected next contention point), FSIF's `serial` executor, or the
-network threads.
-
-## 5. Record the results
-
-Record, for each build and each job:
-- the commit id;
-- "store commit (FsifBackend)" and "fsif commit": count and weighted average over the window;
-- the per-thread CPU per 10 s from step 4;
-- fio's summary.
-
-Update the "Store commit delay" entry in `Todo.txt` with them. If "store commit (FsifBackend)" does not improve, also
-add what the dumps show (the busiest threads and where they spend their time) as the next investigation.
+Then update the "Store commit delay" entry in `Todo.txt` from the report. Include the commits, "store commit
+(FsifBackend)" and "fsif commit", the per-thread CPU, and fio's summary. If "store commit (FsifBackend)" does not
+improve, also add the busiest threads and where they spend their time as the next investigation.

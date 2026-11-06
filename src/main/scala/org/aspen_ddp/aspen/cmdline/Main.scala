@@ -461,7 +461,8 @@ object Main {
             success),
 
       opt[Int]("store-threads").valueName("<n>").
-        text("The most store threads to run; stores share them, each on the least-loaded one (default: one per CPU)").
+        text("The most store threads to run. The host starts with one and adds more as its stores' load needs them " +
+             "(default: a quarter of the CPUs)").
         action((x, c) => c.copy(storeThreads = Some(x))).
         validate(x => if x >= 1 then success else failure("--store-threads must be at least 1"))
     )

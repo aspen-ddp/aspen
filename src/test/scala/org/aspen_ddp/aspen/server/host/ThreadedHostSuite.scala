@@ -7,12 +7,18 @@ import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, Insert, Key, Objec
 import org.aspen_ddp.aspen.common.transaction.KeyValueUpdate
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.*
 
 /** The bootstrap host of the TestNetwork runs on a StoreThreadPool: its stores run on their own store threads, and
- *  its control work on its control thread, rather than in lockstep with the test. Assertions are on outcomes only. */
+ *  its control work on its control thread, rather than in lockstep with the test. The pool rebalances every 20 ms
+ *  with no imbalance allowance, so stores keep moving between the three threads while transactions run. Assertions
+ *  are on outcomes only. */
 class ThreadedHostSuite extends IntegrationTestSuite:
 
-  override def testThreading: ExecutionContext => HostThreading = _ => new StoreThreadPool(maxThreads = 3)
+  override def testThreading: ExecutionContext => HostThreading = _ =>
+    new StoreThreadPool(maxThreads = 3, minThreads = 3,
+      config = StoreBalancer.Config(window = 200.millis, imbalance = 0.0, settle = 100.millis),
+      checkPeriod = Some(20.millis))
 
   override def subFixtureTeardown(): Unit = net.smgr.threading.shutdown()
 

@@ -42,3 +42,4 @@ CLAUDE.local.md
 # Local testing
 local/
 
+__pycache__/

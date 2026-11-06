@@ -4,14 +4,15 @@
     analyze.py <results-dir> [--window-start S] [--window-end S] [--busy S]
 
 Reads <results-dir>/<build>/<section>/ for every build label found and prints a Markdown report, also written to
-<results-dir>/report.md. "before" comes first, then the other builds from the most store threads to the fewest (the
-host's --store-threads, as capture-job.sh recorded it; "default" is one per CPU). The report has:
+<results-dir>/report.md. "before" comes first, then the other builds from the most store threads in use to the fewest
+(as their thread dumps show; capture-job.sh also records the host's --store-threads setting). The report has:
 - a summary per job: store threads, commit rate and latency, the host's total CPU and its CPU per store commit, and
   fio's headline figures;
 - BackendTiming: every stage's count, count-weighted average and max over the window, by default the BackendTiming
   periods lying wholly between 5 s and 55 s after fio's job start (fio's own job_start, so ramp-up and file layout
   are excluded), plus the gap between "store commit (FsifBackend)" and "fsif commit";
 - fio's summary: IOPS, bandwidth, completion latency and fsync latency;
+- the store-thread pool's changes inside the window (threads added, stores moved), with a warning if there were any;
 - per-thread CPU seconds per 10 s between consecutive thread dumps, for aspen-host-control, every aspen-store-N, the
   thread running Host.handleEvent (main's event loop), and the busiest other threads;
 - stacks of every thread using more than --busy seconds per 10 s (default 8), and the locks threads were blocked on.
@@ -72,6 +73,24 @@ def backend_timing(host_log, window_start_ms, window_end_ms):
                 t["total_ms"] += count * avg
                 t["max_ms"] = max(t["max_ms"], mx)
     return {"periods": periods, "covered_ms": covered_ms, "stages": totals}
+
+
+# StoreThreadPool's log lines for each change it makes to the pool
+POOL_CHANGE = re.compile(r"^(\d{4}\.\d\d\.\d\d \d\d:\d\d:\d\d:\d{3}) .*?(Added store thread|Moved store) ")
+
+
+def pool_changes(host_log, window_start_ms, window_end_ms):
+    """Threads added and stores moved inside the window. Nonzero means the pool had not settled."""
+    added = moved = 0
+    with open(host_log, errors="replace") as f:
+        for line in f:
+            m = POOL_CHANGE.match(line)
+            if m and window_start_ms <= log_time_ms(m.group(1)) <= window_end_ms:
+                if m.group(2) == "Added store thread":
+                    added += 1
+                else:
+                    moved += 1
+    return {"added": added, "moved": moved}
 
 
 def stage_avg(timing, name):
@@ -224,12 +243,8 @@ def read_meta(path):
 
 
 def store_threads(meta):
-    """The host's store-thread cap as (text, number); number is None when it is unknown."""
-    value = meta.get("store_threads", "default")
-    cpus = meta.get("cpus")
-    if value == "default":
-        return (f"default ({cpus})" if cpus else "default"), (int(cpus) if cpus else None)
-    return value, int(value)
+    """The host's --store-threads setting, or "default" (whatever that build's default is)."""
+    return meta.get("store_threads", "default")
 
 
 def load_run(path, window_start_s, window_end_s, warnings, label):
@@ -255,6 +270,11 @@ def load_run(path, window_start_s, window_end_s, warnings, label):
         if os.path.exists(host_log):
             timing = backend_timing(host_log, start + window_start_s * 1000, start + end_s * 1000)
             run["timing"] = timing
+            changes = pool_changes(host_log, start + window_start_s * 1000, start + end_s * 1000)
+            run["pool_changes"] = changes
+            if changes["added"] or changes["moved"]:
+                warnings.append(f"{label}: the store-thread pool changed inside the window ({changes['added']} "
+                                f"threads added, {changes['moved']} stores moved): not a steady-state measurement")
             expected = end_s - window_start_s
             if timing["periods"] == 0:
                 warnings.append(f"{label}: no BackendTiming lines in the window; were writes reaching the host?")
@@ -360,7 +380,7 @@ def summary_section(builds, runs):
         r = runs.get(b)
         if r is None:
             continue
-        threads, _ = store_threads(r["meta"])
+        threads = store_threads(r["meta"])
         cpu, in_use = host_cpu(r)
         t = r.get("timing")
         rate = None
@@ -380,11 +400,14 @@ def summary_section(builds, runs):
             num(fio["read"]["iops"] + fio["write"]["iops"]) if fio else "—",
             ms(fio["read"]["clat_mean_ms"]) if fio else "—",
             ms(fio["sync"]["mean_ms"]) if fio else "—",
+            (lambda c: f"+{c['added']} threads, {c['moved']} moves" if c else "—")(r.get("pool_changes")),
         ])
     header = ["build", "store threads", "store commits/s", "store commit avg", "gap", "host CPU s/10 s",
-              "CPU µs/store commit", "fio IOPS", "read clat avg", "fsync avg"]
+              "CPU µs/store commit", "fio IOPS", "read clat avg", "fsync avg",
+              "pool changes in window"]
     return (["Host CPU is every thread's CPU between the dumps; CPU per store commit divides it by the store "
-             "commit rate in the BackendTiming window."] + [""] + table(header, rows))
+             "commit rate in the BackendTiming window. Pool changes are the store threads added and stores moved inside that "
+             "window: anything but zero means the pool was still adjusting during the measurement."] + [""] + table(header, rows))
 
 
 def fio_section(builds, runs):
@@ -480,27 +503,23 @@ def main():
     if not found:
         sys.exit(f"analyze: nothing captured in {a.results}")
 
-    def threads_of(b):
-        for s in SECTIONS:
-            m = os.path.join(a.results, b, s, "meta")
-            if os.path.exists(m):
-                meta = read_meta(m)
-                # A default without a recorded CPU count is still one per CPU, so more than any explicit count.
-                return store_threads(meta)[1] or (float("inf") if meta.get("store_threads", "default") == "default" else 0)
-        return 0
-
-    # "before" first, then the most store threads to the fewest.
-    builds = sorted(found, key=lambda b: (b != "before", -threads_of(b), b))
-
     warnings = []
     runs = defaultdict(dict)  # section -> build -> run
-    for b in builds:
+    for b in found:
         for s in SECTIONS:
             p = os.path.join(a.results, b, s)
             if os.path.isdir(p):
                 runs[s][b] = load_run(p, a.window_start, a.window_end, warnings, f"{b}/{s}")
             else:
                 warnings.append(f"{b}/{s}: not captured")
+
+    def in_use(b):
+        """The most store threads the build ran in any of its jobs' dumps."""
+        return max((host_cpu(r[b])[1] or 0 for r in runs.values() if b in r), default=0)
+
+    # "before" first, then the most store threads in use to the fewest: what a build's setting means depends on its
+    # commit (the default was one per CPU, then a pool growing with load), so the dumps decide.
+    builds = sorted(found, key=lambda b: (b != "before", -in_use(b), b))
 
     out = ["# Host threading: before/after measurement", ""]
     rows = []
@@ -509,14 +528,17 @@ def main():
         commits = {r[b]["meta"].get("commit") for r in runs.values() if b in r} - {None}
         if len(commits) > 1:
             warnings.append(f"{b}: its sections ran on different commits: {', '.join(sorted(commits))}")
-        settings = {store_threads(r[b]["meta"])[0] for r in runs.values() if b in r}
+        settings = {store_threads(r[b]["meta"]) for r in runs.values() if b in r}
         if len(settings) > 1:
             warnings.append(f"{b}: its sections ran with different store threads: {', '.join(sorted(settings))}")
         dirty = " (uncommitted changes)" if meta.get("dirty") == "yes" else ""
-        rows.append([b, store_threads(meta)[0], f"`{meta.get('commit', '?')}`{dirty}", f"`{meta.get('checkout', '?')}`"])
-    out += table(["build", "store threads", "commit", "checkout"], rows) + [""]
-    out += ["\"store threads\" is the host's --store-threads; \"default\" is one per CPU. A build without store "
-            "threads (before the refactor) runs every store on one event thread whatever it says.", ""]
+        rows.append([b, store_threads(meta), in_use(b), f"`{meta.get('commit', '?')}`{dirty}",
+                     f"`{meta.get('checkout', '?')}`"])
+    out += table(["build", "store threads", "in use", "commit", "checkout"], rows) + [""]
+    out += ["\"store threads\" is the host's --store-threads, and \"default\" that build's own default: one per CPU "
+            "before the adaptive pool, and since then one thread at first, growing with load up to a quarter of the "
+            "CPUs. \"in use\" is the most store threads in its thread dumps. A build without store threads (before "
+            "the refactor) runs every store on one event thread.", ""]
 
     for s in SECTIONS:
         if s not in runs:

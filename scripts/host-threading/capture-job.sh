@@ -9,8 +9,8 @@
 #   section        smoke.fio section: randrw-verify or seqwrite
 #   fio-directory  the mounted vdisk (default /mnt/vd1)
 #
-# The meta file records the host's --store-threads setting ("default": one per CPU), which analyze.py reports and
-# orders the builds by. Use one label per setting, such as after-2t and after-4t.
+# The meta file records the host's --store-threads setting ("default" when it has none), which analyze.py reports.
+# Use one label per setting, such as after-2t and after-4t.
 # Run it as your own user, not under sudo: fio runs through sudo, and jcmd runs as the host JVM's owner.
 # It finds the host JVM (HOST_PID overrides that) and records the commit of the checkout it runs from, so the
 # "before" and "after" runs cannot be confused. During the job it takes 3 thread dumps, 10 s apart, starting 15 s in.
@@ -76,8 +76,8 @@ else
 fi
 
 # The launcher's first classpath entry is the checkout's compiled-classes directory, <checkout>/target/...
-# After "host" come the host directory and the host's options; --store-threads is recorded, and "default" means
-# StoreThreadPool's default of one per CPU (builds before the option always used that).
+# After "host" come the host directory and the host's options; --store-threads is recorded, and "default" means the
+# build's own default (builds before the option always used theirs).
 classpath=""
 host_dir=""
 store_threads=default

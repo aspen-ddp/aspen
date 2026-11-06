@@ -75,7 +75,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
           router.markOffline(storeCfg.storeId)
           sds.offlineStores += storeCfg.storeId
         else if os.exists(potentialStoreFile / StoreTransfer.TransferredInMarkerFile) then
-          // Arrived, but the pool may still name the source. startStoreTransferIn resumes the
+          // Arrived, but the pool may still name the source. StoreTransfers.startIn resumes the
           // metadata step for it, and reconcileDeviceState loads it if that step already committed.
           logger.info(s"Skipping load of transferred-in store awaiting its pool update. StoreId ${storeCfg.storeId}. $potentialStoreFile")
           router.markOffline(storeCfg.storeId)

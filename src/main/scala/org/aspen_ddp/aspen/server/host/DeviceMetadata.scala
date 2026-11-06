@@ -72,7 +72,7 @@ class ClientDeviceMetadata(client: AspenClient, hostId: HostId)(using ExecutionC
    *  device outright.
    *
    *  protected so a test subclass can observe the returned Future; the production caller is
-   *  startStoreTransferIn.
+   *  StoreTransfers.startIn.
    */
   def updateStateForTransferredStore(storeId: StoreId,
                                      fromDeviceId: StorageDeviceId,

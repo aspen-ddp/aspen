@@ -53,3 +53,4 @@ final class DeviceControl(val metadata: DeviceMetadata,
   lazy val router: StoreRouter = new StoreRouter(this)
   lazy val loader: StoreLoader = new StoreLoader(this)
   lazy val discovery: DeviceDiscovery = new DeviceDiscovery(this)
+  lazy val transfers: StoreTransfers = new StoreTransfers(this)

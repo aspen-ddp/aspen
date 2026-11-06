@@ -183,7 +183,10 @@ class Frontend(val storeId: StoreId,
       discard(os.objectId)
     else
       objectCache.insert(os)
-    retain(os, shared = true)
+    // A discarded state whose locks are still held stays the one transactions see (see referenced). A newer state
+    // committed meanwhile, as by an opportunistic rebuild of a fresh load, is served through the cache until then
+    val lockedOther = referenced.get(os.objectId).exists(r => !(r eq os) && r.reloadRequired && r.lockHolders.nonEmpty)
+    retain(os, shared = !lockedOther)
     val key = (cs.objectId, txid)
     inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes)
     if deletes then

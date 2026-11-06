@@ -3,7 +3,7 @@ package org.aspen_ddp.aspen.server.store
 import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
-import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
+import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, OpportunisticRebuild, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
 import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
@@ -1164,13 +1164,14 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     (20 to 22).toList.map(n => DataObjectPointer(ObjectId(new UUID(0, n)), poolId, Array[Byte]()))
 
   /** A Frontend over a DeferredCommitBackend, with a cache that holds two empty data objects */
-  def commitWindowFixture(): (Frontend, DeferredCommitBackend, StoreObjectCache, TestNet) =
+  def commitWindowFixture(cacheBytes: Long = 2 * HostObjectCache.EntryOverhead)
+      : (Frontend, DeferredCommitBackend, StoreObjectCache, TestNet) =
     val backend = new DeferredCommitBackend
     populate(backend)
     for p <- others do
       val os = mkObjectState(p.id)
       backend.bootstrapAllocate(p.id, os.objectType, os.metadata, os.data)
-    val cache = new HostObjectCache(2 * HostObjectCache.EntryOverhead).forStore(storeId)
+    val cache = new HostObjectCache(cacheBytes).forStore(storeId)
     val net = new TestNet
     val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache())
     backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
@@ -1311,5 +1312,38 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     backend.deliverCommits()
     cache.pinnedCount shouldBe 0
     cache.sizeInBytes shouldBe HostObjectCache.EntryOverhead + 1
+  }
+
+  test("a commit of a fresh state does not replace a discarded state whose locks are held") {
+    val (frontend, backend, _, net) = commitWindowFixture(cacheBytes = 1024 * 1024)
+    prepare(frontend, net, lockTxd(txid1, List(SharedRevisionLock(kvPtr, rev0)))).disposition shouldBe
+      TransactionDisposition.VoteCommit
+    // Committed by the other stores' votes; its update fails partway through, discarding the locked state
+    prepare(frontend, net, lockTxd(txid2, List(keyRevision(1))), corruptKVUpdate).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    resolve(frontend, net, txid2, committed = true)
+
+    // A network read loads a fresh state, which an opportunistic rebuild then commits
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), kvPtr, FullObject())
+    net.clientMessage() should not be empty
+    val kv = mkKVObjectState()
+    val rebuilt = KVObjectState.encode(Some(k(0)), None, None, None, Map(k(1) ->
+      new ValueState(Value(Array[Byte](9)), rev0, HLCTimestamp(1), None)))
+    frontend.readObjectForOpportunisticRebuild(OpportunisticRebuild(storeId, clientId, kvPtr, rev0,
+      kv.metadata.refcount, HLCTimestamp(50), rebuilt))
+    backend.heldCommits shouldBe 1
+    backend.deliverCommits()
+
+    // The shared lock is still honoured
+    prepare(frontend, net, lockTxd(txid3, List(keyRevision(2)))).disposition shouldBe TransactionDisposition.VoteAbort
+
+    // Once its holder resolves, the rebuilt state is served from memory
+    resolve(frontend, net, txid1, committed = false)
+    val reads = backend.reads
+    frontend.readObjectForNetwork(clientId, new UUID(1, 2), kvPtr, FullObject())
+    net.clientMessage() match
+      case Some(rr: ReadResponse) => rr.result.toOption.get.objectData.get.getByteArray.toList shouldBe rebuilt.getByteArray.toList
+      case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+    backend.reads shouldBe reads
   }
 }

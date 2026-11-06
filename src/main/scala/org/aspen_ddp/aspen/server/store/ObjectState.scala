@@ -9,11 +9,10 @@ class ObjectState(val objectId: ObjectId,
                   val objectType: ObjectType.Value,
                   var data: DataBuffer) {
 
-  /** Used to track the number of references currently working on this object.
-    * The object is not allowed to exit the cache until this number drops to
-    * zero.
+  /** Transactions and in-flight backend commits holding this state. Touched only on the owning store's executor.
+    * See Frontend.retain
     */
-  var transactionReferences: Int = 0
+  var references: Int = 0
 
   var lockedToTransaction: Option[TransactionId] = None
 

@@ -4,7 +4,7 @@ import java.util.UUID
 import org.aspen_ddp.aspen.common.ida.Replication
 import org.aspen_ddp.aspen.common.{DataBuffer, HLCTimestamp}
 import org.aspen_ddp.aspen.common.network.{ClientId, ClientResponse, ReadResponse, TxCommitted, TxFinalized, TxMessage, TxPrepare, TxPrepareResponse, TxResolved}
-import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, Value}
+import org.aspen_ddp.aspen.common.objects.{DataObjectPointer, FullObject, Key, KeySet, KeyValueObjectPointer, Metadata, MetadataOnly, ObjectId, ObjectPointer, ObjectRefcount, ObjectRevision, ObjectType, ReadError, Value}
 import org.aspen_ddp.aspen.common.paxos.ProposalId
 import org.aspen_ddp.aspen.common.pool.PoolId
 import org.aspen_ddp.aspen.common.store.StoreId
@@ -13,7 +13,7 @@ import org.aspen_ddp.aspen.common.transaction.{DataUpdate, DataUpdateOperation, 
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.{Commit, CommitError, CommitState, CompletionHandler, MapBackend}
-import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
+import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache, StoreObjectCache}
 import org.aspen_ddp.aspen.server.transaction.{TransactionStatusCache, Tx}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
@@ -295,31 +295,6 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     net.txMessage() match
       case Some(c: TxCommitted) => c.objectCommitErrors shouldBe List(oid1)
       case other => throw new AssertionError(s"Expected TxCommitted, got $other")
-  }
-
-  test("a backend commit error evicts the state the commit cached") {
-    for err <- List(CommitError.InvalidPointer, CommitError.ObjectMismatch, CommitError.SliceTooLarge,
-                    CommitError.IOFailure) do
-      var handler: Option[CompletionHandler] = None
-      val backend = new MapBackend(storeId):
-        override def setCompletionHandler(h: CompletionHandler): Unit =
-          handler = Some(h)
-          super.setCompletionHandler(h)
-        override def commit(state: CommitState, transactionId: TransactionId): Unit =
-          handler.foreach(_.complete(Commit(storeId, state.objectId, transactionId, Right(err))))
-      val cache = new HostObjectCache(1024 * 1024).forStore(storeId)
-      val frontend = new Frontend(storeId, backend, cache, new TestNet, new TestCrl, new TransactionStatusCache())
-      backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
-
-      val os = mkObjectState(oid1)
-      backend.bootstrapAllocate(oid1, os.objectType, os.metadata, os.data)
-
-      val txd = mktxd().copy(requirements = List(DataUpdate(op1, rev0, DataUpdateOperation.Overwrite)))
-      val prepare = mkPrepare(txd, fromClient = true).copy(objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](1)))))
-      frontend.receiveTransactionMessage(prepare)
-      frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = true))
-
-      withClue(s"$err: ")(cache.get(oid1) shouldBe None)
   }
 
   /** Prepares a transaction updating op1 (requiring `op1Revision`) and an object in another pool, and returns the
@@ -899,9 +874,12 @@ class FrontendSuite extends AnyFunSuite with Matchers {
     prepare(frontend, net, lockTxd(txid3, List(overwrite(fencePtr)))).disposition shouldBe
       TransactionDisposition.VoteAbort
 
-    // Once the holder resolves, the discarded state is reloaded from the backend
+    // Once the holder resolves, the failed commit's state stays in force: the store may have voted for it
     resolve(frontend, net, txid1, committed = false)
     prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 13)), List(overwrite(fencePtr)))).disposition shouldBe
+      TransactionDisposition.VoteAbort
+    val afterFailed = DataUpdate(fencePtr, ObjectRevision(txid2), DataUpdateOperation.Overwrite)
+    prepare(frontend, net, lockTxd(TransactionId(new UUID(0, 14)), List(afterFailed))).disposition shouldBe
       TransactionDisposition.VoteCommit
   }
 
@@ -1145,5 +1123,193 @@ class FrontendSuite extends AnyFunSuite with Matchers {
       frontend.receiveTransactionMessage(TxResolved(storeId, storeId, txid1, committed = false))
     }
     out.toString should not include "UNEXPECTED"
+  }
+
+  // ---- States stay in memory from a commit until the backend reports it complete ----
+
+  /** Holds commits until deliverCommits, applying each to the map only then, and counts backend reads */
+  class DeferredCommitBackend extends MapBackend(storeId):
+    private var handler: Option[CompletionHandler] = None
+    private var held: List[(CommitState, TransactionId)] = Nil
+    var reads: Int = 0
+
+    override def setCompletionHandler(h: CompletionHandler): Unit =
+      handler = Some(h)
+      super.setCompletionHandler(h)
+
+    override def read(pointer: ObjectPointer): Unit =
+      reads += 1
+      super.read(pointer)
+
+    override def commit(state: CommitState, transactionId: TransactionId): Unit =
+      held = held :+ (state, transactionId)
+
+    def heldCommits: Int = held.size
+
+    /** Completes the oldest held commit */
+    def deliverOne(result: Either[Unit, CommitError.Value] = Left(())): Unit =
+      val (state, txid) = held.head
+      held = held.tail
+      if result.isLeft then
+        if state.metadata.refcount.count == 0 then
+          m -= state.objectId
+        else
+          m += (state.objectId -> new ObjectState(state.objectId, state.metadata, state.objectType, state.data))
+      handler.foreach(_.complete(Commit(storeId, state.objectId, txid, result)))
+
+    def deliverCommits(result: Either[Unit, CommitError.Value] = Left(())): Unit =
+      while held.nonEmpty do deliverOne(result)
+
+  val others: List[DataObjectPointer] =
+    (20 to 22).toList.map(n => DataObjectPointer(ObjectId(new UUID(0, n)), poolId, Array[Byte]()))
+
+  /** A Frontend over a DeferredCommitBackend, with a cache that holds two empty data objects */
+  def commitWindowFixture(): (Frontend, DeferredCommitBackend, StoreObjectCache, TestNet) =
+    val backend = new DeferredCommitBackend
+    populate(backend)
+    for p <- others do
+      val os = mkObjectState(p.id)
+      backend.bootstrapAllocate(p.id, os.objectType, os.metadata, os.data)
+    val cache = new HostObjectCache(2 * HostObjectCache.EntryOverhead).forStore(storeId)
+    val net = new TestNet
+    val frontend = new Frontend(storeId, backend, cache, net, new TestCrl, new TransactionStatusCache())
+    backend.setCompletionHandler(op => frontend.backendOperationComplete(op))
+    (frontend, backend, cache, net)
+
+  /** Network-reads `ptr`, returning the object's data or the read error */
+  def readData(frontend: Frontend, net: TestNet, ptr: ObjectPointer): Either[ReadError.Value, List[Byte]] =
+    frontend.readObjectForNetwork(clientId, new UUID(1, 1), ptr, FullObject())
+    net.clientMessage() match
+      case Some(rr: ReadResponse) => rr.result.map(_.objectData.get.getByteArray.toList)
+      case other => throw new AssertionError(s"Expected a ReadResponse, got $other")
+
+  /** Reads the other objects, so the cache holds only them and pinned states */
+  def evictionPressure(frontend: Frontend, net: TestNet): Unit =
+    others.foreach(p => readData(frontend, net, p) shouldBe Right(Nil))
+
+  test("a committed state is served from memory until its backend commit completes") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+    // The retention does not depend on the transaction
+    frontend.receiveTransactionMessage(TxFinalized(storeId, storeId, txid1, committed = true))
+    frontend.transactions.contains(txid1) shouldBe false
+
+    evictionPressure(frontend, net)
+    val reads = backend.reads
+    readData(frontend, net, op1) shouldBe Right(List[Byte](1))
+    backend.reads shouldBe reads
+
+    backend.deliverCommits()
+    evictionPressure(frontend, net)
+    val after = backend.reads
+    readData(frontend, net, op1) shouldBe Right(List[Byte](1))
+    backend.reads shouldBe after + 1
+  }
+
+  test("a read during a deletion's commit gets ObjectNotFound without reaching the backend") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    val delete = RefcountUpdate(op1, ObjectRefcount(1, 1), ObjectRefcount(2, 0))
+    prepare(frontend, net, lockTxd(txid1, List(delete))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+    backend.heldCommits shouldBe 1
+
+    val reads = backend.reads
+    readData(frontend, net, op1) shouldBe Left(ReadError.ObjectNotFound)
+    // A transaction finds the object missing too
+    prepare(frontend, net, lockTxd(txid2, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteAbort
+    backend.reads shouldBe reads
+
+    backend.deliverCommits()
+    readData(frontend, net, op1) shouldBe Left(ReadError.ObjectNotFound)
+    backend.reads shouldBe reads + 1
+  }
+
+  test("a failed backend commit keeps serving the committed state") {
+    for err <- List(CommitError.InvalidPointer, CommitError.ObjectMismatch, CommitError.SliceTooLarge,
+                    CommitError.IOFailure) do
+      withClue(s"$err: "):
+        val (frontend, backend, _, net) = commitWindowFixture()
+        prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe
+          TransactionDisposition.VoteCommit
+        resolve(frontend, net, txid1, committed = true)
+        backend.deliverCommits(Right(err))
+
+        val reads = backend.reads
+        readData(frontend, net, op1) shouldBe Right(List[Byte](1))
+        evictionPressure(frontend, net)
+        val afterPressure = backend.reads
+        readData(frontend, net, op1) shouldBe Right(List[Byte](1))
+        backend.reads shouldBe afterPressure
+        afterPressure shouldBe reads + others.size
+  }
+
+  test("two in-flight commits of one object serve the newest state") {
+    val (frontend, backend, _, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+
+    val txd2 = lockTxd(txid2, List(overwriteAfter(txid1)))
+    frontend.receiveTransactionMessage(mkPrepare(txd2, fromClient = true).copy(
+      objectUpdates = List(ObjectUpdate(oid1, DataBuffer(Array[Byte](2))))))
+    responseFor(net, txid2).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid2, committed = true)
+    backend.heldCommits shouldBe 2
+
+    val reads = backend.reads
+    backend.deliverOne()
+    evictionPressure(frontend, net)
+    val afterPressure = backend.reads
+    readData(frontend, net, op1) shouldBe Right(List[Byte](2))
+    backend.reads shouldBe afterPressure
+
+    backend.deliverOne()
+    readData(frontend, net, op1) shouldBe Right(List[Byte](2))
+    backend.get(oid1).get.data.getByteArray.toList shouldBe List[Byte](2)
+    afterPressure shouldBe reads + others.size
+  }
+
+  test("an aborted transaction leaves its objects cached") {
+    val (frontend, _, cache, net) = commitWindowFixture()
+    readData(frontend, net, others(0)) shouldBe Right(Nil)
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    // Read while the transaction holds op1: evicts others(0), the oldest
+    readData(frontend, net, others(1)) shouldBe Right(Nil)
+    resolve(frontend, net, txid1, committed = false)
+
+    // op1 returned most recently used, so this evicts others(1) instead
+    readData(frontend, net, others(2)) shouldBe Right(Nil)
+    cache.get(oid1) should not be empty
+    cache.get(others(1).id) shouldBe None
+  }
+
+  test("an aborted allocation is not cached") {
+    val (frontend, _, cache, net) = commitWindowFixture()
+    val newPtr = DataObjectPointer(ObjectId(new UUID(0, 30)), poolId, Array[Byte]())
+    val txd = lockTxd(txid1, List(
+      RefcountUpdate(newPtr, ObjectRefcount.Allocating, ObjectRefcount.Default),
+      DataUpdate(newPtr, ObjectRevision.Allocating, DataUpdateOperation.Overwrite))).copy(
+      allocatingObjects = Set(newPtr.id))
+    prepare(frontend, net, txd).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = false)
+
+    cache.get(newPtr.id) shouldBe None
+    cache.sizeInBytes shouldBe 0
+  }
+
+  test("a pinned state counts toward the store's bytes") {
+    val (frontend, backend, cache, net) = commitWindowFixture()
+    prepare(frontend, net, lockTxd(txid1, List(overwrite(op1)))).disposition shouldBe TransactionDisposition.VoteCommit
+    resolve(frontend, net, txid1, committed = true)
+
+    evictionPressure(frontend, net)
+    // op1's in-flight state (one data byte) and the last object read, which the cache keeps although over budget
+    cache.sizeInBytes shouldBe 2 * HostObjectCache.EntryOverhead + 1
+    cache.pinnedCount shouldBe 1
+
+    backend.deliverCommits()
+    cache.pinnedCount shouldBe 0
+    cache.sizeInBytes shouldBe HostObjectCache.EntryOverhead + 1
   }
 }

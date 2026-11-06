@@ -63,13 +63,23 @@ class Frontend(val storeId: StoreId,
   def locksReleased(holder: TransactionId): Unit =
     collisionWaiters.remove(holder).foreach(_.foreach(_.collisionHolderReleased(holder)))
 
-  /** When each outstanding backend commit began, to time it as the store sees it: BackendTiming */
-  private val commitStarts = scala.collection.mutable.HashMap[(ObjectId, TransactionId), Long]()
+  /** Outstanding backend commits, oldest first. Each holds a reference to its state (see retain) from commit until
+    * the backend reports it complete, so the state is served and checked from memory rather than read from a backend
+    * that may not have it yet. `start` times the commit as the store sees it: BackendTiming
+    */
+  private case class InFlight(os: ObjectState, start: Long, deletes: Boolean)
+  private val inFlight = scala.collection.mutable.HashMap[(ObjectId, TransactionId), List[InFlight]]()
+
+  /** Outstanding backend commits deleting each object. Reads that would reach the backend get the answer it will give
+    * once the deletion is applied
+    */
+  private val deleting = scala.collection.mutable.HashMap[ObjectId, Int]()
   private val commitStage = s"store commit (${backend.getClass.getSimpleName})"
 
   private var pendingReads: Map[ObjectId, List[ReadKind]] = Map()
 
-  /** The state of every object a transaction references (see retain), consulted before the cache.
+  /** The state of every object a transaction or an in-flight backend commit references (see retain), consulted before
+    * the cache.
     *
     * Requirement locks live on these states, so every transaction must see the same instance for as long as any
     * transaction references it, whatever the cache does: a state that is evicted, or dropped because it can no longer
@@ -162,28 +172,44 @@ class Frontend(val storeId: StoreId,
 
   def path: os.Path = backend.path
 
-  def commit(os: ObjectState, cs: CommitState, txid: TransactionId): Unit =
-    if os.metadata.refcount.count == 0 then
+  /** Hands `os` to the backend and keeps it in memory until the backend reports the commit complete.
+    *
+    * @param forTransaction the commit applies a transaction's committed update, rather than a rebuild
+    */
+  def commit(os: ObjectState, cs: CommitState, txid: TransactionId, forTransaction: Boolean = false): Unit =
+    val deletes = os.metadata.refcount.count == 0
+    if deletes then
       // Deleted: the state is no longer served, nor checked by transactions that still reference it
       discard(os.objectId)
     else
       objectCache.insert(os)
-    commitStarts((cs.objectId, txid)) = System.nanoTime()
+    retain(os, shared = true)
+    val key = (cs.objectId, txid)
+    inFlight(key) = inFlight.getOrElse(key, Nil) :+ InFlight(os, System.nanoTime(), deletes)
+    if deletes then
+      deleting(os.objectId) = deleting.getOrElse(os.objectId, 0) + 1
     backend.commit(cs, txid)
 
-  /** Called when a transaction takes `os` for one of its objects. A state that only this transaction can know, such
-    * as that of an object it allocates, is not shared with others (`shared = false`).
+  /** Called when a transaction takes `os` for one of its objects, and by commit for the commit's duration. A state that
+    * only this transaction can know, such as that of an object it allocates, is not shared with others
+    * (`shared = false`). The first reference pins the state in the cache: counted, and never evicted.
     */
   def retain(os: ObjectState, shared: Boolean): Unit =
-    os.transactionReferences += 1
+    os.references += 1
+    if os.references == 1 then
+      objectCache.pin(os)
     if shared then
       referenced += (os.objectId -> os)
 
-  /** Releases a reference taken by retain */
+  /** Releases a reference taken by retain. The last one unpins the state: still valid and cached, it becomes evictable
+    * again as the most recently used entry
+    */
   def release(os: ObjectState): Unit =
-    os.transactionReferences -= 1
-    if os.transactionReferences == 0 && referenced.get(os.objectId).exists(_ eq os) then
-      referenced -= os.objectId
+    os.references -= 1
+    if os.references == 0 then
+      if referenced.get(os.objectId).exists(_ eq os) then
+        referenced -= os.objectId
+      objectCache.unpin(os)
 
   /** Stops serving an object's in-memory state: it was deleted, or it differs from what the backend holds. Later
     * reads load it from the backend. A state still referenced by transactions is marked reloadRequired rather than
@@ -278,13 +304,24 @@ class Frontend(val storeId: StoreId,
   def backendOperationComplete(completion: Completion): Unit = completion match {
     case r: Read => backendReadComplete(r.objectId, r.result)
     case c: Commit =>
-      commitStarts.remove((c.objectId, c.transactionId)).foreach: start =>
-        BackendTiming.report.record(commitStage, System.nanoTime() - start)
-      // commit() cached the new state before the backend stored it. The backend refused it, so the cache must not
-      // serve it: reads would return state the store does not hold, and readObjectForRepair would see a repair as
-      // already applied. Evicting a newer cached state too only costs a backend read.
-      if c.result.isRight then
-        discard(c.objectId)
+      val key = (c.objectId, c.transactionId)
+      inFlight.get(key) match
+        case Some(f :: rest) =>
+          if rest.isEmpty then inFlight.remove(key) else inFlight(key) = rest
+          BackendTiming.report.record(commitStage, System.nanoTime() - f.start)
+          c.result match
+            case Left(_) =>
+              release(f.os)
+              if f.deletes then
+                val n = deleting.getOrElse(c.objectId, 1) - 1
+                if n == 0 then deleting.remove(c.objectId) else deleting(c.objectId) = n
+            case Right(err) =>
+              // The state stays pinned and served, and a deletion keeps answering ObjectNotFound, while the store is
+              // loaded: the store may have voted to commit at the write threshold, so it must neither lose the
+              // committed state nor return the pre-commit one. Backlog.txt covers handling this properly
+              logger.error(s"Store $storeId: backend commit of object ${c.objectId} for transaction " +
+                s"${c.transactionId} failed: $err. Its committed state stays in memory while the store is loaded")
+        case _ =>
       transactions.get(c.transactionId).foreach { tx =>
         tx.commitComplete(c.objectId, c.result)
       }
@@ -301,6 +338,10 @@ class Frontend(val storeId: StoreId,
 
         val rr = ReadResponse(clientId, storeId, readUUID, HLCTimestamp.now, Right(cs) )
         net.sendClientResponse(rr)
+
+      case None if deleting.contains(objectId) =>
+        net.sendClientResponse(ReadResponse(clientId, storeId, readUUID, HLCTimestamp.now,
+          Left(ReadError.ObjectNotFound)))
 
       case None =>
         logger.trace(s"Reading uncached object from backing store for read $readUUID")
@@ -320,6 +361,7 @@ class Frontend(val storeId: StoreId,
     val objectId = op.pointer.id
     servableState(objectId) match {
       case Some(os) => opportunisticRebuild(op, os)
+      case None if deleting.contains(objectId) => // Being deleted: nothing to rebuild
       case None =>
         if op.pointer.poolId == storeId.poolId then
           pendingReads.get(objectId) match {
@@ -337,6 +379,7 @@ class Frontend(val storeId: StoreId,
     val objectId = current.pointer.id
     servableState(objectId) match {
       case Some(os) => repair(current, completion, os)
+      case None if deleting.contains(objectId) => repairMissing(current, completion)
       case None =>
         if current.pointer.poolId == storeId.poolId then
           pendingReads.get(objectId) match {
@@ -386,6 +429,9 @@ class Frontend(val storeId: StoreId,
           logger.trace(s"Loading object from CACHE for Tx: ${transaction.transactionId}. Object: $objectId")
           transaction.objectLoaded(os)
 
+        case None if deleting.contains(objectId) =>
+          transaction.objectLoadFailed(objectId, ReadError.ObjectNotFound)
+
         case None =>
           val tr = TransactionRead(transaction.transactionId)
 
@@ -429,6 +475,10 @@ class Frontend(val storeId: StoreId,
           backend.repair(cs, completion)
 
 
+  /** Repairs an object this store cannot read: failure to read probably means a repair is required */
+  private def repairMissing(current: ClientObjectState, completion: Promise[Unit]): Unit =
+    repair(current, completion, new ObjectState(current.pointer.id, Metadata.Zeroed, ObjectType.Data, DataBuffer.Empty))
+
   def backendReadComplete(objectId: ObjectId,
                           result: Either[ReadState, ReadError.Value]): Unit = {
     // Taken before dispatch: handling a read can start another read of the same object (a transaction message held
@@ -436,7 +486,10 @@ class Frontend(val storeId: StoreId,
     val waiting = pendingReads.get(objectId)
     pendingReads -= objectId
 
-    result match {
+    // A read issued before a deletion's commit may return the state the deletion is replacing
+    val effective = if deleting.contains(objectId) then Right(ReadError.ObjectNotFound) else result
+
+    effective match {
       case Left(rs) =>
         // A state still referenced by transactions is never replaced. See referenced
         val loaded = new ObjectState(objectId, rs.metadata, rs.objectType, rs.data)
@@ -481,11 +534,7 @@ class Frontend(val storeId: StoreId,
 
             case _: OpportuneRebuild => // Can't guarantee correctness so we need to ignore this
 
-            case RepairRead(cos, completion) =>
-              // Failure to read probably means a repair is required
-              val os = new ObjectState(objectId, Metadata.Zeroed,
-                ObjectType.Data, DataBuffer.Empty)
-              repair(cos, completion, os)
+            case RepairRead(cos, completion) => repairMissing(cos, completion)
           }
         }
     }

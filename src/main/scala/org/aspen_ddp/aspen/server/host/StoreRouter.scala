@@ -8,7 +8,7 @@ import org.aspen_ddp.aspen.common.store.StoreId
 import org.aspen_ddp.aspen.common.transaction.TransactionStatus
 import org.aspen_ddp.aspen.server.repair.StoreNotHosted
 import org.aspen_ddp.aspen.server.store.Store
-import org.aspen_ddp.aspen.server.store.backend.{Completion, CompletionHandler}
+import org.aspen_ddp.aspen.server.store.backend.CompletionHandler
 import scribe.Logging
 
 import java.util.concurrent.ConcurrentHashMap
@@ -19,11 +19,13 @@ import scala.util.control.NonFatal
 object StoreRouter:
   /** A loaded store and the executor it runs on. A store loaded again gets a new Entry.
    *
-   *  `closed` is confined to the executor: the first task of the store's close (or of its replacement by a reload)
-   *  sets it there, so tasks queued ahead of the close still run against the open store (spec section 5) and tasks
-   *  queued behind it never reach it. */
+   *  `closed` is confined to the executor: the store's close (or its replacement by a reload) sets it there, so tasks
+   *  queued ahead of the close still run against the open store (spec section 5) and tasks queued behind it never
+   *  reach it. `closing` is set on the executor when the close starts and read by I/O completions as they are
+   *  posted: those posted earlier are delivered, those posted later dropped (StoreLoader.startClose). */
   final class Entry(val store: Store, val executor: StoreExecutor):
     var closed: Boolean = false
+    @volatile var closing: Boolean = false
 
 /** The loaded stores, and the delivery of messages, I/O completions and repairs to them (spec section 4).
  *
@@ -31,9 +33,10 @@ object StoreRouter:
  *  any thread may read them. Every write republishes the host's HostStoreView.
  *
  *  Work for a store reaches it in one of two ways:
- *  - From a foreign thread (network, I/O completion, timer, CRL callback): `post` and the `deliver*`, `repair*` and
+ *  - From a foreign thread (network, timer, CRL callback): `post` and the `deliver*`, `repair*` and
  *    `heartbeat` methods built on it. One `threading.dispatch` step looks the store up, then hands the task to the
- *    store's executor, where it runs unless the store's close has started there. In production the dispatch step
+ *    store's executor, where it runs unless the store's close has started there. I/O completions skip the lookup:
+ *    each backend's handler is bound to its entry (`completionHandler`). In production the dispatch step
  *    runs on the calling thread; in lockstep it is the one queued item, and the executor runs inline when it is
  *    drained, as the host's event loop did.
  *  - From the control thread: `onStore` and `onEachStore`, straight to the executor with no dispatch step, and any
@@ -108,8 +111,17 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
             p.success(None)
         p.future
 
-  /** Each backend's completion handler: delivers its completions to its store. */
-  private[host] def completionHandler(): CompletionHandler = op => deliverCompletion(op)
+  /** The completion handler of `entry`'s backend, set before the entry is installed. It never looks in the map: a
+   *  completion arriving after `remove` but before the close starts on the executor belongs to I/O the still-open
+   *  store issued (reads queued ahead of the close), so it is delivered; only those arriving after the close has
+   *  started there are dropped (spec section 5). One dispatch step, then the executor: in lockstep it is one queued
+   *  item, as the host's IOCompletion event was. */
+  private[host] def completionHandler(entry: Entry): CompletionHandler = op =>
+    ctx.threading.dispatch.execute: () =>
+      if ! entry.closing then
+        entry.executor.execute: () =>
+          if ! entry.closed then
+            entry.store.frontend.backendOperationComplete(op)
 
   def deliverTx(msg: TxMessage): Unit =
     val unknown = () =>
@@ -147,9 +159,6 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
               case _ => true
           val r = TransactionCompletionResponse(s.fromClient, s.toStore, s.queryUUID, isComplete)
           ctx.net.sendClientResponse(r)
-
-  def deliverCompletion(op: Completion): Unit =
-    post(op.storeId)(_.frontend.backendOperationComplete(op))
 
   def repair(storeId: StoreId, os: ClientObjectState, completion: Promise[Unit]): Unit =
     val notHosted: () => Unit = () =>
@@ -201,13 +210,19 @@ class StoreRouter(ctx: DeviceControl) extends Logging:
   /** A snapshot of the stores marked offline */
   private[server] def offlineStores: Set[StoreId] = offline.asScala.toSet
 
-  /** Makes the store loaded on `executor` and clears its offline mark. From here on only the executor touches the
-   *  store: the map's put is the happens-before edge for everything the control thread did to it first. */
-  private[host] def install(store: Store, executor: StoreExecutor): Unit =
-    val replaced = stores.put(store.storeId, new Entry(store, executor))
+  /** `install` of a new entry, for a store whose backend needs no completion handler bound to it (tests). */
+  private[host] def install(store: Store, executor: StoreExecutor): Unit = install(new Entry(store, executor))
+
+  /** Makes the entry's store loaded and clears its offline mark. From here on only the executor touches the store:
+   *  the map's put is the happens-before edge for everything the control thread did to it first. */
+  private[host] def install(entry: Entry): Unit =
+    val store = entry.store
+    val replaced = stores.put(store.storeId, entry)
     // A reload over a loaded store, with no close: its queued tasks run, later ones skip it
     if replaced != null then
-      replaced.executor.execute(() => replaced.closed = true)
+      replaced.executor.execute: () =>
+        replaced.closing = true
+        replaced.closed = true
     offline.remove(store.storeId)
     ctx.publishView()
 

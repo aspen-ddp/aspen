@@ -287,11 +287,13 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         val store = new Store(storageDeviceId, ctx.ec, backend, ctx.objectCacheFactory(storeId), ctx.net,
           ctx.backgroundTasks, ctx.crl, ctx.txStatusCache, ctx.finalizerFactory, ctx.txDriverFactory,
           Host.txHeartbeatTimeout(ctx.heartbeatPeriod), maxSliceSize)
-        backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler()))
+        val entry = new StoreRouter.Entry(store, executor)
+        // Bound to this entry, so a reload's new backend gets its own; wrapped by the test seam if any
+        backend.setCompletionHandler(ctx.wrapCompletionHandler(router.completionHandler(entry)))
         // Its transactions are recreated, and its transaction messages handled, once the CRL holds them
         if trs.isDefined then
           store.frontend.awaitRecovery()
-        router.install(store, executor)
+        router.install(entry)
 
         trs match
           case None => p.success(())
@@ -325,14 +327,28 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
    *  close completes. Nothing is awaited. */
   private[host] def closeUnloaded(entry: StoreRouter.Entry): Unit =
     val store = entry.store
-    onExecutor(entry):
-      // Tasks queued behind this one skip the store
-      entry.closed = true
+    startClose(entry):
       store.objectCache.clear()
       ctx.crl.closeStore(store.storeId)
     .onComplete: _ =>
       onExecutor(entry)(store.close()).onComplete: _ =>
         ctx.threading.release(store.storeId)
+
+  /** The first step of a close, on the executor of `entry`, whose store the router no longer holds. Every task
+   *  queued ahead of it has run against the open store. It then sets `closing`, so I/O completions posted from now on
+   *  are dropped, and posts `f` behind it: completions already posted (for I/O those tasks issued, a MapBackend's
+   *  arriving inline) are delivered first. `f` sets `closed`, so nothing queued behind it reaches the store, and
+   *  starts the close. Lockstep: both run inline, as the event loop's ShutdownStore handler did, and a completion is
+   *  dropped if its queued item drains after the close began. */
+  private def startClose[T](entry: StoreRouter.Entry)(f: => Future[T]): Future[T] =
+    onExecutor(entry):
+      entry.closing = true
+      val p = Promise[T]()
+      entry.executor.execute: () =>
+        entry.closed = true
+        try p.completeWith(f)
+        catch case NonFatal(t) => p.failure(t)
+      p.future
 
   /** Runs `f` on the executor of `entry`, whose store the router no longer holds, and completes with its result.
    *  Callbacks on the returned Future name the control context. Lockstep: inline, so the order is the event loop's. */
@@ -373,9 +389,7 @@ class StoreLoader(ctx: DeviceControl) extends Logging:
         router.remove(storeId)
         ctx.devices.devices.get(store.storageDeviceId).foreach: sds =>
           sds.offlineStores += storeId
-        onExecutor(entry):
-          // Tasks queued ahead of this one have run against the open store; those behind it skip it
-          entry.closed = true
+        startClose(entry):
           store.objectCache.clear()
           ctx.crl.closeStore(storeId)
         .flatMap: trs =>

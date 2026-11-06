@@ -17,7 +17,7 @@ import org.aspen_ddp.aspen.server.Host
 import org.aspen_ddp.aspen.server.crl.{CrashRecoveryLog, TransactionRecoveryState}
 import org.aspen_ddp.aspen.server.network.Messenger
 import org.aspen_ddp.aspen.server.store.backend.MapBackend
-import org.aspen_ddp.aspen.server.store.cache.{HostObjectCache, ObjectCache}
+import org.aspen_ddp.aspen.server.store.cache.ObjectCache
 import org.aspen_ddp.aspen.server.transaction.{TransactionDriver, TransactionStatusCache}
 import org.aspen_ddp.aspen.server.transfer.StoreTransferService
 import org.scalatest.funsuite.AnyFunSuite
@@ -114,8 +114,8 @@ object StoreRouterSuite:
 
   /** A DeviceControl on a StoreThreadPool with what loading, routing and closing a store use. Its posted events run
    *  the StoreLoader handlers on the control thread. Its router is ready (as after a Host's startup scan) unless
-   *  `ready` is false; `cached` gives its stores an object cache. */
-  private class Fixture(crl: CrashRecoveryLog, ready: Boolean, cached: Boolean):
+   *  `ready` is false. */
+  private class Fixture(crl: CrashRecoveryLog, ready: Boolean):
     val threading = new StoreThreadPool(maxThreads = 2)
     val net = new RecordingNet
 
@@ -125,8 +125,7 @@ object StoreRouterSuite:
       backgroundTasks = BackgroundTaskManager.NoBackgroundTaskManager, threading = threading,
       post = event => threading.controlEvents.execute(() => handle(event)),
       crl = crl, txStatusCache = new TransactionStatusCache(), wrapCompletionHandler = identity,
-      objectCacheFactory =
-        if cached then new HostObjectCache(1024 * 1024).forStore else _ => ObjectCache.NoCache,
+      objectCacheFactory = _ => ObjectCache.NoCache,
       finalizerFactory = null,
       txDriverFactory = TransactionDriver.noErrorRecoveryFactory, heartbeatPeriod = Duration(5, SECONDS),
       deviceScanPeriod = Duration(10, SECONDS), storeRebuildFactory = null, maxConcurrentRebuilds = 2,
@@ -164,9 +163,8 @@ object StoreRouterSuite:
 
     def shutdown(): Unit = threading.shutdown()
 
-  private def withRouter(crl: CrashRecoveryLog, ready: Boolean = true, cached: Boolean = false)
-                        (f: Fixture => Unit): Unit =
-    val fx = new Fixture(crl, ready, cached)
+  private def withRouter(crl: CrashRecoveryLog, ready: Boolean = true)(f: Fixture => Unit): Unit =
+    val fx = new Fixture(crl, ready)
     try f(fx) finally fx.shutdown()
 
   private def emptyCrl: CrashRecoveryLog = new GatedCrl(Future.unit)
@@ -272,15 +270,11 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
 
   test("tasks queued ahead of a close run against the open store"):
     val s0 = StoreId(poolId, 0)
-    withRouter(emptyCrl, cached = true): fx =>
+    // No object cache: every queued read needs backend I/O, whose completion arrives after the store is removed
+    withRouter(emptyCrl): fx =>
       val backend = bootstrappedBackend(s0)
       await(fx.load(backend))
       val executor = fx.ctx.router.entry(s0).get.executor
-      // Warms the object cache, so the queued reads are answered without backend I/O
-      fx.ctx.router.deliverClient(read(s0))
-      fx.awaitExecutor(executor)
-      fx.awaitExecutor(executor)
-      fx.net.client.size should be(1)
 
       val unblock = new CountDownLatch(1)
       executor.execute(() => { unblock.await(Bound, TimeUnit.SECONDS); () })
@@ -294,8 +288,9 @@ class StoreRouterSuite extends AnyFunSuite with Matchers:
       unblock.countDown()
       await(closed)
 
-      val answered = fx.net.client.asScala.toList.collect { case r: ReadResponse => r }.drop(1)
-      answered.map(_.readUUID) should be(reads.map(_.readUUID).toList)
+      val answered = fx.net.client.asScala.toList.collect { case r: ReadResponse => r }
+      answered.map(_.readUUID).toSet should be(reads.map(_.readUUID).toSet)
+      answered.size should be(Queued)
       answered.forall(_.result.isRight) should be(true)
       backend.closed should be(true)
 

@@ -55,6 +55,10 @@ takes 3 thread dumps 10 s apart starting 15 s into the job, and then copies the 
 written during the job (`HOST_LOG` overrides the log's path). Each capture goes to
 `results/<build>/<section>/`; the script refuses to overwrite one.
 
+To compare store-thread counts, start the `after` host with `--store-threads=<n>` (the default is one per CPU) and
+give each count its own label, for example `after-2t` and `after-4t`. `capture-job.sh` records the host's setting,
+and `analyze.py` shows it and orders the builds by it: `before` first, then the most store threads to the fewest.
+
 ## 3 to 5. Analyse
 
 After both builds are captured:

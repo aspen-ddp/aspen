@@ -143,6 +143,7 @@ object Main {
                   rebalancePeriodUnit:Option[String]=None,
                   networkCacheDir:Option[os.Path]=None,
                   loadJars:Option[String]=None,
+                  storeThreads:Option[Int]=None,
                   outputClientConfig:Option[os.Path]=None)
 
   class ConfigError(msg: String) extends AspenError(msg)
@@ -457,7 +458,12 @@ object Main {
           if x.isEmpty || x.contains('/') || x == "." || x == ".." then
             failure(s"--load-jars must name a directory directly under <host-directory>/${UserJarLoader.JarsDirName}")
           else
-            success)
+            success),
+
+      opt[Int]("store-threads").valueName("<n>").
+        text("The most store threads to run; stores share them, each on the least-loaded one (default: one per CPU)").
+        action((x, c) => c.copy(storeThreads = Some(x))).
+        validate(x => if x >= 1 then success else failure("--store-threads must be at least 1"))
     )
 
   private def amoebafsArgs(p: ArgParser): List[OptionDef[?, Args]] =
@@ -1025,7 +1031,7 @@ object Main {
             case "bootstrap" => bootstrap(createIDA(cfg), cfg.hostDirectory, cfg.hostName, cfg.address,
                                           cfg.dataPort, cfg.httpPort, cfg.storeTransferPort,
                                           cfg.outputClientConfig.getOrElse(os.pwd / ClientConfig.configFilename))
-            case "host" => run_host(cfg.hostDirectory, cfg.loadJars)
+            case "host" => run_host(cfg.hostDirectory, cfg.loadJars, cfg.storeThreads)
             case "amoebafs" => run_amoebafs(session, cfg.fsName, cfg.networkCacheDir)
             case "vdisk-server" => run_vdisk_server(session, cfg.networkCacheDir)
             // OBSOLETE: see the commented-out "debug" parser entry above.
@@ -1627,12 +1633,12 @@ object Main {
   def hostLogFile(hostDir: os.Path): os.Path = hostDir / "logs" / "host.log"
 
   /** Starts the `host` command: blocks forever once the host is running. */
-  def run_host(hostDir: os.Path, loadJars: Option[String]): Int = {
+  def run_host(hostDir: os.Path, loadJars: Option[String], storeThreads: Option[Int]): Int = {
     configureLogging(Some(hostLogFile(hostDir)))
     Thread.setDefaultUncaughtExceptionHandler(logUncaughtExceptions(scribe.Logger.root))
 
     // Crash-only: halt, since without its CRL the host could serve reads but never finish a transaction
-    val h = startHost(hostDir, loadJars, _ => Runtime.getRuntime.halt(1))
+    val h = startHost(hostDir, loadJars, _ => Runtime.getRuntime.halt(1), storeThreads)
 
     // The storage host is meant to run indefinitely. Blocking the main thread on the IO
     // thread is what keeps the process alive; the IO thread itself is a daemon thread.
@@ -1651,10 +1657,13 @@ object Main {
    *  host's client is given. They are loaded before anything else is started so a bad jar fails fast.
    *
    *  `onCrlThreadDeath` is called if a CRL thread dies. An in-process caller must not halt its JVM.
+   *
+   *  `storeThreads` caps the host's store threads (StoreThreadPool's `maxThreads`); by default one per CPU.
    */
   def startHost(hostDir: os.Path,
                 loadJars: Option[String] = None,
-                onCrlThreadDeath: Throwable => Unit = _ => ()): RunningHost = {
+                onCrlThreadDeath: Throwable => Unit = _ => (),
+                storeThreads: Option[Int] = None): RunningHost = {
 
     val userTypeFactories = loadJars.map(UserJarLoader.load(hostDir, _)).getOrElse(Nil)
 
@@ -1729,7 +1738,7 @@ object Main {
       bootstrapCfg.aspenSystemId,
       hostDir,
       ec,
-      new StoreThreadPool(),
+      storeThreads.fold(new StoreThreadPool())(new StoreThreadPool(_)),
       objectCacheFactory,
       nodeNet,
       new BackgroundTaskManager(ec),

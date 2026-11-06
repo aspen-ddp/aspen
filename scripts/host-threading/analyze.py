@@ -3,8 +3,11 @@
 
     analyze.py <results-dir> [--window-start S] [--window-end S] [--busy S]
 
-Reads <results-dir>/<build>/<section>/ for builds "before" and "after" (and any other label found, listed after
-them) and prints a Markdown report, also written to <results-dir>/report.md:
+Reads <results-dir>/<build>/<section>/ for every build label found and prints a Markdown report, also written to
+<results-dir>/report.md. "before" comes first, then the other builds from the most store threads to the fewest (the
+host's --store-threads, as capture-job.sh recorded it; "default" is one per CPU). The report has:
+- a summary per job: store threads, commit rate and latency, the host's total CPU and its CPU per store commit, and
+  fio's headline figures;
 - BackendTiming: every stage's count, count-weighted average and max over the window, by default the BackendTiming
   periods lying wholly between 5 s and 55 s after fio's job start (fio's own job_start, so ramp-up and file layout
   are excluded), plus the gap between "store commit (FsifBackend)" and "fsif commit";
@@ -27,7 +30,6 @@ from collections import Counter, defaultdict
 STORE_COMMIT = "store commit (FsifBackend)"
 FSIF_COMMIT = "fsif commit"
 SECTIONS = ["randrw-verify", "seqwrite"]
-BUILD_ORDER = ["before", "after"]
 TOP_OTHER_THREADS = 10
 MIN_OTHER_CPU = 0.05  # seconds per 10 s; idle threads are left out
 
@@ -221,6 +223,15 @@ def read_meta(path):
     return meta
 
 
+def store_threads(meta):
+    """The host's store-thread cap as (text, number); number is None when it is unknown."""
+    value = meta.get("store_threads", "default")
+    cpus = meta.get("cpus")
+    if value == "default":
+        return (f"default ({cpus})" if cpus else "default"), (int(cpus) if cpus else None)
+    return value, int(value)
+
+
 def load_run(path, window_start_s, window_end_s, warnings, label):
     run = {"meta": read_meta(os.path.join(path, "meta"))}
     fio_out = os.path.join(path, "fio.out")
@@ -332,6 +343,50 @@ def timing_section(builds, runs):
     return lines + [""] + table(header, rows)
 
 
+def host_cpu(run):
+    """The host's total CPU seconds per 10 s, averaged over the dump intervals, and the store threads in use."""
+    dumps = run.get("dumps") or []
+    if len(dumps) < 2:
+        return None, None
+    rates = thread_cpu(dumps)
+    total = sum(sum(r) / len(r) for r in rates.values())
+    stores = sum(1 for k in rates if re.match(r"aspen-store-\d+$", k[0]))
+    return total, stores
+
+
+def summary_section(builds, runs):
+    rows = []
+    for b in builds:
+        r = runs.get(b)
+        if r is None:
+            continue
+        threads, _ = store_threads(r["meta"])
+        cpu, in_use = host_cpu(r)
+        t = r.get("timing")
+        rate = None
+        if t and t["covered_ms"] and STORE_COMMIT in t["stages"]:
+            rate = t["stages"][STORE_COMMIT]["count"] / (t["covered_ms"] / 1000.0)
+        s, f = stage_avg(t, STORE_COMMIT), stage_avg(t, FSIF_COMMIT)
+        per_commit = cpu / 10.0 / rate * 1e6 if cpu is not None and rate else None
+        fio = r.get("fio")
+        rows.append([
+            b,
+            f"{threads}, {in_use} in use" if in_use is not None else threads,
+            num(rate),
+            ms(s),
+            ms(s - f) if s is not None and f is not None else "—",
+            num(cpu, "{:.1f}"),
+            num(per_commit),
+            num(fio["read"]["iops"] + fio["write"]["iops"]) if fio else "—",
+            ms(fio["read"]["clat_mean_ms"]) if fio else "—",
+            ms(fio["sync"]["mean_ms"]) if fio else "—",
+        ])
+    header = ["build", "store threads", "store commits/s", "store commit avg", "gap", "host CPU s/10 s",
+              "CPU µs/store commit", "fio IOPS", "read clat avg", "fsync avg"]
+    return (["Host CPU is every thread's CPU between the dumps; CPU per store commit divides it by the store "
+             "commit rate in the BackendTiming window."] + [""] + table(header, rows))
+
+
 def fio_section(builds, runs):
     metrics = [
         ("read IOPS", lambda f: num(f["read"]["iops"])),
@@ -422,9 +477,20 @@ def main():
     if not os.path.isdir(a.results):
         sys.exit(f"analyze: no directory {a.results}")
     found = sorted(d for d in os.listdir(a.results) if os.path.isdir(os.path.join(a.results, d)))
-    builds = [b for b in BUILD_ORDER if b in found] + [b for b in found if b not in BUILD_ORDER]
-    if not builds:
+    if not found:
         sys.exit(f"analyze: nothing captured in {a.results}")
+
+    def threads_of(b):
+        for s in SECTIONS:
+            m = os.path.join(a.results, b, s, "meta")
+            if os.path.exists(m):
+                meta = read_meta(m)
+                # A default without a recorded CPU count is still one per CPU, so more than any explicit count.
+                return store_threads(meta)[1] or (float("inf") if meta.get("store_threads", "default") == "default" else 0)
+        return 0
+
+    # "before" first, then the most store threads to the fewest.
+    builds = sorted(found, key=lambda b: (b != "before", -threads_of(b), b))
 
     warnings = []
     runs = defaultdict(dict)  # section -> build -> run
@@ -443,15 +509,21 @@ def main():
         commits = {r[b]["meta"].get("commit") for r in runs.values() if b in r} - {None}
         if len(commits) > 1:
             warnings.append(f"{b}: its sections ran on different commits: {', '.join(sorted(commits))}")
+        settings = {store_threads(r[b]["meta"])[0] for r in runs.values() if b in r}
+        if len(settings) > 1:
+            warnings.append(f"{b}: its sections ran with different store threads: {', '.join(sorted(settings))}")
         dirty = " (uncommitted changes)" if meta.get("dirty") == "yes" else ""
-        rows.append([b, f"`{meta.get('commit', '?')}`{dirty}", f"`{meta.get('checkout', '?')}`"])
-    out += table(["build", "commit", "checkout"], rows) + [""]
+        rows.append([b, store_threads(meta)[0], f"`{meta.get('commit', '?')}`{dirty}", f"`{meta.get('checkout', '?')}`"])
+    out += table(["build", "store threads", "commit", "checkout"], rows) + [""]
+    out += ["\"store threads\" is the host's --store-threads; \"default\" is one per CPU. A build without store "
+            "threads (before the refactor) runs every store on one event thread whatever it says.", ""]
 
     for s in SECTIONS:
         if s not in runs:
             continue
         r = runs[s]
-        out += [f"## {s}", "", "### BackendTiming", ""] + timing_section(builds, r) + [""]
+        out += [f"## {s}", "", "### Summary", ""] + summary_section(builds, r) + [""]
+        out += ["### BackendTiming", ""] + timing_section(builds, r) + [""]
         out += ["### fio", ""] + fio_section(builds, r) + [""]
         for b in builds:
             if b not in r:

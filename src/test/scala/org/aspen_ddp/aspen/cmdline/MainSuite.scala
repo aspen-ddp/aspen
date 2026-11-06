@@ -977,6 +977,16 @@ class MainSuite extends AnyFunSuite with Matchers:
       parse("--load-jars=..") shouldBe None
       parse("--load-jars=") shouldBe None
 
+  test("host --store-threads caps the store threads at a positive count"):
+    withTempDir("parse-store-threads"): dir =>
+      def parse(args: String*) = Console.withErr(OutputStream.nullOutputStream()):
+        Main.buildParser.parse(Seq("host", dir.toString) ++ args, Main.Args())
+      parse().map(_.storeThreads) shouldBe Some(None)
+      parse("--store-threads=2").map(_.storeThreads) shouldBe Some(Some(2))
+      parse("--store-threads", "1").map(_.storeThreads) shouldBe Some(Some(1))
+      parse("--store-threads=0") shouldBe None
+      parse("--store-threads=two") shouldBe None
+
   test("startHost loads user jars before starting anything and reports a failure clearly"):
     withTempDir("start-host-jars"): dir =>
       // No host config exists, so reaching the LoadError shows the jars are loaded first

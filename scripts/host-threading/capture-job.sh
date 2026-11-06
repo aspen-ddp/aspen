@@ -9,6 +9,8 @@
 #   section        smoke.fio section: randrw-verify or seqwrite
 #   fio-directory  the mounted vdisk (default /mnt/vd1)
 #
+# The meta file records the host's --store-threads setting ("default": one per CPU), which analyze.py reports and
+# orders the builds by. Use one label per setting, such as after-2t and after-4t.
 # Run it as your own user, not under sudo: fio runs through sudo, and jcmd runs as the host JVM's owner.
 # It finds the host JVM (HOST_PID overrides that) and records the commit of the checkout it runs from, so the
 # "before" and "after" runs cannot be confused. During the job it takes 3 thread dumps, 10 s apart, starting 15 s in.
@@ -74,8 +76,11 @@ else
 fi
 
 # The launcher's first classpath entry is the checkout's compiled-classes directory, <checkout>/target/...
+# After "host" come the host directory and the host's options; --store-threads is recorded, and "default" means
+# StoreThreadPool's default of one per CPU (builds before the option always used that).
 classpath=""
 host_dir=""
+store_threads=default
 for ((i = 0; i < ${#args[@]}; i++))
 do
   case ${args[i]} in
@@ -83,16 +88,19 @@ do
     host)
       for ((j = i + 1; j < ${#args[@]}; j++))
       do
-        if [[ ${args[j]} != -* ]]
-        then
-          host_dir=${args[j]}
-          break
-        fi
+        case ${args[j]} in
+          --store-threads=*) store_threads=${args[j]#--store-threads=} ;;
+          --store-threads) store_threads=${args[j+1]:-}; j=$((j + 1)) ;;
+          --*=*) ;;
+          --*) j=$((j + 1)) ;;  # every other host option takes a value
+          *) [[ -n $host_dir ]] || host_dir=${args[j]} ;;
+        esac
       done
       break
       ;;
   esac
 done
+[[ $store_threads == default || $store_threads =~ ^[1-9][0-9]*$ ]] || die "cannot read --store-threads ('$store_threads')"
 
 first_cp=${classpath%%:*}
 [[ $first_cp == */target/* ]] || die "cannot find the checkout from the host's classpath ('$first_cp')"
@@ -123,9 +131,12 @@ mkdir -p "$out"
   echo "dirty=$([[ -n $dirty ]] && echo yes || echo no)"
   echo "host_log=$host_log"
   echo "fio_dir=$fio_dir"
+  echo "store_threads=$store_threads"
+  echo "cpus=$(nproc)"
 } > "$out/meta"
 
-echo "capture-job: $label/$section: host pid $pid, $checkout at ${commit:0:10}$([[ -n $dirty ]] && echo ' (dirty)')"
+echo "capture-job: $label/$section: host pid $pid, $checkout at ${commit:0:10}$([[ -n $dirty ]] && echo ' (dirty)')," \
+  "store threads: $store_threads"
 [[ -z $dirty ]] || echo "capture-job: warning: $checkout has uncommitted changes" >&2
 
 sudo -v

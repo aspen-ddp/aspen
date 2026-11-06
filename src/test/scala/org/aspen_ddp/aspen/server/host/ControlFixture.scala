@@ -426,9 +426,10 @@ trait ControlFixture:
 
   /** Builds a Host with LockstepThreading, a ManualControlScheduler and RecordingSeams.
    *
-   *  The events the constructor posts (an initial device check, the task-executor start) are dropped unless
-   *  `startupEvents` is set: the first would race a test's own device checks and the second would run a real
-   *  task-executor bootstrap. A test that drains the host's queue and wants them says so. */
+   *  Of the events the constructor posts, the initial CheckAllDevices is dropped unless `keepCheckAllDevices` (it
+   *  would race a test's own device checks) and InitializeTaskExecutor unless `keepInitializeTaskExecutor` (draining
+   *  it starts a real task-executor bootstrap). Everything else the constructor's device scan queued (store loads,
+   *  marker resolutions, adoption continuations) stays queued for the test to drain. */
   protected def newHost(hostRoot: os.Path,
                         failFirstStoreLoad: Boolean = false,
                         ec: ExecutionContext = executionContext,
@@ -436,7 +437,8 @@ trait ControlFixture:
                         storeRebuildFactory: StoreRebuildFactory = StoreRebuildFactory.Filesystem,
                         maxConcurrentRebuilds: Int = 2,
                         hostId: HostId = HostId.BootstrapHostId,
-                        startupEvents: Boolean = false): Host =
+                        keepCheckAllDevices: Boolean = false,
+                        keepInitializeTaskExecutor: Boolean = false): Host =
     val threading = new LockstepThreading(ec)
     val scheduler = new ManualControlScheduler(threading.controlEvents)
     val recording = new RecordingSeams(ec, failFirstStoreLoad)
@@ -446,8 +448,11 @@ trait ControlFixture:
                         Duration(5, SECONDS), Duration(60, SECONDS), transferService, storeRebuildFactory,
                         maxConcurrentRebuilds, seams = recording.seams(scheduler))
     recording.attach(host)
-    if !startupEvents then
-      threading.removeQueued(_ => true)
+    threading.removeQueued:
+      case t: Host.EventTask =>
+        (!keepCheckAllDevices && t.event.isInstanceOf[Host.CheckAllDevices]) ||
+          (!keepInitializeTaskExecutor && t.event.isInstanceOf[Host.InitializeTaskExecutor])
+      case _ => false
     rigs.put(host, new Rig(recording, scheduler))
     host
 
